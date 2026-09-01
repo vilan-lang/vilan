@@ -363,20 +363,86 @@ sees `Src`'s `get(): T` as `get(): u32`. A trait's generic parameters
 may carry defaults
 (`trait PartialEq<B = Self>`) and **bounds** (`trait Holder<T: Bound>`);
 `Self` in a trait body denotes the implementing type. Traits are used as
-**bounds**; a trait is not a type: `let x: Display` is a compile error
-(no trait objects).
+**bounds**; a trait is not a type, and there are no trait objects: no
+value ever has a trait as its type.
 
 That rule is enforced **at the annotation**, in every value position — a
-binding, a parameter, a return type, a field, a generic argument
-(`List<Display>`) — and reported where the trait's name is written,
-whether or not the declaration is ever used. A trait's name stays legal
-in the positions that name a bound or a namespace rather than a value's
-type: a generic parameter's bound (`<T: Display>`), a supertrait, an
-`impl` subject (`impl Iterator<type T>`, which blankets over a bound),
-and the head of a qualified path (`Display::show(x)`). Inside a trait's
-own declaration, write `Self` for "the implementing type"; a generic
-parameter defaulted to it (`trait PartialEq<B = Self>`) is a parameter,
-not the trait, and is unaffected.
+parameter, a return type, a field, a generic argument (`List<Display>`)
+— and reported where the trait's name is written, whether or not the
+declaration is ever used. A trait's name stays legal in the positions
+that name a bound or a namespace rather than a value's type: a generic
+parameter's bound (`<T: Display>`), a supertrait, an `impl` subject
+(`impl Iterator<type T>`, which blankets over a bound), and the head of a
+qualified path (`Display::show(x)`). Inside a trait's own declaration,
+write `Self` for "the implementing type"; a generic parameter defaulted
+to it (`trait PartialEq<B = Self>`) is a parameter, not the trait, and is
+unaffected.
+
+### A trait annotation on a binding
+
+A `let` binding's annotation is the one exception, and it is not an
+exception to the rule above but an application of it: a trait written
+there is a **checked constraint**, not the binding's type.
+
+```
+let count: Signal<i32> = SignalCell::new(1);
+```
+
+`count`'s type is `SignalCell<i32>` — the type its initializer infers,
+exactly as if nothing had been written. The annotation neither widens it
+nor boxes it; it asserts that whatever type the initializer produces
+implements `Signal<i32>`, and is a compile error when it does not. This
+is the bounded-generic rule (§5.6) in binding position: **checked wide,
+kept narrow**, one concrete type per binding. Reading `count`'s members
+therefore reaches `SignalCell`'s own — its fields included — and a
+reassignment must still be a `SignalCell<i32>`.
+
+The reading is universal: any trait name in this position, for every
+trait. It applies to the binding's OWN annotation only — a trait nested
+inside one (`&Display`, `List<Display>`) is a value position like any
+other and is refused, which is what keeps a heterogeneous container
+impossible.
+
+An `if` needs no rule of its own. Its arms unify first (§5.11), and the
+constraint meets the one type that unification produced:
+
+```
+// legal — both arms are SignalCell<i32>
+let cell: Signal<i32> = if c { SignalCell::new(1) } else { SignalCell::new(2) };
+// refused at the ARMS, as an ordinary mismatch: two concrete types,
+// each implementing Signal<i32>, still do not unify
+let cell: Signal<i32> = if c { SignalCell::new(1) } else { OtherSignal::new(2) };
+```
+
+### Associated functions
+
+A trait may declare **associated functions**: `fun`s with no `self`
+receiver, with or without a default body. They are a namespace, not a
+dispatch — there is no receiver to select an implementation with.
+
+```
+trait Signal<T> {
+    fun new(initial: T): SignalCell<T> { SignalCell { value = initial } }
+}
+```
+
+`Trait::func(..)` calls **the trait's own default body**, always. An impl
+may override an associated function, and that override is reached through
+the implementing type's path, `Type::func(..)` — never by re-pointing the
+trait's spelling at it. (This is the opposite of `Trait::method(receiver)`
+for a `self` method, §5.7, which exists precisely to name the trait a
+receiver dispatches through: with a receiver there is something to select,
+and without one there is not.)
+
+Two consequences follow, and both are compile errors rather than
+surprises. `Trait::func(..)` where the trait declares `func` without a
+default body names a per-impl requirement with nothing behind it, and is
+refused, naming both spellings. And a default body is not inherited onto
+an implementing type's path: `Type::func(..)` reaches that type's own
+declaration or nothing, and the refusal names the trait's spelling.
+
+The trait's own generic parameters bind from the call, like any generic
+function's: `Signal::new(7)` binds `T = i32`.
 
 A trait parameter's bound is in scope inside the trait's own default
 bodies, exactly as a function's or impl's is inside theirs (§5.6): a
@@ -704,10 +770,18 @@ fun main() {
 
 Normative rejection cases (each is a compile error):
 
-- Using a trait as a type, in any value position — a binding, a
-  parameter, a return type, a field, a generic argument (`let x: Display
-  = …`, `fun f(v: Display)`, `fun make(): Display`, `struct H { item:
-  Display }`, `List<Display>`). Reported at the annotation (§5.5).
+- Using a trait as a type, in any value position — a parameter, a return
+  type, a field, a generic argument (`fun f(v: Display)`, `fun make():
+  Display`, `struct H { item: Display }`, `let xs: List<Display> = …`).
+  Reported at the annotation (§5.5). A `let` binding's OWN annotation is
+  not this case: there a trait is a checked constraint on the inferred
+  type (§5.5).
+- A `let` binding whose inferred type does not implement the trait its
+  annotation names (`let x: Display = bag`, `Bag` having no `Display`
+  impl). Reported at the annotation (§5.5).
+- `Trait::func(..)` for an associated function the trait declares without
+  a default body, and `Type::func(..)` for one the type's impl does not
+  declare (§5.5).
 - An enum-variant pattern matched against a generic parameter of an
   enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the

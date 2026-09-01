@@ -1706,6 +1706,31 @@ pub struct Trait<'src> {
     pub supertraits: Vec<TypeId>,
 }
 
+/// B161: a TRAIT written as a `let` binding's annotation. The annotation is
+/// not the binding's type and not a widening — the binding keeps the concrete
+/// type its initializer infers — it is a CONSTRAINT that type is checked
+/// against, exactly the bounded-generic rule ported to a binding: checked
+/// wide, kept narrow.
+///
+/// Checked after `build()`, where the binding's own type has settled. That is
+/// also what makes the `if` case fall out rather than needing a rule of its
+/// own: the arms unify FIRST (B163's `Constraint::IfArms`), and the constraint
+/// meets whatever ONE type that unification produced. Two arms of different
+/// concrete types fail at the unification, with the ordinary mismatch, even
+/// when both implement the trait — there is no widening here for them to meet
+/// in.
+#[derive(Debug, Clone)]
+pub struct BindingTraitConstraint {
+    /// The annotated binding.
+    pub variable_id: Id,
+    pub trait_id: Id,
+    /// The trait's written arguments (`Signal<i32>` -> `[i32]`).
+    pub arguments: Vec<TypeId>,
+    /// The annotation's own span: the constraint is what fails, so that is
+    /// where the caret goes.
+    pub span: Span,
+}
+
 /// A pending `impl Subject with Trait` conformance check: the subject type
 /// must provide every member the named trait requires.
 #[derive(Debug, Clone)]
@@ -2912,6 +2937,17 @@ pub struct Analyzer<'src> {
     // Marked here rather than the reverse so the default is the safe one: a
     // type position added later is checked until it says otherwise.
     trait_position_type_ids: HashSet<TypeId>,
+    // The annotation type ids of `let` bindings, keyed to the binding they
+    // annotate. B161: a trait written HERE — and only here among the value
+    // positions — is a CHECKED CONSTRAINT on the binding's inferred type
+    // rather than a refusal; the map is what the `prepped_type_locals` drain
+    // consults to tell the one position from the rest. A nested spelling
+    // (`&Trait`, `List<Trait>`) mints its own inner type id, which is not in
+    // this map and stays refused.
+    binding_annotation_type_ids: HashMap<TypeId, Id>,
+    // The constraints those annotations recorded, checked after `build()` —
+    // where the binding's own type has settled (B161).
+    binding_trait_constraints: Vec<BindingTraitConstraint>,
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
@@ -3541,6 +3577,8 @@ impl<'src> Analyzer<'src> {
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
+            binding_annotation_type_ids: HashMap::default(),
+            binding_trait_constraints: Vec::new(),
             panic_fn_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
@@ -4345,6 +4383,70 @@ impl<'src> Analyzer<'src> {
                     msg,
                 },
                 anchor,
+            );
+        }
+    }
+
+    /// B161: check each `let` binding whose annotation named a TRAIT against
+    /// that trait — the same `satisfies_trait_bound` a generic parameter's
+    /// declared bound goes through, because it is the same rule: the annotation
+    /// constrains the binding's own type, it does not replace it.
+    ///
+    /// Runs after `build()`, so the binding's type has settled — which is what
+    /// makes the `if` case need no rule of its own. The arms unify first
+    /// (B163), and the constraint meets the ONE type that unification produced;
+    /// arms that will not unify have already failed with the ordinary mismatch,
+    /// and the skip below keeps this check from filing a second, misleading
+    /// report on top of it.
+    fn check_binding_trait_constraints(&mut self) {
+        for constraint in std::mem::take(&mut self.binding_trait_constraints) {
+            let Some(variable) = self.variables.get(&constraint.variable_id) else {
+                continue;
+            };
+            let name = variable.name;
+            let value_type = variable.type_id.get_type(self);
+            // Indeterminate values are other diagnostics' business: a binding
+            // that never grounded already failed elsewhere.
+            if matches!(
+                value_type,
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
+            ) {
+                continue;
+            }
+            if self.satisfies_trait_bound(
+                &value_type,
+                constraint.trait_id,
+                &constraint.arguments,
+                0,
+            ) {
+                continue;
+            }
+            let Some(trait_label) =
+                self.bound_trait_label(constraint.trait_id, &constraint.arguments)
+            else {
+                continue;
+            };
+            let type_label = self.pretty_print_type(&value_type, &HashMap::default());
+            let note = self
+                .traits
+                .get(&constraint.trait_id)
+                .map(|trait_| crate::error::Note {
+                    span: trait_.name_span,
+                    msg: format!("'{}' is declared here, as a trait", trait_.name),
+                    source: self.source_of_id(trait_.id),
+                });
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note,
+                    span: constraint.span,
+                    msg: format!(
+                        "'{type_label}' does not implement trait '{trait_label}', required by \
+                         the annotation on '{name}': a trait annotation on a binding is a \
+                         CONSTRAINT on the value's own type, which stays '{type_label}'"
+                    ),
+                },
+                constraint.variable_id,
             );
         }
     }
@@ -13363,6 +13465,55 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// The trait's own ASSOCIATED FUNCTION named `member_name` (B162): a `fun`
+    /// the trait declares with no `self` receiver, so there is no receiver to
+    /// dispatch through and `Trait::func(..)` is the call's ordinary spelling.
+    /// The exact complement of [`method_member_in_trait`]'s `self` filter, over
+    /// the same trait-and-supertraits chain — a member is one or the other.
+    fn associated_function_in_trait(&self, trait_id: Id, member_name: &str) -> Option<Id> {
+        self.trait_with_supertraits(trait_id)
+            .into_iter()
+            .find_map(|id| {
+                self.traits
+                    .get(&id)
+                    .and_then(|trait_| trait_.declarations.get(member_name).copied())
+                    .filter(|member_id| !self.is_self_method(*member_id))
+            })
+    }
+
+    /// The name of a trait `subject_type` implements that declares
+    /// `member_name` as an associated function WITH a default body (B162) —
+    /// for the steer on `Type::func(..)` when the type's own impl declares no
+    /// such member. An associated function has no receiver, so a default body
+    /// is not inherited onto the implementing type's path the way a `self`
+    /// method's is: the call that reaches it is the trait's own spelling, and
+    /// the diagnostic names it rather than leaving it to be hunted for.
+    fn associated_function_provider(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<&'src str> {
+        let implemented: Vec<Id> = self
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                self.compare_type(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
+            .flat_map(|implementation| implementation.trait_ids.clone())
+            .collect();
+        implemented.into_iter().find_map(|trait_id| {
+            let member_id = self.associated_function_in_trait(trait_id, member_name)?;
+            if !self.member_has_default_body(member_id) {
+                return None;
+            }
+            self.traits.get(&trait_id).map(|trait_| trait_.name)
+        })
+    }
+
     /// [`method_member_in_trait`] with the arguments the trait is used AT, and
     /// returning the trait that DECLARES the member together with the
     /// arguments THAT trait is reached with — the pair a caller needs to
@@ -20318,9 +20469,18 @@ impl<'src> Analyzer<'src> {
                     }
                     _ => {}
                 }
-                let type_id = annotation
-                    .map(|x| self.walk_type_node(x, scope_id))
-                    .unwrap_or(Type::Unknown.get_type_id(self));
+                let type_id = match annotation {
+                    Some(node) => {
+                        let type_id = self.walk_type_node(node, scope_id);
+                        // B161: the one value position where a trait is a
+                        // CONSTRAINT rather than an error. Recorded by type id
+                        // because the name has not resolved yet — whether the
+                        // annotation names a trait is the drain's to discover.
+                        self.binding_annotation_type_ids.insert(type_id, id);
+                        type_id
+                    }
+                    None => Type::Unknown.get_type_id(self),
+                };
                 // An annotated let EXPECTS its value at the annotation — the
                 // same seed the function tail gets from its declared return
                 // type, so expectation-readers (`match` leg propagation, `!`'s
@@ -31426,34 +31586,66 @@ impl<'src> Analyzer<'src> {
                         Some(Expr::Trait(_))
                     );
                     let bare_trait_id = match &subject_type {
-                        Type::Trait(trait_id, _)
+                        Type::Trait(trait_id, arguments)
                             if names_the_trait
                                 && !self.trait_position_type_ids.contains(&type_id) =>
                         {
-                            Some(*trait_id)
+                            Some((*trait_id, arguments.clone()))
                         }
                         _ => None,
                     };
-                    if let Some(trait_id) = bare_trait_id {
-                        let (message, note) = self.bare_trait_in_value_position(trait_id, scope_id);
-                        // Attributed to the walk that wrote the annotation, for
-                        // the reason the unresolved arm below is (E108) — this
-                        // is the same drain, and it had the same defect.
-                        self.push_in_source(
-                            Error {
-                                trace: Vec::new(),
-                                note,
-                                span,
-                                msg: message,
-                            },
-                            source_id,
-                        );
+                    // B161: a trait in a `let` binding's annotation is NOT this
+                    // mistake. There the trait is a CONSTRAINT on the type the
+                    // initializer infers — the binding still has one concrete
+                    // type, and the annotation only checks it implements the
+                    // trait — so §12.2's four holes stay shut (nothing is
+                    // widened, nothing heterogeneous is stored, no destructor
+                    // is dropped) while the one position that reads as an
+                    // intention rather than a mistake gets that reading.
+                    //
+                    // NARROWED, not repealed: the refusal still stands at every
+                    // other value position — a parameter, a return type, a
+                    // field — and at every NESTED spelling here (`&Trait`,
+                    // `List<Trait>`), whose inner type ids were never annotation
+                    // ids to begin with.
+                    if let Some((trait_id, arguments)) = &bare_trait_id {
+                        match self.binding_annotation_type_ids.get(&type_id).copied() {
+                            Some(variable_id) => {
+                                self.binding_trait_constraints.push(BindingTraitConstraint {
+                                    variable_id,
+                                    trait_id: *trait_id,
+                                    arguments: arguments.clone(),
+                                    span,
+                                });
+                            }
+                            None => {
+                                let (message, note) =
+                                    self.bare_trait_in_value_position(*trait_id, scope_id);
+                                // Attributed to the walk that wrote the
+                                // annotation, for the reason the unresolved arm
+                                // below is (E108) — this is the same drain, and
+                                // it had the same defect.
+                                self.push_in_source(
+                                    Error {
+                                        trace: Vec::new(),
+                                        note,
+                                        span,
+                                        msg: message,
+                                    },
+                                    source_id,
+                                );
+                            }
+                        }
                     }
                     // A refused annotation resolves to `Unknown`, so the one
                     // report at the annotation stands alone instead of cascading
-                    // a mismatch through every use of the thing it names. The
-                    // write goes through `write_type_slot`, which owns the
-                    // solver's progress accounting (E43).
+                    // a mismatch through every use of the thing it names. A
+                    // CONSTRAINT annotation resolves to `Unknown` for the
+                    // opposite reason: it never was the binding's type, so the
+                    // binding grounds from its initializer exactly as an
+                    // unannotated one does. The write goes through
+                    // `write_type_slot`, which owns the solver's progress
+                    // accounting (E43).
                     self.write_type_slot(
                         type_id,
                         match bare_trait_id {
@@ -31663,9 +31855,38 @@ impl<'src> Analyzer<'src> {
                         }
                         _ => None,
                     };
+                    // B162: the trait's OWN associated function — a `fun` with
+                    // no `self`, declared in the trait body. `Trait::func(..)`
+                    // resolves to THE TRAIT'S DEFAULT BODY, ruled: an impl may
+                    // override the function, and that override is reached
+                    // through the impl's own type path (`Type::func(..)`),
+                    // never by re-pointing the trait's spelling at it. There is
+                    // no receiver to select an impl with, so there is nothing
+                    // for the trait path to dispatch on — unlike a `self`
+                    // method, whose `Trait::member(receiver)` form exists
+                    // precisely to name the trait a receiver dispatches through.
+                    //
+                    // Ranked ABOVE the impl-provided statics so the rule holds
+                    // even when a blanket `impl Trait ...` declares the same
+                    // name: the trait's own body wins its own spelling.
+                    let trait_associated_function = match subject_type {
+                        Type::Trait(trait_id, _) => {
+                            self.associated_function_in_trait(trait_id, member_name)
+                        }
+                        _ => None,
+                    };
+                    // Without a default body the associated function is a
+                    // per-impl REQUIREMENT: calling it on the trait would
+                    // resolve to a signature with nothing behind it (B55's
+                    // internal error, B158's cousin). Refused below, by name.
+                    let bodyless_associated_function = trait_associated_function
+                        .filter(|member_id| !self.member_has_default_body(*member_id));
+                    let trait_associated_function = trait_associated_function
+                        .filter(|member_id| self.member_has_default_body(*member_id));
                     let member_id = variant_id
                         .map(|variant| (variant, None))
                         .or(inherent_method)
+                        .or(trait_associated_function.map(|member_id| (member_id, None)))
                         .or(static_member)
                         // `Trait::member(receiver, ..)` (B57 §3.1): the explicit
                         // disambiguator. The trait's attached-static namespace
@@ -31711,6 +31932,47 @@ impl<'src> Analyzer<'src> {
                                     }
                                 }
                             }
+                        }
+                        // B162: the trait declares the associated function but
+                        // gives it no default body, so `Trait::func(..)` names
+                        // a requirement with nothing behind it. Both spellings
+                        // are named: the one that would work today (through an
+                        // implementing type) and the one that would make this
+                        // very call work (a default body on the trait).
+                        None if bodyless_associated_function.is_some() => {
+                            let trait_name = match subject_type {
+                                Type::Trait(trait_id, _) => self
+                                    .traits
+                                    .get(&trait_id)
+                                    .map(|trait_| trait_.name)
+                                    .unwrap_or("this trait"),
+                                _ => "this trait",
+                            };
+                            let note = bodyless_associated_function.and_then(|member_id| {
+                                self.span_map
+                                    .get(&member_id)
+                                    .map(|span| crate::error::Note {
+                                        span: **span,
+                                        msg: format!(
+                                            "'{member_name}' is declared here, without a body"
+                                        ),
+                                        source: self.source_of_id(member_id),
+                                    })
+                            });
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note,
+                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "'{trait_name}::{member_name}' has no default body, so \
+                                     '{trait_name}::{member_name}(..)' has nothing to call: an \
+                                     associated function without one is a per-impl requirement. \
+                                     Call it through an implementing type — \
+                                     '<Type>::{member_name}(..)' — or give '{member_name}' a \
+                                     default body on '{trait_name}'"
+                                ),
+                            });
+                            self.expr_id_to_expr_map.insert(id, Expr::Error);
                         }
                         // Two traits provide it as a STATIC, and nothing the
                         // type owns outranks them (B83). This is B57's §4
@@ -31810,6 +32072,28 @@ impl<'src> Analyzer<'src> {
                                     "; it is `[trait_only]` on trait `{trait_name}`: reach it \
                                      through a `{trait_name}` bound, not the concrete type"
                                 )
+                            })
+                            .or_else(|| {
+                                // B162: a trait the type implements provides it
+                                // as an ASSOCIATED FUNCTION with a default
+                                // body. No receiver means no dispatch, so the
+                                // default is not inherited onto this path — the
+                                // trait's own spelling is the one that reaches
+                                // it, and an impl that wants it on this path
+                                // declares it.
+                                if subject_is_trait {
+                                    return None;
+                                }
+                                let trait_name =
+                                    self.associated_function_provider(&subject_type, member_name)?;
+                                Some(format!(
+                                    "; trait '{trait_name}' declares '{member_name}' as an \
+                                     associated function with a default body, and an associated \
+                                     function has no receiver to inherit it through — call \
+                                     '{trait_name}::{member_name}(..)', or declare \
+                                     '{member_name}' in the impl for '{subject_str}' to \
+                                     override it"
+                                ))
                             })
                             .unwrap_or_default();
                             self.diagnostics.push(Error {
@@ -39514,6 +39798,9 @@ fn analyze_over_world<'src>(
     analyzer.check_rpc_signatures();
     analyzer.check_expose_fields();
     analyzer.check_generic_bound_satisfaction();
+    // B161's binding-position twin of the bound check above, in the same place
+    // and for the same reason: every binding's type has settled by here.
+    analyzer.check_binding_trait_constraints();
     analyzer.check_tuple_spreads();
     // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
     // inert unless `std::dev` is loaded. Runs inside `analyze()` (like the S2a

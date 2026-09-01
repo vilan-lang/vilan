@@ -260,6 +260,8 @@ spec/types.md h3 the-trap-arm
 spec/types.md h2 54-impls
 spec/types.md h3 dispatch-through-a-bound
 spec/types.md h2 55-traits
+spec/types.md h3 a-trait-annotation-on-a-binding
+spec/types.md h3 associated-functions
 spec/types.md h2 56-generic-binding-and-inference
 spec/types.md h2 57-operator-and-method-dispatch
 spec/types.md h2 58-conversions-and-coercions
@@ -430,6 +432,8 @@ tour/data-and-traits.md h3 backed-enums
 tour/data-and-traits.md h2 impl-methods-and-statics
 tour/data-and-traits.md h2 generics-and-bounds
 tour/data-and-traits.md h2 traits
+tour/data-and-traits.md h2 a-trait-on-a-binding-is-a-constraint
+tour/data-and-traits.md h2 associated-functions
 tour/data-and-traits.md h2 derives
 tour/functions-and-closures.md h1 functions--closures
 tour/functions-and-closures.md h2 functions

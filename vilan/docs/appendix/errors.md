@@ -90,15 +90,35 @@ demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
-A trait's name was written where a type belongs — a binding's
-annotation, a parameter, a return type, a struct field, or a generic
-argument like `List<Display>`. Traits are **bounds**, not types, so no
-value can ever have that type: the impl is fine, the signature is not.
-Write the generic the message spells out — `fun show<T: A>(v: T)` — or,
-inside the trait's own declaration, write `Self`, which is what a trait
-naming itself in a return position always meant. The note points at the
-trait, which may live in another module. For "one of several things at
-runtime", use an enum.
+A trait's name was written where a type belongs — a parameter, a return
+type, a struct field, or a generic argument like `List<Display>`. Traits
+are **bounds**, not types, so no value can ever have that type: the impl
+is fine, the signature is not. Write the generic the message spells out —
+`fun show<T: A>(v: T)` — or, inside the trait's own declaration, write
+`Self`, which is what a trait naming itself in a return position always
+meant. The note points at the trait, which may live in another module.
+For "one of several things at runtime", use an enum. A `let` binding's
+own annotation is not this error: there a trait is a *constraint* on the
+inferred type, see the next entry.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"'…' does not implement trait '…', required by the annotation on '…'"**
+A `let` binding's annotation named a trait, which reads as a constraint
+on the value's own type — the binding still has the concrete type its
+initializer produced — and that type has no impl of the trait. Either
+implement it, or annotate with the type you meant. Note that two `if`
+arms of different types fail earlier, at the arms: the annotation is not
+a widening, so there is nothing for two types to meet in even when both
+implement the trait.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"'…::…' has no default body, so '…::…(..)' has nothing to call"**
+An associated function (a trait `fun` with no `self`) was called on the
+trait, but the trait only declares it — each impl supplies its own body,
+and with no receiver there is nothing to pick between them. Call it
+through an implementing type, `Type::func(..)`, or give the trait's
+declaration a default body, which is what makes the trait's own spelling
+callable.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"cannot call '…' on a value of bare trait type '…'"**

@@ -4152,35 +4152,52 @@ fn b72_a_generic_parameter_is_untouched_by_the_steer() {
 // declarations `Self`, which is what they always meant (§1.5).
 
 #[test]
-fn b72_a_bare_trait_let_annotation_is_refused() {
-    // `let x: A = bag` used to compile, and only USING it failed. The spec has
-    // said since it was written that the ANNOTATION is the error
-    // (`types.md` §5.11); the compiler agrees now.
-    assert_fails_with(
+fn b161_a_trait_let_annotation_is_a_checked_constraint_not_a_refusal() {
+    // SUPERSEDED BY B161 (was `b72_a_bare_trait_let_annotation_is_refused`).
+    // The refusal is NARROWED at this one position, not repealed: a trait in a
+    // `let` annotation is a CONSTRAINT on the binding's inferred type. `x` is
+    // a `Bag`, the annotation only checks `Bag` implements `A`, and the four
+    // §12.2 holes stay shut because nothing was widened — see the three
+    // still-refused positions below, and `traits.rs` for the rule's own pins.
+    assert_compiles(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun main() { let x: A = Bag { n = 1 }; }
         "#,
-        "'A' is a trait, not a type",
     );
-}
-
-#[test]
-fn b72_a_bare_trait_value_still_cannot_be_used() {
-    // The refusal that always existed. The binding now fails one step earlier,
-    // at its annotation, so the use never gets its own report — but the rule
-    // the reader is told is word-for-word the one `MethodLookup::BareTraitValue`
-    // states, which is the point of wording them alike.
+    // A type that does NOT implement it is still refused — by the constraint,
+    // naming the missing impl rather than the annotation's spelling.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
+        struct Other { m: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun main() { let x: A = Bag { n = 1 }; let s = x.name(); }
+        fun main() { let x: A = Other { m = 1 }; }
         "#,
-        "a trait is not a value type (vilan has no trait objects)",
+        "does not implement trait 'A'",
+    );
+}
+
+#[test]
+fn b161_a_trait_annotated_binding_dispatches_on_its_own_type() {
+    // SUPERSEDED BY B161 (was `b72_a_bare_trait_value_still_cannot_be_used`).
+    // There is no bare-trait VALUE here to be unusable: the binding's type is
+    // `Bag`, so the call is `Bag`'s own — statically, with no dispatch at all.
+    // `MethodLookup::BareTraitValue` still guards every position where a value
+    // really does carry a trait type; this position no longer produces one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; print(x.name()); }
+        main();
+        "#,
+        "bag\n",
     );
 }
 
@@ -4259,16 +4276,26 @@ fn b72_a_bare_trait_generic_argument_is_refused() {
 // declaration error now, at the annotation the author wrote.
 
 #[test]
-fn b4_the_internal_error_route_through_a_binding_is_a_clean_refusal() {
-    assert_fails_with(
+fn b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program() {
+    // SUPERSEDED BY B161 (was
+    // `b4_the_internal_error_route_through_a_binding_is_a_clean_refusal`).
+    // B55's internal error came from a value CARRYING a trait type into a
+    // bounded generic, where monomorphization had no concrete type to reach.
+    // B161 removes the carrier rather than the call: `x` is a `Bag`, so the
+    // bounded call has exactly the concrete type it always needed. The two
+    // sibling routes — a field and a return — still refuse, because those
+    // positions still need a real type.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let x: A = Bag { n = 1 }; let s = use_it(x); }
+        fun main() { let x: A = Bag { n = 1 }; print(use_it(x)); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4304,19 +4331,17 @@ fn b4_the_internal_error_route_through_a_return_is_a_clean_refusal() {
 
 #[test]
 fn b4_no_route_to_the_internal_error_survives() {
-    // The half that makes the three above a closure rather than three fixes:
+    // The half that makes the ones above a closure rather than separate fixes:
     // whatever else the programs report, none of them reaches the transformer's
     // B55 guard. "internal:" in a diagnostic is the string that must not
     // appear, because it is the one that asks the user to file a bug for their
     // own mistake.
+    //
+    // The BINDING route left this list with B161 — it is a clean, running
+    // program now, not a diagnostic (see
+    // `b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program`),
+    // and a program that compiles reaches no guard at all.
     for source in [
-        r#"
-        trait A { fun name(self): str; }
-        struct Bag { n: i32 }
-        impl Bag with A { fun name(self): str { "bag" } }
-        fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let x: A = Bag { n = 1 }; let s = use_it(x); }
-        "#,
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
@@ -4767,10 +4792,17 @@ fn a_resource_binding_runs_its_destructor() {
 }
 
 #[test]
-fn a_bare_trait_binding_cannot_swallow_a_resources_destructor() {
-    // P8 row 2. Today this compiles, runs, prints `ok` and NEVER prints
-    // `closing` — one changed word in the annotation deleted the destructor.
-    assert_fails_with(
+fn a_trait_annotated_binding_cannot_swallow_a_resources_destructor() {
+    // P8 row 2, and the pin's CLAIM is unchanged — only the mechanism that
+    // keeps it true. The bug: this compiled, ran, printed `ok` and NEVER
+    // printed `closing`, because one changed word in the annotation gave the
+    // binding a trait type and the destructor had no concrete type to reach.
+    // B72 shut it by refusing the annotation; B161 reopens the annotation as a
+    // CONSTRAINT and shuts the hole at its root instead — `handle` is a
+    // `Handle`, so it is a resource, and its scope end destroys it. That is
+    // the stronger form: the program the author wrote now works, rather than
+    // being refused for a reason that was never about them.
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::drop::Drop;
@@ -4784,7 +4816,7 @@ fn a_bare_trait_binding_cannot_swallow_a_resources_destructor() {
         }
         main();
         "#,
-        "a trait is not a value type (vilan has no trait objects)",
+        "closing\nok\n",
     );
 }
 
