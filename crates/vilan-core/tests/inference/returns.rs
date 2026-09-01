@@ -861,7 +861,7 @@ fn b126_mutually_recursive_unannotated_functions_infer_together() {
 // the amendment. Asserts what SHOULD hold; goes green when the binding is
 // read through its initializer on the inference path.
 #[test]
-#[ignore = "B126 residue, 2026-08-22: a self-call bound by a `let` and read in the tail \
+#[ignore = "B191 (B126's residue, re-owned 2026-09-01): a self-call bound by a `let` and read in the tail \
             (`let x = g(n - 1); x + 1`) in an unannotated recursive body still fails \
             \"could not be resolved\" — a `let` binding is not read through its \
             initializer on the inference path"]

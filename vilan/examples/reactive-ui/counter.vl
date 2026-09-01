@@ -13,15 +13,12 @@
 // qualify; importing the member `style` would SHADOW the module and take
 // `style::Display` with it, so the builder is qualified too.
 //
-// The one import left is the B172 workaround: a module-qualified path is a parse
 // error in every TYPE position, so `counter_card`'s return cannot be written
-// `style::Style`. It comes out when B172 closes.
 
-import std::style::Style;
 
 // Typed atomic styles (proposal/ui-styling.md): built inside `const`, so the
 // rules land in app.css at build time; `.styled(..)` just sets the classes.
-fun counter_card(): Style {
+fun counter_card(): style::Style {
 	style::style()
 		.display(style::Display::Flex)
 		.flex_direction(style::FlexDirection::Column)

@@ -372,5 +372,5 @@ row	flagship	key
 <<<<<<< HEAD
 346	flagship	`{subject_label}`'s `{method_name}` accepts `{declared_label}`, but the right operand is `{rhs_label}`
 =======
-346	-	'{member_name}' in module '{module_name}' is not a type
+347	-	'{member_name}' in module '{module_name}' is not a type
 >>>>>>> b172
