@@ -912,7 +912,17 @@ impl Document {
         // Prefer the project's declared platform and source root (the file's role in
         // its `vilan.toml`); fall back to inferring the platform from imports and
         // rooting `pkg::` at the file's own directory.
+        //
+        // Timed for the same reason the core pipeline's phases are (E106): this
+        // is not a lookup. `platform_color::file_platforms` walks the loader's
+        // `pkg::` graph from EVERY entry of the manifest until one reaches this
+        // file (E113), and the walk resolves and parses each module it reaches
+        // — per analysis, so per keystroke — while `resolve_dependencies`
+        // re-reads the manifest closure beside it. The core line cannot see any
+        // of it: it starts inside `analyze`.
+        let phase_context_start = std::time::Instant::now();
         let context = resolve_project_context(entry_path);
+        let phase_context = phase_context_start.elapsed();
         let manifest_problem = context.manifest_problem;
         let pkg_root = context
             .pkg_root
@@ -942,6 +952,7 @@ impl Document {
         // process-global caches, which a keystroke's content would leak for
         // the session (§7.5). The `AnalyzedProgram` built below owns and
         // reclaims them beside the entry text and tree.
+        let phase_analyze_start = std::time::Instant::now();
         let vilan_core::AnalyzedEntry {
             program,
             diagnostics,
@@ -955,6 +966,8 @@ impl Document {
             context.platform,
             &context.workspace,
         );
+        let phase_analyze = phase_analyze_start.elapsed();
+        let phase_index_start = std::time::Instant::now();
 
         // The entity table the navigation queries index, computed by the one
         // function both front-ends use (`vilan_ide::entity_spans`).
@@ -1005,11 +1018,13 @@ impl Document {
         // modules.
         let program =
             unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) };
+        let phase_index = phase_index_start.elapsed();
         // The other legs' verdicts on a shared module (E113), computed AFTER
         // the primary so a panic in one of them cannot cost the analysis the
         // user is looking at. Each is a full analysis under that leg's platform
         // whose program is published and then dropped — the diagnostics are all
         // the editor keeps, and hover/goto/completion stay the primary leg's.
+        let phase_legs_start = std::time::Instant::now();
         let shared_diagnostics = context
             .shared_platforms
             .iter()
@@ -1024,6 +1039,27 @@ impl Document {
                 )
             })
             .collect();
+        // The server's half of the `VILAN_PHASE_TIMING` split (E106): one line
+        // per LSP analysis, naming the four costs the core pipeline's own line
+        // cannot see — project resolution (the E113 reachability walk and the
+        // dependency closure), the analysis proper, the editor tables built
+        // over it, and the extra full analysis each FURTHER leg of a shared
+        // module costs. Stderr, like the core line, and behind the same switch,
+        // so one variable turns the whole picture on. `legs` is the count, not
+        // a duration: a file two legs reach pays TWO analyses per keystroke,
+        // and that is the fact to read first.
+        if vilan_core::phase_timing_enabled() {
+            let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[vilan phase] lsp-context {:.1}ms lsp-analyze {:.1}ms lsp-index {:.1}ms \
+                 lsp-legs {:.1}ms legs {}",
+                milliseconds(phase_context),
+                milliseconds(phase_analyze),
+                milliseconds(phase_index),
+                milliseconds(phase_legs_start.elapsed()),
+                context.shared_platforms.len(),
+            );
+        }
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),

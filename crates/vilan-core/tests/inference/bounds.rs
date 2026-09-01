@@ -7225,3 +7225,134 @@ fn b157_a_second_blanket_for_maybe_signal_is_refused_at_its_declaration() {
         "'MaybeSignal' is already implemented for 'T' by module 'reactive'",
     );
 }
+
+// --- E106/M19: dispatch refinement selects per TYPE, not per call site ---
+
+/// Analyzes `source`, refines every trait-dispatch site the shared call graph
+/// leaves indirect, and reports `(impl selections evaluated, refined edges,
+/// dispatch sites)`.
+///
+/// The site enumeration is the `context` pass's own (`context.rs`): every call
+/// the graph records as `TraitDispatch`/`GenericMember`, with the candidate
+/// list `dispatch_refine::candidates_of` gives its member name. Driving
+/// `refined_edges` directly is deliberate — both shipped consumers (the
+/// context pass and `const_eval`'s const-only check) reach it through their
+/// own trigger conditions, and the property here belongs to the refinement,
+/// not to either trigger.
+///
+/// Runs on a large-stack worker with the counter zeroed there, so a
+/// concurrently running test cannot contribute to it (the isolation
+/// `call_graphs_built_by_one_analysis` documents).
+fn dispatch_selections(source: &str) -> (usize, usize, usize) {
+    use vilan_core::call_graph::{CallGraph, CallTarget, IndirectReason};
+    use vilan_core::dispatch_refine::{
+        self, DispatchSite, RefinedCaller, candidates_of, member_name_at,
+    };
+
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let graph = CallGraph::build(&program);
+            let mut sites: Vec<DispatchSite> = Vec::new();
+            for node in graph.nodes() {
+                for call in graph.calls_of(node.id()) {
+                    if !matches!(
+                        call.target,
+                        CallTarget::Indirect(
+                            IndirectReason::TraitDispatch | IndirectReason::GenericMember
+                        )
+                    ) {
+                        continue;
+                    }
+                    let Some(name) = member_name_at(&program, call.call_id) else {
+                        continue;
+                    };
+                    sites.push(DispatchSite {
+                        owner: RefinedCaller::Node(node.id()),
+                        call: call.call_id,
+                        candidates: candidates_of(&program, name),
+                    });
+                }
+            }
+            dispatch_refine::reset_selection_count();
+            let edges = dispatch_refine::refined_edges(&program, &graph, &sites);
+            (dispatch_refine::selection_count(), edges.len(), sites.len())
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// E106/M19. An `OnConstraint` site is resolved per ENTRY of the function that
+/// owns the constraint, and each entry asks which impl members its concrete
+/// type selects — a scan of every implementation whose own entries may recurse
+/// into another such scan. The entry count is a program-size quantity, so the
+/// question is what the answer is keyed on. It is keyed on the RESOLVED TYPE:
+/// twelve calls at one type ask once.
+///
+/// Only a counter can pin it. The memo changes no edge, so no behaviour test
+/// can see it, and the timing it exists for is not assertable on a shared
+/// machine. The measured instance is kolt's generated icon module: 17,895
+/// selections per pass for 32 distinct answers, twice per analysis, 2.5 s of a
+/// 5 s keystroke.
+/// Read as a DIFFERENTIAL between two caller counts, because std's own
+/// prelude contributes dispatch sites of its own and an absolute count would
+/// pin those too: what the memo owns is the SLOPE. Four extra entries must add
+/// four refined edges (the refinement is untouched) and ZERO selections.
+#[test]
+fn a_bounded_dispatch_reached_from_many_callers_selects_once_per_type() {
+    let program_with = |entries: usize| {
+        let calls: String = (0..entries)
+            .map(|index| format!("            tell(Badge {{ size = {index} }});\n"))
+            .collect();
+        format!(
+            r#"
+        trait Show3 {{ fun show3(self): str; }}
+        struct Badge {{ size: i32 }}
+        impl Badge with Show3 {{ fun show3(self): str {{ "badge" }} }}
+
+        fun tell<V: Show3>(value: V) {{ print(value.show3()); }}
+
+        fun main() {{
+{calls}        }}
+        main();
+        "#
+        )
+    };
+    let (few_selections, few_edges, few_sites) = dispatch_selections(&program_with(4));
+    let (many_selections, many_edges, many_sites) = dispatch_selections(&program_with(8));
+
+    assert_eq!(
+        few_sites, many_sites,
+        "the same one dispatch site (`value.show3()` inside `tell`) plus std's, \
+         either way: only the ENTRY count moved"
+    );
+    assert_eq!(
+        many_edges - few_edges,
+        4,
+        "four more entries of `tell` refine to four more edges — the answer is \
+         unchanged, which is what makes the memo invisible"
+    );
+    assert_eq!(
+        many_selections, few_selections,
+        "…and to NO more impl selections: eight `Badge` literals are eight type \
+         IDS but one TYPE, and the selection is keyed on the type. Without the \
+         memo this grows one-for-one with the entry count"
+    );
+}

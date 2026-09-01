@@ -875,7 +875,13 @@ impl PhaseClock {
     }
 }
 
-pub(crate) fn phase_timing_enabled() -> bool {
+/// Whether the `VILAN_PHASE_TIMING` instrument is on — public so a FRONT END
+/// can add its own phases to the same line under the same switch. The language
+/// server does (`document::analyze_on_this_thread`): the costs it owns —
+/// project resolution, the editor tables, a shared module's further legs — all
+/// sit outside `analyze`, so the core line above cannot see them, and a second
+/// switch would mean two half-pictures.
+pub fn phase_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("VILAN_PHASE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
