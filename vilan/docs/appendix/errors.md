@@ -300,6 +300,22 @@ no implicit conversions. An unsuffixed literal adapts to its peer
 **"`&&` takes `bool` operands"** (Vilan has no truthiness).
 → [Values and types](../tour/values-and-types.md)
 
+**"`…` takes two values of the same type, but the operands are `…` and `…`:
+`…` is wider than what `…` admits"**
+The same rule reaching a **generic parameter** on the right of a native
+operator — `total - value`, `total & value`, `total < value`,
+`total == value` where `value: T`. An operator belongs to its LEFT
+operand: the right one has to be a *member* of what the left admits, and
+a bound can prove membership only where that set has a trait naming it.
+`i32`'s does not — `i32` compares against `i32` and nothing else, and a
+bound promises a trait's *methods*, never that the parameter **is** an
+`i32` — so no bound rescues this, and adding one is not the fix.
+Convert where the type is known and declare the operand `i32`. A native
+left operand never dispatches either: an `impl i32 with Add` is not
+consulted, because the host operator *is* the semantics there.
+→ [Values and types](../tour/values-and-types.md),
+[Data and traits](../tour/data-and-traits.md)
+
 **"`+` on `str` concatenates, and `…` has no string form: concatenating it
 renders the value's runtime shape …"**
 A value with no string form was concatenated into one. Only `str`, the
@@ -333,6 +349,12 @@ The `==`/`<` rule above, for addition: no implicit conversions between
 numeric types. An unsuffixed literal still adapts to its peer
 (`stamp + 1000` is fine for an `i53` stamp); two differently-typed
 *variables* need a suffix or an `as_*` conversion (`ratio + count.as_f64()`).
+A **generic parameter** on the right of a number's `+` is refused for a
+reason of its own — *"`T` is wider than what `i32`'s `add` accepts"* —
+and, unlike the concatenation above, **no bound fixes it**: `str`'s
+admitted set has a trait that names it (`Display`), a number's has none,
+so `T: Add` promises `T + T` and says nothing about `i32`. Convert where
+the type is known and declare the operand `i32`.
 → [Values and types](../tour/values-and-types.md)
 
 **"`+` adds numbers and concatenates `str`, and `…` is neither: it has no

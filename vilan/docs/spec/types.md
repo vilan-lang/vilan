@@ -608,15 +608,29 @@ with.
 
 A **generic parameter** admits exactly what its bounds promise, and no
 more: a declaration is checked once for all its instantiations, so the
-bounds are the whole of what the operand is known to be. An unbounded
-one promises nothing — neither a string form nor the left operand's type
-— and is one of the things "anything else" covers. A bound providing
-`to_string(self): str` promises the string form, so the parameter
-concatenates, and the concatenation *calls* that implementation at each
-instantiation: the promise is kept, not assumed. A bound promising
-something else (`T: Add`) is refused with the unbounded case, for the
-same reason. To add rather than concatenate, bound the parameter with
-the operator's own trait, or take a concrete type.
+bounds are the whole of what the operand is known to be. Whether that is
+enough is decided by the LEFT operand, because what the right one has to
+show is *membership* of the set the left admits — and a bound can show
+membership only where a trait names that set.
+
+`str`'s set has one. A bound providing `to_string(self): str` promises
+the string form, so the parameter concatenates, and the concatenation
+*calls* that implementation at each instantiation: the promise is kept,
+not assumed. An unbounded parameter promises nothing and a bound
+promising something else (`T: Add`) promises the wrong thing; both are
+refused, for the same reason.
+
+A number's set has no such trait. `i32 + i32` is the only admitted pair,
+nothing names "is an `i32`", and a bound promises a trait's *methods*
+rather than a type — `Add`'s `B` defaults to `Self`, which is the
+parameter, not the left operand. So a parameter is never an admissible
+right operand of a native operator over a number: not of `+`, and not of
+any sibling (`-`, `*`, the bit and shift operators, `==`, `<`), whatever
+it is bounded to. The same holds for `str`'s own comparisons, which want
+a `str` and have no trait naming that either. Convert where the type is
+known and declare the operand concretely. A parameter on the LEFT is a
+different question: there the bound selects an impl and the operator
+dispatches through it, which is what `T: Add` is for.
 
 ```vilan,fragment
 "n=" + count                 // str + i32 — concatenation
@@ -631,6 +645,12 @@ fun show<T>(value: T): str { "v=" + value }           // error: `T` is unbounded
 fun show<T: Add>(value: T): str { "v=" + value }      // error: no bound provides `to_string`
 fun show<T: Display>(value: T): str { "v=" + value }  // the impl is called
 fun show<T: Display>(value: T): str { i"v={value}" }  // the hole is the same expression
+```
+
+```vilan,fragment
+fun bump<T: Add>(total: i32, value: T): i32 { total + value }  // error: `T` is wider
+fun bump<T: Add>(total: i32, value: T): bool { total < value } // error: same, for `<`
+fun sum<T: Add>(first: T, second: T): T { first + second }     // the parameter is on the LEFT
 ```
 
 `is` (§3.7 level 10) tests a value against a match pattern and yields

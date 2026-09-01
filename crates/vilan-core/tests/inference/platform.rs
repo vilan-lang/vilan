@@ -5262,24 +5262,31 @@ fn a_display_bound_reached_through_a_supertrait_still_renders() {
     );
 }
 
+// --- B179: a BOUNDED generic right operand of a NATIVE operator -------------
+//
+// B169 closed the UNBOUNDED parameter on the right of `+`, B176 closed the
+// bounded one where the left operand was `str`, and the square neither covered
+// was a live miscompile: `fun bump<T: Add>(total: i32, value: T): i32
+// { total + value }` compiled, and `bump(1, Point { x = 1, y = 2 })` printed
+// `11,2` — a string, typed `i32`, from a declaration carrying a bound.
+//
+// RULED (2026-09-01): refuse. The `+` belongs to the LEFT operand, so the right
+// one must be a member of what the left's `add` accepts — and a bound can prove
+// membership only where that set is trait-characterizable. `str`'s is, which is
+// exactly why B176's render bound works. A number's is not: `i32`'s `add`
+// accepts `i32`, no trait names that set, and a bound promises a trait's
+// METHODS, never that the parameter IS `i32`. So EVERY generic right operand of
+// a numeric-left `+` refuses, whatever its bound promises — and the same
+// argument closes the rest of the native family, which had the identical hole
+// with the identical garbage. The generic LEFT operand is the other half of the
+// frame (B174) and stays open on purpose: trait defaults write
+// `self.once() + self.once()` over the trait's own parameter today.
+
 #[test]
-#[ignore = "B179: a BOUNDED generic right operand of a NATIVE numeric `+` is \
-            still admitted unchecked, and no bound can promise what that \
-            position needs — the refuse-or-admit ruling is B179's"]
 fn a_bounded_generic_added_to_a_number_is_rejected() {
-    // KNOWN BUG. B169 closed the unbounded case here and B176 closed the
-    // concatenating case for a bound; this is the square neither covers.
-    // `bump(1, Point { x = 1, y = 2 })` prints `11,2` — a string, typed as an
-    // `i32` — exactly the unbounded sibling's garbage, from a declaration that
-    // carries a bound.
-    //
-    // The concatenation could be fixed by ROUTING because a bound can promise
-    // a string form. This position cannot: a native left operand never
-    // dispatches, so the only admissible right operand is one known to BE
-    // `i32`, and `T: Add` does not say that — `Add`'s `B` defaults to `Self`,
-    // which is `T`, not the left operand's type. So the answer is a refusal,
-    // and refusing here is a ruling about what a bound on the right of a
-    // native operator may mean, not a codegen fix.
+    // The pin B179 was filed as. The bound is `Add` — the most plausible one
+    // an author would reach for, and the one the pre-ruling message actually
+    // STEERED them to ("Bound it (`<T: Add>`)"), straight into this program.
     assert_fails_spanning(
         r#"
         import std::operators::Add;
@@ -5302,6 +5309,258 @@ fn a_bounded_generic_added_to_a_number_is_rejected() {
         "#,
         "total + value",
         "the operands are `i32` and `T`",
+    );
+}
+
+#[test]
+fn a_display_bounded_generic_added_to_a_number_is_rejected() {
+    // "Whatever its bound promises" is the load-bearing half of the ruling, so
+    // it needs a bound that is NOT `Add` and that genuinely works one square
+    // over: `T: Display` is admitted on the right of a `str +` (B176 routes it
+    // through the impl) and is still refused here, because a string form is
+    // not membership of `i32`'s set either.
+    assert_fails_spanning(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun bump<T: Display>(total: i32, value: T): i32 {
+            total + value
+        }
+
+        fun main() {
+            print(bump(1, Point { x = 1, y = 2 }));
+        }
+        "#,
+        "total + value",
+        "wider than what `i32`'s `add` accepts",
+    );
+}
+
+#[test]
+fn a_compound_add_of_a_bounded_generic_into_a_number_is_rejected() {
+    // `total += value` desugars to `total = total + value` from a SECOND
+    // registration site, so the routing has to reach it separately — and it is
+    // the spelling most likely to sit in a loop. It printed the same `11,2`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Add {
+            fun add(self, other: Point): Point {
+                Point { x = self.x + other.x, y = self.y + other.y }
+            }
+        }
+
+        fun bump<T: Add>(start: i32, value: T): i32 {
+            mut total = start;
+            total += value;
+            total
+        }
+
+        fun main() {
+            print(bump(1, Point { x = 1, y = 2 }));
+        }
+        "#,
+        "total += value",
+        "wider than what `i32`'s `add` accepts",
+    );
+}
+
+#[test]
+fn a_generic_arithmetic_operand_of_a_number_is_rejected() {
+    // The arithmetic siblings. b148's SCOPE note deferred `f64 * i32` — two
+    // GROUNDED numerics, which compute a correct answer — and that stays
+    // deferred; a parameter computes no answer at all. `total - value` and
+    // `total * value` both emitted `NaN`, typed `i32`.
+    for operator in ["-", "*", "/", "%"] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct Point {{ x: i32, y: i32 }}
+
+                fun bump<T>(total: i32, value: T): i32 {{
+                    total {operator} value
+                }}
+
+                fun main() {{
+                    print(bump(1, Point {{ x = 1, y = 2 }}));
+                }}
+                "#
+            ),
+            "`T` is wider than what `i32` admits",
+        );
+    }
+}
+
+#[test]
+fn a_generic_bitwise_operand_of_a_number_is_rejected() {
+    // The bitwise/shift class, where the garbage is quietest of all: the host
+    // coerces the operand to `0`, so `total & value` was `0` and `total <<
+    // value` was `total` — plausible integers with no sign anything was wrong.
+    for operator in ["&", "|", "^", "<<", ">>"] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct Point {{ x: i32, y: i32 }}
+
+                fun bump<T>(total: i32, value: T): i32 {{
+                    total {operator} value
+                }}
+
+                fun main() {{
+                    print(bump(1, Point {{ x = 1, y = 2 }}));
+                }}
+                "#
+            ),
+            "`T` is wider than what `i32` admits",
+        );
+    }
+}
+
+#[test]
+fn a_generic_compared_against_a_number_is_rejected() {
+    // The ordering class. B24 checked these operands and its `grounded`
+    // leniency let a parameter straight through, so `total < value` emitted
+    // the host's `<` over a struct's tuple and returned a plausible `false`.
+    for operator in ["<", ">", "<=", ">="] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct Point {{ x: i32, y: i32 }}
+
+                fun ahead<T>(total: i32, value: T): bool {{
+                    total {operator} value
+                }}
+
+                fun main() {{
+                    print(ahead(1, Point {{ x = 1, y = 2 }}));
+                }}
+                "#
+            ),
+            "`T` is wider than what `i32` admits",
+        );
+    }
+}
+
+#[test]
+fn a_generic_equated_with_a_number_is_rejected() {
+    // The equality class, the same shape and the same plausible `false`.
+    for operator in ["==", "!="] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct Point {{ x: i32, y: i32 }}
+
+                fun same<T>(total: i32, value: T): bool {{
+                    total {operator} value
+                }}
+
+                fun main() {{
+                    print(same(1, Point {{ x = 1, y = 2 }}));
+                }}
+                "#
+            ),
+            "`T` is wider than what `i32` admits",
+        );
+    }
+}
+
+#[test]
+fn a_generic_equated_with_a_str_is_rejected() {
+    // `str` earns its exception for `+` ALONE: concatenation is the one native
+    // operator whose admitted set a trait can name. `==` on a `str` still
+    // wants a `str`, and nothing names that set, so the parameter is refused
+    // here exactly as against a number — `"a" == value` was `false`.
+    assert_fails_spanning(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun same<T: Display>(label: str, value: T): bool {
+            label == value
+        }
+
+        fun main() {
+            print(same("a", Point { x = 1, y = 2 }));
+        }
+        "#,
+        "label == value",
+        "`T` is wider than what `str` admits",
+    );
+}
+
+#[test]
+fn a_bounded_generic_concatenated_after_a_str_still_renders() {
+    // The exception the whole ruling turns on, guarded from the other side:
+    // closing the numeric square must not close B176's. `str`'s admitted set
+    // IS trait-characterizable, the render bound proves membership, and the
+    // operand still routes through the impl at each monomorphization.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun show<T: Display>(value: T): str {
+            "v=" + value
+        }
+
+        fun main() {
+            print(show(Point { x = 1, y = 2 }));
+            print(show(5));
+        }
+        "#,
+        "v=(1, 2)\nv=5\n",
+    );
+}
+
+#[test]
+fn the_conversion_steer_for_a_generic_numeric_operand_compiles_and_runs() {
+    // The refusal names two spellings and the first one has to work, or the
+    // rule leaves a numeric helper with no legal way to take a foreign value:
+    // convert where the type is KNOWN, and declare the operand `i32`.
+    assert_compiles_and_runs(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        impl Point {
+            fun magnitude(self): i32 {
+                self.x + self.y
+            }
+        }
+
+        fun bump(total: i32, value: i32): i32 {
+            total + value
+        }
+
+        fun main() {
+            print(bump(1, Point { x = 1, y = 2 }.magnitude()));
+        }
+        "#,
+        "4\n",
     );
 }
 
@@ -5435,8 +5694,10 @@ fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
     // subject_dispatches` is exactly that shape, and refusing here refuses it.
     // Closing this is a bound requirement on every such declaration, the
     // breaking generics change b148's SCOPE note deferred; the sibling on the
-    // RIGHT side (B169) is narrower and IS closed, because there the left
-    // operand is already a grounded native whose semantics are known.
+    // RIGHT side is narrower and IS closed — B169 for the unbounded parameter,
+    // B179 for the bounded one and for the rest of the native family — because
+    // there the left operand is already a grounded native whose semantics are
+    // known, and the question is only whether the right one is a member.
     assert_fails_spanning(
         r#"
         fun bump<T>(value: T): T {
