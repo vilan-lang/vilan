@@ -4847,6 +4847,282 @@ fn an_unbounded_generic_concatenated_into_a_string_is_rejected() {
     );
 }
 
+// --- B170: `+` skipped its check when the LEFT operand was non-nominal -------
+//
+// B148 closed the hole for a NATIVE left operand and the dispatch loop's own
+// guard kept it open from the other side: the loop `continue`d unless the left
+// operand was a `Struct` or an `Enum`, so a tuple, an array, a closure, a
+// function reference, `void` and an unbounded generic reached neither the
+// admitted set above nor the no-`Add` refusal below. The old anything-goes
+// emission survived for exactly those shapes — `(1, 2) + 1` printed `1,21`
+// (b148's own miscompile, entered from the left), `nothing() + 1` was `NaN`,
+// a closure concatenated its SOURCE TEXT, and `let v = if false { 1 }; v + 1`
+// printed a plausible wrong `1`.
+//
+// `+`'s admitted set is now reached by every left-operand SHAPE. The guard
+// still exists, but it only decides whether an IMPL could be found — not
+// whether the check runs — so a non-nominal operand with a real
+// `impl (i32, i32) with Add` dispatches, and one without is refused by name.
+
+#[test]
+fn a_tuple_left_operand_of_addition_is_rejected() {
+    // The exact mirror of `a_tuple_concatenated_into_a_string_is_rejected`:
+    // the same runtime garbage, entered from the left.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let pair = (1, 2);
+            let _sum = pair + 1;
+        }
+        "#,
+        "pair + 1",
+        "`(i32, i32)` is neither: it has no `Add`",
+    );
+}
+
+#[test]
+fn a_void_left_operand_of_addition_is_rejected() {
+    // `nothing() + 1` was `NaN`. `void` gets its own reason: there is no
+    // value to add, and no impl to write either.
+    assert_fails_spanning(
+        r#"
+        fun nothing() {}
+
+        fun main() {
+            let _sum = nothing() + 1;
+        }
+        "#,
+        "nothing() + 1",
+        "this operand is `void`",
+    );
+}
+
+#[test]
+fn a_valueless_if_left_operand_of_addition_is_rejected() {
+    // The shape that reads as working code: an `if` with no `else` produces
+    // no value, so `v + 1` printed `1` — a plausible wrong answer rather
+    // than a visible `NaN`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let v = if false { 1 };
+            let _sum = v + 1;
+        }
+        "#,
+        "v + 1",
+        "this operand is `void`",
+    );
+}
+
+#[test]
+fn a_closure_left_operand_of_addition_is_rejected() {
+    // The right side has refused this since B148
+    // (`a_closure_or_function_reference_concatenated_into_a_string_is_rejected`);
+    // from the left it concatenated the closure's SOURCE TEXT.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let f = |n: i32| n + 1;
+            let _text = f + "!";
+        }
+        "#,
+        r#"f + "!""#,
+        "`|i32| i32` is neither: it has no `Add`",
+    );
+}
+
+#[test]
+fn a_fixed_array_left_operand_of_addition_is_rejected() {
+    // `List` is a struct and was already refused; a fixed array is not, and
+    // lowers to the same JS array, so it rendered the same comma-joined shape.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let a: [i32; 2] = [ 1, 2 ];
+            let _sum = a + 1;
+        }
+        "#,
+        "a + 1",
+        "`[i32; 2]` is neither: it has no `Add`",
+    );
+}
+
+#[test]
+fn a_function_reference_left_operand_of_addition_is_rejected() {
+    assert_fails_with(
+        r#"
+        fun helper(n: i32): i32 { n }
+
+        fun main() {
+            let _text = helper + 1;
+        }
+        "#,
+        "is neither: it has no `Add`",
+    );
+}
+
+#[test]
+#[ignore = "B170 residual: an unbounded generic LEFT operand still escapes the check"]
+fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
+    // KNOWN BUG, and the one left-operand shape the fix deliberately did not
+    // take. The declaration is checked once for all instantiations and an
+    // unbounded `T` promises nothing, so `bump(Point { … })` emits `value + 1`
+    // and the host concatenates the struct's tuple.
+    //
+    // The census says why it stays: a trait default body over the trait's own
+    // parameter is written unbounded today and computes correct answers for
+    // every numeric instantiation — `macros::an_inherited_default_on_a_generic_
+    // subject_dispatches` is exactly that shape, and refusing here refuses it.
+    // Closing this is a bound requirement on every such declaration, the
+    // breaking generics change b148's SCOPE note deferred; the sibling on the
+    // RIGHT side (B169) is narrower and IS closed, because there the left
+    // operand is already a grounded native whose semantics are known.
+    assert_fails_spanning(
+        r#"
+        fun bump<T>(value: T): T {
+            value + 1
+        }
+
+        fun main() {
+            let _n = bump(5);
+        }
+        "#,
+        "value + 1",
+        "`T` is neither: it has no `Add`",
+    );
+}
+
+#[test]
+fn a_bounded_generic_left_operand_of_addition_still_dispatches() {
+    // The escape hatch the refusal steers to has to work, or the rule would
+    // have no legal spelling.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        fun bump<T: Add>(value: T, one: T): T {
+            value + one
+        }
+
+        fun main() {
+            print(bump(5, 1));
+            print(bump(1.5, 2.5));
+        }
+        "#,
+        "6\n4\n",
+    );
+}
+
+#[test]
+fn a_tuple_left_operand_of_the_sibling_operators_is_rejected() {
+    // The guard gated the whole loop, not just `+`, so every operator that
+    // models a trait skipped its no-impl refusal for these shapes and emitted
+    // the host's: `(1, 2) == (1, 2)` was `false` (JS compares references),
+    // `(1, 2) < (1, 3)` was `true` (JS compares `"1,2" < "1,3"`), and
+    // `(1, 2) - 1` was `NaN`.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _same = (1, 2) == (1, 2);
+        }
+        "#,
+        "type '(i32, i32)' does not implement the `PartialEq` operator",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _ordered = (1, 2) < (1, 3);
+        }
+        "#,
+        "type '(i32, i32)' does not implement the `PartialOrd` operator",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _difference = (1, 2) - 1;
+        }
+        "#,
+        "type '(i32, i32)' does not implement the `Sub` operator",
+    );
+}
+
+#[test]
+fn a_void_or_function_operand_is_refused_without_impl_advice() {
+    // A refusal is worth what the reader can do with it, and "add
+    // `impl void with PartialEq`" is not something anyone can write. `void`
+    // and a function value get the reason instead; a tuple and an array,
+    // whose impls DO resolve, keep the standard advice above.
+    assert_fails_with(
+        r#"
+        fun nothing() {}
+
+        fun main() {
+            let _same = nothing() == nothing();
+        }
+        "#,
+        "`==` needs a value on the left, and this operand is `void`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let f = |n: i32| n;
+            let _same = f == f;
+        }
+        "#,
+        "a function value has no `PartialEq`, and none can be written for one",
+    );
+}
+
+#[test]
+fn a_tuple_with_its_own_partial_eq_impl_dispatches() {
+    // Proof the advice the tuple refusal gives is advice that works — and
+    // that the fix routes the shape through the impl LOOKUP, not just
+    // through a refusal.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+
+        impl (i32, i32) with PartialEq {
+            fun eq(self, b: (i32, i32)): bool {
+                self.0 == b.0 && self.1 == b.1
+            }
+        }
+
+        fun main() {
+            print((1, 2) == (1, 2));
+            print((1, 2) == (1, 3));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn a_tuple_with_its_own_add_impl_dispatches() {
+    // The guard used to skip the DISPATCH too, so an `impl` on a non-nominal
+    // subject resolved and then never ran: `(1, 2) + 1` emitted native `+`
+    // and produced the string `"1,21"`. Routing the shape through the check
+    // routes it through the impl lookup as well.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        impl (i32, i32) with Add<i32> {
+            fun add(self, b: i32): (i32, i32) {
+                (self.0 + b, self.1 + b)
+            }
+        }
+
+        fun main() {
+            let t = (1, 2) + 1;
+            print(t.0);
+            print(t.1);
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
 // --- §J.3: module-level initializers cannot await ----------------------------
 //
 // Initializers run at module load — no enclosing function to become async,

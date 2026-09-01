@@ -32774,10 +32774,55 @@ impl<'src> Analyzer<'src> {
                             GenericDispatch::OnConstraint(constraint_id, method_name),
                         );
                     }
+                    // An UNBOUNDED parameter on the left still falls through
+                    // to the native emission, and B170's census says why that
+                    // stays: a trait default body over the trait's OWN
+                    // parameter (`trait Doubler<T> { fun twice(self): T {
+                    // self.once() + self.once() } }`) is written unbounded
+                    // today and computes correct answers for every numeric
+                    // instantiation. Refusing it is a bound requirement on
+                    // every such declaration — the breaking generics change
+                    // b148's SCOPE note deferred, not this miscompile fix —
+                    // so it is pinned `#[ignore]`d as B170's residual instead.
                 }
                 continue;
             }
-            if !matches!(lhs_type, Type::Struct(_, _) | Type::Enum(_, _)) {
+            // B170: the left operand's SHAPE used to decide whether the loop
+            // looked for an impl at all — it `continue`d unless the operand
+            // was a `Struct` or an `Enum` — so `void`, tuples, arrays,
+            // closures and function references reached neither `+`'s admitted
+            // set above nor the no-impl refusal below, and the anything-goes
+            // native emission survived for exactly those shapes: `(1, 2) + 1`
+            // printed `1,21` (b148's own miscompile, entered from the left),
+            // `nothing() + 1` was `NaN`, and a closure concatenated its source
+            // text. Being non-nominal is not a reason to skip the check; it is
+            // only a reason for the lookup to come back empty — and it need
+            // not even do that, since an `impl (i32, i32) with Add` resolved
+            // fine and was simply never reached.
+            //
+            // The shapes that still skip are the ones with no verdict to give:
+            // `Any` absorbs and `Never` is unreachable (neither is a claim
+            // about a runtime value), `Unknown`/`Unresolved` have not settled,
+            // `Mapped` is still symbolic, and a `Module` is not a value —
+            // naming one as an operand is already someone else's diagnostic.
+            //
+            // `Trait` skips for a reason of its own, and a census found it:
+            // std's `List<T: Add + Default>::sum` writes `mut total =
+            // T::default()`, and the multi-bound `T::default()` infers as the
+            // BOUND (`Default`) rather than as `T`, so `total += item` arrives
+            // here with a trait-typed left operand. Judging it would refuse
+            // std's own `sum`/`product` over an inference wart in a different
+            // subsystem, so the shape is left as it was and filed instead.
+            if matches!(
+                lhs_type,
+                Type::Any
+                    | Type::Never
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Module(_)
+                    | Type::Mapped(_, _, _)
+                    | Type::Trait(_, _)
+            ) {
                 continue;
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
@@ -32848,17 +32893,71 @@ impl<'src> Analyzer<'src> {
                 // native JS, so skip them; any other type genuinely needs the impl.
                 if !self.is_native_operator_type(&lhs_type) {
                     let type_name = match &lhs_type {
-                        Type::Struct(id, _) => self.structs.get(id).map(|s| s.name),
-                        Type::Enum(id, _) => self.enums.get(id).map(|e| e.name),
-                        _ => None,
+                        Type::Struct(id, _) => self.structs.get(id).map(|s| s.name.to_string()),
+                        Type::Enum(id, _) => self.enums.get(id).map(|e| e.name.to_string()),
+                        // B170: a non-nominal operand has no declaration to
+                        // name, but it does have a spelling — and a refusal
+                        // that cannot say WHICH operand it means is barely a
+                        // refusal. `pretty_print_type` gives `(i32, i32)`,
+                        // `[i32; 2]`, `|i32| i32`, `void`.
+                        _ => Some(self.pretty_print_type(&lhs_type, &HashMap::default())),
                     }
-                    .unwrap_or("value");
+                    .unwrap_or_else(|| "value".to_string());
                     // Advise the trait's REQUIRED method — the operator method
                     // is usually an inherited default over it.
                     let required = if trait_name == "PartialOrd" {
                         "partial_compare"
                     } else {
                         method_name
+                    };
+                    // B170: the refusal a non-nominal operand gets has to be
+                    // one it can act on, and "add `impl void with PartialEq`"
+                    // is not — `void` and a function value have no subject an
+                    // impl can name. A tuple and an array DO (`impl (i32, i32)
+                    // with PartialEq` resolves and dispatches), so those keep
+                    // the standard advice alongside the struct/enum operands.
+                    let msg = match (&lhs_type, op) {
+                        // `+` states its admitted pairs rather than reading
+                        // them off an impl (spec §5.7), so on a non-nominal
+                        // operand it says what the pairs ARE — the sentence
+                        // `bool` and a backed enum already get.
+                        (Type::Void, BinaryOp::Add) => {
+                            "`+` adds numbers and concatenates `str`, and this operand is `void`: \
+                             the expression it comes from produces no value — a function that \
+                             returns nothing, an `if` with no `else`, a statement — so there is \
+                             nothing to add"
+                                .to_string()
+                        }
+                        (
+                            Type::Closure(_, _)
+                            | Type::Function(_)
+                            | Type::Tuple(_)
+                            | Type::Array(_, _),
+                            BinaryOp::Add,
+                        ) => {
+                            format!(
+                                "`+` adds numbers and concatenates `str`, and `{type_name}` is \
+                                 neither: it has no `Add`, so the host would render the value's \
+                                 runtime shape instead — a tuple and an array as their \
+                                 comma-joined elements, a closure as its source text. Only a \
+                                 `str` LEFT operand concatenates: put the string first, having \
+                                 rendered this one with `.to_string()`"
+                            )
+                        }
+                        (Type::Void, _) => format!(
+                            "`{symbol}` needs a value on the left, and this operand is `void`: the \
+                             expression it comes from produces no value — a function that returns \
+                             nothing, an `if` with no `else`, a statement"
+                        ),
+                        (Type::Closure(_, _) | Type::Function(_), _) => format!(
+                            "`{symbol}` models `{trait_name}`, and `{type_name}` does not \
+                             implement it: a function value has no `{trait_name}`, and none can \
+                             be written for one — the host would have compared references instead"
+                        ),
+                        _ => format!(
+                            "type '{type_name}' does not implement the `{trait_name}` operator; \
+                             add `impl {type_name} with {trait_name}` providing `{required}`"
+                        ),
                     };
                     // Anchored, not bare-pushed (E82): in a module the refusal
                     // belongs to the module's file, and in DERIVED code (a
@@ -32872,10 +32971,7 @@ impl<'src> Analyzer<'src> {
                             trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "type '{type_name}' does not implement the `{trait_name}` operator; \
-                                 add `impl {type_name} with {trait_name}` providing `{required}`"
-                            ),
+                            msg,
                         },
                         binary_id,
                     );

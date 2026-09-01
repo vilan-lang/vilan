@@ -487,6 +487,12 @@ right operand (default `Self`); the result type is the impl's (for the
 arithmetic traits, `Self`). Compound assignment `x op= e` is exactly
 `x = x op e` with `x`'s place evaluated once.
 
+The left operand's *shape* does not enter into it. A tuple or an array
+is an impl subject like any other (`impl (i32, i32) with PartialEq`),
+and one without the impl is the same error a struct without it is — the
+operators are never the host's. `void` is refused outright: an
+expression that produces no value has no operand to be.
+
 The primitives do not dispatch — native machine operators *are* their
 semantics — so their admitted operand pairs are stated rather than read
 off an impl. For `+` those pairs are exactly two:
