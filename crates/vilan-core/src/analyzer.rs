@@ -18054,6 +18054,43 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// A35, the SHADOWED twin of [`Analyzer::element_view_import_note`]: the
+    /// element desugar's callee is a bare `view`, so a user item of that name
+    /// captures it, and every `<tag />` in the file then reports
+    /// `` `view` expects 0 arguments, but got 1 instead `` against the element —
+    /// a message about an arity nobody wrote, with the shadowing item shown only
+    /// as "declared here". Any generator over an external name set walks into
+    /// this (lucide ships an icon called `view`); RULED 2026-09-01 to be named
+    /// in the diagnostic rather than fixed by making the desugar hygienic —
+    /// shadowing a name is a ruled feature, and this is a curated message for
+    /// the one name where the shadow is invisible in the source.
+    ///
+    /// Same detection as the absent case: the SUBJECT's span is markup — it
+    /// starts with `<`, a span only the element desugar gives an accessor — so
+    /// a hand-written `view(..)` call, whose subject span is the ident, keeps
+    /// the ordinary arity message. `None` for everything else, including a
+    /// `view` that resolved to std's own (which takes its argument and never
+    /// reaches an arity failure).
+    fn element_view_shadow_message(&self, subject_id: Id, callee_id: Id) -> Option<String> {
+        if self.functions.get(&callee_id)?.name != "view" {
+            return None;
+        }
+        let span = **self.span_map.get(&subject_id)?;
+        let source = self.source_of_id(subject_id).unwrap_or(SourceId(0));
+        if !self
+            .source_text(source)?
+            .get(span.into_range())?
+            .starts_with('<')
+        {
+            return None;
+        }
+        Some(
+            "element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` \
+             — rename it, or write this element as its lowered call, `ui::view(…)`"
+                .to_string(),
+        )
+    }
+
     /// A `css { … }` block lowers to `std::style::style` (css-block.md §5.1,
     /// S4): an unresolved `style` whose span is the `css` KEYWORD — the one
     /// span the block's desugar gives a generated accessor on purpose, so the
@@ -27330,15 +27367,23 @@ impl<'src> Analyzer<'src> {
                         None => argument_ids,
                     };
                     if argument_ids.len() != parameters.len() {
+                        // A35: the one arity failure whose count is nobody's
+                        // mistake — the element desugar's `view` captured by a
+                        // user item — gets a message about the capture instead.
+                        let msg = self
+                            .element_view_shadow_message(subject_id, function_id)
+                            .unwrap_or_else(|| {
+                                self.argument_count_message(
+                                    self.callable_name(function_id),
+                                    &parameters,
+                                    argument_ids.len(),
+                                )
+                            });
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: self.declared_here_note(function_id),
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
-                            msg: self.argument_count_message(
-                                self.callable_name(function_id),
-                                &parameters,
-                                argument_ids.len(),
-                            ),
+                            msg,
                         });
                         return Resolution::Failed;
                     }

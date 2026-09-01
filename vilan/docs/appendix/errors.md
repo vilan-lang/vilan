@@ -760,6 +760,21 @@ declares reports exactly like your entry's modules — the read anchors
 at itself, in the member's file.)
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
 
+**"element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` …"**
+`<tag />` is sugar for a `view("tag")` call, and something in this file
+declares its own `view`, which captured the callee — so every element in
+the file resolves to your function instead of the library's. Shadowing a
+name is allowed on purpose, and the desugar's callee is an ordinary name
+like any other; what this message exists for is that the capture is
+*invisible* in the element, which otherwise reports an argument count
+nobody wrote. Two ways out: rename your `view` (what a generator over an
+external name set should do — `lucide` ships an icon called `view`), or
+write the element as the call it lowers to, `ui::view(…)`, whose
+qualified path no local name can capture. If the message you got instead
+is `cannot find 'view' in this scope`, nothing is shadowing — you just
+need `import std::ui::{ view, View };`.
+→ [Building UI](../guide/ui.md)
+
 **"`…` reads context `…`, so it can't be used as a value"**
 A function that reads an ambient context (like the current owner) can't
 be passed around as a plain closure: the context channel would be

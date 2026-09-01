@@ -2142,6 +2142,109 @@ fn an_element_without_view_in_scope_fails_at_the_element_head() {
     );
 }
 
+// --- A35: the element desugar's `view`, SHADOWED --------------------------
+//
+// The desugar's callee is a bare `view`, so a user item of that name captures
+// it. lucide ships an icon called `view`, its generated `fun view(): View`
+// silently took over, and every `<tag />` in the file reported
+// `` `view` expects 0 arguments, but got 1 instead `` against the ELEMENT — an
+// arity nobody wrote, with the shadowing item shown only as "declared here".
+// RULED 2026-09-01: name it in the diagnostic. The desugar stays capturable
+// (shadowing a name is a ruled feature; `an_explicit_import_shadows_a_prelude_
+// name_silently` is the neighbouring pin), so this is a message, not hygiene.
+
+#[test]
+fn a35_a_shadowed_element_view_names_the_shadow_instead_of_an_arity() {
+    assert_fails_spanning(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "div",
+        "element syntax lowers to `std::ui::view`, and `view` here is your own `fun view`",
+    );
+}
+
+#[test]
+fn a35_the_shadowed_steer_names_both_ways_out() {
+    // Renaming, or writing the element as the call it lowers to. Neither is
+    // guessable from `` `view` expects 0 arguments ``, which is why the
+    // curated message exists at all.
+    assert_fails_with(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "rename it, or write this element as its lowered call, `ui::view(…)`",
+    );
+}
+
+#[test]
+fn a35_the_shadowed_message_still_points_at_the_declaration() {
+    // The C3 note is what makes "your own `fun view`" actionable: it is the
+    // site. It was already there; the primary is what changed.
+    assert_fails_noting(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "element syntax lowers to `std::ui::view`",
+        // The first `view` in the source is the declaration's own name span,
+        // which is where the C3 note lands.
+        "view",
+        "`view` is declared here",
+    );
+}
+
+#[test]
+fn a35_a_hand_written_view_call_keeps_the_ordinary_arity_message() {
+    // The control the detection rests on: element origin is the SUBJECT's
+    // markup span (it starts with `<`), so a `view(..)` the author actually
+    // typed — whose subject span is the ident — is an ordinary arity mistake
+    // and must not be told about element syntax it never used.
+    assert_fails_with(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = view(1);
+        }
+        "#,
+        "`view` expects 0 arguments, but got 1 instead",
+    );
+    assert_fails_without(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = view(1);
+        }
+        "#,
+        "element syntax lowers to",
+    );
+}
+
+#[test]
+fn a35_the_absent_case_still_gets_the_import_steer() {
+    // The two arms are twins and must not collapse into one: with no `view` in
+    // scope at all there is nothing to name as a shadow, and the answer is the
+    // import.
+    assert_fails_noting(
+        r#"
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "cannot find 'view' in this scope",
+        "<div",
+        "element syntax lowers to std::ui::view; add",
+    );
+}
+
 #[test]
 fn an_element_text_attribute_warns_toward_the_content_method() {
     // Element-syntax S4: `text(…)` undotted in a head is an attribute — the

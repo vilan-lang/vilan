@@ -370,3 +370,4 @@ row	flagship	key
 344	-	std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history
 345	flagship	`{symbol}` takes two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what `{lhs_label}` admits
 346	flagship	`main` takes no parameters: the shell owns what is passed to a program, so nothing can call the entry with arguments — read them with `std::process::args()`, which hands back the argument tail as a `List<str>`
+347	flagship	element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` — rename it, or write this element as its lowered call, `ui::view(…)`
