@@ -348,14 +348,14 @@ import std::http::{ Response, Server };
 import std::json::json_codec;
 import std::print;
 import std::process;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::rpc_server::Service;
 import std::shared::Shared;
 import std::time::sleep;
 
 [service(SoakClient)]
 struct Counter {
-	[expose] total: Signal<i32>,
+	[expose] total: SignalCell<i32>,
 	calls: Shared<i32>,
 }
 

@@ -5,7 +5,7 @@
 // `Source` and keep one DOM property in sync — each is an `effect`, so when
 // the source changes only that property updates, with no re-render.
 //
-// A READ-ONLY binding demands only `Source<T>`, never the concrete `Signal<T>`
+// A READ-ONLY binding demands only `Source<T>`, never the concrete `SignalCell<T>`
 // (A33): a binding that never writes its argument has no business insisting on
 // the writable type, and a user's own `Source` — a storage-backed cell, a
 // `RemoteSource`, any custom mirror — drives them exactly like a signal.
@@ -46,6 +46,7 @@ import pkg::reactive::{
 	Owner,
 	RowStep,
 	Signal,
+	SignalCell,
 	Source,
 	comp,
 	get_owner,
@@ -162,7 +163,7 @@ impl View {
 	}
 
 	/// An attribute. The value's TYPE decides its life
-	/// (proposal/element-syntax.md §5): a `str` sets once; a `Signal<str>`
+	/// (proposal/element-syntax.md §5): a `str` sets once; a `SignalCell<str>`
 	/// re-sets whenever it changes, exactly `bind_attr`. Anything `AttrValue`
 	/// fills the slot.
 	fun attr<V: AttrValue>(self, name: str, value: V): View {
@@ -192,7 +193,7 @@ impl View {
 
 	/// Append content — structure only, no ownership bookkeeping. Anything
 	/// `Slot` fills a child position (proposal/element-syntax.md §5): a `View`
-	/// appends as an element, a `str` as a text node, a `Signal<str>` as a
+	/// appends as an element, a `str` as a text node, a `SignalCell<str>` as a
 	/// text node kept in sync, a `List<View>` appends each. Text and element
 	/// children interleave as real siblings — mixed content without wrapper
 	/// spans.
@@ -255,18 +256,17 @@ impl View {
 	/// Two-way bind an `<input>`'s value to a signal: the input shows the
 	/// signal, and typing writes it back.
 	///
-	/// CONCRETE `Signal`, deliberately (A33): this binding WRITES — the read
-	/// half would take a `Source<str>` like every other, but the write-back
-	/// half needs `set`, which `Source` does not declare. Widening it waits on
-	/// the write-side ruling (A32); until then a custom source drives every
-	/// read-only binding and this one asks for a signal.
+	/// Bounded on `Signal<str>`, the WRITABLE trait (A32): this binding writes,
+	/// so `Source` — which declares `get`/`sub` and no `set` — is not enough,
+	/// and the concrete cell is more than it needs. Any impl satisfies it: a
+	/// cell that clamps its setter, one that persists, one that debounces.
 	///
 	/// The listener reaches NO element (`proposal/lifetimes.md` §5, V3), which
 	/// takes both halves of `write_back_value`'s note: the typed text comes off
 	/// the EVENT, and the listener is created in a scope that never held an
 	/// element. What survives an unmount is then element → listener → signal,
 	/// with nothing pointing back.
-	fun bind_value(self, signal: Signal<str>): View {
+	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		let element = self.element;
 		signal.effect(|value| {
 			element.set_value(value);
@@ -503,7 +503,7 @@ impl View {
 		source: S,
 		render: (sync |T| View) context owner_scope,
 	): View {
-		let gated: Signal<T> = Signal::new(source.get());
+		let gated: SignalCell<T> = SignalCell::new(source.get());
 		let wired: Shared<bool> = Shared::new(false);
 		let generation: Shared<i32> = Shared::new(0);
 		let advance = |value: T| {
@@ -567,7 +567,7 @@ impl View {
 
 /// The write-back half of `bind_value`. Each input event's write is a boundary
 /// dispatch, so it settles in its own turn.
-fun write_back_value(element: Element, signal: Signal<str>) {
+fun write_back_value<S: Signal<str>>(element: Element, signal: S) {
 	element.on_event("input", |event| turn(FlushPolicy::AtSuspension, || {
 		signal.set(event.target_value());
 	}));
@@ -584,12 +584,12 @@ fun write_back_draft(element: Element, draft: Draft<str>) {
 /// True while a route chunk is in flight (proposal/bundle-splitting.md §2) —
 /// the one hook a loading indicator needs. Re-exported as
 /// `std::router::pending`, which is where an app reads it.
-let chunk_pending_signal: Signal<bool> = Signal::new(false);
+let chunk_pending_signal: SignalCell<bool> = SignalCell::new(false);
 
 /// Why the last route chunk fetch failed, or `None` (§S3). Re-exported as
 /// `std::router::chunk_error`. Cleared when the next navigation starts, so a
 /// view bound to it shows the failure exactly until something is retried.
-let chunk_error_signal: Signal<Option<str>> = Signal::new(None);
+let chunk_error_signal: SignalCell<Option<str>> = SignalCell::new(None);
 
 /// The route arm a value selects. See `swap_split`.
 [extern("__chunk_arm", retains)]
@@ -626,12 +626,12 @@ fun chunk_preload<T: PartialEq, S: Source<T>>(source: S) {
 }
 
 /// True while a route chunk is being fetched.
-fun chunk_pending(): Signal<bool> {
+fun chunk_pending(): SignalCell<bool> {
 	chunk_pending_signal
 }
 
 /// Why the last route chunk fetch failed, or `None`.
-fun chunk_failure(): Signal<Option<str>> {
+fun chunk_failure(): SignalCell<Option<str>> {
 	chunk_error_signal
 }
 
@@ -657,7 +657,7 @@ fun clear_chunk_error() {
 /// static-vs-tracked distinction, and ordinary trait dispatch decides what
 /// lands in the DOM.
 ///
-/// The tracked arm is `Signal<str>` and not `Source<str>` — DEFERRED, not an
+/// The tracked arm is `SignalCell<str>` and not `Source<str>` — DEFERRED, not an
 /// oversight (A33). `bind_text` and friends widened to a `Source` BOUND, which
 /// is an ordinary generic parameter; the trait arms here would have to widen to
 /// a BLANKET impl (`impl S: Source<str> with Slot`), and that machinery is
@@ -682,10 +682,15 @@ impl str with Slot {
 	}
 }
 
-/// A reactive text node — re-set whenever the signal changes: `bind_text`
+/// A reactive text node — re-set whenever the source changes: `bind_text`
 /// scoped to one node instead of the whole element. Registers with the
 /// nearest enclosing boundary, like every binding.
-impl Signal<str> with Slot {
+///
+/// A BLANKET over the read trait (B158/B165): every `Source<str>` places
+/// reactively — a cell, a derived signal, a `RemoteSource`, a user's own
+/// mirror — and `str`'s own impl outranks it by the specificity order wherever
+/// both would match.
+impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		let node = create_text_node("");
 		parent.element.append_text(node);
@@ -707,8 +712,8 @@ impl List<View> with Slot {
 /// Something that can fill an attribute value (proposal/element-syntax.md §5).
 /// This is what `<div name(value)>` desugars through — element syntax builds
 /// `.attr(name, value)`, never `.bind_attr` — so the arms below are exactly the
-/// element-syntax attribute vocabulary. Widening the tracked arm past
-/// `Signal<str>` is the blanket-impl question deferred to B158 (see `Slot`).
+/// element-syntax attribute vocabulary. The tracked arm is a BLANKET over
+/// `Source<str>` (B158/B165), so any reactive value fills an attribute.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 trait AttrValue {
 	fun apply(self, parent: View, name: str);
@@ -721,8 +726,8 @@ impl str with AttrValue {
 	}
 }
 
-/// Set and track — exactly `bind_attr`.
-impl Signal<str> with AttrValue {
+/// Set and track — exactly `bind_attr`, for every `Source<str>`.
+impl type S: Source<str> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		let element = parent.element;
 		self.effect(|value| {

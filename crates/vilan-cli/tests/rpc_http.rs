@@ -281,7 +281,7 @@ import std::time::sleep;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 import std::json::{ Json, FromJson, json_codec };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::rpc::{
 	HttpTransport, connect_split, bridge,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
@@ -295,7 +295,7 @@ let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 [service(Client)]
 struct Board {
-	count: Signal<i32>,
+	count: SignalCell<i32>,
 }
 
 impl Board {
@@ -407,7 +407,7 @@ import std::shared::Shared;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 import std::json::{ Json, FromJson, json_codec };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::rpc::{ ReactiveServer, DuplexEnd };
 import std::http::{ Response, Server };
 import std::rpc_server::Service;
@@ -416,7 +416,7 @@ let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 [service(Client)]
 struct Board {
-	count: Signal<i32>,
+	count: SignalCell<i32>,
 }
 
 impl Board {
@@ -594,7 +594,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::io::panic;
 import std::json::{ Json, FromJson, json_codec };
 import std::wire::Serializer;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::rpc::{
 	HttpTransport, connect_socket, bridge, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
@@ -606,7 +606,7 @@ let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 [service(Client)]
 struct Board {
-	count: Signal<i32>,
+	count: SignalCell<i32>,
 }
 
 impl Board {
@@ -724,7 +724,7 @@ import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 import std::io::panic;
 import std::json::{ Json, FromJson, json_codec };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::rpc::{
 	connect_socket, bridge, SocketTransport, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
@@ -736,7 +736,7 @@ let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 [service(Client)]
 struct Board {
-	count: Signal<i32>,
+	count: SignalCell<i32>,
 }
 
 impl Board {
@@ -868,7 +868,7 @@ import std::result::Result::{ self, Ok, Err };
 import std::io::panic;
 import std::json::{ Json, FromJson };
 import std::binary::binary_codec;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::rpc::{
 	connect_socket, bridge, SocketTransport, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
@@ -880,7 +880,7 @@ let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 [service(Client)]
 struct Board {
-	count: Signal<i32>,
+	count: SignalCell<i32>,
 }
 
 impl Board {

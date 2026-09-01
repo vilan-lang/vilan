@@ -92,7 +92,7 @@ is the second protocol, a sibling to RPC over a duplex transport:
 - The client holds a typed `RemoteSource<i32>` (the read-only half of the
   reactive split: client code can't write a server signal; `get`/`sub` only,
   no `set`). Its `sub` opens the channel and observes a local mirror
-  (`Signal<Option<i32>>`, `None` until the first update) that inbound `Update`
+  (`SignalCell<Option<i32>>`, `None` until the first update) that inbound `Update`
   frames keep in sync; `count = 0` is the current value, delivered on
   subscribe, then `1` and `2` as the server `set`s it. The observer receives
   decoded values, never wire text.

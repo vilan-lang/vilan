@@ -1197,7 +1197,7 @@ fn a25_disposing_the_last_remote_subscription_sends_unsubscribe() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
 
@@ -1221,7 +1221,7 @@ fn a25_disposing_the_last_remote_subscription_sends_unsubscribe() {
                 spy_client.send(frame);
             });
 
-            let counter: Signal<i32> = Signal::new(0);
+            let counter: SignalCell<i32> = Signal::new(0);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1253,12 +1253,12 @@ fn a25_a_second_watcher_opens_no_second_server_forward() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let counter: Signal<i32> = Signal::new(0);
+            let counter: SignalCell<i32> = Signal::new(0);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1292,7 +1292,7 @@ fn a25_a_second_subscribe_frame_opens_no_second_forward() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveServer, duplex_pair, encode_control };
         import std::wire::Frame;
 
@@ -1305,7 +1305,7 @@ fn a25_a_second_subscribe_frame_opens_no_second_forward() {
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let counter: Signal<i32> = Signal::new(0);
+            let counter: SignalCell<i32> = Signal::new(0);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             client_end.on_frame(|frame| print(i"down {text_of(frame)}"));
             client_end.send(encode_control(json_codec(), "Subscribe", channel));
@@ -1335,7 +1335,7 @@ fn a25_a_same_turn_resubscribe_cancels_the_pending_unsubscribe() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
 
@@ -1358,7 +1358,7 @@ fn a25_a_same_turn_resubscribe_cancels_the_pending_unsubscribe() {
                 spy_client.send(frame);
             });
 
-            let counter: Signal<i32> = Signal::new(0);
+            let counter: SignalCell<i32> = Signal::new(0);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1395,7 +1395,7 @@ fn a25_a_pending_unsubscribe_does_not_cross_a_rebind() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair, encode_control };
         import std::wire::Frame;
 
@@ -1418,7 +1418,7 @@ fn a25_a_pending_unsubscribe_does_not_cross_a_rebind() {
                 spy_client.send(frame);
             });
 
-            let counter: Signal<i32> = Signal::new(0);
+            let counter: SignalCell<i32> = Signal::new(0);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1453,7 +1453,7 @@ fn a25_a_counted_subscription_releases_its_lease_once() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::{ Owner, Signal };
+        import std::reactive::{ Owner, Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
 
@@ -1473,7 +1473,7 @@ fn a25_a_counted_subscription_releases_its_lease_once() {
             });
             spy_server.on_frame(|frame| spy_client.send(frame));
 
-            let counter: Signal<i32> = Signal::new(0);
+            let counter: SignalCell<i32> = Signal::new(0);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1513,7 +1513,7 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
         import std::json::json_codec;
         import std::option::Option::{ None, Some, self };
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
         import std::wire::Frame;
 
@@ -1525,7 +1525,7 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
         }
 
         // One plain call down from the scope — coverage propagates here.
-        fun label(mirror: RemoteSource<i32>): Signal<str> {
+        fun label(mirror: RemoteSource<i32>): SignalCell<str> {
             mirror.map(|value| match value {
                 Some(let n) => i"{n}",
                 None => "Loading...",
@@ -1544,7 +1544,7 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
                 spy_client.send(frame);
             });
 
-            let counter: Signal<i32> = Signal::new(7);
+            let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1585,12 +1585,12 @@ fn a25_map_outside_an_owner_scope_is_a_compile_error() {
         import std::json::json_codec;
         import std::option::Option::{ None, Some, self };
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let counter: Signal<i32> = Signal::new(7);
+            let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let text = remote.map(|value| match value {
@@ -1611,12 +1611,12 @@ fn a25_or_outside_an_owner_scope_is_a_compile_error() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let counter: Signal<i32> = Signal::new(7);
+            let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let text = remote.or(0);
@@ -1636,12 +1636,12 @@ fn e74_a25_map_anchors_at_the_users_call() {
     let source = r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let counter: Signal<i32> = Signal::new(7);
+            let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let text = remote.map(|value| "seen");
@@ -1667,12 +1667,12 @@ fn e74_a25_or_anchors_at_the_users_call() {
     let source = r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let counter: Signal<i32> = Signal::new(7);
+            let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let text = remote.or(0);
@@ -1704,7 +1704,7 @@ fn a25_or_reads_the_initial_before_the_first_frame_and_the_value_after() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::shared::Shared;
         import std::wire::Frame;
@@ -1729,7 +1729,7 @@ fn a25_or_reads_the_initial_before_the_first_frame_and_the_value_after() {
                 spy_client.send(frame);
             });
 
-            let title: Signal<str> = Signal::new("hello");
+            let title: SignalCell<str> = Signal::new("hello");
             let channel = ReactiveServer::new(server_end, json_codec()).expose(title);
             let remote: RemoteSource<str> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1766,7 +1766,7 @@ fn a25_two_maps_under_one_owner_take_one_subscribe() {
         import std::json::json_codec;
         import std::option::Option::{ None, Some, self };
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
 
@@ -1789,7 +1789,7 @@ fn a25_two_maps_under_one_owner_take_one_subscribe() {
                 spy_client.send(frame);
             });
 
-            let counter: Signal<i32> = Signal::new(1);
+            let counter: SignalCell<i32> = Signal::new(1);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1834,7 +1834,7 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
         import std::wire::Frame;
 
@@ -1864,7 +1864,7 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
                 spy_client.send(frame);
             });
 
-            let counter: Signal<i32> = Signal::new(1);
+            let counter: SignalCell<i32> = Signal::new(1);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
 
@@ -1889,7 +1889,7 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
 /// B129 (found by A25's lane; repro'd on v0.30.0): an empty `[]` passed to a
 /// `T`-typed parameter did not take its element type from the receiver's
 /// already-bound `T` — `remote.or([])` on a `RemoteSource<List<Todo>>` gave a
-/// `Signal<List<unknown>>` ("cannot access field 'done' on type any" at the
+/// `SignalCell<List<unknown>>` ("cannot access field 'done' on type any" at the
 /// first use), and `Option<List<Todo>>::unwrap_or([])` lost it the same way.
 /// Fixed in the analyzer's empty-list arm: the literal's element slot grounds
 /// from the expectation (`List<E>`, `E` fully determined). This pin asserts
@@ -1909,7 +1909,7 @@ fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
         r#"
         import std::json::json_codec;
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         [derive(Wire, PartialEq, Debug)]
@@ -1929,7 +1929,7 @@ fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
 
         fun main() {
             let (client_end, server_end) = duplex_pair();
-            let todos: Signal<List<Todo>> = Signal::new([Todo { id = 1, done = false }, Todo { id = 2, done = true }]);
+            let todos: SignalCell<List<Todo>> = Signal::new([Todo { id = 1, done = false }, Todo { id = 2, done = true }]);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
             let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let scope = Owner::new();
@@ -2107,7 +2107,7 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
 
         [derive(PartialEq, Debug)]
         struct Todo { id: i32, done: bool }
@@ -2116,7 +2116,7 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
             let scope = Owner::new();
             let n = owner_scope.run(scope, || {
                 let items = Signal::new([Todo { id = 1, done = false }]);
-                let remaining: Signal<i32> = items.map(|list| {
+                let remaining: SignalCell<i32> = items.map(|list| {
                     mut open = 0;
                     for todo in list {
                         if !todo.done {
@@ -2193,7 +2193,7 @@ fn b129_the_inline_chain_types_its_closure_parameter_too() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
 
         struct Todo { id: i32, done: bool }
 

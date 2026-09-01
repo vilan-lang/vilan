@@ -580,7 +580,7 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   move checker cannot see. `Option` is the sanctioned container (it is a
   Vilan enum, checkable under R11). The rule is read **per instantiation**,
   not per written head: a resource that reaches a container through a
-  generic aggregate's member is rejected the same way, so `Signal<Database>`
+  generic aggregate's member is rejected the same way, so `SignalCell<Database>`
   — whose storage is a `Shared<T>` — is refused exactly as
   `Shared<Database>` is. Holding the resource in a struct field of your own
   is the sanctioned alternative, and stays legal.

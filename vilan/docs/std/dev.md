@@ -93,9 +93,9 @@ stashing one is a **compile error at the call site**. The type system
 enforces what Vite leaves to convention:
 
 ```vilan,fragment
-let live: Signal<i32> = Signal::new(0);
+let live: SignalCell<i32> = Signal::new(0);
 dev::stash("live", live);
-// error: `Signal<i32>` cannot cross a hot swap: a closure, view, resource,
+// error: `SignalCell<i32>` cannot cross a hot swap: a closure, view, resource,
 // or reactive cell (`Signal`/`Shared`) carries code or identity the new
 // bundle cannot adopt; stash only plain data
 ```

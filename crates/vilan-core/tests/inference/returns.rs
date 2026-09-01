@@ -1452,13 +1452,13 @@ fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     assert_fails_spanning_nth(
         r#"
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
 
         fun main() {
         	let scope = Owner::new();
         	let n = owner_scope.run(scope, || {
         		let count = Signal::new(1);
-        		let doubled: Signal<i32> = count.map(|n| {
+        		let doubled: SignalCell<i32> = count.map(|n| {
         			n * 2;
         		});
         		doubled.get()

@@ -17,7 +17,7 @@
 
 import std::io::print;
 import std::option::Option::{ None, Some, self };
-import std::reactive::Signal;
+import std::reactive::SignalCell;
 import std::router::{ Routable, chunk_error, current_path, link, pending, segments };
 import std::ui::{ View, mount_root, view };
 
@@ -97,7 +97,7 @@ fun not_found_page(): View {
 
 // === The shell ===============================================================
 
-fun app(route: Signal<Route>): View {
+fun app(route: SignalCell<Route>): View {
 	view("main")
 		.child(view("nav")
 			.child(link("Home", Route::Home))

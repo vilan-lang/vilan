@@ -100,7 +100,7 @@ let db: Database = open_database();
 
 [service(NotesClient)]
 struct NotesStore {
-	[expose] notes: Signal<List<Note>>,
+	[expose] notes: SignalCell<List<Note>>,
 }
 ```
 
@@ -250,7 +250,7 @@ wired here at all: `client.notes` is a `RemoteSource<List<Note>>`, and
 the screen reads it where it is shown —
 
 ```vilan,fragment
-fun screen(client: NotesClient<SocketTransport>, token: Signal<str>, route: Signal<Route>): View {
+fun screen(client: NotesClient<SocketTransport>, token: SignalCell<str>, route: SignalCell<Route>): View {
 	let notes = client.notes.or([]);
 	…
 }

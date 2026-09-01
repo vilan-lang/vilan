@@ -10,7 +10,7 @@
 // in `items` like anyone else's would.
 
 import std::display::format;
-import std::reactive::{ Signal, combine };
+import std::reactive::{ Signal, SignalCell, combine };
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{ RpcError, SocketTransport };
 import std::style::{ AlignItems, Color, Cursor, Display, Length, Style, space, style };
@@ -63,7 +63,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 
-	let remaining: Signal<i32> = items.map(|list| {
+	let remaining: SignalCell<i32> = items.map(|list| {
 		mut open = 0;
 		for todo in list {
 			if !todo.done {
@@ -73,7 +73,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 		open
 	});
 
-	let visible: Signal<List<Todo>> = combine((items, filter)).map(|(list, current)| {
+	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, current)| {
 		mut shown: List<Todo> = [];
 		for todo in list {
 			let keep = current == "all" || (current == "active" && !todo.done) || (current == "done" && todo.done);
@@ -120,7 +120,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 // A filter button highlights itself when its value is the active filter —
 // two const styles, selected at runtime: `bind_class` over their class lists
 // is the recorded composition for signal-driven style switching.
-fun filter_button(filter: Signal<str>, value: str, label: str): View {
+fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 	let active = const button + style().font_weight(700).border(Length::px(1), Color::gray(700));
 	let base_classes = button.class_list();
 	let active_classes = active.class_list();

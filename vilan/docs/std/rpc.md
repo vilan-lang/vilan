@@ -34,9 +34,9 @@ struct RemoteSource<T> { … }
 
 impl RemoteSource<type T> {
 	fun get(self): Option<T>                              // passive: the cache, `None` before the first update
-	fun status(self): Signal<Status>                      // passive: `Waiting` until a value has arrived, then `Ready`
-	fun or(self, initial: T): Signal<T>                   // counted, owner-scoped: `initial` until the first update
-	fun map<U>(self, transform: sync |Option<T>| U): Signal<U>   // counted, owner-scoped: the `Option` confronted once
+	fun status(self): SignalCell<Status>                      // passive: `Waiting` until a value has arrived, then `Ready`
+	fun or(self, initial: T): SignalCell<T>                   // counted, owner-scoped: `initial` until the first update
+	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
 }
@@ -65,11 +65,11 @@ code with no owner: you hold the `Subscription` and `dispose` it.
 that renders the value subscribes, the mirror stays `Waiting`, and that is
 correct — the channel was never opened.
 
-The `Signal<T>` that `or`/`map` return is a local derivative: writing it
+The `SignalCell<T>` that `or`/`map` return is a local derivative: writing it
 writes nothing back (the server owns the source) and the next update
 overwrites it. An empty-list `initial` needs no annotation — the `[]`
 takes its element type from the mirror
-(`let notes = client.notes.or([]);` is a `Signal<List<Note>>`).
+(`let notes = client.notes.or([]);` is a `SignalCell<List<Note>>`).
 
 ## Errors
 
@@ -93,7 +93,7 @@ rpc's own return type (`Option<Task>`), not here.
 enum ConnectionState { Connected, Reconnecting, Closed }
 
 impl SocketTransport {
-	fun connection_state(self): Signal<ConnectionState>
+	fun connection_state(self): SignalCell<ConnectionState>
 	fun on_reconnect(self, hook: async || void)
 }
 ```

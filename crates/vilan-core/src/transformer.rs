@@ -7038,7 +7038,7 @@ impl<'src> Transformer<'src> {
     /// The trait arguments a bound wrote, resolved through the current
     /// monomorphization — what [`crate::impl_select`] needs to tell an impl
     /// providing `MaybeSignal<str>` from one providing
-    /// `MaybeSignal<Signal<str>>` on the same receiver.
+    /// `MaybeSignal<SignalCell<str>>` on the same receiver.
     fn wanted_trait_arguments(&self, arguments: &[TypeId]) -> Vec<TypeId> {
         arguments
             .iter()
@@ -7985,8 +7985,8 @@ impl<'src> Transformer<'src> {
     /// member none of the type's impls declare, but a (super)trait it implements
     /// provides with a body. Mirrors the analyzer's Gap E resolution.
     fn resolve_inherited_default(&self, type_id: TypeId, member: &str) -> Option<Id> {
-        // The impl subject is written in its own generic terms (`Signal<T>`),
-        // the receiver in concrete ones (`Signal<i32>`), so the search is over
+        // The impl subject is written in its own generic terms (`SignalCell<T>`),
+        // the receiver in concrete ones (`SignalCell<i32>`), so the search is over
         // the impls that APPLY to the receiver ([`crate::impl_select`]) — exact
         // type equality only ever matched non-generic subjects, silently
         // dropping inherited defaults on generic types (the emitted call then

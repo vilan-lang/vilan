@@ -46,7 +46,7 @@ is idempotent and cycle-tolerant) and binds the imported items in the
 importing module's scope:
 
 - `import std::io::print;` binds the item `print`.
-- `import std::reactive::{ Signal, combine };` binds each set member.
+- `import std::reactive::{ Signal, SignalCell, combine };` binds each set member.
 - `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
   unqualified use.
@@ -119,7 +119,7 @@ A name is resolved differently by position:
 - In **value position**, lookup takes the nearest binding of any kind.
 
 Consequently a local variable named `Signal` does not break `let s:
-Signal<i32>` annotations in the same scope, but relying on this is poor
+SignalCell<i32>` annotations in the same scope, but relying on this is poor
 style.
 
 ## 4.6 Statics and members

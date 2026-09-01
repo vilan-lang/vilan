@@ -1,6 +1,6 @@
 //! A33: a read-only binding takes a `Source`, and it is a LIVE one.
 //!
-//! `std::ui`'s read-only binders were widened from the concrete `Signal<T>` to a
+//! `std::ui`'s read-only binders were widened from the concrete `SignalCell<T>` to a
 //! `Source<T>` bound, so a user's own reactive type can drive them. That the
 //! widened signatures ACCEPT such a type is a compile fact, pinned in
 //! `vilan-core`'s inference suite. What only a running program can show is that
@@ -28,7 +28,7 @@ use std::process::Command;
 /// binding that needed the write side would not compile against this at all.
 const STORED: &str = r#"
 struct Stored<T> {
-	inner: Signal<T>,
+	inner: SignalCell<T>,
 }
 
 impl Stored<type T> with Source<T> {
@@ -175,7 +175,7 @@ fn build_and_run(tag: &str, app: &str) -> String {
 /// and again after the values move.
 fn app_source() -> String {
     format!(
-        r#"import std::reactive::{{ Signal, Source, Subscription }};
+        r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
 import std::ui::{{ View, mount_root, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
@@ -294,7 +294,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
 #[test]
 fn a_user_source_drives_swap_and_keeps_driving_it() {
     let app = format!(
-        r#"import std::reactive::{{ Signal, Source, Subscription }};
+        r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
 import std::ui::{{ View, mount_root, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.

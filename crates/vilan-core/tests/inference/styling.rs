@@ -4425,7 +4425,7 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
     assert_compiles_browser(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::router::{ current_path, navigate, segments, link, Routable };
 
         [derive(PartialEq)]
@@ -4630,7 +4630,7 @@ fn a_slot_grounded_list_maps_and_sums() {
 
 #[test]
 fn a_mapped_signal_meets_a_bound_without_annotation() {
-    // B19 (FIXED): `current_path().map(..)` yields `Signal<U = Route>`;
+    // B19 (FIXED): `current_path().map(..)` yields `SignalCell<U = Route>`;
     // passing it to `swap<T: PartialEq>` without annotating the intermediate
     // binding must check the bound against the RESOLVED `Route`, not demand
     // `U: PartialEq`. The method resolution now DEFERS while a closure
@@ -4639,7 +4639,7 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
     assert_compiles_browser(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::router::{ current_path, segments };
 
         [derive(PartialEq)]
@@ -4671,14 +4671,14 @@ fn swap_requires_a_comparable_value() {
     assert_fails_browser_with(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         struct Opaque {
             tag: str,
         }
 
         fun main() {
-            let source: Signal<Opaque> = Signal::new(Opaque { tag = "a" });
+            let source: SignalCell<Opaque> = Signal::new(Opaque { tag = "a" });
             let _root = mount_root("app", || view("main")
                 .swap(source, |current| view("p").text(current.tag)));
         }
@@ -4695,11 +4695,11 @@ fn swap_boundaries_nest() {
     assert_compiles_browser(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         fun main() {
-            let outer: Signal<i32> = Signal::new(0);
-            let inner: Signal<str> = Signal::new("a");
+            let outer: SignalCell<i32> = Signal::new(0);
+            let inner: SignalCell<str> = Signal::new("a");
             let _root = mount_root("app", || view("main")
                 .swap(outer, |level| view("section")
                     .child(view("h1").text(i"level {level}"))
@@ -4716,12 +4716,12 @@ fn swap_composes_with_sibling_bindings() {
     assert_compiles_browser(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         fun main() {
-            let page: Signal<i32> = Signal::new(0);
-            let items: Signal<List<str>> = Signal::new(["a", "b"]);
-            let visible: Signal<bool> = Signal::new(true);
+            let page: SignalCell<i32> = Signal::new(0);
+            let items: SignalCell<List<str>> = Signal::new(["a", "b"]);
+            let visible: SignalCell<bool> = Signal::new(true);
             let _root = mount_root("app", || view("main")
                 .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
                 .child(view("aside").show(visible))

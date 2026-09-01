@@ -6958,7 +6958,7 @@ pub(crate) mod tests {
     fn member_completion_on_a_call_inside_an_element_attribute_closure() {
         let labels = completions_at_marker(
             "import std::io::print;\n\
-             import std::reactive::Signal;\n\
+             import std::reactive::{ Signal, SignalCell };\n\
              import std::result::Result;\n\
              import std::ui::view;\n\
              struct Note { id: i32, text: str }\n\
@@ -6966,7 +6966,7 @@ pub(crate) mod tests {
              impl NotesClient {\n\
              \tfun add(self, name: str): Result<Note, str> { Result::Ok(Note { id = 1, text = name }) }\n\
              }\n\
-             fun app(client: NotesClient, note_name: Signal<str>) {\n\
+             fun app(client: NotesClient, note_name: SignalCell<str>) {\n\
              \t<form on:submit(|event| { print(client.add(note_name.get()).~); })></form>\n\
              }\n",
             '~',
@@ -7308,8 +7308,7 @@ pub(crate) mod tests {
     // --- E67: an element's opening tag (editing-dx.md §18) ------------------
 
     /// The prelude the element-head pins share.
-    const ELEMENT_HEAD_PRELUDE: &str =
-        "import std::ui::view;\nimport std::reactive::Signal;\nimport std::io::print;\n";
+    const ELEMENT_HEAD_PRELUDE: &str = "import std::ui::view;\nimport std::reactive::{ Signal, SignalCell };\nimport std::io::print;\n";
 
     fn element_head_completions(body: &str) -> Vec<String> {
         completions_at_marker(
@@ -8272,7 +8271,7 @@ pub(crate) mod tests {
     // lines from anything reactive).
     #[test]
     fn entry_records_index_the_entry_text() {
-        let text = "import std::reactive::Signal;\n\nstruct Row {\n\tcell: Signal<i32>,\n}\n";
+        let text = "import std::reactive::{ Signal, SignalCell };\n\nstruct Row {\n\tcell: SignalCell<i32>,\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let program = document.program.as_ref().expect("the program analyzes");
         for (source, span, _, label) in &program.type_references {
@@ -8296,13 +8295,13 @@ pub(crate) mod tests {
     // A written generic type application highlights as its HEAD name plus its
     // arguments, each a name of its own. The reference used to be recorded at the
     // whole `Name<Args>` span, and since `semantic_tokens` drops overlaps, that
-    // one token ate every argument's: `Signal<List<str>>` lit up as a single
+    // one token ate every argument's: `SignalCell<List<str>>` lit up as a single
     // struct and both arguments went dark. Nesting and a closure argument are
     // both here — a closure's parameter and return types are the case the whole
     // span reached furthest over.
     #[test]
     fn a_generic_type_application_tokenizes_its_head_and_arguments() {
-        let text = "import std::reactive::Signal;\nimport std::shared::Shared;\n\nstruct Row {\n\tcells: Signal<List<str>>,\n\thook: Shared<|i32| bool>,\n}\n";
+        let text = "import std::reactive::SignalCell;\nimport std::shared::Shared;\n\nstruct Row {\n\tcells: SignalCell<List<str>>,\n\thook: Shared<|i32| bool>,\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         // The token covering exactly the `occurrence`-th `name` in the text.
@@ -8324,7 +8323,10 @@ pub(crate) mod tests {
         };
         // The head of each application, name-sized rather than swallowing its
         // arguments.
-        assert!(token_at("Signal", 1).is_some(), "Signal head: {tokens:?}");
+        assert!(
+            token_at("SignalCell", 1).is_some(),
+            "SignalCell head: {tokens:?}"
+        );
         assert!(token_at("Shared", 1).is_some(), "Shared head: {tokens:?}");
         // The arguments, no longer eaten: nested nominal, and a closure's
         // parameter and return types.

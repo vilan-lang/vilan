@@ -27,7 +27,7 @@ external fun create_element(tag: str): Element;
 external fun create_element_ns(namespace: str, tag: str): Element;
 
 /// `document.createTextNode(content)` — a fresh, unattached text node. Text
-/// CHILDREN ride this (`std::ui`'s `child` on a `str` or `Signal<str>`): mixed
+/// CHILDREN ride this (`std::ui`'s `child` on a `str` or `SignalCell<str>`): mixed
 /// content interleaves text nodes between element children as real siblings,
 /// never wrapper spans.
 [extern("document.createTextNode")]

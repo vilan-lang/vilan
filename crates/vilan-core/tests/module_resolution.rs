@@ -2430,8 +2430,8 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
         ),
         (
             "the `[expose]` rule",
-            "import std::reactive::Signal;\nstruct Password { hash: str }\n\
-             struct Session {\n\t[expose] secret: Signal<Password>,\n}\n"
+            "import std::reactive::{ Signal, SignalCell };\nstruct Password { hash: str }\n\
+             struct Session {\n\t[expose] secret: SignalCell<Password>,\n}\n"
                 .to_string(),
             "import pkg::m::Session;\nfun main() { }\n",
             "is `[expose]`d, but its element `Password` is not Wire",

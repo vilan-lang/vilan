@@ -2303,16 +2303,16 @@ fn conforming_elements_pass_a_spread_element_bound() {
     );
 }
 
-/// The payoff: a MAPPED pack. `gather(a, b)` inverts `(U in T: Signal<U>)`
-/// against the collected `(Signal<i32>, Signal<str>)` to recover
+/// The payoff: a MAPPED pack. `gather(a, b)` inverts `(U in T: SignalCell<U>)`
+/// against the collected `(SignalCell<i32>, SignalCell<str>)` to recover
 /// `T = (i32, str)` — the shipped inversion, reached through the spread.
 #[test]
 fn a_mapped_spread_pack_inverts_to_its_source_tuple() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
-        fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {
+        import std::reactive::{ Signal, SignalCell };
+        fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T> {
             let snapshot = || (source in sources => source.get());
             let derived = Signal::new(snapshot());
             let subscriptions = (source in sources => source.sub(|_| {
@@ -3113,8 +3113,8 @@ fn a_mapped_pack_spreads_like_any_tuple() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
-        fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): i32 {
+        import std::reactive::{ Signal, SignalCell };
+        fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): i32 {
             1
         }
         fun main() {
@@ -4239,7 +4239,7 @@ fn an_async_closure_into_an_extern_callback_is_refused() {
 fn e68_an_uncovered_effect_reports_only_the_coverage_primary() {
     let source = r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         fun main() {
             let counter = Signal::new(0);
@@ -4260,7 +4260,7 @@ fn e68_an_uncovered_effect_reports_only_the_coverage_primary() {
 fn e68_a_refused_run_shape_reports_only_the_context_primaries() {
     let source = r#"
         import std::io::print;
-        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
 
         fun main() {
             let counter = Signal::new(0);

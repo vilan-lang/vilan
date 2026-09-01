@@ -38,7 +38,7 @@ fn map_registers_its_subscription_into_the_ambient_owner() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, owner_scope };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
 
         fun main() {
             let count = Signal::new(1);
@@ -64,7 +64,7 @@ fn combine_registers_every_input_subscription_into_the_ambient_owner() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, combine, owner_scope };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, combine, owner_scope };
 
         fun main() {
             let left = Signal::new(1);
@@ -95,7 +95,7 @@ fn flatten_registers_its_outer_and_live_inner_subscriptions() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, owner_scope };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
 
         fun main() {
             let first = Signal::new(1);
@@ -128,10 +128,10 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
-        let count: Signal<i32> = Signal::new(1);
-        let doubled: Signal<i32> = count.map(|n| n * 2);
+        let count: SignalCell<i32> = Signal::new(1);
+        let doubled: SignalCell<i32> = count.map(|n| n * 2);
 
         fun main() {
             print(doubled.get());
@@ -161,7 +161,7 @@ fn disposing_a_reactive_server_clears_its_transports_inbound_handler() {
         r#"
         import std::io::print;
         import std::json::json_codec;
-        import std::reactive::{ Disposable, Signal };
+        import std::reactive::{ Disposable, Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
@@ -192,7 +192,7 @@ fn disposing_a_reactive_client_clears_its_transports_inbound_handler() {
         r#"
         import std::io::print;
         import std::json::json_codec;
-        import std::reactive::{ Disposable, Signal };
+        import std::reactive::{ Disposable, Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {
@@ -226,7 +226,7 @@ fn disposing_a_reactive_client_twice_is_harmless() {
         r#"
         import std::io::print;
         import std::json::json_codec;
-        import std::reactive::{ Disposable, Signal };
+        import std::reactive::{ Disposable, Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
         fun main() {

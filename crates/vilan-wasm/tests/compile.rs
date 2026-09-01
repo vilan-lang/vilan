@@ -116,7 +116,7 @@ fn a_browser_layer_import_resolves() {
 #[test]
 fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
     let output = compile(
-        "import std::reactive::Signal;\n\
+        "import std::reactive::{ Signal, SignalCell };\n\
          import std::ui::{ View, mount_root, view };\n\
          \n\
          [derive(PartialEq)]\n\
@@ -134,7 +134,7 @@ fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
          }\n\
          \n\
          fun main() {\n\
-         \tlet route: Signal<Route> = Signal::new(Route::Home);\n\
+         \tlet route: SignalCell<Route> = Signal::new(Route::Home);\n\
          \tlet _root = mount_root(\"app\", || view(\"main\").swap(route, |current| match current {\n\
          \t\tRoute::Home => home_page(),\n\
          \t\tRoute::Away => away_page(),\n\

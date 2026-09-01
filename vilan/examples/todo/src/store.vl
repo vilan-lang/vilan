@@ -9,7 +9,7 @@
 
 import std::fs;
 import std::json::json_codec;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ Err, Ok, self };
 import std::shared::Shared;
 import std::wire::{ Frame, decode, encode };
@@ -22,7 +22,7 @@ let storage = "todos.json";
 struct TodoStore {
 	// The one authoritative list. `[expose]`d, so the generated
 	// `TodoClient::connect` mirrors it on every connection's wire.
-	[expose] todos: Signal<List<Todo>>,
+	[expose] todos: SignalCell<List<Todo>>,
 	// Ids stay unique across restarts: `boot` seeds this past the stored list.
 	next_id: Shared<i32>,
 }

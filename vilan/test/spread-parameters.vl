@@ -4,7 +4,7 @@
 // per arity, including the two source syntax cannot write as a value: the empty
 // pack `()` and the one-element pack `(x)`.
 import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun middle(...items: (i32, i32, i32)): i32 {
 	items.1
@@ -31,9 +31,9 @@ fun outer(...items: (i32, i32)): i32 {
 	forward(items)
 }
 
-// The payoff: a mapped pack. `gather(a, b)` inverts `(U in T: Signal<U>)`
+// The payoff: a mapped pack. `gather(a, b)` inverts `(U in T: SignalCell<U>)`
 // against the collected argument tuple to recover `T = (i32, str)`.
-fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {
+fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T> {
 	let snapshot = || (source in sources => source.get());
 	let derived = Signal::new(snapshot());
 	let subscriptions = (source in sources => source.sub(|_| {

@@ -15,7 +15,7 @@
 
 import std::json::json_codec;
 import std::option::Option::{ None, Some, self };
-import std::reactive::{ Signal, Source, batch };
+import std::reactive::{ Signal, SignalCell, Source, batch };
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{
 	Dispatcher,
@@ -178,7 +178,7 @@ impl AccountsClient<type T> {
 // mirrors it via the reactive protocol (§8); `user_id` is private — it never crosses.
 [service(Client)]
 struct Session {
-	[expose] status: Signal<str>,
+	[expose] status: SignalCell<str>,
 	user_id: Shared<Option<i32>>,
 }
 
@@ -245,7 +245,7 @@ fun main() {
 	session_demo();
 }
 
-// The reactive north star (proposal §8), by hand: a server holds a `Signal<i32>` and
+// The reactive north star (proposal §8), by hand: a server holds a `SignalCell<i32>` and
 // exposes it; a client subscribes to the remote handle and sees every change flow over a
 // duplex transport. The `Signal`/`Source` never crosses as a value — it is exported as a
 // channel id, and its updates cross as `Update` frames.
@@ -258,7 +258,7 @@ fun reactive_demo() {
 	// value single-passes into an `Update` envelope over the codec). `channel` is the
 	// handle that, in a real system, would cross to the client in an RPC reply;
 	// in-process we hand it over.
-	let counter: Signal<i32> = Signal::new(0);
+	let counter: SignalCell<i32> = Signal::new(0);
 	let server = ReactiveServer::new(server_end, json_codec());
 	let channel = server.expose(counter);
 

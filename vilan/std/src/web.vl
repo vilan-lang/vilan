@@ -14,7 +14,16 @@ export import pkg::result::Result::{ self, Err, Ok };
 
 // `Signal` — rank 1 in application code (21 of 42 app files, ahead of `print`
 // at 15). Base layer, so a server-rendered build reaches it too.
+//
+// `SignalCell` travels with it (A32). `Signal` is the writable TRAIT now, and
+// `Signal::new(v)` — the everyday spelling, unchanged — hands back the cell; but
+// a trait may only be written as a `let` annotation (B161), so the three
+// positions that need a real type name the cell instead: a struct field
+// (`todos: SignalCell<List<Todo>>`), a return type, a generic argument. Those
+// are exactly the sites the census counted `Signal` at, so leaving the cell out
+// would put back the import this set exists to delete.
 export import pkg::reactive::Signal;
+export import pkg::reactive::SignalCell;
 
 // `view` and `View` — ranks 3 and 4, the builder and its type, one idea. A view
 // tree is dense with `view("div")` calls, which is why these are bare members

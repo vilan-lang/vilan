@@ -153,7 +153,7 @@ fn build_and_run(tag: &str, app: &str, harness: &str, support: &[(&str, &str)]) 
 /// The idiom `std::router` documents, run 25 times: derive the typed route from
 /// the module-level path signal inside a `mount_root` body, then dispose.
 const ROUTER_IDIOM: &str = r#"import std::io::print;
-import std::reactive::{ Disposable, Signal };
+import std::reactive::{ Disposable, Signal, SignalCell };
 import std::router::{ current_path, segments };
 import std::ui::{ View, mount_root, view };
 
@@ -204,7 +204,7 @@ fn derivations_detach_from_their_source_with_their_boundary() {
 
 const TWO_WAY_BINDINGS: &str = r#"import std::io::print;
 import std::option::Option::{ None, self };
-import std::reactive::{ Signal, draft };
+import std::reactive::{ Signal, SignalCell, draft };
 import std::ui::{ View, mount_root, view };
 
 fun main() {
@@ -259,18 +259,18 @@ require("./app.js");
 /// two-way input, a handler that writes signals the view reads (V4), a keyed
 /// list, and a live reactive RPC session on an in-process duplex.
 const CYCLE_EXEMPLAR: &str = r#"import std::json::json_codec;
-import std::reactive::{ Disposable, Signal };
+import std::reactive::{ Disposable, Signal, SignalCell };
 import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 import std::ui::{ View, mount_root, view };
 
-let path: Signal<str> = Signal::new("/");
-let route: Signal<str> = path.map(|value| "route" + value);
+let path: SignalCell<str> = Signal::new("/");
+let route: SignalCell<str> = path.map(|value| "route" + value);
 
 fun row(item: str): View {
 	view("li").text(item)
 }
 
-fun app(items: Signal<List<str>>, draft: Signal<str>): View {
+fun app(items: SignalCell<List<str>>, draft: SignalCell<str>): View {
 	view("main")
 		.child(view("h1").bind_text(route))
 		.child(view("input").bind_value(draft))
@@ -282,7 +282,7 @@ fun app(items: Signal<List<str>>, draft: Signal<str>): View {
 }
 
 fun main() {
-	let items: Signal<List<str>> = Signal::new(["a", "b"]);
+	let items: SignalCell<List<str>> = Signal::new(["a", "b"]);
 	let draft = Signal::new("");
 	let root = mount_root("app", || app(items, draft));
 

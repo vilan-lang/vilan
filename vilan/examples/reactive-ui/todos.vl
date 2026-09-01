@@ -3,7 +3,7 @@
 // conditional rendering. The dependency graph is literally the combinator tree.
 
 import std::display::format;
-import std::reactive::{ Signal, combine };
+import std::reactive::{ Signal, SignalCell, combine };
 import std::ui::{ View, view };
 
 // `bind_each` reconciles by key and re-renders only CHANGED rows — `Todo`
@@ -18,14 +18,14 @@ struct Todo {
 fun todos(): View {
 	// All state is plain signals. Value semantics means `set_with` hands the body
 	// an owned copy of the current value to mutate and return.
-	let items: Signal<List<Todo>> = Signal::new([]);
+	let items: SignalCell<List<Todo>> = Signal::new([]);
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 	let next_id = Signal::new(0);
 
 	// `remaining` depends only on `items` — one input, so plain `derive`. The
 	// result is a read-only `Source`; only the root `Signal`s above can be `set`.
-	let remaining: Signal<i32> = items.map(|list| {
+	let remaining: SignalCell<i32> = items.map(|list| {
 		mut open = 0;
 		for todo in list {
 			if !todo.done {
@@ -40,7 +40,7 @@ fun todos(): View {
 	// yields a `Source<(List<Todo>, str)>`; `derive` then maps the pair. The graph
 	// is data: `visible` recomputes exactly when either input changes — no body is
 	// run to "find" the dependencies.
-	let visible: Signal<List<Todo>> = combine((items, filter)).map(|(list, filter)| {
+	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, filter)| {
 		mut shown: List<Todo> = [];
 		for todo in list {
 			let keep = filter == "all" || (filter == "active" && !todo.done) || (filter == "done" && todo.done);
@@ -107,7 +107,7 @@ fun count_done(list: List<Todo>): i32 {
 
 // A filter button highlights itself when its value is the active filter — a
 // single-dependency `derive` over `filter`.
-fun filter_button(filter: Signal<str>, value: str, label: str): View {
+fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 	view("button")
 		.text(label)
 		.bind_class(filter.map(|current| if current == value {
@@ -122,7 +122,7 @@ fun filter_button(filter: Signal<str>, value: str, label: str): View {
 // is static for this render; toggling rebuilds `items`, which re-renders the row.
 // It takes the shared `items` signal so the checkbox / remove button can update
 // the list everyone reads from.
-fun todo_row(items: Signal<List<Todo>>, todo: Todo): View {
+fun todo_row(items: SignalCell<List<Todo>>, todo: Todo): View {
 	view("li")
 		.class(if todo.done {
 			"done"
@@ -134,7 +134,7 @@ fun todo_row(items: Signal<List<Todo>>, todo: Todo): View {
 		.child(view("button").class("remove").text("✕").on("click", || remove(items, todo.id)))
 }
 
-fun toggle(items: Signal<List<Todo>>, id: i32) {
+fun toggle(items: SignalCell<List<Todo>>, id: i32) {
 	items.set_with(|list| {
 		mut next: List<Todo> = [];
 		for todo in list {
@@ -148,7 +148,7 @@ fun toggle(items: Signal<List<Todo>>, id: i32) {
 	});
 }
 
-fun remove(items: Signal<List<Todo>>, id: i32) {
+fun remove(items: SignalCell<List<Todo>>, id: i32) {
 	items.set_with(|list| {
 		mut kept: List<Todo> = [];
 		for todo in list {

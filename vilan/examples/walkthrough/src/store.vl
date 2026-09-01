@@ -6,7 +6,7 @@
 
 import std::db::{ Database, Row, Statement };
 import std::option::Option::{ None, Some, self };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import pkg::notes::{ AuthOutcome, Note };
 
 // --- node:crypto bindings for password hashing (sync, fits the dispatch
@@ -45,7 +45,7 @@ fun fresh_token(): str {
 // module scope; the store stays plain data.
 [service(NotesClient)]
 struct NotesStore {
-	[expose] notes: Signal<List<Note>>,
+	[expose] notes: SignalCell<List<Note>>,
 }
 
 impl NotesStore {

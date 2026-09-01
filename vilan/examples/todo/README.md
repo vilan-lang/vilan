@@ -52,7 +52,7 @@ both, so a stale bundle is detectable.
 
 ## How the data flows
 
-The server holds the list in an `[expose]`d `Signal<List<Todo>>` and mounts the
+The server holds the list in an `[expose]`d `SignalCell<List<Todo>>` and mounts the
 generated dispatcher on its own `Server::builder()` chain with
 `ServerBuilder::with_service`: one port serving the page (written from the
 build), the browser leg's build (`serve_build`), the WebSocket upgrade, and the

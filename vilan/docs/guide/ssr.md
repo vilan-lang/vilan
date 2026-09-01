@@ -32,11 +32,11 @@ in a `common` library both packages depend on instead.
 
 ```vilan
 import std::ui::{ view, View, render };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 // The one component both legs build.
 fun app(): View {
-	let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
+	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
 	view("main")
 		.child(view("h1").text("Tasks"))
 		.child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))
@@ -113,10 +113,10 @@ the natural factoring is a shared `fun app(): View` with a per-leg `main`.
 
 ```vilan,browser
 import std::ui::{ view, View, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun app(): View {
-	let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
+	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
 	view("main")
 		.child(view("h1").text("Tasks"))
 		.child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))

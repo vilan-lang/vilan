@@ -19,7 +19,7 @@ their own sub-pages.
 ```vilan,browser
 import std::ui::{ view, View, mount_root };
 import std::router::{ current_path, navigate, segments, link, Routable };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::option::Option::{ self, Some, None };
 
 [derive(PartialEq)]
@@ -97,7 +97,7 @@ Now the pieces one at a time.
 
 ## The live path becomes a route signal
 
-`current_path()` is a `Signal<str>` of `location.pathname`. It stays
+`current_path()` is a `SignalCell<str>` of `location.pathname`. It stays
 current across `navigate` calls and the browser's back/forward buttons.
 Derive your typed route from it once:
 

@@ -1566,7 +1566,7 @@ pub struct Implementation<'src> {
     /// fall back to a trait's inherited default methods.
     pub trait_ids: Vec<Id>,
     /// Each provided trait's generic arguments, in the impl's own generic terms
-    /// (`impl Signal<type T> with Readable<T>` -> `[(readable_id, [T])]`). Used to
+    /// (`impl SignalCell<type T> with Readable<T>` -> `[(readable_id, [T])]`). Used to
     /// recover a parameterized trait's arguments for a concrete subject.
     pub trait_args: Vec<(Id, Vec<TypeId>)>,
 }
@@ -1724,7 +1724,7 @@ pub struct BindingTraitConstraint {
     /// The annotated binding.
     pub variable_id: Id,
     pub trait_id: Id,
-    /// The trait's written arguments (`Signal<i32>` -> `[i32]`).
+    /// The trait's written arguments (`SignalCell<i32>` -> `[i32]`).
     pub arguments: Vec<TypeId>,
     /// The annotation's own span: the constraint is what fails, so that is
     /// where the caret goes.
@@ -2274,7 +2274,11 @@ type RpcSignatureCheck<'src> = (&'src str, Id, Vec<(String, Option<&'src Node<'s
 /// span to report at, and the STRUCT's entity id — the file that span indexes
 /// into, which the check cannot ask for later because it runs after `build()`
 /// (B112). See `check_expose_fields`.
-type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, Span, Id);
+/// An `[expose]`d field awaiting its check: the label for the message, the
+/// field's WRITTEN type node (for rendering), the field's RESOLVED type id (what
+/// the `std::Source` reconciliation runs against), the annotation's span, and
+/// the declaring struct.
+type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, TypeId, Span, Id);
 
 #[derive(Clone, Debug)]
 pub struct Analyzer<'src> {
@@ -2957,6 +2961,11 @@ pub struct Analyzer<'src> {
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
+    // The `std::reactive` `Source` TRAIT, if loaded. `[expose]` reconciles an
+    // exposed field's type against it (A32's ruling): a field is exposable when
+    // its type IMPLEMENTS the nominal std trait, not when its spelling happens
+    // to be the canonical cell's.
+    source_trait_id: Option<Id>,
     print_fn_id: Option<Id>,
     // `std::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
@@ -3594,6 +3603,7 @@ impl<'src> Analyzer<'src> {
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
             panic_fn_id: None,
+            source_trait_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
@@ -6497,11 +6507,11 @@ impl<'src> Analyzer<'src> {
         bindings
     }
 
-    /// A binding's transfer form (`hmr.md` §4): a `Signal<T>`/`Shared<T>` with a
+    /// A binding's transfer form (`hmr.md` §4): a `SignalCell<T>`/`Shared<T>` with a
     /// transferable payload carries that payload across the swap; a plain-data type
     /// carries its value; anything else is excluded (fresh init).
     fn hmr_transfer_form(&mut self, type_id: TypeId) -> TransferForm {
-        let signal_id = self.primitive_struct_ids.get("Signal").copied();
+        let signal_id = self.primitive_struct_ids.get("SignalCell").copied();
         let shared_id = self.primitive_struct_ids.get("Shared").copied();
         if let Type::Struct(id, arguments) = type_id.get_type(self) {
             if Some(id) == signal_id && arguments.len() == 1 {
@@ -6582,7 +6592,7 @@ impl<'src> Analyzer<'src> {
         const SCALARS: &[&str] = &[
             "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
         ];
-        let signal_id = self.primitive_struct_ids.get("Signal").copied();
+        let signal_id = self.primitive_struct_ids.get("SignalCell").copied();
         let shared_id = self.primitive_struct_ids.get("Shared").copied();
         match type_id.get_type(self) {
             Type::Struct(id, arguments) => {
@@ -6591,7 +6601,7 @@ impl<'src> Analyzer<'src> {
                     return (false, true);
                 }
                 // A bare `Signal`/`Shared` COMPONENT is not transferable-as-value —
-                // only a top-level `Signal<T>`/`Shared<T>` binding transfers, via
+                // only a top-level `SignalCell<T>`/`Shared<T>` binding transfers, via
                 // its payload form (handled in `hmr_transfer_form`).
                 if Some(id) == signal_id || Some(id) == shared_id {
                     return (false, true);
@@ -6848,8 +6858,8 @@ impl<'src> Analyzer<'src> {
     ///
     /// The check is per-INSTANTIATION, not per head (A19): a resource can reach a
     /// container through a generic aggregate's field, where the container is
-    /// written generically and holds nothing yet. `Signal<T>`'s storage is a
-    /// `Shared<T>`, so `Shared<Database>` was refused while `Signal<Database>` —
+    /// written generically and holds nothing yet. `SignalCell<T>`'s storage is a
+    /// `Shared<T>`, so `Shared<Database>` was refused while `SignalCell<Database>` —
     /// the same container, holding the same resource — compiled clean.
     ///
     /// And it is per-instantiation whatever the type's PROVENANCE (B103). The
@@ -7184,8 +7194,8 @@ impl<'src> Analyzer<'src> {
 
     /// Finds a native container holding a resource at or beneath `type_id`, for
     /// R10. The head is asked first — the original question — and then, for a
-    /// GENERIC aggregate, each member as instantiated HERE: `Signal<T>`'s
-    /// `value: Shared<T>` is a `Shared<Database>` only at `Signal<Database>`, and
+    /// GENERIC aggregate, each member as instantiated HERE: `SignalCell<T>`'s
+    /// `value: Shared<T>` is a `Shared<Database>` only at `SignalCell<Database>`, and
     /// the head alone cannot see that (A19). The member descent skips a member
     /// whose substituted type is its declared one: a concrete member is a type in
     /// its own right, already checked, and reporting it again would be two
@@ -12148,19 +12158,44 @@ impl<'src> Analyzer<'src> {
     /// exposed field must be a `Signal` of a Wire type — exposure is
     /// observation, and the observed values cross the wire. Runs after all
     /// modules are walked.
+    /// `[expose]`: a field may be exposed when its type IMPLEMENTS
+    /// `std::Source` and the element that impl provides is Wire (A32's ruling).
+    ///
+    /// The test used to be the field's SPELLING — `Node::AccessorWithGenerics(
+    /// "Signal", [element])` — which made the canonical cell the only exposable
+    /// type in the language: a `StorageSignal`, a `RemoteSource`, any mirror of
+    /// one's own was refused for not being spelled `Signal`, and so was a field
+    /// written through an alias. Reconciling against the nominal trait removes
+    /// that ceiling without widening what crosses the wire: `Source` is what
+    /// "observable" means, and the element comes off the impl rather than off
+    /// the written arguments, so a source whose element is not its first type
+    /// argument is read correctly too.
     fn check_expose_fields(&mut self) {
         let checks = std::mem::take(&mut self.expose_fields_to_check);
-        for (label, type_node, span, declaration_id) in checks {
-            let signal_element = match type_node {
-                Some(Node::AccessorWithGenerics("Signal", arguments)) if arguments.0.len() == 1 => {
-                    Some(&arguments.0[0].0)
-                }
+        // With `std::reactive` unloaded, no type in the program can implement
+        // `Source`, so every exposed field takes the refusal below rather than
+        // going unchecked.
+        let source_trait_id = self.source_trait_id;
+        for (label, type_node, field_type_id, span, declaration_id) in checks {
+            let field_type = field_type_id.get_type(self);
+            // A field that never grounded is another diagnostic's business.
+            if matches!(field_type, Type::Unknown | Type::Unresolved) {
+                continue;
+            }
+            let element = match source_trait_id
+                .and_then(|trait_id| self.trait_args_for(&field_type, trait_id))
+            {
+                Some(arguments) if arguments.len() == 1 => Some(arguments[0]),
                 _ => None,
             };
-            match signal_element {
-                Some(element) if self.is_wire_type(element) => {}
+            let rendered_field = type_node
+                .map(render_type)
+                .unwrap_or_else(|| self.pretty_print_type(&field_type, &HashMap::default()));
+            match element {
+                Some(element) if self.resolved_type_is_wire(element) => {}
                 Some(element) => {
-                    let rendered = render_type(element);
+                    let element_type = element.get_type(self);
+                    let rendered = self.pretty_print_type(&element_type, &HashMap::default());
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -12168,7 +12203,7 @@ impl<'src> Analyzer<'src> {
                             span,
                             msg: format!(
                                 "{label} is `[expose]`d, but its element `{rendered}` is not Wire: \
-                             an exposed signal's values cross the wire, so the element must be \
+                             an exposed source's values cross the wire, so the element must be \
                              Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
                              `[derive(Wire)]` type)"
                             ),
@@ -12177,18 +12212,17 @@ impl<'src> Analyzer<'src> {
                     );
                 }
                 None => {
-                    let rendered = type_node
-                        .map(render_type)
-                        .unwrap_or_else(|| "_".to_string());
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
-                                "{label} is `[expose]`d, but its type `{rendered}` is not a \
-                             `Signal`: only observable state (`Signal<T>` with a Wire `T`) can \
-                             be exposed; a plain value has nothing to subscribe to"
+                                "{label} is `[expose]`d, but its type `{rendered_field}` does not \
+                             implement `std::Source`: only observable state can be exposed, \
+                             because the client mirrors it by subscribing. Write a \
+                             `SignalCell<T>` with a Wire `T`, or implement `std::Source<T>` for \
+                             this type"
                             ),
                         },
                         declaration_id,
@@ -12196,6 +12230,34 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+    }
+
+    /// [`is_wire_type`]'s rule read off a RESOLVED type rather than a written
+    /// node — for the `[expose]` element, which now comes from the `Source`
+    /// impl and so has no node of its own.
+    fn resolved_type_is_wire(&self, type_id: TypeId) -> bool {
+        let (name, arguments) = match type_id.get_type(self) {
+            Type::Struct(id, arguments) => (self.structs.get(&id).map(|s| s.name), arguments),
+            Type::Enum(id, arguments) => (self.enums.get(&id).map(|e| e.name), arguments),
+            _ => return false,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        if matches!(name, "str" | "i32" | "u32" | "i53" | "f64" | "bool") {
+            return true;
+        }
+        // A `[derive(Wire)]` name is Wire whatever its arguments, exactly as the
+        // node-shaped check reads it: the derive emits no generic impls, so a
+        // generic Wire type fails at its own declaration and its arguments can
+        // never reach the payload.
+        if self.wire_names.contains(name) {
+            return true;
+        }
+        matches!(name, "List" | "Option")
+            && arguments
+                .iter()
+                .all(|argument| self.resolved_type_is_wire(*argument))
     }
 
     /// Resolves a method `member_name` callable on a concrete `subject_type`
@@ -19050,9 +19112,18 @@ impl<'src> Analyzer<'src> {
     /// Inheriting the subject's exact constraint id makes the binder identical to
     /// having written the bound out — including multi-bound (`T: A + B`) cases,
     /// whose extra bounds hang off that same id.
+    ///
+    /// A binder's own BOUND may declare binders too (B165): `impl type S:
+    /// Source<type T> with MaybeSignal<T>` is generic in both `S` and `T`, and
+    /// `T` is in scope for the whole head — the sibling bounds, the `with`
+    /// clause, and every member signature. The bounds are walked as the binder
+    /// they constrain registers, so the nested ones register FIRST.
     fn register_subject_binders(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) {
         match &node.0 {
             Node::TypeBinder(name, bounds) => {
+                for bound in bounds {
+                    self.register_subject_binders(bound, scope_id);
+                }
                 self.register_binder(name, &node.1, bounds, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
@@ -20693,22 +20764,6 @@ impl<'src> Analyzer<'src> {
                 let mut fields = Vec::new();
                 for child in body.iter().flat_map(|body| &body.0) {
                     let (field_name, field_name_span) = child.0.0;
-                    // An `[expose]`d field must be a `Signal` of a Wire type —
-                    // recorded now, checked once every module's Wire names are
-                    // collected (`check_expose_fields`).
-                    if child.0.2 {
-                        self.expose_fields_to_check.push((
-                            format!("field `{field_name}` of struct `{name}`"),
-                            child.0.1.as_ref().map(|type_node| &type_node.0),
-                            child
-                                .0
-                                .1
-                                .as_ref()
-                                .map(|type_node| type_node.1)
-                                .unwrap_or(child.1),
-                            id,
-                        ));
-                    }
                     // An `async || T` field peels its marker (J2): calls
                     // through the field await.
                     let mut field_type_node = child.0.1.as_ref();
@@ -20719,6 +20774,24 @@ impl<'src> Analyzer<'src> {
                     let type_id = field_type_node
                         .map(|x| self.walk_type_node(x, body_scope_id))
                         .unwrap_or(Type::Unknown.get_type_id(self));
+                    // An `[expose]`d field's type must implement `std::Source`
+                    // over a Wire element — recorded now with the type it walked
+                    // to, checked once every module's Wire names and impls are
+                    // collected (`check_expose_fields`).
+                    if child.0.2 {
+                        self.expose_fields_to_check.push((
+                            format!("field `{field_name}` of struct `{name}`"),
+                            child.0.1.as_ref().map(|type_node| &type_node.0),
+                            type_id,
+                            child
+                                .0
+                                .1
+                                .as_ref()
+                                .map(|type_node| type_node.1)
+                                .unwrap_or(child.1),
+                            id,
+                        ));
+                    }
                     fields.push(Field {
                         name: field_name,
                         name_span: field_name_span,
@@ -21979,7 +22052,7 @@ impl<'src> Analyzer<'src> {
                 // recording `node.1` here — which reaches to the closing `>` —
                 // laid a second reference right over them, and the language
                 // server, which drops overlapping tokens, then kept only the
-                // outer one: `Signal<List<str>>` highlighted (and hovered, and
+                // outer one: `SignalCell<List<str>>` highlighted (and hovered, and
                 // navigated) as one name, with `List` and `str` dark. The head is
                 // the application's leading token, so it starts where the node
                 // does; the `min` keeps a span inside its node whatever a future
@@ -22757,7 +22830,36 @@ impl<'src> Analyzer<'src> {
         };
         let mut bindable = own_generics;
         bindable.extend(self.impl_binder_generics(member_id));
+        bindable.extend(self.declaring_trait_generics(member_id));
         bindable
+    }
+
+    /// The generic parameters of the TRAIT declaring `member_id` — `SignalCell<T>`'s
+    /// `T` for a `fun new(value: T): SignalCell<T>` the trait carries.
+    ///
+    /// A trait's ASSOCIATED FUNCTION (B162) is reached at `Trait::func(..)`
+    /// with no receiver and no impl, so neither channel the two sets above
+    /// cover exists: the function's own generics are empty and no
+    /// implementation declares it. The trait's own parameters are then the
+    /// call's ONLY binding channel, exactly as a with-clause binder's arguments
+    /// are for an impl-declared member. Without them `Signal::new(1)` typed as
+    /// `SignalCell<T>` with `T` abstract, and every use of the binding was
+    /// reported for a parameter the author never wrote.
+    ///
+    /// Harmless for a `self` method, where the receiver has already bound the
+    /// same ids: an already-bound id reconciles to itself and re-inserts
+    /// unchanged.
+    fn declaring_trait_generics(&self, member_id: Id) -> Vec<TypeId> {
+        self.traits
+            .values()
+            .find(|trait_| {
+                trait_
+                    .declarations
+                    .values()
+                    .any(|declared| *declared == member_id)
+            })
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
     }
 
     /// The generic binder constraint ids of the impl DECLARING `member_id`:
@@ -23492,7 +23594,7 @@ impl<'src> Analyzer<'src> {
                             // binding then REBINDS the receiver-known `T` to
                             // `List<unknown>` (reconcile's generic arm pushes
                             // the raw argument side), which is the reported
-                            // `Signal<List<unknown>>` hover. Only an unfilled
+                            // `SignalCell<List<unknown>>` hover. Only an unfilled
                             // slot takes the expectation, and only a fully
                             // determined `E` commits — a slot write is
                             // permanent, so a mid-inference or abstract
@@ -24585,7 +24687,7 @@ impl<'src> Analyzer<'src> {
 
     /// Binds a generic that appears only in another generic's *parameterized bound*
     /// (`S: Source<T>`), once that other generic is bound to a concrete type — recovering
-    /// the bound's arguments from the concrete type's impl (`Signal<i32>: Source<i32>`
+    /// the bound's arguments from the concrete type's impl (`SignalCell<i32>: Source<i32>`
     /// binds `T = i32`). Without this the inner generic stays abstract and a call
     /// monomorphizes to the empty abstract method (a `to_json` inside a `|T| ..` closure
     /// yields `undefined`). `bound_owners` are the constraints whose bounds to inspect;
@@ -25173,7 +25275,7 @@ impl<'src> Analyzer<'src> {
                 }
                 // A parameterized trait (`Readable<U>`) binds its arguments from the
                 // concrete impl: recover the type's trait arguments and reconcile
-                // them against the template, so `Signal<A>` against `Readable<U>`
+                // them against the template, so `SignalCell<A>` against `Readable<U>`
                 // binds `U = A`.
                 let mut bindings = Vec::new();
                 if !template_arguments.is_empty() {
@@ -35374,7 +35476,7 @@ pub struct HmrBinding {
 pub enum TransferForm {
     /// A plain-data binding: the value itself crosses the swap.
     Value,
-    /// A `Signal<T>` with transferable `T`: the payload (the value cell) crosses;
+    /// A `SignalCell<T>` with transferable `T`: the payload (the value cell) crosses;
     /// the new bundle builds a fresh signal seeded with it, so old subscribers die.
     SignalPayload,
     /// A `Shared<T>` with transferable `T`: the payload crosses into a fresh cell.
@@ -36407,16 +36509,20 @@ pub(crate) fn service_impl_source(
         .map(str::to_string)
         .unwrap_or_else(|| format!("{service_name}Client"));
     // The `[expose]`d fields — each becomes a typed `RemoteSource<Element>`
-    // mirror on the client. The element comes off the field's `Signal<Element>`
-    // type (the `[expose]` check guarantees that shape); a malformed field
-    // renders `_`, surfacing a clear error at the generated use site.
+    // mirror on the client. This runs at macro-expansion time, before any type
+    // resolves, so the element is read off the field's SOLE type argument —
+    // `SignalCell<Note>`, `StorageSignal<str>`, any single-parameter source.
+    // Whether the field is exposable at all is the analyzer's
+    // `check_expose_fields`, which reconciles it against `std::Source`; a source
+    // whose element is not its one type argument renders `_` here and surfaces a
+    // clear error at the generated use site.
     let exposed: Vec<(&str, String)> = fields
         .0
         .iter()
         .filter(|field| field.0.2)
         .map(|field| {
             let element = match field.0.1.as_ref().map(|type_node| &type_node.0) {
-                Some(Node::AccessorWithGenerics("Signal", arguments)) if arguments.0.len() == 1 => {
+                Some(Node::AccessorWithGenerics(_, arguments)) if arguments.0.len() == 1 => {
                     render_type(&arguments.0[0].0)
                 }
                 _ => "_".to_string(),
@@ -39627,19 +39733,28 @@ fn analyze_inner<'src>(
             .insert("Shared", shared_struct_id);
     }
 
-    // The `std::reactive` `Signal` struct, if `reactive.vl` loaded — captured the
-    // same way as `Shared`, for the HMR transfer classification (`hmr.md` §4):
-    // a `Signal<T>` binding carries its payload across a hot swap. `Signal` is
-    // otherwise recognized only syntactically, so its id is captured nowhere else.
-    let signal_struct_id = module_scopes
+    // The `std::reactive` `SignalCell` struct, if `reactive.vl` loaded — captured
+    // the same way as `Shared`, for the HMR transfer classification (`hmr.md` §4):
+    // a `SignalCell<T>` binding carries its payload across a hot swap. The rule is
+    // about the CELL's representation, not about the `Signal` contract — a custom
+    // impl's storage is its own business — so this keys on the cell alone.
+    let signal_cell_struct_id = module_scopes
         .get("reactive")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
-        .and_then(|scope| scope.name_to_id_map.get("Signal").copied());
-    if let Some(signal_struct_id) = signal_struct_id {
+        .and_then(|scope| scope.name_to_id_map.get("SignalCell").copied());
+    if let Some(signal_cell_struct_id) = signal_cell_struct_id {
         analyzer
             .primitive_struct_ids
-            .insert("Signal", signal_struct_id);
+            .insert("SignalCell", signal_cell_struct_id);
     }
+
+    // The `std::reactive` `Source` TRAIT, if `reactive.vl` loaded. `[expose]`
+    // reconciles an exposed field's type against it (A32): the nominal std trait
+    // decides what is observable, not a spelling.
+    analyzer.source_trait_id = module_scopes
+        .get("reactive")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("Source").copied());
 
     // The `std::json` `JsonValue` struct, if `json.vl` loaded — same treatment.
     // Its `field` method id is captured after `build()` to lower to `self[name]`.

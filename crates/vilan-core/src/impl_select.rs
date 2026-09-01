@@ -26,8 +26,8 @@
 //!    wants — a bound-directed call always does — an applying impl is kept
 //!    only if the arguments it provides FOR THIS RECEIVER are those arguments.
 //!    A blanket `impl type T with MaybeSignal<T>` provides
-//!    `MaybeSignal<Signal<str>>` on a `Signal<str>` where
-//!    `impl Signal<type T> with MaybeSignal<T>` provides `MaybeSignal<str>`,
+//!    `MaybeSignal<SignalCell<str>>` on a `SignalCell<str>` where
+//!    `impl SignalCell<type T> with MaybeSignal<T>` provides `MaybeSignal<str>`,
 //!    so the bound alone separates them and each is reachable.
 //! 3. **Specificity.** Among the survivors, the impl whose subject the others
 //!    match and which matches none of theirs wins — any constructor-headed
@@ -406,6 +406,7 @@ fn provides_wanted_instantiation(
     }
     let mut bindings = HashMap::default();
     bind_subject(program, implementation.subject, concrete, &mut bindings);
+    bind_bound_binders(program, implementation.subject, &mut bindings);
     written
         .iter()
         .zip(wanted.arguments)
@@ -418,6 +419,108 @@ fn provides_wanted_instantiation(
                 _ => true,
             }
         })
+}
+
+/// Grounds the binders a subject's BOUNDS introduce (B165): in
+/// `impl type S: Src<type T> with Maybe<T>`, `S` binds from the receiver and
+/// `T` binds from the receiver's OWN `Src` implementation — `Cell: Src<i32>`
+/// binds `T = i32`, so the impl provides `Maybe<i32>` on a `Cell` and not
+/// `Maybe<Cell>`.
+///
+/// Without this the bound's binder stayed a hole, the arguments the impl
+/// provides read as "not resolvable", and tier 2's `instantiation_agrees` kept
+/// the impl on the leniency clause. Two blankets separated only by their
+/// instantiation — the static `impl type T with Maybe<T>` and this one — then
+/// reached tier 3 together, where the bounded binder is the stronger one and
+/// won: a `holder<V: Maybe<Cell>>(cell)` ran the reactive body against a value
+/// that was never a `Cell`, and printed `undefined`. A silent miscompile, and
+/// only expressible once a binder could be written inside a bound at all.
+fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap<TypeId, TypeId>) {
+    let mut binders = Vec::new();
+    collect_subject_binders(program, subject, &mut binders);
+    for binder in binders {
+        let Some(concrete) = bindings.get(&binder).copied() else {
+            continue;
+        };
+        for bound_id in bound_type_ids(program, binder) {
+            let Some(Type::Trait(trait_id, bound_arguments)) =
+                program.type_id_to_type_map.get(&bound_id).cloned()
+            else {
+                continue;
+            };
+            if bound_arguments.is_empty() {
+                continue;
+            }
+            let Some(provided) = provided_trait_arguments(program, concrete, trait_id) else {
+                continue;
+            };
+            if provided.len() != bound_arguments.len() {
+                continue;
+            }
+            for (pattern, actual) in bound_arguments.iter().zip(provided) {
+                bind_subject(program, *pattern, actual, bindings);
+            }
+        }
+    }
+}
+
+/// The bound type ids a binder carries — the `Src<type T>` of
+/// `type S: Src<type T>`, arguments and all. [`bound_trait_ids`] reads the same
+/// list for its ids alone.
+fn bound_type_ids(program: &Program, constraint_id: TypeId) -> Vec<TypeId> {
+    program
+        .generic_bounds
+        .get(&constraint_id)
+        .cloned()
+        .unwrap_or_else(|| vec![constraint_id])
+}
+
+/// The arguments `concrete` provides for `trait_id`, through the first impl
+/// that applies to it and names the trait — the emission-side reading of the
+/// analyzer's `trait_args_for`.
+fn provided_trait_arguments(
+    program: &Program,
+    concrete: TypeId,
+    trait_id: Id,
+) -> Option<Vec<TypeId>> {
+    for implementation in &program.implementations {
+        let Some((_, written)) = implementation
+            .trait_args
+            .iter()
+            .find(|(provided, _)| *provided == trait_id)
+        else {
+            continue;
+        };
+        if !subject_applies(program, implementation.subject, concrete) {
+            continue;
+        }
+        let mut bindings = HashMap::default();
+        bind_subject(program, implementation.subject, concrete, &mut bindings);
+        return Some(
+            written
+                .iter()
+                .map(|argument| ground_id(program, *argument, &bindings))
+                .collect(),
+        );
+    }
+    None
+}
+
+/// [`ground`] at the id level, one step deep: a written argument that IS a
+/// binder becomes what that binder bound, and anything else stays as written.
+///
+/// Shallow on purpose. A constructed argument (`Source<List<T>>`) would need a
+/// substituted type INTERNED, which needs a mutable analyzer this side of the
+/// pipeline does not have; leaving it as written keeps the binder a hole, which
+/// the instantiation filter reads as "cannot tell" and keeps the impl — the
+/// behaviour before this grounding existed.
+fn ground_id(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, TypeId>) -> TypeId {
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(Type::Generic(constraint_id)) => {
+            bindings.get(constraint_id).copied().unwrap_or(type_id)
+        }
+        _ => type_id,
+    }
 }
 
 /// Every implementation that applies to `concrete`, in declaration order,

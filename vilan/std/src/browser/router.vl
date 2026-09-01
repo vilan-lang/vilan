@@ -14,7 +14,7 @@
 
 import pkg::dom::{ Event, window };
 import pkg::option::Option;
-import pkg::reactive::{ FlushPolicy, Signal, turn };
+import pkg::reactive::{ FlushPolicy, SignalCell, turn };
 import pkg::shared::Shared;
 import pkg::ui::{ View, chunk_failure, chunk_pending, view };
 
@@ -28,7 +28,7 @@ external fun location_path(): str;
 
 /// The path-signal singleton (the `std::reactive` module-state pattern) —
 /// created empty at load, wired to the real location on first use.
-let path_signal: Signal<str> = Signal::new("");
+let path_signal: SignalCell<str> = SignalCell::new("");
 let wired: Shared<bool> = Shared::new(false);
 
 /// Wire the singleton once: read the current location and subscribe
@@ -49,7 +49,7 @@ fun ensure_wired() {
 
 /// The current `location.pathname`, live across `navigate` and back/forward.
 /// Derive the app's typed route from it: `current_path().map(parse)`.
-fun current_path(): Signal<str> {
+fun current_path(): SignalCell<str> {
 	ensure_wired();
 	path_signal
 }
@@ -108,7 +108,7 @@ fun plain_left_click(event: Event): bool {
 /// until the chunk lands, so the previous page stays on screen; bind this to
 /// show a spinner over it. Always false in a single-file build, which has no
 /// chunk to wait for.
-fun pending(): Signal<bool> {
+fun pending(): SignalCell<bool> {
 	chunk_pending()
 }
 
@@ -118,6 +118,6 @@ fun pending(): Signal<bool> {
 /// happen) and publishes the reason here; the next navigation clears it and
 /// refetches, so a retry is a link click and needs no API. Always `None` in a
 /// single-file build.
-fun chunk_error(): Signal<Option<str>> {
+fun chunk_error(): SignalCell<Option<str>> {
 	chunk_failure()
 }

@@ -1,6 +1,9 @@
 // A module beside the entry, reached as `pkg::counter`.
 //
-// State is a `Signal`. `count.map(..)` derives a NEW reactive value whose
+// State is a signal. `Signal::new(0)` hands back a `SignalCell` — `Signal` is
+// the writable TRAIT (`set`/`set_with`), `SignalCell` the canonical cell that
+// implements it, and a component that wants any signal bounds on the trait.
+// `count.map(..)` derives a NEW reactive value whose
 // dependency is structural — known when it is built, not discovered by running
 // it — and `bind_text` takes that derived source, so the text updates itself.
 // (The i-string renders the number directly, by host coercion.)
@@ -10,7 +13,7 @@
 // the bundle. `.styled(..)` only puts the generated class names on the element
 // — `index.html` links the sidecar.
 //
-// `Signal`, `view` and `View` are ambient: `prelude = "std::web"` in
+// `Signal`, `SignalCell`, `view` and `View` are ambient: `prelude = "std::web"` in
 // vilan.toml puts them in scope with no import, along with the MODULES `style`
 // and `ui` — which is why the chain below writes `style::Display::Flex` and
 // imports nothing for it. The prelude carries the module, not its members, so

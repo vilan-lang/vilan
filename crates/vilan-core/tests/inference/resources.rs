@@ -378,18 +378,18 @@ fn r10_refuses_a_resource_reaching_shared_through_a_generic_field() {
 
 #[test]
 fn r10_refuses_a_signal_of_a_resource() {
-    // `Signal<T>`'s storage IS a `Shared<T>` (signal-update.md §6), so
-    // `Signal<Database>` is `Shared<Database>` by another name — and used to
+    // `SignalCell<T>`'s storage IS a `Shared<T>` (signal-update.md §6), so
+    // `SignalCell<Database>` is `Shared<Database>` by another name — and used to
     // compile clean while the direct spelling was refused.
     assert_fails_spanning(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::db::Database;
-        fun sink(cell: Signal<Database>) {}
+        fun sink(cell: SignalCell<Database>) {}
         fun main() {}
         "#,
-        "Signal<Database>",
-        "`Shared` cannot hold the resource `Database`, reached through `Signal.value`",
+        "SignalCell<Database>",
+        "`Shared` cannot hold the resource `Database`, reached through `SignalCell.value`",
     );
 }
 
@@ -399,10 +399,10 @@ fn r10_leaves_a_signal_of_data_alone() {
     // data argument reaches a `Shared<i32>` / `Shared<List<str>>` and stops.
     assert_compiles(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
-            let count: Signal<i32> = Signal::new(1);
-            let names: Signal<List<str>> = Signal::new(["a"]);
+            let count: SignalCell<i32> = Signal::new(1);
+            let names: SignalCell<List<str>> = Signal::new(["a"]);
             count.set(2);
             names.set(["b"]);
         }
@@ -2137,12 +2137,12 @@ fn r9_kolt_hook_shape_over_a_module_level_database_compiles() {
     // Database pins likewise assert_compiles here.)
     assert_compiles(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::shared::Shared;
         import std::db::Database;
         struct Workspace { id: i32, name: str }
         let db: Database = Database::open(":memory:");
-        let workspaces: Signal<List<Workspace>> = Signal::new([]);
+        let workspaces: SignalCell<List<Workspace>> = Signal::new([]);
         fun main() {
             let create = |name: str| {
                 let id = db.prepare("INSERT INTO workspace (name) VALUES (?)").run([name]);
@@ -3271,7 +3271,7 @@ fn a_context_requiring_drop_body_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         let counter = Signal::new(0);
         resource struct Bump { x: i32 }
         impl Bump with Drop {
@@ -5292,10 +5292,10 @@ fn a_service_struct_owning_a_resource_is_rejected() {
     assert_fails_with(
         r#"
         import std::db::Database;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         [service(Client)]
         struct Store {
-            [expose] count: Signal<i32>,
+            [expose] count: SignalCell<i32>,
             db: Database,
         }
         impl Store {

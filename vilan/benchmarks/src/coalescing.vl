@@ -8,7 +8,7 @@ import std::json::{ Json, json_codec };
 import std::wire::Serializer;
 import std::option::Option::{ Some, None };
 import std::result::Result::{ self, Ok, Err };
-import std::reactive::{ batch, Signal };
+import std::reactive::{ batch, Signal, SignalCell };
 import std::rpc::{
 	duplex_pair, local_rpc, Dispatcher, RpcError, RpcOutcome, call, arg, reply, decode_failed,
 	ReactiveServer, ReactiveClient, RemoteSource,
@@ -30,7 +30,7 @@ fun run() {
 		server_outer.send(frame);
 	});
 
-	let counter: Signal<i32> = Signal::new(0);
+	let counter: SignalCell<i32> = Signal::new(0);
 	let server = ReactiveServer::new(server_end, json_codec());
 	let channel = server.expose(counter);
 	let deliveries: Shared<i32> = Shared::new(0);

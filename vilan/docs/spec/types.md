@@ -261,7 +261,7 @@ impl's generics:
 
 ```vilan,fragment
 impl List<type T: PartialEq> { … }      // for every List<T> where T: PartialEq
-impl Signal<Signal<type U>> { … }       // only for nested signals
+impl SignalCell<SignalCell<type U>> { … }       // only for nested signals
 impl type T: Display { … }              // blanket: every T that is Display
 ```
 
@@ -269,6 +269,20 @@ An impl applies to a concrete type when the pattern matches it and every
 binder's bounds hold. Members may be functions (with or without
 `self`). A function without `self` is a **static**, reached as
 `Subject::name(…)`.
+
+A binder may be written **inside another binder's bound**, and it declares
+the impl's generics exactly like one written in the subject's own
+arguments. Its scope is the whole head — the sibling bounds, the `with`
+clause, and every member signature:
+
+```vilan,fragment
+impl type S: Source<type T> with MaybeSignal<T> { … }
+```
+
+reads "for every `S` that is a `Source` of some `T`", and binds that `T`
+per receiver: a `Words: Source<str>` instantiates the impl at `T = str`, a
+`Counts: Source<i32>` at `T = i32`. A name in a bound that no binder
+declares is still unresolved, and is reported where it is written.
 
 A trait has **one implementation per subject**: writing
 `impl Bag with Show` twice is a compile error at the second one, since
@@ -331,19 +345,19 @@ trait MaybeSignal<T> { fun bind(self, react: |T| void); }
 impl type T with MaybeSignal<T> {              // every type, statically
 	fun bind(self, react: |T| void) { react(self); }
 }
-impl Signal<type T> with MaybeSignal<T> {      // signals, reactively
+impl SignalCell<type T> with MaybeSignal<T> {      // signals, reactively
 	fun bind(self, react: |T| void) { let _watching = self.sub(react); }
 }
 
 fun badge<V: MaybeSignal<str>>(label: V) { … }  // takes both, no ceremony
 ```
 
-Because the instantiation is decided first, a `Signal<str>` reaches the
+Because the instantiation is decided first, a `SignalCell<str>` reaches the
 `Signal` impl under a `MaybeSignal<str>` bound and the blanket under a
-`MaybeSignal<Signal<str>>` bound, where it is a static value of that
+`MaybeSignal<SignalCell<str>>` bound, where it is a static value of that
 type. The two impls never overlap at one bound: the blanket provides
-`MaybeSignal<Signal<str>>` there and the `Signal` impl provides
-`MaybeSignal<str>`, and `T = Signal<T>` has no solution at any finite
+`MaybeSignal<SignalCell<str>>` there and the `Signal` impl provides
+`MaybeSignal<str>`, and `T = SignalCell<T>` has no solution at any finite
 `T`. There is no way to write "every type *except* a signal" — a
 negative bound would make adding an implementation a breaking change for
 everyone who wrote one — and by this order there is no need to.
@@ -385,13 +399,13 @@ exception to the rule above but an application of it: a trait written
 there is a **checked constraint**, not the binding's type.
 
 ```
-let count: Signal<i32> = SignalCell::new(1);
+let count: SignalCell<i32> = SignalCell::new(1);
 ```
 
 `count`'s type is `SignalCell<i32>` — the type its initializer infers,
 exactly as if nothing had been written. The annotation neither widens it
 nor boxes it; it asserts that whatever type the initializer produces
-implements `Signal<i32>`, and is a compile error when it does not. This
+implements `SignalCell<i32>`, and is a compile error when it does not. This
 is the bounded-generic rule (§5.6) in binding position: **checked wide,
 kept narrow**, one concrete type per binding. Reading `count`'s members
 therefore reaches `SignalCell`'s own — its fields included — and a
@@ -408,10 +422,10 @@ constraint meets the one type that unification produced:
 
 ```
 // legal — both arms are SignalCell<i32>
-let cell: Signal<i32> = if c { SignalCell::new(1) } else { SignalCell::new(2) };
+let cell: SignalCell<i32> = if c { SignalCell::new(1) } else { SignalCell::new(2) };
 // refused at the ARMS, as an ordinary mismatch: two concrete types,
-// each implementing Signal<i32>, still do not unify
-let cell: Signal<i32> = if c { SignalCell::new(1) } else { OtherSignal::new(2) };
+// each implementing SignalCell<i32>, still do not unify
+let cell: SignalCell<i32> = if c { SignalCell::new(1) } else { OtherSignal::new(2) };
 ```
 
 ### Associated functions
@@ -421,7 +435,7 @@ receiver, with or without a default body. They are a namespace, not a
 dispatch — there is no receiver to select an implementation with.
 
 ```
-trait Signal<T> {
+trait SignalCell<T> {
     fun new(initial: T): SignalCell<T> { SignalCell { value = initial } }
 }
 ```
@@ -479,11 +493,11 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
    (`fun f<T: PartialEq, S: Source<T>>(source: S)`) is bound once that
    sibling is: the bound's arguments are recovered from the
    implementation the sibling's type provides for the bound trait
-   (`Signal<i32>: Source<i32>` binds `T := i32`). The arguments are read
+   (`SignalCell<i32>: Source<i32>` binds `T := i32`). The arguments are read
    at that implementation's OWN binders, so an argument whose type is
    caller-generic comes through as the caller's parameter — bounds
    intact — exactly as a concrete one comes through as the concrete
-   type: under `impl Signal<type Z> with Source<Z>`, a `Signal<T>`
+   type: under `impl SignalCell<type Z> with Source<Z>`, a `SignalCell<T>`
    receiver binds `Z := T` and the bound's argument is the caller's `T`,
    never the impl's `Z`.
 4. After binding, every bound's satisfaction is checked; an unsatisfied
@@ -675,7 +689,7 @@ each element `U` of `T` to `F<U>`; `combine`'s signature is the
 canonical use:
 
 ```vilan,fragment
-fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T>
+fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
 A **tuple comprehension** `(x in xs => e)` is the value-level mapping
@@ -695,7 +709,7 @@ flat, and they are collected into that one tuple argument:
 
 ```vilan,fragment
 fun log<T: (..: Display)>(...items: T)      //  log(1, "hi")  ==  log((1, "hi"))
-fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T>
+fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
 `T` is the **pack** — the tuple of the collected arguments' types — not

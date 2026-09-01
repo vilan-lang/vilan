@@ -118,12 +118,12 @@ that renders them:
 
 ```vilan,browser
 import std::dev;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 // Carried across every swap by key + type. Edit main's body, save, and these
 // hold their values — only the view re-runs.
 mut opened = 0;
-let recent: Signal<List<str>> = Signal::new([]);
+let recent: SignalCell<List<str>> = Signal::new([]);
 
 fun main() {
 	opened = opened + 1;
@@ -497,7 +497,7 @@ takes:
 
 ```vilan,browser
 import std::option::Option::{ None, Some, self };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::router::{ chunk_error, current_path, pending, segments };
 import std::ui::{ View, mount_root, view };
 

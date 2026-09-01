@@ -2563,7 +2563,7 @@ impl<'src> Printer<'src> {
                     self.out.push(')');
                 }
             }
-            // `(U in T: Signal<U>)` — a mapped tuple type: `template` applied to
+            // `(U in T: SignalCell<U>)` — a mapped tuple type: `template` applied to
             // each element of the tuple `source`, with `binder` naming the element
             // type. The parentheses are the form's own, not a group around it.
             Node::MappedType {
@@ -5134,7 +5134,7 @@ mod idempotency {
                       \t[trait_only]\n\tfun tag(self): str;\n\
                       \t[doc(hidden)]\n\tfun internal(self): i32;\n}\n\
                       [service(Client)]\n\
-                      struct Sess {\n\t[expose] status: Signal<str>,\n\thidden: i32,\n}\n\
+                      struct Sess {\n\t[expose] status: SignalCell<str>,\n\thidden: i32,\n}\n\
                       impl Sess {\n\t[rpc]\n\tfun login(self, name: str): bool {\n\t\ttrue\n\t}\n}\n";
         let formatted = format(source);
         assert!(
@@ -5683,17 +5683,17 @@ mod bailing_constructs {
         );
     }
 
-    /// `(U in T: Signal<U>)` — a mapped tuple type, and its expression-level
+    /// `(U in T: SignalCell<U>)` — a mapped tuple type, and its expression-level
     /// counterpart `(source in sources => source.get())`. The parentheses belong
     /// to each form (the parser consumes them), so the printer emits them.
     #[test]
     fn mapped_type_and_tuple_comprehension() {
         assert_construct(
-            "fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {\n\
+            "fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {\n\
              \tlet snapshot = || (source in sources => source.get());\n\
              \tSignal::new(snapshot())\n\
              }\n",
-            "fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {\n\
+            "fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {\n\
              \tlet snapshot = || (source in sources => source.get());\n\
              \tSignal::new(snapshot())\n\
              }\n",
@@ -5727,10 +5727,10 @@ mod bailing_constructs {
             "fun tail<T: (2..)>(sep: str, mut ...rest: T): i32 {\n\t0\n}\n",
         );
         assert_construct(
-            "fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {\n\
+            "fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T> {\n\
              \tSignal::new(sources)\n\
              }\n",
-            "fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {\n\
+            "fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T> {\n\
              \tSignal::new(sources)\n\
              }\n",
         );
@@ -7003,7 +7003,7 @@ mod spanning_renderings {
     #[test]
     fn an_over_budget_declaration_does_not_arm_its_body() {
         let wide_signature = "fun task_row(client: KoltClient<SocketTransport>, workspace_id: i32, \
-                              task: Task, token: Signal<str>): View {\n\
+                              task: Task, token: SignalCell<str>): View {\n\
                               \tlet age = now().since(task.created_at).describe();\n\
                               \tview(\"li\").styled(row)\n\
                               }\n";
@@ -7014,7 +7014,7 @@ mod spanning_renderings {
              \tclient: KoltClient<SocketTransport>,\n\
              \tworkspace_id: i32,\n\
              \ttask: Task,\n\
-             \ttoken: Signal<str>,\n\
+             \ttoken: SignalCell<str>,\n\
              ): View {\n\
              \tlet age = now().since(task.created_at).describe();\n\
              \tview(\"li\").styled(row)\n\
@@ -7495,7 +7495,7 @@ mod split_comment_attachment {
         let source = "fun demo(\n\
                       \t// the live client\n\
                       \tclient: Client,\n\
-                      \ttoken: Signal<str>,\n\
+                      \ttoken: SignalCell<str>,\n\
                       ) {\n\
                       \twork()\n\
                       }\n";

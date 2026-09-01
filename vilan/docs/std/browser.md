@@ -115,8 +115,8 @@ fun view(tag: str): View
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
-trait Slot { fun place(self, parent: View) }          // View | str | Signal<str> | List<View>
-trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Signal<str>
+trait Slot { fun place(self, parent: View) }          // View | str | SignalCell<str> | List<View>
+trait AttrValue { fun apply(self, parent: View, name: str) }   // str | SignalCell<str>
 ```
 
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
@@ -146,17 +146,17 @@ too.
 | `text` | `(content: str): View` | static text |
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
-| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `Signal<str>` tracks |
+| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `SignalCell<str>` tracks |
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
-| `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`Signal<str>`), or `List<View>` |
+| `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`SignalCell<str>`), or `List<View>` |
 | `children` | `(items: List<View>): View` | append several |
 | `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
 | `bind_styled` | `(source: S): View`; `S: Source<Style>` | reactive compiled style — `styled`'s reactive twin |
 | `bind_attr` | `(name: str, source: S): View`; `S: Source<str>` | reactive attribute |
-| `bind_value` | `(signal: Signal<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
+| `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |
 | `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
@@ -174,7 +174,7 @@ Every binding above that only READS its argument is generic over
 `RemoteSource` mirror or a type of your own all drive it:
 
 ```vilan,fragment
-struct Stored<T> { inner: Signal<T> }
+struct Stored<T> { inner: SignalCell<T> }
 
 impl Stored<type T> with Source<T> {
 	fun get(self): T { self.inner.get() }
@@ -195,13 +195,13 @@ Two things deliberately still ask for the concrete type:
   yet — the write side is its own design question.
 - **`attr` and `child`**, whose reactive arms are the `AttrValue` and
   `Slot` traits — so `<div href(source)>` and `<p>{source}</p>` still want
-  a `Signal<str>`. Widening a trait ARM is a blanket impl rather than a
+  a `SignalCell<str>`. Widening a trait ARM is a blanket impl rather than a
   bound on a parameter, and that is a separate piece of machinery.
 
 ## std::router
 
 ```vilan,fragment
-fun current_path(): Signal<str>       // location.pathname, live (navigate + back/forward)
+fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"]
 
@@ -209,8 +209,8 @@ trait Routable { fun to_path(self): str }
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
 
 // Route chunks (a `split = true` leg) — both are ordinary signals
-fun pending(): Signal<bool>                 // a route chunk is in flight
-fun chunk_error(): Signal<Option<str>>      // the last fetch failed, with the reason
+fun pending(): SignalCell<bool>                 // a route chunk is in flight
+fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with the reason
 ```
 
 `current_path()` is a singleton signal: every caller gets the same one, and

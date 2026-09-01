@@ -7,7 +7,7 @@ import std::http::{ Response, Server };
 import std::json::{ FromJson, Json, json_codec };
 import std::option::Option::{ None, Some, self };
 import std::io::print;
-import std::reactive::{ Signal, Subscription };
+import std::reactive::{ Signal, SignalCell, Subscription };
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{
 	DuplexEnd,
@@ -30,7 +30,7 @@ let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 [service(Client)]
 struct Board {
-	count: Signal<i32>,
+	count: SignalCell<i32>,
 }
 
 impl Board {

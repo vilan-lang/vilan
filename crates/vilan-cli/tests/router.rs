@@ -30,7 +30,7 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// nested layouts, a hand-written `parse`/`href` pair over `segments`, typed
 /// `link`s, programmatic `navigate`, and a `swap`-rendered page tree.
 const APP: &str = r#"import std::ui::{ View, view, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::router::{ current_path, navigate, segments, link, Routable };
 import std::option::Option::{ self, Some, None };
 
@@ -109,7 +109,7 @@ fun home_page(): View {
 /// The swapped-AWAY page for the disposal check (A21): a `style_var` whose
 /// signal is written from a button OUTSIDE the swapped subtree, so the write
 /// can be fired after this page is gone.
-fun login_page(width: Signal<str>): View {
+fun login_page(width: SignalCell<str>): View {
 	view("section")
 		.attr("id", "login")
 		.style_var("--w", width)
@@ -126,7 +126,7 @@ fun workspace_layout(org: str, inner: WorkspaceRoute): View {
 		})
 }
 
-fun app(route: Signal<Route>): View {
+fun app(route: SignalCell<Route>): View {
 	let width = Signal::new("10px");
 	view("main")
 		.child(view("nav")

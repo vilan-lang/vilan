@@ -132,6 +132,31 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
 /// not see at all. The extra impls only ever add members, which is the
 /// direction this module's guarantee allows.
 pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str) -> Vec<Id> {
+    impl_members_for_bound(program, subject_type_id, member, &[])
+}
+
+/// [`impl_members_for`], narrowed to the impls that provide one of `traits`.
+///
+/// A call through a BOUND can only reach an impl of the bound's own trait:
+/// `v.bind(..)` under `V: MaybeSignal<str>` is answered by an impl of
+/// `MaybeSignal`, never by some other trait that happens to declare a member
+/// spelled `bind`. The candidate list this refines is name-keyed by design
+/// (`candidates_of`), which is sound for the union edges and far too wide for
+/// coverage: with two traits in a program declaring the same member name, every
+/// call to either inherited the other's context reads. std shipping a blanket
+/// `impl type T with MaybeSignal<T>` made that concrete — the subject matches
+/// every type, so its `bind` was selected for every receiver in every program
+/// that loaded `std::reactive`.
+///
+/// An empty `traits` keeps the unfiltered reading, and so does a filter that
+/// selects nothing: this narrows where the language says it may, and widens
+/// back wherever it cannot tell.
+pub fn impl_members_for_bound(
+    program: &Program,
+    subject_type_id: TypeId,
+    member: &str,
+    traits: &[Id],
+) -> Vec<Id> {
     let Some(resolved) = program.type_id_to_type_map.get(&subject_type_id) else {
         return Vec::new();
     };
@@ -139,7 +164,7 @@ pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str
         (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
         (a, b) => a == b,
     };
-    let matching: Vec<&crate::analyzer::Implementation> = program
+    let mut matching: Vec<&crate::analyzer::Implementation> = program
         .implementations
         .iter()
         .filter(|implementation| {
@@ -154,6 +179,21 @@ pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str
                 )
         })
         .collect();
+    if !traits.is_empty() {
+        let narrowed: Vec<&crate::analyzer::Implementation> = matching
+            .iter()
+            .copied()
+            .filter(|implementation| {
+                implementation
+                    .trait_ids
+                    .iter()
+                    .any(|trait_id| traits.contains(trait_id))
+            })
+            .collect();
+        if !narrowed.is_empty() {
+            matching = narrowed;
+        }
+    }
     let declared: Vec<Id> = matching
         .iter()
         .filter_map(|implementation| implementation.declarations.get(member).copied())
@@ -171,6 +211,38 @@ pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str
                 .and_then(|trait_| trait_.declarations.get(member).copied())
         })
         .collect()
+}
+
+/// The traits a generic parameter's constraint names, transitively through
+/// supertraits — the impls a call through that parameter may reach.
+///
+/// The constraint id IS the first bound's type id (`register_binder`), and any
+/// further bounds hang off `generic_bounds` at the same id. An unbounded
+/// parameter yields nothing, which the caller reads as "do not narrow".
+fn bound_traits(program: &Program, constraint: TypeId) -> Vec<Id> {
+    let mut pending: Vec<TypeId> = vec![constraint];
+    pending.extend(
+        program
+            .generic_bounds
+            .get(&constraint)
+            .into_iter()
+            .flatten()
+            .copied(),
+    );
+    let mut traits: Vec<Id> = Vec::new();
+    while let Some(type_id) = pending.pop() {
+        let Some(Type::Trait(trait_id, _)) = program.type_id_to_type_map.get(&type_id) else {
+            continue;
+        };
+        if traits.contains(trait_id) {
+            continue;
+        }
+        traits.push(*trait_id);
+        if let Some(trait_) = program.traits.get(trait_id) {
+            pending.extend(trait_.supertraits.iter().copied());
+        }
+    }
+    traits
 }
 
 /// How chasing a constraint through one call's recorded bindings ended.
@@ -340,11 +412,15 @@ pub fn refined_edges(
                 continue;
             }
         };
+        // The traits the bound names, with their supertraits: a call through
+        // this constraint can only reach an impl of one of them, whatever else
+        // in the program spells the member the same way.
+        let constraint_traits = bound_traits(program, constraint);
         // Concrete resolution → the impl members the type selects; an
         // empty selection (defensive — the bound audit rejects no-impl
         // types) falls back to every candidate.
         let selected_for = |resolved: TypeId| -> Vec<Id> {
-            let selected = impl_members_for(program, resolved, member);
+            let selected = impl_members_for_bound(program, resolved, member, &constraint_traits);
             if selected.is_empty() {
                 site.candidates.clone()
             } else {
