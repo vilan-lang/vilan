@@ -15,7 +15,7 @@ mod uri;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -497,6 +497,22 @@ struct Backend {
     /// the session); when absent, call-shaped completions degrade to plain text
     /// (WO-3).
     snippet_support: Arc<AtomicBool>,
+    /// The WORLD revision (E117): bumped by every notification that changes what
+    /// an analysis would read — an open, an edit, a close, a save. An analysis
+    /// is stamped with the value it started from
+    /// ([`Document::stamp_analysis`]), which orders two results that finish out
+    /// of order even when neither document's own text moved: a dependent's
+    /// buffer is unchanged by an edit in the module it imports, so text equality
+    /// cannot separate "read the module mid-edit" from "read it restored", and
+    /// the loser used to publish last. That is the ghost diagnostic.
+    revision: Arc<AtomicU64>,
+    /// Serializes a publish's PLAN with its SEND (E117). The planner is a
+    /// synchronous mutex, so plan order is well defined; without this gate the
+    /// `publish_diagnostics` awaits of two publishes could still interleave and
+    /// deliver the older plan last, which is the same ghost by a different
+    /// route. Held across the sends and nothing else — the analyses themselves
+    /// stay fully concurrent.
+    publish_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Locate the `std` package directory: `$VILAN_STD`, else the nearest ancestor
@@ -1296,12 +1312,18 @@ async fn analyze_and_publish(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
+    revision: &AtomicU64,
     uri: Url,
     text: String,
 ) -> bool {
     let path = uri.to_file_path().unwrap_or_default();
     let std_dir = discover_std_dir(&path);
-    let analysis = match tokio::task::spawn_blocking(move || {
+    // E117: the world this analysis is about to read, sampled BEFORE it starts.
+    // A later notification bumps the counter, so a result stamped lower is by
+    // construction a view of an older world — whatever its own text says.
+    let started_at = revision.load(Ordering::SeqCst);
+    let mut analysis = match tokio::task::spawn_blocking(move || {
         Document::analyze(&text, &std_dir, &path)
     })
     .await
@@ -1309,10 +1331,11 @@ async fn analyze_and_publish(
         Ok(analysis) => analysis,
         Err(_) => return false,
     };
+    analysis.stamp_analysis(started_at);
     if !land(documents, &uri, analysis) {
         return false;
     }
-    publish_document(documents, client, publish_state, &uri).await;
+    publish_document(documents, client, publish_state, publish_gate, &uri).await;
     true
 }
 
@@ -1336,6 +1359,16 @@ async fn analyze_and_publish(
 ///   implies a later `did_change` whose own debounced task (or an
 ///   already-landed fresher analysis) covers the buffer.
 ///
+/// - **The world moved on** (E117). The analysis read an older world than the
+///   one already adopted here: some file it loaded has been edited since it
+///   started. Text equality cannot see this — it is the DEPENDENT's case, where
+///   this document's own buffer never moved and both of its in-flight analyses
+///   match it — so the [`Backend::revision`] stamp decides. Without it, the
+///   analysis that read a module mid-edit could land (and publish) after the
+///   one that read it restored, and the editor kept the error from a state the
+///   user had already undone. Older strictly: an equal stamp is a second look
+///   at the same world and lands normally.
+///
 /// So the analyzed snapshot only ever advances to *the* live text, never
 /// sideways to a different stale one. `adopt_analysis` keeps its own
 /// keep-the-live-side guard all the same — two independent layers: this one
@@ -1348,6 +1381,9 @@ fn land(documents: &DashMap<Url, Document>, uri: &Url, analysis: Document) -> bo
         return false;
     };
     if document.text != analysis.text {
+        return false;
+    }
+    if analysis.analysis_revision() < document.analysis_revision() {
         return false;
     }
     document.adopt_analysis(analysis);
@@ -1363,8 +1399,14 @@ async fn publish_document(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
     uri: &Url,
 ) {
+    // E117: plan and send as one step. The plan is already ordered (the planner
+    // is a mutex, and it drops a superseded owner's plan outright); the gate is
+    // what stops two publishes' `publish_diagnostics` awaits from interleaving
+    // and delivering the older plan last.
+    let _sending = publish_gate.lock().await;
     // Plan before the first await (neither the map guard nor the planner
     // lock may be held across one).
     let actions = {
@@ -1397,6 +1439,8 @@ async fn reanalyze_dependents(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
+    revision: &AtomicU64,
     changed: &Url,
 ) -> bool {
     let changed_path = changed.to_file_path().ok();
@@ -1411,7 +1455,16 @@ async fn reanalyze_dependents(
         .collect();
     let mut landed = false;
     for (uri, text) in dependents {
-        landed |= analyze_and_publish(documents, client, publish_state, uri, text).await;
+        landed |= analyze_and_publish(
+            documents,
+            client,
+            publish_state,
+            publish_gate,
+            revision,
+            uri,
+            text,
+        )
+        .await;
     }
     landed
 }
@@ -1572,6 +1625,8 @@ impl Backend {
         let documents = Arc::clone(&self.documents);
         let pending = Arc::clone(&self.pending);
         let publish_state = Arc::clone(&self.publish_state);
+        let publish_gate = Arc::clone(&self.publish_gate);
+        let revision = Arc::clone(&self.revision);
         let client = self.client.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
@@ -1588,12 +1643,27 @@ impl Backend {
                 PauseAction::Superseded | PauseAction::Unchanged => return,
                 PauseAction::Analyze => {}
             }
-            let landed =
-                analyze_and_publish(&documents, &client, &publish_state, uri.clone(), text).await;
+            let landed = analyze_and_publish(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &revision,
+                uri.clone(),
+                text,
+            )
+            .await;
             // The edit may change what other open files see (they import this
             // one, or a file it re-exports) — bring their diagnostics up to date.
-            let dependents_landed =
-                reanalyze_dependents(&documents, &client, &publish_state, &uri).await;
+            let dependents_landed = reanalyze_dependents(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &revision,
+                &uri,
+            )
+            .await;
             // The analyzed snapshot moved under the client's highlighting and
             // hints; ask for them again (S5). Every guard is long dropped here.
             send_refreshes(&client, refresh_plan(landed || dependents_landed)).await;
@@ -1944,8 +2014,11 @@ impl LanguageServer for Backend {
                 &path,
                 Some(params.text_document.text.clone()),
             );
+            // The overlay just changed what every analysis reads (E117).
+            let started_at = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
             let std_dir = discover_std_dir(&path);
-            let document = Document::analyze(&params.text_document.text, &std_dir, &path);
+            let mut document = Document::analyze(&params.text_document.text, &std_dir, &path);
+            document.stamp_analysis(started_at);
             // The ONLY place a document enters the map. Every later analysis lands
             // by merge onto what is here (`land`), which is what lets a result
             // arriving after `did_close` be dropped instead of resurrecting the
@@ -1954,7 +2027,14 @@ impl LanguageServer for Backend {
             true
         });
         if publish {
-            publish_document(&self.documents, &self.client, &self.publish_state, &uri).await;
+            publish_document(
+                &self.documents,
+                &self.client,
+                &self.publish_state,
+                &self.publish_gate,
+                &uri,
+            )
+            .await;
         }
     }
 
@@ -2006,6 +2086,11 @@ impl LanguageServer for Backend {
             if let Ok(path) = uri.to_file_path() {
                 vilan_core::analyzer::set_document_overlay(&path, Some(text.clone()));
             }
+            // The world every analysis reads has moved (E117) — bump BEFORE the
+            // debounced task samples it, so an analysis already in flight is
+            // stamped with the world it actually read and this edit's own
+            // analysis is stamped strictly higher.
+            self.revision.fetch_add(1, Ordering::SeqCst);
             self.on_change(uri, text);
         })
     }
@@ -2014,6 +2099,9 @@ impl LanguageServer for Backend {
         // A save changes what OTHER documents' analyses read from disk (module
         // loading is disk-backed), so re-analyze every open document.
         let saved = params.text_document.uri;
+        // A save changes what a disk read answers, so it moves the world too
+        // (E117) — a manifest save especially, which re-colors every open file.
+        self.revision.fetch_add(1, Ordering::SeqCst);
         // `.map` consumes the map guard inside the closure, so nothing is held
         // across the awaits below (which take the same key for writing).
         let mut landed = false;
@@ -2026,13 +2114,22 @@ impl LanguageServer for Backend {
                 &self.documents,
                 &self.client,
                 &self.publish_state,
+                &self.publish_gate,
+                &self.revision,
                 uri,
                 text,
             )
             .await;
         }
-        landed |=
-            reanalyze_dependents(&self.documents, &self.client, &self.publish_state, &saved).await;
+        landed |= reanalyze_dependents(
+            &self.documents,
+            &self.client,
+            &self.publish_state,
+            &self.publish_gate,
+            &self.revision,
+            &saved,
+        )
+        .await;
         // Same sweep rule as a typing pause (S5).
         send_refreshes(&self.client, refresh_plan(landed)).await;
     }
@@ -2051,13 +2148,18 @@ impl LanguageServer for Backend {
         if let Ok(path) = uri.to_file_path() {
             vilan_core::analyzer::set_document_overlay(&path, None);
         }
+        // Dropping the overlay changes what every other analysis reads (E117).
+        self.revision.fetch_add(1, Ordering::SeqCst);
         self.documents.remove(&uri);
         self.semantic_token_cache.remove(&uri);
         // Drop the edit generation so any in-flight debounced analysis bails.
         self.pending.remove(&uri);
         // Clear this document's diagnostics AND the ones it published onto
         // other files — each target republishes as the remaining owners'
-        // merged view (empty where this was the only contributor).
+        // merged view (empty where this was the only contributor). Under the
+        // same plan-with-send gate every other publish takes (E117), so a
+        // concurrent analysis's sends cannot land in the middle of the clear.
+        let _sending = self.publish_gate.lock().await;
         let actions = self
             .publish_state
             .lock()
@@ -2847,6 +2949,8 @@ mod snapshot_consistency_tests {
             line_indices: Arc::new(DashMap::new()),
             config: Arc::new(std::sync::RwLock::new(Config::default())),
             snippet_support: Arc::new(AtomicBool::new(false)),
+            revision: Arc::new(AtomicU64::new(0)),
+            publish_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -4082,6 +4186,53 @@ mod snapshot_consistency_tests {
             "the snapshot stays consistent at the last adopted analysis",
         );
     }
+
+    // E117, the ghost diagnostic. The two guards above are both text
+    // comparisons, and text is exactly what a DEPENDENT's buffer does not
+    // change: an edit in a module it imports leaves this file byte-identical,
+    // so both of its in-flight analyses match the live text and both land — in
+    // whichever order they finish. The one that read the module mid-edit could
+    // therefore land, and publish, after the one that read it restored, which
+    // is the error that flashes back after a comment/uncomment round trip. The
+    // world revision each analysis READ is what separates them.
+    #[test]
+    fn an_analysis_of_an_older_world_is_dropped_though_its_text_still_matches() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        documents.insert(uri.clone(), document(SOURCE));
+        // The analysis that read the RESTORED world finishes first.
+        let mut newer = document(SOURCE);
+        newer.stamp_analysis(5);
+        assert!(land(&documents, &uri, newer), "the later world lands");
+        // The one that read the module mid-edit finishes second.
+        let mut older = document(SOURCE);
+        older.stamp_analysis(3);
+        assert!(
+            !land(&documents, &uri, older),
+            "an older world is dropped even though the buffer never moved",
+        );
+        assert_eq!(
+            documents.get(&uri).expect("still open").analysis_revision(),
+            5,
+            "the adopted snapshot is not regressed to the superseded world",
+        );
+    }
+
+    // …and the ordering is STRICT on older only: two analyses stamped with the
+    // same world say the same thing, and a dependents' sweep legitimately
+    // re-runs a document within one world. Dropping an equal stamp would make
+    // that sweep a no-op and leave the dependent's diagnostics stale.
+    #[test]
+    fn an_analysis_of_the_same_world_still_lands() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        let mut opened = document(SOURCE);
+        opened.stamp_analysis(4);
+        documents.insert(uri.clone(), opened);
+        let mut resweep = document(SOURCE);
+        resweep.stamp_analysis(4);
+        assert!(land(&documents, &uri, resweep));
+    }
 }
 
 /// kolt.local 034: the cross-document reach of references and rename at the
@@ -4212,6 +4363,8 @@ async fn main() {
         line_indices: Arc::new(DashMap::new()),
         config: Arc::new(std::sync::RwLock::new(Config::default())),
         snippet_support: Arc::new(AtomicBool::new(false)),
+        revision: Arc::new(AtomicU64::new(0)),
+        publish_gate: Arc::new(tokio::sync::Mutex::new(())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

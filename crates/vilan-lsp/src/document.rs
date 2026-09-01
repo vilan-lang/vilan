@@ -519,6 +519,19 @@ pub struct Document {
     /// can enumerate modules the `Program` never loaded. `None` on the degraded
     /// internal-error document, which resolved nothing.
     import_roots: Option<ImportRoots>,
+    /// The server's world revision this analysis READ (E117), stamped by the
+    /// caller through [`Document::stamp_analysis`] — every buffer change bumps
+    /// it, so a larger number is a strictly later view of every open file.
+    ///
+    /// `text_hash` answers "is this analysis of my own current text", which is
+    /// enough for the file being typed in and vacuous for every other one: a
+    /// DEPENDENT's buffer does not move when the module it imports does, so two
+    /// of its analyses — one that read the module mid-edit, one that read it
+    /// restored — are text-identical and both would land, in either order. This
+    /// is what separates them. Zero on a document nobody stamped (every test
+    /// fixture, and the degraded internal-error document), which keeps the
+    /// comparison a no-op there.
+    analysis_revision: u64,
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -892,6 +905,7 @@ impl Document {
             manifest_problem: None,
             shared_diagnostics: Vec::new(),
             import_roots: None,
+            analysis_revision: 0,
         }
     }
 
@@ -1044,6 +1058,7 @@ impl Document {
             manifest_problem,
             shared_diagnostics,
             import_roots: Some(import_roots),
+            analysis_revision: 0,
         }
     }
 
@@ -1410,6 +1425,19 @@ impl Document {
         self.analyzed_index.offset(position)
     }
 
+    /// Record the world revision this analysis read (E117). Called on a fresh
+    /// [`Document::analyze`] result before it is landed; the value travels with
+    /// the analysis through [`Document::adopt_analysis`].
+    pub fn stamp_analysis(&mut self, revision: u64) {
+        self.analysis_revision = revision;
+    }
+
+    /// The world revision the current analysis read — the ordering key that
+    /// says which of two results is the later view (see the field).
+    pub fn analysis_revision(&self) -> u64 {
+        self.analysis_revision
+    }
+
     /// Whether the live buffer has advanced past the analyzed text — i.e. an
     /// analysis is pending and program answers describe an older text.
     ///
@@ -1476,6 +1504,7 @@ impl Document {
             manifest_problem,
             shared_diagnostics,
             import_roots,
+            analysis_revision,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
@@ -1495,6 +1524,7 @@ impl Document {
         self.manifest_problem = manifest_problem;
         self.shared_diagnostics = shared_diagnostics;
         self.import_roots = import_roots;
+        self.analysis_revision = analysis_revision;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
