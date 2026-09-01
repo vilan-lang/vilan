@@ -19001,9 +19001,18 @@ impl<'src> Analyzer<'src> {
     /// Inheriting the subject's exact constraint id makes the binder identical to
     /// having written the bound out — including multi-bound (`T: A + B`) cases,
     /// whose extra bounds hang off that same id.
+    ///
+    /// A binder's own BOUND may declare binders too (B165): `impl type S:
+    /// Source<type T> with MaybeSignal<T>` is generic in both `S` and `T`, and
+    /// `T` is in scope for the whole head — the sibling bounds, the `with`
+    /// clause, and every member signature. The bounds are walked as the binder
+    /// they constrain registers, so the nested ones register FIRST.
     fn register_subject_binders(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) {
         match &node.0 {
             Node::TypeBinder(name, bounds) => {
+                for bound in bounds {
+                    self.register_subject_binders(bound, scope_id);
+                }
                 self.register_binder(name, &node.1, bounds, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {

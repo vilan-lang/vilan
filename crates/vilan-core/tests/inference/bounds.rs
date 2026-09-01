@@ -6512,3 +6512,152 @@ fn a_concrete_signal_still_drives_the_swap_family() {
         "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// B165 — a `type` binder inside an impl head's BOUND
+// ---------------------------------------------------------------------------
+
+/// The shape B157's generic blanket needs: the subject's binder is constrained
+/// by a PARAMETERIZED trait, and the bound's own argument is a fresh binder the
+/// rest of the head reuses. `type T` under `Src<..>` used to report `cannot
+/// find type 'T'` — the binder was registered for the subject alone, never for
+/// the bound it is written inside.
+#[test]
+fn b165_a_type_binder_inside_a_bound_declares_the_impls_parameter() {
+    assert_compiles_and_runs(
+        r#"
+
+        trait Src<T> { fun read(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+
+        struct Cell { value: str }
+        impl Cell with Src<str> { fun read(self): str { self.value } }
+
+        impl type S: Src<type T> with Maybe<T> {
+            fun show(self, react: |T| void) { react(self.read()); }
+        }
+
+        fun tell<V: Maybe<str>>(v: V) { v.show(|text| print(text)); }
+
+        fun main() {
+            tell(Cell { value = "through the bound" });
+        }
+        main();
+        "#,
+        "through the bound\n",
+    );
+}
+
+/// The binder is the IMPL's parameter, so it varies per receiver: two `Src`
+/// impls at different arguments both reach the one blanket, each at its own
+/// element type.
+#[test]
+fn b165_the_bounds_binder_varies_with_the_receivers_own_argument() {
+    assert_compiles_and_runs(
+        r#"
+
+        trait Src<T> { fun read(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+
+        struct Words { value: str }
+        struct Counts { value: i32 }
+        impl Words with Src<str> { fun read(self): str { self.value } }
+        impl Counts with Src<i32> { fun read(self): i32 { self.value } }
+
+        impl type S: Src<type T> with Maybe<T> {
+            fun show(self, react: |T| void) { react(self.read()); }
+        }
+
+        fun words<V: Maybe<str>>(v: V) { v.show(|text| print(text)); }
+        fun counts<V: Maybe<i32>>(v: V) { v.show(|n| print(i"n={n}")); }
+
+        fun main() {
+            words(Words { value = "text" });
+            counts(Counts { value = 7 });
+        }
+        main();
+        "#,
+        "text\nn=7\n",
+    );
+}
+
+/// Binder scope is the WHOLE head, not just the `with` clause: a binder written
+/// in one bound is reusable by a LATER bound on the same subject.
+#[test]
+fn b165_a_binder_from_one_bound_is_reusable_by_a_sibling_bound() {
+    assert_compiles_and_runs(
+        r#"
+
+        trait Src<T> { fun read(self): T; }
+        trait Tagged<T> { fun tag(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+
+        struct Cell { value: str }
+        impl Cell with Src<str> { fun read(self): str { self.value } }
+        impl Cell with Tagged<str> { fun tag(self): str { "cell" } }
+
+        impl type S: Src<type T> + Tagged<T> with Maybe<T> {
+            fun show(self, react: |T| void) { react(self.tag()); react(self.read()); }
+        }
+
+        fun tell<V: Maybe<str>>(v: V) { v.show(|text| print(text)); }
+
+        fun main() { tell(Cell { value = "body" }); }
+        main();
+        "#,
+        "cell\nbody\n",
+    );
+}
+
+/// A name that is NOT declared as a binder anywhere in the head still refuses,
+/// in the same words — the fix widens where a binder may be WRITTEN, it does
+/// not make every name in a bound resolve.
+#[test]
+fn b165_an_undeclared_name_inside_a_bound_still_refuses() {
+    assert_fails_with(
+        r#"
+
+        trait Src<T> { fun read(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+
+        impl type S: Src<Missing> with Maybe<Missing> {
+            fun show(self, react: |Missing| void) { react(self.read()); }
+        }
+        "#,
+        "cannot find type 'Missing'",
+    );
+}
+
+/// The generic blanket standing beside the static one — B157's `MaybeSignal`
+/// family, whole: a plain value reaches the blanket, a `Source` of the same
+/// element reaches the bounded impl, and B158's specificity order picks between
+/// them.
+#[test]
+fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, Source };
+
+        trait Maybe<T> { fun show(self, react: |T| void); }
+
+        impl type T with Maybe<T> {
+            fun show(self, react: |T| void) { react(self); }
+        }
+
+        impl type S: Source<type T> with Maybe<T> {
+            fun show(self, react: |T| void) { let _watching = self.sub(react); }
+        }
+
+        fun badge<V: Maybe<str>>(label: V) { label.show(|text| print(i"[{text}]")); }
+
+        fun main() {
+            badge("static");
+            let live = Signal::new("first");
+            badge(live);
+            live.set("second");
+        }
+        main();
+        "#,
+        "[static]\n[first]\n[second]\n",
+    );
+}

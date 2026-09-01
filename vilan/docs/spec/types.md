@@ -270,6 +270,20 @@ binder's bounds hold. Members may be functions (with or without
 `self`). A function without `self` is a **static**, reached as
 `Subject::name(…)`.
 
+A binder may be written **inside another binder's bound**, and it declares
+the impl's generics exactly like one written in the subject's own
+arguments. Its scope is the whole head — the sibling bounds, the `with`
+clause, and every member signature:
+
+```vilan,fragment
+impl type S: Source<type T> with MaybeSignal<T> { … }
+```
+
+reads "for every `S` that is a `Source` of some `T`", and binds that `T`
+per receiver: a `Words: Source<str>` instantiates the impl at `T = str`, a
+`Counts: Source<i32>` at `T = i32`. A name in a bound that no binder
+declares is still unresolved, and is reported where it is written.
+
 A trait has **one implementation per subject**: writing
 `impl Bag with Show` twice is a compile error at the second one, since
 nothing would rank them and the second would never run. Two impls are the
