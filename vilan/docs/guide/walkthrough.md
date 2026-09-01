@@ -114,7 +114,7 @@ struct NotesStore {
 
 Why module-level, and not a field on `NotesStore`? A `Database` is a
 `resource`: it has a single owner, it *moves* rather than copies, and it closes
-itself when its owner's scope ends. A struct that owns a resource is itself a
+itself at its owner's last use. A struct that owns a resource is itself a
 resource. `[service]` generates a dispatcher that captures the store into
 one closure per `[rpc]` method, which a resource can't be (a closure capturing a
 resource is the double-owner bug the class exists to prevent). So the long-lived

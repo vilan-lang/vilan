@@ -7,7 +7,7 @@ Almost everything in Vilan is a value: it copies, and the copy is yours (the
 A database handle that copied would close twice. A task owner that copied
 would cancel the wrong tasks. These are **resources**: values with a single
 owner, that *move* instead of copying, and that are torn down
-deterministically when their owner's scope ends.
+deterministically at their owner's **last use**.
 
 You mark one with `resource` and, if it needs cleanup, give it a `Drop`:
 
@@ -27,14 +27,15 @@ impl Guard with Drop {
 fun main() {
 	let first = Guard { label = "first" };
 	let second = Guard { label = "second" };
-	print("body");
+	print(i"holding {first.label} and {second.label}");
 }
 ```
 
-That program prints `body`, then `dropped second`, then `dropped first`.
-Two things to notice: `drop` ran on its own at the end of `main`, with
-no call from you, and the two guards tore down in **reverse** order,
-the way a stack unwinds.
+That program prints `holding first and second`, then `dropped second`,
+then `dropped first`. Two things to notice: `drop` ran on its own, with no
+call from you, and — because that one `print` is the last statement to read
+*both* guards — they tore down in **reverse** declaration order, the way a
+stack unwinds.
 
 ## Moving, not copying
 
@@ -95,16 +96,35 @@ function that moves its parameter out has to say `own`.
 
 ## Teardown happens at the last use — and on every exit
 
-A resource is destroyed after the **last statement that reads it**, not at
-the end of its scope. A handle nothing reads again is released right where
-it was acquired; two resources last read in the same statement are
-destroyed in reverse declaration order, as they always were. A loan counts
-as a read of what it names, so an owner is never destroyed while a view
-into it is still in use.
+A resource is destroyed after the **last statement that uses it**, not at
+the end of its scope. **Declaring it counts as a use**, so a resource
+nothing reads again is destroyed right where it was created:
 
-The point of tying it to the last use rather than the scope is a scope that
-does not end: a server's `main` never returns, and under the older rule
-every handle it opened was released never.
+```vilan
+import std::drop::Drop;
+
+resource struct Guard { label: str }
+impl Guard with Drop {
+	fun drop(&mut self) { print(i"dropped {self.label}"); }
+}
+
+fun main() {
+	let unread = Guard { label = "unread" };
+	print("body");
+}
+```
+
+That prints `dropped unread`, then `body` — nothing ever names `unread`
+again, so the `let` is both its first use and its last. Binding a value is
+how you say *keep this*; reading it is how you say *still*.
+
+Two resources last read in the same statement are destroyed in reverse
+declaration order, as they always were. A loan counts as a read of what it
+names, so an owner is never destroyed while a view into it is still in use.
+
+The point of tying teardown to the last use rather than to the scope is a
+scope that does not end: a server's `main` never returns, and under the
+older rule every handle it opened was released never.
 
 Teardown still runs however control leaves: falling off the bottom, an
 early `ret`, a `jump` out of a loop, even a panic unwinding through. There
@@ -122,7 +142,8 @@ reads the very slot the write is about to overwrite.
 
 A **pattern capture is a binding like any other**. Matching by value
 consumes what you matched, so the capture becomes the payload's owner —
-and it drops at the end of the arm that bound it:
+and, like any binding, it drops after the arm's last statement that reads
+it:
 
 ```vilan
 import std::drop::Drop;
@@ -144,8 +165,8 @@ fun main() {
 ```
 
 This prints `using held`, `dropped held`, `after match` — the payload dies
-at the end of the leg, not at the end of `main`, because that leg is where
-it was bound. Move it somewhere else inside the leg (return it, pass it by
+with the `print` that read it, not at the end of `main`, because that leg
+is where it was bound. Move it somewhere else inside the leg (return it, pass it by
 `own`, put it in a struct) and the destination owns it instead; it is
 destroyed exactly once either way. A capture from a *loan* — `match &slot`,
 or `slot is Some(let g)` — owns nothing, because nothing was consumed:
@@ -153,8 +174,8 @@ or `slot is Some(let g)` — owns nothing, because nothing was consumed:
 
 ## Tearing down early: `drop(x)`
 
-Sometimes you want a resource gone *before* its scope ends. Move it into
-`drop`:
+Sometimes you want to name the last use yourself rather than let the
+compiler find it. Move the resource into `drop`:
 
 ```vilan
 import std::drop::{ Drop, drop };
@@ -168,13 +189,14 @@ fun main() {
 	let a = Guard { label = "a" };
 	let b = Guard { label = "b" };
 	drop(a);                 // a is torn down right here
-	print("after drop(a)");
+	print(i"still holding {b.label}");
 }
 ```
 
-This prints `dropped a`, `after drop(a)`, `dropped b`. `drop` takes its
-argument by move, so `a` is spent at that line: there is no `close()`
-to call and no way to use `a` afterward by mistake. (On plain data,
+This prints `dropped a`, `still holding b`, `dropped b`. Moving into `drop`
+*is* a use, so it becomes `a`'s last one and `a` is spent at that line:
+there is no `close()` to call and no way to use `a` afterward by mistake.
+`b` outlives it because the `print` still reads `b`. (On plain data,
 `drop(x)` means "I'm done with this"; it does nothing.)
 
 ## Conditional teardown: `Option.take`
@@ -202,17 +224,17 @@ fun main() {
 }
 ```
 
-After the `take`, `slot` is `None`, so nothing drops a second time at the
-end of `main`. `take` is also how a resource leaves a struct field: the
+After the `take`, `slot` is `None`, so when `slot` reaches its own last use
+nothing drops a second time. `take` is also how a resource leaves a struct field: the
 one sanctioned way to move a resource out of something that is still
 alive.
 
 ## A real resource: `Database`
 
 The std `Database` is a resource: opening one gives you a handle that closes
-itself on drop. A short-lived database closes when its function returns; a
-server that runs forever wants the opposite, so it keeps the database at
-**module level**, where it lives for the whole process and never drops:
+itself on drop. A database in a local closes at its last use; a server that
+runs forever wants the opposite, so it keeps the database at **module
+level**, where it lives for the whole process and never drops:
 
 ```vilan,norun
 import std::db::{ Database, Row };
@@ -243,8 +265,8 @@ Every function reaches `db` by loan (a method call is a loan), never by
 moving it. A module-level resource is loan-only for this reason: moving
 or `drop`ing it would close the shared handle out from under the rest
 of the program, so the compiler rejects that. When you *do* want a
-database that closes at the end of a scope, open it in a local instead,
-or `drop(db)` to close it early.
+database that closes on its own, open it in a local instead — it closes
+after the last statement that uses it, or wherever you write `drop(db)`.
 
 A **closure** may reach a module-level resource too. A closure that
 references `db` isn't capturing an owner: it borrows the same
@@ -294,14 +316,19 @@ fun main() {
 		};
 	});
 	print("enter returned without joining");
+	sleep(50);
+	owner.cancel();          // owner's last use — the tasks stop here
 }
 ```
 
-Unlike a `nursery`, `enter` does not wait for the spawned work; it
-returns right away, and the tasks keep running under `owner`. When `owner` drops (at
-the end of `main`, or at an explicit `drop(owner)`), the tasks are cancelled.
-That is the whole point: the *owner's* lifetime bounds the work, and the
-owner is an ordinary resource the scope rules already know how to tear down.
+Unlike a `nursery`, `enter` does not wait for the spawned work; it returns
+right away, and the tasks keep running under `owner`. They keep running
+only as long as `owner` does: the owner is destroyed after its **last
+use**, and its `drop` cancels them. That is why this example reads `owner`
+once more at the end — delete that line and `enter` becomes the last use,
+so the tasks are cancelled the moment `enter` returns and `background work`
+never prints. The *owner's* lifetime bounds the work, and its lifetime ends
+at its last use.
 
 ## Traps
 

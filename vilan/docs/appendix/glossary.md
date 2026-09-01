@@ -66,9 +66,9 @@ hasn't confirmed yet. Dirty fields ignore adoption; the user's text wins.
 locally at once, commits in the background, and keeps your text on
 failure. [Reactive state](../guide/reactive.md).
 
-<a id="drop"></a>**drop**: destruction. The `Drop` hook runs at an owner's scope end;
-`drop(x)` moves a value in to destroy it early. Only [resources](#resource)
-have one. [Resources](../tour/resources.md).
+<a id="drop"></a>**drop**: destruction. The `Drop` hook runs after an owner's last use;
+`drop(x)` moves a value in to name that point yourself. Only
+[resources](#resource) have one. [Resources](../tour/resources.md).
 
 <a id="echo"></a>**echo**: your own change arriving back through a [mirror](#mirror). A
 draft recognizes it and does nothing, so your caret never jumps.
