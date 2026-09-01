@@ -1435,6 +1435,22 @@ async fn publish_document(
 /// a changed URL that is not a file path sweeps everyone — both are the old
 /// behavior, kept exactly where its reason still holds. Returns whether any
 /// of them landed an analysis.
+///
+/// `recolored` widens the sweep to a whole package (E116): every open document
+/// whose package root is at or under that path is swept, dependency edge or
+/// not. The edge is the right gate for DIAGNOSTICS — a file that never loaded
+/// the edited one cannot see the edit — and the wrong one for platform COLOR,
+/// which is decided by which entry REACHES a file. That relation points the
+/// other way: writing `import pkg::a` in the entry re-colors `a.vl`, and
+/// `a.vl` depends on nothing, so the edge swept it never and the process
+/// fallback stuck until the server restarted.
+///
+/// A saved MANIFEST arrives here the same way, and had the same hole from the
+/// other end: `vilan.toml` is in no program's `canonical_sources`, so once the
+/// sweep was gated on the edge (B39a) a manifest save re-analyzed nothing at
+/// all — a target change, a new entry, a fixed dependency all sat there until
+/// a restart. It passes its own directory, which every package root beneath it
+/// is under.
 async fn reanalyze_dependents(
     documents: &DashMap<Url, Document>,
     client: &Client,
@@ -1442,14 +1458,25 @@ async fn reanalyze_dependents(
     publish_gate: &tokio::sync::Mutex<()>,
     revision: &AtomicU64,
     changed: &Url,
+    recolored: Option<&Path>,
 ) -> bool {
     let changed_path = changed.to_file_path().ok();
     let dependents: Vec<(Url, String)> = documents
         .iter()
         .filter(|entry| entry.key() != changed)
-        .filter(|entry| match &changed_path {
-            Some(path) => entry.value().depends_on(path),
-            None => true,
+        .filter(|entry| {
+            if let Some(recolored) = recolored
+                && entry
+                    .value()
+                    .package_root()
+                    .is_some_and(|root| root.starts_with(recolored))
+            {
+                return true;
+            }
+            match &changed_path {
+                Some(path) => entry.value().depends_on(path),
+                None => true,
+            }
         })
         .map(|entry| (entry.key().clone(), entry.value().text.clone()))
         .collect();
@@ -1467,6 +1494,43 @@ async fn reanalyze_dependents(
         .await;
     }
     landed
+}
+
+/// How far the open document at `uri` reaches through its own package, and
+/// which package that is (E116) — the two facts [`recolored_package`] compares
+/// across a re-analysis. A closed or never-opened document reaches nothing.
+///
+/// Read synchronously; the guard is taken and dropped here, never held across
+/// the caller's await.
+fn package_reach(documents: &DashMap<Url, Document>, uri: &Url) -> Option<(u64, PathBuf)> {
+    let document = documents.get(uri)?;
+    let root = document.package_root()?;
+    Some((document.package_graph_fingerprint(), root.to_path_buf()))
+}
+
+/// The package whose platform coloring a re-analysis invalidated, if any
+/// (E116): its root when the set of package modules the edited file reaches
+/// MOVED, `None` when the import graph is where it was.
+///
+/// The `pkg::` graph is what `platform_color::file_platforms` walks to decide
+/// which entry reaches — and therefore colors — each file, so a change in it
+/// can re-color files this one neither imports nor is imported by. Nothing
+/// else in the file can: a body edit, a rename, a new `std` import all leave
+/// the reach identical and skip the sweep.
+///
+/// Separated from its effects so the decision is testable without a server.
+fn recolored_package(
+    before: Option<(u64, PathBuf)>,
+    after: Option<(u64, PathBuf)>,
+) -> Option<PathBuf> {
+    let (after_reach, root) = after?;
+    match before {
+        // The same package, reaching the same modules: nothing to re-color.
+        Some((before_reach, before_root)) if before_reach == after_reach && before_root == root => {
+            None
+        }
+        _ => Some(root),
+    }
 }
 
 /// One thing the server asks the client to re-request after a sweep of
@@ -1643,6 +1707,7 @@ impl Backend {
                 PauseAction::Superseded | PauseAction::Unchanged => return,
                 PauseAction::Analyze => {}
             }
+            let reach_before = package_reach(&documents, &uri);
             let landed = analyze_and_publish(
                 &documents,
                 &client,
@@ -1655,6 +1720,7 @@ impl Backend {
             .await;
             // The edit may change what other open files see (they import this
             // one, or a file it re-exports) — bring their diagnostics up to date.
+            let recolored = recolored_package(reach_before, package_reach(&documents, &uri));
             let dependents_landed = reanalyze_dependents(
                 &documents,
                 &client,
@@ -1662,6 +1728,7 @@ impl Backend {
                 &publish_gate,
                 &revision,
                 &uri,
+                recolored.as_deref(),
             )
             .await;
             // The analyzed snapshot moved under the client's highlighting and
@@ -2102,6 +2169,16 @@ impl LanguageServer for Backend {
         // A save changes what a disk read answers, so it moves the world too
         // (E117) — a manifest save especially, which re-colors every open file.
         self.revision.fetch_add(1, Ordering::SeqCst);
+        // E116: a saved `vilan.toml` is the coloring input itself — its target,
+        // its entries, its `default-entry` all decide what every file under it
+        // analyzes as — and it is in no program's `canonical_sources`, so the
+        // dependency edge alone finds nothing to sweep. Its own directory
+        // stands for the packages beneath it.
+        let saved_manifest_directory = is_manifest(&saved)
+            .then(|| saved.to_file_path().ok())
+            .flatten()
+            .and_then(|path| path.parent().map(vilan_core::util::canonical_path));
+        let reach_before = package_reach(&self.documents, &saved);
         // `.map` consumes the map guard inside the closure, so nothing is held
         // across the awaits below (which take the same key for writing).
         let mut landed = false;
@@ -2121,6 +2198,8 @@ impl LanguageServer for Backend {
             )
             .await;
         }
+        let recolored = saved_manifest_directory
+            .or_else(|| recolored_package(reach_before, package_reach(&self.documents, &saved)));
         landed |= reanalyze_dependents(
             &self.documents,
             &self.client,
@@ -2128,6 +2207,7 @@ impl LanguageServer for Backend {
             &self.publish_gate,
             &self.revision,
             &saved,
+            recolored.as_deref(),
         )
         .await;
         // Same sweep rule as a typing pause (S5).
@@ -4677,7 +4757,7 @@ mod session_leak_tests {
 
     const PROGRAM: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
 
-    fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
+    pub(crate) fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
         DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -4688,7 +4768,11 @@ mod session_leak_tests {
         }
     }
 
-    fn whole_file_change(uri: &Url, version: i32, text: &str) -> DidChangeTextDocumentParams {
+    pub(crate) fn whole_file_change(
+        uri: &Url,
+        version: i32,
+        text: &str,
+    ) -> DidChangeTextDocumentParams {
         DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri.clone(),
@@ -4802,5 +4886,174 @@ mod session_leak_tests {
         }
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E116: a file's platform color is decided by which ENTRY reaches it, and the
+/// reachability walk is per-analysis — so the coloring only moves when the file
+/// is re-analyzed, and nothing used to re-analyze a file because SOMEONE ELSE'S
+/// import graph changed. The owner's report: an unreferenced file falls back to
+/// the process layer (E113's designated-entry rule, correct), then keeps that
+/// color after the import that reaches it is written, until the server is
+/// restarted.
+///
+/// Driven through the real notification handlers, because the bug is entirely
+/// in which documents the server chooses to re-analyze.
+#[cfg(test)]
+mod package_recolor_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// The kolt shape: a browser `client`, a node `server`, the process side
+    /// designated — so a module NO entry reaches falls back to process.
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+         [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+    /// A module using the BROWSER `View`'s `element` field: clean under
+    /// `browser`, "no field 'element'" under any process target.
+    const WIDGET: &str = "import std::ui::{ View, view };\n\n\
+         fun attach(): View {\n\tlet root = view(\"div\");\n\t\
+         root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
+    const CLIENT_WITHOUT_IMPORT: &str =
+        "import std::io::print;\n\nfun main() {\n\tprint(\"client\");\n}\n";
+    const CLIENT_WITH_IMPORT: &str =
+        "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\n";
+    const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+
+    /// The fixture package on disk, and the URIs of the two files the editor
+    /// opens. Uniquified per test process and per thread, like every other
+    /// workspace fixture here.
+    fn workspace(name: &str) -> (PathBuf, Url, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-recolor-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        for (relative, contents) in [
+            ("vilan.toml", MANIFEST),
+            ("src/widget.vl", WIDGET),
+            ("src/client.vl", CLIENT_WITHOUT_IMPORT),
+            ("src/server.vl", SERVER),
+        ] {
+            std::fs::write(directory.join(relative), contents).expect("a source file");
+        }
+        let widget = Url::from_file_path(directory.join("src/widget.vl")).expect("a file url");
+        let client = Url::from_file_path(directory.join("src/client.vl")).expect("a file url");
+        (directory, widget, client)
+    }
+
+    /// Whether the open document at `uri` is currently publishing the
+    /// process-`View` error — the exact squiggle the owner sees on a
+    /// browser-only file colored as process.
+    fn colored_as_process(backend: &Backend, uri: &Url) -> bool {
+        backend
+            .documents
+            .get(uri)
+            .expect("open")
+            .published_diagnostics()
+            .iter()
+            .any(|item| item.message.contains("has no field 'element'"))
+    }
+
+    /// Wait for the debounced analysis and the sweep it triggers to settle.
+    /// Polls rather than sleeping a fixed span: the analysis is real work on a
+    /// blocking thread, and a loaded machine is exactly when a fixed sleep
+    /// turns a pin into a flake.
+    async fn settled(backend: &Backend, uri: &Url, expected: bool) -> bool {
+        for _ in 0..200 {
+            if colored_as_process(backend, uri) == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_package_import_edit_recolors_the_open_file_it_reaches() {
+        let (directory, widget_uri, client_uri) = workspace("import");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend
+            .did_open(open_params(&client_uri, CLIENT_WITHOUT_IMPORT))
+            .await;
+        assert!(
+            colored_as_process(backend, &widget_uri),
+            "no entry reaches the widget yet, so `default-entry = \"server\"` colors it process \
+             — E113's fallback, and the premise of this pin",
+        );
+
+        // The entry gains the import that reaches it. The widget's own buffer
+        // does not move, and it does not depend on the entry — the entry
+        // depends on IT — so the dependency-edge sweep finds nothing to do.
+        backend
+            .did_change(whole_file_change(&client_uri, 2, CLIENT_WITH_IMPORT))
+            .await;
+        assert!(
+            settled(backend, &widget_uri, false).await,
+            "the error must clear without a restart: the widget is now reached by the browser \
+             entry, so it analyzes as browser",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn removing_the_import_colors_the_file_back() {
+        // The mirror, so the sweep is not one-way: deleting the import makes
+        // the widget unreached again and the process fallback returns. A fix
+        // that only ever re-colored TOWARD browser would pass the first pin
+        // and fail this one.
+        let (directory, widget_uri, client_uri) = workspace("removal");
+        std::fs::write(directory.join("src/client.vl"), CLIENT_WITH_IMPORT).expect("a source file");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend
+            .did_open(open_params(&client_uri, CLIENT_WITH_IMPORT))
+            .await;
+        assert!(
+            !colored_as_process(backend, &widget_uri),
+            "the browser entry reaches it, so it starts clean",
+        );
+        backend
+            .did_change(whole_file_change(&client_uri, 2, CLIENT_WITHOUT_IMPORT))
+            .await;
+        assert!(
+            settled(backend, &widget_uri, true).await,
+            "unreached again: the designated process entry colors it once more",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The decision itself, without a server. An ordinary body edit leaves the
+    /// `pkg::` graph exactly where it was, so it must NOT drag every open file
+    /// in the package through a re-analysis — the sweep is the expensive half
+    /// of a typing pause, and widening it unconditionally would undo B39a.
+    #[test]
+    fn an_edit_that_does_not_move_the_graph_recolors_nothing() {
+        let root = PathBuf::from("/pkg/src");
+        assert_eq!(
+            recolored_package(Some((7, root.clone())), Some((7, root.clone()))),
+            None,
+            "same package, same reach",
+        );
+        assert_eq!(
+            recolored_package(Some((7, root.clone())), Some((9, root.clone()))),
+            Some(root.clone()),
+            "the reach moved: the whole package is re-colored",
+        );
+        assert_eq!(
+            recolored_package(None, Some((7, root.clone()))),
+            Some(root.clone()),
+            "a file that had no package and now has one re-colors it",
+        );
+        assert_eq!(
+            recolored_package(Some((7, root)), None),
+            None,
+            "a file with no package of its own sweeps nobody",
+        );
     }
 }

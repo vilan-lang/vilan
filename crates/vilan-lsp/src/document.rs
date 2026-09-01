@@ -532,6 +532,12 @@ pub struct Document {
     /// fixture, and the degraded internal-error document), which keeps the
     /// comparison a no-op there.
     analysis_revision: u64,
+    /// The `pkg::` source root this analysis resolved under, canonicalized —
+    /// `None` when the file belongs to no project at all. E116's identity: two
+    /// open documents sharing a root are colored by ONE import graph, so an
+    /// edit that changes which entry reaches a file has to invalidate every one
+    /// of them, not only the ones that import the edited file.
+    package_root: Option<PathBuf>,
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -906,6 +912,7 @@ impl Document {
             shared_diagnostics: Vec::new(),
             import_roots: None,
             analysis_revision: 0,
+            package_root: None,
         }
     }
 
@@ -928,6 +935,14 @@ impl Document {
         // rooting `pkg::` at the file's own directory.
         let context = resolve_project_context(entry_path);
         let manifest_problem = context.manifest_problem;
+        // E116: the DECLARED root, canonicalized, kept as the file's package
+        // identity. Deliberately not the fallback below — a file with no
+        // project has no package to be colored by, and rooting it at its own
+        // directory would make unrelated neighbours look like siblings.
+        let package_root = context
+            .pkg_root
+            .as_deref()
+            .map(vilan_core::util::canonical_path);
         let pkg_root = context
             .pkg_root
             .unwrap_or_else(|| pkg_root_fallback(entry_path));
@@ -1059,6 +1074,7 @@ impl Document {
             shared_diagnostics,
             import_roots: Some(import_roots),
             analysis_revision: 0,
+            package_root,
         }
     }
 
@@ -1438,6 +1454,45 @@ impl Document {
         self.analysis_revision
     }
 
+    /// The canonical `pkg::` source root this analysis resolved under — the
+    /// package whose import graph colors this file (E116). `None` for a file
+    /// that belongs to no project: it shares a package with nobody, so it is
+    /// never swept as a peer and never sweeps one.
+    pub fn package_root(&self) -> Option<&Path> {
+        self.package_root.as_deref()
+    }
+
+    /// A fingerprint of the package modules this analysis reached: every
+    /// `canonical_sources` entry under the package root, order-independent.
+    ///
+    /// E116: a file's platform color is decided by which ENTRY reaches it
+    /// (`platform_color::file_platforms` walks the `pkg::` graph), so an
+    /// `import pkg::a` written anywhere in the package can re-color a file that
+    /// imports nothing and is imported by nobody the editor knows about. That
+    /// edit is invisible to the dependency-edge gate — the unreached file does
+    /// not depend on the entry, the entry depends on IT — which is why the
+    /// color stuck until a restart. A change in this fingerprint is the signal
+    /// that the graph moved, and the package's other open documents are swept.
+    /// Std and dependency sources are excluded: they cannot change which of
+    /// this package's entries reaches this package's files.
+    pub fn package_graph_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let (Some(program), Some(root)) = (self.program.as_ref(), self.package_root.as_ref())
+        else {
+            return 0;
+        };
+        let mut reached: Vec<&Path> = program
+            .canonical_sources
+            .iter()
+            .filter(|source| source.starts_with(root))
+            .map(PathBuf::as_path)
+            .collect();
+        reached.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        reached.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Whether the live buffer has advanced past the analyzed text — i.e. an
     /// analysis is pending and program answers describe an older text.
     ///
@@ -1505,6 +1560,7 @@ impl Document {
             shared_diagnostics,
             import_roots,
             analysis_revision,
+            package_root,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
@@ -1525,6 +1581,7 @@ impl Document {
         self.shared_diagnostics = shared_diagnostics;
         self.import_roots = import_roots;
         self.analysis_revision = analysis_revision;
+        self.package_root = package_root;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
