@@ -37175,13 +37175,60 @@ pub fn base_cache_stats() -> (u64, u64) {
     )
 }
 
+/// How many worlds the base cache is RETAINING right now (backlog M11) — the
+/// number the hit/miss pair cannot express and the one the item's finding is
+/// about: eviction here is per-key overwrite and nothing else, so a session
+/// that meets N distinct key shapes retains N worlds until something clears
+/// the map. A count, not an estimate; the bytes those worlds are worth are
+/// [`crate::leak_tally::LeakSite::BaseCacheWorld`]'s.
+#[doc(hidden)]
+pub fn base_cache_retained() -> usize {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        })
+        .unwrap_or(0)
+}
+
+/// The bytes a stored world is recorded as retaining (backlog M11): the module
+/// texts it was built from, summed. Source-proportional rather than a heap
+/// audit, for the reason [`crate::leak_tally::LeakSite::BaseCacheWorld`]
+/// states — the derived analyzer state a world holds scales with the text it
+/// was derived from, and the texts themselves are the parse cache's own
+/// (shared) sites. Deliberately a pure function of the world, so an eviction
+/// can compute exactly what the store recorded without the map having to carry
+/// the figure alongside the value.
+fn base_cache_world_bytes(world: &World<'_>) -> usize {
+    world
+        .analyzer
+        .source_texts
+        .iter()
+        .map(|(_, text)| text.len())
+        .sum()
+}
+
 #[doc(hidden)]
 pub fn base_cache_clear() {
     if let Some(cache) = BASE_CACHE.get() {
-        cache
+        let mut cache = cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Give every retained world back to the tally before dropping it
+        // (backlog M11). The release may land on a different thread from the
+        // record — a test clears from the runner's thread, a world was stored
+        // on an analysis thread — which is the cross-thread shape
+        // `leak_tally::outstanding` is signed for.
+        for world in cache.values() {
+            crate::leak_tally::release(
+                crate::leak_tally::LeakSite::BaseCacheWorld,
+                base_cache_world_bytes(world),
+            );
+        }
+        cache.clear();
     }
 }
 
@@ -37268,7 +37315,13 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
         false
     };
     if stale {
-        cache.remove(key);
+        // A removed world stops being retained, so its bytes go back (M11).
+        if let Some(evicted) = cache.remove(key) {
+            crate::leak_tally::release(
+                crate::leak_tally::LeakSite::BaseCacheWorld,
+                base_cache_world_bytes(&evicted),
+            );
+        }
     }
     BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     None
@@ -37310,11 +37363,24 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // (no pkg refs, no services, no macro-DEFINING entry text), so no other
     // entry-derived state exists in the world.
     let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
+    // Backlog M11: this map is the compiler's largest per-process retention
+    // and the tally could not see it. Record what the world is worth on the
+    // way in, and give back whatever it displaced — per-key overwrite is the
+    // only eviction this path has, so a session that never repeats a key
+    // never releases, and THAT is what the site now makes countable.
+    let stored_bytes = base_cache_world_bytes(&static_world);
     let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
-    cache
+    let displaced = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, static_world);
+    if let Some(displaced) = displaced {
+        crate::leak_tally::release(
+            crate::leak_tally::LeakSite::BaseCacheWorld,
+            base_cache_world_bytes(&displaced),
+        );
+    }
+    crate::leak_tally::record(crate::leak_tally::LeakSite::BaseCacheWorld, stored_bytes);
 }
 
 /// Expands the ENTRY over a constructed [`World`] — the derive/macro hoist
