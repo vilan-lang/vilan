@@ -213,7 +213,7 @@ elif git merge-base --is-ancestor refs/heads/next "$TAG_COMMIT"; then
     NEXT_PENDING=1
     ok "next fast-forwards onto the fold, in $NEXT_WORKTREE"
 else
-    red "next ($(git rev-parse --short refs/heads/next)) has moved past $VERSION — it cannot fast-forward onto the fold; merge main into next by hand instead"
+    red "next ($(git rev-parse --short refs/heads/next)) has moved past $VERSION — it cannot fast-forward onto the fold; fold by hand (merge the tag into main, push, merge main into next), then RUN THIS SCRIPT AGAIN: it recognizes the finished fold and performs the dispatches (docs.yml, deploy.yml, the manifest check) that a hand-fold skips — v0.40.0's book stayed stale for two days because they were"
 fi
 
 # --- the live manifest -----------------------------------------------------
