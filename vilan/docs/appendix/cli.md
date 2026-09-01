@@ -199,7 +199,9 @@ that explains them.
 ## `vilan run [file] [args…]`
 
 Builds and runs. Anything after the file is forwarded to the program.
-Reach it with `process::args()`. Under `--watch` it rebuilds and
+Reach it with `import std::process;` and `process::args()` — both lines:
+the qualified `std::process::args()` is a namespace path, not an
+expression. Under `--watch` it rebuilds and
 restarts on every save; in a project with a browser leg, hot module
 replacement is on by default: the page swaps changed code in place
 instead of reloading (see [the dev loop](../guide/dev-loop.md)).

@@ -121,7 +121,7 @@ enum Command {
         watch: bool,
     },
     /// Build and run a source file, forwarding any trailing arguments to the
-    /// program (reach them with `process::args()`).
+    /// program (reach them with `import std::process;` and `process::args()`).
     Run {
         /// A `.vl` file, a project directory, or omitted to use `vilan.toml`.
         file: Option<PathBuf>,

@@ -2181,6 +2181,30 @@ fn a35_the_shadowed_steer_names_both_ways_out() {
         "#,
         "rename it, or write this element as its lowered call, `ui::view(…)`",
     );
+    // Both ways out, compiled (audit run 7's steer sweep, ledger row 360).
+    // The lowered call, which needs the module rather than the bare name:
+    assert_compiles(
+        r#"
+        import std::ui;
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = ui::view("div");
+        }
+        "#,
+    );
+    // And the rename. What the element lowers to has to still be REACHABLE
+    // after the shadow is gone — ambient from the web prelude in the projects
+    // that meet this message, and named explicitly here, since the harness
+    // compiles against the base one.
+    assert_compiles(
+        r#"
+        import std::ui::view;
+        fun render(): i32 { 1 }
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+    );
 }
 
 #[test]

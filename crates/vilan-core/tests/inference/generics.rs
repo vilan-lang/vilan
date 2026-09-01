@@ -5080,13 +5080,115 @@ fn b188_an_under_supplied_parameter_annotation_refuses() {
 fn b188_the_under_supply_refusal_names_the_written_spelling() {
     // The message hands back the spelling that fixes it, so the parameter
     // names are the declaration's own.
+    //
+    // Audit run 7 (F4): those names are the DECLARATION's, and they are not in
+    // scope at the annotation — `write `Holder<S>`` alone steered straight into
+    // "cannot find type 'S'". The spelling still leads, because it is what the
+    // shape has to become, but the message now says where `S` comes from and
+    // names two ways to supply it. Both are pinned below, compiling.
     assert_fails_with(
         r#"
         struct Holder<S> { inner: S }
         fun read(h: Holder): i32 { h.inner }
         fun main() { print(read(Holder { inner = 7 })); }
         "#,
-        "write `Holder<S>`",
+        "write `Holder<S>` with `S` supplied here: a concrete type \
+         (`Holder<i32>`), or a parameter this signature declares (add `<S>` to \
+         its generics)",
+    );
+}
+
+#[test]
+fn b188_the_literal_spelling_the_refusal_names_does_not_compile_alone() {
+    // The defect F4 recorded, kept as a pin so the steer cannot quietly shrink
+    // back to it: writing the spelling and nothing else names a type that is
+    // the declaration's parameter, not this signature's.
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun read(h: Holder<S>): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "cannot find type 'S'",
+    );
+}
+
+#[test]
+fn b188_both_spellings_the_under_supply_refusal_blesses_compile() {
+    // Claim one: a concrete argument, the message's own `Holder<i32>`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder<S> { inner: S }
+        fun read(h: Holder<i32>): i32 { h.inner }
+        fun main() { print(read(Holder { inner = 7 })); }
+        main();
+        "#,
+        "7\n",
+    );
+    // Claim two: `<S>` added to the signature's own generics, which is what
+    // puts the name the spelling uses in scope.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder<S> { inner: S }
+        fun read<S>(h: Holder<S>): S { h.inner }
+        fun main() { print(read(Holder { inner = 7 })); }
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b188_a_bounded_parameter_is_not_blessed_with_a_concrete_example() {
+    // The concrete example is only offered where it is TRUE. A parameter with a
+    // bound cannot be filled by a type named blind, so the message says what
+    // the argument has to satisfy instead of naming one that may not.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Holder<S: Show> { inner: S }
+        fun read(h: Holder): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "write `Holder<S>` with `S` supplied here: a concrete type that \
+         satisfies its bound, or a parameter this signature declares (add \
+         `<S>` to its generics)",
+    );
+}
+
+#[test]
+fn b188_a_two_parameter_under_supply_pluralizes_its_steer() {
+    assert_fails_with(
+        r#"
+        struct Pair<A, B> { a: A, b: B }
+        fun read(p: Pair): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "write `Pair<A, B>` with `A, B` supplied here: concrete types \
+         (`Pair<i32, i32>`), or parameters this signature declares (add \
+         `<A, B>` to its generics)",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Pair<A, B> { a: A, b: B }
+        fun read(p: Pair<i32, i32>): i32 { p.a }
+        fun main() { print(read(Pair { a = 3, b = 4 })); }
+        main();
+        "#,
+        "3\n",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Pair<A, B> { a: A, b: B }
+        fun read<A, B>(p: Pair<A, B>): A { p.a }
+        fun main() { print(read(Pair { a = 3, b = "x" })); }
+        main();
+        "#,
+        "3\n",
     );
 }
 

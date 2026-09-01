@@ -99,9 +99,13 @@ filesystem. Rename the file or the import so the two agree.
 A parameter list declares what values a function accepts, and the entry
 accepts none — nothing in the language can call `main`, so a parameter
 there is a guess about what the shell will send rather than a promise
-about it. Delete the list and read the arguments with
-`process::args()`, a `List<str>` of everything after the script path,
-whose type is always right. (This shape used to compile: the entry's
+about it. Delete the list and read the arguments in two lines: `import
+std::process;` at the top of the file, then `process::args()` in the
+body, a `List<str>` of everything after the script path, whose type is
+always right. Both lines are needed — `std::process::args()` written
+inline is a namespace path, not an expression (`std` is a namespace, not
+a value), and a bare `process::args()` with no import above it has no
+`process` to qualify through. (This shape used to compile: the entry's
 body becomes the program's top-level statements, so the parameter was a
 free name and the program died at its first use.)
 → [Process modules](../std/process.md)
@@ -226,7 +230,9 @@ every trait-provided one.
 **"'…' is not an inherent member of '…': … provide… it; call … instead"**
 `Type::method(receiver)` means the type's *own* method. This one comes
 from a trait, so name the trait at the path head instead:
-`Trait::method(receiver)`.
+`Trait::method(receiver)`. It reads the same whether the impl block
+declares the method or takes the trait's default body — a default body
+is provision, and `Trait::method` is what reaches it either way.
 → [Names, modules, and packages](../spec/names.md)
 
 **"'…' does not implement '…', so '…::…' cannot be called on it"**

@@ -98,7 +98,7 @@ yours.
 | `vilan init [name]` | scaffold a project; `--template` picks `node`, `browser`, or `fullstack` |
 | `vilan build [path]` | compile to `<file>.mjs` — `.js` for a browser entry (no path: use the nearest `vilan.toml`) |
 | `vilan check [path]` | type-check and report problems, write nothing |
-| `vilan run [path] [args…]` | build and run; extra args reach `process::args()` |
+| `vilan run [path] [args…]` | build and run; extra args reach `process::args()`, under `import std::process;` |
 | `vilan fmt [paths…]` | format source files in place (`--check` to verify only) |
 | `vilan test [path]` | run `*_test.vl` files (a failed `assert` panics = test fails) |
 
