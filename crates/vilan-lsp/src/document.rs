@@ -41,8 +41,14 @@ struct ProjectContext {
     shared_platforms: Vec<BuildPlatform>,
     pkg_root: Option<PathBuf>,
     /// The file's resolved dependency workspace (P2), so cross-package imports
-    /// (`import <dep>::..`) type-check in the editor.
+    /// (`import <dep>::..`) type-check in the editor. Its `platform_reason` is
+    /// already stamped for `platform`, the leg the editor's own analysis runs
+    /// under (E119); a shared leg re-stamps it from `platform_reasons` below.
     workspace: BuildWorkspace,
+    /// E119: per color, WHY this file is analyzed under it — the same answer
+    /// `vilan check <file>` prints, from the same function. Empty when there is
+    /// no project to answer from.
+    platform_reasons: Vec<(BuildPlatform, String)>,
     /// Why the project didn't resolve, when it didn't (F5 S5). Everything below
     /// still degrades exactly as it did — the difference is that the reason is
     /// now published instead of swallowed.
@@ -56,8 +62,22 @@ impl ProjectContext {
             shared_platforms: Vec::new(),
             pkg_root: None,
             workspace: BuildWorkspace::default(),
+            platform_reasons: Vec::new(),
             manifest_problem: None,
         }
+    }
+
+    /// This context's workspace as a leg OTHER than the primary sees it: the
+    /// same dependency graph, re-stamped with that leg's own E119 reason. The
+    /// primary leg reads `workspace` directly and clones nothing.
+    fn workspace_for(&self, platform: BuildPlatform) -> BuildWorkspace {
+        let mut workspace = self.workspace.clone();
+        workspace.platform_reason = self
+            .platform_reasons
+            .iter()
+            .find(|(colored, _)| *colored == platform)
+            .map(|(_, reason)| reason.clone());
+        workspace
     }
 }
 
@@ -133,17 +153,31 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
     // `vilan build` was clean (E113, the owner's kolt report).
     if let Some(package) = &manifest.package {
         let pkg_root = root.join(package.root());
-        let mut platforms =
-            vilan_core::platform_color::file_platforms(&pkg_root, &manifest, entry_path)
-                .into_iter();
+        // Each color with the REASON it was chosen (E119) — the same function
+        // `vilan check <file>` calls, so the two surfaces cannot come to two
+        // conclusions about why a file is colored either.
+        let choices =
+            vilan_core::platform_color::file_platform_choices(&pkg_root, &manifest, entry_path);
+        let platform_reasons: Vec<(BuildPlatform, String)> = choices
+            .iter()
+            .map(|choice| (choice.platform, choice.reason.clause()))
+            .collect();
+        let mut platforms = choices.into_iter().map(|choice| choice.platform);
         let platform = platforms.next();
         let shared_platforms: Vec<BuildPlatform> = platforms.collect();
-        let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        let (mut workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        workspace.platform_reason = platform.and_then(|platform| {
+            platform_reasons
+                .iter()
+                .find(|(colored, _)| *colored == platform)
+                .map(|(_, reason)| reason.clone())
+        });
         return ProjectContext {
             platform,
             shared_platforms,
             pkg_root: Some(pkg_root),
             workspace,
+            platform_reasons,
             manifest_problem,
         };
     }
@@ -186,6 +220,9 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             shared_platforms: Vec::new(),
             pkg_root: Some(pkg_root),
             workspace,
+            // A `[library]` declares no target and the editor invents none (see
+            // above), so there is no colour to explain.
+            platform_reasons: Vec::new(),
             manifest_problem,
         };
     }
@@ -912,10 +949,11 @@ impl Document {
         // Prefer the project's declared platform and source root (the file's role in
         // its `vilan.toml`); fall back to inferring the platform from imports and
         // rooting `pkg::` at the file's own directory.
-        let context = resolve_project_context(entry_path);
-        let manifest_problem = context.manifest_problem;
+        let mut context = resolve_project_context(entry_path);
+        let manifest_problem = context.manifest_problem.take();
         let pkg_root = context
             .pkg_root
+            .clone()
             .unwrap_or_else(|| pkg_root_fallback(entry_path));
         // `std` is resolved as a library (its layered roots) from the std directory
         // — the manifest when present, else a bare base layer (L2).
@@ -1020,7 +1058,9 @@ impl Document {
                     &pkg_root,
                     entry_path,
                     *platform,
-                    &context.workspace,
+                    // Each leg gets its own E119 reason: a shared module's miss
+                    // under the browser leg is explained by the browser leg.
+                    &context.workspace_for(*platform),
                 )
             })
             .collect();

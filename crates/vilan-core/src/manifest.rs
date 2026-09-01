@@ -1592,6 +1592,9 @@ pub fn resolve_workspace_with_hook_report(
             entry_dependencies,
             macro_limits,
             entry_prelude,
+            // The front end fills this in (E119): resolving the dependency
+            // graph says nothing about which entry coloured the file.
+            platform_reason: None,
         },
         hook_report.into_values().collect(),
     ))

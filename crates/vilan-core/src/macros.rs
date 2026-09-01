@@ -841,6 +841,10 @@ fn compile_world(
         // ambient scope is `world_prelude_nodes`' meta vocabulary, and a
         // macro body talks to the compiler, not to `std::option`.
         entry_prelude: crate::manifest::PreludeSpec::Off,
+        // A macro world is a nested compile of the compiler's own vocabulary;
+        // no file of the user's is being coloured, so there is nothing to
+        // explain (E119).
+        platform_reason: None,
     };
     let previously_in_world = IN_MACRO_WORLD.with(|flag| flag.replace(true));
     let (program, errors) = analyze_source(

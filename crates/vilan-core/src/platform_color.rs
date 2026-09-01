@@ -829,6 +829,64 @@ fn name_of(program: &Program, id: Id) -> String {
 /// shape G20 established — it simply unified them on the manifest's default
 /// rather than on reachability.
 pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<Platform> {
+    file_platform_choices(pkg_root, manifest, file)
+        .into_iter()
+        .map(|choice| choice.platform)
+        .collect()
+}
+
+/// WHY a file is analyzed under the platform it is (E119). The color decides
+/// which `std` layer overlays the program, and therefore what the file's types
+/// ARE — so a diagnostic about a type that only exists under the *other* overlay
+/// is unreadable without the reason, and reads as a compiler mistake. E113
+/// computes the color; this is the sentence that goes with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlatformReason {
+    /// The classic single-entry package: its `target` colors every file under
+    /// the source root, whatever reaches what.
+    PackageTarget,
+    /// A multi-entry package, and this entry's leg loads the file.
+    ReachedBy(String),
+    /// A multi-entry package where NO leg loads the file — a module in
+    /// progress, or one whose importer was just deleted — so the designated
+    /// `default-entry` answers.
+    DefaultEntry(String),
+    /// The caller overrode everything: `--platform <p>` on the command line.
+    Flag,
+}
+
+impl PlatformReason {
+    /// The clause a diagnostic appends after "this file is analyzed under
+    /// `<platform>`". Written to complete that sentence, not to stand alone.
+    pub fn clause(&self) -> String {
+        match self {
+            PlatformReason::PackageTarget => {
+                "the package's `target` colors every file in it".into()
+            }
+            PlatformReason::ReachedBy(entry) => format!("the `{entry}` entry reaches it"),
+            PlatformReason::DefaultEntry(entry) => {
+                format!("no entry reaches it (default-entry is `{entry}`)")
+            }
+            PlatformReason::Flag => "`--platform` was passed".into(),
+        }
+    }
+}
+
+/// One color a file is analyzed under, with the reason it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformChoice {
+    pub platform: Platform,
+    pub reason: PlatformReason,
+}
+
+/// [`file_platforms`], each color carrying WHY it was chosen (E119). The
+/// coloring rule is stated in full on `file_platforms`; nothing here decides
+/// anything it does not.
+pub fn file_platform_choices(
+    pkg_root: &Path,
+    manifest: &Manifest,
+    file: &Path,
+) -> Vec<PlatformChoice> {
     let Some(package) = manifest.package.as_ref() else {
         return Vec::new();
     };
@@ -840,7 +898,10 @@ pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<
     let root = crate::util::canonical_path(pkg_root);
     if manifest.entries.is_empty() {
         return if file.starts_with(&root) {
-            vec![package.resolved_target().unwrap_or_default()]
+            vec![PlatformChoice {
+                platform: package.resolved_target().unwrap_or_default(),
+                reason: PlatformReason::PackageTarget,
+            }]
         } else {
             Vec::new()
         };
@@ -854,18 +915,21 @@ pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<
         .map(|(name, entry)| (name.as_str(), entry.resolved_target().unwrap_or_default()))
         .collect();
     legs.sort_by_key(|(_, platform)| !matches!(platform, Platform::Browser));
-    let mut platforms: Vec<Platform> = Vec::new();
+    let mut choices: Vec<PlatformChoice> = Vec::new();
     for (name, platform) in &legs {
-        if platforms.contains(platform) {
+        if choices.iter().any(|choice| choice.platform == *platform) {
             continue;
         }
         let entry = pkg_root.join(manifest.entries[*name].path(name));
         if crate::analyzer::package_modules_reachable_from(&entry, pkg_root).contains(&file) {
-            platforms.push(*platform);
+            choices.push(PlatformChoice {
+                platform: *platform,
+                reason: PlatformReason::ReachedBy((*name).to_string()),
+            });
         }
     }
-    if !platforms.is_empty() {
-        return platforms;
+    if !choices.is_empty() {
+        return choices;
     }
     // Unreached: the designated leg's platform, for a file that is the
     // package's to color at all. A file outside the source root is not (it
@@ -877,8 +941,13 @@ pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<
     }
     manifest
         .default_entry()
-        .and_then(|name| manifest.entries.get(name))
-        .map(|entry| vec![entry.resolved_target().unwrap_or_default()])
+        .and_then(|name| Some((name, manifest.entries.get(name)?)))
+        .map(|(name, entry)| {
+            vec![PlatformChoice {
+                platform: entry.resolved_target().unwrap_or_default(),
+                reason: PlatformReason::DefaultEntry(name.to_string()),
+            }]
+        })
         .unwrap_or_default()
 }
 

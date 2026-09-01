@@ -625,6 +625,7 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let source: &'static str = Box::leak(
         std::fs::read_to_string(&entry_path)

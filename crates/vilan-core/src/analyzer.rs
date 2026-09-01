@@ -2509,6 +2509,11 @@ pub struct Analyzer<'src> {
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
     struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
+    /// E119: the platform this analysis runs under, and why (the latter already
+    /// rendered) — copied off the call's arguments and the `Workspace` so the
+    /// diagnostic sites can read both without threading either.
+    platform: Platform,
+    platform_reason: Option<String>,
     // The file currently being walked, so type references (which aren't entities)
     // can be tagged with their source for the language server.
     current_source_id: SourceId,
@@ -2536,6 +2541,14 @@ pub struct Analyzer<'src> {
     // these sources via `frozen_entity`; the std-clean invariant that makes
     // that sound is pinned in `check_scope_differential.rs`.
     std_sources: HashSet<SourceId>,
+    /// E119: the std sources that live in a platform LAYER root rather than in
+    /// the base root, with that layer's name (`process`, `browser`). These are
+    /// the OVERLAID files — the ones whose `View`, `Element` and friends are one
+    /// type under this build's platform and a different type under the other, so
+    /// a miss on one of them is the miss that needs the overlay named. A std
+    /// module in the BASE root is not here: it is the same type under every
+    /// platform and has no twin to name.
+    std_layer_sources: HashMap<SourceId, String>,
     // The dependency packages' sources loaded from DISK (E84,
     // diagnostics-standard.md C3a): code the user did not write, whether
     // fetched (git) or path-linked. The context-coverage pass demotes and
@@ -3543,6 +3556,9 @@ impl<'src> Analyzer<'src> {
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
+            std_layer_sources: HashMap::default(),
+            platform: Platform::default(),
+            platform_reason: None,
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
@@ -18054,6 +18070,45 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// E119: a miss on a type that came from an OVERLAID `std` layer names the
+    /// overlay and why THIS file is analyzed under it.
+    ///
+    /// The platform decides more than which functions may run: it selects
+    /// `std`'s layer overlay, so it decides what a name like `View` IS. Under
+    /// the process overlay a `View` is `{ tag, attributes, children, text }` and
+    /// under the browser one it is `{ element }` — so `self.element` on a
+    /// browser module colored `node` draws `struct 'View' has no field
+    /// 'element'` on correct code. E113 fixed the COLOR; this fixes what the
+    /// message says when the color is right and the author still cannot see it,
+    /// which is every time the color came from something other than the file
+    /// itself: an unreached module taking the `default-entry`'s leg, a shared
+    /// module reported under a leg the author was not thinking about.
+    ///
+    /// Fires only for a type defined in a std LAYER source (`std_layer_sources`)
+    /// — a base-root std type is the same under every platform and has no twin
+    /// to name — and never for the user's own types, which the overlay does not
+    /// touch. `platform_reason` is the front end's; without one (a bare file, a
+    /// test harness) the note still names the overlay and the platform, which is
+    /// the half that is always knowable here.
+    fn overlaid_std_type_note(&self, definition_id: Id, type_name: &str) -> Option<Note> {
+        let source = self.source_of_id(definition_id)?;
+        let layer = self.std_layer_sources.get(&source)?;
+        let span = **self.span_map.get(&definition_id)?;
+        let platform = self.platform.runtime_name();
+        let head = format!(
+            "`{type_name}` here is std's {layer} twin — this file is analyzed under {platform}"
+        );
+        let msg = match &self.platform_reason {
+            Some(reason) => format!("{head}: {reason}"),
+            None => head,
+        };
+        Some(Note {
+            span,
+            msg,
+            source: Some(source),
+        })
+    }
+
     /// A35, the SHADOWED twin of [`Analyzer::element_view_import_note`]: the
     /// element desugar's callee is a bare `view`, so a user item of that name
     /// captures it, and every `<tag />` in the file then reports
@@ -28415,9 +28470,22 @@ impl<'src> Analyzer<'src> {
             MethodLookup::Defer => Resolution::Deferred,
             MethodLookup::NotCallable => {
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                // E119, the METHOD half of the same story: a `View` under the
+                // wrong overlay is missing methods as well as fields, and the
+                // answer is the same one — which twin this is, and why.
+                let note = match subject_type {
+                    Type::Struct(struct_id, _) => {
+                        let name = self
+                            .structs
+                            .get(&struct_id)
+                            .map(|struct_| struct_.name.to_string());
+                        name.and_then(|name| self.overlaid_std_type_note(struct_id, &name))
+                    }
+                    _ => None,
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
-                    note: None,
+                    note,
                     span: self
                         .member_name_spans
                         .get(&id)
@@ -31398,7 +31466,10 @@ impl<'src> Analyzer<'src> {
                     None => {
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
-                            note: None,
+                            // E119: when the struct came from an overlaid std
+                            // layer, the miss is usually about WHICH `View` this
+                            // is, not about the field.
+                            note: self.overlaid_std_type_note(struct_id, struct_name),
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
                         });
@@ -38134,6 +38205,19 @@ pub struct Workspace {
     /// rather than on a `PackageSpec` because the entry package has no spec in
     /// `packages` — that slice is its dependencies.
     pub entry_prelude: crate::manifest::PreludeSpec,
+    /// WHY this analysis runs under the platform it does (E119), already
+    /// rendered by [`crate::platform_color::PlatformReason::clause`] — "no entry
+    /// reaches it (default-entry is `server`)". `None` when the front end has no
+    /// project to answer from (a bare file, a test harness), and the diagnostic
+    /// that reads it then says only which platform it is under.
+    ///
+    /// It lives here, on the resolved project context the front end hands to the
+    /// analysis, for the same reason `entry_prelude` does: it is a fact about
+    /// THIS program that only the front end knows, and every entry point already
+    /// threads a `Workspace`. It is deliberately not part of what the base cache
+    /// keys on — the reason does not change which modules load, resolve, or
+    /// expand, only what one diagnostic says about them.
+    pub platform_reason: Option<String>,
 }
 
 /// A package loaded during analysis: its source root, the namespace its modules
@@ -39437,6 +39521,23 @@ fn analyze_inner<'src>(
                     if matches!(origin, Origin::Std) && !document_overlay_contains(&module_path) {
                         analyzer.std_sources.insert(SourceId(sources.len() as u32));
                     }
+                    // E119: a std module under a platform LAYER root is an
+                    // OVERLAID file — its types are this platform's twin of a
+                    // name the other platform spells differently. Recorded for
+                    // every std layer module, overlaid buffer included: an open
+                    // `ui.vl` is still the process twin. Canonical on both sides
+                    // (`windows-support.md` §5), like every other containment
+                    // test over a library root.
+                    if matches!(origin, Origin::Std) {
+                        let canonical = crate::util::canonical_path(&module_path);
+                        if let Some(layer) = std.layers.iter().find(|layer| {
+                            canonical.starts_with(crate::util::canonical_path(&layer.root))
+                        }) {
+                            analyzer
+                                .std_layer_sources
+                                .insert(SourceId(sources.len() as u32), layer.name.clone());
+                        }
+                    }
                     // A dependency package's module is code the user did not
                     // write (E84, diagnostics-standard.md C3a): the
                     // context-coverage walk demotes and traces it exactly
@@ -40269,6 +40370,11 @@ fn analyze_over_world<'src>(
         owned_nursery_struct_id,
         phase_marks,
     } = world;
+    // E119: set AFTER the world is unpacked — a world can come from the base
+    // cache, whose analyzer carries whatever the analysis that stored it had,
+    // and the color and its reason belong to THIS call.
+    analyzer.platform = platform;
+    analyzer.platform_reason = workspace.platform_reason.clone();
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);

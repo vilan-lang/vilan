@@ -284,6 +284,23 @@ Close enough is a real threshold: `"entires"` suggests `"entries"`, and
 `"x"` suggests nothing at all.
 → [Control flow](../tour/control-flow.md)
 
+**"`…` here is std's … twin — this file is analyzed under …"** *(a note)*
+This rides under a field or method miss on a **std** type, and it is
+usually the whole story. A build's platform selects `std`'s layer
+overlay, so it decides what a name like `View` *is*: `{ element }` in
+the browser layer, `{ tag, attributes, children, text }` in the process
+one. If your file is being analyzed under the platform you did not have
+in mind, correct code reports a field that does not exist. The note
+names which twin you got and **why that platform** — one of four: the
+entry that reaches this file, the `default-entry` that answers when no
+entry reaches it, an explicit `--platform`, or a single-entry package's
+own `target`. Fix the situation the reason names rather than the line:
+if a module should be browser code, have the browser entry reach it
+(import it from that entry, directly or transitively); if it is shared
+between legs, it must type-check under *every* leg that loads it, and
+the note tells you which one is complaining.
+→ [Platforms](../tour/platforms.md), [Building UI](../guide/ui.md)
+
 **"`…` expects N arguments, but got M instead: `…` is missing."** ·
 **"`…` expects N fields, but got M instead: `…` is not a field of `…`."**
 A call or a struct literal is short of, or over, its declared list. The
