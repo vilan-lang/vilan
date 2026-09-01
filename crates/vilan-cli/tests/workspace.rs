@@ -1608,3 +1608,308 @@ fn a_file_with_no_manifest_above_it_keeps_its_manifest_less_context() {
     assert!(output.status.success(), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── File mode and the LSP color a module by REACHABILITY (E113) ──
+//
+// A build compiles one leg per `[entry.<name>]`, each over the modules that
+// leg loads, each under that leg's target. The platform is not only what the
+// admission walk admits: it selects `std`'s layer overlay, so it decides what
+// the file's types ARE. `View` is `{ element }` in the browser layer and
+// `{ tag, attributes, children, text }` in the process one.
+//
+// File mode used to answer every path-addressed file with the `node` default —
+// so every browser-only module of a fullstack app was checked against the
+// process overlay and reported "struct 'View' has no field 'element'" on
+// correct code, while `vilan build` was clean. The fix is
+// `platform_color::file_platforms`, which both this and the language server
+// take: the entry that REACHES the module colors it.
+//
+// The four cases below are the whole rule, and the package-mode pin after them
+// is the invariant they must not disturb.
+
+/// A fullstack package: a browser `client`, a node `server`, `default-entry`
+/// on the node side (kolt's shape), plus whatever modules the caller adds.
+fn write_fullstack_package(dir: &Path, default_entry: &str, modules: &[(&str, &str)]) {
+    write(
+        dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\ndefault-entry = \"{default_entry}\"\n\n\
+             [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n"
+        ),
+    );
+    for (path, contents) in modules {
+        write(dir, path, contents);
+    }
+}
+
+/// A module using the BROWSER `View`'s `element` field — clean under `browser`,
+/// "no field 'element'" under any process target.
+const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+     export fun attach(): View {\n\tlet root = view(\"div\");\n\t\
+     root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
+
+/// The mirror: the PROCESS `View`'s `tag` field — clean under node, "no field
+/// 'tag'" under `browser`.
+const PROCESS_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+     export fun markup(): str {\n\tlet root = view(\"div\");\n\troot.tag\n}\n";
+
+#[test]
+fn file_mode_colors_a_browser_only_module_by_the_entry_that_reaches_it() {
+    // E113 itself, from the owner's kolt report: `interact.vl` is reached only
+    // from the browser entry, `default-entry` is the node one, and file mode
+    // answered with the node default — so `self.element` drew "struct 'View'
+    // has no field 'element'" on a module `vilan build` compiles clean.
+    let dir = temp_project("e113_browser_only");
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/widget.vl", BROWSER_ONLY_MODULE),
+            (
+                "src/client.vl",
+                "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\nmain();\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\nmain();\n",
+            ),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/widget.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a module only the browser entry reaches is checked as browser:\n{text}"
+    );
+    assert!(
+        !text.contains("has no field 'element'"),
+        "the process overlay's `View` is not this module's:\n{text}"
+    );
+    // The build agrees, which is the whole complaint: it always did.
+    let package = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(package.status.success(), "{}", combined(&package));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_colors_a_node_only_module_by_the_entry_that_reaches_it() {
+    // The mirror-image control, and the reason the fix cannot be "prefer
+    // browser": the module is reached only from the NODE entry while
+    // `default-entry` names the browser one, and it uses the process `View`'s
+    // `tag`. Reachability answers node; a browser default — or the old node
+    // default read as a lucky guess — would be the wrong instrument even where
+    // it happens to agree.
+    let dir = temp_project("e113_node_only");
+    write_fullstack_package(
+        &dir,
+        "client",
+        &[
+            ("src/store.vl", PROCESS_ONLY_MODULE),
+            (
+                "src/client.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"client\");\n}\nmain();\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\nimport pkg::store::markup;\n\n\
+                 fun main() {\n\tprint(markup());\n}\nmain();\n",
+            ),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/store.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a module only the node entry reaches is checked as node:\n{text}"
+    );
+    // Non-vacuous: the same file under the browser color is red, so the pin is
+    // measuring the coloring and not the module's own innocence.
+    let forced = vilan_plain(&[
+        "check",
+        "--platform",
+        "browser",
+        dir.join("src/store.vl").to_str().unwrap(),
+    ]);
+    assert!(
+        !forced.status.success() && combined(&forced).contains("has no field 'tag'"),
+        "{}",
+        combined(&forced)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_checks_a_shared_module_under_every_leg_that_reaches_it() {
+    // A module BOTH entries reach is compiled once per leg and must type-check
+    // under each, so file mode checks it under each and reports the union — the
+    // same verdict `vilan check .` gives. Answering from one color would pass a
+    // file the build refuses, which is the E113 lie pointing the other way.
+    let dir = temp_project("e113_shared");
+    let reach = "import pkg::shared::labelled;\n\nfun main() {\n\tlabelled(\"app\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            // The mistake only the BROWSER leg can see (`tag` is the process
+            // twin's field), in a module BOTH legs load — and `default-entry`
+            // is the node one, so the leg that catches it is never the leg a
+            // single-color answer would have picked.
+            (
+                "src/shared.vl",
+                "import std::ui::{ View, view };\n\n\
+                 export fun labelled(text: str): str {\n\tlet root = view(text);\n\t\
+                 root.tag\n}\n",
+            ),
+            ("src/client.vl", reach),
+            ("src/server.vl", reach),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/shared.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no field 'tag'"),
+        "the browser leg's verdict on a shared module is reported too:\n{text}"
+    );
+    // Exactly what the package check says, from the leg that says it.
+    let package = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(
+        !package.status.success() && combined(&package).contains("has no field 'tag'"),
+        "{}",
+        combined(&package)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_falls_back_to_the_default_entry_for_an_unreached_module() {
+    // No entry loads it — a module in progress, or one whose importer was just
+    // deleted. There is no reaching leg to ask, so the package's designated
+    // `default-entry` answers, and moving that designation moves the color.
+    let dir = temp_project("e113_unreached");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "client",
+        &[
+            ("src/orphan.vl", BROWSER_ONLY_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let orphan = dir.join("src/orphan.vl");
+    let browser_default = vilan_plain(&["check", orphan.to_str().unwrap()]);
+    assert!(
+        browser_default.status.success(),
+        "`default-entry = \"client\"` colors an unreached module browser:\n{}",
+        combined(&browser_default)
+    );
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+         [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    let node_default = vilan_plain(&["check", orphan.to_str().unwrap()]);
+    assert!(
+        !node_default.status.success()
+            && combined(&node_default).contains("has no field 'element'"),
+        "and moving the designation moves the color:\n{}",
+        combined(&node_default)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn package_mode_still_checks_every_leg() {
+    // The invariant beside the fix: `vilan check .` is unchanged — one compile
+    // per entry, under that entry's own target, and a mistake only ONE leg can
+    // see still fails the command. E113 moved what file mode answers; it must
+    // move nothing about what the package check does.
+    let dir = temp_project("e113_package_mode");
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/widget.vl", BROWSER_ONLY_MODULE),
+            (
+                "src/client.vl",
+                "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\nmain();\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\nimport pkg::store::markup;\n\n\
+                 fun main() {\n\tprint(markup());\n}\nmain();\n",
+            ),
+            // Reached only by the node leg, and BROKEN only under browser —
+            // proof the node leg ran, since the browser leg never loads it.
+            ("src/store.vl", PROCESS_ONLY_MODULE),
+        ],
+    );
+    let clean = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(
+        clean.status.success(),
+        "both legs check, each under its own target:\n{}",
+        combined(&clean)
+    );
+    // Break the BROWSER leg alone: the node entry never loads `widget.vl`, so
+    // only a per-leg check can catch this.
+    write(
+        &dir,
+        "src/widget.vl",
+        "import std::ui::{ View, view };\n\n\
+         export fun attach(): View {\n\tlet root = view(\"div\");\n\troot.tag;\n\troot\n}\n",
+    );
+    let broken = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(
+        !broken.status.success() && combined(&broken).contains("has no field 'tag'"),
+        "the browser leg's own mistake fails the package check:\n{}",
+        combined(&broken)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_does_not_ask_a_module_for_a_main() {
+    // Found fixing E113, and the reason its verification could not be run:
+    // file mode compiled every path it was handed as if it were the program, so
+    // `vilan check src/widget.vl` on a clean module answered "Cannot execute
+    // program without a main function" — a demand no module can meet. An ENTRY
+    // still gets the demand, because an entry without `main` is a build that
+    // cannot succeed.
+    let dir = temp_project("e113_module_main");
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/widget.vl", BROWSER_ONLY_MODULE),
+            (
+                "src/client.vl",
+                "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\nmain();\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\nmain();\n",
+            ),
+        ],
+    );
+    let module = vilan_plain(&["check", dir.join("src/widget.vl").to_str().unwrap()]);
+    let text = combined(&module);
+    assert!(
+        module.status.success() && !text.contains("without a main function"),
+        "a module is not a program and is never asked for one:\n{text}"
+    );
+    // The entry keeps the demand.
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::io::print;\n\nfun greet() {\n\tprint(\"server\");\n}\n",
+    );
+    let entry = vilan_plain(&["check", dir.join("src/server.vl").to_str().unwrap()]);
+    let entry_text = combined(&entry);
+    assert!(
+        !entry.status.success() && entry_text.contains("without a main function"),
+        "an entry that lost its `main` still says so:\n{entry_text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -37784,6 +37784,67 @@ pub fn module_source_file(roots: &[&Path], name: &str) -> Option<PathBuf> {
     resolve_module_in_roots(roots, name).map(|resolution| resolution.path)
 }
 
+/// Every file of the package rooted at `pkg_root` that a build entered at
+/// `entry` **loads** — the entry itself and the transitive closure of its
+/// `pkg::` module references, as canonical paths.
+///
+/// This is the loader's own reachability, not a second one: the seeds are
+/// [`collect_module_refs`]`(.., "pkg")` — every `import`/`use` under `pkg` at
+/// any nesting depth, the same call the load loop makes — and each name
+/// resolves through [`resolve_module_file`] against the single root a package's
+/// own modules search. A module's siblings are its out-edges, exactly as they
+/// are during a compile, so "did this leg load that file" gets one answer
+/// wherever it is asked.
+///
+/// The caller is [`crate::platform_color::file_platforms`]: which entry
+/// *reaches* a module is which platform colors it, and a compile is far too
+/// expensive to ask that question with (the language server asks it per
+/// keystroke). Parses go through the loader's caches, so a saved sibling is
+/// parsed once per distinct content for the whole process.
+///
+/// Overlay-served content is **owned and reclaimed here** (`leak-soak.md`
+/// §7.5/§7.9.4): an open buffer's text is a keystroke's and can never recur, so
+/// letting this walk park one in the process-global parse cache would leak a
+/// text + tree per landed keystroke. Inside an analysis's own collection scope
+/// the walk simply adopts into it, and the analysis reclaims as it always does.
+pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<PathBuf> {
+    // Activate a scope only when there is none: `CollectionScope` is not
+    // re-entrant on a thread, and a walk running inside an analysis's scope
+    // wants that analysis's ownership anyway.
+    let scope =
+        (!crate::owned_modules::collecting()).then(crate::owned_modules::CollectionScope::activate);
+    let mut reached: HashSet<PathBuf> = HashSet::default();
+    let mut queue = vec![entry.to_path_buf()];
+    reached.insert(crate::util::canonical_path(entry));
+    while let Some(path) = queue.pop() {
+        // Names are copied out of the tree before the next iteration, so no
+        // borrow of an owned allocation outlives the reclaim below.
+        let siblings: Vec<String> = match load_package_module(&path) {
+            Some(loaded) => collect_module_refs(&loaded.ast.0, "pkg")
+                .into_iter()
+                .map(|(module, _)| module.to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        for module in siblings {
+            let Some(file) = resolve_module_file(pkg_root, &module) else {
+                continue;
+            };
+            if reached.insert(crate::util::canonical_path(&file.path)) {
+                queue.push(file.path);
+            }
+        }
+    }
+    if let Some(scope) = scope {
+        // SAFETY: every reference this walk derived from those loads died with
+        // the loop above — the module names were copied into owned `String`s,
+        // and nothing global retains a borrow (a walk stores no world and
+        // expands no macro, so §7.9.4a/b's two escape routes are both shut).
+        unsafe { scope.drain().reclaim() };
+    }
+    reached
+}
+
 /// Every name an `import` may bind from the module file at `path`, loaded ON
 /// DEMAND — the point of an import is to reach something the program has not
 /// loaded, so the analyzed `Program` cannot answer this.

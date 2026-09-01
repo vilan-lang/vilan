@@ -450,16 +450,36 @@ fn note_refused_dependency_hooks(project: &Project) {
 
 /// Type-checks the project once. A standalone `[library]` has no fixed platform, so
 /// it verifies the platform contract (§4.2) instead of a single-platform build.
+///
+/// A file shared between the legs of a multi-entry package is checked under
+/// EVERY color the build compiles it under, and every leg's diagnostics are
+/// reported (E113) — the build compiles it once per leg and it must type-check
+/// under each, so answering from one color would pass a file `vilan check .`
+/// refuses. An explicit `--platform` overrides the lot: naming a platform is
+/// asking about that platform.
 fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> RoundOutcome {
     with_project(file, |project| match project {
         Project::Single {
             unit,
             platform: package_platform,
+            shared_platforms,
+            module_file,
             ..
         } => match effective_platform(platform.as_deref(), package_platform) {
             // A `none` package is a pure library — not buildable, but type-checkable
             // (against the base layer only).
-            Ok(platform) => check_single(&unit, platform, debug),
+            Ok(first) => {
+                let goal = if module_file {
+                    CompileGoal::CheckModule
+                } else {
+                    CompileGoal::Check
+                };
+                let mut platforms = vec![first];
+                if platform.is_none() {
+                    platforms.extend(shared_platforms);
+                }
+                check_single(&unit, &platforms, debug, goal)
+            }
             Err(message) => report_error(&message),
         },
         Project::Workspace { members, .. } => check_workspace(&members, debug),
@@ -2891,8 +2911,20 @@ enum Project {
     Single {
         unit: Unit,
         /// The package's declared `target` platform, if any (`None` ⇒ the `node`
-        /// default).
+        /// default). In file mode this is the FIRST color the build compiles the
+        /// addressed file under ([`vilan_core::platform_color::file_platforms`]).
         platform: Option<Platform>,
+        /// The further colors the build compiles this file under: a module
+        /// shared between legs of a multi-entry package is compiled once per
+        /// leg and must type-check under each, so `check` covers every one of
+        /// them and reports the union (E113). Empty for everything else —
+        /// including a build, which writes one artifact and so uses `platform`
+        /// alone.
+        shared_platforms: Vec<Platform>,
+        /// The addressed file is a MODULE of its package rather than one of its
+        /// program entries — only file mode can produce it, and only `check`
+        /// reads it (a module has no `main` to lack, E113).
+        module_file: bool,
         /// The `[build] run` hooks to run before building it (A9).
         hooks: BuildHooks,
     },
@@ -3021,6 +3053,9 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             options: BuildOptions::default(),
         },
         platform: None,
+        shared_platforms: Vec::new(),
+        // A file with no `[package]` above it IS the program it names.
+        module_file: false,
         hooks: BuildHooks::default(),
     };
     let Some((directory, manifest)) = owning_package(&entry)? else {
@@ -3033,29 +3068,20 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
         .build_options()
         .map_err(|error| format!("invalid {}/vilan.toml: {error}", directory.display()))?;
     let pkg_root = directory.join(package.root());
-    // The platform, by the language server's rule (`document.rs`'s
-    // `resolve_project_context`): the classic single-entry form colors every
-    // file under its source root; a multi-entry package colors an ENTRY file by
-    // its own target and leaves anything else to inference, since a module
-    // reached from several entries has no one target. A file outside the source
-    // root is not the package's to color either — it still resolves `pkg::` and
-    // the dependencies, which is what it needs.
-    //
-    // Compared canonically on both sides, never textually: `./src/main.vl` and
-    // `src/main.vl` name one file and must get one answer, and — the symlink
-    // doctrine, `spec/const.md` §9.2 — so must a source root reached through a
-    // link.
-    let resolved_entry = vilan_core::util::canonical_path(&entry);
-    let platform = if manifest.entries.is_empty() {
-        resolved_entry
-            .starts_with(vilan_core::util::canonical_path(&pkg_root))
-            .then(|| package.resolved_target().unwrap_or_default())
-    } else {
-        manifest.entries.iter().find_map(|(name, declared)| {
-            (vilan_core::util::canonical_path(pkg_root.join(declared.path(name))) == resolved_entry)
-                .then(|| declared.resolved_target().unwrap_or_default())
-        })
-    };
+    // The platform, by the one rule the language server also takes
+    // (`platform_color::file_platforms`): the classic single-entry form colors
+    // every file under its source root, and a multi-entry package colors a file
+    // by the entry that REACHES it — the build's own question, since a build is
+    // one compile per entry over the modules that entry loads. Several reaching
+    // legs give several colors, and `check_once` covers each; none, and the
+    // designated `default-entry` answers. A file outside the source root is not
+    // the package's to color — it still resolves `pkg::` and the dependencies,
+    // which is what it needs.
+    let mut platforms =
+        vilan_core::platform_color::file_platforms(&pkg_root, &manifest, &entry).into_iter();
+    let platform = platforms.next();
+    let shared_platforms: Vec<Platform> = platforms.collect();
+    let module_file = is_package_module(&pkg_root, &manifest, &entry);
     Ok(Project::Single {
         unit: Unit {
             name: String::new(),
@@ -3066,8 +3092,39 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             options,
         },
         platform,
+        shared_platforms,
+        module_file,
         hooks: BuildHooks::default(),
     })
+}
+
+/// Whether `file` is a MODULE of the package: under its source root, and not
+/// one of its declared program entries (the single `[package] entry`, default
+/// `main.vl`, or an `[entry.<name>]` path). A module has no `main`, and nothing
+/// should ask it for one (E113).
+///
+/// A file OUTSIDE the source root is not the package's module — it is a program
+/// that happens to sit in the directory, and it keeps the demand it always had.
+///
+/// Compared canonically on both sides, never textually: `./src/main.vl` and
+/// `src/main.vl` name one file and must get one answer, and — the symlink
+/// doctrine, `spec/const.md` §9.2 — so must a file reached through a link.
+fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> bool {
+    let Some(package) = manifest.package.as_ref() else {
+        return false;
+    };
+    let file = vilan_core::util::canonical_path(file);
+    if !file.starts_with(vilan_core::util::canonical_path(pkg_root)) {
+        return false;
+    }
+    let same = |candidate: PathBuf| vilan_core::util::canonical_path(candidate) == file;
+    if manifest.entries.is_empty() {
+        return !same(pkg_root.join(package.entry()));
+    }
+    !manifest
+        .entries
+        .iter()
+        .any(|(name, declared)| same(pkg_root.join(declared.path(name))))
 }
 
 /// Reads, parses, validates, and reports warnings for the `vilan.toml` in
@@ -3373,6 +3430,10 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
     Ok(Project::Single {
         unit: unit_from_package(directory, package, options),
         platform: package.resolved_target(),
+        // A package addressed as a DIRECTORY builds its own entry: one leg, one
+        // color, and an entry it is. Both are file-mode questions (E113).
+        shared_platforms: Vec::new(),
+        module_file: false,
         hooks: BuildHooks::from_manifest(directory, &manifest),
     })
 }
@@ -3427,10 +3488,34 @@ fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
 /// in one statement stops hiding the type errors everywhere else in the file
 /// (§2.2 mechanism 1, measured as P29). Neither goal ever emits JavaScript from a
 /// recovered tree.
+///
+/// `CheckModule` is `Check` for a file that is **not** a program entry — a
+/// module of its package, addressed by path. It skips the emission walk, whose
+/// one failure is the missing `main` a module has no business declaring: file
+/// mode compiled every path it was given as if it were the program, so
+/// `vilan check src/interact.vl` on a perfectly good module answered "Cannot
+/// execute program without a main function" (found fixing E113). An ENTRY
+/// keeps `Check`, so a `vilan check .` whose entry really has lost its `main`
+/// still says so rather than going green over a build that cannot succeed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompileGoal {
     Emit,
     Check,
+    CheckModule,
+}
+
+impl CompileGoal {
+    /// Whether this goal analyzes a tree recovered from syntax errors (both
+    /// checking goals do; emission never does).
+    fn analyzes_recovered_trees(self) -> bool {
+        matches!(self, CompileGoal::Check | CompileGoal::CheckModule)
+    }
+
+    /// Whether this goal runs the emission walk. `CheckModule` does not: a
+    /// module is not a program, and emission's only diagnostic says so.
+    fn emits(self) -> bool {
+        !matches!(self, CompileGoal::CheckModule)
+    }
 }
 
 /// What one compile produced, for the caller that writes it out. A tuple grew
@@ -3584,27 +3669,35 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
     }
 }
 
-/// Type-checks a lone package / bare file, writing no output.
-fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> RoundOutcome {
-    match compile_unit(
-        unit,
-        platform,
-        CompileGoal::Check,
-        emit_debug,
-        false,
-        None,
-        None,
-    ) {
-        Ok(_) => {
-            println!(
-                "{}: {}",
-                unit.entry.display(),
-                paint::out(paint::Style::GREEN, "no errors")
-            );
-            RoundOutcome::Succeeded
-        }
-        Err(_) => RoundOutcome::Failed,
+/// Type-checks a lone package / bare file, writing no output. `goal` is
+/// `CompileGoal::CheckModule` when the addressed file is a module of its
+/// package rather than one of its entries (E113).
+///
+/// `platforms` is usually one. It is several for a module SHARED between the
+/// legs of a multi-entry package: the build compiles such a file once per leg
+/// and it must type-check under every one of them, so the check reports each
+/// leg's diagnostics and a clean verdict means clean everywhere (E113). One
+/// verdict line either way — the file is the subject, not the number of colors
+/// it took to clear it.
+fn check_single(
+    unit: &Unit,
+    platforms: &[Platform],
+    emit_debug: bool,
+    goal: CompileGoal,
+) -> RoundOutcome {
+    let mut ok = true;
+    for platform in platforms {
+        ok &= compile_unit(unit, *platform, goal, emit_debug, false, None, None).is_ok();
     }
+    if !ok {
+        return RoundOutcome::Failed;
+    }
+    println!(
+        "{}: {}",
+        unit.entry.display(),
+        paint::out(paint::Style::GREEN, "no errors")
+    );
+    RoundOutcome::Succeeded
 }
 
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
@@ -5045,7 +5138,7 @@ fn compile_to_js(
     let fresh_root: Option<vilan_core::Spanned<vilan_core::node::NodeList>> = match &cached {
         None => {
             let (tree, errors) = vilan_core::parsing::parse(src.as_str());
-            let analyzable = errors.is_empty() || goal == CompileGoal::Check;
+            let analyzable = errors.is_empty() || goal.analyzes_recovered_trees();
             parse_errors = errors;
             tree.filter(|_| analyzable).map(|(mut items, span)| {
                 // Elements desugar, then bare-`?` marks become lift regions,
@@ -5278,6 +5371,11 @@ fn compile_to_js(
             // rename; `transform_split` returns the eager bundle where
             // `transform` returns the whole one, plus the chunk files.
             let emitted = match split {
+                // A module of a package, addressed by path: analysis is the
+                // whole job (E113). Emission's one diagnostic is the missing
+                // `main` a module never had, and running the walk for it would
+                // be asking a file to be a program because someone named it.
+                _ if !goal.emits() => Ok(String::new()),
                 Some((leg, sink)) => {
                     vilan_core::transform_split(&program, options, leg).map(|split_program| {
                         // Splitting is not free, and below a few KB of

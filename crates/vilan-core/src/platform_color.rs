@@ -33,12 +33,14 @@
 //! every function gets a shortest witness chain to the layer it requires.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 
 use crate::analyzer::{GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
+use crate::manifest::Manifest;
 use crate::span::Span;
 use crate::target::Platform;
 use crate::type_::{Type, TypeId};
@@ -785,6 +787,99 @@ fn name_of(program: &Program, id: Id) -> String {
         return variable.name.to_string();
     }
     "closure".to_string()
+}
+
+// ── Which platform colors a FILE (E113) ──────────────────────────────────────
+
+/// The platforms a single file of a package is analyzed under — the same
+/// coloring one level up, answering "which build is this file part of?" instead
+/// of "may this function run here?".
+///
+/// It exists because a build's platform is not only what [`check`] admits: it
+/// selects `std`'s layer overlay, and therefore what the file's types *are*. A
+/// browser module's `View` is `{ element }`; the process twin's is
+/// `{ tag, attributes, children, text }`. Pick the wrong platform for a file and
+/// correct code is reported as nonsense — E113's report, where every
+/// browser-only module of a fullstack app drew "struct `View` has no field
+/// `element`" in the editor while `vilan build` was clean.
+///
+/// The answer is **reachability**, which is what the build itself uses: a
+/// multi-entry package lowers to one build unit per entry, and each unit
+/// compiles the modules it loads under its own target. So:
+///
+/// - reached by exactly one entry → that entry's platform;
+/// - reached by several → **each** of their platforms, deduplicated, in the
+///   build's own leg order (browser-class first, `package_units`' rule). A
+///   shared module is compiled once per leg and must type-check under every
+///   one of them, so a surface reporting fewer diagnostics than the build
+///   would is the same lie in the other direction; callers check it under each
+///   color and report the union;
+/// - reached by none → the `default-entry`'s platform, when one is designated.
+///
+/// The classic single-entry form is unchanged and still answers first: the
+/// package's `target` colors every file under its source root. A file outside
+/// the source root, a manifest with no `[package]`, and an unreached module in
+/// a package that designates no `default-entry` all answer with **no**
+/// platform — the caller then does what it does for a file with no project at
+/// all (the CLI's `node` default, the editor's inference from the file's own
+/// imports).
+///
+/// One function, both surfaces: `vilan check <file>` and the language server
+/// must not come to two conclusions about the same file, which is exactly the
+/// shape G20 established — it simply unified them on the manifest's default
+/// rather than on reachability.
+pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<Platform> {
+    let Some(package) = manifest.package.as_ref() else {
+        return Vec::new();
+    };
+    // Compared canonically on both sides, never textually: `./src/main.vl` and
+    // `src/main.vl` name one file and must get one answer, and — the symlink
+    // doctrine, `spec/const.md` §9.2 — so must a source root reached through a
+    // link.
+    let file = crate::util::canonical_path(file);
+    let root = crate::util::canonical_path(pkg_root);
+    if manifest.entries.is_empty() {
+        return if file.starts_with(&root) {
+            vec![package.resolved_target().unwrap_or_default()]
+        } else {
+            Vec::new()
+        };
+    }
+    // The legs, in the order the build compiles them (`package_units`):
+    // browser-class first, stable among themselves — so the FIRST color a
+    // shared module reports is the first leg to compile it.
+    let mut legs: Vec<(&str, Platform)> = manifest
+        .entries
+        .iter()
+        .map(|(name, entry)| (name.as_str(), entry.resolved_target().unwrap_or_default()))
+        .collect();
+    legs.sort_by_key(|(_, platform)| !matches!(platform, Platform::Browser));
+    let mut platforms: Vec<Platform> = Vec::new();
+    for (name, platform) in &legs {
+        if platforms.contains(platform) {
+            continue;
+        }
+        let entry = pkg_root.join(manifest.entries[*name].path(name));
+        if crate::analyzer::package_modules_reachable_from(&entry, pkg_root).contains(&file) {
+            platforms.push(*platform);
+        }
+    }
+    if !platforms.is_empty() {
+        return platforms;
+    }
+    // Unreached: the designated leg's platform, for a file that is the
+    // package's to color at all. A file outside the source root is not (it
+    // still resolves `pkg::` and the dependencies, which is what it needs), and
+    // a package that designates no `default-entry` has nothing to fall back to;
+    // either way the caller keeps whatever it does for a file with no project.
+    if !file.starts_with(&root) {
+        return Vec::new();
+    }
+    manifest
+        .default_entry()
+        .and_then(|name| manifest.entries.get(name))
+        .map(|entry| vec![entry.resolved_target().unwrap_or_default()])
+        .unwrap_or_default()
 }
 
 /// The program's entry: a function named `main` defined in user code. Also

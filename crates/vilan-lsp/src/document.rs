@@ -34,6 +34,11 @@ use vilan_ide::{
 /// file's imports and roots `pkg::` at the file's own directory.
 struct ProjectContext {
     platform: Option<BuildPlatform>,
+    /// The FURTHER colors the build compiles this file under — a module shared
+    /// between the legs of a multi-entry package (E113). Each is analyzed too,
+    /// for its diagnostics only, so the editor reports what the build would
+    /// rather than one leg's half of it.
+    shared_platforms: Vec<BuildPlatform>,
     pkg_root: Option<PathBuf>,
     /// The file's resolved dependency workspace (P2), so cross-package imports
     /// (`import <dep>::..`) type-check in the editor.
@@ -48,6 +53,7 @@ impl ProjectContext {
     fn none() -> ProjectContext {
         ProjectContext {
             platform: None,
+            shared_platforms: Vec::new(),
             pkg_root: None,
             workspace: BuildWorkspace::default(),
             manifest_problem: None,
@@ -112,27 +118,30 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
 
     // A package: root `pkg::` at its declared source root and resolve its
     // dependency workspace (best-effort — a resolution error degrades to no
-    // deps). The platform: the classic single-entry form analyzes every file
-    // under the root against the package target; a multi-entry package
-    // (proposal/platform-coloring.md §4.2) analyzes an ENTRY file under its
-    // declared target, and any other file with a platform inferred from its
-    // own imports — a module may be reached from several entries, and having
-    // no `main` it faces no admission walk, so the choice only affects
-    // scratch-style inference (hover colors are platform-independent).
+    // deps). The platform is `platform_color::file_platforms`' answer, the same
+    // one `vilan check <file>` takes: the classic single-entry form analyzes
+    // every file under the root against the package target, and a multi-entry
+    // package (proposal/platform-coloring.md §4.2) analyzes a file under the
+    // platform of the entry that REACHES it.
+    //
+    // §4.2 originally left a non-entry file to inference "because a module has
+    // no `main` and thus no admission walk". That reasoning missed what a
+    // platform also decides: which `std` layer serves a twin module. Under the
+    // process overlay a browser module's `View` is `{ tag, attributes, children,
+    // text }` and `self.element` is a field that does not exist — so every
+    // browser-only module of a fullstack app cried wolf in the editor while
+    // `vilan build` was clean (E113, the owner's kolt report).
     if let Some(package) = &manifest.package {
         let pkg_root = root.join(package.root());
-        let platform = if manifest.entries.is_empty() {
-            let build_platform = package.resolved_target().unwrap_or_default();
-            is_within(&pkg_root, entry_path).then_some(build_platform)
-        } else {
-            manifest.entries.iter().find_map(|(name, entry)| {
-                same_file(&pkg_root.join(entry.path(name)), entry_path)
-                    .then(|| entry.resolved_target().unwrap_or_default())
-            })
-        };
+        let mut platforms =
+            vilan_core::platform_color::file_platforms(&pkg_root, &manifest, entry_path)
+                .into_iter();
+        let platform = platforms.next();
+        let shared_platforms: Vec<BuildPlatform> = platforms.collect();
         let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
         return ProjectContext {
             platform,
+            shared_platforms,
             pkg_root: Some(pkg_root),
             workspace,
             manifest_problem,
@@ -174,6 +183,7 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
         return ProjectContext {
             platform: None,
+            shared_platforms: Vec::new(),
             pkg_root: Some(pkg_root),
             workspace,
             manifest_problem,
@@ -496,6 +506,14 @@ pub struct Document {
     /// The `vilan.toml` failure behind this analysis, if any — published as one
     /// diagnostic on the manifest itself (see [`ManifestProblem`]).
     manifest_problem: Option<ManifestProblem>,
+    /// What the OTHER legs of a multi-entry package say about this file (E113):
+    /// a module shared between a browser entry and a node one is compiled once
+    /// per leg and must type-check under each, so the editor reports the union
+    /// the build would. Already published — the programs that produced them
+    /// were dropped (and reclaimed) at the end of the analysis, so there is
+    /// nothing left to resolve a `SourceId` against. Empty for every file with
+    /// one color, which is nearly all of them.
+    shared_diagnostics: Vec<PublishedDiagnostic>,
     /// What an `import`/`use` path in this file can reach (E57) — the analysis's
     /// own `std` spec, package root, and dependency packages, kept so completion
     /// can enumerate modules the `Program` never loaded. `None` on the degraded
@@ -661,6 +679,7 @@ pub const TOKEN_TYPES: [&str; 13] = [
 /// One diagnostic as the language server publishes it: the file it belongs to
 /// (`None` = the analyzed document itself), its span *in that file's text*, the
 /// message, and the severity. LSP-type-free so the grouping is unit-testable.
+#[derive(Clone)]
 pub struct PublishedDiagnostic {
     pub path: Option<PathBuf>,
     pub span: Span,
@@ -678,12 +697,27 @@ pub struct PublishedDiagnostic {
     pub trace: Vec<PublishedHop>,
 }
 
+impl PublishedDiagnostic {
+    /// Whether two published diagnostics are the SAME squiggle: same file, same
+    /// span, same words, same severity. The union of two legs' verdicts on a
+    /// shared module (E113) is deduplicated by it — most of what a browser
+    /// compile and a node compile say about one module is the same sentence
+    /// about the same characters, and the reader wants one of it.
+    fn same_place_and_words(&self, other: &PublishedDiagnostic) -> bool {
+        self.path == other.path
+            && self.span == other.span
+            && self.warning == other.warning
+            && self.message == other.message
+    }
+}
+
 /// One requirement-trace entry as the publisher wants it (backlog E78):
 /// located like the C3 note, plus whether it marks an uncovered CALL — a
 /// call hop additionally publishes as its own diagnostic at that location
 /// (E81), while the elision tail only ever rides as related information
 /// (its span is the last kept hop's, already underlined by that hop's own
 /// diagnostic).
+#[derive(Clone)]
 pub struct PublishedHop {
     pub span: Span,
     pub message: String,
@@ -856,6 +890,7 @@ impl Document {
             retained_tail_start: usize::MAX,
             platform_requirements: HashMap::default(),
             manifest_problem: None,
+            shared_diagnostics: Vec::new(),
             import_roots: None,
         }
     }
@@ -970,6 +1005,25 @@ impl Document {
         // modules.
         let program =
             unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) };
+        // The other legs' verdicts on a shared module (E113), computed AFTER
+        // the primary so a panic in one of them cannot cost the analysis the
+        // user is looking at. Each is a full analysis under that leg's platform
+        // whose program is published and then dropped — the diagnostics are all
+        // the editor keeps, and hover/goto/completion stay the primary leg's.
+        let shared_diagnostics = context
+            .shared_platforms
+            .iter()
+            .flat_map(|platform| {
+                Self::diagnostics_under(
+                    text,
+                    &std,
+                    &pkg_root,
+                    entry_path,
+                    *platform,
+                    &context.workspace,
+                )
+            })
+            .collect();
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
@@ -988,142 +1042,104 @@ impl Document {
             retained_tail_start: usize::MAX,
             platform_requirements,
             manifest_problem,
+            shared_diagnostics,
             import_roots: Some(import_roots),
         }
+    }
+
+    /// One further leg's verdict on this file: analyze it under `platform` and
+    /// publish what that compile says, keeping nothing (E113).
+    ///
+    /// The program is built and dropped inside this function, so its entry
+    /// text, tree and overlay-served module copies are reclaimed here —
+    /// `AnalyzedProgram`'s `Drop` is the same reclaim a superseded analysis
+    /// takes. Publishing before the drop is what makes that safe: a
+    /// `PublishedDiagnostic` carries resolved `PathBuf`s, so nothing that
+    /// survives needs a `SourceId` to mean anything.
+    fn diagnostics_under(
+        text: &str,
+        std: &vilan_core::PackageSpec,
+        pkg_root: &Path,
+        entry_path: &Path,
+        platform: BuildPlatform,
+        workspace: &BuildWorkspace,
+    ) -> Vec<PublishedDiagnostic> {
+        let (leaked_text, leaked) = Leaked::leak(
+            text.to_string().into_boxed_str(),
+            LeakSite::LspEntryText,
+            text.len(),
+        );
+        let vilan_core::AnalyzedEntry {
+            program,
+            diagnostics,
+            ast,
+            owned_modules,
+        } = analyze_source_owning_overlay_modules(
+            leaked,
+            std,
+            pkg_root,
+            entry_path,
+            Some(platform),
+            workspace,
+        );
+        let program_diagnostics = program
+            .as_ref()
+            .map(|program| program.diagnostics.len())
+            .unwrap_or(0);
+        let mut diagnostic_sources =
+            vec![SourceId(0); diagnostics.len().saturating_sub(program_diagnostics)];
+        if let Some(program) = &program {
+            diagnostic_sources.extend(program.diagnostic_sources.iter().copied());
+        }
+        let warnings = program
+            .as_ref()
+            .map(|program| program.warnings.clone())
+            .unwrap_or_default();
+        let warning_sources = program
+            .as_ref()
+            .map(|program| program.warning_sources.clone())
+            .unwrap_or_default();
+        // SAFETY: exactly `analyze_on_this_thread`'s pairing — the program was
+        // built by `analyze_source_owning_overlay_modules` over the text
+        // `leaked_text` owns, `ast` is the handle to the tree it borrows, and
+        // `owned_modules` the overlay-served copies it parsed for itself.
+        let program =
+            unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) };
+        let published = publish(
+            program.as_ref(),
+            &diagnostics,
+            &diagnostic_sources,
+            &warnings,
+            &warning_sources,
+        );
+        // Everything kept is owned; the pair (and its reclaim) ends here.
+        drop(program);
+        published
     }
 
     /// The document's diagnostics grouped for publishing: errors attributed to
     /// the file they occurred in (`None` = this document), plus this document's
     /// warnings. Diagnostics from generated (derive) code carry template spans
     /// that map to no file — they attach to the entry at offset 0, labeled.
+    ///
+    /// A file shared between the legs of a multi-entry package also carries the
+    /// other legs' diagnostics (E113), deduplicated against this leg's: the two
+    /// compiles agree about most of a shared module, and one mistake reported
+    /// twice is one squiggle.
     pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
-        let mut published = Vec::new();
-        // The C3 note as the publisher wants it: its span, its message, and the
-        // file it lives in when it has one of its own (`None` = the
-        // diagnostic's own file, whichever that is — backlog E17).
-        let locate = |note: &vilan_core::error::Note| {
-            let note_path = note
-                .source
-                .and_then(|source| self.program.as_ref()?.source_path(source))
-                .map(Path::to_path_buf);
-            (note.span, note.msg.clone(), note_path)
-        };
-        let note_of = |error: &Error| error.note.as_ref().map(locate);
-        // The E78 requirement trace, each hop located exactly like the note.
-        let trace_of = |error: &Error| {
-            error
-                .trace
+        let mut published = publish(
+            self.program.as_ref(),
+            &self.diagnostics,
+            &self.diagnostic_sources,
+            &self.warnings,
+            &self.warning_sources,
+        );
+        for shared in &self.shared_diagnostics {
+            if !published
                 .iter()
-                .map(|hop| {
-                    let (span, message, path) = locate(&hop.note);
-                    PublishedHop {
-                        span,
-                        message,
-                        path,
-                        call: hop.call,
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        for (index, error) in self.diagnostics.iter().enumerate() {
-            let source = self
-                .diagnostic_sources
-                .get(index)
-                .copied()
-                .unwrap_or(SourceId(0));
-            if source == SourceId(0) {
-                published.push(PublishedDiagnostic {
-                    path: None,
-                    span: error.span,
-                    message: error.msg.clone(),
-                    warning: false,
-                    note: note_of(error),
-                    trace: trace_of(error),
-                });
-            } else if source == DERIVED_SOURCE {
-                published.push(PublishedDiagnostic {
-                    path: None,
-                    span: Span::from(0..0),
-                    message: format!("(in generated code) {}", error.msg),
-                    warning: false,
-                    note: None,
-                    trace: Vec::new(),
-                });
-            } else {
-                let path = self
-                    .program
-                    .as_ref()
-                    .and_then(|program| program.source_path(source))
-                    .map(Path::to_path_buf);
-                match path {
-                    // The note rides along with the diagnostic wherever it is
-                    // published (backlog E17): a declaration note is exactly
-                    // what LSP related information is for, and dropping it in
-                    // this branch cost every module-attributed diagnostic its
-                    // second location.
-                    Some(path) => published.push(PublishedDiagnostic {
-                        path: Some(path),
-                        span: error.span,
-                        message: error.msg.clone(),
-                        warning: false,
-                        note: note_of(error),
-                        trace: trace_of(error),
-                    }),
-                    // An unknown source (shouldn't happen): keep the error
-                    // visible on the entry rather than dropping it.
-                    None => published.push(PublishedDiagnostic {
-                        path: None,
-                        span: Span::from(0..0),
-                        message: error.msg.clone(),
-                        warning: false,
-                        note: None,
-                        trace: Vec::new(),
-                    }),
-                }
-            }
-        }
-        for (index, warning) in self.warnings.iter().enumerate() {
-            // A warning is attributed like an error: a module's warning
-            // squiggles in the module, not at that offset in this document.
-            let source = self
-                .warning_sources
-                .get(index)
-                .copied()
-                .unwrap_or(SourceId(0));
-            let path = (source != SourceId(0)).then(|| {
-                self.program
-                    .as_ref()
-                    .and_then(|program| program.source_path(source))
-                    .map(Path::to_path_buf)
-            });
-            match path {
-                // This document's own.
-                None => published.push(PublishedDiagnostic {
-                    path: None,
-                    span: warning.span,
-                    message: warning.msg.clone(),
-                    warning: true,
-                    note: note_of(warning),
-                    trace: trace_of(warning),
-                }),
-                Some(Some(path)) => published.push(PublishedDiagnostic {
-                    path: Some(path),
-                    span: warning.span,
-                    message: warning.msg.clone(),
-                    warning: true,
-                    note: note_of(warning),
-                    trace: trace_of(warning),
-                }),
-                // A source with no file (generated code): keep it visible on
-                // the entry rather than at that offset in the wrong text.
-                Some(None) => published.push(PublishedDiagnostic {
-                    path: None,
-                    span: Span::from(0..0),
-                    message: warning.msg.clone(),
-                    warning: true,
-                    note: None,
-                    trace: Vec::new(),
-                }),
+                .any(|item| item.same_place_and_words(shared))
+            {
+                published.push(shared.clone());
             }
         }
         // The manifest channel (F5 S5): ONE diagnostic, on `vilan.toml` itself
@@ -1146,7 +1162,143 @@ impl Document {
         }
         published
     }
+}
 
+/// One analysis's diagnostics and warnings, grouped for publishing — the body
+/// [`Document::published_diagnostics`] used to inline, taken as parameters so a
+/// further leg's throwaway program can be published the same way (E113).
+fn publish(
+    program: Option<&Program>,
+    diagnostics: &[Error],
+    diagnostic_sources: &[SourceId],
+    warnings: &[Error],
+    warning_sources: &[SourceId],
+) -> Vec<PublishedDiagnostic> {
+    let mut published = Vec::new();
+    // The C3 note as the publisher wants it: its span, its message, and the
+    // file it lives in when it has one of its own (`None` = the
+    // diagnostic's own file, whichever that is — backlog E17).
+    let locate = |note: &vilan_core::error::Note| {
+        let note_path = note
+            .source
+            .and_then(|source| program?.source_path(source))
+            .map(Path::to_path_buf);
+        (note.span, note.msg.clone(), note_path)
+    };
+    let note_of = |error: &Error| error.note.as_ref().map(locate);
+    // The E78 requirement trace, each hop located exactly like the note.
+    let trace_of = |error: &Error| {
+        error
+            .trace
+            .iter()
+            .map(|hop| {
+                let (span, message, path) = locate(&hop.note);
+                PublishedHop {
+                    span,
+                    message,
+                    path,
+                    call: hop.call,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    for (index, error) in diagnostics.iter().enumerate() {
+        let source = diagnostic_sources
+            .get(index)
+            .copied()
+            .unwrap_or(SourceId(0));
+        if source == SourceId(0) {
+            published.push(PublishedDiagnostic {
+                path: None,
+                span: error.span,
+                message: error.msg.clone(),
+                warning: false,
+                note: note_of(error),
+                trace: trace_of(error),
+            });
+        } else if source == DERIVED_SOURCE {
+            published.push(PublishedDiagnostic {
+                path: None,
+                span: Span::from(0..0),
+                message: format!("(in generated code) {}", error.msg),
+                warning: false,
+                note: None,
+                trace: Vec::new(),
+            });
+        } else {
+            let path = program
+                .and_then(|program| program.source_path(source))
+                .map(Path::to_path_buf);
+            match path {
+                // The note rides along with the diagnostic wherever it is
+                // published (backlog E17): a declaration note is exactly
+                // what LSP related information is for, and dropping it in
+                // this branch cost every module-attributed diagnostic its
+                // second location.
+                Some(path) => published.push(PublishedDiagnostic {
+                    path: Some(path),
+                    span: error.span,
+                    message: error.msg.clone(),
+                    warning: false,
+                    note: note_of(error),
+                    trace: trace_of(error),
+                }),
+                // An unknown source (shouldn't happen): keep the error
+                // visible on the entry rather than dropping it.
+                None => published.push(PublishedDiagnostic {
+                    path: None,
+                    span: Span::from(0..0),
+                    message: error.msg.clone(),
+                    warning: false,
+                    note: None,
+                    trace: Vec::new(),
+                }),
+            }
+        }
+    }
+    for (index, warning) in warnings.iter().enumerate() {
+        // A warning is attributed like an error: a module's warning
+        // squiggles in the module, not at that offset in this document.
+        let source = warning_sources.get(index).copied().unwrap_or(SourceId(0));
+        let path = (source != SourceId(0)).then(|| {
+            program
+                .and_then(|program| program.source_path(source))
+                .map(Path::to_path_buf)
+        });
+        match path {
+            // This document's own.
+            None => published.push(PublishedDiagnostic {
+                path: None,
+                span: warning.span,
+                message: warning.msg.clone(),
+                warning: true,
+                note: note_of(warning),
+                trace: trace_of(warning),
+            }),
+            Some(Some(path)) => published.push(PublishedDiagnostic {
+                path: Some(path),
+                span: warning.span,
+                message: warning.msg.clone(),
+                warning: true,
+                note: note_of(warning),
+                trace: trace_of(warning),
+            }),
+            // A source with no file (generated code): keep it visible on
+            // the entry rather than at that offset in the wrong text.
+            Some(None) => published.push(PublishedDiagnostic {
+                path: None,
+                span: Span::from(0..0),
+                message: warning.msg.clone(),
+                warning: true,
+                note: None,
+                trace: Vec::new(),
+            }),
+        }
+    }
+    published
+}
+
+impl Document {
     /// Advances the LIVE snapshot — the text and its line index — without
     /// re-analyzing. Applied on every edit so live-text queries (notably
     /// completion's context scan) see the just-typed character immediately,
@@ -1322,6 +1474,7 @@ impl Document {
             reference_index,
             platform_requirements,
             manifest_problem,
+            shared_diagnostics,
             import_roots,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
@@ -1340,6 +1493,7 @@ impl Document {
         self.reference_index = reference_index;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
+        self.shared_diagnostics = shared_diagnostics;
         self.import_roots = import_roots;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
@@ -5400,6 +5554,162 @@ pub(crate) mod tests {
                 .iter()
                 .map(|item| &item.message)
                 .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E113: a module's color is the entry that REACHES it ──────────────────
+    //
+    // §4.2 left a non-entry file to inference "because a module has no `main`
+    // and thus no admission walk". The platform decides more than admission: it
+    // picks `std`'s layer overlay, so it decides what the file's types ARE.
+    // Under the process overlay a browser module's `View` is
+    // `{ tag, attributes, children, text }` and `self.element` is a field that
+    // does not exist — the owner's kolt report, where every browser-only module
+    // showed "struct 'View' has no field 'element'" in the editor while
+    // `vilan build` was clean. Reachability answers it, exactly as the build
+    // does, and `platform_color::file_platforms` is the one place both the
+    // editor and `vilan check <file>` ask.
+
+    /// The kolt shape: a browser `client`, a node `server`, `default-entry` on
+    /// the node side, plus the caller's modules. The FIRST file is the one
+    /// `analyze_workspace` opens.
+    fn fullstack_package(default_entry: &str) -> String {
+        format!(
+            "[package]\nname = \"app\"\ndefault-entry = \"{default_entry}\"\n\n\
+             [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n"
+        )
+    }
+
+    /// A module using the BROWSER `View`'s `element` field: clean under
+    /// `browser`, "no field 'element'" under any process target.
+    const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+         fun attach(): View {\n\tlet root = view(\"div\");\n\t\
+         root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
+
+    /// The mirror: the PROCESS `View`'s `tag`. Clean under node, red under
+    /// `browser`.
+    const PROCESS_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
+         fun markup(): str {\n\tlet root = view(\"div\");\n\troot.tag\n}\n";
+
+    #[test]
+    fn a_browser_only_module_analyzes_under_the_entry_that_reaches_it() {
+        // E113 in the editor: `widget.vl` is reached only from the browser
+        // entry, and `default-entry` names the node one.
+        let (dir, widget) = analyze_workspace(&[
+            ("src/widget.vl", BROWSER_ONLY_MODULE),
+            ("vilan.toml", &fullstack_package("server")),
+            (
+                "src/client.vl",
+                "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ]);
+        assert!(
+            widget.published_diagnostics().is_empty(),
+            "a module only the browser entry reaches analyzes as browser: {:?}",
+            messages(&widget.published_diagnostics())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_only_module_analyzes_under_the_entry_that_reaches_it() {
+        // The mirror-image control: reached only from the NODE entry while
+        // `default-entry` names the browser one. The answer is reachability,
+        // not a browser preference — a "prefer browser" fix would redden this.
+        let (dir, store) = analyze_workspace(&[
+            ("src/store.vl", PROCESS_ONLY_MODULE),
+            ("vilan.toml", &fullstack_package("client")),
+            (
+                "src/client.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"client\");\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\nimport pkg::store::markup;\n\n\
+                 fun main() {\n\tprint(markup());\n}\n",
+            ),
+        ]);
+        assert!(
+            store.published_diagnostics().is_empty(),
+            "a module only the node entry reaches analyzes as node: {:?}",
+            messages(&store.published_diagnostics())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shared_module_publishes_every_reaching_legs_diagnostics() {
+        // A module BOTH entries reach is compiled once per leg and must
+        // type-check under each, so the editor reports the union the build
+        // would. The mistake here is one only the BROWSER leg can see, in a
+        // package whose `default-entry` is the node one — so a single-color
+        // answer would have missed it whichever color it picked first.
+        let reach = "import pkg::shared::labelled;\n\nfun main() {\n\tlabelled(\"app\");\n}\n";
+        let (dir, shared) = analyze_workspace(&[
+            (
+                "src/shared.vl",
+                "import std::ui::{ View, view };\n\n\
+                 fun labelled(text: str): str {\n\tlet root = view(text);\n\troot.tag\n}\n",
+            ),
+            ("vilan.toml", &fullstack_package("server")),
+            ("src/client.vl", reach),
+            ("src/server.vl", reach),
+        ]);
+        let published = shared.published_diagnostics();
+        assert!(
+            published
+                .iter()
+                .any(|item| item.message.contains("has no field 'tag'")),
+            "the browser leg's verdict reaches the editor too: {:?}",
+            messages(&shared.published_diagnostics())
+        );
+        // One squiggle per mistake: the legs agree about everything else in the
+        // file, and a duplicate would be published twice at the same span.
+        assert_eq!(
+            published
+                .iter()
+                .filter(|item| item.message.contains("has no field 'tag'"))
+                .count(),
+            1,
+            "deduplicated across legs: {:?}",
+            messages(&shared.published_diagnostics())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreached_module_analyzes_under_the_default_entry() {
+        // No entry loads it — a module in progress, or one whose importer was
+        // just deleted. The designated `default-entry` answers, and moving the
+        // designation moves the color.
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n";
+        let (dir, orphan) = analyze_workspace(&[
+            ("src/orphan.vl", BROWSER_ONLY_MODULE),
+            ("vilan.toml", &fullstack_package("client")),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ]);
+        assert!(
+            orphan.published_diagnostics().is_empty(),
+            "`default-entry = \"client\"` colors it browser: {:?}",
+            messages(&orphan.published_diagnostics())
+        );
+        std::fs::write(dir.join("vilan.toml"), fullstack_package("server")).unwrap();
+        let path = dir.join("src/orphan.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let orphan = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            orphan
+                .published_diagnostics()
+                .iter()
+                .any(|item| item.message.contains("has no field 'element'")),
+            "and moving the designation moves the color: {:?}",
+            messages(&orphan.published_diagnostics())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
