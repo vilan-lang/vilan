@@ -1,6 +1,6 @@
 [package]
 name = "vilan-wasm"
-version = "0.39.0"
+version = "0.40.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The Vilan compiler as a WebAssembly module, for the web playground."
