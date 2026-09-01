@@ -34596,6 +34596,152 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                 }
+                let native_left = grounded(&lhs_type) && self.is_native_operator_type(&lhs_type);
+                // Whether the left operand is a native NUMBER — the carve-out
+                // the rule below turns on. `str` is a native operator
+                // primitive without being one of these, so it is excluded by
+                // name; `bool` and a backed enum are native `Enum`s and never
+                // reach `is_native_operator_primitive` at all.
+                let numeric_left =
+                    self.is_native_operator_primitive(&lhs_type) && !self.is_str_type(&lhs_type);
+                // --- the arithmetic family on a NON-NUMERIC native left
+                //     operand (B196) ---
+                //
+                // B148 scoped its check to `+` and argued the scope in the
+                // SCOPE note below: the other native operators "emit
+                // arithmetic on numbers, where `+` emits a rendering". That
+                // holds for a NUMERIC left operand and for nothing else.
+                // Three native types are not numbers — `bool`, `str`, and a
+                // backed enum — and for those the sentence inverts. The host
+                // operator returns a number; a binary takes its static type
+                // from the LEFT operand; so the result is a number wearing a
+                // type it is not. That is `+`'s own miscompile entered by the
+                // other nine operators, and it shipped in v0.40.0:
+                //
+                //   * `let c: bool = true - 3` holds `-2`. Every number but
+                //     `0` is truthy, so `if c` takes the TRUE branch while
+                //     `c == true` is false — a `bool` that is neither.
+                //   * `let s: str = "12" - "3"` holds `9`, typed `str`, and
+                //     `s.len()` on it is `undefined`.
+                //   * `Level::High ^ Level::Low` is `4` typed `Level`, a value
+                //     matching NO variant: `== Level::Low` and `== Level::High`
+                //     are both false, and a `match` on it panics on a value
+                //     the program could not have written down.
+                //
+                // So the carve-out is "the left operand is a number", never
+                // "the operator is not `+`". The numeric MIXING b148's SCOPE
+                // note deferred is a different question and stays deferred:
+                // `f64 * i32` computes a correct answer of the declared type,
+                // and refusing it is a numeric-strictness change with an
+                // `as_f64()` migration, not a miscompile fix.
+                //
+                // `+` keeps the block below rather than joining this one,
+                // because its admitted set is not this one: `str + x`
+                // concatenates, the one thing a non-numeric native left
+                // operand legitimately does with an arithmetic symbol.
+                if native_left
+                    && !numeric_left
+                    && matches!(
+                        op,
+                        BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::Div
+                            | BinaryOp::Rem
+                            | BinaryOp::Shl
+                            | BinaryOp::Shr
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitXor
+                            | BinaryOp::BitOr
+                    )
+                {
+                    let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                    let is_bool =
+                        matches!(&lhs_type, Type::Enum(id, _) if self.bool_enum_id == Some(*id));
+                    // The admitted set per left type, named rather than
+                    // implied: a refusal that only says "not this one" leaves
+                    // the reader to guess which ones are.
+                    let (admitted, exhibit, steer) = if is_bool {
+                        (
+                            "`== != && || !`".to_string(),
+                            "`true` and `false` compute as `1` and `0`, so `true - 3` is `-2`: \
+                             truthy, and not `== true`"
+                                .to_string(),
+                            match op {
+                                BinaryOp::BitAnd => {
+                                    "`&&` is `bool`'s conjunction; to compute on \
+                                                     numbers, test the value first (`if flag { 1 } \
+                                                     else { 0 }`)"
+                                }
+                                BinaryOp::BitOr => {
+                                    "`||` is `bool`'s disjunction; to compute on \
+                                                    numbers, test the value first (`if flag { 1 } \
+                                                    else { 0 }`)"
+                                }
+                                BinaryOp::BitXor => {
+                                    "`!=` is `bool`'s exclusive or; to compute on \
+                                                     numbers, test the value first (`if flag { 1 } \
+                                                     else { 0 }`)"
+                                }
+                                _ => {
+                                    "Test the value and compute on the numbers you mean \
+                                      (`if flag { 1 } else { 0 }`)"
+                                }
+                            }
+                            .to_string(),
+                        )
+                    } else if self.is_str_type(&lhs_type) {
+                        (
+                            "`+ == != < <= > >=`".to_string(),
+                            "the host coerces the text, so `\"12\" - \"3\"` is `9`, on which \
+                             `.len()` is undefined"
+                                .to_string(),
+                            if matches!(op, BinaryOp::Mul) {
+                                "A `str` repeats with `.repeat(n)`; to compute, parse the text \
+                                 first (`.parse_i32()`, `.parse_f64()`) and hold the number"
+                            } else {
+                                "Parse the text first (`.parse_i32()`, `.parse_f64()`) and compute \
+                                 on the number"
+                            }
+                            .to_string(),
+                        )
+                    } else {
+                        // A backed enum. A STRING backing admits no ordering
+                        // either (§3.6, refused above), so the two backings
+                        // name different sets.
+                        let ordered = self.string_backed_enum(&lhs_type).is_none();
+                        (
+                            if ordered {
+                                "`== != < <= > >=`"
+                            } else {
+                                "`== !=`"
+                            }
+                            .to_string(),
+                            format!(
+                                "the host computes on the backing values, and their result is \
+                                 rarely a backing any variant has — a `{lhs_label}` matching none \
+                                 of them"
+                            ),
+                            "A backing value is a lowering detail, not a number to compute with: \
+                             match on the variant, or hold the number you mean"
+                                .to_string(),
+                        )
+                    };
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "`{symbol}` on `{lhs_label}` has no meaning: `{lhs_label}`'s \
+                                 admitted operators are {admitted}. A binary takes its type from \
+                                 the LEFT operand and the host operator returns a number, so this \
+                                 expression is a number wearing `{lhs_label}` — {exhibit}. {steer}"
+                            ),
+                        },
+                        binary_id,
+                    );
+                    continue;
+                }
                 // --- `+`'s admitted set on the native path (B148) ---
                 //
                 // Every operator that reaches here models a trait whose right
@@ -34628,14 +34774,17 @@ impl<'src> Analyzer<'src> {
                 // `==`/`<` but have no `Add`, and reach `+` only through host
                 // coercion (`true + true` is `2`).
                 //
-                // SCOPE. This is `+`'s rule, not the arithmetic family's. The
-                // other native operators share the hole — `f64 * i32` and
-                // `str - str` still go unchecked — but not the bug: they emit
-                // arithmetic on numbers, where `+` emits a rendering. Closing
-                // theirs refuses code that computes correct answers today, so
-                // it is a breaking numeric-strictness change with a migration
-                // of its own (`as_f64()`), not this miscompile fix.
-                let native_left = grounded(&lhs_type) && self.is_native_operator_type(&lhs_type);
+                // SCOPE. This is `+`'s rule, not the arithmetic family's —
+                // and the reason is now the block ABOVE, not the one this note
+                // used to give. It read: "the other native operators emit
+                // arithmetic on numbers, where `+` emits a rendering", which
+                // was half right. It is right about a NUMERIC left operand,
+                // and `f64 * i32` is still the deliberate carve-out on that
+                // half: two grounded numbers computing a correct answer of the
+                // declared type, whose refusal is a numeric-strictness change
+                // with an `as_f64()` migration. It was wrong about `str - str`
+                // and its siblings, which had `+`'s own bug and no numbers
+                // anywhere — B196 closed them.
                 if native_left && matches!(op, BinaryOp::Add) {
                     let concatenating = self.is_str_type(&lhs_type);
                     if !concatenating && !self.is_native_operator_primitive(&lhs_type) {
