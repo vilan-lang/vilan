@@ -123,6 +123,27 @@ fn first_difference(golden: &str, rebuilt: &str) -> String {
     }
 }
 
+/// How many times a source reads a registry slot AT A USE —
+/// `__vilan_chunks.fn.docs_nav(…)` rather than the preamble's
+/// `const docs_nav = __vilan_chunks.fn.docs_nav;` or the tail's
+/// `__vilan_chunks.fn.docs_nav = docs_nav;`. That is the form a reference to
+/// another CHUNK's function takes (M20, `bundle-boundaries.md` §4.1), and this
+/// counts its cost: one property lookup per occurrence.
+fn call_site_registry_reads(source: &str) -> usize {
+    source
+        .split("__vilan_chunks.fn.")
+        .skip(1)
+        .filter(|tail| {
+            let end = tail
+                .find(|character: char| {
+                    !character.is_alphanumeric() && character != '_' && character != '$'
+                })
+                .unwrap_or(tail.len());
+            tail[end..].starts_with('(')
+        })
+        .count()
+}
+
 /// The top-level declarations of an emitted file, in order — the seam the B33
 /// invariant is read off. A `const X = …` at column 0 is a module binding (or a
 /// chunk's registry read, which is why the chunk side asserts on absence).
@@ -169,6 +190,26 @@ fn the_split_fixture_emits_its_pinned_artifacts() {
         "a chunk reads the eager scope — a module binding included — \
          through the registry: {home}"
     );
+
+    // M20 (`bundle-boundaries.md` §1.6 fact 2, D5): a chunk's every non-std
+    // dependency is EAGER under the route partition, so its snapshot is sound
+    // and it pays no property read at a call. The emitter reads a name at the
+    // USE only when a sibling CHUNK owns it, which this partition cannot
+    // produce — so the count here is 0, and that zero is why the reference-form
+    // rule is latent on every plan v1 can make. The eager bundle's forwarders
+    // are the same read and are counted in `app.js`, deliberately not here.
+    for artifact in ARTIFACTS
+        .iter()
+        .filter(|name| name.starts_with("app.Route_"))
+    {
+        let chunk = read(&staged, artifact);
+        assert_eq!(
+            call_site_registry_reads(&chunk),
+            0,
+            "{artifact} must reach nothing but the eager scope, which it \
+             snapshots once: {chunk}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&staged);
 }
 
