@@ -836,8 +836,22 @@ pub fn generated_root_in(directory: &Path) -> Option<PathBuf> {
 /// and it is what makes "nearest manifest" mean what a reader expects), resolved
 /// second (which covers the editor opening the product by its real path). One
 /// resolution rule, both consumers: `vilan fmt` and format-on-save.
+///
+/// **A product that is not on disk yet (B198, RULED).** The subject and the
+/// declared root are both resolved with
+/// [`canonical_path_of_unwritten`](crate::util::canonical_path_of_unwritten)
+/// rather than `canonical_path`, because a containment test is only sound when
+/// its two sides are spelled alike. `outputs = "gen/lib.vl"` names a file the
+/// generator has not written, so `canonicalize` fails on it and the caller's
+/// spelling survives — while the declared root, which IS on disk, comes back as
+/// the filesystem spells it. Comparing those two is a folded root against a
+/// lexical child, and it answers NO for a product plainly inside its own root:
+/// on Windows for `GEN` against `gen`, and on unix for a root reached through a
+/// link. Resolving the deepest ancestor that does exist puts both sides in the
+/// same spelling; where nothing exists at all, both degrade lexically together,
+/// which is the spelled ladder and not a mixed comparison.
 pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {
-    let resolved = crate::util::canonical_path(path);
+    let resolved = crate::util::canonical_path_of_unwritten(path);
     let spelled = crate::util::spelled_path(path);
     covering_from(&spelled, &resolved).or_else(|| covering_from(&resolved, &resolved))
 }
@@ -850,7 +864,11 @@ fn covering_from(start: &Path, resolved: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(directory) = current {
         if let Some(root) = generated_root_in(directory) {
-            let root = crate::util::canonical_path(&root);
+            // The root gets the same resolution as the subject, and for the
+            // same reason: a generator that has not run yet has not made its
+            // root either, and a lexical root against a resolved child is the
+            // B198 mismatch with the sides swapped.
+            let root = crate::util::canonical_path_of_unwritten(&root);
             if resolved.starts_with(&root) {
                 return Some(root);
             }
@@ -4242,6 +4260,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// B198's unix twin: the same fail-OPEN, expressed with a LINK instead of
+    /// with case folding.
+    ///
+    /// The Windows pin below reaches this defect through NTFS's case fold, and
+    /// so cannot run here. But case is only one of the ways a filesystem gives
+    /// a path two spellings; a symlink is the other, and it is portable. A
+    /// product the generator has not written yet has no on-disk path, so
+    /// `canonicalize` fails on it and the caller's spelling survives — while
+    /// the declared root, which IS on disk, comes back resolved. Reached
+    /// through `elsewhere/peek`, the two share no prefix at all, so the
+    /// containment test said the file was outside its own generated root and
+    /// `vilan fmt` would have rewritten a product: §12.1's fmt↔hook loop,
+    /// on unix, with no case folding anywhere near it.
+    ///
+    /// The pin above is its control — the same tree, the same link, the same
+    /// root, differing only in whether the product has been written — and it
+    /// was green before this, which is what makes "not yet on disk" the whole
+    /// difference under test.
+    #[cfg(unix)]
+    #[test]
+    fn a_product_the_generator_has_not_written_yet_is_covered_through_a_link() {
+        let root = std::env::temp_dir().join(format!(
+            "vilan-covering-peek-unwritten-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let package = root.join("package");
+        std::fs::create_dir_all(package.join("gen")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../package/gen", root.join("elsewhere/peek")).unwrap();
+        let expected = Some(crate::util::canonical_path(package.join("gen")));
+
+        assert_eq!(
+            generated_root_covering(&package.join("gen/not_written_yet.vl")),
+            expected,
+            "the control: a product is a product before its generator has run"
+        );
+        assert_eq!(
+            generated_root_covering(&root.join("elsewhere/peek/not_written_yet.vl")),
+            expected,
+            "and reached through the link it is the same product — the link is on \
+             disk even though the file under it is not, so the containment test has \
+             a resolved ancestor to anchor both sides to"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The Windows hazard neither pin above can reach (audit run 7, Order 24):
     /// NTFS FOLDS CASE, so `gen` and `GEN` are two paths on unix and one
     /// directory here. Nothing in this predicate folds case itself — it compares
@@ -4290,37 +4360,37 @@ mod tests {
     }
 
     /// The fail-OPEN corner of the same hazard, and the one RED measurement in
-    /// audit run 7's Windows batch.
+    /// audit run 7's Windows batch — LIVE since B198 ruled (Order 25).
     ///
     /// A product that its generator HAS NOT WRITTEN YET is not on disk, so
-    /// `canonical_path` degrades to the lexical `normalize_components` and keeps
+    /// `canonical_path` degraded to the lexical `normalize_components` and kept
     /// whatever case it was handed — while the declared root, which IS on disk,
     /// canonicalizes to the spelling NTFS holds. `covering_from`'s containment
     /// test (`resolved.starts_with(&root)`) compares components byte-for-byte,
-    /// so the two disagree, the file reads as UNCOVERED, and the formatter
-    /// rewrites a product: §12.1's fmt↔hook loop, reached by a spelling rather
+    /// so the two disagreed, the file read as UNCOVERED, and the formatter
+    /// rewrote a product: §12.1's fmt↔hook loop, reached by a spelling rather
     /// than by a link.
     ///
-    /// The first half is the control and is green — spelled as the directory is
-    /// on disk, a not-yet-written product is covered, which is the property
-    /// `outputs = "src/icons/lib.vl"` depends on before the first build. Only
-    /// the folded spelling fails, and only where a filesystem folds case, which
-    /// is why this is `cfg(windows)` and why no unix pin could have caught it.
+    /// The first half is the control and was always green — spelled as the
+    /// directory is on disk, a not-yet-written product is covered, which is the
+    /// property `outputs = "src/icons/lib.vl"` depends on before the first
+    /// build. Only the folded spelling failed.
     ///
-    /// Neither direction is obviously right, which is why this is `#[ignore]`d
-    /// rather than fixed here: folding case inside `covering_from` would make
-    /// the predicate platform-dependent in a function whose whole point is that
-    /// two front ends answer alike, and the alternative — resolving the nearest
-    /// EXISTING ancestor and rebuilding the tail — changes what `canonical_path`
-    /// promises for every caller. B198 carries the ruling.
+    /// **The ruling: both sides canonical-or-fail** (B198, 2026-09-01). Neither
+    /// of the two directions the pin was filed against is what shipped.
+    /// `covering_from` does not fold case — it is a predicate two front ends
+    /// have to answer alike, and a platform-dependent comparison inside it is
+    /// exactly what that rules out — and `canonical_path`'s promise to its
+    /// every other caller is untouched. What changed is the resolution the
+    /// CONTAINMENT TEST uses: `util::canonical_path_of_unwritten` anchors both
+    /// sides at the deepest ancestor that is on disk, so a folded root is never
+    /// compared against a lexical child, and a tree with nothing on disk at all
+    /// degrades to G17's spelled ladder with both sides lexical together.
+    /// `a_product_the_generator_has_not_written_yet_is_covered_through_a_link`
+    /// is the same defect on unix, reached through a symlink instead of a case
+    /// fold, and is the pin that was red-proved locally.
     #[cfg(windows)]
     #[test]
-    #[ignore = "B198: whether `covering_from` folds case is an open ruling. A product \
-                its generator has not written yet has no on-disk path to \
-                canonicalize, so a case-folded spelling keeps its case while the \
-                declared root canonicalizes to NTFS's — the containment test at \
-                `manifest.rs` ~854 answers None and the formatter rewrites a \
-                product. Asserts the DESIRED outcome; un-ignore when B198 rules."]
     fn a_product_the_generator_has_not_written_yet_is_still_covered() {
         let base =
             std::env::temp_dir().join(format!("vilan-covering-unwritten-{}", std::process::id()));
