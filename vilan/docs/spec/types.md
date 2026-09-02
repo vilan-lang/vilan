@@ -747,9 +747,30 @@ right operand of a native operator over a number: not of `+`, and not of
 any sibling (`-`, `*`, the bit and shift operators, `==`, `<`), whatever
 it is bounded to. The same holds for `str`'s own comparisons, which want
 a `str` and have no trait naming that either. Convert where the type is
-known and declare the operand concretely. A parameter on the LEFT is a
-different question: there the bound selects an impl and the operator
-dispatches through it, which is what `T: Add` is for.
+known and declare the operand concretely.
+
+A parameter on the LEFT is a different question, and there the bound is
+**required**. The operator dispatches through its left operand, so the
+bound is what selects the implementation to run; a parameter without one
+has no implementation to dispatch to, and the operator is refused. What
+admits it is a bound that **provides the operator's method** — the
+parameter's own bound, or one reached through a supertrait: `+` needs
+`T: Add`, `-` needs `T: Sub`, `==` and `!=` need `T: PartialEq`, the
+four orderings need `T: PartialOrd`, and so on for every operator that
+models a trait. Merely being bounded is not enough, for the same reason
+it is not enough on the right: `T: Display` promises `to_string`, not
+`add`.
+
+Inside a trait's own default body the rule is unchanged, and the
+parameter is then the **trait's**. The bound goes on the trait, so the
+refusal names it: adding it there moves every `impl` of the trait and
+every bound that mentions it, which is not a local edit the way a
+function's own parameter is.
+
+`&&` and `||` are the one family with no spelling that works. They admit
+`bool`, they model no operator trait at all, and no trait names that set
+— so a parameter is refused on **either** side, whatever it is bounded
+to, and the fix is to change the type rather than to add a bound.
 
 ```vilan,fragment
 "n=" + count                 // str + i32 — concatenation
@@ -770,6 +791,21 @@ fun show<T: Display>(value: T): str { i"v={value}" }  // the hole is the same ex
 fun bump<T: Add>(total: i32, value: T): i32 { total + value }  // error: `T` is wider
 fun bump<T: Add>(total: i32, value: T): bool { total < value } // error: same, for `<`
 fun sum<T: Add>(first: T, second: T): T { first + second }     // the parameter is on the LEFT
+```
+
+```vilan,fragment
+fun sum<T>(a: T, b: T): T { a + b }                 // error: `+` on `T` needs `T: Add`
+fun sum<T: Display>(a: T, b: T): T { a + b }        // error: `Display` does not declare `add`
+fun sum<T: Add>(a: T, b: T): T { a + b }            // the bound provides `add`
+fun same<T: PartialEq>(a: T, b: T): bool { a == b } // one bound per operator
+fun smaller<T: Ord>(a: T, b: T): bool { a <= b }    // a supertrait's `le` counts
+fun both<T>(a: T, b: bool): bool { a && b }         // error: no bound can prove `bool`
+
+trait Doubler<T> {                                  // error: the bound goes on the TRAIT
+	fun once(self): T;
+	fun twice(self): T { self.once() + self.once() }
+}
+trait Doubler<T: Add> { … }                         // the spelling that works
 ```
 
 Where the left operand *does* dispatch, the same membership question is

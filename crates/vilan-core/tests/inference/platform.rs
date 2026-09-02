@@ -5279,8 +5279,10 @@ fn a_display_bound_reached_through_a_supertrait_still_renders() {
 // a numeric-left `+` refuses, whatever its bound promises — and the same
 // argument closes the rest of the native family, which had the identical hole
 // with the identical garbage. The generic LEFT operand is the other half of the
-// frame (B174) and stays open on purpose: trait defaults write
-// `self.once() + self.once()` over the trait's own parameter today.
+// frame and stayed open on purpose, because trait defaults wrote
+// `self.once() + self.once()` over the trait's own parameter; B174 took that
+// breaking step once its migration was priced at one site, and the two halves
+// now agree — a bound must PROVIDE the operator's method to admit either.
 
 #[test]
 fn a_bounded_generic_added_to_a_number_is_rejected() {
@@ -6240,26 +6242,37 @@ fn a_function_reference_left_operand_of_addition_is_rejected() {
     );
 }
 
+// --- B174: the generic LEFT operand, the deferred breaking step, TAKEN ------
+//
+// The other half of the operand-role frame, and the last escape from the
+// unbounded-parameter check inside a trait default. B169 and B179 closed the
+// RIGHT operand and B181 closed the logical pair's right half; each time the
+// LEFT was left, on the stated ground that refusing it is a bound requirement
+// on every trait default written over the trait's OWN parameter — a breaking
+// generics change with a migration, not a miscompile fix.
+//
+// The census priced that migration and the number was ONE: a single compiler
+// fixture (`macros::an_inherited_default_on_a_generic_subject_dispatches`)
+// writes the shape, and the only other estate sites are the `#[ignore]`d pins
+// below, which the change turns green. Zero in std, the corpus, docs fences,
+// examples, templates, kolt or the website. Ruled 2026-09-01: take it, and
+// require a bound that PROVIDES the operator's method rather than merely any
+// bound — otherwise `<T: Display>` on the left of `+` stays exactly as broken
+// as `<T>` (P4 of the census), and the two sides would still disagree about
+// what a bound has to prove.
+//
+// The garbage the refusals replace, from the census and audit run 7:
+//   `bump(Point { … })`            emitted `value + 1`      -> the tuple, concatenated
+//   `both(Point { … }, true)`      emitted `value && flag`  -> the struct, typed `bool`
+//   `same<T>(M { n = 7 }, M { n = 7 })`                     -> `false`
+//   `less<T>(M { n = 10 }, M { n = 9 })`                    -> `true` ("10" < "9")
+// Each a plausible wrong answer rather than a visible `NaN`.
+
 #[test]
-#[ignore = "B174: an unbounded generic LEFT operand still escapes the check — \
-            refusing it is a bound requirement on every trait default written \
-            over the trait's own parameter, the deferred breaking step"]
 fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
-    // KNOWN BUG, and the one left-operand shape the fix deliberately did not
-    // take. The declaration is checked once for all instantiations and an
-    // unbounded `T` promises nothing, so `bump(Point { … })` emits `value + 1`
-    // and the host concatenates the struct's tuple.
-    //
-    // The census says why it stays: a trait default body over the trait's own
-    // parameter is written unbounded today and computes correct answers for
-    // every numeric instantiation — `macros::an_inherited_default_on_a_generic_
-    // subject_dispatches` is exactly that shape, and refusing here refuses it.
-    // Closing this is a bound requirement on every such declaration, the
-    // breaking generics change b148's SCOPE note deferred; the sibling on the
-    // RIGHT side is narrower and IS closed — B169 for the unbounded parameter,
-    // B179 for the bounded one and for the rest of the native family — because
-    // there the left operand is already a grounded native whose semantics are
-    // known, and the question is only whether the right one is a member.
+    // The declaration is checked once for all instantiations and an unbounded
+    // `T` promises nothing, so `bump(Point { … })` emitted `value + 1` and the
+    // host concatenated the struct's tuple.
     assert_fails_spanning(
         r#"
         fun bump<T>(value: T): T {
@@ -6271,7 +6284,7 @@ fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
         }
         "#,
         "value + 1",
-        "`T` is neither: it has no `Add`",
+        "`+` on `T` needs `T: Add`",
     );
 }
 
@@ -6293,6 +6306,354 @@ fn a_bounded_generic_left_operand_of_addition_still_dispatches() {
         }
         "#,
         "6\n4\n",
+    );
+}
+
+#[test]
+fn an_unbounded_generic_left_operand_of_the_sibling_operators_is_rejected() {
+    // Audit run 7 widened B174 past `+`: every operator that models a trait
+    // escaped through the same fall-through, and the arithmetic ones are the
+    // least dangerous of them. `-` and `*` produced `NaN`, but the comparisons
+    // produced plausible BOOLEANS — `same(M { n = 7 }, M { n = 7 })` was
+    // `false` (JS compares the lowered structs by reference) and
+    // `less(M { n = 10 }, M { n = 9 })` was `true` (lexicographic `"10" < "9"`).
+    // Each names the bound that admits it, which differs per operator.
+    assert_fails_spanning(
+        r#"
+        fun drop_one<T>(value: T): T {
+            value - 1
+        }
+
+        fun main() {
+            let _n = drop_one(5);
+        }
+        "#,
+        "value - 1",
+        "`-` on `T` needs `T: Sub`",
+    );
+    assert_fails_spanning(
+        r#"
+        fun same<T>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun main() {
+            let _same = same(1, 1);
+        }
+        "#,
+        "a == b",
+        "`==` on `T` needs `T: PartialEq`",
+    );
+    assert_fails_spanning(
+        r#"
+        fun less<T>(a: T, b: T): bool {
+            a < b
+        }
+
+        fun main() {
+            let _less = less(1, 2);
+        }
+        "#,
+        "a < b",
+        "`<` on `T` needs `T: PartialOrd`",
+    );
+}
+
+#[test]
+fn a_trait_defaults_own_parameter_as_a_left_operand_is_rejected() {
+    // THE breaking shape, and the whole of the migration the census priced:
+    // a default written over the trait's own unbounded parameter. It cannot be
+    // fixed locally the way a free function's can — the bound goes on the
+    // TRAIT, and every `impl` and every bound naming it moves with it — which
+    // is why the refusal says where the parameter is declared.
+    //
+    // It worked by luck at `i32` and printed `abab` for `Holder { value = "ab" }`.
+    assert_fails_spanning(
+        r#"
+        trait Doubler<T> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T {
+                self.value
+            }
+        }
+
+        fun main() {
+            print(Holder { value = 21 }.twice());
+        }
+        "#,
+        "self.once() + self.once()",
+        "declared on `trait Doubler`",
+    );
+}
+
+#[test]
+fn a_left_operand_bound_that_does_not_provide_the_operator_is_rejected() {
+    // The ruling's refinement, and the difference between closing the item and
+    // closing the hole (census §6.2, probe P4): "require a bound" is not
+    // "require the RIGHT bound". `T: Display` promises `to_string`, not `add`,
+    // and before this it fell through to the SAME native emission an unbounded
+    // parameter did — `Holder { value = "ab" }` still printed `abab`. The
+    // right operand already checked adequacy (`T: Display` with `+` and with
+    // `==` both fail there), so the two sides disagreed about what a bound has
+    // to prove; now they do not.
+    assert_fails_spanning(
+        r#"
+        import std::display::Display;
+
+        fun bump<T: Display>(value: T): T {
+            value + 1
+        }
+
+        fun main() {
+            let _n = bump(5);
+        }
+        "#,
+        "value + 1",
+        "its bounds (`Display`) do not declare `add`",
+    );
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+
+        trait Doubler<T: Display> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+        "#,
+        "`+` on `T` needs `T: Add`",
+    );
+}
+
+#[test]
+fn a_generic_left_operand_of_the_logical_operators_is_rejected() {
+    // B181's left half, and the one family where "add a bound" is NOT the fix:
+    // `&&` and `||` admit `bool` and nothing else, they model no operator trait
+    // at all, and no trait names that set — so a parameter refuses outright,
+    // whatever it is bounded to, exactly as B181 already refused it on the
+    // right. `both(Point { x = 1, y = 2 }, true)` printed the struct: JS's `&&`
+    // yields its RIGHT operand when the left is truthy.
+    assert_fails_with(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun both<T>(value: T, flag: bool): bool {
+            value && flag
+        }
+
+        fun main() {
+            print(both(Point { x = 1, y = 2 }, true));
+        }
+        "#,
+        "takes `bool` operands",
+    );
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+
+        fun either<T: Display>(value: T, flag: bool): bool {
+            value || flag
+        }
+
+        fun main() {
+            print(either(7, true));
+        }
+        "#,
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn a_bounded_generic_left_operand_of_the_sibling_operators_still_dispatches() {
+    // Every refusal above has to have a legal spelling that RUNS, or the rule
+    // would only be a way of rejecting programs. One per bound the refusals
+    // name — `Sub`, `PartialEq`, `PartialOrd` — dispatched through the bound
+    // and re-resolved to each instantiation's own impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Sub;
+        import std::compare::PartialEq;
+        import std::compare::PartialOrd;
+
+        fun drop_one<T: Sub>(value: T, one: T): T {
+            value - one
+        }
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun less<T: PartialOrd>(a: T, b: T): bool {
+            a < b
+        }
+
+        fun main() {
+            print(drop_one(5, 1));
+            print(same(7, 7));
+            print(same("a", "b"));
+            print(less(9, 10));
+            print(less(10, 9));
+        }
+        "#,
+        "4\ntrue\nfalse\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn a_supertrait_bound_admits_the_left_operand() {
+    // The adequacy check reads the bound's SUPERTRAITS, not just the bound —
+    // std's own `math::minmax<T: Ord>` writes `a <= b`, and `Ord`'s `le` comes
+    // from its `PartialOrd` supertrait. A check that looked only at the named
+    // trait would refuse std.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::Ord;
+
+        fun smaller<T: Ord>(a: T, b: T): T {
+            if a <= b { a } else { b }
+        }
+
+        fun main() {
+            print(smaller(9, 4));
+            print(smaller("b", "a"));
+        }
+        "#,
+        "4\na\n",
+    );
+}
+
+#[test]
+fn a_bounded_trait_parameter_left_operand_still_dispatches() {
+    // The estate edit's own pin, in the spelling that shipped: the ONE site the
+    // census found, migrated. The bound is orthogonal to what the fixture
+    // asserts (that an inherited default dispatches on a generic impl subject),
+    // so the answer is unchanged — and now it is an answer the declaration
+    // earns rather than one it gets by luck at `i32`.
+    //
+    // The impl's binder does NOT restate the bound, which is why the migration
+    // is one edit and not two.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T {
+                self.value
+            }
+        }
+
+        fun main() {
+            print(Holder { value = 21 }.twice());
+        }
+
+        main();
+        "#,
+        "42\n",
+    );
+    // And the bound the trait now carries is load-bearing at the instantiation
+    // that used to produce garbage: this is the `abab` program, refused where
+    // the parameter is GROUNDED rather than where it is written — so the
+    // unrestated binder loses nothing.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct Point { x: i32, y: i32 }
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T {
+                self.value
+            }
+        }
+
+        fun main() {
+            print(Holder { value = Point { x = 1, y = 2 } }.twice());
+        }
+        "#,
+        "'Point' does not implement trait 'Add'",
+    );
+}
+
+#[test]
+fn generated_code_is_not_held_to_the_left_operands_bound() {
+    // The boundary, and it is B188's — drawn on the same generators, for the
+    // same reason, and already shipped there. `[derive(PartialEq)]` on a
+    // generic struct emits `fun eq(self, other: Holder)` comparing a `T`-typed
+    // field, so the rule would refuse the derive surface wholesale; and the
+    // diagnostic anchors at the `[derive(..)]`, which is not where the bound
+    // goes, so it would name a fix from a span that is not the declaration.
+    // The census priced what a program WRITES, and that is what the rule
+    // covers. Bounding the struct DOES work (the control below), so the
+    // generator half is filed, not unfixable.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [derive(PartialEq)]
+        struct Holder<T> {
+            value: T,
+        }
+
+        fun main() {
+            print(Holder { value = 1 } == Holder { value = 1 });
+        }
+        "#,
+        "true\n",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        [derive(PartialEq)]
+        struct Holder<T: PartialEq> {
+            value: T,
+        }
+
+        fun main() {
+            print(Holder { value = 1 } == Holder { value = 2 });
+        }
+        "#,
+        "false\n",
     );
 }
 
@@ -7903,7 +8264,9 @@ fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
 // trait-characterizable (B176's render bound) — there is not even an operator
 // trait to consult. So every generic right operand refuses, whatever its bound.
 //
-// The LEFT half is B174's deferral shape and waits with it.
+// The LEFT half was B174's deferral shape and went with it: same check, side
+// condition dropped, same sentence — the reason a bound cannot prove `bool`
+// never depended on which operand was being judged.
 
 #[test]
 fn b181_an_unbounded_generic_right_operand_of_and_is_rejected() {
@@ -7994,13 +8357,13 @@ fn b181_a_bool_right_operand_still_short_circuits() {
 }
 
 #[test]
-#[ignore = "B174's half: an unbounded generic LEFT operand of `&&` still \
-            escapes the check — refusing it is the deferred breaking generics \
-            change, the same one that keeps `value + 1` open on the left."]
 fn an_unbounded_generic_left_operand_of_and_is_rejected() {
-    // KNOWN BUG. `both(Point { x = 1, y = 2 }, true)` prints `true`: the host's
-    // `&&` finds the struct truthy and yields the right operand. The left half
-    // is deliberately untouched by B181, exactly as B179 left `+`'s to B174.
+    // B174 took the left half. `both(Point { x = 1, y = 2 }, true)` printed the
+    // struct: the host's `&&` finds it truthy and yields the RIGHT operand,
+    // which is then typed `bool`. B181 left this to the breaking step; the
+    // wording it shipped already reads for either side, because the reason is
+    // the same one — `bool`'s set is `bool`, and no bound can prove membership
+    // of it.
     assert_fails_with(
         r#"
         struct Point { x: i32, y: i32 }

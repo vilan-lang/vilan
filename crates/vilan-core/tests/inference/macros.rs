@@ -3509,13 +3509,31 @@ fn a_trait_default_body_reads_context_through_covered_dispatch() {
 // matched impl subjects by exact type equality, so generic subjects never
 // matched and the call silently bound to the trait's ABSTRACT member (the
 // B12 silent-miscompile shape). Now nominal, like `resolve_member_on_type`.
+//
+// MIGRATED for B174, and this is the whole of the estate's migration: the
+// census swept std, the corpus, docs fences, examples, benchmarks, templates,
+// kolt and the website and found exactly one trait default written over the
+// trait's own UNBOUNDED parameter, which is this one. `T: Add` is orthogonal to
+// what the fixture asserts — that an inherited default dispatches on a generic
+// impl subject — and the answer is unchanged at `42`. It was an answer this
+// declaration got by luck: `Holder { value = "ab" }.twice()` printed `abab`
+// through the same default, one type argument from demonstrating the bug the
+// fixture was silently relying on.
+//
+// The impl's own binder deliberately does NOT restate the bound. It does not
+// have to: satisfaction is checked where the parameter is GROUNDED, so
+// `Holder { value = Point { … } }.twice()` is refused at that call — "'Point'
+// does not implement trait 'Add'", labelled at the trait's declaration —
+// whether the binder repeats `: Add` or not. Restating it would make the
+// migration look like two edits when it is one.
 #[test]
 fn an_inherited_default_on_a_generic_subject_dispatches() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::operators::Add;
 
-        trait Doubler<T> {
+        trait Doubler<T: Add> {
             fun once(self): T;
 
             fun twice(self): T {

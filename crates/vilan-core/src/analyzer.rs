@@ -23987,6 +23987,28 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default()
     }
 
+    /// The name of the trait that declares `constraint_id` as one of its OWN
+    /// generic parameters, if any — the inverse of
+    /// [`Self::declaring_trait_generics`], keyed on the parameter instead of on
+    /// the member.
+    ///
+    /// B174's refusal needs it because the fix differs by declaration site. A
+    /// function's own parameter is bounded where it is written and nothing else
+    /// moves; a TRAIT's parameter cannot be bounded locally — the bound changes
+    /// the trait, and with it every `impl` of it and every bound that names it
+    /// — so the diagnostic says which trait the reader is about to change
+    /// rather than leaving them to find it.
+    fn trait_declaring_generic(&self, constraint_id: TypeId) -> Option<&'src str> {
+        self.traits
+            .values()
+            .find(|trait_| {
+                trait_
+                    .generic_parameter_constraint_ids
+                    .contains(&constraint_id)
+            })
+            .map(|trait_| trait_.name)
+    }
+
     /// The generic binder constraint ids of the impl DECLARING `member_id`:
     /// subject binders (`impl Wrapper<type T>`, recoverable from the subject's
     /// type arguments) and with-clause binders (`impl P with Trait<type S:
@@ -34487,9 +34509,7 @@ impl<'src> Analyzer<'src> {
             if let Some(rhs_id) = rhs_id {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let bool_type = self.bool_type();
-                    for (operand_id, side, is_right) in
-                        [(lhs_id, "left", false), (rhs_id, "right", true)]
-                    {
+                    for (operand_id, side) in [(lhs_id, "left"), (rhs_id, "right")] {
                         let operand = self.infer_type(operand_id, &bool_type, &HashMap::default());
                         // B181, and the same membership principle B179 settled
                         // for the native family: `grounded` excludes every
@@ -34509,10 +34529,16 @@ impl<'src> Analyzer<'src> {
                         // So every generic right operand refuses, whatever it
                         // is bounded to.
                         //
-                        // The LEFT half waits with B174: refusing a parameter
-                        // there is the deferred breaking generics change, not
-                        // this miscompile fix.
-                        if is_right && matches!(operand, Type::Generic(_)) {
+                        // B174 takes the LEFT half, and it is the one place in
+                        // that step where "add the bound the operator needs" is
+                        // NOT the fix: every other operator models a trait a
+                        // parameter can be bounded to, and these two model
+                        // none, so the same sentence serves both sides
+                        // unchanged — the reason a bound cannot prove `bool`
+                        // does not depend on which operand is being judged. The
+                        // author's fix is to change the type, and the steer
+                        // already says so.
+                        if matches!(operand, Type::Generic(_)) {
                             let label = self.pretty_print_type(&operand, &HashMap::default());
                             self.push_anchored(
                                 Error {
@@ -35006,10 +35032,11 @@ impl<'src> Analyzer<'src> {
                 // SHAPE through the check; this routes every right one.
                 //
                 // The LEFT operand being a parameter is the other half of the
-                // frame and is deliberately untouched (B174): a trait default
-                // body writes `self.once() + self.once()` over the trait's own
-                // parameter today, so refusing it is a breaking generics
-                // change with a migration, not this miscompile fix.
+                // frame, and was deliberately untouched here because a trait
+                // default body wrote `self.once() + self.once()` over the
+                // trait's own parameter — a breaking generics change with a
+                // migration, not this miscompile fix. B174 took it below, once
+                // the census priced that migration at one site.
                 if native_left && !matches!(op, BinaryOp::Add) {
                     let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::default());
                     if matches!(rhs_type, Type::Generic(_)) {
@@ -35083,17 +35110,92 @@ impl<'src> Analyzer<'src> {
                             binary_id,
                             GenericDispatch::OnConstraint(constraint_id, method_name),
                         );
+                    } else {
+                        // B174, the deferred breaking step, TAKEN. A parameter
+                        // whose bounds do not provide the operator's method
+                        // used to fall through to the same native emission a
+                        // grounded value gets, so `fun bump<T>(value: T): T {
+                        // value + 1 }` compiled and `bump(Point { x = 1, y = 2
+                        // })` printed `1,21` — the struct's lowered tuple,
+                        // concatenated and typed `T`. The declaration is
+                        // checked once for all its instantiations, so the
+                        // bounds are the whole of what the operand is known to
+                        // be (spec §types, "a generic parameter admits exactly
+                        // what its bounds promise"), and an unbounded one is
+                        // known to be nothing at all.
+                        //
+                        // The rule is ADEQUACY, not merely a bound: `T:
+                        // Display` promises `to_string` and not `add`, and
+                        // before this it was as broken as `<T>` — the `provides`
+                        // check above only RECORDED a dispatch and never
+                        // refused its absence. The right operand already
+                        // checked adequacy, so the two sides disagreed about
+                        // what a bound has to prove; the census recommended
+                        // ending that asymmetry and the ruling took it.
+                        //
+                        // The refusal names the bound that would admit the
+                        // operand, because the LEFT operand is exactly where a
+                        // bound works — B179's operand-role ruling — and names
+                        // the trait when the parameter is a trait's own, since
+                        // there the bound cannot be added locally: it moves the
+                        // trait, and every `impl` and every bound naming it.
+                        //
+                        // GENERATED code is exempt, on B188's already-shipped
+                        // boundary and for its stated reason. `[derive(
+                        // PartialEq)]` on `struct Holder<T>` emits `fun eq(
+                        // self, other: Holder)` comparing a `T`-typed field, so
+                        // the generators would trip this rule wholesale — and
+                        // the diagnostic anchors at the `[derive(..)]`, which
+                        // is not where the fix goes, so it would tell a reader
+                        // to bound a parameter from a span that is not the
+                        // parameter's declaration. Making the generators
+                        // generic-aware is a ruling rather than a fix (the
+                        // reflection surface a macro sees carries no generic
+                        // parameters, and a derived impl over a parameter needs
+                        // bounds nothing computes), and B174's census priced
+                        // what a program WRITES. So the rule is total over
+                        // that, and the generator half is filed rather than
+                        // half-shipped — exactly as B188 left the same
+                        // generators on the same ground.
+                        if self.source_of_id(binary_id) == Some(DERIVED_SOURCE) {
+                            continue;
+                        }
+                        let label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let (trait_name, _) =
+                            operator_trait_method(op).expect("matched just above");
+                        let promise = if bound_trait_ids.is_empty() {
+                            format!("`{label}` is unbounded")
+                        } else {
+                            let bounds = bound_trait_ids
+                                .iter()
+                                .filter_map(|trait_id| self.traits.get(trait_id))
+                                .map(|bound| format!("`{}`", bound.name))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("its bounds ({bounds}) do not declare `{method_name}`")
+                        };
+                        let site = match self.trait_declaring_generic(constraint_id) {
+                            Some(trait_) => format!(" on `trait {trait_}`"),
+                            None => String::new(),
+                        };
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` on `{label}` needs `{label}: {trait_name}` — a \
+                                     parameter promises only what its bounds promise, and \
+                                     {promise}, so there is no `{method_name}` to dispatch to. \
+                                     `{symbol}` dispatches through its LEFT operand, which is \
+                                     exactly where a bound decides the implementation: add it \
+                                     where `{label}` is declared{site}, or write a concrete type \
+                                     here"
+                                ),
+                            },
+                            binary_id,
+                        );
                     }
-                    // An UNBOUNDED parameter on the left still falls through
-                    // to the native emission, and B170's census says why that
-                    // stays: a trait default body over the trait's OWN
-                    // parameter (`trait Doubler<T> { fun twice(self): T {
-                    // self.once() + self.once() } }`) is written unbounded
-                    // today and computes correct answers for every numeric
-                    // instantiation. Refusing it is a bound requirement on
-                    // every such declaration — the breaking generics change
-                    // b148's SCOPE note deferred, not this miscompile fix —
-                    // so it is pinned `#[ignore]`d as B170's residual instead.
                 }
                 continue;
             }
