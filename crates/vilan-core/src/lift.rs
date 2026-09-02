@@ -304,13 +304,13 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             Node::Tuple(items)
         }
         Node::Repeat(value, length) => Node::Repeat(seal_boxed(value), seal_boxed(length)),
-        Node::StructInitializer(name, generics, mut fields) => {
+        Node::StructInitializer(namespace, name, generics, mut fields) => {
             for field in fields.0.iter_mut() {
                 if let Some(value) = field.0.1.as_mut() {
                     take_and_seal(value);
                 }
             }
-            Node::StructInitializer(name, generics, fields)
+            Node::StructInitializer(namespace, name, generics, fields)
         }
         Node::Binary(op, left, right) => Node::Binary(op, seal_boxed(left), seal_boxed(right)),
         Node::Unary(op, inner) => Node::Unary(op, seal_boxed(inner)),

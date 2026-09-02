@@ -4585,8 +4585,16 @@ impl<'src> Printer<'src> {
                 self.print_argument_spans(argument_spans);
                 self.out.push(')');
             }
-            Node::StructInitializer(name, generic_arguments, fields) => {
-                self.out.push_str(name);
+            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
+                // The path as written (B190) — the namespace spine, then the
+                // name. The printer BAILS on a form it does not know, falling
+                // the whole file back to its source silently, so a qualified
+                // literal without this would have stopped being formatted.
+                for segment in namespace {
+                    self.out.push_str(segment);
+                    self.out.push_str("::");
+                }
+                self.out.push_str(name.0);
                 if let Some((generic_arguments, _)) = generic_arguments {
                     self.out.push('<');
                     for (index, (argument, _)) in generic_arguments.iter().enumerate() {
@@ -5179,6 +5187,31 @@ mod reformats {
              fun render(card: &Card, shape: (style::Style, i32)): style::Style {\n\
              \tlet held: style::Style = card.style;\n\
              \tshape.0\n\
+             }\n";
+        assert_formats(source, source);
+    }
+
+    /// A module-qualified struct LITERAL (B190) reprints as written. Same
+    /// hazard as the type path above, and pinned for the same reason: the
+    /// printer BAILS on a form it does not know, which turns a missing arm
+    /// into a file that quietly stops being formatted rather than a failure
+    /// anyone sees.
+    #[test]
+    fn a_module_qualified_struct_literal_round_trips() {
+        let source = "mod shapes {\n\
+             \tmod deep {\n\
+             \t\tstruct Ring {\n\
+             \t\t\tr: i32,\n\
+             \t\t}\n\
+             \t}\n\n\
+             \tstruct Dot {\n\
+             \t\tx: i32,\n\
+             \t}\n\
+             }\n\n\
+             fun main() {\n\
+             \tlet d = shapes::Dot { x = 1 };\n\
+             \tlet r = shapes::deep::Ring { r = 2 };\n\
+             \tprint(i\"{d.x}{r.r}\");\n\
              }\n";
         assert_formats(source, source);
     }

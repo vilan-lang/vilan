@@ -1908,7 +1908,16 @@ pub struct StructInitializerConstraint<'src> {
     /// The lexical scope the initializer appears in, so the struct name resolves
     /// from there (walking parents) rather than scanning every scope by name.
     pub scope_id: Id,
+    /// The modules the head was reached through, in source order — empty for
+    /// the bare spelling (B190). The name below is the LAST segment either way,
+    /// which is what every message about the DECLARATION says.
+    pub namespace: Vec<&'src str>,
     pub struct_name: &'src str,
+    /// The name's own span. With a namespace in front of it the literal no
+    /// longer begins where its name does, so the reference record that
+    /// go-to-definition and semantic tokens ride reads this instead of
+    /// measuring the name's length from the literal's start.
+    pub struct_name_span: Span,
     pub struct_fields: Vec<Field<'src>>,
     pub generic_argument_ids: Vec<TypeId>,
     pub generic_parameter_constraint_ids: Vec<TypeId>,
@@ -2215,7 +2224,8 @@ impl<'src> StructInitializerConstraint<'src> {
     fn from_walk(
         initializer_id: Id,
         scope_id: Id,
-        name: &'src str,
+        namespace: Vec<&'src str>,
+        name: Spanned<&'src str>,
         generic_argument_ids: Vec<TypeId>,
         e_fields: Vec<(&'src str, Id, Span, Span)>,
         fields_span: Span,
@@ -2224,12 +2234,24 @@ impl<'src> StructInitializerConstraint<'src> {
             initializer_id,
             struct_id: Id(0),
             scope_id,
-            struct_name: name,
+            namespace,
+            struct_name: name.0,
+            struct_name_span: name.1,
             struct_fields: Vec::new(),
             generic_argument_ids,
             generic_parameter_constraint_ids: Vec::new(),
             fields: e_fields,
             fields_span,
+        }
+    }
+
+    /// The head as the author WROTE it, for the two messages that report the
+    /// head rather than a field (B190). Every other message names the
+    /// declaration, whose name is the last segment on its own.
+    fn written_path(&self) -> String {
+        match self.namespace.is_empty() {
+            true => self.struct_name.to_string(),
+            false => format!("{}::{}", self.namespace.join("::"), self.struct_name),
         }
     }
 }
@@ -22133,7 +22155,7 @@ impl<'src> Analyzer<'src> {
                 // patterns have been resolved.
                 None
             }
-            Node::StructInitializer(name, generic_arguments, fields) => {
+            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
                 let generic_argument_ids = generic_arguments
                     .as_ref()
                     .map(|x| {
@@ -22180,7 +22202,8 @@ impl<'src> Analyzer<'src> {
                     StructInitializerConstraint::from_walk(
                         id,
                         scope_id,
-                        name,
+                        namespace.clone(),
+                        (name.0, name.1),
                         generic_argument_ids,
                         e_fields,
                         fields.1,
@@ -32280,6 +32303,53 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The declaration a struct literal's head names: a bare name resolved
+    /// LEXICALLY, or a module-qualified path walked through the modules that
+    /// declare it (B190). `None` when a segment does not name a module, or the
+    /// last name is not declared where the path says it is — the caller reports
+    /// it as the unknown struct it is, spelled the way the author wrote it.
+    ///
+    /// A path addresses exactly what the named module declares (B52), so the
+    /// walk never falls outward the way the lexical lookup does. That is the
+    /// same rule B172's type-path drain applies one level up, and the same
+    /// primitive answers both: `member_in_namespace` over the module's own body
+    /// scope.
+    fn resolve_initializer_head(
+        &mut self,
+        constraint: &StructInitializerConstraint<'src>,
+    ) -> Option<Id> {
+        let Some((first, rest)) = constraint.namespace.split_first() else {
+            return self.try_get_expr_id_by_name(constraint.struct_name, constraint.scope_id);
+        };
+        let head = self.try_get_expr_id_by_name(first, constraint.scope_id)?;
+        let mut scope_id = self.namespace_body_scope(head)?;
+        for segment in rest {
+            let member = self.member_in_namespace(segment, scope_id)?;
+            scope_id = self.namespace_body_scope(member)?;
+        }
+        self.member_in_namespace(constraint.struct_name, scope_id)
+    }
+
+    /// The scope an entity NAMESPACES: a module's body, or an enum's variants.
+    /// `None` for anything else, which is how a path through a segment that
+    /// namespaces nothing declines.
+    ///
+    /// The enum arm is not a widening of what a literal may name — a variant is
+    /// still not a struct, and the caller refuses it as one. It is what lets
+    /// the refusal SAY that: `shapes::Kind::Round { r = 1 }` walks to the
+    /// variant and is told "`Round` is not a struct", where declining at `Kind`
+    /// would report the whole path as an unknown struct and leave the author
+    /// looking for a declaration that is right where they said it was. An enum
+    /// namespaces its variants elsewhere too (a `use` statement reads one), so
+    /// this is that rule, not a second one.
+    fn namespace_body_scope(&self, entity_id: Id) -> Option<Id> {
+        match self.expr_id_to_expr_map.get(&entity_id)? {
+            Expr::Module(module_id) => self.modules.get(module_id).map(|module| module.body.1),
+            Expr::Enum(enum_id) => self.enums.get(enum_id).map(|enum_| enum_.variants_scope_id),
+            _ => None,
+        }
+    }
+
     /// `Struct { field = value, .. }`: resolve the struct by name (lexically),
     /// check field count, infer each value against its declared field type
     /// (binding the struct's type arguments), and record the initializer. Defers
@@ -32290,27 +32360,33 @@ impl<'src> Analyzer<'src> {
         &mut self,
         constraint: &StructInitializerConstraint<'src>,
     ) -> Resolution {
-        let struct_id =
-            match self.try_get_expr_id_by_name(constraint.struct_name, constraint.scope_id) {
-                Some(expr_id) => expr_id,
-                None => {
-                    let span = self
-                        .span_map
-                        .get(&constraint.initializer_id)
-                        .map(|span| **span)
-                        .unwrap_or(constraint.fields_span);
-                    let steer = self
+        let struct_id = match self.resolve_initializer_head(constraint) {
+            Some(expr_id) => expr_id,
+            None => {
+                let span = self
+                    .span_map
+                    .get(&constraint.initializer_id)
+                    .map(|span| **span)
+                    .unwrap_or(constraint.fields_span);
+                // The import steer answers "which module declares this name",
+                // which a QUALIFIED head has already answered — and answered
+                // wrongly, which is what the message says. Only the bare
+                // spelling takes it.
+                let steer = match constraint.namespace.is_empty() {
+                    true => self
                         .import_steer(constraint.struct_name)
-                        .unwrap_or_default();
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span,
-                        msg: format!("unknown struct: {}{}", constraint.struct_name, steer),
-                    });
-                    return Resolution::Failed;
-                }
-            };
+                        .unwrap_or_default(),
+                    false => String::new(),
+                };
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!("unknown struct: {}{}", constraint.written_path(), steer),
+                });
+                return Resolution::Failed;
+            }
+        };
         // Existence check only — the struct itself is re-fetched below, after
         // `record_reference`'s `&mut self` borrow.
         if !self.structs.contains_key(&struct_id) {
@@ -32323,19 +32399,20 @@ impl<'src> Analyzer<'src> {
                 trace: Vec::new(),
                 note: None,
                 span,
-                msg: format!("cannot initialize a non-struct: {}", constraint.struct_name),
+                msg: format!(
+                    "cannot initialize a non-struct: {}",
+                    constraint.written_path()
+                ),
             });
             return Resolution::Failed;
         }
-        // Record the literal's NAME as a reference (the literal starts with
-        // it, so the name span is the initializer's head) — semantic tokens
-        // and go-to-definition on `Point { .. }`'s name ride this.
-        if let Some(initializer_span) = self.span_map.get(&constraint.initializer_id) {
-            let start = initializer_span.into_range().start;
-            let name_span: Span = (start..start + constraint.struct_name.len()).into();
-            if let Some(source) = self.source_of_id(constraint.initializer_id) {
-                self.record_reference(source, name_span, struct_id);
-            }
+        // Record the literal's NAME as a reference — semantic tokens and
+        // go-to-definition on `Point { .. }`'s name ride this. The span comes
+        // from the parser (B190): a qualified head means the literal no longer
+        // starts where its name does, so measuring the name's length from the
+        // literal's start would have drawn the label over the module prefix.
+        if let Some(source) = self.source_of_id(constraint.initializer_id) {
+            self.record_reference(source, constraint.struct_name_span, struct_id);
         }
         let struct_ = self.structs.get(&struct_id).expect("checked above");
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();

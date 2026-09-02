@@ -277,13 +277,13 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Repeat(value, length) => {
             Node::Repeat(desugar_boxed(value, source), desugar_boxed(length, source))
         }
-        Node::StructInitializer(name, generics, mut fields) => {
+        Node::StructInitializer(namespace, name, generics, mut fields) => {
             for field in fields.0.iter_mut() {
                 if let Some(value) = field.0.1.as_mut() {
                     take_and_desugar(value, source);
                 }
             }
-            Node::StructInitializer(name, generics, fields)
+            Node::StructInitializer(namespace, name, generics, fields)
         }
         Node::Binary(op, left, right) => Node::Binary(
             op,

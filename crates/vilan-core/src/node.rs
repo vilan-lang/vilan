@@ -616,8 +616,14 @@ pub enum Node<'src> {
         bool,
         Option<Spanned<Vec<Spanned<StructField<'src>>>>>,
     ),
+    // B190: the head is B172's `type-path`, not a bare identifier. The
+    // namespace segments are the modules the name was reached through, in
+    // source order (`shapes::deep::Ring` gives `["shapes", "deep"]`) and empty
+    // for the bare spelling; the name carries its own span, since with a
+    // prefix in front of it the literal's start is no longer where it begins.
     StructInitializer(
-        &'src str,
+        Vec<&'src str>,
+        Spanned<&'src str>,
         Option<GenericArguments<'src>>,
         Spanned<Vec<Spanned<StructInitializerField<'src>>>>,
     ),
@@ -976,7 +982,7 @@ impl<'src> Node<'src> {
                     }
                 }
             }
-            Node::StructInitializer(_, generic_arguments, fields) => {
+            Node::StructInitializer(_, _, generic_arguments, fields) => {
                 for argument in generic_arguments.iter().flat_map(|arguments| &arguments.0) {
                     visit(argument);
                 }

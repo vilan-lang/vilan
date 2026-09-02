@@ -5985,3 +5985,133 @@ fn a_qualified_path_refusal_is_attributed_to_the_module_that_wrote_it() {
 // The web-prelude half of B172 — that a module-carried name reaches its TYPES
 // as well as its values — needs a manifest prelude, so it is pinned beside the
 // prelude harness in `tests/module_resolution.rs`.
+
+// --- B190: a struct LITERAL takes the same qualified head ---------------------
+//
+// B172 admitted `type-path` in every TYPE position and left one spelling
+// behind: the literal, whose rule keyed on a bare identifier followed by `{`.
+// So `shapes::Dot` was a type, `shapes::make()` was a call, and
+// `shapes::Dot { x = 1 }` was a PARSE error ("expected `;` to end this
+// statement") — which is why two of B172's own pins construct through a
+// `make()` helper instead of saying what they mean. The literal now reads the
+// same production, and the condition-position rule is untouched: a condition
+// parses through the no-struct mode, which never reaches the literal rule at
+// all, so a qualified path before a `{` there stays an operand exactly as the
+// bare form does.
+
+/// A module with a nested module, an enum and a struct — enough to write a
+/// literal head of one segment, of two, and one that is not a struct at all.
+const QUALIFIED: &str = r#"
+        mod shapes {
+            import std::compare::PartialEq;
+
+            mod deep {
+                struct Ring {
+                    r: i32,
+                }
+            }
+
+            enum Kind {
+                Round(i32),
+                Flat,
+            }
+
+            impl Kind with PartialEq {
+                fun eq(self, other: Kind): bool {
+                    if self is Kind::Flat {
+                        other is Kind::Flat
+                    } else {
+                        false
+                    }
+                }
+            }
+
+            struct Dot {
+                x: i32,
+            }
+        }
+"#;
+
+fn with_qualified(rest: &str) -> String {
+    format!("{QUALIFIED}\n{rest}\n")
+}
+
+#[test]
+fn a_qualified_struct_literal_takes_one_segment() {
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() { let d = shapes::Dot { x = 1 }; print(i\"{d.x}\"); }\nmain();",
+        ),
+        "1\n",
+    );
+}
+
+#[test]
+fn a_qualified_struct_literal_takes_two_segments() {
+    // The production is a repetition, not a special case for one `::`, so the
+    // nested module has to work for the same reason `std::reactive::SignalCell`
+    // works as a type.
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() { let r = shapes::deep::Ring { r = 2 }; print(i\"{r.r}\"); }\nmain();",
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn a_qualified_literal_head_that_is_not_a_struct_is_refused_by_name_not_by_the_parser() {
+    // The enum-variant twin. This language's variants carry a POSITIONAL
+    // payload (`Kind::Round(1)`), so there is no such thing as
+    // `Kind::Round { r = 1 }` — but the mistake is now a semantic one, told in
+    // the vocabulary of what the path names, where before the parser refused
+    // the whole statement with "expected `;`" and said nothing about `Round`.
+    // The path walks a module and then an enum, whose namespace holds its
+    // variants exactly as a `use` statement reads it.
+    let source = with_qualified("fun main() { let k = shapes::Kind::Round { r = 1 }; }\nmain();");
+    assert_fails_with(
+        &source,
+        "cannot initialize a non-struct: shapes::Kind::Round",
+    );
+    assert_fails_without(&source, "expected `;`");
+}
+
+#[test]
+fn an_unknown_qualified_literal_head_names_the_path_as_written() {
+    // The miss reports the spelling the author used, not the last segment on
+    // its own — `Nope` alone would send them looking in the wrong file.
+    assert_fails_with(
+        &with_qualified("fun main() { let n = shapes::Nope { x = 1 }; }\nmain();"),
+        "unknown struct: shapes::Nope",
+    );
+}
+
+#[test]
+fn a_qualified_path_before_a_brace_in_condition_position_is_still_an_operand() {
+    // The disambiguation, at the spelling the change introduces. A condition's
+    // operands exclude struct literals so that `if Foo { … }` is a block; the
+    // qualified form has to obey the same rule, or every `if x == mod::Enum::V
+    // { … }` in the language would start reading its own body as a field list.
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() {\n\
+             \tlet k = shapes::Kind::Flat;\n\
+             \tif k == shapes::Kind::Flat { print(\"flat\"); }\n\
+             \tfor _ in [1] { print(\"once\"); }\n\
+             }\nmain();",
+        ),
+        "flat\nonce\n",
+    );
+}
+
+#[test]
+fn a_parenthesised_qualified_literal_is_admitted_in_a_condition() {
+    // The escape the spec names for the bare form, which the qualified form
+    // inherits unchanged: parenthesise the literal and the condition takes it.
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() { if (shapes::Dot { x = 1 }).x == 1 { print(\"one\"); } }\nmain();",
+        ),
+        "one\n",
+    );
+}
