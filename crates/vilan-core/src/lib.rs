@@ -51,7 +51,8 @@ pub use owned_modules::OwnedModules;
 pub use span::{Span, Spanned};
 pub use target::{Backend, Platform, PlatformPattern};
 pub use transformer::{
-    EmittedChunk, JsProgram, SplitProgram, transform, transform_split, transform_to_ast,
+    EmittedChunk, JsProgram, SplitProgram, transform, transform_split, transform_split_with_plan,
+    transform_to_ast,
 };
 
 use std::collections::{HashMap, HashSet};

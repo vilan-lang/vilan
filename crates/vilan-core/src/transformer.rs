@@ -111,6 +111,13 @@ pub struct EmittedChunk {
     /// The artifact's file name, beside the entry bundle.
     pub file: String,
     pub source: String,
+    /// How many references to a SIBLING chunk's functions this chunk emitted as
+    /// registry reads — one property lookup apiece, at the use rather than at
+    /// evaluation (`bundle-boundaries.md` D5). The route partition makes this 0
+    /// by construction (nothing reachable from two arms is chunked at all), so
+    /// it is also the measurement that says whether a partition introduced a
+    /// cross-chunk edge.
+    pub cross_chunk_references: usize,
 }
 
 /// A split entry's artifacts (`bundle-splitting.md` §3): the eager bundle plus
@@ -158,7 +165,23 @@ pub fn transform_split<'src>(
     options: &BuildOptions,
     leg: &str,
 ) -> Result<SplitProgram, Error> {
-    let plan = crate::chunks::plan(program);
+    transform_split_with_plan(program, options, leg, &crate::chunks::plan(program))
+}
+
+/// [`transform_split`] over a GIVEN partition, which is the whole of the
+/// emitter's contract: where a chunk's membership came from is the planner's
+/// business, and the emission below asks the plan for nothing but its buckets,
+/// its tags and its gate. Route splitting passes `chunks::plan`'s verdict;
+/// a partition that puts two mutually-referencing functions in different chunks
+/// — which the route partition cannot produce (`bundle-boundaries.md` §1.6,
+/// fact 2) and a declared boundary produces by definition — is emitted by the
+/// same code, and is what the cross-chunk reference form below exists for.
+pub fn transform_split_with_plan<'src>(
+    program: &'src Program<'src>,
+    options: &BuildOptions,
+    leg: &str,
+    plan: &crate::chunks::ChunkPlan,
+) -> Result<SplitProgram, Error> {
     if plan.chunks.is_empty() {
         // Nothing splittable: the entry is a single file, exactly as if the
         // flag were absent. Reported by `--print-chunks`, not by a failure.
@@ -220,9 +243,33 @@ pub fn transform_split<'src>(
     }
     // …and registers everything a chunk reads back out of it.
     let mut chunk_sources: Vec<String> = Vec::new();
+    let mut crossings: Vec<usize> = Vec::new();
     for (index, nodes) in assembled.chunks.iter().enumerate() {
+        // A name a SIBLING chunk owns cannot be read at evaluation time: the
+        // sibling may not have been fetched yet, and a `const` initialized from
+        // a missing property is not a live view of it — it takes `undefined` and
+        // KEEPS it after the sibling registers (`bundle-boundaries.md` §4.1, D5;
+        // probe P3). Such a reference is emitted as a registry read at the use
+        // instead, exactly the form the eager forwarder already carries, so
+        // arrival order stops mattering at the cost of one property lookup per
+        // use. The route partition produces no such reference at all (§1.6, fact
+        // 2), which is why this is inert for every chunk plan v1 can make.
+        let siblings: BTreeSet<String> = chunk_names
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .flat_map(|(_, names)| names.iter().cloned())
+            .collect();
+        let mut own_nodes: Vec<js::Node<'src>> = nodes.to_vec();
+        let mut crossed = 0usize;
+        rewrite_sibling_references(&mut own_nodes, &siblings, &mut crossed);
+        crossings.push(crossed);
+
+        // What is left to snapshot is EAGER names only, and a snapshot of one is
+        // sound by construction: the eager registrations run in the entry's own
+        // module evaluation, strictly before any chunk can be fetched.
         let mut references = BTreeSet::new();
-        collect_references(nodes, &mut references);
+        collect_references(&own_nodes, &mut references);
         let needs: Vec<String> = references
             .into_iter()
             .filter(|name| eager_names.contains(name) && !chunk_names[index].contains(name))
@@ -242,7 +289,7 @@ pub fn transform_split<'src>(
                 value: Box::new(registry_slot(name)),
             }));
         }
-        chunk_nodes.extend(nodes.iter().cloned());
+        chunk_nodes.extend(own_nodes);
         for name in &chunk_names[index] {
             chunk_nodes.push(js::Node::Assignment(
                 Box::new(registry_slot(name)),
@@ -318,11 +365,13 @@ pub fn transform_split<'src>(
             .chunks
             .iter()
             .zip(chunk_sources)
-            .map(|(chunk, source)| EmittedChunk {
+            .zip(crossings)
+            .map(|((chunk, source), cross_chunk_references)| EmittedChunk {
                 arm: chunk.arm.clone(),
                 tag: chunk.tag,
                 file: crate::chunks::chunk_file_name(leg, &chunk.arm),
                 source,
+                cross_chunk_references,
             })
             .collect(),
     })
@@ -357,6 +406,174 @@ fn chunk_forwarder<'src>(function: &js::Function<'src>) -> js::Node<'src> {
         )))],
         is_async: function.is_async,
     })
+}
+
+/// Rewrites every reference a chunk makes to a name a SIBLING chunk owns into a
+/// read of that name's registry slot AT THE USE — `__vilan_chunks.fn.docs_nav`
+/// where the body said `docs_nav` — and counts them. The call form that comes
+/// out, `__vilan_chunks.fn.docs_nav(page)`, is the eager forwarder's own body,
+/// which is what proves the shape emittable.
+///
+/// This is the one place the split's two sides differ on how a name is read.
+/// An EAGER name is snapshotted once in the chunk preamble, because the eager
+/// registrations happen in the entry's module evaluation and no chunk can be
+/// fetched before that; a sibling chunk's name has no such order behind it, and
+/// a `const` taken from a slot the sibling has not filled binds `undefined`
+/// permanently — it does not become the function when the sibling lands
+/// (`bundle-boundaries.md` §4.1, D5; probe P3). Reading at the use costs one
+/// property lookup per reference and makes arrival order irrelevant, which is
+/// what a nested or shared boundary needs and what the route partition can then
+/// stop guaranteeing by construction.
+///
+/// Scope-correct rather than name-correct: a reference is rewritten only where
+/// the name is not bound by an enclosing declaration inside the chunk. The
+/// scope rename runs over the whole program before the chunk runs are lifted
+/// out, so a local can never take a top-level chunk name today — but a rewrite
+/// that silently depended on that would corrupt a body the day it could.
+fn rewrite_sibling_references(
+    nodes: &mut [js::Node],
+    siblings: &BTreeSet<String>,
+    count: &mut usize,
+) {
+    if siblings.is_empty() {
+        return;
+    }
+    rewrite_sibling_block(nodes, siblings, &HashSet::default(), count);
+}
+
+/// One statement list is one JS block scope: its `function`, `const` and `let`
+/// declarations bind over the whole list (a use before the declaration is a
+/// temporal-dead-zone error, not a reference to an outer binding), so they are
+/// collected before anything in the list is rewritten.
+fn rewrite_sibling_block(
+    nodes: &mut [js::Node],
+    siblings: &BTreeSet<String>,
+    outer: &HashSet<String>,
+    count: &mut usize,
+) {
+    let mut bound = outer.clone();
+    for node in nodes.iter() {
+        match node {
+            js::Node::Function(function) => {
+                bound.insert(function.name.clone());
+            }
+            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                bound.insert(variable.name.clone());
+            }
+            _ => {}
+        }
+    }
+    for node in nodes.iter_mut() {
+        rewrite_sibling_node(node, siblings, &bound, count);
+    }
+}
+
+/// Must be exhaustive over the node tree in both directions: a reference this
+/// walk misses stays a dangling free name, and a binding it fails to see would
+/// take a local's reference out to the registry.
+fn rewrite_sibling_node(
+    node: &mut js::Node,
+    siblings: &BTreeSet<String>,
+    bound: &HashSet<String>,
+    count: &mut usize,
+) {
+    match node {
+        js::Node::Local(name) => {
+            if siblings.contains(name) && !bound.contains(name) {
+                let name = name.clone();
+                *count += 1;
+                *node = registry_slot(&name);
+            }
+        }
+        js::Node::Function(function) => {
+            let mut inner = bound.clone();
+            inner.extend(
+                function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone()),
+            );
+            rewrite_sibling_block(&mut function.body, siblings, &inner, count);
+        }
+        js::Node::Closure(closure) => {
+            let mut inner = bound.clone();
+            inner.extend(
+                closure
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone()),
+            );
+            rewrite_sibling_block(&mut closure.body, siblings, &inner, count);
+        }
+        js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+            rewrite_sibling_node(&mut variable.value, siblings, bound, count)
+        }
+        js::Node::ForOf(binding, iterable, body) => {
+            rewrite_sibling_node(iterable, siblings, bound, count);
+            let mut inner = bound.clone();
+            inner.insert(binding.clone());
+            rewrite_sibling_block(body, siblings, &inner, count);
+        }
+        js::Node::While(condition, body) => {
+            rewrite_sibling_node(condition, siblings, bound, count);
+            rewrite_sibling_block(body, siblings, bound, count);
+        }
+        js::Node::If(branch) => rewrite_sibling_if(branch, siblings, bound, count),
+        js::Node::Try(body, finally) => {
+            rewrite_sibling_block(body, siblings, bound, count);
+            rewrite_sibling_block(finally, siblings, bound, count);
+        }
+        js::Node::Call(subject, arguments) => {
+            rewrite_sibling_node(subject, siblings, bound, count);
+            for argument in arguments {
+                rewrite_sibling_node(argument, siblings, bound, count);
+            }
+        }
+        js::Node::Assignment(left, right)
+        | js::Node::Binary(_, left, right)
+        | js::Node::PropertyIndex(left, right) => {
+            rewrite_sibling_node(left, siblings, bound, count);
+            rewrite_sibling_node(right, siblings, bound, count);
+        }
+        js::Node::Await(inner)
+        | js::Node::Unary(_, inner)
+        | js::Node::Return(inner)
+        | js::Node::Throw(inner)
+        | js::Node::Spread(inner)
+        // `Property`'s member is a property name, not a binding — recurse only
+        // the subject, exactly as the rename walk does.
+        | js::Node::Property(inner, _) => rewrite_sibling_node(inner, siblings, bound, count),
+        js::Node::Array(items) => {
+            for item in items {
+                rewrite_sibling_node(item, siblings, bound, count);
+            }
+        }
+        js::Node::String(_)
+        | js::Node::Number(_, _)
+        | js::Node::Bool(_)
+        | js::Node::Null
+        | js::Node::Void
+        | js::Node::Break
+        | js::Node::Continue => {}
+    }
+}
+
+fn rewrite_sibling_if(
+    branch: &mut js::IfBranch,
+    siblings: &BTreeSet<String>,
+    bound: &HashSet<String>,
+    count: &mut usize,
+) {
+    match branch {
+        js::IfBranch::If(condition, body, else_branch) => {
+            rewrite_sibling_node(condition, siblings, bound, count);
+            rewrite_sibling_block(body, siblings, bound, count);
+            if let Some(else_branch) = else_branch {
+                rewrite_sibling_if(else_branch, siblings, bound, count);
+            }
+        }
+        js::IfBranch::Else(body) => rewrite_sibling_block(body, siblings, bound, count),
+    }
 }
 
 /// Plants `__chunk_preload(<route signal>)` ahead of every statement that
