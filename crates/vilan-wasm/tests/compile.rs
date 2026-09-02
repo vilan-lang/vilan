@@ -984,13 +984,17 @@ fn browser_mode_seeds_the_web_set() {
 /// not got.
 ///
 /// The second half is the honesty half, and it is a pin rather than an
-/// observation. `web_prelude_steer` (`prelude.md` §11.4) answers "set
-/// `prelude = \"std::web\"` in vilan.toml", which is advice a pasted buffer
-/// cannot take — the playground's answer is its own mode toggle. It stays
-/// silent here only because the steer's std module inventory is a `read_dir`
-/// (`analyzer.rs`, `std_module_files`) and the playground has no filesystem, so
-/// an overlay-aware inventory would light up exactly that misdirection. This
-/// pin is what such a change has to meet.
+/// observation: `web_prelude_steer` (`prelude.md` §11.4) must not answer "set
+/// `prelude = \"std::web\"` in vilan.toml" here, because a pasted buffer has no
+/// manifest to edit.
+///
+/// It used to hold for the wrong reason — the steer was SILENT, its std module
+/// inventory being a `read_dir` (`analyzer.rs`, `std_module_files`) behind a
+/// compiler with no filesystem, so the pin was recording a defect (E120). The
+/// inventory lists the document overlay now, so the steer fires; what keeps the
+/// manifest sentence away is the front end declaring which control can change
+/// the ambient scope — [`vilan_core::PreludeRepair::Toggle`] — and the arm it
+/// selects is pinned below.
 #[test]
 fn node_mode_takes_the_base_set_and_names_no_manifest() {
     assert_clean(
@@ -1007,6 +1011,63 @@ fn node_mode_takes_the_base_set_and_names_no_manifest() {
         !miss.message.contains("vilan.toml"),
         "a pasted buffer has no manifest to edit: {}",
         miss.message
+    );
+}
+
+/// The web-set steer's PLAYGROUND arm (E120): where there is no manifest, the
+/// repair is the page's own prelude toggle — and the one-name import beside it,
+/// which is the repair a visitor who wants exactly this name can take without
+/// changing what the rest of the buffer means.
+#[test]
+fn the_web_set_steer_names_the_prelude_toggle_and_the_import() {
+    let output = compile_for_node("fun main() {\n\tlet count = Signal::new(0);\n}\n");
+    let miss = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Signal"))
+        .expect("node mode must report the absent web-set name");
+    assert!(
+        miss.message
+            .contains("switch the playground's prelude to the web set"),
+        "the playground's repair is its toggle: {}",
+        miss.message
+    );
+    assert!(
+        miss.message.contains("import std::reactive::Signal;"),
+        "and the one-name import beside it: {}",
+        miss.message
+    );
+}
+
+/// The B4 import steer — "cannot find `X`; import it first" — is what a
+/// playground visitor most needs, and it was dead here for the same reason
+/// (E120): the steer's std-wide index is built from `std_module_files`, which
+/// only ever listed a directory.
+///
+/// `Arena` is the probe rather than a name like `Map`, and the difference is
+/// what makes this pin non-vacuous. `import_steer_inner` searches the LOADED
+/// modules first, and the web prelude drags most of std in behind `ui` and
+/// `style` — so a name in any of those already steered here, index or no index.
+/// Nothing a playground buffer loads reaches `std::arena`, so only the
+/// inventory can name it.
+#[test]
+fn the_plain_import_steer_fires_with_no_filesystem() {
+    assert_reports(
+        &compile("fun main() {\n\tlet a: Arena<i32> = Arena::new();\n}\n"),
+        "import it first (`import std::arena::Arena;`)",
+        "the B4 import steer",
+    );
+}
+
+/// The same inventory feeds the unimported-trait-method steer (std-surface.md
+/// §5), so it was dead here too: `to_string` needs `std::display::Display`,
+/// which a browser-mode buffer never loads on its own.
+#[test]
+fn the_trait_method_steer_fires_with_no_filesystem() {
+    assert_reports(
+        &compile("fun main() {\n\tlet s = 42.to_string();\n}\n"),
+        "import std::display::Display",
+        "the unimported-trait-method steer",
     );
 }
 

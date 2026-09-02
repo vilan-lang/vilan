@@ -2924,6 +2924,10 @@ pub struct Analyzer<'src> {
     /// tell "you are not on the web set" from "you are, and this name is
     /// genuinely missing". `None` is `prelude = false`.
     entry_prelude_path: Option<String>,
+    /// Which control the same steer sends the reader to (E120) — the front
+    /// end's [`Workspace::prelude_repair`], copied in beside the platform and
+    /// its reason once the world is settled.
+    prelude_repair: PreludeRepair,
     // The sibling index for the METHOD steer (std-surface.md §5): which
     // unloaded std module carries a method of this name on a subject with this
     // head, and what to import to reach it. `(subject head, method name) ->
@@ -3805,6 +3809,7 @@ impl<'src> Analyzer<'src> {
             std_export_index: None,
             web_prelude_index: None,
             entry_prelude_path: None,
+            prelude_repair: PreludeRepair::default(),
             std_trait_method_index: None,
             derived_origins: Vec::new(),
             closure_parameter_fill_sites: HashMap::default(),
@@ -30529,6 +30534,17 @@ impl<'src> Analyzer<'src> {
     /// `document.rs::quickfix_offers_the_add_import_beside_the_web_set_steer`,
     /// because this paragraph previously claimed the opposite and nothing
     /// caught it (E110, audit run 6's F22).
+    ///
+    /// WHICH repair it names is the front end's [`Workspace::prelude_repair`]
+    /// (E120), because the manifest line is advice only a reader who has a
+    /// manifest can take. The playground has none — a pasted buffer is not a
+    /// package — and holds the ambient scope in the page's own controls
+    /// instead, so there the sentence asks for the SET rather than naming a
+    /// widget: which control reaches it is the page's business and has already
+    /// changed once. The one-name import rides beside it, and is the half that
+    /// carries over: it is the repair that leaves the rest of the buffer
+    /// meaning what it meant, and in the playground no quickfix can insert it,
+    /// so the message has to spell it.
     fn web_prelude_steer(&mut self, name: &str) -> Option<String> {
         if self.entry_prelude_path.as_deref() == Some(crate::manifest::WEB_PRELUDE) {
             return None;
@@ -30537,11 +30553,36 @@ impl<'src> Analyzer<'src> {
         if !self.web_prelude_index.as_ref()?.contains(name) {
             return None;
         }
-        Some(format!(
-            "; `{name}` is in the prelude of the web set — set \
-             `prelude = \"{}\"` in vilan.toml",
-            crate::manifest::WEB_PRELUDE
-        ))
+        // Each arm spells its whole sentence, rather than sharing a factored-out
+        // head: `diagnostics_ledger.rs`'s appendix gate greps the tree for the
+        // text the errors appendix quotes, so a message composed from two
+        // literals is a message it can no longer hold to its documentation. The
+        // shared clause is nine words; the guarantee is worth them.
+        Some(match self.prelude_repair {
+            PreludeRepair::Manifest => format!(
+                "; `{name}` is in the prelude of the web set — set \
+                 `prelude = \"{}\"` in vilan.toml",
+                crate::manifest::WEB_PRELUDE
+            ),
+            PreludeRepair::Toggle => {
+                // The declaring module, from the same std-wide index the B4
+                // steer reads. Every name that reaches here has one (the
+                // module-carried entries left this set with E110's F2 fix), but
+                // a steer degrades rather than fails: without one the toggle
+                // stands alone.
+                self.build_std_indexes_if_needed();
+                let import = self
+                    .std_export_index
+                    .as_ref()
+                    .and_then(|index| index.get(name))
+                    .map(|module| format!(", or import it (`import std::{module}::{name};`)"))
+                    .unwrap_or_default();
+                format!(
+                    "; `{name}` is in the prelude of the web set — switch the \
+                     playground's prelude to the web set{import}"
+                )
+            }
+        })
     }
 
     /// Reads `std::web`'s importable names off disk, once, on the first failed
@@ -39710,6 +39751,30 @@ pub struct Workspace {
     /// keys on — the reason does not change which modules load, resolve, or
     /// expand, only what one diagnostic says about them.
     pub platform_reason: Option<String>,
+    /// WHICH CONTROL can change this program's ambient scope (E120) — read by
+    /// the web-set steer, which has to name a repair the reader can actually
+    /// take. A front end fact for the same reason `platform_reason` is one, and
+    /// out of the base cache key for the same reason: it changes what one
+    /// diagnostic says, never what loads or resolves.
+    pub prelude_repair: PreludeRepair,
+}
+
+/// Where a program's ambient scope is SET, in the reader's terms — the web-set
+/// steer's repair (`prelude.md` §11.4, E120).
+///
+/// The steer's whole job is to name the edit that fixes the miss, so it has to
+/// know which surface holds the prelude. Every file-backed front end holds it in
+/// a manifest; the playground has no `vilan.toml` for a pasted buffer to edit
+/// and holds it in a page toggle instead, which is why "set `prelude = …` in
+/// vilan.toml" was advice a visitor could not take. Only the front end knows
+/// which world it is, so only the front end can say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreludeRepair {
+    /// The entry package's `vilan.toml` — every front end with files behind it.
+    #[default]
+    Manifest,
+    /// The playground's prelude toggle (K14): a host control rather than a file.
+    Toggle,
 }
 
 /// A package loaded during analysis: its source root, the namespace its modules
@@ -40409,27 +40474,27 @@ fn analyze_inner<'src>(
     // (element-syntax S4 — the source-inspecting diagnostics read it).
     analyzer.source_texts.push((SourceId(0), entry_source));
     // The std module inventory for the B4 import steer (module name, path) —
-    // every layer's `*.vl` except the package surface itself. Recorded
-    // eagerly (a cheap directory walk); parsed lazily, only if a resolution
-    // ever fails. The path stays a `PathBuf`: a `to_str()` gate here used to
-    // drop a perfectly good module because some ANCESTOR directory was not
-    // UTF-8 (`windows-support.md` §5). The module NAME still has to be `str` —
-    // it is a vilan identifier, which a non-UTF-8 stem can never be, so such a
-    // file is deliberately not a steerable module.
+    // every layer's modules except the package surface itself, which is
+    // integrated into the package name and is not a module a user imports
+    // through. Recorded eagerly (a cheap listing); parsed lazily, only if a
+    // resolution ever fails.
+    //
+    // It is `modules_in_root`'s listing rather than a `read_dir` of its own
+    // (E120), and that is the whole of the playground fix: the listing consults
+    // the DOCUMENT OVERLAY beside the disk, so a std that exists only as
+    // registered buffers — the wasm build's embedded toolchain, which has no
+    // filesystem under it at all — is inventoried like any other. A `read_dir`
+    // there answered empty, and every steer this inventory feeds was silent in
+    // the playground for it. One listing, one source of truth: whatever the
+    // loader can RESOLVE in a root is what the steer can NAME — including the
+    // `windows-support.md` §5 rule this loop used to restate for itself (path a
+    // `PathBuf`, name a `str`), which is `modules_in_root`'s own contract now.
     for root in std::iter::once(&std.base_root).chain(std.layers.iter().map(|layer| &layer.root)) {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "vl")
-                    && path.file_stem().is_some_and(|stem| stem != "lib")
-                    && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-                {
-                    analyzer
-                        .std_module_files
-                        .push((stem.to_string(), path.clone()));
-                }
-            }
-        }
+        analyzer.std_module_files.extend(
+            modules_in_root(root)
+                .into_iter()
+                .filter(|(name, _)| name != "lib"),
+        );
     }
     analyzer.std_module_files.sort();
     // What the ENTRY package resolves under, for the web-set steer arm
@@ -41865,9 +41930,12 @@ fn analyze_over_world<'src>(
     } = world;
     // E119: set AFTER the world is unpacked — a world can come from the base
     // cache, whose analyzer carries whatever the analysis that stored it had,
-    // and the color and its reason belong to THIS call.
+    // and the color and its reason belong to THIS call. E120's prelude repair
+    // rides here for exactly the same reason: neither is part of the base cache
+    // key, so a stored world's value is another call's.
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
+    analyzer.prelude_repair = workspace.prelude_repair;
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);

@@ -843,8 +843,9 @@ fn compile_world(
         entry_prelude: crate::manifest::PreludeSpec::Off,
         // A macro world is a nested compile of the compiler's own vocabulary;
         // no file of the user's is being coloured, so there is nothing to
-        // explain (E119).
-        platform_reason: None,
+        // explain (E119) — and with no program prelude above, nothing for the
+        // web-set steer to offer a repair for either (E120).
+        ..Workspace::default()
     };
     let previously_in_world = IN_MACRO_WORLD.with(|flag| flag.replace(true));
     let (program, errors) = analyze_source(

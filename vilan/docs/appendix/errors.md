@@ -42,7 +42,11 @@ prelude makes ambient, and this package is on the base one. Either set
 both work; the steer only means the manifest line is usually what you
 wanted. It fires only for names the web set carries as bare members,
 never for its module-carried names (`style`, `ui`): switching preludes
-would leave a `style::Display` miss exactly where it was.
+would leave a `style::Display` miss exactly where it was. In the **web
+playground** the same miss reads "switch the playground's prelude to the
+web set, or import it (`import std::reactive::Signal;`)" — a pasted
+buffer is not a package and has no `vilan.toml` to edit, so the repair
+there is the page's prelude toggle.
 → [Projects](../tour/projects.md), [spec §4.7](../spec/names.md)
 
 **"`std` is a namespace, not a value; import the module first …"**

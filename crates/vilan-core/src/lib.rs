@@ -40,7 +40,7 @@ pub mod type_;
 pub mod util;
 
 // The common pipeline + core types, re-exported for convenience.
-pub use analyzer::{Layer, PackageSpec, Program, Workspace, analyze};
+pub use analyzer::{Layer, PackageSpec, PreludeRepair, Program, Workspace, analyze};
 pub use error::Error;
 pub use macros::MacroLimits;
 #[doc(hidden)]
