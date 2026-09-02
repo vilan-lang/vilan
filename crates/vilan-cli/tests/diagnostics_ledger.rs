@@ -117,6 +117,38 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     ("355", "its plain no-string-form arm"),
     ("356", "its `str`-on-the-right arm"),
     ("357", "its same-type arm, the ladder's fallthrough"),
+    // B200's unary ladders, built the same way and handed over by the same
+    // field shorthand — one `let msg = if … else if …` per operator. Their
+    // arms differ in HEAD, not just in a slot (`-` on a native non-numeric
+    // states an admitted set; on an aggregate it states that no `Neg` trait
+    // exists to give the symbol a meaning; on a parameter it states why no
+    // bound can prove membership), so folding them into one templated
+    // `msg:` literal the enumeration could read would cost the sentences
+    // their accuracy. Rowed by hand instead, as the `+` ladder above is.
+    ("368", "`!`'s parameter arm (`analyzer.rs`)"),
+    ("369", "`!`'s `void` arm"),
+    (
+        "370",
+        "`!`'s truthiness arm — every other non-`bool` operand",
+    ),
+    ("371", "`-`'s parameter arm"),
+    ("372", "`-`'s `bool` arm"),
+    ("373", "`-`'s `str` arm"),
+    ("374", "`-`'s backed-enum arm"),
+    ("375", "`-`'s `void` arm"),
+    (
+        "376",
+        "`-`'s no-`Neg`-trait arm — every other non-numeric operand",
+    ),
+    // B197's operator-conformance refusal shares the missing-member push with
+    // the ordinary one, choosing between them in a `let msg = if …` the walk
+    // cannot read for the same reason.
+    (
+        "378",
+        "the operator arm of the trait-conformance refusal (`analyzer.rs`)",
+    ),
+    ("379", "`!`'s trait-typed arm"),
+    ("380", "`-`'s trait-typed arm"),
 ];
 
 /// Ledger rows with no key at all, and so absent from the index, with the

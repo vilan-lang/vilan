@@ -8209,20 +8209,34 @@ fn b175_the_sibling_operators_refuse_a_bare_trait_too() {
     }
 }
 
+// --- B193: a trait default's `self <op> self` ---------------------------------
+//
+// The one trait-typed shape B175 left skipping, and the answer was never a
+// refusal: `self + self` in a default over a supertrait `Add` is exactly the
+// program declaring the supertrait is FOR. It miscompiled because nothing
+// dispatched it — skipping the operator check kept the anything-goes native
+// emission, and over two lowered structs the host's operators are garbage:
+//
+//   Money { cents = 21 }.twice()   →  `[21] + [21]` is the string "2121",
+//                                     slot 0 of it is "2", so `.cents`
+//                                     printed 2. A plausible wrong answer.
+//   Money { cents = 21 }.zero()    →  `[21] - [21]` is NaN; `.cents` printed
+//                                     `undefined`.
+//   Money { cents = 3 }.square()   →  `[3] * [3]`, `undefined` likewise.
+//   Tag { id = 1 }.same()          →  `self === self` — a reference compare
+//                                     that ignored the impl, so a `PartialEq`
+//                                     whose `eq` answers `false` still
+//                                     printed `true`.
+//
+// One fix, at the dispatch: a default body's operand dispatches on the type
+// the default is being SPECIALIZED for (`GenericDispatch::OnType(None, ..)`,
+// read against `current_self_type` at emission — the same channel a `self`
+// CALL in a default body has used since B55), and the analyzer stops skipping
+// the shape.
+
 #[test]
-#[ignore = "B193 (B175's residual): `self` inside a trait DEFAULT body is `Type::Trait` \
-            too, and `self + self` over a supertrait `Add` still emits the host's \
-            `+`. Refusing it needs a spelling that works first — `self.add(self)` \
-            does not resolve there either, and the binary emitter has no \
-            `OnType(None)` case to dispatch a default body's operand on the type \
-            being specialized."]
 fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
-    // KNOWN BUG. `Money { cents = 21 }.twice()` prints `2`: the emission is the
-    // host's `+` over two lowered structs, so `[21] + [21]` is the string
-    // "2121" and slot 0 of it is "2" — a plausible wrong answer, not a visible
-    // NaN. It is the one trait-typed shape B175 deliberately left skipping,
-    // because both halves of closing it (a working spelling, and a dispatch for
-    // it) are the same deeper defect.
+    // The pin B193 was filed as. Pre-fix it printed `2`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -8245,6 +8259,421 @@ fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
         }
         "#,
         "42\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_subtraction_dispatches_too() {
+    // Audit run 7 widened the item off `+`: `-` over the same pair is NaN, so
+    // this one printed `undefined` rather than a plausible number.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Sub;
+
+        trait Zeroer with Sub {
+            fun zero(self): Self { self - self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Sub {
+            fun sub(self, other: Money): Money { Money { cents = self.cents - other.cents } }
+        }
+
+        impl Money with Zeroer {}
+
+        fun main() {
+            print(Money { cents = 21 }.zero().cents);
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_multiplication_dispatches_too() {
+    // Pre-fix: `undefined`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Mul;
+
+        trait Squarer with Mul {
+            fun square(self): Self { self * self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Mul {
+            fun mul(self, other: Money): Money { Money { cents = self.cents * other.cents } }
+        }
+
+        impl Money with Squarer {}
+
+        fun main() {
+            print(Money { cents = 3 }.square().cents);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_equality_dispatches_to_the_impl() {
+    // `==` needs an impl that DISAGREES with the host to witness anything:
+    // `self === self` is true for the same value whatever the impl says, so a
+    // conventional `eq` would have hidden the defect. This one answers
+    // `false`, and pre-fix the program printed `true` — the emission was
+    // `self === self`, the impl never called.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        trait Selfsame with PartialEq {
+            fun same(self): bool { self == self }
+        }
+
+        struct Tag { id: i32 }
+
+        impl Tag with PartialEq {
+            fun eq(self, other: Tag): bool { false }
+        }
+
+        impl Tag with Selfsame {}
+
+        fun main() {
+            print(Tag { id = 1 }.same());
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_default_dispatches_at_each_specialization() {
+    // The point of dispatching on the SPECIALIZED type rather than on
+    // anything the default itself knows: one default body, two impls, two
+    // answers. The native specialization keeps native JS, which is what the
+    // emitter's own `compares_natively` guard is for — dispatching a native
+    // back into std's `impl i32 with Add` would recurse forever.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+        struct Steps { count: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Steps with Add {
+            // Deliberately not a plain sum, so the dispatch is visible.
+            fun add(self, other: Steps): Steps { Steps { count = self.count + other.count + 1 } }
+        }
+
+        impl Money with Doubler {}
+        impl Steps with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+            print(Steps { count = 21 }.twice().count);
+        }
+        "#,
+        "42\n43\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_default_operator_its_trait_never_promised_is_refused() {
+    // The other half of no longer skipping: a default body may now be JUDGED,
+    // and `self + self` in a trait with no `Add` supertrait is a real error —
+    // every specialization would reach the host's `+` over a lowered value.
+    // It gets its own sentence rather than B175's bare-trait one, whose steer
+    // ("hold the value in a generic bounded by the trait") is nonsense inside
+    // the trait's own body: the declaration that works is a supertrait.
+    assert_fails_with(
+        r#"
+        trait Doubler {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "Declare it as a supertrait (`trait Doubler with Add`)",
+    );
+}
+
+// --- B197: an operator trait's method is required at impl time ---------------
+//
+// Audit run 7's F12, RULED. `std::operators`'s ten traits carry
+// `panic("not implemented yet")` bodies — deliberately, so the declarations
+// type-check (`ret-checking.md`) — and a body is a body, so the conformance
+// check's "a default is inherited" rule let `impl P with Add { }` through.
+//
+// Pre-fix, that program:
+//
+//   vilan check   →  `no errors`.
+//   vilan run     →  an uncaught `not implemented yet` from node, with no
+//                    type, no method and no span — the one diagnostic in the
+//                    surface that names nothing at all.
+//
+// while the refusal a type with NO impl gets reads "add `impl P with Add`
+// providing `add`": advice this program had followed to the letter, minus the
+// providing half.
+//
+// The ruling: the method is REQUIRED at the impl. The panicking bodies stay
+// (they are what the compound-assignment derivation reads, and `+=` still
+// derives from `+`), but there is no coherent program in which an operator
+// impl omits its method, because the default's only behaviour is to throw.
+
+#[test]
+fn b197_an_operator_impl_with_no_method_is_refused() {
+    // The exhibit the item was filed on. Pre-fix: `check` clean, `run`
+    // throwing `not implemented yet`.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add { }
+
+        fun main() {
+            let sum = P { n = 1 } + P { n = 2 };
+            print(sum.n);
+        }
+        "#,
+        "`impl P with Add` provides no `add`",
+    );
+}
+
+#[test]
+fn b197_the_refusal_names_the_type_and_the_signature_to_write() {
+    // The least the item asked for, which the ruling gets for free: the
+    // runtime panic named nothing, and this names the type, the method, the
+    // reason the default exists, and the exact signature. The signature is
+    // rendered here rather than read off the trait, because the trait's own
+    // `b: B` renders as `b: Add` — not a signature anyone can write.
+    let source = r#"
+        import std::operators::Mul;
+
+        struct Money { cents: i32 }
+
+        impl Money with Mul { }
+
+        fun main() {}
+        "#;
+    assert_fails_with(source, "Declare `fun mul(self, b: Money): Money`");
+    assert_fails_with(source, "it exists so `*=` can derive from `*`");
+    assert_fails_without(source, "b: Mul");
+}
+
+#[test]
+fn b197_a_declared_operand_type_is_named_in_the_signature() {
+    // `impl Meters with Add<Feet>` declares its own `B`, so the signature the
+    // refusal names is not the `Self`-defaulted one.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> { }
+
+        fun main() {}
+        "#,
+        "Declare `fun add(self, b: Feet): Meters`",
+    );
+}
+
+#[test]
+fn b197_the_requirement_reaches_through_a_supertrait() {
+    // Reached through `trait Doubler with Add`, the requirement comes from a
+    // trait the impl does not name — so the sentence says whose it is, and
+    // names the other way to satisfy it.
+    let source = r#"
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Doubler {}
+
+        fun main() {}
+        "#;
+    assert_fails_with(source, "(`Doubler` requires `Add`) provides no `add`");
+    assert_fails_with(source, "in an `impl Money with Add` of its own");
+}
+
+#[test]
+fn b197_a_separate_impl_of_the_operator_trait_satisfies_it() {
+    // And it does satisfy it: the conformance check's existing
+    // provided-elsewhere rule covers the operator family unchanged, which is
+    // what B193's own programs rely on.
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b197_every_operator_trait_requires_its_own_method() {
+    // Per case, not per example: the item is one rule over ten traits, and a
+    // rule pinned at one of them is a rule pinned nowhere.
+    for (trait_name, method, symbol) in [
+        ("Add", "add", "+"),
+        ("Sub", "sub", "-"),
+        ("Mul", "mul", "*"),
+        ("Div", "div", "/"),
+        ("Rem", "rem", "%"),
+        ("Shl", "shl", "<<"),
+        ("Shr", "shr", ">>"),
+        ("BitAnd", "bit_and", "&"),
+        ("BitXor", "bit_xor", "^"),
+        ("BitOr", "bit_or", "|"),
+    ] {
+        let source = format!(
+            r#"
+            import std::operators::{trait_name};
+
+            struct P {{ n: i32 }}
+
+            impl P with {trait_name} {{ }}
+
+            fun main() {{}}
+            "#
+        );
+        assert_fails_with(
+            &source,
+            &format!("`impl P with {trait_name}` provides no `{method}`"),
+        );
+        assert_fails_with(
+            &source,
+            &format!("so `{symbol}=` can derive from `{symbol}`"),
+        );
+    }
+}
+
+#[test]
+fn b197_an_operator_impl_that_writes_its_method_still_runs() {
+    // The control the requirement must not break.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add {
+            fun add(self, other: P): P { P { n = self.n + other.n } }
+        }
+
+        fun main() {
+            print((P { n = 1 } + P { n = 2 }).n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b197_the_compound_form_still_derives_from_the_operator() {
+    // The reason the panicking defaults stay, pinned so a later lane cannot
+    // delete them and call the suite green: `+=` derives from `+`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add {
+            fun add(self, other: P): P { P { n = self.n + other.n } }
+        }
+
+        fun main() {
+            mut total = P { n = 1 };
+            total += P { n = 2 };
+            print(total.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b197_a_non_operator_traits_default_is_still_inherited() {
+    // The rule is the operator family's, not "every default is now required":
+    // an ordinary trait's default body is inherited exactly as before, and so
+    // is a non-operator default of an operator trait's own supertrait chain
+    // (`PartialOrd`'s `lt`/`le`/`gt`/`ge` over `partial_compare`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::{ Option, Some };
+
+        trait Greeter {
+            fun greet(self): str { "hello" }
+        }
+
+        struct Meters { m: i32 }
+
+        impl Meters with Greeter {}
+
+        impl Meters with PartialEq {
+            fun eq(self, other: Meters): bool { self.m == other.m }
+        }
+
+        impl Meters with PartialOrd {
+            fun partial_compare(self, other: Meters): Option<Ordering> {
+                if self.m < other.m {
+                    Some(Ordering::Less)
+                } else {
+                    if self.m > other.m { Some(Ordering::Greater) } else { Some(Ordering::Equal) }
+                }
+            }
+        }
+
+        fun main() {
+            print(Meters { m = 1 }.greet());
+            print(Meters { m = 1 } < Meters { m = 2 });
+        }
+        "#,
+        "hello\ntrue\n",
     );
 }
 
@@ -8763,26 +9192,329 @@ fn b196_the_admitted_operators_of_each_left_type_still_run() {
     );
 }
 
+// --- B200: the unary operators' operands ------------------------------------
+//
+// B196's own find, closed here. The binary loop above reads
+// `prepped_binary_ops`; a unary was typed somewhere else entirely
+// (`Expr::Unary` in `infer_type_inner`, which simply returns the operand's
+// type) and reached no operand rule at all. Same defect, same family, one
+// operand to blame instead of two — and off the native path it is worse than
+// the binary case, because `-` on an aggregate is `NaN` rather than a
+// plausible wrong number.
+//
+// The pre-fix runs, recorded because a green pin proves only that the program
+// is refused NOW:
+//
+//   let flipped: bool = -true      →  -1. `== true` printed false and
+//                                      `== false` printed false: a `bool`
+//                                      that is neither value, exactly as
+//                                      `true - 3` was.
+//   let value: str = -"12"         →  -12, typed `str`.
+//   let level: Level = -Level::High →  -5 typed `Level`; `== Level::High` and
+//                                      `== Level::Low` both printed false.
+//   let p = -Point { x = 1, y = 2 } →  the host's `-[1, 2]`, `NaN`, and
+//                                      `p.x` printed `undefined`.
+//   fun negate<T: Sub>(v: T): T { -v } → compiled; `negate(5)` printed `-5`
+//                                      and `negate(Point { … }).x` printed
+//                                      `undefined`.
+//   print(!5) / print(!"hi") /
+//   print(!Point { x = 1, y = 2 }) →  false, false, false — the host's
+//                                      truthiness test, never the question
+//                                      the author asked.
+//
+// The admitted sets are stated, not read off an impl: vilan has no `Neg` and
+// no `Not` trait, so nothing here ever dispatches, and `-` admits the numeric
+// primitives while `!` admits `bool`. A type PARAMETER is refused for B179's
+// reason — no trait names either set, so no bound can prove membership.
+
 #[test]
-#[ignore = "B200 (found by lane b196)'s residual: the UNARY `-` takes its operand's type with no check \
-            at all (`Expr::Unary(_, operand)` in `infer_type_inner`), so `-true`, \
-            `-\"12\"` and `-Level::High` are the same miscompile at a different \
-            site — a second refusal family with a census and a ledger row of its \
-            own, not this binary gate's."]
 fn b196_a_unary_minus_on_a_non_numeric_operand_is_rejected() {
-    // KNOWN BUG, found on B196's path and deliberately not taken. The binary
-    // loop this lane fixed reads `prepped_binary_ops`; a unary is typed
-    // somewhere else entirely and reaches no operand rule at all, so `-true`
-    // is `-1` typed `bool`, `-"12"` is `-12` typed `str`, and
-    // `-Level::High` is `-5` typed `Level` — matching no variant, exactly as
-    // `Level::High ^ Level::Low` did.
-    assert_fails_with(
+    // The pin B200 was filed as (its `#[ignore]` reason named B200), kept
+    // under its found-as name. Pre-fix: `-1`, equal to neither `true` nor
+    // `false`.
+    assert_fails_spanning(
         r#"
         fun main() {
             let flipped: bool = -true;
             print(flipped);
         }
         "#,
-        "has no meaning",
+        "-true",
+        "`-` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_str_is_rejected() {
+    // Pre-fix: `-12`, typed `str`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let value: str = -"12";
+            print(value);
+        }
+        "#,
+        r#"-"12""#,
+        "`-` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_backed_enum_is_rejected() {
+    // Pre-fix: `-5` typed `Level`, matching neither variant — the silent
+    // shape, exactly as `Level::High ^ Level::Low` was.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = -Level::High;
+            print(level == Level::High);
+        }
+        "#,
+        "-Level::High",
+        "`-` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_struct_is_rejected() {
+    // The shape the binary family never had: no native coercion produces even
+    // a plausible number. Pre-fix this compiled and `p.x` printed `undefined`.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let p = -Point { x = 1, y = 2 };
+            print(p.x);
+        }
+        "#,
+        "-Point { x = 1, y = 2 }",
+        "vilan has no `Neg` trait",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_bounded_generic_is_rejected() {
+    // B179's rule at the unary site: the bound is IRRELEVANT, because no
+    // trait names the numeric set. Pre-fix `negate(5)` printed `-5` and
+    // `negate(Point { x = 1, y = 2 }).x` printed `undefined` — the same
+    // declaration, correct for one instantiation and garbage for the other.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Sub;
+
+        fun negate<T: Sub>(value: T): T {
+            -value
+        }
+
+        fun main() {
+            print(negate(5));
+        }
+        "#,
+        "-value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_an_unbounded_generic_is_rejected() {
+    // The unbounded half gets the same sentence for the same reason: a bound
+    // could not have rescued it either.
+    assert_fails_spanning(
+        r#"
+        fun negate<T>(value: T): T {
+            -value
+        }
+
+        fun main() {
+            print(negate(5));
+        }
+        "#,
+        "-value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_void_is_rejected() {
+    // B170's rule on the unary side: the refusal must be one the reader can
+    // act on, and `void` has no number inside it to negate.
+    assert_fails_with(
+        r#"
+        fun nothing() {}
+
+        fun main() {
+            print(-nothing());
+        }
+        "#,
+        "this operand is `void`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_number_is_rejected() {
+    // The twin. `!`'s RESULT was always typed `bool`, so nothing wore a type
+    // it was not — the defect is that the host's `!` admits every value, so
+    // `!5` compiled to `false` and the author's question was never asked.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            print(!5);
+        }
+        "#,
+        "!5",
+        "`!` negates a `bool`, and this operand is `i32`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_str_is_rejected() {
+    // Pre-fix: `false`. The emptiness test the author plausibly meant is
+    // `.is_empty()`, which the refusal names.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            print(!"hi");
+        }
+        "#,
+        r#"!"hi""#,
+        "`!` negates a `bool`, and this operand is `str`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_struct_is_rejected() {
+    // Pre-fix: `false`, and it would have been `false` for every struct ever
+    // written — an aggregate lowers to an array, and an array is always
+    // truthy.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            print(!Point { x = 1, y = 2 });
+        }
+        "#,
+        "!Point { x = 1, y = 2 }",
+        "`!` negates a `bool`, and this operand is `Point`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_generic_is_rejected() {
+    // B181's sentence at the unary site, and for B181's reason: `bool`'s set
+    // is `bool` itself and `!` models no operator trait to consult.
+    assert_fails_spanning(
+        r#"
+        fun negated<T>(value: T): bool {
+            !value
+        }
+
+        fun main() {
+            print(negated(true));
+        }
+        "#,
+        "!value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_trait_typed_operand_is_rejected() {
+    // The trait-typed shape, which the BINARY site can rescue and this one
+    // cannot: B193 dispatches a default body's `self + self` on the type being
+    // specialized, because a supertrait can promise `Add`. Nothing can promise
+    // `-` — there is no `Neg` trait to declare — so every specialization would
+    // reach the host's `-` over a lowered value. Pre-fix,
+    // `Money { cents = 21 }.flipped().cents` printed `undefined`.
+    assert_fails_spanning(
+        r#"
+        trait Flipper {
+            fun flipped(self): Self { -self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Flipper {}
+
+        fun main() {
+            print(Money { cents = 21 }.flipped().cents);
+        }
+        "#,
+        "-self",
+        "vilan has no `Neg` for one to require",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_trait_typed_operand_is_rejected() {
+    // Its twin: no `Not` trait either, so `!self` in a default body was the
+    // host's truthiness test over a lowered value — `false` for every
+    // specialization, whatever it held.
+    assert_fails_spanning(
+        r#"
+        trait Negator {
+            fun negated(self): bool { !self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Negator {}
+
+        fun main() {
+            print(Money { cents = 21 }.negated());
+        }
+        "#,
+        "!self",
+        "vilan has no `Not` for one to require",
+    );
+}
+
+#[test]
+fn b200_a_bare_trait_unary_operand_gets_the_bound_steer() {
+    // B175's rule about WHICH refusal, on the unary side: the two ways of
+    // arriving at a trait-typed operand need different steers, because only
+    // the default body has a trait to add a method to. A bare trait outside
+    // one gets B175's own sentence.
+    let source = r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            print(-Maker::make());
+        }
+        "#;
+    assert_fails_with(source, "A trait is a bound, not a value type");
+    assert_fails_with(source, "(`<T: Maker>`)");
+    assert_fails_without(source, "Inside a default body");
+}
+
+#[test]
+fn b200_the_admitted_unary_forms_still_compile_and_run() {
+    // The control. Every form the two admitted sets cover, including the
+    // negative literal (`-128i8` is `Unary('-')` OVER the literal, and the
+    // range check runs before the minus applies) and a `!` over a comparison.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            print(-5);
+            print(-5.5);
+            let x = 3;
+            print(-x);
+            print(-x - 1);
+            print(-128i8);
+            print(!true);
+            print(!(1 == 2));
+            print(!!true);
+        }
+        "#,
+        "-5\n-5.5\n-3\n-4\n-128\nfalse\ntrue\ntrue\n",
     );
 }

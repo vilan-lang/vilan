@@ -3143,6 +3143,11 @@ pub struct Analyzer<'src> {
     // resolved after typing to decide native JS arithmetic vs an operator-trait
     // method call (`Add::add`, ...).
     prepped_binary_ops: Vec<(Id, BinaryOp, Id)>,
+    // Unary expressions (`-x`, `!x`), as (unary id, operator, operand id),
+    // awaiting the post-solve operand check (B200). A unary takes its type
+    // from its OPERAND, so an unchecked one is the binary family's miscompile
+    // at a site with only one operand to blame.
+    prepped_unary_ops: Vec<(Id, char, Id)>,
     // `if`/`for` conditions awaiting the post-solve `bool` check (B28), with
     // the construct label the diagnostic names.
     prepped_conditions: Vec<(Id, &'static str)>,
@@ -3946,6 +3951,40 @@ fn operator_trait_method(op: BinaryOp) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The method an operator trait REQUIRES of an impl, by trait name — the one
+/// the use-site refusal already names ("add `impl P with Add` providing
+/// `add`"), and the one B197 makes required at the impl.
+///
+/// Only the ten `std::operators` traits are listed, because they are the only
+/// ones whose required method carries a DEFAULT body: `panic("not implemented
+/// yet")`, written so the declarations type-check (`ret-checking.md`). Every
+/// other operator trait already requires its method the ordinary way —
+/// `PartialEq`'s `eq` and `PartialOrd`'s `partial_compare` are declared
+/// bodyless, and their comparison defaults derive from those — so listing
+/// them here would say nothing the conformance check does not already do.
+///
+/// Matched by NAME, which is how the whole operator family resolves its traits
+/// (`operator_method`, `operator_trait_method`): a program's own `trait Add`
+/// is reached by the same lookups.
+/// Paired with the operator's own symbol, so the refusal can name the
+/// compound form the panicking default actually exists for (`+=`, not
+/// "`add`-assignment").
+fn operator_trait_required_method(trait_name: &str) -> Option<(&'static str, &'static str)> {
+    match trait_name {
+        "Add" => Some(("add", "+")),
+        "Sub" => Some(("sub", "-")),
+        "Mul" => Some(("mul", "*")),
+        "Div" => Some(("div", "/")),
+        "Rem" => Some(("rem", "%")),
+        "Shl" => Some(("shl", "<<")),
+        "Shr" => Some(("shr", ">>")),
+        "BitAnd" => Some(("bit_and", "&")),
+        "BitXor" => Some(("bit_xor", "^")),
+        "BitOr" => Some(("bit_or", "|")),
+        _ => None,
+    }
+}
+
 /// Flattens an `import`/`use` tree into (path, leaf-name) pairs, e.g.
 /// `a::{ b, c::d }` becomes `([a], b)` and `([a, c], d)`.
 pub(crate) fn flatten_namespace_branch<'src>(
@@ -4073,6 +4112,7 @@ impl<'src> Analyzer<'src> {
             for_each_views: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
+            prepped_unary_ops: Vec::new(),
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
@@ -21410,7 +21450,8 @@ impl<'src> Analyzer<'src> {
                 self.walk_expr_node(inner, scope_id);
                 None
             }
-            // Only `!` exists today and yields `bool`; full lowering deferred.
+            // `!` yields `bool`; `-` yields its operand's type. Both hold their
+            // operand to an admitted set, checked after the solve (B200).
             Node::Unary(operator, operand) => {
                 // B195: `!` swaps which of the `if`'s branches a capture inside
                 // it is bound in — the then-branch of `!(x is P)` runs exactly
@@ -21422,6 +21463,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let operand_id = self.walk_expr_node(operand, scope_id);
                 self.condition_polarity = outer_polarity;
+                self.prepped_unary_ops.push((id, *operator, operand_id));
                 Some(Expr::Unary(*operator, operand_id))
             }
             // `&x` / `&mut x` — a view of a place. For aggregates a view is the
@@ -34501,18 +34543,44 @@ impl<'src> Analyzer<'src> {
             // AND its supertraits (a member with a default body is inherited, so
             // an impl need not provide it). Implementing `X with Ord` thus
             // requires the members of `Ord` plus `Eq`/`PartialOrd`/`PartialEq`.
-            let required: Vec<(&'src str, Id)> = self
-                .trait_with_supertraits(trait_id)
-                .into_iter()
-                .filter_map(|id| self.traits.get(&id).map(|trait_| (id, trait_)))
-                .flat_map(|(declaring_trait_id, trait_)| {
-                    trait_
-                        .declarations
-                        .iter()
-                        .filter(|(_, member_id)| !self.member_has_default_body(**member_id))
-                        .map(move |(name, _)| (*name, declaring_trait_id))
-                })
-                .collect();
+            //
+            // B197 adds ONE exception to "a default body is inherited": an
+            // operator trait's own method. `std::operators`'s ten traits carry
+            // `panic("not implemented yet")` bodies — deliberately, so the
+            // declarations type-check — and a body is a body, so
+            // `impl P with Add { }` satisfied every check the compiler had.
+            // `check` was clean, and `P { n = 1 } + P { n = 2 }` threw
+            // `not implemented yet` at RUNTIME with no type, no method and no
+            // span: the one diagnostic in the surface that names nothing at
+            // all. Meanwhile the use-site refusal for a type with no impl at
+            // all says "add `impl P with Add` providing `add`" — advice this
+            // program had followed to the letter, minus the providing half.
+            //
+            // Those bodies stay: the compound-assignment derivation reads
+            // them, and `+=` still derives from `+`. What changes is that an
+            // impl of an operator trait must WRITE the method, because there
+            // is no coherent program in which it does not — the default's
+            // only behaviour is to throw.
+            let required: Vec<(&'src str, Id)> = {
+                let analyzer = &*self;
+                analyzer
+                    .trait_with_supertraits(trait_id)
+                    .into_iter()
+                    .filter_map(|id| analyzer.traits.get(&id).map(|trait_| (id, trait_)))
+                    .flat_map(|(declaring_trait_id, trait_)| {
+                        let operator_method =
+                            operator_trait_required_method(trait_.name).map(|(name, _)| name);
+                        trait_
+                            .declarations
+                            .iter()
+                            .filter(move |(name, member_id)| {
+                                !analyzer.member_has_default_body(**member_id)
+                                    || operator_method == Some(**name)
+                            })
+                            .map(move |(name, _)| (*name, declaring_trait_id))
+                    })
+                    .collect()
+            };
             // B177: a conformance diagnostic that cannot say WHOSE member it
             // means is barely a diagnostic (B170's rule, on the impl side). A
             // non-struct subject used to fall back to the literal word "type",
@@ -34659,14 +34727,79 @@ impl<'src> Analyzer<'src> {
                         ))
                     })
                     .unwrap_or((String::new(), None));
+                // B197: the operator family gets its own sentence, because its
+                // REASON is not the ordinary one. The trait does declare a body
+                // here, so "missing" would read as wrong to anyone who has read
+                // `std::operators` — what is missing is the only body that can
+                // do anything, since the declared one throws. The message says
+                // that, and says what the default is actually for, so nobody
+                // reads the requirement as an oversight to work around.
+                let declaring_trait_name = self
+                    .traits
+                    .get(&declaring_trait_id)
+                    .map(|trait_| trait_.name)
+                    .unwrap_or(check.trait_name);
+                let operator = operator_trait_required_method(declaring_trait_name)
+                    .filter(|(method, _)| *method == member_name);
+                let msg = if let Some((_, symbol)) = operator {
+                    // The signature to write, rendered HERE rather than read
+                    // off the trait's declaration: every one of the ten reads
+                    // `fun m(self, b: B): Self`, and `function_signature_label`
+                    // renders a `B = Self` parameter as the trait's own name
+                    // (`fun add(self, b: Add): Add`) — which is not a signature
+                    // anyone can write. `Self` is this impl's subject, and `B`
+                    // is whatever the `with` clause supplied, defaulting to it.
+                    let operand = check
+                        .trait_arguments
+                        .first()
+                        .map(|argument| {
+                            let argument = argument.get_type(self);
+                            self.pretty_print_type(&argument, &HashMap::default())
+                        })
+                        .unwrap_or_else(|| subject_name.clone());
+                    // The head names the impl the AUTHOR wrote. Reached
+                    // through a supertrait (`trait Doubler with Add`, then
+                    // `impl Money with Doubler {}`) the requirement comes from
+                    // a trait the impl does not name, so the sentence says
+                    // whose it is — and says the other way to satisfy it,
+                    // which is the separate impl the conformance check already
+                    // accepts.
+                    let (inherited, steer) = if declaring_trait_name == check.trait_name {
+                        (String::new(), String::new())
+                    } else {
+                        (
+                            format!(
+                                " (`{}` requires `{declaring_trait_name}`)",
+                                check.trait_name
+                            ),
+                            format!(
+                                ", here or in an `impl {subject_name} with \
+                                 {declaring_trait_name}` of its own"
+                            ),
+                        )
+                    };
+                    format!(
+                        "`impl {subject_name} with {}`{inherited} provides no `{member_name}`: an \
+                         operator trait's method is required at impl time. \
+                         `{declaring_trait_name}` declares a body for it, but that body is \
+                         `panic(\"not implemented yet\")` — it exists so `{symbol}=` can derive \
+                         from `{symbol}`, not so `{member_name}` can go unwritten — so this impl \
+                         compiles clean and the first `{symbol}` on a `{subject_name}` throws at \
+                         runtime, naming neither the type nor the method. Declare `fun \
+                         {member_name}(self, b: {operand}): {subject_name}`{steer}",
+                        check.trait_name
+                    )
+                } else {
+                    format!(
+                        "'{}' does not implement trait '{}': missing '{}'{}",
+                        subject_name, check.trait_name, member_name, expected_signature
+                    )
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note,
                     span: check.span,
-                    msg: format!(
-                        "'{}' does not implement trait '{}': missing '{}'{}",
-                        subject_name, check.trait_name, member_name, expected_signature
-                    ),
+                    msg,
                 });
             }
         }
@@ -35084,6 +35217,242 @@ impl<'src> Analyzer<'src> {
                     );
                 }
             }
+        }
+
+        // --- B200: a unary operator's operand has an admitted set too ---
+        //
+        // B196 closed the binary family — every native operator refuses a
+        // non-numeric LEFT operand — and left this site untouched, because a
+        // unary is typed somewhere else entirely (`Expr::Unary` in
+        // `infer_type_inner`) and reached no operand rule at all. The defect
+        // is the same one, at the site with only one operand to blame: a
+        // unary takes its type from its OPERAND, and the host's `-` returns a
+        // number, so `-true` was `-1` typed `bool` — truthy, and equal to
+        // neither `true` nor `false` — `-"12"` was `-12` typed `str`, and
+        // `-Level::High` was `-5` typed `Level`, matching no variant. Off the
+        // native path it was worse: `-Point { x = 1, y = 2 }` is the host's
+        // `-[1, 2]`, `NaN`, and reading a field of it is `undefined`.
+        //
+        // The admitted sets, stated rather than read off an impl (there is no
+        // `Neg` and no `Not` trait for a program to write, so nothing here
+        // ever dispatches):
+        //
+        //   * `-` admits the numeric primitives, and nothing else.
+        //   * `!` admits `bool`, and nothing else. The RESULT was always typed
+        //     `bool`, so `!` never miscompiled a type — but the host's `!` is
+        //     a truthiness test that admits every value, so `!5` was `false`
+        //     and `!"hi"` was `false` and a struct was always truthy: a test
+        //     the author could not have meant, silently compiled. Same rule as
+        //     B28's `if` condition, at the operator that produces the `bool`.
+        //
+        // A type PARAMETER is refused for B179's reason, which is the family's
+        // reason: membership in an admitted set is provable by bound only
+        // where a trait names the set. No trait names "the numeric primitives"
+        // and none names "`bool`", and neither operator models an operator
+        // trait to consult, so no bound can prove membership — a bound
+        // promises a trait's methods, never that the parameter IS a number.
+        for (unary_id, operator, operand_id) in std::mem::take(&mut self.prepped_unary_ops) {
+            let expected = if operator == '!' {
+                self.bool_type()
+            } else {
+                Type::Unknown
+            };
+            let operand_type = self.infer_type(operand_id, &expected, &HashMap::default());
+            // The shapes with no verdict to give, exactly as the binary loop
+            // lists them: `Any` absorbs and `Never` is unreachable (neither is
+            // a claim about a runtime value), `Unknown`/`Unresolved` have not
+            // settled, `Mapped` is still symbolic, and a `Module` is not a
+            // value — naming one as an operand is already someone else's
+            // diagnostic.
+            //
+            // `Trait` is NOT on that list, and the reason is the difference
+            // between this site and the binary one. There, a trait-typed
+            // operand may still have somewhere to go — B193 dispatches a
+            // default body's `self` on the type being specialized, because a
+            // supertrait can promise `Add`. Nothing can promise `-` or `!`:
+            // vilan has neither a `Neg` nor a `Not` trait, so no trait a
+            // program can write gives either symbol a meaning, and a
+            // trait-typed operand here has no dispatch to reach at any
+            // specialization. Skipping it would leave the family's own
+            // miscompile behind at the one shape that can never be rescued —
+            // `trait Flipper { fun flipped(self): Self { -self } }` printed
+            // `undefined` for every specialization, and `!self` printed
+            // `false` for all of them.
+            if matches!(
+                operand_type,
+                Type::Any
+                    | Type::Never
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Module(_)
+                    | Type::Mapped(_, _, _)
+            ) {
+                continue;
+            }
+            let label = self.pretty_print_type(&operand_type, &HashMap::default());
+            let is_generic = matches!(operand_type, Type::Generic(_));
+            let is_bool =
+                matches!(&operand_type, Type::Enum(id, _) if self.bool_enum_id == Some(*id));
+            if operator == '!' {
+                if is_bool {
+                    continue;
+                }
+                let msg = if is_generic {
+                    format!(
+                        "`!` negates a `bool`, and `{label}` is a type parameter: `bool`'s set is \
+                         `bool` itself, no trait names it, and `!` models no operator trait to \
+                         consult, so no bound on `{label}` can prove membership — a bound promises \
+                         a trait's methods, never that the parameter IS `bool`. Test the value and \
+                         negate the `bool`, or declare this operand `bool`"
+                    )
+                } else if matches!(operand_type, Type::Void) {
+                    // B170's rule on the unary side: a refusal has to be one
+                    // the reader can act on, and `void` has no value to test.
+                    "`!` negates a `bool`, and this operand is `void`: the expression it comes \
+                     from produces no value — a function that returns nothing, an `if` with no \
+                     `else`, a statement — so there is nothing to negate"
+                        .to_string()
+                } else if matches!(operand_type, Type::Trait(_, _)) {
+                    // B175's shape, and B193's — `self` inside a trait default
+                    // body is `Type::Trait` too. The binary site can dispatch
+                    // such an operand on the type being specialized, because a
+                    // supertrait can promise `Add`; nothing can promise `!`,
+                    // since vilan has no `Not` trait, so this one has no
+                    // dispatch to reach at any specialization. B175's rule
+                    // about WHICH refusal applies: the two ways of arriving
+                    // need different steers, because only one of them has a
+                    // trait body to add a method to.
+                    let steer = if self.is_in_trait_default(unary_id) {
+                        "Inside a default body `self` IS the trait, so this would reach the host's \
+                         truthiness test over a lowered value: ask the trait for the `bool` you \
+                         mean (a required method returning one) and negate that"
+                            .to_string()
+                    } else {
+                        format!(
+                            "A trait is a bound, not a value type (vilan has no trait objects): \
+                             hold the value in a generic bounded by the trait (`<T: {label}>`) and \
+                             test what the bound provides"
+                        )
+                    };
+                    format!(
+                        "`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — \
+                         vilan has no `Not` for one to require — so `!` can never resolve through \
+                         a trait, at any specialization. {steer}"
+                    )
+                } else {
+                    format!(
+                        "`!` negates a `bool`, and this operand is `{label}`: the host's `!` is a \
+                         truthiness test that admits every value, so this compiles to a question \
+                         nobody asked — `!5` is `false`, `!\"\"` is `true`, and an aggregate is \
+                         always truthy, whatever it holds. Write the test you mean (`value == …`, \
+                         `value.is_empty()`) and negate that"
+                    )
+                };
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&unary_id).unwrap_or(&&EMPTY_SPAN),
+                        msg,
+                    },
+                    unary_id,
+                );
+                continue;
+            }
+            // `-`. A numeric primitive is the whole admitted set; `str` is a
+            // native operator primitive without being one of these, so it is
+            // excluded by name, and `bool` and a backed enum are native
+            // `Enum`s that never reach `is_native_operator_primitive` at all.
+            let numeric = self.is_native_operator_primitive(&operand_type)
+                && !self.is_str_type(&operand_type);
+            if numeric {
+                continue;
+            }
+            let msg = if is_generic {
+                format!(
+                    "`-` negates a number, and `{label}` is a type parameter: the set `-` admits \
+                     is the numeric primitives, no trait names it, and `-` models no operator \
+                     trait to consult, so no bound on `{label}` can prove membership — a bound \
+                     promises a trait's methods, never that the parameter IS a number. Declare \
+                     this operand a numeric type, or subtract from a zero the bound does provide"
+                )
+            } else if is_bool {
+                "`-` on `bool` has no meaning: `bool`'s admitted unary operator is `!`. A unary \
+                 takes its type from its OPERAND and the host operator returns a number, so this \
+                 expression is a number wearing `bool` — `true` and `false` compute as `1` and \
+                 `0`, so `-true` is `-1`: truthy, and equal to neither `true` nor `false`. Test \
+                 the value and compute on the numbers you mean (`if flag { 1 } else { 0 }`)"
+                    .to_string()
+            } else if self.is_str_type(&operand_type) {
+                "`-` on `str` has no meaning: `str`'s admitted operators are `+ == != < <= > >=`, \
+                 none of them unary. A unary takes its type from its OPERAND and the host coerces \
+                 the text, so `-\"12\"` is `-12` typed `str`, on which `.len()` is undefined. \
+                 Parse the text first (`.parse_i32()`, `.parse_f64()`) and negate the number"
+                    .to_string()
+            } else if self.is_native_operator_type(&operand_type) {
+                // A backed enum. Native for `==`/`<`, and a backing value is
+                // not a number to compute with.
+                let ordered = self.string_backed_enum(&operand_type).is_none();
+                let admitted = if ordered {
+                    "`== != < <= > >=`"
+                } else {
+                    "`== !=`"
+                };
+                format!(
+                    "`-` on `{label}` has no meaning: `{label}`'s admitted operators are \
+                     {admitted}, none of them unary. A unary takes its type from its OPERAND and \
+                     the host negates the backing value, so this expression is a number wearing \
+                     `{label}` — and the negation of a backing is rarely a backing any variant \
+                     has, so the result matches none of them. A backing value is a lowering \
+                     detail, not a number to compute with: match on the variant, or hold the \
+                     number you mean"
+                )
+            } else if matches!(operand_type, Type::Trait(_, _)) {
+                // The `!` arm's twin, and the same reason: there is no `Neg`
+                // for a trait to require, so a trait-typed operand has no
+                // dispatch to reach at any specialization — and the same split
+                // over WHICH steer, since only the default body has a trait to
+                // add a method to.
+                let steer = if self.is_in_trait_default(unary_id) {
+                    "Inside a default body `self` IS the trait, so this would reach the host's `-` \
+                     over a lowered value: ask the trait for the number you mean (a required \
+                     method returning one) and negate that"
+                        .to_string()
+                } else {
+                    format!(
+                        "A trait is a bound, not a value type (vilan has no trait objects): hold \
+                         the value in a generic bounded by the trait (`<T: {label}>`) and negate \
+                         what the bound provides"
+                    )
+                };
+                format!(
+                    "`-` negates a number, and `{label}` is a trait: no trait names the numeric \
+                     set — vilan has no `Neg` for one to require — so `-` can never resolve \
+                     through a trait, at any specialization. {steer}"
+                )
+            } else if matches!(operand_type, Type::Void) {
+                "`-` negates a number, and this operand is `void`: the expression it comes from \
+                 produces no value — a function that returns nothing, an `if` with no `else`, a \
+                 statement — so there is nothing to negate"
+                    .to_string()
+            } else {
+                format!(
+                    "`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so \
+                     there is no impl that could give `-` a meaning here — the host would negate \
+                     the value's runtime shape instead, which is `NaN` for every aggregate. Negate \
+                     the number inside it (`-value.field`), or give the type a method that returns \
+                     the negation"
+                )
+            };
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&unary_id).unwrap_or(&&EMPTY_SPAN),
+                    msg,
+                },
+                unary_id,
+            );
         }
 
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {
@@ -35869,18 +36238,69 @@ impl<'src> Analyzer<'src> {
             // typed as a BARE trait has no concrete type to dispatch to, and
             // an operator on it is refused by the no-impl branch below.
             //
-            // ONE trait-typed shape still skips, and it is the one with no
-            // actionable verdict to give: `self` inside a trait DEFAULT body is
+            // B175 left ONE trait-typed shape skipping, and B193 closes it
+            // rather than refusing it: `self` inside a trait DEFAULT body is
             // also `Type::Trait` (the same distinction `is_in_trait_default`
-            // draws for the method path). `self + self` in a default over a
-            // supertrait `Add` miscompiles today — it emits the host's `+` over
-            // two lowered structs — but refusing it would be advice nobody can
-            // act on: the explicit spelling `self.add(self)` does not resolve
-            // there either, and the binary emitter has no `OnType(None)` case
-            // to dispatch a default body's operand on the type being
-            // specialized. Both halves are one deeper defect (filed), and
-            // B170's own rule applies until it closes: a refusal a reader
-            // cannot act on is barely a refusal.
+            // draws for the method path), and `self + self` in a default over a
+            // supertrait `Add` is not a program to refuse — it is the whole
+            // point of declaring the supertrait. It miscompiled because nothing
+            // DISPATCHED it: skipping the check kept the anything-goes native
+            // emission, which over two lowered structs is the host's `+` on two
+            // arrays — `Money { cents = 21 }.twice()` was `"2121"`, printed as
+            // `2` after slot 0. B175 could not close it because the refusal it
+            // would have written was advice nobody could take; the answer was
+            // never a refusal.
+            //
+            // A default body's operand dispatches on the type the default is
+            // being SPECIALIZED for — `GenericDispatch::OnType(None, method)`,
+            // the same channel a `self`-CALL in a default body has used since
+            // B55, resolved against `current_self_type` at emission. So the
+            // explicit spelling now works for the same reason the operator
+            // does, and the two halves close together as filed.
+            if let Type::Trait(trait_id, _) = lhs_type
+                && self.is_in_trait_default(binary_id)
+            {
+                // `&&` and `||` are the only prepped operators modelling no
+                // trait, and they `continue`d far above, so every operator
+                // that reaches here has one.
+                let Some((trait_name, method_name)) = operator_trait_method(op) else {
+                    continue;
+                };
+                if self.method_member_in_trait(trait_id, method_name).is_some() {
+                    self.generic_dispatch
+                        .insert(binary_id, GenericDispatch::OnType(None, method_name));
+                    continue;
+                }
+                // The default body writes an operator its own trait never
+                // promised. That IS a refusal a reader can act on, and it is
+                // not the bare-trait one B175 wrote: the steer there ("hold the
+                // value in a generic bounded by the trait") is nonsense inside
+                // the trait's own body, where the declaration that works is a
+                // supertrait on the trait itself.
+                let trait_label = self
+                    .traits
+                    .get(&trait_id)
+                    .map(|trait_| trait_.name.to_string())
+                    .unwrap_or_else(|| self.pretty_print_type(&lhs_type, &HashMap::default()));
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "`{symbol}` models `{trait_name}`, and `{trait_label}` does not \
+                             require it: inside a default body `self` is the trait itself, so the \
+                             operator resolves through what `{trait_label}` promises — and a \
+                             specialization that never implemented `{trait_name}` would reach the \
+                             host's operator over a lowered value. Declare it as a supertrait \
+                             (`trait {trait_label} with {trait_name}`), which every impl must \
+                             then satisfy"
+                        ),
+                    },
+                    binary_id,
+                );
+                continue;
+            }
             if matches!(
                 lhs_type,
                 Type::Any
@@ -35889,8 +36309,7 @@ impl<'src> Analyzer<'src> {
                     | Type::Unresolved
                     | Type::Module(_)
                     | Type::Mapped(_, _, _)
-            ) || (matches!(lhs_type, Type::Trait(_, _)) && self.is_in_trait_default(binary_id))
-            {
+            ) {
                 continue;
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {

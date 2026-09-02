@@ -391,3 +391,16 @@ row	flagship	key
 365	-	`{name}` takes no type arguments, {written_count} given — it declares no generics, so there is nothing here for this list to bind; write `{name}(…)`
 366	-	`{name}` takes at most {declared_count} type {argument(s)}, {written_count} given — a SHORTER list is fine (the parameters it does not reach are inferred from the arguments), but there is no parameter left for the extra {one(s)} to bind
 367	-	`{symbol}` on `{label}` needs `{label}: {trait_name}` — a parameter promises only what its bounds promise, and {promise}, so there is no `{method_name}` to dispatch to. `{symbol}` dispatches through its LEFT operand, which is exactly where a bound decides the implementation: add it where `{label}` is declared{site}, or write a concrete type here
+368	-	`!` negates a `bool`, and `{label}` is a type parameter: `bool`'s set is `bool` itself, no trait names it, and `!` models no operator trait to consult, so no bound on `{label}` can prove membership
+369	-	`!` negates a `bool`, and this operand is `void`: the expression it comes from produces no value
+370	-	`!` negates a `bool`, and this operand is `{label}`: the host's `!` is a truthiness test that admits every value, so this compiles to a question nobody asked
+371	-	`-` negates a number, and `{label}` is a type parameter: the set `-` admits is the numeric primitives, no trait names it, and `-` models no operator trait to consult, so no bound on `{label}` can prove membership
+372	-	`-` on `bool` has no meaning: `bool`'s admitted unary operator is `!`. A unary takes its type from its OPERAND and the host operator returns a number
+373	-	`-` on `str` has no meaning: `str`'s admitted operators are `+ == != < <= > >=`, none of them unary
+374	-	`-` on `{label}` has no meaning: `{label}`'s admitted operators are {admitted}, none of them unary
+375	-	`-` negates a number, and this operand is `void`: the expression it comes from produces no value
+376	-	`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so there is no impl that could give `-` a meaning here
+377	-	`{symbol}` models `{trait_name}`, and `{trait_label}` does not require it: inside a default body `self` is the trait itself, so the operator resolves through what `{trait_label}` promises
+378	-	`impl {subject_name} with {trait}`{inherited} provides no `{member_name}`: an operator trait's method is required at impl time
+379	-	`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — vilan has no `Not` for one to require
+380	-	`-` negates a number, and `{label}` is a trait: no trait names the numeric set — vilan has no `Neg` for one to require
