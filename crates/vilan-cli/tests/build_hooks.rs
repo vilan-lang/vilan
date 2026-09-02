@@ -2533,12 +2533,11 @@ fn tests_that_drive_a_watch_session(source: &str) -> Vec<String> {
             current = None;
             continue;
         }
-        if let Some(name) = &current {
-            if SPAWNS_A_WATCHER.iter().any(|marker| line.contains(marker))
-                && !driving.contains(name)
-            {
-                driving.push(name.clone());
-            }
+        if let Some(name) = &current
+            && SPAWNS_A_WATCHER.iter().any(|marker| line.contains(marker))
+            && !driving.contains(name)
+        {
+            driving.push(name.clone());
         }
     }
     driving
