@@ -120,6 +120,11 @@ impl Completion {
 }
 
 /// The category of a completion, for its editor icon.
+///
+/// A plain fieldless tag, so it carries the derives a tag should: E121's
+/// keystroke-path symbol index stores one per declared name and compares them
+/// (`crates/vilan-lsp/src/keystroke.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompletionKind {
     Macro,
     Function,
