@@ -486,6 +486,12 @@ pub fn compile_program_with(
 
     let workspace = Workspace {
         entry_prelude: prelude.resolve(platform),
+        // There is no `vilan.toml` behind a pasted buffer, so the web-set steer
+        // must not send a visitor to one (E120). The page's own prelude toggle
+        // is where this program's ambient scope is actually set — the wire form
+        // the binding layer below passes straight through — so it is what the
+        // steer names.
+        prelude_repair: vilan_core::PreludeRepair::Toggle,
         ..Workspace::default()
     };
     let leaked = interned_entry(source);

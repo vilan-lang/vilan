@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::manifest::PreludeSpec;
 use vilan_core::{
-    Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, Workspace, analyze_source,
+    Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair, Workspace,
+    analyze_source,
 };
 
 fn std_spec() -> PackageSpec {
@@ -2789,6 +2790,18 @@ fn analyze_under_prelude(
     entry: &str,
     platform: Platform,
 ) -> Vec<String> {
+    analyze_under_prelude_repaired(prelude, PreludeRepair::default(), files, entry, platform)
+}
+
+/// [`analyze_under_prelude`] with the front end's declared prelude REPAIR
+/// (E120) — which control the web-set steer sends the reader to.
+fn analyze_under_prelude_repaired(
+    prelude: PreludeSpec,
+    repair: PreludeRepair,
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("vilan_prelude_{}_{unique}", std::process::id()));
@@ -2803,6 +2816,7 @@ fn analyze_under_prelude(
     let leaked: &'static str = Box::leak(source.into_boxed_str());
     let workspace = Workspace {
         entry_prelude: prelude,
+        prelude_repair: repair,
         ..Workspace::default()
     };
     let (_program, errors) = analyze_source(
@@ -3218,6 +3232,40 @@ fn a_web_set_name_steers_to_the_manifest_key_not_to_an_import() {
             e.contains("in the prelude of the web set") && e.contains("prelude = \"std::web\"")
         }),
         "{errors:#?}"
+    );
+}
+
+/// The playground arm of the same steer (E120). WHICH repair the message names
+/// is a fact about the front end, not about the program — a `vilan.toml` line
+/// is advice a pasted buffer cannot take — so the front end declares it and the
+/// analyzer owns both wordings. The manifest arm above is this one's control:
+/// same program, same prelude, default repair, unchanged sentence.
+#[test]
+fn a_toggle_front_end_steers_at_the_prelude_toggle_not_the_manifest() {
+    let errors = analyze_under_prelude_repaired(
+        base_prelude(),
+        PreludeRepair::Toggle,
+        &[(
+            "main.vl",
+            "fun main() { let s = Signal::new(0); print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    let steer = errors
+        .iter()
+        .find(|error| error.contains("in the prelude of the web set"))
+        .unwrap_or_else(|| panic!("{errors:#?}"));
+    assert!(
+        steer.contains("switch the playground's prelude to the web set"),
+        "{steer}"
+    );
+    // The one-name import beside it, so the reader who wants exactly this name
+    // has a repair that does not change what the rest of the buffer means.
+    assert!(steer.contains("import std::reactive::Signal;"), "{steer}");
+    assert!(
+        !steer.contains("vilan.toml"),
+        "there is no manifest to edit: {steer}"
     );
 }
 

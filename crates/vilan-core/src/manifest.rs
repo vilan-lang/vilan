@@ -1592,9 +1592,11 @@ pub fn resolve_workspace_with_hook_report(
             entry_dependencies,
             macro_limits,
             entry_prelude,
-            // The front end fills this in (E119): resolving the dependency
-            // graph says nothing about which entry coloured the file.
-            platform_reason: None,
+            // The front end fills the rest in: resolving the dependency graph
+            // says nothing about which entry coloured the file (E119), nor
+            // about which control can change the ambient scope (E120) — and
+            // this one resolved a manifest, so the default already names it.
+            ..Workspace::default()
         },
         hook_report.into_values().collect(),
     ))
