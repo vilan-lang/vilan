@@ -7848,20 +7848,34 @@ fn b175_the_sibling_operators_refuse_a_bare_trait_too() {
     }
 }
 
+// --- B193: a trait default's `self <op> self` ---------------------------------
+//
+// The one trait-typed shape B175 left skipping, and the answer was never a
+// refusal: `self + self` in a default over a supertrait `Add` is exactly the
+// program declaring the supertrait is FOR. It miscompiled because nothing
+// dispatched it — skipping the operator check kept the anything-goes native
+// emission, and over two lowered structs the host's operators are garbage:
+//
+//   Money { cents = 21 }.twice()   →  `[21] + [21]` is the string "2121",
+//                                     slot 0 of it is "2", so `.cents`
+//                                     printed 2. A plausible wrong answer.
+//   Money { cents = 21 }.zero()    →  `[21] - [21]` is NaN; `.cents` printed
+//                                     `undefined`.
+//   Money { cents = 3 }.square()   →  `[3] * [3]`, `undefined` likewise.
+//   Tag { id = 1 }.same()          →  `self === self` — a reference compare
+//                                     that ignored the impl, so a `PartialEq`
+//                                     whose `eq` answers `false` still
+//                                     printed `true`.
+//
+// One fix, at the dispatch: a default body's operand dispatches on the type
+// the default is being SPECIALIZED for (`GenericDispatch::OnType(None, ..)`,
+// read against `current_self_type` at emission — the same channel a `self`
+// CALL in a default body has used since B55), and the analyzer stops skipping
+// the shape.
+
 #[test]
-#[ignore = "B193 (B175's residual): `self` inside a trait DEFAULT body is `Type::Trait` \
-            too, and `self + self` over a supertrait `Add` still emits the host's \
-            `+`. Refusing it needs a spelling that works first — `self.add(self)` \
-            does not resolve there either, and the binary emitter has no \
-            `OnType(None)` case to dispatch a default body's operand on the type \
-            being specialized."]
 fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
-    // KNOWN BUG. `Money { cents = 21 }.twice()` prints `2`: the emission is the
-    // host's `+` over two lowered structs, so `[21] + [21]` is the string
-    // "2121" and slot 0 of it is "2" — a plausible wrong answer, not a visible
-    // NaN. It is the one trait-typed shape B175 deliberately left skipping,
-    // because both halves of closing it (a working spelling, and a dispatch for
-    // it) are the same deeper defect.
+    // The pin B193 was filed as. Pre-fix it printed `2`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -7884,6 +7898,161 @@ fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
         }
         "#,
         "42\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_subtraction_dispatches_too() {
+    // Audit run 7 widened the item off `+`: `-` over the same pair is NaN, so
+    // this one printed `undefined` rather than a plausible number.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Sub;
+
+        trait Zeroer with Sub {
+            fun zero(self): Self { self - self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Sub {
+            fun sub(self, other: Money): Money { Money { cents = self.cents - other.cents } }
+        }
+
+        impl Money with Zeroer {}
+
+        fun main() {
+            print(Money { cents = 21 }.zero().cents);
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_multiplication_dispatches_too() {
+    // Pre-fix: `undefined`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Mul;
+
+        trait Squarer with Mul {
+            fun square(self): Self { self * self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Mul {
+            fun mul(self, other: Money): Money { Money { cents = self.cents * other.cents } }
+        }
+
+        impl Money with Squarer {}
+
+        fun main() {
+            print(Money { cents = 3 }.square().cents);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_equality_dispatches_to_the_impl() {
+    // `==` needs an impl that DISAGREES with the host to witness anything:
+    // `self === self` is true for the same value whatever the impl says, so a
+    // conventional `eq` would have hidden the defect. This one answers
+    // `false`, and pre-fix the program printed `true` — the emission was
+    // `self === self`, the impl never called.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        trait Selfsame with PartialEq {
+            fun same(self): bool { self == self }
+        }
+
+        struct Tag { id: i32 }
+
+        impl Tag with PartialEq {
+            fun eq(self, other: Tag): bool { false }
+        }
+
+        impl Tag with Selfsame {}
+
+        fun main() {
+            print(Tag { id = 1 }.same());
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_default_dispatches_at_each_specialization() {
+    // The point of dispatching on the SPECIALIZED type rather than on
+    // anything the default itself knows: one default body, two impls, two
+    // answers. The native specialization keeps native JS, which is what the
+    // emitter's own `compares_natively` guard is for — dispatching a native
+    // back into std's `impl i32 with Add` would recurse forever.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+        struct Steps { count: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Steps with Add {
+            // Deliberately not a plain sum, so the dispatch is visible.
+            fun add(self, other: Steps): Steps { Steps { count = self.count + other.count + 1 } }
+        }
+
+        impl Money with Doubler {}
+        impl Steps with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+            print(Steps { count = 21 }.twice().count);
+        }
+        "#,
+        "42\n43\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_default_operator_its_trait_never_promised_is_refused() {
+    // The other half of no longer skipping: a default body may now be JUDGED,
+    // and `self + self` in a trait with no `Add` supertrait is a real error —
+    // every specialization would reach the host's `+` over a lowered value.
+    // It gets its own sentence rather than B175's bare-trait one, whose steer
+    // ("hold the value in a generic bounded by the trait") is nonsense inside
+    // the trait's own body: the declaration that works is a supertrait.
+    assert_fails_with(
+        r#"
+        trait Doubler {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "Declare it as a supertrait (`trait Doubler with Add`)",
     );
 }
 

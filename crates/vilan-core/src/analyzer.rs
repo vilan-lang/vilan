@@ -35310,18 +35310,69 @@ impl<'src> Analyzer<'src> {
             // typed as a BARE trait has no concrete type to dispatch to, and
             // an operator on it is refused by the no-impl branch below.
             //
-            // ONE trait-typed shape still skips, and it is the one with no
-            // actionable verdict to give: `self` inside a trait DEFAULT body is
+            // B175 left ONE trait-typed shape skipping, and B193 closes it
+            // rather than refusing it: `self` inside a trait DEFAULT body is
             // also `Type::Trait` (the same distinction `is_in_trait_default`
-            // draws for the method path). `self + self` in a default over a
-            // supertrait `Add` miscompiles today — it emits the host's `+` over
-            // two lowered structs — but refusing it would be advice nobody can
-            // act on: the explicit spelling `self.add(self)` does not resolve
-            // there either, and the binary emitter has no `OnType(None)` case
-            // to dispatch a default body's operand on the type being
-            // specialized. Both halves are one deeper defect (filed), and
-            // B170's own rule applies until it closes: a refusal a reader
-            // cannot act on is barely a refusal.
+            // draws for the method path), and `self + self` in a default over a
+            // supertrait `Add` is not a program to refuse — it is the whole
+            // point of declaring the supertrait. It miscompiled because nothing
+            // DISPATCHED it: skipping the check kept the anything-goes native
+            // emission, which over two lowered structs is the host's `+` on two
+            // arrays — `Money { cents = 21 }.twice()` was `"2121"`, printed as
+            // `2` after slot 0. B175 could not close it because the refusal it
+            // would have written was advice nobody could take; the answer was
+            // never a refusal.
+            //
+            // A default body's operand dispatches on the type the default is
+            // being SPECIALIZED for — `GenericDispatch::OnType(None, method)`,
+            // the same channel a `self`-CALL in a default body has used since
+            // B55, resolved against `current_self_type` at emission. So the
+            // explicit spelling now works for the same reason the operator
+            // does, and the two halves close together as filed.
+            if let Type::Trait(trait_id, _) = lhs_type
+                && self.is_in_trait_default(binary_id)
+            {
+                // `&&` and `||` are the only prepped operators modelling no
+                // trait, and they `continue`d far above, so every operator
+                // that reaches here has one.
+                let Some((trait_name, method_name)) = operator_trait_method(op) else {
+                    continue;
+                };
+                if self.method_member_in_trait(trait_id, method_name).is_some() {
+                    self.generic_dispatch
+                        .insert(binary_id, GenericDispatch::OnType(None, method_name));
+                    continue;
+                }
+                // The default body writes an operator its own trait never
+                // promised. That IS a refusal a reader can act on, and it is
+                // not the bare-trait one B175 wrote: the steer there ("hold the
+                // value in a generic bounded by the trait") is nonsense inside
+                // the trait's own body, where the declaration that works is a
+                // supertrait on the trait itself.
+                let trait_label = self
+                    .traits
+                    .get(&trait_id)
+                    .map(|trait_| trait_.name.to_string())
+                    .unwrap_or_else(|| self.pretty_print_type(&lhs_type, &HashMap::default()));
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "`{symbol}` models `{trait_name}`, and `{trait_label}` does not \
+                             require it: inside a default body `self` is the trait itself, so the \
+                             operator resolves through what `{trait_label}` promises — and a \
+                             specialization that never implemented `{trait_name}` would reach the \
+                             host's operator over a lowered value. Declare it as a supertrait \
+                             (`trait {trait_label} with {trait_name}`), which every impl must \
+                             then satisfy"
+                        ),
+                    },
+                    binary_id,
+                );
+                continue;
+            }
             if matches!(
                 lhs_type,
                 Type::Any
@@ -35330,8 +35381,7 @@ impl<'src> Analyzer<'src> {
                     | Type::Unresolved
                     | Type::Module(_)
                     | Type::Mapped(_, _, _)
-            ) || (matches!(lhs_type, Type::Trait(_, _)) && self.is_in_trait_default(binary_id))
-            {
+            ) {
                 continue;
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {

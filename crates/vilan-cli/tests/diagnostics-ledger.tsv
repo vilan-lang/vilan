@@ -395,3 +395,4 @@ row	flagship	key
 370	-	`-` on `{label}` has no meaning: `{label}`'s admitted operators are {admitted}, none of them unary
 371	-	`-` negates a number, and this operand is `void`: the expression it comes from produces no value
 372	-	`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so there is no impl that could give `-` a meaning here
+373	-	`{symbol}` models `{trait_name}`, and `{trait_label}` does not require it: inside a default body `self` is the trait itself, so the operator resolves through what `{trait_label}` promises

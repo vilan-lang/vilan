@@ -4334,8 +4334,22 @@ impl<'src> Transformer<'src> {
                 // A CONCRETE receiver whose operator method is an inherited trait
                 // default (`instant < instant` over `PartialOrd`'s `lt`) records
                 // `OnType` instead — same re-dispatch, the type known up front.
-                if let Some(GenericDispatch::OnType(Some(receiver_type_id), member_name)) =
+                //
+                // B193: and `OnType(None, ..)` — a `self` operand inside a trait
+                // DEFAULT body — dispatches on the type the default is being
+                // SPECIALIZED for, exactly as a `self`-CALL in a default body
+                // does (`Expr::Call`'s own `OnType` arm, which has read
+                // `current_self_type` since B55). This arm demanded a type up
+                // front, so a default body's `self + self` matched nothing here
+                // and fell through to the native emission below: over two
+                // lowered structs the host's `+` is a string concatenation, so
+                // `Money { cents = 21 }.twice()` was `[21] + [21]` — `"2121"` —
+                // and slot 0 of that is `"2"`. `-` and `*` over the same pair
+                // were `undefined`, and `==` was a reference compare that
+                // ignored the impl.
+                if let Some(GenericDispatch::OnType(receiver_type_id, member_name)) =
                     self.program.generic_dispatch.get(&id).copied()
+                    && let Some(receiver_type_id) = receiver_type_id.or(self.current_self_type)
                 {
                     let concrete = self.resolve_type_id(receiver_type_id);
                     if !self.compares_natively(concrete)
