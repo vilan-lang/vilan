@@ -57,6 +57,7 @@ macro fun Debug(item: Item): Source {
 		}
 		let printer = fun_of("debug").parameter("self").returns("str").expr(body);
 		ret source("import std::debug::Debug;\n" + impl_of(target.name)
+			.generics(target.binders("Debug"))
 			.implements("Debug")
 			.method(printer)
 			.render());
@@ -85,6 +86,7 @@ macro fun Debug(item: Item): Source {
 		}
 		let printer = fun_of("debug").parameter("self").returns("str").expr(arms.render());
 		ret source("import std::debug::Debug;\n" + impl_of(target.name)
+			.generics(target.binders("Debug"))
 			.implements("Debug")
 			.method(printer)
 			.render());

@@ -30,7 +30,7 @@ use crate::error::Error;
 use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::interpreter::{self, Limits};
-use crate::node::{Func, ImportBranch, Node, NodeList, Pattern};
+use crate::node::{Func, GenericParameters, ImportBranch, Node, NodeList, Pattern};
 use crate::options::BuildOptions;
 use crate::span::{Span, Spanned};
 use crate::transformer::{JsProgram, js, transform_functions};
@@ -668,6 +668,7 @@ const AMBIENT_META_TYPES: &[&str] = &[
     "ServiceItem",
     "Field",
     "Variant",
+    "GenericParameter",
     "TypeExpr",
     "Arguments",
     "Source",
@@ -1962,11 +1963,51 @@ fn void_type_expr() -> js::Node<'static> {
     array(vec![string_literal("void"), array(Vec::new())])
 }
 
+/// The `List<GenericParameter>` for a struct/enum declaration's own parameters:
+/// each name, its written trait bounds, and its default AS WRITTEN (`""` when
+/// it has none). A TUPLE-bounded parameter (`T: (2..)`) reads with no bounds —
+/// the tuple form replaces the trait-bound list and has no v1 spelling in the
+/// reflection surface.
+///
+/// This is what lets a generator spell its subject as an APPLICATION
+/// (`Handle<T>`) instead of bare (B194): a bare name in an applied position is
+/// an under-supplied application, which only B188's erasure ever let through.
+fn construct_generic_parameters(
+    parameters: &Option<GenericParameters>,
+    text: &str,
+) -> js::Node<'static> {
+    array(
+        parameters
+            .iter()
+            .flat_map(|parameters| &parameters.0)
+            .map(|parameter| {
+                array(vec![
+                    string_literal(parameter.name),
+                    array(
+                        parameter
+                            .bounds
+                            .iter()
+                            .map(|bound| construct_type_expr(bound, text))
+                            .collect(),
+                    ),
+                    string_literal(
+                        &parameter
+                            .default
+                            .as_ref()
+                            .map(|default| slice(text, default.1).to_string())
+                            .unwrap_or_default(),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// The `Item` value for the annotated node: `[0, StructItem]`, `[1, EnumItem]`,
 /// or `[2, FunctionItem]` — the variant order declared in `meta.vl`.
 fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
     match &item.0 {
-        Node::Struct(name, _generics, _external, _resource, fields) => {
+        Node::Struct(name, generics, _external, _resource, fields) => {
             let fields = fields
                 .iter()
                 .flat_map(|fields| &fields.0)
@@ -1984,10 +2025,14 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                 .collect();
             array(vec![
                 discriminant(0),
-                array(vec![string_literal(name.0), array(fields)]),
+                array(vec![
+                    string_literal(name.0),
+                    array(fields),
+                    construct_generic_parameters(generics, text),
+                ]),
             ])
         }
-        Node::Enum(name, _generics, _resource, variants) => {
+        Node::Enum(name, generics, _resource, variants) => {
             let variants = variants
                 .0
                 .iter()
@@ -2021,6 +2066,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                     string_literal(
                         crate::analyzer::backed_enum_backing_type_of(item).unwrap_or_default(),
                     ),
+                    construct_generic_parameters(generics, text),
                 ]),
             ])
         }
