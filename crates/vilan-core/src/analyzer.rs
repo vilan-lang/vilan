@@ -20001,6 +20001,47 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// A CALL's written generic-argument list checked against the callee's
+    /// generic parameters (B192), as the refusal message when it is too long.
+    ///
+    /// The rule is one-sided on purpose, and it is not the one
+    /// [`Self::written_application_arity_error`] applies to a TYPE application.
+    /// A type application is the whole binding — nothing else can supply a
+    /// missing argument, so an under-supplied `Holder` is refused. A call has a
+    /// second channel: its arguments. So a SHORT list is not missing anything —
+    /// it binds the parameters it reaches, positionally, and inference fills
+    /// the rest exactly as it does when nothing is written at all. Only a list
+    /// LONGER than the parameter list has a written argument with nothing to
+    /// bind, and until B192 that argument was silently dropped: `tag<Dog, Fox>`
+    /// on a one-generic `tag` compiled and ran as though `<Dog>` had been
+    /// written.
+    fn written_call_generic_arity_error(
+        &self,
+        function_id: Id,
+        declared_count: usize,
+        written_count: usize,
+    ) -> Option<String> {
+        if written_count <= declared_count {
+            return None;
+        }
+        let name = self.callable_name(function_id).unwrap_or("this call");
+        // The zero-generic callee has no prefix at all, so every written
+        // argument is an extra one and there is no shorter list to steer to.
+        if declared_count == 0 {
+            return Some(format!(
+                "`{name}` takes no type arguments, {written_count} given — it declares no \
+                 generics, so there is nothing here for this list to bind; write `{name}(…)`"
+            ));
+        }
+        Some(format!(
+            "`{name}` takes at most {declared_count} type {}, {written_count} given — a \
+             SHORTER list is fine (the parameters it does not reach are inferred from the \
+             arguments), but there is no parameter left for the extra {} to bind",
+            plural(declared_count, "argument", "arguments"),
+            plural(written_count - declared_count, "one", "ones"),
+        ))
+    }
+
     /// The declared generic-parameter constraint ids of the named type (struct,
     /// enum, or trait), in order — for inheriting a subject binder's bound from
     /// the type it implements. `None` if the name does not resolve to such a type
@@ -28379,6 +28420,24 @@ impl<'src> Analyzer<'src> {
                 if let Some((function_id, parameters, generic_parameter_constraint_ids)) =
                     function_data
                 {
+                    // B192: the written generic list is a PREFIX. Only one
+                    // length is wrong — longer than what it prefixes — and it
+                    // is checked here, before anything binds, so the extra
+                    // argument is refused rather than dropped on the floor.
+                    if let Some(msg) = self.written_call_generic_arity_error(
+                        function_id,
+                        generic_parameter_constraint_ids.len(),
+                        generic_argument_ids.len(),
+                    ) {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: self.declared_here_note(function_id),
+                            span: self.clamp_span_to_first_line(arguments_span, call_id),
+                            msg,
+                        });
+                        self.expr_id_to_expr_map.insert(call_id, Expr::Error);
+                        return Resolution::Failed;
+                    }
                     // `...` is a call convention over an ordinary tuple
                     // parameter: collect the pack here and the rest of this
                     // function — and every pass after it — sees the tuple form.

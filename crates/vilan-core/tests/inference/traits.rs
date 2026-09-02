@@ -763,19 +763,24 @@ fn b186_an_implicit_generic_is_appended_after_the_written_ones() {
     );
 }
 
+// --- B192: a PARTIAL generic-argument list binds positionally, inference the rest ---
+//
+// The written list is a PREFIX, not the whole binding. `tag<Dog>` on a
+// `<T, U>` function fixes `T` and leaves `U` to the arguments, exactly as
+// writing nothing leaves both to them. Before B192 the transformer read a
+// non-empty written list as the WHOLE substitution (`call_substitution`'s
+// first arm zipped it against the callee's parameters and returned), so `U`
+// reached emission abstract and `subject.greet()` resolved to the trait's
+// bodyless requirement — the "resolved to a requirement, which has no body"
+// internal error, at emission, on a program the analyzer had fully typed.
+
 #[test]
-#[ignore = "B192 (a partial generic-argument list; found by lane b186) found this and did not cause it: a PARTIAL generic-argument \
-            list leaves the unsupplied parameters uninferred, and reaches \
-            emission abstract. Pre-existing — it reproduces on two WRITTEN \
-            generics with no sugar in sight — and reported as found-not-fixed \
-            for an item of its own."]
 fn a_partial_generic_argument_list_still_infers_the_rest() {
     // `tag<Dog>` on a `<T, U>` function supplies one of two. Supplying NONE
     // works (inference from the arguments) and supplying BOTH works; supplying
-    // one leaves `U` abstract into emission, where it surfaces as the
-    // "resolved to a requirement, which has no body" internal error. B186's
-    // sugar reaches the same hole through `tag<Dog>(label, subject: Greet)`,
-    // which is how it was found.
+    // one used to leave `U` abstract into emission. B186's sugar reaches the
+    // same hole through `tag<Dog>(label, subject: Greet)`, which is how it was
+    // found.
     assert_compiles_and_runs(
         &format!(
             r#"{GREET}
@@ -789,6 +794,91 @@ fn a_partial_generic_argument_list_still_infers_the_rest() {
             "#
         ),
         "woof/ring\n",
+    );
+}
+
+#[test]
+fn a_full_generic_argument_list_still_binds_every_parameter() {
+    // The control the partial case is measured against: with the whole list
+    // written, the written arguments alone decide the instantiation and the
+    // inferred bindings must not disturb them. `Fox` is written for `U` while
+    // the ARGUMENT is a `Fox` too, so a merge that let inference overwrite the
+    // written prefix would still pass here — which is why the pin below writes
+    // the two the other way round.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun tag<T: Greet, U: Greet>(label: T, subject: U): str {{
+                label.greet() + "/" + subject.greet()
+            }}
+            fun main() {{
+                print(tag<Dog, Fox>(Dog {{ name = "rex" }}, Fox {{ name = "vix" }}));
+            }}
+            main();
+            "#
+        ),
+        "woof/ring\n",
+    );
+}
+
+#[test]
+fn the_written_prefix_outranks_what_inference_would_have_bound() {
+    // Precedence, stated where it is observable: `Greet`'s `greet` is chosen
+    // by the generic's binding, and here the two parameters take the SAME
+    // argument type. Written `<Fox, Dog>` against `(Dog, Dog)` arguments would
+    // print "woof/woof" if inference won and "ring/woof" if the written prefix
+    // does — and the written prefix is what the author asked for. (A `Dog` is
+    // accepted for a `U = Fox` parameter only because both satisfy the bound
+    // the body actually calls through; the point of the pin is WHICH impl the
+    // instance is specialized with.)
+    let source = format!(
+        r#"{GREET}
+        fun tag<T: Greet, U: Greet>(label: T, subject: U): str {{
+            T::greet(label) + "/" + U::greet(subject)
+        }}
+        fun main() {{
+            print(tag<Fox, Dog>(Fox {{ name = "vix" }}, Dog {{ name = "rex" }}));
+        }}
+        main();
+        "#
+    );
+    assert_compiles_and_runs(&source, "ring/woof\n");
+}
+
+#[test]
+fn a_generic_argument_list_longer_than_the_parameter_list_is_refused() {
+    // The one shape a prefix cannot be: longer than what it prefixes. `tag`
+    // declares one generic, so the second written argument binds nothing — and
+    // before B192 it was SILENTLY DROPPED, the call compiling and running as
+    // though only `<Dog>` had been written. Under-supply is inference's job;
+    // over-supply is a mistake with nowhere to put the extra.
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun tag<T: Greet>(label: T): str {{ label.greet() }}
+            fun main() {{
+                print(tag<Dog, Fox>(Dog {{ name = "rex" }}));
+            }}
+            main();
+            "#
+        ),
+        "`tag` takes at most 1 type argument, 2 given",
+    );
+}
+
+#[test]
+fn a_generic_argument_list_on_a_non_generic_function_is_refused() {
+    // The zero-parameter edge of the same rule: there is no prefix at all, so
+    // every written argument is an extra one.
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun bark(): str {{ "woof" }}
+            fun main() {{ print(bark<Dog>()); }}
+            main();
+            "#
+        ),
+        "`bark` takes no type arguments, 1 given",
     );
 }
 
