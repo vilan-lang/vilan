@@ -35,10 +35,11 @@ Parameters are `?` placeholders. Synchronous by design (fits the rpc
 dispatch path). `desc` and other SQL keywords fail as column names.
 
 `Database` is a **`resource`**: it has a single owner and *moves* rather than
-copies, and it closes its `node:sqlite` handle when its owner's scope ends. A
-`let db = Database::open(..)` local closes on the function's return, with no
-`close()` method to remember. `drop(db)` closes it early (the move spends the
-binding). A **module-level** `Database` is the serve-forever idiom: it has
+copies, and it closes its `node:sqlite` handle at its owner's last use. A
+`let db = Database::open(..)` local closes after the last statement that uses
+it, with no `close()` method to remember. `drop(db)` names that point
+yourself (the move spends the binding). A **module-level** `Database` is the
+serve-forever idiom: it has
 process lifetime, never drops, and is reachable only by loan (method calls,
 `&`-passing). Moving or `drop`ing a module-level database is a compile error.
 Being a resource, a `Database` cannot go into a `List` (use `Option` or a
@@ -548,8 +549,8 @@ Everything above is a complete operation on a path — open, act, close, in
 one call. What needs more than one act on the *same* open file is the
 handle tier. `File` is a `resource`: it moves rather than copies, a stale
 binding is a compile error rather than an `EBADF`, and its destructor
-closes the underlying handle at the owner's scope end — there is no
-`close()` to forget or to call twice, and `drop(file)` is the early form.
+closes the underlying handle at the owner's last use — there is no
+`close()` to forget or to call twice, and `drop(file)` is the explicit form.
 The five constructors replace node's flags string ("wx" and friends —
 an untyped enum whose failure mode is a runtime `EINVAL`): each says in
 its name what it does to a file that already exists, which is the only
@@ -575,14 +576,16 @@ close is *awaited* — which the destructor's close deliberately is not.
 `FileHandle.close()` is asynchronous on the host and a destructor cannot
 await, so a dropped `File` *initiates* its close without waiting: written
 data is safe either way, but only `with_file` can observe a close
-failure. Scope-end `Drop` stays underneath as the safety net. Two shapes
+failure. The last-use `Drop` stays underneath as the safety net. Two shapes
 to know before reaching for a handle: a closure cannot capture a `File`
 (hand it in as a parameter, which is exactly what `with_file` does), and
 `List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
 container, so "a pool of open files" is not expressible today. A
 module-level `File` is not expressible either — every constructor is
 async and a module-level `let` cannot await — so a process-lifetime
-handle is a local in `main`, held across whatever `main` awaits.
+handle is a local in `main`, kept alive by being *used* across whatever
+`main` awaits: teardown follows the last use, so a handle nothing reads
+after the await closes before it.
 
 There is one scoped form per constructor — `with_file_create`,
 `with_file_create_new`, `with_file_append`, `with_file_modify` — and the

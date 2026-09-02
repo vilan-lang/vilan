@@ -584,7 +584,7 @@ an `Option<…>` and `take()` it out.
 
 **"`…` is moved on one path through this branch but not another: …"**
 An `if`/`match` moves the binding on some paths and not others, so its
-end-of-scope ownership isn't static (there are no runtime drop flags). Move it
+ownership at the drop point isn't static (there are no runtime drop flags). Move it
 on *every* path, on none, or hold it in an `Option` and `take()` on the
 path that consumes it. A diverging leg (one that `ret`s or `jump`s out) is
 exempt: it never reaches the merge.
