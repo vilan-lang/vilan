@@ -268,8 +268,19 @@ fn run_cli() -> ExitCode {
                     explain::ask();
                 }
                 let roots = watch.then(|| watch_roots(&file));
+                // M22: the per-leg reuse record lives for the life of the
+                // watcher and is created only for one. A one-shot build passes
+                // `None` and is the build it always was.
+                let mut watch_state = watch.then(BuildWatchState::default);
                 run_or_watch(roots, move || {
-                    build_once(file.clone(), stdout, platform.clone(), debug, rerun_hooks)
+                    build_once(
+                        file.clone(),
+                        stdout,
+                        platform.clone(),
+                        debug,
+                        rerun_hooks,
+                        watch_state.as_mut(),
+                    )
                 })
             }
         },
@@ -330,6 +341,9 @@ fn build_once(
     platform: Option<String>,
     debug: bool,
     rerun_hooks: bool,
+    // `Some` only under `--watch` (backlog M22): what the previous round
+    // compiled each leg from, so a leg the edit did not reach is reused.
+    watch_state: Option<&mut BuildWatchState>,
 ) -> RoundOutcome {
     // Before the hooks, which are the first thing that records: every round of
     // `--watch` explains itself, and a round must not inherit the previous
@@ -351,7 +365,9 @@ fn build_once(
             },
             // A workspace builds each member for its own declared platform, so the
             // `--platform` flag doesn't apply.
-            Project::Workspace { root, members, .. } => build_workspace(&root, &members, debug),
+            Project::Workspace { root, members, .. } => {
+                build_workspace(&root, &members, debug, watch_state)
+            }
             Project::Library { name, .. } => not_buildable_library(&name),
         }
     })
@@ -1675,7 +1691,9 @@ fn build_and_spawn_run(
                     return None;
                 }
             };
-            if build_workspace_artifacts(&root, &members, false, Emission::WholeBundles).is_err() {
+            if build_workspace_artifacts(&root, &members, false, Emission::WholeBundles, None)
+                .is_err()
+            {
                 return None;
             }
             launch(
@@ -3814,16 +3832,82 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
 /// — a `none` member is a pure library, compiled only as a dependency of a host.
 /// Members build in declaration order (the client before the server, so the
 /// server's `dist/client.js` exists). `--platform`/`--stdout` don't apply.
-fn build_workspace(root: &Path, members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
-    match build_workspace_artifacts(root, members, debug, Emission::AsDeclared) {
+fn build_workspace(
+    root: &Path,
+    members: &[(Unit, Platform)],
+    debug: bool,
+    watch_state: Option<&mut BuildWatchState>,
+) -> RoundOutcome {
+    // A borrow of the state has to survive the call, and the failure arm has
+    // to write to it — so take the flag update through a raw re-borrow rather
+    // than moving the option in twice.
+    let mut state = watch_state;
+    let outcome = build_workspace_artifacts(
+        root,
+        members,
+        debug,
+        Emission::AsDeclared,
+        state.as_deref_mut(),
+    );
+    match outcome {
         Ok(()) => {
+            if let Some(state) = state {
+                state.failed = false;
+            }
             // Every leg is written, so the report is complete — see
             // `build_single` for why only a successful build prints one.
             explain::print();
             RoundOutcome::Succeeded
         }
-        Err(_) => RoundOutcome::Failed,
+        Err(_) => {
+            // A failed round's `dist/` is not a baseline: the next round
+            // recompiles every leg (`hmr::round_forces_full`).
+            if let Some(state) = state {
+                state.failed = true;
+            }
+            RoundOutcome::Failed
+        }
     }
+}
+
+/// What one `vilan build --watch` round remembers for the next one, so a leg
+/// the edit did not reach is REUSED rather than recompiled (backlog M22).
+///
+/// `run --watch` has had this since E12 half b; `build --watch` never did, and
+/// the measured consequence on kolt was that a one-character edit in
+/// `views.vl` — a module only the CLIENT leg loads — recompiled client, probe
+/// AND server every round. The state is deliberately the same three fields the
+/// HMR round keeps, and the decision is made by the same two functions
+/// (`hmr::round_forces_full`, `hmr::leg_is_current`): two watch loops that
+/// answer "is this leg current?" two different ways is exactly the drift this
+/// tree refuses elsewhere.
+///
+/// Only `--watch` builds carry one. A one-shot `vilan build` passes `None` and
+/// is byte-for-byte the build it always was.
+#[derive(Default)]
+struct BuildWatchState {
+    /// Per leg, in `members` order: what the last round compiled it from and
+    /// what it bundled. Empty on the first round, which is one of the guards
+    /// that forces a full one.
+    legs: Vec<BuildWatchLeg>,
+    /// Every `vilan.toml` in the tree, hashed: a manifest change can alter
+    /// output without touching a `.vl` source, so it forces a full round.
+    manifest: Option<u64>,
+    /// The previous round failed, so nothing it left in `dist/` is trustworthy.
+    failed: bool,
+}
+
+/// One leg's record in [`BuildWatchState`].
+struct BuildWatchLeg {
+    name: String,
+    /// Each source the leg was compiled from, mapped to the content hash it
+    /// was compiled at — re-hashed, never re-stat'ed (the E12 rule).
+    sources: BTreeMap<PathBuf, u64>,
+    /// What `const asset::bundle` registered for this leg, kept so a SKIPPED
+    /// leg still occupies its output names in the cross-leg collision check
+    /// below: two legs bundling two different files to one name is an error
+    /// whether or not this round recompiled both of them.
+    bundled: Vec<(PathBuf, String)>,
 }
 
 /// Whether a build honours a browser leg's `[entry.<name>] split`
@@ -3870,6 +3954,10 @@ fn build_workspace_artifacts(
     members: &[(Unit, Platform)],
     debug: bool,
     emission: Emission,
+    // `Some` only under `vilan build --watch` (backlog M22): the previous
+    // round's per-leg record, which decides which legs this round may reuse.
+    // Replaced with this round's record on the way out.
+    watch_state: Option<&mut BuildWatchState>,
 ) -> Result<(), ExitCode> {
     let dist = root.join("dist");
     if let Err(error) = fs::create_dir_all(&dist) {
@@ -3892,8 +3980,69 @@ fn build_workspace_artifacts(
     // files to one output name is one `dist/` asked to serve two files on one
     // url, which `asset::bundle_as` made expressible (const-eval.md §3.1).
     let mut bundled_names: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // M22 — which legs this round may SKIP. Same decision, same two functions
+    // and the same safety cases as the HMR round's: reuse is by CONTENT (every
+    // source the leg's artifact was compiled from re-hashes to what it was
+    // compiled with), never by mtime — the watcher's scan only TRIGGERS
+    // rounds. `--explain` forces a full round: the report is a statement about
+    // what THIS build wrote, and a skipped leg has no facts to contribute, so
+    // reusing one would silently shorten the report rather than speed it up.
+    let mut watch_state = watch_state;
+    // The tree walk it costs is paid once per round, whatever it decides.
+    let manifest = watch_state.is_some().then(|| manifest_fingerprint(root));
+    let skip: BTreeSet<String> = match watch_state.as_deref() {
+        Some(state)
+            if !explain::asked()
+                && !hmr::round_forces_full(
+                    state.legs.is_empty(),
+                    state.failed,
+                    state
+                        .manifest
+                        .is_some_and(|previous| Some(previous) != manifest),
+                ) =>
+        {
+            state
+                .legs
+                .iter()
+                .filter(|leg| hmr::leg_is_current(&leg.sources, current_source_hash))
+                .map(|leg| leg.name.clone())
+                .collect()
+        }
+        _ => BTreeSet::new(),
+    };
+    if let Some(state) = watch_state.as_deref_mut() {
+        state.manifest = manifest;
+    }
+    // This round's record, built as the legs are compiled (or carried over).
+    let mut recorded: Vec<BuildWatchLeg> = Vec::new();
     for (unit, platform) in members {
         if platform.is_none() {
+            continue;
+        }
+        if skip.contains(&unit.name) {
+            // Reuse: the leg's artifact in `dist/` was compiled from exactly
+            // these bytes, so a recompile would rewrite the file it already
+            // holds. Its bundled names still have to occupy the collision map
+            // — the other legs' copies are checked against them this round
+            // just as they were last round — and they are already on disk, so
+            // no copy is repeated.
+            let previous = state_leg(watch_state.as_deref(), &unit.name)
+                .expect("the skip set is built from the recorded legs");
+            for (source, name) in &previous.bundled {
+                bundled_names.insert(name.clone(), source.clone());
+            }
+            let output = artifact_path(&dist, &unit.name, *platform);
+            println!(
+                "{} {} -> {}",
+                paint::out(paint::Style::CYAN, "Fresh"),
+                unit.entry.display(),
+                paint::out(paint::Style::BOLD, &output.display().to_string())
+            );
+            recorded.push(BuildWatchLeg {
+                name: previous.name.clone(),
+                sources: previous.sources.clone(),
+                bundled: previous.bundled.clone(),
+            });
             continue;
         }
         if emission == Emission::WholeBundles {
@@ -3903,6 +4052,15 @@ fn build_workspace_artifacts(
         let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
         let mut compiled =
             compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
+        // What the NEXT round re-hashes to decide this leg's skip (M22).
+        // Recorded whether or not a watch is running: the cost is a clone of
+        // the loaded-file list, and a state to write it into is what makes it
+        // a watch.
+        recorded.push(BuildWatchLeg {
+            name: unit.name.clone(),
+            sources: compiled.sources.iter().cloned().collect(),
+            bundled: compiled.bundled.clone(),
+        });
         // Before the writers, which record the files this leg's facts explain.
         explain::leg_facts(&unit.name, std::mem::take(&mut compiled.explain));
         let output = artifact_path(&dist, &unit.name, *platform);
@@ -3941,7 +4099,35 @@ fn build_workspace_artifacts(
         warn_superseded_sibling(&output);
         explain::bundle(output, &unit.name);
     }
+    if let Some(state) = watch_state {
+        state.legs = recorded;
+    }
     Ok(())
+}
+
+/// A leg's record from the previous `build --watch` round, by name.
+fn state_leg<'state>(
+    state: Option<&'state BuildWatchState>,
+    name: &str,
+) -> Option<&'state BuildWatchLeg> {
+    state?.legs.iter().find(|leg| leg.name == name)
+}
+
+/// A watched source's content hash RIGHT NOW, read the way the compiler reads
+/// it (BOM dropped, `windows-support.md` §2) so the compare is against the
+/// text the compiler consumed. A recorded input that is a DIRECTORY re-hashes
+/// as its listing (`asset::read_dir`, const-eval.md §3.1), so a file appearing
+/// or vanishing in a listed tree fails the compare. `None` — deleted,
+/// unreadable — disqualifies the skip by construction.
+///
+/// The same reader the HMR round uses, for the same reason it uses it.
+fn current_source_hash(path: &Path) -> Option<u64> {
+    if path.is_dir() {
+        return vilan_core::const_eval::directory_input_hash(path);
+    }
+    vilan_core::util::read_source(path)
+        .ok()
+        .map(|text| vilan_core::content_hash(&text))
 }
 
 /// Type-checks every member of a workspace (each for its own platform; a `none`
@@ -4075,7 +4261,8 @@ fn run_workspace(
             return ExitCode::FAILURE;
         }
     };
-    if let Err(code) = build_workspace_artifacts(root, members, false, Emission::WholeBundles) {
+    if let Err(code) = build_workspace_artifacts(root, members, false, Emission::WholeBundles, None)
+    {
         return code;
     }
     // Run from the project root so the server reads sibling `dist/` bundles; the script

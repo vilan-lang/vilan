@@ -86,6 +86,20 @@ thread_local! {
     /// Thread-local for that same reason: an analysis is single-threaded, and
     /// plain `cargo test` runs analyses concurrently in one process.
     static SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Total wall spent inside [`refined_edges`] on this thread since
+    /// [`reset_refine_time`] — the `dispatch-refine` bucket of the
+    /// `VILAN_PHASE_TIMING` post-pass line (N43).
+    ///
+    /// This call is reached from TWO passes that the line names separately
+    /// (`context::thread_contexts` and the const pass's `check_const_only`),
+    /// so its cost used to be split across two buckets whose names described
+    /// neither it nor them — reading the split cost the editor-perf lane a
+    /// detour through a profiler. One accumulator, summed across both call
+    /// sites, is what makes the shared constant readable from the line.
+    /// Accumulated unconditionally, like the const pass's own sub-split: two
+    /// clock reads per call are noise next to a program-wide scan.
+    static REFINE_TIME: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
 /// The number of impl selections [`refined_edges`] has evaluated on this
@@ -97,6 +111,18 @@ pub fn selection_count() -> usize {
 /// Zeroes this thread's [`selection_count`].
 pub fn reset_selection_count() {
     SELECTION_COUNT.with(|count| count.set(0));
+}
+
+/// How long this thread has spent inside [`refined_edges`] since the last
+/// [`reset_refine_time`]. See [`REFINE_TIME`].
+pub(crate) fn refine_time() -> std::time::Duration {
+    REFINE_TIME.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`refine_time`] — called once per analysis, at the
+/// top of `post_analysis_passes`, which is where both call sites live.
+pub(crate) fn reset_refine_time() {
+    REFINE_TIME.with(|time| time.set(std::time::Duration::ZERO));
 }
 
 /// The trait-member name a call's dispatch record names, when the call also
@@ -314,7 +340,25 @@ fn resolve_through(
 /// per-site rules; the guarantees are (a) every edge's `callee` is one of the
 /// site's candidates, and (b) fallbacks always widen to the whole candidate
 /// list, so a consumer can miss nothing a candidate list covered.
+///
+/// The wall of every call lands in [`REFINE_TIME`], which the phase line's
+/// `dispatch-refine` bucket reads back (N43). The measured region is the
+/// whole call INCLUDING the empty-`sites` early return, so the bucket
+/// answers "what did dispatch refinement cost this analysis" rather than
+/// "what did the calls that did work cost".
 pub fn refined_edges(
+    program: &Program,
+    graph: &CallGraph,
+    sites: &[DispatchSite],
+) -> Vec<RefinedEdge> {
+    let started = crate::PhaseClock::now();
+    let edges = refined_edges_timed(program, graph, sites);
+    REFINE_TIME.with(|time| time.set(time.get() + started.elapsed()));
+    edges
+}
+
+/// [`refined_edges`] itself; the public name is its timing wrapper.
+fn refined_edges_timed(
     program: &Program,
     graph: &CallGraph,
     sites: &[DispatchSite],
