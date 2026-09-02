@@ -302,6 +302,195 @@ pub enum ExprIfBranch {
     Else((Vec<Id>, Id)),
 }
 
+/// The divergence analysis — "does control leave here, on every path?" — as a
+/// free walk over an expression map, so the type checker and the editor read
+/// ONE answer.
+///
+/// It lived as three private `Analyzer` methods (`block_diverges` /
+/// `expr_diverges` / `if_diverges`) until E114's unreachable-code paint needed
+/// it: a statement is grayed exactly when the statement before it diverges, and
+/// a second walk written for the editor is a second opinion waiting to disagree
+/// with the checker about what "dead" means. Both now call this.
+///
+/// **The two askers are not identical, and the difference is the point.** The
+/// checker asks [`Divergence::checker`], whose leaves are only `ret` and
+/// `jump`. The editor asks [`Divergence::paint`], which additionally treats a
+/// `panic(…)` call as a leaf. Paint may see MORE divergence than the checker
+/// safely — it decides nothing, and a `panic` call really does lower to a
+/// `throw` (`Program::panic_fn_id`), so the statement after one really is
+/// unreachable. Widening the CHECKER the same way would be a language change,
+/// not a refinement: `expr_diverges` gates the R4/R7 diverging-leg exemption
+/// and `check_return_position`, so a body ending in `panic()` would newly
+/// satisfy a declared return type and a merge would newly drop that leg's
+/// contribution. That is a decision for a proposal, not for a paint lane.
+pub struct Divergence<'a, 'src> {
+    exprs: &'a HashMap<Id, Expr<'src>>,
+    /// The `panic` intrinsic, when this asker counts a call to it as a leaf.
+    /// `None` is the checker's narrow question, byte-for-byte what the three
+    /// private methods answered before they moved here.
+    panic_fn: Option<Id>,
+    /// The call table, needed only to map a `Expr::Call` to its callee when
+    /// `panic_fn` is set.
+    calls: Option<&'a IndexMap<Id, FunctionCall>>,
+    /// The unconditional `for { … }` loops of the ENTRY file that nothing breaks
+    /// out of, and which therefore never fall through to the statement after
+    /// them. Empty for the checker (see the type's docs); computed once by
+    /// [`Divergence::paint`].
+    endless_loops: HashSet<Id>,
+}
+
+impl<'a, 'src> Divergence<'a, 'src> {
+    /// The type checker's question: `ret`/`jump` are the only leaves.
+    pub fn checker(exprs: &'a HashMap<Id, Expr<'src>>) -> Self {
+        Divergence {
+            exprs,
+            panic_fn: None,
+            calls: None,
+            endless_loops: HashSet::default(),
+        }
+    }
+
+    /// The editor's question (E114): the checker's leaves plus a `panic(…)`
+    /// call (which lowers to a `throw`) and an endless `for { … }` (which never
+    /// falls through). See the type's own docs for why the two askers differ.
+    ///
+    /// Only the ENTRY file's loops are classified, because only the entry file
+    /// is painted and the classification is span-based — two files' spans are
+    /// two coordinate systems, and comparing across them would nest a loop
+    /// inside a `jump` it never contained.
+    pub fn paint(program: &'a Program<'src>) -> Self {
+        Divergence {
+            exprs: &program.entity_map,
+            panic_fn: program.panic_fn_id,
+            calls: Some(&program.function_calls),
+            endless_loops: endless_loops(program),
+        }
+    }
+
+    /// Whether a block definitely diverges (every path returns / jumps out), so
+    /// it never reaches an enclosing merge.
+    pub fn block(&self, statements: &[Id], tail: Id) -> bool {
+        statements.iter().any(|s| self.expr(*s)) || self.expr(tail)
+    }
+
+    /// Whether an expression definitely diverges. `ret`/`jump` are the leaves (a
+    /// `panic(…)` call too, for [`Divergence::paint`]); a block/`if`/`match`
+    /// diverges when all of its continuations do.
+    pub fn expr(&self, expr_id: Id) -> bool {
+        match self.exprs.get(&expr_id) {
+            Some(Expr::FunctionReturn(_)) | Some(Expr::Jump(_)) => true,
+            Some(Expr::Block((statements, tail))) => self.block(statements, *tail),
+            Some(Expr::If(branch)) => self.if_branch(branch),
+            Some(Expr::Match(_, legs)) => {
+                !legs.is_empty() && legs.iter().all(|leg| self.expr(leg.body))
+            }
+            Some(Expr::Call(call_id)) => self.is_panic_call(*call_id),
+            Some(Expr::For(None, _)) => self.endless_loops.contains(&expr_id),
+            _ => false,
+        }
+    }
+
+    /// An `if` diverges iff every arm diverges AND an `else` exists (without one,
+    /// the implicit fall-through continues).
+    fn if_branch(&self, branch: &ExprIfBranch) -> bool {
+        match branch {
+            ExprIfBranch::If(_, (statements, tail), Some(else_branch)) => {
+                self.block(statements, *tail) && self.if_branch(else_branch)
+            }
+            ExprIfBranch::If(_, _, None) => false,
+            ExprIfBranch::Else((statements, tail)) => self.block(statements, *tail),
+        }
+    }
+
+    /// Whether `call_id` calls the `panic` intrinsic — always false for the
+    /// checker, which is what keeps its answer unchanged by this move.
+    fn is_panic_call(&self, call_id: Id) -> bool {
+        let (Some(panic_fn), Some(calls)) = (self.panic_fn, self.calls) else {
+            return false;
+        };
+        let Some(call) = calls.get(&call_id) else {
+            return false;
+        };
+        // A resolved direct callee reads back as `Local(function id)` — the
+        // shape every other callee query in this file matches on (`Expr::Local`
+        // is the *resolved reference*, not a variable). `Function` is accepted
+        // beside it so a subject that arrives already-unwrapped is not a silent
+        // miss.
+        matches!(
+            self.exprs.get(&call.subject_id),
+            Some(Expr::Local(callee) | Expr::Function(callee)) if *callee == panic_fn
+        )
+    }
+}
+
+/// The entry file's unconditional `for { … }` loops that nothing breaks out of
+/// — the loops control never leaves except by leaving the FUNCTION, so the
+/// statement after one is unreachable (E114's third case; `for` with no
+/// condition is the language's only endless-loop form, `for cond { … }` being
+/// the `while`).
+///
+/// A `ret` inside such a loop does not rescue the code after it — that leaves
+/// the whole function — so `jump break` is the only exit worth finding, and the
+/// question is which loop each one binds to. `jump` carries no label, so it
+/// binds to the NEAREST enclosing loop: among the loops whose span contains the
+/// `jump`, the one with the smallest span. Nesting is therefore decided by the
+/// source the user wrote, which is exactly what the reader sees.
+///
+/// Conservative in both directions that matter: a loop is classified endless
+/// only when it is in the entry file, has a span, and no `jump break` anywhere
+/// binds to it — an unspanned (desugared) loop and an inner break of ambiguous
+/// nesting both leave the loop OUT of the set, so the statement after it stays
+/// painted as live.
+fn endless_loops(program: &Program) -> HashSet<Id> {
+    // The entry's own expressions, fetched by id range — this runs on every
+    // publish, and scanning the whole program's `entity_map` to find one file's
+    // loops is the shape E121 exists to stop.
+    let span_of = |id: Id| -> Option<Span> {
+        program
+            .span_map
+            .get(&id)
+            .map(|span| **span)
+            .filter(|span| span.start < span.end)
+    };
+    let mut loops: Vec<(Id, Span, bool)> = Vec::new();
+    let mut breaks: Vec<Span> = Vec::new();
+    for (id, expression) in program.entities_of(SourceId(0)) {
+        match expression {
+            Expr::For(condition, _) => {
+                if let Some(span) = span_of(id) {
+                    loops.push((id, span, condition.is_none()));
+                }
+            }
+            Expr::ForEach(..) => {
+                if let Some(span) = span_of(id) {
+                    loops.push((id, span, false));
+                }
+            }
+            Expr::Jump("break") => {
+                if let Some(span) = span_of(id) {
+                    breaks.push(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut endless: HashSet<Id> = loops
+        .iter()
+        .filter(|(_, _, unconditional)| *unconditional)
+        .map(|(id, _, _)| *id)
+        .collect();
+    for jump in breaks {
+        let bound_to = loops
+            .iter()
+            .filter(|(_, span, _)| span.start <= jump.start && jump.end <= span.end)
+            .min_by_key(|(_, span, _)| span.end - span.start);
+        if let Some((id, _, _)) = bound_to {
+            endless.remove(id);
+        }
+    }
+    endless
+}
+
 /// Whether `branch` ends in an `else` on every path — the `if` produces a
 /// value only when this holds (`Type::Void` otherwise, `infer_type_path`'s
 /// `Expr::If` arm). Hoisted out of that arm (editing-dx.md §17, regime 2) so
@@ -10794,34 +10983,20 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a block definitely diverges (every path returns / jumps out), so
     /// it never reaches an enclosing merge — the R4/R7 diverging-leg exemption.
+    ///
+    /// The analysis itself is [`Divergence`], a free walk over the expression
+    /// map, so the editor's unreachable-code paint (E114) reads THIS answer
+    /// rather than a second opinion of its own. The checker asks it in its
+    /// narrow form ([`Divergence::checker`] — no `panic` recognition); see that
+    /// constructor for why widening it here would be a language change.
     fn block_diverges(&self, statements: &[Id], tail: Id) -> bool {
-        statements.iter().any(|s| self.expr_diverges(*s)) || self.expr_diverges(tail)
+        Divergence::checker(&self.expr_id_to_expr_map).block(statements, tail)
     }
 
-    /// Whether an expression definitely diverges. `ret`/`jump` are the leaves; a
-    /// block/`if`/`match` diverges when all of its continuations do.
+    /// Whether an expression definitely diverges — [`Divergence::expr`] over the
+    /// analyzer's own expression map.
     fn expr_diverges(&self, expr_id: Id) -> bool {
-        match self.expr_id_to_expr_map.get(&expr_id) {
-            Some(Expr::FunctionReturn(_)) | Some(Expr::Jump(_)) => true,
-            Some(Expr::Block((statements, tail))) => self.block_diverges(statements, *tail),
-            Some(Expr::If(branch)) => self.if_diverges(branch),
-            Some(Expr::Match(_, legs)) => {
-                !legs.is_empty() && legs.iter().all(|leg| self.expr_diverges(leg.body))
-            }
-            _ => false,
-        }
-    }
-
-    /// An `if` diverges iff every arm diverges AND an `else` exists (without one,
-    /// the implicit fall-through continues).
-    fn if_diverges(&self, branch: &ExprIfBranch) -> bool {
-        match branch {
-            ExprIfBranch::If(_, (statements, tail), Some(else_branch)) => {
-                self.block_diverges(statements, *tail) && self.if_diverges(else_branch)
-            }
-            ExprIfBranch::If(_, _, None) => false,
-            ExprIfBranch::Else((statements, tail)) => self.block_diverges(statements, *tail),
-        }
+        Divergence::checker(&self.expr_id_to_expr_map).expr(expr_id)
     }
 
     /// R9 (destruction.md §4): no closure or spawn captures a resource. A closure
@@ -37747,6 +37922,40 @@ impl<'src> Program<'src> {
             .iter()
             .find(|range| id.0 >= range.start && id.0 < range.end)
             .map(|range| range.source)
+    }
+
+    /// [`Self::source_of`] INVERTED: the entity-id ranges `source`'s own
+    /// entities occupy.
+    ///
+    /// `source_of` is a linear scan of `source_ranges`, which is right for one
+    /// id and wrong for a filter — asking it per entity in a whole-program table
+    /// is the scan re-run once per row. A caller that wants "everything from
+    /// this one file" takes the ranges once and tests membership against them
+    /// (E114's paint walks are the first: they classify only the OPEN file, and
+    /// were walking every std body to find out which bodies those were).
+    pub fn id_ranges_of(&self, source: SourceId) -> Vec<std::ops::Range<u32>> {
+        self.source_ranges
+            .iter()
+            .filter(|range| range.source == source)
+            .map(|range| range.start..range.end)
+            .collect()
+    }
+
+    /// The expressions `source` wrote, as `(id, expr)` — walked by ID RANGE, not
+    /// by scanning `entity_map`.
+    ///
+    /// The map is whole-program: an editor question about the OPEN file scanned
+    /// `std` and every dependency to find the handful of rows it wanted, and
+    /// paid that on every publish. Ids are assigned per file in contiguous
+    /// blocks ([`Self::id_ranges_of`]), so the file's own rows can be *fetched*
+    /// instead, which is proportional to the file rather than to the program.
+    /// Rows the range covers but the map has no entry for (an id that named
+    /// something other than an expression) are simply skipped.
+    pub fn entities_of(&self, source: SourceId) -> impl Iterator<Item = (Id, &Expr<'src>)> {
+        self.id_ranges_of(source)
+            .into_iter()
+            .flat_map(|range| range.map(Id))
+            .filter_map(|id| self.entity_map.get(&id).map(|expression| (id, expression)))
     }
 
     /// The attribute a GENERATED entity was expanded from: its span, in the

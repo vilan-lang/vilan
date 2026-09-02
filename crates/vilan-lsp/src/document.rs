@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
-use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Parameter, SourceId};
+use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
 use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
@@ -280,6 +280,69 @@ fn resolve_dependencies(
 /// spellings differed by a `.` or a `..`.
 fn same_file(a: &Path, b: &Path) -> bool {
     vilan_core::util::canonical_path(a) == vilan_core::util::canonical_path(b)
+}
+
+/// The smallest span covering both — E114's unreachable third builds one range
+/// per dead block out of its statements' spans.
+fn union(a: Span, b: Span) -> Span {
+    Span::new((), a.start.min(b.start)..a.end.max(b.end))
+}
+
+/// Every STATEMENT LIST the ENTRY file wrote, paired with its trailing
+/// expression: the regions a diverging statement can leave a dead tail in
+/// (E114's unreachable third).
+///
+/// A block-shaped region is not one syntactic thing in the resolved program —
+/// `Expr::Block` is one shape, but an `if` arm, a loop body and a function body
+/// each store their own `(Vec<Id>, Id)` inline rather than wrapping a block —
+/// so all four are collected here, once, instead of at the two call sites that
+/// would otherwise each have to remember the list. `match` legs need no arm of
+/// their own: a leg's body is an expression id, and a braced one IS an
+/// `Expr::Block`. Closures likewise — a closure's `return_` is one expression.
+///
+/// **The ENTRY's regions is not a filter applied afterwards, it is the walk's
+/// scope**, and that is a cost decision as much as a correctness one: only the
+/// open file is painted, so `Program::entities_of` FETCHES the file's rows by id
+/// range instead of scanning a whole-program map — and the divergence walk that
+/// follows no longer visits every `std` body on every publish. The function
+/// table is filtered rather than fetched, because it is small next to the
+/// expression map and a declaration's id is the key.
+///
+/// The regions are unordered and may repeat a list reachable two ways; the
+/// caller sorts and dedups the spans it derives, which is cheaper than deduping
+/// the regions and is the only ordering anything downstream needs.
+fn block_regions<'a>(
+    program: &'a Program<'a>,
+    entry_ids: &[std::ops::Range<u32>],
+) -> Vec<(&'a [Id], Id)> {
+    fn if_arms<'a>(branch: &'a ExprIfBranch, regions: &mut Vec<(&'a [Id], Id)>) {
+        match branch {
+            ExprIfBranch::If(_, (statements, tail), next) => {
+                regions.push((statements, *tail));
+                if let Some(next) = next {
+                    if_arms(next, regions);
+                }
+            }
+            ExprIfBranch::Else((statements, tail)) => regions.push((statements, *tail)),
+        }
+    }
+
+    let mut regions: Vec<(&[Id], Id)> = Vec::new();
+    for (_, expression) in program.entities_of(SourceId(0)) {
+        match expression {
+            Expr::Block((statements, tail))
+            | Expr::For(_, (statements, tail))
+            | Expr::ForEach(_, _, (statements, tail)) => regions.push((statements, *tail)),
+            Expr::If(branch) => if_arms(branch, &mut regions),
+            _ => {}
+        }
+    }
+    for (id, function) in &program.functions {
+        if entry_ids.iter().any(|range| range.contains(&id.0)) {
+            regions.push((&function.body.0, function.body.1));
+        }
+    }
+    regions
 }
 
 /// Whether `file` lives within `directory`, through the same helper.
@@ -2790,6 +2853,172 @@ impl Document {
             .into_iter()
             .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans))
             .collect()
+    }
+
+    /// The local bindings nothing in this file reads (E114's declarations
+    /// third) — the spans the editor FADES, in the analyzed text's coordinates.
+    ///
+    /// **Local, and only local, because Vilan has no other private scope.**
+    /// There is no visibility marker in the language: `pub fun helper()` is a
+    /// parse error whose curated rule says so ("a module's items are importable
+    /// as they stand"), and `module_importables` will bind ANY top-level name an
+    /// `import` asks for. So a top-level `fun`/`struct`/`enum`/`let` is module
+    /// surface — a file the editor never analyzed may import it — and fading one
+    /// on the strength of a single-entry analysis would be a guess. A function
+    /// body is the one scope the language genuinely closes: nothing outside it
+    /// can name a `let` declared inside, so "unreferenced here" IS "dead", with
+    /// no world the editor cannot see. (See the lane's report for the
+    /// whole-package design that WOULD reach the top level, and its cost.)
+    ///
+    /// Paint, not a warning, exactly like the imports third: hint severity,
+    /// `DiagnosticTag::Unnecessary`, out of every count (`publish::
+    /// diagnostic_groups`).
+    ///
+    /// Conservative in the imports third's two ways plus two of its own:
+    ///  - nothing fades while the buffer is ahead of the analysis, and nothing
+    ///    fades in a file carrying a diagnostic (a half-typed line might be
+    ///    about to read the binding);
+    ///  - an `_`-led name is the language's own "I know" marker (`let _ = …` is
+    ///    what the `[must_use]` rule tells you to write), so it never fades;
+    ///  - a binding whose reference index DROPPED a use site (a span that could
+    ///    not be narrowed onto its identifier) is kept: an incomplete tally is
+    ///    no evidence of zero.
+    ///
+    /// Parameters are deliberately not here. A parameter is signature, not a
+    /// local: a trait impl must take what the declaration takes, so an unused
+    /// one is frequently obligatory rather than dead.
+    pub fn unused_local_spans(&self) -> Vec<Span> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        // The entry's id ranges first, because every later test is cheaper than
+        // `source_of` (a linear scan of `source_ranges`, which asked per
+        // variable is that scan re-run once per row).
+        let entry_ids = program.id_ranges_of(SourceId(0));
+        let module_level: HashSet<Id> = program.module_level_bindings().into_iter().collect();
+        program
+            .variables
+            .iter()
+            .filter(|(id, _)| entry_ids.iter().any(|range| range.contains(&id.0)))
+            .filter(|(id, _)| !module_level.contains(*id))
+            .filter(|(_, variable)| !variable.name.starts_with('_'))
+            .filter(|(id, _)| {
+                let definition = Definition::Entity(**id);
+                self.reference_index.dropped_for(definition) == 0
+                    && self
+                        .reference_index
+                        .occurrences_of(definition)
+                        .all(|occurrence| occurrence.is_declaration)
+            })
+            .map(|(_, variable)| variable.name_span)
+            .collect()
+    }
+
+    /// The statements this file can never reach (E114's unreachable third) — the
+    /// spans the editor FADES, in the analyzed text's coordinates. One span per
+    /// block, covering the whole dead tail rather than one mark per statement:
+    /// what died is the REST of the block, and N faded lines say that N times.
+    ///
+    /// It is the CHECKER's divergence analysis, not a second one
+    /// ([`vilan_core::analyzer::Divergence`], which the analyzer's own
+    /// `block_diverges` now calls too). `ret`, `jump` (the loop tails), an `if`
+    /// whose every arm diverges *and* has an `else`, and a `match` whose every
+    /// arm diverges are the checker's own leaves and arrive unchanged. Paint
+    /// asks for two the checker does not have, documented on `Divergence`
+    /// itself: a `panic(…)` call, which lowers to a `throw`, and an endless
+    /// `for { … }` nothing breaks out of — `for` with no condition being the
+    /// language's only endless-loop form, since `for cond { … }` is the `while`
+    /// and `for … in` finishes with its iterable.
+    ///
+    /// Conservative in the imports third's two ways — nothing fades while the
+    /// buffer is ahead of the analysis, nothing fades in a file carrying a
+    /// diagnostic — plus the two this walk needs: a dead region is reported only
+    /// where every statement in it carries a real span IN THIS FILE (a
+    /// desugaring's synthesized statement borrows a span it did not write, and a
+    /// synthesized void tail has none at all), and a region whose span does not
+    /// grow is dropped rather than published as an empty range.
+    pub fn unreachable_spans(&self) -> Vec<Span> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        let entry_ids = program.id_ranges_of(SourceId(0));
+        let divergence = vilan_core::analyzer::Divergence::paint(program);
+        let mut spans: Vec<Span> = Vec::new();
+        for (statements, tail) in block_regions(program, &entry_ids) {
+            let Some(diverging) = statements
+                .iter()
+                .position(|statement| divergence.expr(*statement))
+            else {
+                continue;
+            };
+            // Everything after the diverging statement, as ONE range — and only
+            // if every piece of it is code this file actually wrote. The tail is
+            // asked separately, and asked TWICE, because a block's trailing
+            // expression is usually synthesized: `fun f() { ret; }` ends in a
+            // `Void` whose recorded span is the closing BRACE (the S3 callable
+            // anchor). It passes every span test and is not code at all, so it
+            // is excluded by its expression rather than by its span — and being
+            // excluded it must also not veto the real dead statements before it.
+            let dead = &statements[diverging + 1..];
+            let mut extent = self.written_extent(program, &entry_ids, dead);
+            if !dead.is_empty() && extent.is_none() {
+                continue;
+            }
+            let tail_is_written = !matches!(program.entity_map.get(&tail), Some(Expr::Void) | None);
+            if let Some(tail_span) = tail_is_written
+                .then(|| self.written_extent(program, &entry_ids, std::slice::from_ref(&tail)))
+                .flatten()
+            {
+                extent = Some(match extent {
+                    Some(existing) => union(existing, tail_span),
+                    None => tail_span,
+                });
+            }
+            if let Some(span) = extent {
+                spans.push(span);
+            }
+        }
+        spans.sort_by_key(|span| (span.start, span.end));
+        spans.dedup();
+        spans
+    }
+
+    /// The span covering `entities`, or `None` unless every one of them is code
+    /// WRITTEN IN THIS FILE: a real, non-empty span, in the entry source, inside
+    /// the analyzed text. A desugaring's synthesized statement fails this, which
+    /// is the whole reason it is asked — fading a range the user cannot see (or
+    /// one that belongs to a different file) is the mark that lies. An empty
+    /// `entities` answers `None`: there is nothing to fade.
+    fn written_extent(
+        &self,
+        program: &Program,
+        entry_ids: &[std::ops::Range<u32>],
+        entities: &[Id],
+    ) -> Option<Span> {
+        let limit = self.analyzed_text().len();
+        let mut extent: Option<Span> = None;
+        for id in entities {
+            if !entry_ids.iter().any(|range| range.contains(&id.0)) {
+                return None;
+            }
+            let span = program.span_map.get(id)?;
+            if span.start >= span.end || span.end > limit {
+                return None;
+            }
+            extent = Some(match extent {
+                Some(existing) => union(existing, **span),
+                None => **span,
+            });
+        }
+        extent
     }
 
     /// Whether the top-level import whose terminal name occupies `leaf_span` is
@@ -9578,6 +9807,327 @@ pub(crate) mod tests {
             "the fixture must actually be broken",
         );
         assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: unused LOCAL declarations, as paint ────────────────────────────
+    //
+    // The declarations third, at the only scope Vilan actually closes. There is
+    // no visibility marker in the language (`pub fun f()` is a parse error whose
+    // curated rule says "a module's items are importable as they stand"), so a
+    // top-level item is module surface and can never be faded from a single
+    // entry's analysis — which is itself pinned below, because it is the whole
+    // shape of the feature and a later refactor must not quietly widen it.
+
+    /// The name each faded local covers, so a pin reads as the binding the user
+    /// would see grayed.
+    fn faded_locals(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        let mut names: Vec<String> = document
+            .unused_local_spans()
+            .into_iter()
+            .map(|span| text[span.into_range()].to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The source each faded dead region covers.
+    fn faded_dead(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unreachable_spans()
+            .into_iter()
+            .map(|span| text[span.into_range()].to_string())
+            .collect()
+    }
+
+    /// A green fixture's two answers, with the fixture's own greenness asserted
+    /// first — every pin below depends on a clean analysis, since both producers
+    /// are switched off by a diagnostic and would otherwise pass vacuously.
+    fn green(files: &[(&str, &str)]) -> (PathBuf, Document) {
+        let (dir, document) = analyze_workspace(files);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a GREEN fixture, got {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        (dir, document)
+    }
+
+    #[test]
+    fn a_local_nothing_reads_is_faded_and_a_read_one_is_not() {
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tlet kept = 1;\n\tlet dead = 2;\n\tprint(kept);\n}\n",
+        )]);
+        assert_eq!(faded_locals(&document), vec!["dead".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_underscore_led_local_is_never_faded() {
+        // `_`-led is the language's own "I know" marker — the `[must_use]` rule
+        // tells you to write `let _ = …` — so fading it would gray the very
+        // gesture that says "I meant this".
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tlet _unused = 1;\n\tlet _ = 2;\n}\n",
+        )]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_top_level_item_is_never_faded_because_the_language_has_no_private_one() {
+        // THE RULING, pinned. `unreachable_helper` and `spare` are referenced by
+        // nothing in this program — the emission pruner would emit neither — and
+        // they still must not fade: any file the editor never analyzed may write
+        // `import pkg::main::unreachable_helper;` and get it, with nothing in
+        // the language marking it private. A fade here would be a guess about a
+        // world this analysis cannot see.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "let spare = 7;\nfun unreachable_helper(): i32 {\n\t1\n}\nfun main() {}\n",
+        )]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "a top-level item is module surface: {:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parameter_is_never_faded() {
+        // A parameter is signature, not a local: an impl must take what the
+        // declaration takes, so an unread one is routinely obligatory.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun ignores(value: i32) {}\nfun main() {\n\tignores(1);\n}\n",
+        )]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_read_only_under_a_browser_color_is_not_faded() {
+        // E113's coloring, on this third. The file is analyzed under the color
+        // its `vilan.toml` declares — the same one the build takes — so a read
+        // that only exists in a browser build is still a read. Under the process
+        // analysis this file would not even type-check, and the diagnostic gate
+        // below would switch the fade off rather than gray a live binding.
+        let (dir, document) = green(&[
+            (
+                "src/main.vl",
+                "fun main() {\n\tlet width = 4;\n\tprint(width);\n}\n",
+            ),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ntarget = \"browser\"\n",
+            ),
+        ]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_local_is_faded_while_the_file_carries_a_diagnostic() {
+        // The imports third's conservatism, inherited: a half-typed line might
+        // be about to read the binding.
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet dead = 1;\n\tmissing_name();\n}\n",
+        )]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_local_is_faded_while_the_buffer_is_ahead_of_the_analysis() {
+        // The other half of the imports third's conservatism: a stale analysis
+        // describes a file the user has already changed, and its spans no longer
+        // index the text the editor would fade.
+        let (dir, mut document) =
+            green(&[("main.vl", "fun main() {\n\tlet dead = 1;\n\tprint(2);\n}\n")]);
+        assert_eq!(faded_locals(&document), vec!["dead".to_string()]);
+        document.set_text("fun main() {\n\tlet dead = 1;\n\tprint(3);\n}\n");
+        assert!(document.is_stale(), "the fixture must actually be stale");
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: unreachable code, as paint ─────────────────────────────────────
+    //
+    // The divergence analysis is the CHECKER's (`analyzer::Divergence`), with
+    // the one widening paint is allowed and the checker is not: a `panic(…)`
+    // call is a leaf here, because it lowers to a `throw`. Each pin below is one
+    // way control leaves.
+
+    #[test]
+    fn a_statement_after_ret_is_faded() {
+        let (dir, document) = green(&[("main.vl", "fun main() {\n\tret;\n\tprint(1);\n}\n")]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_whole_dead_tail_is_one_faded_region_not_one_per_statement() {
+        // What died is the REST of the block. Three faded lines say the same
+        // thing three times; the editor gets one range.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tret;\n\tprint(1);\n\tprint(2);\n\tprint(3);\n}\n",
+        )]);
+        assert_eq!(
+            faded_dead(&document),
+            vec!["print(1);\n\tprint(2);\n\tprint(3)".to_string()],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_panic_is_faded() {
+        // The paint-only widening. `panic` lowers to a `throw`, so the statement
+        // after one genuinely never runs — but the CHECKER does not count it as
+        // divergence, and must not: `expr_diverges` gates the R4/R7 exemption
+        // and return-position checking, and widening it there would change what
+        // the language accepts.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "import std::io::panic;\nfun main() {\n\tpanic(\"stop\");\n\tprint(1);\n}\n",
+        )]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_a_loop_tail_jump_is_faded() {
+        // `jump` is the loop tail — the language's `break`/`continue` — and one
+        // of the checker's own two divergence leaves.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tfor {\n\t\tjump break;\n\t\tprint(1);\n\t}\n}\n",
+        )]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_an_if_whose_every_arm_diverges_is_faded() {
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tif 1 > 0 {\n\t\tret;\n\t} else {\n\t\tret;\n\t}\n\tprint(1);\n}\n",
+        )]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_if_with_no_else_leaves_the_rest_of_the_block_alive() {
+        // The exemption that keeps the whole class honest: without an `else` the
+        // implicit fall-through continues, so the statement after it is reached
+        // on the condition's false path.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tif 1 > 0 {\n\t\tret;\n\t}\n\tprint(1);\n}\n",
+        )]);
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_an_endless_for_is_faded_and_a_broken_one_is_not() {
+        // `for { … }` with no condition is the language's only endless-loop
+        // form (`for cond { … }` is the `while`), and control leaves it only by
+        // leaving the function. A `jump break` binds to the NEAREST enclosing
+        // loop, so the second fixture's loop does fall through and its tail
+        // stays alive.
+        let (endless_dir, endless) = green(&[(
+            "main.vl",
+            "fun main() {\n\tfor {\n\t\tprint(1);\n\t}\n\tprint(2);\n}\n",
+        )]);
+        assert_eq!(faded_dead(&endless), vec!["print(2)".to_string()]);
+        let _ = std::fs::remove_dir_all(&endless_dir);
+
+        let (broken_dir, broken) = green(&[(
+            "main.vl",
+            "fun main() {\n\tfor {\n\t\tjump break;\n\t}\n\tprint(2);\n}\n",
+        )]);
+        assert!(
+            faded_dead(&broken).is_empty(),
+            "a loop something breaks out of falls through: {:?}",
+            faded_dead(&broken),
+        );
+        let _ = std::fs::remove_dir_all(&broken_dir);
+    }
+
+    #[test]
+    fn nothing_is_faded_as_unreachable_while_the_file_carries_a_diagnostic() {
+        // The same conservatism the imports third takes: a broken file's
+        // statement list is a guess, and a mark that lies is worse than no mark.
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tret;\n\tmissing_name();\n}\n")]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_that_merely_ends_in_ret_fades_nothing() {
+        // The synthesized-tail case, which is the common one: `fun f() { ret; }`
+        // has a trailing void expression the user never wrote. Fading it would
+        // gray a closing brace.
+        let (dir, document) = green(&[("main.vl", "fun main() {\n\tprint(1);\n\tret;\n}\n")]);
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -507,15 +507,29 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
     // folded into `published_diagnostics` for the same reason: this is the one
     // place where what goes ON THE WIRE is assembled, so nothing that counts
     // diagnostics can accidentally count these.
-    for span in document.unused_import_spans() {
-        entry_group.push(Diagnostic {
-            range: document.analyzed_range(&span),
-            severity: Some(DiagnosticSeverity::HINT),
-            source: Some("vilan".to_string()),
-            message: "unused import".to_string(),
-            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-            ..Default::default()
-        });
+    //
+    // The other two thirds arrive the same way and for the same reason: an
+    // unread local binding, and the statements after a diverging one. Each is
+    // its own message because each is its own fix — delete the binding, delete
+    // the dead lines — and all three share the severity, the tag, and the
+    // conservatism (`Document::unused_import_spans` and its two siblings all
+    // answer empty for a stale or broken file).
+    let faded = [
+        ("unused import", document.unused_import_spans()),
+        ("unused local", document.unused_local_spans()),
+        ("unreachable code", document.unreachable_spans()),
+    ];
+    for (message, spans) in faded {
+        for span in spans {
+            entry_group.push(Diagnostic {
+                range: document.analyzed_range(&span),
+                severity: Some(DiagnosticSeverity::HINT),
+                source: Some("vilan".to_string()),
+                message: message.to_string(),
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                ..Default::default()
+            });
+        }
     }
     let mut groups = vec![(owner.clone(), entry_group)];
     groups.extend(extra_groups);
@@ -677,9 +691,11 @@ mod tests {
             &path,
         );
         commented.stamp_analysis(3);
-        // …and the restored one, which does.
+        // …and the restored one, which does. The `print(right)` is
+        // load-bearing (E114): a binding nothing reads publishes a faded
+        // "unused local" hint, and this state must publish NOTHING.
         let mut restored = Document::analyze(
-            "fun main() {\n\tlet right: i32 = 1;\n}\n",
+            "fun main() {\n\tlet right: i32 = 1;\n\tprint(right);\n}\n",
             &std_root(),
             &path,
         );
@@ -753,6 +769,53 @@ mod tests {
                 .iter()
                 .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
             "a clean file with an unused import has no errors or warnings: {published:#?}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E114's other two thirds at the wire, pinned for the ONE property that is
+    /// the owner's whole posture: they are paint. A dead local and a dead
+    /// statement publish at HINT severity with `DiagnosticTag::Unnecessary`, so
+    /// nothing that counts diagnostics can count them — a Warning here would put
+    /// tidiness observations in the Problems badge and gate a build on style.
+    /// The severities are asserted over the WHOLE published group and not only
+    /// over the faded items, which is what makes "does not enter the count" a
+    /// property of the file and not of the diagnostics we happened to look at.
+    #[test]
+    fn a_dead_local_and_a_dead_statement_publish_as_hints_tagged_unnecessary() {
+        let (directory, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet dead = 1;\n\tret;\n\tprint(2);\n}\n",
+        )]);
+        let uri = Url::from_file_path(directory.join("main.vl")).expect("a file URL");
+        let published = PublishState::new()
+            .plan_publish(&uri, &document)
+            .into_iter()
+            .find(|(target, _)| *target == uri)
+            .map(|(_, group)| group)
+            .expect("the entry publishes");
+        let faded: Vec<&Diagnostic> = published
+            .iter()
+            .filter(|item| item.tags.as_deref() == Some(&[DiagnosticTag::UNNECESSARY]))
+            .collect();
+        let mut messages: Vec<&str> = faded.iter().map(|item| item.message.as_str()).collect();
+        messages.sort_unstable();
+        assert_eq!(
+            messages,
+            vec!["unreachable code", "unused local"],
+            "both thirds reach the wire: {published:#?}",
+        );
+        assert!(
+            faded
+                .iter()
+                .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
+            "{published:#?}",
+        );
+        assert!(
+            published
+                .iter()
+                .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
+            "a clean file with dead code has no errors or warnings: {published:#?}",
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1283,9 +1346,12 @@ mod tests {
         let (dir, _) =
             analyze_workspace(&[("solo.vl", "fun main() {\n\tlet wrong: i32 = \"text\";\n}\n")]);
         let (_, broken) = open(&dir, "solo.vl");
+        // The `print(right)` is load-bearing (E114): a binding nothing reads
+        // publishes a faded "unused local" hint, and every assertion below is
+        // about a file that publishes NOTHING.
         std::fs::write(
             dir.join("solo.vl"),
-            "fun main() {\n\tlet right: i32 = 1;\n}\n",
+            "fun main() {\n\tlet right: i32 = 1;\n\tprint(right);\n}\n",
         )
         .unwrap();
         let (_, fixed) = open(&dir, "solo.vl");
@@ -1535,9 +1601,12 @@ mod tests {
         );
         assert_eq!(visible(&editor), fresh_view(&[(&uri, &document)]));
 
+        // The `print(right)` is load-bearing (E114): a binding nothing reads
+        // publishes a faded "unused local" hint, and every assertion below is
+        // about a file that publishes NOTHING.
         std::fs::write(
             dir.join("solo.vl"),
-            "fun main() {\n\tlet right: i32 = 1;\n}\n",
+            "fun main() {\n\tlet right: i32 = 1;\n\tprint(right);\n}\n",
         )
         .unwrap();
         let (_, fixed) = open(&dir, "solo.vl");
