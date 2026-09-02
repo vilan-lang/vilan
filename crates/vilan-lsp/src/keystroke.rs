@@ -46,6 +46,7 @@ use vilan_core::token::Token;
 use vilan_ide::{Completion, CompletionKind};
 
 use crate::document::{MODIFIER_DECLARATION, MODIFIER_READONLY, TokenKind};
+use crate::line_index::LineIndex;
 
 // ---------------------------------------------------------------------------
 // 1. The two-sided anchor
@@ -722,8 +723,23 @@ pub fn module_name_of(path: &Path) -> String {
 pub struct LandedSnapshot {
     /// The declaration shape of the text this analysis ran on.
     pub stamp: ShapeStamp,
-    /// The analysis's semantic tokens, in ANALYZED coordinates.
+    /// The analysis's semantic tokens, in ANALYZED coordinates, ordered by
+    /// start offset and non-overlapping (`Document::semantic_tokens`
+    /// guarantees both, and B38's salvage tail appends strictly after them).
     pub tokens: Vec<(Span, TokenKind, u32)>,
+    /// E122's viewport index over [`tokens`](Self::tokens): `token_lines[line]`
+    /// is the position in `tokens` of the first token whose start line is at
+    /// or after `line`. Non-decreasing, `tokens.len()` at the end, and one
+    /// longer than the highest token line — so a line window is a clamp and
+    /// two indexes, never a scan.
+    ///
+    /// It lives HERE, beside the tokens it indexes, rather than in a second
+    /// memo of its own: the capture is already built once per analysis and
+    /// invalidated in exactly one place (`Document::adopt_analysis`), and a
+    /// parallel memo of the same stream would be a second thing to keep
+    /// truthful. Empty on a snapshot nothing landed into, which
+    /// [`tokens_in_lines`](Self::tokens_in_lines) reads as "no tokens".
+    pub token_lines: Vec<u32>,
     /// The analysis's inlay hints, in ANALYZED coordinates.
     pub hints: Vec<(usize, String)>,
     /// The declared names of every module the analysis loaded.
@@ -733,6 +749,49 @@ pub struct LandedSnapshot {
 }
 
 impl LandedSnapshot {
+    /// Build [`token_lines`](Self::token_lines) over the tokens now held, in
+    /// the `index` those tokens' offsets belong to (the ANALYZED one).
+    ///
+    /// Called once per analysis, from the two places the capture's tokens are
+    /// set: `Document::capture_landed` on the analysis thread, and
+    /// `Document::adopt_analysis` after B38's salvage tail is folded in. Start
+    /// lines are non-decreasing because start offsets are strictly increasing,
+    /// which is what lets a line window be a contiguous slice at all.
+    pub fn index_token_lines(&mut self, index: &LineIndex) {
+        let mut lines: Vec<u32> = Vec::with_capacity(self.tokens.len());
+        for (span, ..) in &self.tokens {
+            lines.push(index.range(span).start.line);
+        }
+        let highest = lines.last().copied().unwrap_or(0) as usize;
+        let mut token_lines = vec![self.tokens.len() as u32; highest + 2];
+        // Backwards, so a line with several tokens keeps the FIRST of them and
+        // a line with none inherits the next line's start.
+        for (position, line) in lines.iter().enumerate().rev() {
+            token_lines[*line as usize] = position as u32;
+        }
+        for line in (0..token_lines.len() - 1).rev() {
+            token_lines[line] = token_lines[line].min(token_lines[line + 1]);
+        }
+        self.token_lines = token_lines;
+    }
+
+    /// The captured tokens whose start line lies in `first_line..=last_line` —
+    /// the viewport slice `semanticTokens/range` answers with (E122).
+    ///
+    /// Byte-identical to filtering [`tokens`](Self::tokens) by the same
+    /// predicate, and costing the slice rather than the file: this used to be
+    /// a whole-file walk of the program plus one line lookup per token in the
+    /// file, so twenty visible lines cost what the whole file cost (12.2 ms on
+    /// kolt's `views.vl`, `proposal/editor-latency.md` §1.6).
+    pub fn tokens_in_lines(&self, first_line: u32, last_line: u32) -> &[(Span, TokenKind, u32)] {
+        let Some(last) = self.token_lines.len().checked_sub(1) else {
+            return &[];
+        };
+        let first = self.token_lines[(first_line as usize).min(last)] as usize;
+        let past = self.token_lines[(last_line as usize).saturating_add(1).min(last)] as usize;
+        &self.tokens[first..past.max(first)]
+    }
+
     /// The tokens the live buffer should be painted with, given `anchor` and
     /// `verdict` — the §2.1.3 split, in one place.
     ///

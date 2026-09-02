@@ -24,13 +24,15 @@ dashmap = "6"
 serde_json = "1"
 
 # Test-only, and only for the clock: E121's keystroke-path gate
-# (`src/keystroke.rs`'s `gate` module) asserts THREAD CPU time so that eleven
-# sibling test suites cannot red it (backlog M15), and neither platform exposes
-# a thread clock through `std`. Both packages are already in the lockfile — and
-# so already covered by `THIRD-PARTY-NOTICES.txt` — because the tree depends on
-# them elsewhere; these edges add no third-party surface to the shipped binary,
-# which is why they are dev-dependencies and not dependencies. The identical
-# pair on `vilan-cli` carries the same note for the same reason.
+# (`src/keystroke.rs`'s `gate` module) and E122's range-scaling gate
+# (`main.rs`'s `semantic_token_range_cost_tests`) both assert THREAD CPU time so
+# that eleven sibling test suites cannot red them (backlog M15), and neither
+# platform exposes a thread clock through `std`. Both packages are already in
+# the lockfile — and so already covered by `THIRD-PARTY-NOTICES.txt` — because
+# the tree depends on them elsewhere; these edges add no third-party surface to
+# the shipped binary, which is why they are dev-dependencies and not
+# dependencies. The identical pair on `vilan-cli` carries the same note for the
+# same reason.
 [target."cfg(unix)".dev-dependencies]
 libc = "0.2"
 

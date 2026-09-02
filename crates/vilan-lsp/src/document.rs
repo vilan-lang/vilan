@@ -854,6 +854,35 @@ pub struct PublishedHop {
     pub call: bool,
 }
 
+/// B38, the salvage signature: when `stream` is entirely silent within the
+/// retained suffix — the shape of a parse break truncating the file to a
+/// prefix — the previous analysis's tokens for the byte-identical tail fill
+/// in, already shifted into this analysis's coordinates. A stream that reaches
+/// the suffix suppresses this wholesale, which is what keeps re-classification
+/// of identical text (semantics flow downward) fresh rather than stale.
+///
+/// Two callers, and they are the same rule applied to the same tokens at the
+/// two moments they exist: [`Document::semantic_tokens`], the walk, and
+/// [`Document::adopt_analysis`], which folds the tail into the analysis's
+/// CAPTURE the moment it computes one. Appending rather than merging is sound
+/// because the guard has just established that every kept token ends at or
+/// before `tail_start` and every retained one starts at or after it, so the
+/// result is still sorted and still non-overlapping.
+fn fold_retained_tail(
+    stream: &mut Vec<(Span, TokenKind, u32)>,
+    tail: &[(Span, TokenKind, u32)],
+    tail_start: usize,
+) {
+    if tail.is_empty() || !stream.iter().all(|(span, ..)| span.end <= tail_start) {
+        return;
+    }
+    stream.extend(
+        tail.iter()
+            .filter(|(span, ..)| span.start >= tail_start)
+            .cloned(),
+    );
+}
+
 /// The markup spans of a raw parse (element-syntax S5): tag names (open and
 /// close), the angle brackets around them, attribute and event names, and the
 /// desugar-scaffolding spans whose analyzed tokens the markup replaces.
@@ -994,10 +1023,26 @@ impl Document {
             .unwrap_or_else(|_| Self::internal_error(&outer_text))
     }
 
-    /// The degraded document a panicked analysis lands on: no program, the
-    /// live text faithfully recorded (so position mapping and re-analysis on
-    /// the next edit behave), and one honest diagnostic.
-    fn internal_error(text: &str) -> Self {
+    /// A document holding `text` and NOTHING an analysis produces: no program,
+    /// no diagnostics, the live text faithfully recorded so position mapping
+    /// and the next re-analysis behave.
+    ///
+    /// Two callers, and they are the two ways a document can exist without an
+    /// analysis behind it: the degraded document a panicked analysis lands on
+    /// ([`internal_error`](Document::internal_error), which adds its one honest
+    /// diagnostic), and the entry `did_open` puts in the map before it schedules
+    /// the first analysis (E123). Every query handler already reads `program`
+    /// through an `Option` and answers emptily when there is none — the same
+    /// state the debounce window has always had between an edit and its
+    /// analysis.
+    ///
+    /// `text_hash` is the hash of `text`, which says "the analyzed text is
+    /// this" while nothing has been analyzed. That is deliberate and safe
+    /// because a document only ever reaches the map WITH an analysis of that
+    /// exact text scheduled: the skip it can produce (`pause_action`'s
+    /// `Unchanged`, when an edit is undone inside one debounce window) skips a
+    /// re-analysis that the open's own analysis is already doing.
+    pub fn unanalyzed(text: &str) -> Self {
         let line_index = Arc::new(LineIndex::new(text));
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
@@ -1005,13 +1050,8 @@ impl Document {
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: AnalyzedProgram::none(),
-            diagnostics: vec![Error { trace: Vec::new(),
-                note: None,
-                span: vilan_core::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
-                    .to_string(),
-            }],
-            diagnostic_sources: vec![SourceId(0)],
+            diagnostics: Vec::new(),
+            diagnostic_sources: Vec::new(),
             warnings: Vec::new(),
             warning_sources: Vec::new(),
             text: text.to_string(),
@@ -1029,6 +1069,23 @@ impl Document {
             // Nothing landed, so the keystroke path answers from syntax alone.
             landed: LandedSnapshot::default(),
         }
+    }
+
+    /// The degraded document a panicked analysis lands on: [`unanalyzed`], plus
+    /// the one honest diagnostic saying so.
+    ///
+    /// [`unanalyzed`]: Document::unanalyzed
+    fn internal_error(text: &str) -> Self {
+        let mut document = Self::unanalyzed(text);
+        document.diagnostics = vec![Error {
+            trace: Vec::new(),
+            note: None,
+            span: vilan_core::span::Span::new((), 0..0),
+            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
+                .to_string(),
+        }];
+        document.diagnostic_sources = vec![SourceId(0)];
+        document
     }
 
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
@@ -1244,13 +1301,18 @@ impl Document {
         if !self.program.is_some() {
             return LandedSnapshot::default();
         }
-        LandedSnapshot {
+        let mut landed = LandedSnapshot {
             stamp: shape_stamp(self.analyzed_text()),
             tokens: self.semantic_tokens(),
+            token_lines: Vec::new(),
             hints: self.inlay_hints(),
             index: self.landed_symbol_index(entry_path),
             landed: true,
-        }
+        };
+        // E122: the viewport index over the tokens just captured, paid on the
+        // same thread and in the same breath as the walk that produced them.
+        landed.index_token_lines(&self.analyzed_index);
+        landed
     }
 
     /// The per-module symbol index this analysis supports (§2.1.4): every
@@ -1623,9 +1685,10 @@ impl Document {
     /// re-analyzing. Applied on every edit so live-text queries (notably
     /// completion's context scan) see the just-typed character immediately,
     /// while the heavier re-analysis stays debounced. The analyzed snapshot
-    /// (`program`, `analyzed_index`, `text_hash`) is deliberately untouched:
-    /// program answers stay exactly right for the text they were computed
-    /// from, and the pending re-analysis still fires.
+    /// (`program`, `analyzed_index`, `text_hash`, and with them the analysis's
+    /// captured answers) is deliberately untouched: program answers stay
+    /// exactly right for the text they were computed from, and the pending
+    /// re-analysis still fires.
     pub fn set_text(&mut self, text: &str) {
         self.line_index = Arc::new(LineIndex::new(text));
         self.text = text.to_string();
@@ -1903,6 +1966,18 @@ impl Document {
         // so they are adopted with it. Nothing is recomputed here — the walk
         // was paid on the analysis thread.
         self.landed = landed;
+        // E122, and the ONE place the capture's inputs move: the analysis was
+        // built without the salvage tail this adoption just computed for it, so
+        // the tail is folded in HERE and the line index rebuilt over the
+        // result. After this line `self.landed.tokens` is exactly what
+        // `self.semantic_tokens()` would answer, which is what lets `full` and
+        // `range` serve one capture instead of two pictures of it.
+        fold_retained_tail(
+            &mut self.landed.tokens,
+            &self.retained_tail,
+            self.retained_tail_start,
+        );
+        self.landed.index_token_lines(&self.analyzed_index);
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -2332,12 +2407,32 @@ impl Document {
         hints
     }
 
+    /// The analyzed snapshot's tokens whose start line lies in
+    /// `first_line..=last_line`, sliced out of the capture by E122's line
+    /// index — what `semanticTokens/range` answers with, in ANALYZED
+    /// coordinates like every other reader of the capture.
+    pub fn semantic_tokens_in_lines(
+        &self,
+        first_line: u32,
+        last_line: u32,
+    ) -> &[(Span, TokenKind, u32)] {
+        self.landed.tokens_in_lines(first_line, last_line)
+    }
+
     /// The entry document's semantic tokens (E2), name-sized and
     /// non-overlapping, sorted by position. Classification comes from the
     /// ANALYZED program: declaration name spans, identifier-sized reference
     /// entities, method-call name spans, and type-position references (whose
     /// definitions also cover macro names — they share trait names by design,
     /// and only semantics can tell them apart).
+    ///
+    /// This is the WALK, and it is paid **once per landed analysis**: E121's
+    /// [`capture_landed`](Document::capture_landed) calls it on the analysis
+    /// thread and every request afterwards is served from the capture it
+    /// stores (`LandedSnapshot::tokens`, and for a viewport request the line
+    /// index beside it — E122). The other caller is
+    /// [`compute_retained_tail`](Document::compute_retained_tail), which reads
+    /// the OUTGOING analysis one last time as it is replaced.
     pub fn semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
@@ -2541,25 +2636,7 @@ impl Document {
                 kept.push((span, kind, modifiers));
             }
         }
-        // B38, the salvage signature: when the fresh stream is entirely
-        // silent within the retained suffix — the shape of a parse break
-        // truncating the file to a prefix — the previous analysis's tokens
-        // for the byte-identical tail fill in, already shifted. A stream
-        // that reaches the suffix suppresses this wholesale, which is what
-        // keeps re-classification of identical text (semantics flow
-        // downward) fresh rather than stale.
-        if !self.retained_tail.is_empty()
-            && kept
-                .iter()
-                .all(|(span, ..)| span.end <= self.retained_tail_start)
-        {
-            kept.extend(
-                self.retained_tail
-                    .iter()
-                    .filter(|(span, ..)| span.start >= self.retained_tail_start)
-                    .cloned(),
-            );
-        }
+        fold_retained_tail(&mut kept, &self.retained_tail, self.retained_tail_start);
         kept
     }
 
@@ -11606,6 +11683,55 @@ pub(crate) mod tests {
         assert!(
             !retained.is_empty(),
             "the byte-identical tail below the break must keep its tokens"
+        );
+    }
+
+    /// E122's fold, and the thing that lets ONE capture serve every token
+    /// request: the salvage tail is folded into the analysis's CAPTURE at
+    /// adoption, not read back out of the walk at serve time. So the captured
+    /// stream — what `semanticTokens/full` and `semanticTokens/range` both
+    /// answer from — is byte-for-byte what the walk answers, salvage included,
+    /// and the line index built beside it reaches into the salvaged tail.
+    ///
+    /// Before this, `capture_landed` ran on the analysis thread (where the
+    /// tail does not exist yet) and nothing folded it in afterwards, so the
+    /// capture and the walk disagreed exactly on the salvaged region.
+    #[test]
+    fn the_capture_carries_the_salvaged_tail_and_indexes_its_lines() {
+        let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let zeta = offset_at(broken, "zeta", 0);
+        let mut document = analyze_text(whole);
+        document.adopt_analysis(analyze_text(broken));
+        // Premise: this adoption really did retain a tail, or the equality
+        // below would hold for the uninteresting reason.
+        assert!(
+            !document.retained_tail.is_empty(),
+            "the break no longer retains a tail — this pin's premise is gone"
+        );
+
+        assert_eq!(
+            document.landed.tokens,
+            document.semantic_tokens(),
+            "the capture every request is served from must be exactly the walk, \
+             salvage and all"
+        );
+
+        let line = document.analyzed_index().position(zeta).line;
+        let sliced = document.semantic_tokens_in_lines(line, line);
+        let filtered: Vec<_> = document
+            .semantic_tokens()
+            .into_iter()
+            .filter(|(span, ..)| document.analyzed_index().range(span).start.line == line)
+            .collect();
+        assert!(
+            !sliced.is_empty(),
+            "the line index must reach into the salvaged tail, not stop at the \
+             last token the fresh analysis produced"
+        );
+        assert_eq!(
+            sliced, filtered,
+            "and the slice of a salvaged line must be the filter of it"
         );
     }
 
