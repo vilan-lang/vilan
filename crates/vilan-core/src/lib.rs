@@ -709,10 +709,15 @@ pub fn post_analysis_passes(
     // here rather than in `analyze_source` so both pipelines (the LSP/test
     // path AND the CLI's) show it.
     let phase_post_start = PhaseClock::now();
-    let phase_graph_start = PhaseClock::now();
+    // N43: `dispatch_refine::refined_edges` is reached from two of the buckets
+    // below (`contexts+graph` and `const-pass`), and on kolt it was most of
+    // both. Zero the accumulator here — the top of the only region that calls
+    // it — so the `dispatch-refine` bucket is this analysis's total.
+    dispatch_refine::reset_refine_time();
+    let phase_contexts_start = PhaseClock::now();
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
-    let phase_graph = phase_graph_start.elapsed();
+    let phase_contexts = phase_contexts_start.elapsed();
     let phase_async_start = PhaseClock::now();
     async_infer::infer(program, &call_graph);
     let phase_async = phase_async_start.elapsed();
@@ -776,20 +781,35 @@ pub fn post_analysis_passes(
     // line, stderr for the same reason. The named buckets do not sum to the
     // `post-passes` total — the residual is the seam glue (the graph install,
     // diagnostic-order normalization) — and `const-lower`/`const-interp` are a
-    // SUB-split of `const-eval`: the shared world's lowering + per-site
+    // SUB-split of `const-pass`: the shared world's lowering + per-site
     // assembly against the interpreter's evaluation, the two thirds/one third
     // `const-eval.md` §10.2 had to hand-measure. Printed for macro worlds too,
     // exactly as the aggregate line this extends was.
+    //
+    // N43 — TWO buckets are named after what they TIME, not after the pass a
+    // reader assumed. `contexts+graph` is `context::thread_contexts` (which
+    // builds its own call graph when it rewrites, and falls back to
+    // `CallGraph::build` when it does not); calling it `call-graph` sent the
+    // editor-perf lane looking at graph construction for a cost that was
+    // dispatch refinement. `const-pass` is the whole const pass, of which
+    // `const-lower + const-interp` is the actual const EVALUATION: on kolt the
+    // bucket read 1,189 ms while the evaluation inside it was 11 ms, the rest
+    // being `check_const_only`'s dispatch refinement. `dispatch-refine` is
+    // that shared constant, summed across both call sites, so the next lane
+    // reads the split off the line instead of a profiler. It is deliberately
+    // NOT disjoint from the two buckets it explains — it is a slice through
+    // them, and the comment above already says the buckets do not sum.
     if phase_timing_enabled() {
         let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
         let (const_lower, const_interp) = const_eval::phase_split();
         eprintln!(
-            "[vilan phase] post-passes {:.1}ms call-graph {:.1}ms async-infer {:.1}ms \
+            "[vilan phase] post-passes {:.1}ms contexts+graph {:.1}ms async-infer {:.1}ms \
              view-suspensions {:.1}ms async-drops {:.1}ms context-drops {:.1}ms \
-             platform-color {:.1}ms const-eval {:.1}ms const-lower {:.1}ms \
-             const-interp {:.1}ms const-fuel-max {} init-order {:.1}ms",
+             platform-color {:.1}ms const-pass {:.1}ms const-lower {:.1}ms \
+             const-interp {:.1}ms const-fuel-max {} init-order {:.1}ms \
+             dispatch-refine {:.1}ms",
             milliseconds(phase_post_start.elapsed()),
-            milliseconds(phase_graph),
+            milliseconds(phase_contexts),
             milliseconds(phase_async),
             milliseconds(phase_views),
             milliseconds(phase_async_drops),
@@ -800,6 +820,7 @@ pub fn post_analysis_passes(
             milliseconds(const_interp),
             const_eval::max_fuel_used(),
             milliseconds(phase_init),
+            milliseconds(dispatch_refine::refine_time()),
         );
     }
     // The depth line (B138), after the last pass that recurses: macro worlds

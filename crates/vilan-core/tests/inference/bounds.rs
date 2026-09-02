@@ -7356,3 +7356,89 @@ fn a_bounded_dispatch_reached_from_many_callers_selects_once_per_type() {
          memo this grows one-for-one with the entry count"
     );
 }
+
+/// Analyzes `source` on a large-stack worker and reports how many BOUND
+/// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
+/// instrument. The counter is zeroed on the worker thread, so a concurrently
+/// running test cannot contribute to it (the isolation
+/// `dispatch_selections` documents).
+fn generic_bound_checks(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::analyzer::reset_generic_bound_checks();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            assert!(program.is_some(), "analysis should produce a program");
+            vilan_core::analyzer::generic_bound_checks()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M19, tranche 1. `check_generic_bound_satisfaction` walks EVERY recorded
+/// call site of the whole program on every analysis — including every site in
+/// every module the edit did not touch — and asks, per bound, whether the
+/// value's type satisfies it. The question's answer depends only on the
+/// resolved types, so it is asked once per (type, trait, arguments), not once
+/// per call.
+///
+/// Only a counter can pin it, for `refined_edges`' reasons: the memo changes
+/// no diagnostic (the assertions below check that the analysis stays clean
+/// either way), and the timing it exists for is not assertable on a shared
+/// machine. Read as a DIFFERENTIAL between two call counts, because std's own
+/// prelude contributes bound checks of its own and an absolute count would pin
+/// those too: what the memo owns is the SLOPE. Sixteen more calls at the same
+/// type must add ZERO evaluations.
+///
+/// The measured instance is kolt with its generated icon module: `checks` is
+/// the largest remaining per-keystroke phase and 63% of it is this check, over
+/// 1,791 functions that did not change.
+#[test]
+fn a_generic_bound_checked_at_many_call_sites_is_evaluated_once_per_type() {
+    let program_with = |calls: usize| {
+        let body: String = (0..calls)
+            .map(|index| format!("            let _{index} = pass(Coin {{ face = {index} }});\n"))
+            .collect();
+        format!(
+            r#"
+        trait Flip {{ fun flip(self): i32; }}
+        struct Coin {{ face: i32 }}
+        impl Coin with Flip {{ fun flip(self): i32 {{ self.face }} }}
+
+        fun pass<V: Flip>(value: V): i32 {{ value.flip() }}
+
+        fun main() {{
+{body}        }}
+        main();
+        "#
+        )
+    };
+    let few = generic_bound_checks(&program_with(4));
+    let many = generic_bound_checks(&program_with(20));
+    assert!(
+        few > 0,
+        "the fixture must actually reach the check, or the pin is vacuous"
+    );
+    assert_eq!(
+        many, few,
+        "sixteen more `pass(Coin {{ .. }})` calls are sixteen more type IDS but \
+         ONE type: the bound is evaluated per (type, trait, arguments), not per \
+         call site. Without the memo this grows one-for-one with the call count \
+         ({few} -> {many})"
+    );
+}

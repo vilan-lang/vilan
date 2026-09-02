@@ -50,6 +50,35 @@ thread_local! {
     /// [`return_records_served_under_substitution`].
     static RECORDS_SERVED_UNDER_SUBSTITUTION: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    /// How many BOUND EVALUATIONS [`Analyzer::check_generic_bound_satisfaction`]
+    /// has performed on this thread since [`reset_generic_bound_checks`] — the
+    /// M19 memo's instrument, and the only thing that can see it working. See
+    /// [`generic_bound_checks`].
+    static GENERIC_BOUND_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of bound evaluations this thread's
+/// [`Analyzer::check_generic_bound_satisfaction`] has performed since the last
+/// [`reset_generic_bound_checks`] — one per (resolved value type, required
+/// trait, resolved trait arguments) triple it has not answered before.
+///
+/// The counter, not a clock, for `dispatch_refine::selection_count`'s reasons
+/// exactly: the memo changes no diagnostic, so no behaviour test can see it,
+/// and a timing assertion on a shared machine is not a test. The measured
+/// instance is kolt with the generated icon module — `checks` is the largest
+/// remaining per-keystroke phase and 63% of it is this one check, asked once
+/// per (call site × constraint) over 1,791 unchanged functions for a handful
+/// of distinct answers.
+///
+/// Thread-local, like every counter beside it: an analysis is single-threaded,
+/// and plain `cargo test` runs analyses concurrently in one process.
+pub fn generic_bound_checks() -> usize {
+    GENERIC_BOUND_CHECKS.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`generic_bound_checks`].
+pub fn reset_generic_bound_checks() {
+    GENERIC_BOUND_CHECKS.with(|count| count.set(0));
 }
 
 /// The number of type inferences this thread's analyzer has entered — an
@@ -4269,6 +4298,40 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(call_id, substitution)| (*call_id, substitution.clone()))
             .collect();
+        // --- M19, tranche 1: the answers are keyed on RESOLVED TYPES. ---
+        //
+        // This loop is whole-program: it walks every recorded call site of the
+        // program, including every site inside modules the edit did not touch.
+        // On kolt that is 1,791 generated icon functions re-asked on every
+        // keystroke, and this check is 63% of the `checks` phase they dominate.
+        //
+        // What the loop asks per (site, constraint) is `does THIS type satisfy
+        // THAT bound` — a question whose answer depends only on the resolved
+        // types involved, never on which call asked it. So the answers memoize,
+        // and the key is the resolved `Type`, exactly as `refined_edges`'
+        // selection memo is (E106/M19): ids are minted per OCCURRENCE — one per
+        // expression — so an id-keyed memo memoizes nothing, while two ids
+        // resolving to equal `Type`s drive an identical walk. Both memoized
+        // calls read their subject only as a resolved `Type` plus a trait id
+        // (`satisfies_trait_bound` scans `implementations` and recurses through
+        // the argument ids the resolved types carry; `unrankable_bound_impls`
+        // ranks that trait's impls against the value type), so equal keys have
+        // equal answers by construction.
+        //
+        // Per analysis, not across analyses: what an unchanged module's
+        // analysis could REUSE is M19's remainder, and it needs a cache keyed
+        // on module content that the current one-Analyzer-per-program shape has
+        // no seam for. This tranche is the part that needs no such seam.
+        //
+        // Nested on the value type rather than keyed on a flat tuple so a HIT
+        // costs no allocation: the outer lookup takes `&Type`, and a memo that
+        // cloned the subject type once per call site would hand a good part of
+        // the saving straight back in allocation (17k sites is 17k clones).
+        // Only a MISS clones, which is once per distinct answer.
+        type SatisfactionMemo = HashMap<Type, HashMap<(Id, Vec<Type>), bool>>;
+        type UnrankableMemo = HashMap<Type, HashMap<Id, Option<String>>>;
+        let mut satisfaction_memo: SatisfactionMemo = HashMap::default();
+        let mut unrankable_memo: UnrankableMemo = HashMap::default();
         for (call_id, substitution) in recorded {
             for (&constraint_id, &value_type_id) in &substitution {
                 let bound_traits = self.generic_bound_traits(constraint_id);
@@ -4309,12 +4372,37 @@ impl<'src> Analyzer<'src> {
                                 .get_type_id(self)
                         })
                         .collect();
-                    if self.satisfies_trait_bound(
-                        &value_type,
-                        *required_trait_id,
-                        &required_arguments,
-                        0,
-                    ) {
+                    // The memo key: the value's resolved type, the required
+                    // trait, and the required arguments RESOLVED (they are
+                    // freshly minted ids above, so keying on them would key on
+                    // the occurrence).
+                    let argument_types: Vec<Type> = required_arguments
+                        .iter()
+                        .map(|argument| argument.get_type(self))
+                        .collect();
+                    let bound_key = (*required_trait_id, argument_types);
+                    let remembered = satisfaction_memo
+                        .get(&value_type)
+                        .and_then(|by_bound| by_bound.get(&bound_key))
+                        .copied();
+                    let satisfied = match remembered {
+                        Some(answer) => answer,
+                        None => {
+                            GENERIC_BOUND_CHECKS.with(|count| count.set(count.get() + 1));
+                            let answer = self.satisfies_trait_bound(
+                                &value_type,
+                                *required_trait_id,
+                                &required_arguments,
+                                0,
+                            );
+                            satisfaction_memo
+                                .entry(value_type.clone())
+                                .or_default()
+                                .insert(bound_key, answer);
+                            answer
+                        }
+                    };
+                    if satisfied {
                         // The bound HOLDS — but a call through it still has to
                         // reach exactly one body, and the specificity order is
                         // what picks it (B158, spec §5.4). A binding whose
@@ -4325,9 +4413,23 @@ impl<'src> Analyzer<'src> {
                         // body-less requirement (B55's internal error, which
                         // asked the author to report a program that was
                         // theirs to fix).
-                        if let Some(msg) =
-                            self.unrankable_bound_impls(&value_type, *required_trait_id)
-                        {
+                        let remembered = unrankable_memo
+                            .get(&value_type)
+                            .and_then(|by_trait| by_trait.get(required_trait_id))
+                            .cloned();
+                        let unrankable = match remembered {
+                            Some(answer) => answer,
+                            None => {
+                                let answer =
+                                    self.unrankable_bound_impls(&value_type, *required_trait_id);
+                                unrankable_memo
+                                    .entry(value_type.clone())
+                                    .or_default()
+                                    .insert(*required_trait_id, answer.clone());
+                                answer
+                            }
+                        };
+                        if let Some(msg) = unrankable {
                             errors.push((
                                 call_id,
                                 **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
@@ -39783,6 +39885,26 @@ struct BaseCacheKey {
     /// The dependency packages' preludes ride in `workspace` below, since
     /// `workspace_fingerprint` renders one row per package spec.
     entry_prelude: Option<String>,
+    /// The entry's own package: its canonical root and its sorted, deduped
+    /// `pkg::` reference names — `None` for an entry that references no
+    /// sibling (backlog M21).
+    ///
+    /// M21: a `pkg::` reference used to BYPASS the cache outright, so kolt's
+    /// `views.vl` and `client.vl` rebuilt std's whole world on every keystroke
+    /// (`base` 248–288 ms) while its sibling `theme.vl`, which imports no
+    /// sibling, hit at 0.0 ms. Nothing about std's world depends on the
+    /// package built on top of it; what the bypass was really standing in for
+    /// is that sibling modules LOAD INTO the world, so a world built for one
+    /// sibling set is not a world for another — and that is a KEY, exactly as
+    /// the `std::` seeds are. Their content is validated per hit like every
+    /// other loaded source (the E12 rule), and the root leads because two
+    /// packages' `views` are different modules.
+    ///
+    /// `None` rather than an empty pair for the sibling-free entry, so every
+    /// key a pre-M21 world was stored under is unchanged and std-only worlds
+    /// go on being shared across packages (the root is irrelevant when no
+    /// sibling loads).
+    entry_pkg: Option<(PathBuf, Vec<&'static str>)>,
 }
 
 /// The base cache (S3c, analysis-reuse.md §6.10): resolved pre-entry worlds
@@ -39989,13 +40111,13 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // which are analysis-owned and freed, and exactly why the gate above
     // refuses to store a world that made any: the M9 clause this argument
     // now rests on), the entry-derived strings that reach the world's maps
-    // — a seeded module name, whether it seeded `std` or a DEPENDENCY — go
-    // through `interned_display_name`, dependency namespace display names go
-    // through it too, and the three entry slots (the only places
-    // entry-borrowed data ever lands before the entry walk) were just
-    // emptied. The store path is additionally gated on `base_cacheable`
-    // (no pkg refs, no services, no macro-DEFINING entry text), so no other
-    // entry-derived state exists in the world.
+    // — a seeded module name, whether it seeded `std`, a `pkg::` SIBLING
+    // (M21) or a DEPENDENCY — go through `interned_display_name`, dependency
+    // namespace display names go through it too, and the three entry slots
+    // (the only places entry-borrowed data ever lands before the entry walk)
+    // were just emptied. The store path is additionally gated on
+    // `base_cacheable` (no services, no macro-DEFINING entry text), so no
+    // other entry-derived state exists in the world.
     let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
     // Backlog M11: this map is the compiler's largest per-process retention
     // and the tally could not see it. Record what the world is worth on the
@@ -40093,8 +40215,19 @@ fn expand_entry_over_world<'src>(
                 return true;
             }
         }
-        if !collect_module_refs(list, "pkg").is_empty() {
-            return true;
+        // The same question for the entry package's own modules (M21). This
+        // used to rebuild the world for ANY generated `pkg::` reference —
+        // correct, and the conservative shape a bypassed cache could afford,
+        // since a `pkg::`-importing entry never reached the cache at all. Now
+        // that such an entry is cached, "the generated code names a sibling"
+        // is the common case, not the exotic one, and blanket-rebuilding on it
+        // would hand back the whole saving to any package whose derives reach
+        // a sibling. The rule that was always the right one: rebuild when the
+        // demanded module is one this world never loaded.
+        for (module, _) in collect_module_refs(list, "pkg") {
+            if !world.pkg_module_names.contains(module) {
+                return true;
+            }
         }
     }
     world
@@ -40130,6 +40263,14 @@ struct World<'src> {
     entry_is_module: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
+    /// The ENTRY package's own modules this world loaded, by name — `pkg::`
+    /// addressable and nothing else (`module_scopes` above is deliberately
+    /// std-only: a user module named `io` must not shadow the real one for the
+    /// primitive captures). Kept so the entry-expansion hoist can answer "does
+    /// this world already hold the `pkg::` module the generated code demands?"
+    /// the same way it answers it for `std::` (M21), instead of rebuilding the
+    /// world for every derive that reaches a sibling.
+    pkg_module_names: HashSet<&'src str>,
     generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>>,
     // The std intrinsics the tail keys passes off (resolved from the loaded
     // world's scopes; `None` when the module never loaded).
@@ -40303,12 +40444,15 @@ fn analyze_inner<'src>(
     // The base cache (S3c): a WORLD — everything up to and including the
     // pre-entry `resolve_world` — is a pure function of the loaded files'
     // content plus [`BaseCacheKey`] (platform, the entry's std:: reference
-    // names, the workspace, the expansion budgets) whenever the entry brings
-    // no world-entangling features. The bypass list is conservative and
-    // syntactic where it must be: `pkg::` siblings, `[service]` blocks, and
-    // macro-DEFINING text all expand or load inside the world-building loop,
-    // so such entries build fresh and are never stored. Overlays need no
-    // bypass — see below.
+    // names, its `pkg::` sibling set and package root, the workspace, the
+    // expansion budgets) whenever the entry brings no world-entangling
+    // features. The bypass list is conservative and syntactic where it must
+    // be: `[service]` blocks and macro-DEFINING text expand inside the
+    // world-building loop, so such entries build fresh and are never stored.
+    // `pkg::` siblings USED to bypass too (M21) — they load inside the loop,
+    // which is a reason to key on them, not a reason to refuse: they are in
+    // the key above and content-validated per hit like every other loaded
+    // source. Overlays need no bypass — see below.
     let entry_seed_names: Vec<String> = {
         let mut names: Vec<String> = collect_module_refs(&nodes.0, "std")
             .into_iter()
@@ -40336,6 +40480,18 @@ fn analyze_inner<'src>(
         seeds.dedup();
         seeds
     };
+    // The entry's `pkg::sibling` references — interned for the same reason the
+    // `std::` and dependency seeds are: they seed the load, so they reach the
+    // world's maps, and a STORED world may hold no entry-text slice (M21).
+    let entry_pkg_seeds: Vec<&'static str> = {
+        let mut names: Vec<&'static str> = collect_module_refs(&nodes.0, "pkg")
+            .into_iter()
+            .map(|(name, _)| interned_display_name(name.to_string()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
     let entry_is_inside_std = {
         let pkg_root_canonical = crate::util::canonical_path(pkg_root);
         std::iter::once(&std.base_root)
@@ -40351,10 +40507,15 @@ fn analyze_inner<'src>(
             .entry_prelude
             .module_path()
             .map(|path| path.to_string()),
+        entry_pkg: (!entry_pkg_seeds.is_empty()).then(|| {
+            (
+                crate::util::canonical_path(pkg_root),
+                entry_pkg_seeds.clone(),
+            )
+        }),
     };
     let base_cacheable = allow_cache
         && !entry_is_inside_std
-        && collect_module_refs(&nodes.0, "pkg").is_empty()
         && !contains_service(&nodes.0)
         // Macro-DEFINING entries stay bypassed: their definitions register
         // into the registry the world carries, which would leak one entry's
@@ -40520,6 +40681,8 @@ fn analyze_inner<'src>(
     source_hashes.push(lib_loaded.map_or(0, |loaded| crate::content_hash(loaded.text)));
     let lib_source_id = SourceId((sources.len() - 1) as u32);
     let mut module_scopes: HashMap<&str, Id> = HashMap::default();
+    // The entry package's own loaded modules, by name (M21). See `World`.
+    let mut pkg_module_names: HashSet<&str> = HashSet::default();
     // Each loaded module carries the `[derive(..)]` impls synthesized from its own
     // items (or `None`), walked into the module's scope after its body — the general
     // form of the entry's derive expansion, so a derived type imported from another
@@ -40607,10 +40770,12 @@ fn analyze_inner<'src>(
     // The entry's `pkg::sibling` references pull in its own package's modules from
     // `pkg_root`. When the entry is itself a std file (`compiling_std`) these are
     // std siblings, so the origin stays `Std` and the load is unchanged.
+    // Interned above (M21): these names reach the world's maps, and a world
+    // the cache may store holds no entry-text slice.
     to_load.extend(
-        collect_module_refs(&nodes.0, "pkg")
-            .into_iter()
-            .map(|(name, _)| (entry_pkg_origin, name)),
+        entry_pkg_seeds
+            .iter()
+            .map(|name| (entry_pkg_origin, *name as &str)),
     );
     // `bool`, `List`, and `null` are core primitives, so their (dependency-free)
     // modules are always loaded even when not imported.
@@ -41100,6 +41265,12 @@ fn analyze_inner<'src>(
             // the real one and break those captures).
             if origin == Origin::Std {
                 module_scopes.insert(name, module_scope_id);
+            }
+            // M21: the entry package's own modules, for the entry-expansion
+            // hoist's "is it already here?" question. A dependency's modules
+            // are not `pkg::` from the entry, so they are not in this set.
+            if origin == Origin::Pkg {
+                pkg_module_names.insert(name);
             }
             // Record which package this module's source belongs to, so its imports
             // resolve `pkg::`/`<dep>::` relative to that package. Std sources always
@@ -41798,6 +41969,7 @@ fn analyze_inner<'src>(
         entry_is_module,
         global_scope_id,
         module_scopes,
+        pkg_module_names,
         generated_by_source,
         list_struct_id,
         list_new_fn_id,
@@ -41853,6 +42025,7 @@ fn analyze_over_world<'src>(
         entry_is_module,
         global_scope_id,
         module_scopes,
+        pkg_module_names: _,
         generated_by_source,
         list_struct_id,
         mut list_new_fn_id,

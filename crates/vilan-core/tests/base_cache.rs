@@ -596,9 +596,9 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     vilan_core::analyzer::base_cache_clear();
 
     // A workspace with one dependency package: dependency files are exactly
-    // the files a multi-package workspace has open in the editor, and —
-    // unlike a `pkg::` sibling, which bypasses the base cache anyway — they
-    // are loaded into the world the cache stores.
+    // the files a multi-package workspace has open in the editor, and — like
+    // a `pkg::` sibling since M21 — they are loaded into the world the cache
+    // stores.
     let root = std::env::temp_dir().join(format!("vilan_m9_gate_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
@@ -988,4 +988,138 @@ fn the_base_cache_grows_with_distinct_import_sets_not_with_keystrokes() {
         "three import sets revisited must retain three worlds — a revisit has to \
          HIT, not store a fourth"
     );
+}
+
+/// M21 — an entry with any `pkg::` import used to bypass the base cache
+/// OUTRIGHT.
+///
+/// The measured consequence on kolt: `views.vl` and `client.vl` rebuilt
+/// std's whole world on every keystroke (`base` 248–288 ms, and 758 ms
+/// median under lane load) while their sibling `theme.vl`, which imports no
+/// sibling, hit at 0.0 ms. The world is std's; the package is analyzed on
+/// top of it, and the sibling set is a KEY — the same thing the `std::`
+/// seeds and the dependency seeds already are — not a reason to refuse.
+///
+/// Four properties, in the order they matter: the second analysis HITS; a
+/// hit is observation-identical to a cache-cleared build (the cache may not
+/// change an answer); a DIFFERENT sibling set is a different world and
+/// misses; and an edited sibling evicts by CONTENT (the E12 rule), which is
+/// what keeps an editor from being served a stale sibling.
+#[test]
+fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let root = std::env::temp_dir().join(format!("vilan_m21_pkg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("helper.vl"), "fun helper(): i32 {\n\t7\n}\n").expect("write helper");
+    std::fs::write(root.join("other.vl"), "fun other(): i32 {\n\t9\n}\n").expect("write other");
+
+    // Two entries with the SAME sibling set and the same std seeds, differing
+    // only in their bodies — a keystroke, in cache terms.
+    const FIRST: &str =
+        "import std::io::print;\nimport pkg::helper::helper;\nfun main() { print(helper()); }\n";
+    const SECOND: &str = "import std::io::print;\nimport pkg::helper::helper;\n\
+                          fun main() { print(helper() + 1); }\n";
+    // A different sibling set: a different world.
+    const BOTH: &str = "import std::io::print;\nimport pkg::helper::helper;\n\
+                        import pkg::other::other;\nfun main() { print(helper() + other()); }\n";
+
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let entry_path = root.join("main.vl");
+
+    fn observe_in(
+        spec: &PackageSpec,
+        pkg_root: &Path,
+        entry_path: &Path,
+        source: &'static str,
+    ) -> (String, Option<String>) {
+        let spec = spec.clone();
+        let pkg_root = pkg_root.to_path_buf();
+        let entry_path = entry_path.to_path_buf();
+        on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (diagnostics, javascript)
+        })
+    }
+
+    vilan_core::analyzer::base_cache_clear();
+    let retained_empty = vilan_core::analyzer::base_cache_retained();
+    let first = observe_in(&spec, &root, &entry_path, FIRST);
+    assert_eq!(first.0, "[]", "the fixture must analyze clean: {}", first.0);
+    let (hits_before, misses_before) = stats();
+    let retained_after_first = vilan_core::analyzer::base_cache_retained();
+
+    let cached = observe_in(&spec, &root, &entry_path, SECOND);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "an entry with one `pkg::` import must HIT on its second analysis \
+         (M21); it missed instead"
+    );
+    assert_eq!(misses_after, misses_before, "a hit is not also a miss");
+
+    // A `pkg::` world costs ONE retained world, like every other key shape —
+    // M11's number is what says so.
+    assert_eq!(
+        retained_after_first - retained_empty,
+        1,
+        "one sibling set must retain exactly one world, not \
+         {}",
+        retained_after_first - retained_empty
+    );
+
+    // The cache may not change an answer.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe_in(&spec, &root, &entry_path, SECOND);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.1, fresh.1, "emitted JS differs cached vs fresh");
+    assert!(cached.1.is_some(), "the fixture must emit");
+
+    // A different sibling set is a different world.
+    let (hits_pre_both, misses_pre_both) = stats();
+    let both = observe_in(&spec, &root, &entry_path, BOTH);
+    let (hits_both, misses_both) = stats();
+    assert_eq!(both.0, "[]", "the two-sibling fixture must analyze clean");
+    assert_eq!(
+        (hits_both, misses_both),
+        (hits_pre_both, misses_pre_both + 1),
+        "a different `pkg::` sibling set must MISS — the world holds the \
+         siblings, so the set is part of the key"
+    );
+
+    // E12: an edited sibling evicts by content, and the rebuild sees the edit.
+    std::fs::write(root.join("helper.vl"), "fun helper(): i32 {\n\t8\n}\n").expect("edit helper");
+    let (hits_pre_edit, misses_pre_edit) = stats();
+    let edited = observe_in(&spec, &root, &entry_path, SECOND);
+    let (hits_edit, misses_edit) = stats();
+    assert_eq!(
+        (hits_edit, misses_edit),
+        (hits_pre_edit, misses_pre_edit + 1),
+        "an edited `pkg::` sibling must evict and miss, not serve a stale world"
+    );
+    assert_ne!(
+        edited.1, fresh.1,
+        "the rebuild after a sibling edit must carry the edit"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
 }

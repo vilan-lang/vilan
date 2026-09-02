@@ -608,22 +608,43 @@ fn phase_timing_env_var_prints_the_post_pass_breakdown() {
          stderr was: {stderr}"
     );
     for bucket in [
-        "call-graph",
+        // N43: the bucket is named after WHAT IT TIMES. `contexts+graph` is
+        // `context::thread_contexts` (which builds its own graph when it
+        // rewrites, and falls back to `CallGraph::build` when it does not) —
+        // reading it as "the call graph" cost the editor-perf lane a detour.
+        "contexts+graph",
         "async-infer",
         "view-suspensions",
         "async-drops",
         "context-drops",
         "platform-color",
-        "const-eval",
+        // Likewise: the bucket is the whole const PASS, whose 1,189 ms on
+        // kolt was `check_const_only`'s dispatch refinement and NOT const
+        // evaluation (the real const work was 11 ms). `const-lower` /
+        // `const-interp` remain its evaluation sub-split.
+        "const-pass",
         "const-lower",
         "const-interp",
         "init-order",
+        // The constant both mislabelled buckets were really spending their
+        // time in, now readable without a detour: total wall inside
+        // `dispatch_refine::refined_edges` across the analysis.
+        "dispatch-refine",
     ] {
         assert!(
             stderr.contains(bucket),
             "the post-pass line must carry the `{bucket}` bucket — the whole \
              point is that the next attribution is a run, not a hand-patch; \
              stderr was: {stderr}"
+        );
+    }
+    // The old names must be GONE, not merely joined: a line carrying both
+    // spellings would let the next reader pick the wrong one.
+    for stale in ["call-graph ", "const-eval "] {
+        assert!(
+            !stderr.contains(stale),
+            "the post-pass line still carries the mislabelled `{stale}`bucket \
+             (N43); stderr was: {stderr}"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
