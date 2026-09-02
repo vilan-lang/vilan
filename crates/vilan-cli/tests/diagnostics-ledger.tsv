@@ -390,3 +390,4 @@ row	flagship	key
 364	-	; `{name}` is in the prelude of the web set — switch the playground's prelude to the web set{import}
 365	-	`{name}` takes no type arguments, {written_count} given — it declares no generics, so there is nothing here for this list to bind; write `{name}(…)`
 366	-	`{name}` takes at most {declared_count} type {argument(s)}, {written_count} given — a SHORTER list is fine (the parameters it does not reach are inferred from the arguments), but there is no parameter left for the extra {one(s)} to bind
+367	-	`{symbol}` on `{label}` needs `{label}: {trait_name}` — a parameter promises only what its bounds promise, and {promise}, so there is no `{method_name}` to dispatch to. `{symbol}` dispatches through its LEFT operand, which is exactly where a bound decides the implementation: add it where `{label}` is declared{site}, or write a concrete type here
