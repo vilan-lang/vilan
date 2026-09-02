@@ -192,18 +192,66 @@ fn normalize_components(path: &Path) -> PathBuf {
 /// the longest-path-safe spelling, and it is never shown to the user (the
 /// original path is what diagnostics print).
 pub fn canonical_path(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
-    let Ok(canonical) = std::fs::canonicalize(path) else {
-        return normalize_components(path);
-    };
+    canonicalized(path.as_ref()).unwrap_or_else(|| normalize_components(path.as_ref()))
+}
+
+/// [`canonical_path`]'s on-disk arm alone: `None` where the path is not there.
+fn canonicalized(path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
     // A path Windows cannot spell in UTF-8 (an unpaired surrogate) keeps its
     // verbatim form: it is still a consistent key, just a longer one.
-    match canonical.to_str() {
+    Some(match canonical.to_str() {
         Some(text) => match strip_verbatim_prefix(text) {
             Cow::Borrowed(stripped) if stripped.len() == text.len() => canonical,
             stripped => PathBuf::from(stripped.into_owned()),
         },
         None => canonical,
+    })
+}
+
+/// [`canonical_path`] for a path that **is not on disk yet** — a build product
+/// before its generator has written it: the deepest ancestor that IS on disk is
+/// canonicalized, and the components below it are re-attached exactly as they
+/// were spelled.
+///
+/// The comparison key `canonical_path` yields is only like-with-like when both
+/// sides resolved. When one did not, the two are a resolved spelling and a
+/// spelled one, and every way a filesystem can give a path two spellings makes
+/// them differ: a symlink anywhere in the ancestry (unix and Windows alike), and
+/// on a case-insensitive filesystem the case of every component. Containment
+/// then answers NO for a path that is plainly inside its root — B198's fail-open,
+/// found on Windows against `gen` / `GEN` and reachable on unix through a link.
+///
+/// So this is the resolution a containment test uses when the subject may not
+/// exist: **canonical-or-fail, never folded-against-lexical**. What cannot be
+/// resolved is the tail, which is by definition the part no filesystem has an
+/// opinion about yet — so the two sides of the comparison are again like with
+/// like, and the answer for a tree where nothing at all is on disk degrades to
+/// G17's spelled ladder (both sides lexical) rather than to a mixed comparison.
+///
+/// Not a replacement for [`canonical_path`], whose promise to every other caller
+/// — "the path as the disk spells it, or the path as you spelled it" — is
+/// unchanged. This one costs one `canonicalize` per missing ancestor, and for a
+/// path that IS on disk it costs exactly what `canonical_path` costs: the first
+/// attempt succeeds.
+pub fn canonical_path_of_unwritten(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let mut unwritten: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut ancestor = path;
+    loop {
+        if let Some(mut resolved) = canonicalized(ancestor) {
+            for name in unwritten.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        // Nothing on this path exists: there is no anchor, so the whole thing
+        // normalizes lexically, exactly as `canonical_path` would answer.
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+            return normalize_components(path);
+        };
+        unwritten.push(name);
+        ancestor = parent;
     }
 }
 
@@ -451,8 +499,8 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_path, join_with, normalize_components, normalize_newlines, strip_bom,
-        strip_verbatim_prefix, trim_multiline_string,
+        canonical_path, canonical_path_of_unwritten, join_with, normalize_components,
+        normalize_newlines, strip_bom, strip_verbatim_prefix, trim_multiline_string,
     };
     use std::path::{Path, PathBuf};
 
@@ -623,6 +671,50 @@ mod tests {
             canonical.display()
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unwritten_path_resolves_through_the_deepest_ancestor_that_exists() {
+        // B198. `canonical_path` answers a path not on disk with the caller's
+        // own spelling, which is the right key and the wrong SIDE of a
+        // containment test: the other side resolved. Here the directory is real
+        // and reached through a link, so `canonical_path` and this one give
+        // measurably different answers for the same missing file.
+        let base = std::env::temp_dir().join(format!(
+            "vilan-canonical-unwritten-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).expect("create the probe directory");
+        let root = canonical_path(&base);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("real"), root.join("link"))
+            .expect("link the probe directory");
+
+        let unwritten = root.join("real/not_written_yet.vl");
+        assert!(!unwritten.exists(), "the probe file must not be on disk");
+        assert_eq!(
+            canonical_path_of_unwritten(&unwritten),
+            root.join("real/not_written_yet.vl"),
+            "the tail is re-attached to its resolved ancestor"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            canonical_path_of_unwritten(root.join("link/not_written_yet.vl")),
+            root.join("real/not_written_yet.vl"),
+            "and the ancestor is RESOLVED, which is the whole difference from \
+             `canonical_path` — it answers the link's own spelling here"
+        );
+
+        // Nothing on the path exists: both degrade lexically, together.
+        let nowhere = base.join("absent/pkg/./src/main.vl");
+        assert_eq!(
+            canonical_path_of_unwritten(&nowhere),
+            canonical_path(&nowhere),
+            "with no anchor there is nothing to resolve, so the two agree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -2455,3 +2455,174 @@ fn a_relative_directory_symlink_inside_the_project_is_followed() {
         "and nothing is said about it:\n{text}"
     );
 }
+
+// ── The wall-clock waits' suite placement (tracker N46) ───────────────────────
+//
+// Every test that drives a live `--watch` session and then waits for a ROUND
+// belongs to `.config/nextest.toml`'s `wall-clock-waits` group, which runs them
+// one at a time. The reason is the 301 s red this file's own pins have paid
+// three times: watch sessions, each spawning a watcher and a compile, all
+// eligible to run at once inside an interleave already 16 wide. The language
+// server's `package_recolor_tests` are in the group for the same reason and
+// join it from the other side of the workspace; they are named directly in the
+// filterset, and this file's scan does not reach them.
+//
+// The group is selected by a filterset, and part of that filterset is a NAME
+// pattern — which is exactly the kind of thing that rots when somebody adds a
+// pin (or renames one) without knowing the pattern exists. This is the check
+// that keeps it honest, and it is not theoretical: it is what found the two
+// members outside the HMR suites, `split`'s `a_watch_round_clears_the_chunks_a
+// _build_left` and `serve_build`'s `run_watch_tells_its_child_it_is_watching`.
+
+/// Binaries whose every test is a watch session, so the filterset takes them
+/// whole.
+const WATCH_SESSION_BINARIES: &[&str] = &["hmr", "hmr_swap", "hmr_css_matrix", "watch_lifecycle"];
+
+/// Binaries with a watch family inside a larger suite, selected by name.
+const MIXED_BINARIES: &[&str] = &[
+    "build_hooks",
+    "assets",
+    "asset_bundle",
+    "split",
+    "serve_build",
+];
+
+/// The name substrings the filterset's `test(/watch|round/)` matches.
+const NAME_MARKERS: &[&str] = &["watch", "round"];
+
+/// How a test says it drives a live session: the local spawner, or the flag
+/// handed straight to the binary.
+const SPAWNS_A_WATCHER: &[&str] = &["spawn_watch(", "\"--watch\""];
+
+fn suite_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
+}
+
+/// Every `#[test]` in `source` that drives a watch session, by name.
+///
+/// Line oriented, and comments are dropped first: three of this tree's tests
+/// only MENTION `--watch` in the prose above them (`asset_bundle`'s containment
+/// refusal is one), and counting those would put the gate in the business of
+/// arguing about doc comments.
+fn tests_that_drive_a_watch_session(source: &str) -> Vec<String> {
+    let mut driving = Vec::new();
+    let mut current: Option<String> = None;
+    let mut recent_attributes = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            recent_attributes.push(trimmed.to_string());
+        }
+        if let Some(rest) = line.strip_prefix("fn ") {
+            let is_test = recent_attributes
+                .iter()
+                .any(|line| line.starts_with("#[test]"));
+            recent_attributes.clear();
+            current = is_test
+                .then(|| {
+                    rest.split('(')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                })
+                .filter(|name| !name.is_empty());
+            continue;
+        }
+        if line.starts_with('}') {
+            current = None;
+            continue;
+        }
+        if let Some(name) = &current
+            && SPAWNS_A_WATCHER.iter().any(|marker| line.contains(marker))
+            && !driving.contains(name)
+        {
+            driving.push(name.clone());
+        }
+    }
+    driving
+}
+
+#[test]
+fn every_test_that_drives_a_watch_session_is_in_the_group() {
+    let mut stray = Vec::new();
+    let entries = std::fs::read_dir(suite_root()).expect("the CLI's tests directory");
+    for entry in entries {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let binary = path
+            .file_stem()
+            .expect("a file stem")
+            .to_string_lossy()
+            .into_owned();
+        if WATCH_SESSION_BINARIES.contains(&binary.as_str()) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read a suite");
+        for name in tests_that_drive_a_watch_session(&source) {
+            let selected = MIXED_BINARIES.contains(&binary.as_str())
+                && NAME_MARKERS.iter().any(|marker| name.contains(marker));
+            if !selected {
+                stray.push(format!("  {binary}::{name}"));
+            }
+        }
+    }
+    assert!(
+        stray.is_empty(),
+        "these tests drive a live `--watch` session but are not selected by \
+         `.config/nextest.toml`'s `watch-rounds` filterset, so they run against the \
+         full 16-wide interleave and pay N46's 301 s bound. Either name the test so \
+         `test(/watch|round/)` reaches it and add its binary to MIXED_BINARIES here, \
+         or add the whole binary to both this list and the filterset:\n{}",
+        stray.join("\n")
+    );
+}
+
+/// Members the scan above cannot reach, because they live outside this crate's
+/// suite directory: the language server's package-recolor pins, which wait on a
+/// debounced re-analysis instead of on a watch round. Named here so the config
+/// check below covers them, and so dropping them from the filterset is a red
+/// rather than a silence.
+const MEMBERS_OUTSIDE_THIS_CRATE: &[&str] = &["binary(vilan-lsp) & test(/package_recolor_tests/)"];
+
+#[test]
+fn the_group_is_declared_the_way_this_file_reads_it() {
+    // The other half. The check above is worth nothing if the filterset it
+    // describes is not the filterset that ships — a group renamed, a binary
+    // dropped from the union, `max-threads` raised back to the default — so the
+    // config is read and held against the same lists.
+    let config = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.config/nextest.toml"),
+    )
+    .expect("the committed nextest profile");
+    assert!(
+        config.contains("wall-clock-waits = { max-threads = 1 }"),
+        "the group must exist and must be ONE thread — that is the whole fix:\n{config}"
+    );
+    assert!(
+        config.contains("test-group = 'wall-clock-waits'"),
+        "an override must actually join the group:\n{config}"
+    );
+    assert!(
+        config.contains("test(/watch|round/)"),
+        "the name pattern this file reimplements must be the one in the filterset"
+    );
+    for binary in WATCH_SESSION_BINARIES.iter().chain(MIXED_BINARIES) {
+        assert!(
+            config.contains(&format!("binary({binary})")),
+            "`{binary}` holds watch sessions but the filterset does not name it"
+        );
+    }
+    for member in MEMBERS_OUTSIDE_THIS_CRATE {
+        assert!(
+            config.contains(member),
+            "`{member}` waits on a wall clock for another thread's work and the \
+             filterset does not select it"
+        );
+    }
+}

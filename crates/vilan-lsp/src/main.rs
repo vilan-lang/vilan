@@ -5053,12 +5053,33 @@ mod package_recolor_tests {
             .any(|item| item.message.contains("has no field 'element'"))
     }
 
+    /// How long the poll below waits for a recolor that must eventually happen.
+    ///
+    /// A LIVENESS bound, not a performance assertion: neither pin claims the
+    /// recolor is fast, only that it arrives without a restart. So the number
+    /// only has to be too large for a healthy sweep and finite for a stuck one,
+    /// and a green run never pays it — the poll returns the moment the
+    /// condition holds.
+    ///
+    /// It was 10 s (200 × 50 ms), and 10 s is not too large for a healthy sweep
+    /// (tracker N46): the recolor is a real re-analysis of a real package on a
+    /// blocking thread, it costs 13.8 s for the whole pin on an idle box, and
+    /// two sibling lanes' unions turned it red under ten-lane load while the
+    /// same pin PASSED at 19.7 s at loadavg ~85 and passes on CI. That is
+    /// E39/E40's disease exactly — `WATCH_LIVENESS` was raised 20 s → 120 s →
+    /// 300 s for it, one strike at a time — so this takes 300 s at once, for
+    /// the same recorded reason: the whole point of the bound is to catch a
+    /// sweep that never fires, and the machine's speed is not what either pin
+    /// is about.
+    const RECOLOR_LIVENESS: Duration = Duration::from_secs(300);
+
     /// Wait for the debounced analysis and the sweep it triggers to settle.
     /// Polls rather than sleeping a fixed span: the analysis is real work on a
     /// blocking thread, and a loaded machine is exactly when a fixed sleep
     /// turns a pin into a flake.
     async fn settled(backend: &Backend, uri: &Url, expected: bool) -> bool {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + RECOLOR_LIVENESS;
+        while std::time::Instant::now() < deadline {
             if colored_as_process(backend, uri) == expected {
                 return true;
             }

@@ -30,6 +30,10 @@
 //!    referenced from some other production, or is the start symbol. A
 //!    production that names a rule nobody wrote, and a rule nothing reaches,
 //!    are both drift.
+//! 5. **The exemption expires** (N42). `TOKEN_CLASSES_NOT_IN_LEXICAL` widens
+//!    check 4, and a widening is only worth its ink while what it covers is
+//!    still uncovered: a class recorded there that §2 has since declared with
+//!    a production of its own reds, by name.
 //!
 //! # What this file does NOT verify
 //!
@@ -114,10 +118,10 @@ const TOKEN_CLASSES_NOT_IN_LEXICAL: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every capitalized token class §3 may use: the productions `spec/lexical.md`
-/// writes, plus the recorded few above. Read from §2 rather than copied, so a
-/// class that leaves §2 stops being available to §3.
-fn token_classes() -> BTreeSet<String> {
+/// The token classes `spec/lexical.md` DECLARES — §2's own productions, and
+/// nothing else. Read from the document rather than copied, so a class that
+/// leaves §2 stops being available to §3.
+fn lexical_token_classes() -> BTreeSet<String> {
     let lexical = read(LEXICAL);
     let mut classes: BTreeSet<String> = BTreeSet::new();
     for line in lexical.lines() {
@@ -135,6 +139,13 @@ fn token_classes() -> BTreeSet<String> {
         classes.len() >= 4,
         "spec/lexical.md reads as {classes:?} token classes — the §2 scan has          stopped matching"
     );
+    classes
+}
+
+/// Every capitalized token class §3 may use: the productions `spec/lexical.md`
+/// writes, plus the recorded few above.
+fn token_classes() -> BTreeSet<String> {
+    let mut classes = lexical_token_classes();
     classes.extend(
         TOKEN_CLASSES_NOT_IN_LEXICAL
             .iter()
@@ -476,5 +487,32 @@ fn every_production_the_grammar_writes_is_one_the_grammar_reaches() {
         "spec §3 writes production(s) nothing reaches: {unreached:?}. Either a \
          rule that references them was dropped (the grammar is behind the \
          parser), or they are dead and should go."
+    );
+}
+
+#[test]
+fn every_recorded_token_class_still_needs_recording() {
+    // The inverse of the exemption (tracker N42). `TOKEN_CLASSES_NOT_IN_LEXICAL`
+    // widens what §3 may name, and a widening only earns its ink while the thing
+    // it covers is still uncovered: the moment `spec/lexical.md` grows a
+    // production for one of these, the entry stops exempting anything and
+    // becomes a claim about the document that is no longer true.
+    //
+    // This is not hypothetical. N39 removed `ISTRING` from this list BY HAND,
+    // having noticed it in a read-through, and nothing would have noticed it
+    // otherwise: the gate stays green either way, because a name that is BOTH
+    // recorded here and declared in §2 is simply inserted twice into a set.
+    let declared = lexical_token_classes();
+    let stale: Vec<&str> = TOKEN_CLASSES_NOT_IN_LEXICAL
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| declared.contains(*name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "token class(es) {stale:?} are recorded in TOKEN_CLASSES_NOT_IN_LEXICAL as \
+         classes `{LEXICAL}` does not declare — and it declares them. The exemption \
+         covers nothing now: delete the entry, and §2's production carries the class \
+         on its own."
     );
 }

@@ -14,6 +14,18 @@ is recorded as fixed while a test still asserts it is not, and nobody is
 looking at either. A pin whose owner is in neither the index nor the archive is
 worse - it points at nothing at all.
 
+**Platform-gated pins are seen, and that is the point of enumerating TEXTUALLY**
+(tracker N45). The enumeration is `git ls-files '*.rs'` plus a line scan: no
+compilation, no test list, no target. So a `#[cfg(windows)]` pin's `#[ignore]`
+reason is read on a Linux box exactly as a portable one is, and the close-time
+cross-check covers it - which matters because the OTHER half of N27, the weekly
+`--run-ignored only` leg in `.github/workflows/ignored-pins.yml`, runs on
+`ubuntu-latest` alone: there a `cfg(windows)` pin compiles away, never runs, and
+so can never be reported as "now PASSES". The two halves fail differently on
+purpose, and this is the half that does not go blind at a platform boundary.
+`a cfg-gated pin is enumerated like any other` in the self-test below is what
+holds that.
+
 Usage, from the repository root:
 
     scripts/ignored-pins.py --tracker ../proposals/projects/vilan/tracker
@@ -276,6 +288,12 @@ fn acronym() {}
 
 #[ignore = "I18n is not item 18"]
 fn not_item_eighteen() {}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "B198: a platform-gated pin, invisible to the weekly ubuntu run \\
+            and visible here"]
+fn platform_gated() {}
 '''
 
 
@@ -287,7 +305,7 @@ def self_test(out) -> int:
             failures.append(claim)
 
     found = ignore_attributes(SELF_TEST_SOURCE)
-    check("four attributes are read, prose is not", len(found) == 4)
+    check("five attributes are read, prose is not", len(found) == 5)
     reasons = [pin.reason for pin in found]
     check(
         "a wrapped reason is one run",
@@ -298,6 +316,23 @@ def self_test(out) -> int:
     check("a reason naming no item has no item", found[1].item is None)
     check("`ARM64` is not read as an id", found[2].item is None)
     check("`I18n` is not read as item 18", found[3].item is None)
+    # N45. The enumeration is textual, so a pin the ubuntu leg cannot even
+    # compile is still read here, reason and all - which is the only automated
+    # route by which a `cfg(windows)` pin's `#[ignore]` can expire. Read by
+    # REASON rather than by position, so a scanner that goes blind at the `cfg`
+    # gate reports a named failure instead of running off the end of the list.
+    gated = next(
+        (pin for pin in found if pin.reason.startswith("B198")),
+        None,
+    )
+    check("a cfg-gated pin is enumerated like any other", gated is not None)
+    check(
+        "and its wrapped reason is one run",
+        gated is not None
+        and gated.reason
+        == "B198: a platform-gated pin, invisible to the weekly ubuntu run "
+        "and visible here",
+    )
     check(
         "a fenced fixture is blanked",
         ATTRIBUTE

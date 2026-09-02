@@ -3427,6 +3427,13 @@ fn a_backslash_before_a_crlf_break_after_a_hole_in_a_triple_quoted_string_emits_
 /// platform coloring gave a layer requirement — the observable that says
 /// whether the file was recognized as library territory or silently demoted to
 /// "user code".
+///
+/// `cfg(unix)` because its one caller is (tracker N45): the symlink pin below
+/// is the only thing that needs it, and a helper compiled with no caller is
+/// `dead_code` — which `-D warnings` makes an ERROR, so on the Windows target
+/// this one function was the whole reason a `cargo clippy --all-targets` leg
+/// could not be added for it.
+#[cfg(unix)]
 fn entry_functions_with_a_requirement(entry: &Path) -> (usize, usize) {
     let std = std_spec();
     let source: &'static str = Box::leak(
