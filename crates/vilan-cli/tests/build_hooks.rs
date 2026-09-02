@@ -2476,7 +2476,13 @@ fn a_relative_directory_symlink_inside_the_project_is_followed() {
 
 /// Binaries whose every test is a watch session, so the filterset takes them
 /// whole.
-const WATCH_SESSION_BINARIES: &[&str] = &["hmr", "hmr_swap", "hmr_css_matrix", "watch_lifecycle"];
+const WATCH_SESSION_BINARIES: &[&str] = &[
+    "hmr",
+    "hmr_swap",
+    "hmr_css_matrix",
+    "watch_lifecycle",
+    "watch_leg_reuse",
+];
 
 /// Binaries with a watch family inside a larger suite, selected by name.
 const MIXED_BINARIES: &[&str] = &[

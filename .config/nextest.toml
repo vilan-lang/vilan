@@ -71,8 +71,8 @@ priority = 100
 wall-clock-waits = { max-threads = 1 }
 
 [[profile.default.overrides]]
-# `hmr`, `hmr_swap`, `hmr_css_matrix` and `watch_lifecycle` are watch sessions
-# end to end, so they join whole. The next five binaries are mostly one-shot
+# `hmr`, `hmr_swap`, `hmr_css_matrix`, `watch_lifecycle` and `watch_leg_reuse` are
+# watch sessions end to end, so they join whole. The next five binaries are mostly one-shot
 # `build` pins with a watch family inside them, and the family is named the way
 # it is spelled: every one of these tests carries `watch` or `round` in its
 # name. A name filter can rot in silence, so it does not stand alone —
@@ -88,6 +88,7 @@ wall-clock-waits = { max-threads = 1 }
 # buffer. Same bound, same failure, same cure.
 filter = '''
     binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
+    + binary(watch_leg_reuse)
     + ((binary(build_hooks) + binary(assets) + binary(asset_bundle) + binary(split)
         + binary(serve_build)) & test(/watch|round/))
     + (binary(vilan-lsp) & test(/package_recolor_tests/))
