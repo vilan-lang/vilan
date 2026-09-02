@@ -20,10 +20,14 @@ use vilan_core::{
     Workspace as BuildWorkspace, analyze_source_owning_overlay_modules,
 };
 
+use crate::keystroke::{
+    Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
+    candidates, cursor_context, module_name_of, shape_stamp,
+};
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
 use vilan_ide::{
-    Analysis, BOOK_BASE, Completion, ImportRoots, KEYWORD_DOCS, keyword_lexeme,
+    Analysis, BOOK_BASE, Completion, CompletionKind, ImportRoots, KEYWORD_DOCS, keyword_lexeme,
     source_call_subject, span_of,
 };
 
@@ -575,6 +579,12 @@ pub struct Document {
     /// edit that changes which entry reaches a file has to invalidate every one
     /// of them, not only the ones that import the edited file.
     package_root: Option<PathBuf>,
+    /// E121's keystroke path: what this analysis's answers were, captured once
+    /// when it was built, so a request between two landings costs an anchor and
+    /// a lex instead of a walk of the whole analyzed program. Part of the
+    /// ANALYSIS side — `adopt_analysis` takes it wholesale with the program it
+    /// describes. See [`crate::keystroke`].
+    landed: LandedSnapshot,
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -953,6 +963,8 @@ impl Document {
             import_roots: None,
             analysis_revision: 0,
             package_root: None,
+            // Nothing landed, so the keystroke path answers from syntax alone.
+            landed: LandedSnapshot::default(),
         }
     }
 
@@ -1132,7 +1144,7 @@ impl Document {
                 context.shared_platforms.len(),
             );
         }
-        Document {
+        let mut document = Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
@@ -1154,7 +1166,142 @@ impl Document {
             import_roots: Some(import_roots),
             analysis_revision: 0,
             package_root,
+            landed: LandedSnapshot::default(),
+        };
+        // E121: the keystroke path's whole-program walk, paid HERE — once per
+        // analysis, on the analysis thread — instead of once per request on
+        // the keystroke thread. See [`LandedSnapshot`].
+        document.landed = document.capture_landed(entry_path);
+        document
+    }
+
+    /// Capture what this freshly analyzed document's answers are, for the
+    /// keystroke path to re-serve until the next analysis lands.
+    fn capture_landed(&self, entry_path: &Path) -> LandedSnapshot {
+        if !self.program.is_some() {
+            return LandedSnapshot::default();
         }
+        LandedSnapshot {
+            stamp: shape_stamp(self.analyzed_text()),
+            tokens: self.semantic_tokens(),
+            hints: self.inlay_hints(),
+            index: self.landed_symbol_index(entry_path),
+            landed: true,
+        }
+    }
+
+    /// The per-module symbol index this analysis supports (§2.1.4): every
+    /// declared name, grouped by the module that declares it.
+    ///
+    /// Grouping is by `Program::source_of`, whose `SourceRange` windows are
+    /// disjoint by construction (an entity id only grows), and the module's
+    /// identity is `canonical_sources[source]` — the same table
+    /// [`Document::depends_on`] reads. Module index 0 is the entry, which is
+    /// the convention [`SymbolIndex::ENTRY`] names; its entries are the ones
+    /// the keystroke path re-reads from live syntax.
+    ///
+    /// Derive-generated entities (`DERIVED_SOURCE`) are skipped: their spans
+    /// are offsets into a template, not into any file a user can complete in.
+    fn landed_symbol_index(&self, entry_path: &Path) -> SymbolIndex {
+        let Some(program) = self.program.as_ref() else {
+            return SymbolIndex::default();
+        };
+        let mut by_module: Vec<ModuleSymbols> = vec![ModuleSymbols {
+            path: Some(entry_path.to_path_buf()),
+            module_name: module_name_of(entry_path),
+            // Filled by `refresh_entry_from_syntax` below, so the entry's
+            // export list is always the LIVE buffer's.
+            stamp: None,
+            entries: Vec::new(),
+        }];
+        let slot_of = |source: SourceId, by_module: &mut Vec<ModuleSymbols>| -> Option<usize> {
+            if source == SourceId(0) {
+                return Some(SymbolIndex::ENTRY);
+            }
+            if source == DERIVED_SOURCE {
+                return None;
+            }
+            let path = program.canonical_sources.get(source.0 as usize)?;
+            if let Some(existing) = by_module
+                .iter()
+                .position(|module| module.path.as_deref() == Some(path.as_path()))
+            {
+                return Some(existing);
+            }
+            by_module.push(ModuleSymbols {
+                path: Some(path.clone()),
+                module_name: module_name_of(path),
+                stamp: None,
+                entries: Vec::new(),
+            });
+            Some(by_module.len() - 1)
+        };
+        let epoch = self.analysis_revision.max(1);
+        let push =
+            |id: Id, name: String, kind: CompletionKind, by_module: &mut Vec<ModuleSymbols>| {
+                let Some(source) = program.source_of(id) else {
+                    return;
+                };
+                let Some(slot) = slot_of(source, by_module) else {
+                    return;
+                };
+                let call_parameters = (kind == CompletionKind::Function).then(|| {
+                    program
+                        .functions
+                        .get(&id)
+                        .map(|function| {
+                            function
+                                .parameters
+                                .iter()
+                                .filter_map(|parameter| program.parameters.get(parameter))
+                                .map(|parameter| parameter.name.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+                by_module[slot].entries.push(SymbolEntry {
+                    name,
+                    kind,
+                    signature: vilan_ide::signature_label(program, id),
+                    call_parameters,
+                    analysis_epoch: epoch,
+                });
+            };
+        for (id, function) in &program.functions {
+            push(
+                *id,
+                function.name.to_string(),
+                CompletionKind::Function,
+                &mut by_module,
+            );
+        }
+        for (id, struct_) in &program.structs {
+            push(
+                *id,
+                struct_.name.to_string(),
+                CompletionKind::Struct,
+                &mut by_module,
+            );
+        }
+        for (id, enum_) in &program.enums {
+            push(
+                *id,
+                enum_.name.to_string(),
+                CompletionKind::Enum,
+                &mut by_module,
+            );
+        }
+        for (id, trait_) in &program.traits {
+            push(
+                *id,
+                trait_.name.to_string(),
+                CompletionKind::Trait,
+                &mut by_module,
+            );
+        }
+        let mut index = SymbolIndex { by_module };
+        index.refresh_entry_from_syntax(self.analyzed_text());
+        index
     }
 
     /// One further leg's verdict on this file: analyze it under `platform` and
@@ -1422,6 +1569,7 @@ impl Document {
         // A whole-text set has no edit shape to record: the map from the
         // analyzed snapshot is broken until the next analysis lands.
         self.live_edits = None;
+        self.refresh_keystroke_index();
     }
 
     /// Apply one LSP content change to the LIVE snapshot: a ranged event
@@ -1448,12 +1596,34 @@ impl Document {
                 new_len: replacement.len(),
             });
         }
+        self.refresh_keystroke_index();
+    }
+
+    /// E121 §2.1.4: bring the edited module's entry in the symbol index back to
+    /// the live buffer, but only when the buffer's declaration shape moved.
+    ///
+    /// The mandate's "invalidated only by that module's own edits", made exact.
+    /// The common keystroke types inside a function body, leaves the stamp
+    /// alone and costs one lex and one hash; only a keystroke that adds,
+    /// removes, renames or re-signs a declaration pays for the rebuild. Runs on
+    /// the keystroke thread and is O(file).
+    fn refresh_keystroke_index(&mut self) {
+        self.landed.index.refresh_entry_from_syntax(&self.text);
     }
 
     /// Map an ANALYZED-space byte offset into the live text, through the
     /// recorded edits — `None` when the log is unmappable. An offset inside
     /// a replaced region clamps into the replacement (the anchor's text is
     /// gone; its nearest surviving position is the honest answer).
+    ///
+    /// E121 retired its shipped caller: the inlay-hint handler used this to
+    /// approximate a live position for an analyzed-space hint, and the
+    /// keystroke path answers in live space outright, so there is nothing left
+    /// to approximate. The mechanism (`live_edits`, `EditDelta`) is still the
+    /// incremental-sync log B39c records and B39c's pins still hold it, so it
+    /// is compiled with the tests rather than carried dead in the shipped
+    /// binary — the rule `Document::references` states below.
+    #[cfg(test)]
     pub fn live_offset(&self, offset: usize) -> Option<usize> {
         let edits = self.live_edits.as_ref()?;
         let mut offset = offset;
@@ -1508,7 +1678,11 @@ impl Document {
         self.analyzed_index.range(span)
     }
 
-    /// The LSP position for a program byte offset (an inlay hint's anchor).
+    /// The LSP position for a program byte offset. Its shipped caller was the
+    /// inlay-hint handler, which E121 moved onto live-space offsets and the
+    /// live index; compiled with the tests for the reason
+    /// `Document::references` states below.
+    #[cfg(test)]
     pub fn analyzed_position(&self, offset: usize) -> Position {
         self.analyzed_index.position(offset)
     }
@@ -1640,6 +1814,7 @@ impl Document {
             import_roots,
             analysis_revision,
             package_root,
+            landed,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
@@ -1661,6 +1836,10 @@ impl Document {
         self.import_roots = import_roots;
         self.analysis_revision = analysis_revision;
         self.package_root = package_root;
+        // E121: the captured answers belong to the program that produced them,
+        // so they are adopted with it. Nothing is recomputed here — the walk
+        // was paid on the analysis thread.
+        self.landed = landed;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -1672,6 +1851,9 @@ impl Document {
             // edits no longer start from this snapshot.
             self.live_edits = None;
         }
+        // The entry module's export list follows the LIVE buffer, not the
+        // analyzed one — a `fun` typed during the analysis must complete.
+        self.landed.index.refresh_entry_from_syntax(&self.text);
     }
 
     /// Computes B38's retained tail: the longest byte-identical common
@@ -2316,6 +2498,160 @@ impl Document {
             );
         }
         kept
+    }
+
+    // -- E121's keystroke path (proposal/editor-latency.md §2.1) -------------
+    //
+    // Four entry points, each O(file) and none of which runs `Analyzer`,
+    // `resolve_project_context`, or the filesystem. They answer the LIVE
+    // buffer; the providers above answer the ANALYZED one and remain the
+    // source the snapshot is captured from.
+
+    /// The two-sided anchor between the analyzed text and the live buffer.
+    pub fn keystroke_anchor(&self) -> Anchor {
+        Anchor::compute(self.analyzed_text(), &self.text)
+    }
+
+    /// What the landed analysis is worth for the buffer as it stands (§2.1.2).
+    ///
+    /// `dependency_moved` is the caller's answer to the paper's case 4 —
+    /// another module this analysis loaded has been edited since. The server
+    /// passes `false`, and the reason is that case 4 already closes by LANDING
+    /// rather than by degrading: an edit to a module this file imports leaves
+    /// this file's own buffer untouched, so its anchor is the identity and the
+    /// landed answer is served exactly as it is today, until
+    /// `reanalyze_dependents` re-lands it. Nothing here is newly stale; the
+    /// parameter is the seam a cancellation-aware scheduler would supply.
+    ///
+    /// The live buffer's stamp is READ, not recomputed: `set_text` and
+    /// `apply_change` maintain it on the symbol index as part of the same lex
+    /// the index needs anyway, so a verdict costs a comparison and the anchor's
+    /// two byte scans. It falls back to hashing when no index entry exists,
+    /// which is only the never-analyzed document.
+    pub fn keystroke_verdict(&self, dependency_moved: bool) -> Verdict {
+        if !self.landed.landed {
+            return Verdict::Unusable;
+        }
+        let anchor = self.keystroke_anchor();
+        let live_stamp = self
+            .landed
+            .index
+            .entry_stamp()
+            .unwrap_or_else(|| shape_stamp(&self.text));
+        Verdict::decide(&anchor, live_stamp == self.landed.stamp, dependency_moved)
+    }
+
+    /// Semantic tokens for the LIVE buffer, in LIVE coordinates.
+    ///
+    /// The landed stream re-mapped through the anchor, plus the edit window
+    /// painted from syntax alone — and, when a name binding moved or no anchor
+    /// survives, syntax alone for the whole file. The cost is one anchor
+    /// (two byte scans), a filter over the landed stream, and one lex: O(file),
+    /// and flat in the size of the analyzed program, which is the whole
+    /// mandate.
+    pub fn keystroke_tokens(&self, dependency_moved: bool) -> Vec<(Span, TokenKind, u32)> {
+        let anchor = self.keystroke_anchor();
+        let verdict = self.keystroke_verdict(dependency_moved);
+        self.landed.tokens_for(&self.text, &anchor, verdict)
+    }
+
+    /// Inlay hints for the LIVE buffer, in LIVE coordinates — Q1/Q4's ruling:
+    /// re-mapped through the anchor, withheld inside the edit window, served
+    /// unchanged rather than flickered off when stale, withheld entirely when
+    /// no anchor survives.
+    pub fn keystroke_hints(&self, dependency_moved: bool) -> Vec<(usize, String)> {
+        let anchor = self.keystroke_anchor();
+        let verdict = self.keystroke_verdict(dependency_moved);
+        self.landed.hints_for(&anchor, verdict)
+    }
+
+    /// Completion candidates at a LIVE `offset`, answered from the symbol
+    /// index and the cursor's syntactic context (§2.1.4).
+    ///
+    /// Three shapes, and what each may read:
+    ///
+    /// - **scope** — the edited module's own declarations, read from the live
+    ///   buffer's syntax, so a `fun` typed one keystroke ago completes. Only
+    ///   its own: a name another module declares is not in scope here without
+    ///   an import, and reaching it is auto-import's job. Measured on a kolt
+    ///   copy, adding every loaded module's names to this arm turned a
+    ///   125-candidate scope completion into a 3,144-candidate one.
+    /// - **`module::`** — that module's entry in the index, by the name a path
+    ///   spells it with. This is the arm the index straightforwardly replaces:
+    ///   no `read_dir`, no per-module `name_to_id_map` sweep.
+    /// - **`receiver.`** — a member list is a *type* question and the index
+    ///   cannot answer it. When the verdict is [`Verdict::Exact`] the LANDED
+    ///   analysis answers (a read of a finished `Program`, not a type-check);
+    ///   otherwise the receiver's binding may have moved, and the module's own
+    ///   names are offered instead of a member list that would be a lie of the
+    ///   kind Q4 rules against for hints.
+    ///
+    /// The landed engine then fills in everything only resolution can supply —
+    /// locals, members, keywords, snippets, auto-imports — and a label the
+    /// index already offered is dropped rather than repeated. The index goes
+    /// FIRST because it is the only source that knows what the live buffer
+    /// declares: a `fun` typed one keystroke ago is in it and cannot be in the
+    /// landed analysis.
+    pub fn keystroke_completion(&self, offset: usize, dependency_moved: bool) -> Vec<Completion> {
+        let verdict = self.keystroke_verdict(dependency_moved);
+        let context = cursor_context(&self.text, offset);
+        if context == CursorContext::None {
+            return Vec::new();
+        }
+        let index = &self.landed.index;
+        let entry_names = |prefix: &str| {
+            index
+                .by_module
+                .get(SymbolIndex::ENTRY)
+                .map(|entry| candidates(&entry.entries, prefix))
+                .unwrap_or_default()
+        };
+        let mut offered = match &context {
+            // Handled above; the arm keeps the match total without a
+            // catch-all that would swallow a future context.
+            CursorContext::None => Vec::new(),
+            // The EDITED module's own declarations, and deliberately nothing
+            // else. A name another module declares is not in scope here without
+            // an import, and offering it as though it were is both wrong and
+            // expensive: measured on a kolt copy, adding every loaded module's
+            // names turned a 125-candidate scope completion into a
+            // 3,144-candidate one. Reaching those names is auto-import's job,
+            // which the landed engine below already does with the ranking tiers
+            // and the `additionalTextEdits` that insert the import.
+            CursorContext::Scope { prefix } => entry_names(prefix),
+            CursorContext::Path { module, prefix } => index
+                .module(module)
+                .map(|module| candidates(&module.entries, prefix))
+                .unwrap_or_default(),
+            // A member position in the exact state: the landed analysis owns
+            // the member list, and it arrives below. Otherwise the receiver's
+            // binding may have moved, and the module's own names are the
+            // honest offer.
+            CursorContext::Member { prefix } => match verdict {
+                Verdict::Exact => Vec::new(),
+                Verdict::Stale | Verdict::Unusable => entry_names(prefix),
+            },
+        };
+        // The landed engine's resolution-derived candidates, deduplicated by
+        // label. It reads the last completed analysis and never runs
+        // `Analyzer`; retiring its own whole-program sweeps behind the index
+        // (`auto_import_completions`, `modules_in_root`'s per-request
+        // `read_dir`) is the next tranche, and this is the seam it happens at.
+        for candidate in self.completion(offset) {
+            if !offered
+                .iter()
+                .any(|existing| existing.label == candidate.label)
+            {
+                offered.push(candidate);
+            }
+        }
+        offered
+    }
+
+    /// The keystroke path's own view of the symbol index, for the pins.
+    #[cfg(test)]
+    pub(crate) fn keystroke_index(&self) -> &SymbolIndex {
+        &self.landed.index
     }
 
     fn type_reference_at(&self, program: &Program, offset: usize) -> Option<(Option<Id>, String)> {

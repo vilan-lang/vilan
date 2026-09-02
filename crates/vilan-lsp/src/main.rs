@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod book_sync;
 mod document;
+mod keystroke;
 mod line_index;
 mod manifest_completion;
 mod publish;
@@ -2313,33 +2314,23 @@ impl LanguageServer for Backend {
             };
             let range = params.range;
             let hints = document
-                .inlay_hints()
+                // E121 (Q1/Q4): the landed hints re-mapped through the
+                // two-sided anchor, WITHHELD inside the edit window — a hint on
+                // the line you are typing is the most likely to be wrong and
+                // the least useful, and its absence there is invisible because
+                // it was about to move anyway. A hint outside the window sits
+                // on byte-identical text, so its position is exact.
+                //
+                // That exactness is what retires the analyzed/live index dance
+                // this filter used to need: the offsets are already live-space,
+                // so one index answers both the hint's position and the
+                // viewport compare, and there is no approximation left to
+                // fall back to.
+                .keystroke_hints(false)
                 .into_iter()
                 .filter_map(|(offset, label)| {
-                    // The anchor is a program offset, so it converts through the
-                    // ANALYZED index (S1). Through the live one, an insertion above
-                    // slid every hint below it — and the viewport filter on the next
-                    // line then dropped the ones that slid out of range entirely.
-                    //
-                    // The filter compares against `params.range`, which is
-                    // live-space. With incremental sync (B39c) the recorded
-                    // edits map the anchor into live space and the compare
-                    // is EXACT; when the map is broken (a whole-text set, an
-                    // analysis of an older text) it falls back to the old
-                    // approximation — exact for same-line edits, off by the
-                    // inserted or deleted lines near the viewport edge until
-                    // the refresh lands. The HINT keeps its analyzed-space
-                    // position either way: program answers describe the
-                    // analyzed snapshot (the snapshot-consistency rule), and
-                    // the client clips out-of-range answers harmlessly.
-                    let position = document.analyzed_position(offset);
-                    let visible = match document.live_offset(offset) {
-                        Some(live) => {
-                            let live_position = document.line_index.position(live);
-                            live_position >= range.start && live_position <= range.end
-                        }
-                        None => position >= range.start && position <= range.end,
-                    };
+                    let position = document.line_index.position(offset);
+                    let visible = position >= range.start && position <= range.end;
                     visible.then_some(InlayHint {
                         position,
                         label: InlayHintLabel::String(label),
@@ -2375,8 +2366,13 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
+            // E121's keystroke path: the LANDED stream re-mapped through the
+            // two-sided anchor plus the edit window painted from syntax, in
+            // LIVE coordinates — so the encode goes through the LIVE index, not
+            // the analyzed one. That index switch IS the change: an answer that
+            // describes the buffer on screen has to be positioned against it.
             let data =
-                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+                encode_semantic_tokens(&document.keystroke_tokens(false), &document.line_index);
             drop(document);
             let id = fresh_result_id();
             self.semantic_token_cache
@@ -2405,8 +2401,10 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
+            // The same stream `semantic_tokens_full` answers with (E121), or
+            // the delta chain would compare two different pictures.
             let data =
-                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+                encode_semantic_tokens(&document.keystroke_tokens(false), &document.line_index);
             drop(document);
             let id = fresh_result_id();
             // Swap the baseline for the new stream in one motion; the OLD
@@ -2550,8 +2548,18 @@ impl LanguageServer for Backend {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .completion_function_call;
             let snippet_support = self.snippet_support.load(Ordering::Relaxed);
+            // E121 §2.1.4. The keystroke path's index answers FIRST, because it
+            // is the only source that knows what the live buffer declares: a
+            // `fun` typed one keystroke ago is in the index and cannot be in
+            // the landed analysis. The landed engine's candidates then fill in
+            // everything resolution alone can supply — members, keywords,
+            // snippets, auto-imports — and a label the index already offered is
+            // dropped rather than repeated. Retiring the engine's own
+            // whole-program sweeps behind the index (`auto_import_completions`,
+            // `modules_in_root`'s per-request `read_dir`) is the next tranche;
+            // this is the seam it happens at.
             let items = document
-                .completion(offset)
+                .keystroke_completion(offset, false)
                 .into_iter()
                 .map(|completion| {
                     to_completion_item(completion, mode, snippet_support, &document.line_index)
@@ -3535,11 +3543,25 @@ mod snapshot_consistency_tests {
     }
 
     // S1/S3: read-only queries never refuse — they answer
-    // correctly-for-the-snapshot. Semantic tokens over a stale buffer come back
-    // byte-identical to the pre-edit answer, which is what stops the
-    // highlighting from breaking up while the analysis catches up.
+    // correctly-for-the-snapshot.
+    //
+    // **E121 (RULED 2026-09-01) narrows what "the snapshot" means for this one
+    // handler, and this pin is rewritten to the narrower rule.** S1's original
+    // claim was that the whole token stream comes back byte-identical to the
+    // pre-edit answer — the highlighting holds still for the full staleness
+    // window, measured at 409 ms on the fast file and 1.1 s on the slow one
+    // (`proposal/editor-latency.md` §1.5). Q5 rules that out: *"commenting a
+    // line out must read as a comment at once, not keep its semantic colors for
+    // the staleness window"*. The keystroke path therefore repaints the EDIT
+    // WINDOW from syntax on every keystroke and re-maps everything outside it
+    // through the two-sided anchor.
+    //
+    // So the property this pin now holds is the sharper, true one: **the
+    // anchors hold still and the window tracks the buffer.** Nothing is lost,
+    // no classification changes, and the only movement is the edited line's own
+    // token following the character that was typed in front of it.
     #[tokio::test]
-    async fn semantic_tokens_answer_the_analyzed_snapshot_while_typing() {
+    async fn semantic_tokens_track_the_edit_window_and_anchor_the_rest() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = uri();
@@ -3562,19 +3584,49 @@ mod snapshot_consistency_tests {
             .semantic_tokens_full(params)
             .await
             .expect("tokens while typing");
-        // The DATA holds still; the `result_id` is fresh per response by
-        // design (B39b's delta chain), so the comparison names the claim.
+        // The `result_id` is fresh per response by design (B39b's delta chain),
+        // so the comparison names the data.
         let data_of = |answer: Option<SemanticTokensResult>| match answer {
             Some(SemanticTokensResult::Tokens(tokens)) => tokens.data,
             other => panic!("the full provider returns tokens, got {other:?}"),
         };
         let baseline = data_of(baseline);
-        assert_eq!(
-            baseline,
-            data_of(mid_edit),
-            "the answer holds still until the analysis lands",
-        );
+        let mid_edit = data_of(mid_edit);
         assert!(!baseline.is_empty(), "the fixture must produce tokens");
+        assert_eq!(
+            baseline.len(),
+            mid_edit.len(),
+            "no token may be lost mid-keystroke: the window repaints from syntax and the \
+             anchors re-map, so the stream keeps its shape",
+        );
+        // `EDITED` inserts one space on line 0, so `main` — the only token in
+        // the edit window — starts one column later, and its CLASS is
+        // unchanged because syntax alone decides that an identifier after `fun`
+        // is a function declaration.
+        assert_eq!(
+            (
+                mid_edit[0].delta_line,
+                mid_edit[0].delta_start,
+                mid_edit[0].token_type,
+                mid_edit[0].token_modifiers_bitset,
+            ),
+            (
+                baseline[0].delta_line,
+                baseline[0].delta_start + 1,
+                baseline[0].token_type,
+                baseline[0].token_modifiers_bitset,
+            ),
+            "the token in the edit window must follow the character typed in front of it",
+        );
+        // Everything below the edited line rode the anchor: the encoding is
+        // relative, and byte-identical text at a constant shift encodes
+        // identically.
+        assert_eq!(
+            &baseline[1..],
+            &mid_edit[1..],
+            "every token outside the edit window sits on byte-identical text, so its answer \
+             is exact and unmoved",
+        );
     }
 
     // S1: inlay hints, same property — and the viewport filter is what made

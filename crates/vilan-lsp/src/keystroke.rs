@@ -1,0 +1,1944 @@
+//! The keystroke path (E121, `proposal/editor-latency.md` §2.1): semantic
+//! tokens, inlay hints and completion answered in **O(file)** from the last
+//! LANDED analysis re-mapped onto the live buffer — and never by
+//! type-checking.
+//!
+//! The paper's measurement is the reason this module exists. Every provider
+//! today re-walks the whole analyzed program per request, so one unchanged
+//! 468-token file costs 4.2 ms of CPU to tokenize inside a 4-function import
+//! closure and 27.0 ms inside a 5,000-function one (§1.4a): the cost is
+//! proportional to the *codebase*, not to the file, and the mandate's 10 ms
+//! budget is spent at ≈490 reachable functions. Nothing about that is a
+//! tuning problem. The fix is to stop recomputing.
+//!
+//! Three pieces, each with its own honesty argument:
+//!
+//! 1. **The two-sided anchor** ([`Anchor`]) — the generalization of B38's
+//!    `compute_retained_tail`. Everything before the first differing byte and
+//!    after the last differing byte is *byte-identical* between the analyzed
+//!    text and the live buffer, so the landed answers for those regions map
+//!    onto the live buffer by a constant shift and are position-exact. The
+//!    middle window — the region the user is editing — has no image and is
+//!    served from **syntax alone**.
+//! 2. **The declaration-shape stamp** ([`ShapeStamp`]) — a hash of everything
+//!    the token stream shows OUTSIDE a function body, which is exactly the
+//!    text that binds a module-scope name. An unchanged stamp means no name's
+//!    resolution can have moved, so the landed classification outside the
+//!    window is still true; a changed one degrades the file's tokens to
+//!    syntax-only until the next analysis lands.
+//! 3. **The per-module symbol index** ([`SymbolIndex`]) — declared names,
+//!    kinds and signature labels, grouped by the module that declares them,
+//!    built once when an analysis lands and refreshed for the edited module
+//!    from its own syntax. Completion reads it instead of sweeping every
+//!    module's name map and instead of `read_dir`.
+//!
+//! The three combine into three verdicts ([`Verdict`]), which are the honest
+//! vocabulary for what an answer is worth mid-keystroke. `Document`'s
+//! `keystroke_*` methods are the consumers.
+
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use vilan_core::Span;
+use vilan_core::lexing::tokenize;
+use vilan_core::token::Token;
+use vilan_ide::{Completion, CompletionKind};
+
+use crate::document::{MODIFIER_DECLARATION, MODIFIER_READONLY, TokenKind};
+
+// ---------------------------------------------------------------------------
+// 1. The two-sided anchor
+// ---------------------------------------------------------------------------
+
+/// The byte-identical regions shared by the ANALYZED text and the LIVE buffer:
+/// a common prefix, a common suffix, and the window between them that has no
+/// image in the landed analysis.
+///
+/// B38 (`Document::compute_retained_tail`) already built half of this and
+/// stated the honesty argument that governs the whole of it: *"Identity of
+/// BYTES is the whole honesty argument: the suffix is literally the same text,
+/// so positions are exact."* The generalization is that a keystroke has text
+/// on BOTH sides of it, and the half B38 threw away — everything before the
+/// edit — is the larger half in every file longer than the cursor's line.
+///
+/// Both edges are trimmed to a **line boundary**: the prefix back to the start
+/// of the line holding the first difference, the suffix forward to the start
+/// of the line after the last one. A line boundary is a token boundary (a
+/// `\n` byte cannot occur inside a UTF-8 sequence, and the lexer's only
+/// newline-spanning token is a multiline string, which the containment rules
+/// below drop rather than mis-place), so the two anchors never cut a token in
+/// half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// Bytes of byte-identical, line-aligned common prefix. The same offset in
+    /// both texts.
+    pub prefix: usize,
+    /// Bytes of byte-identical, line-aligned common suffix.
+    pub suffix: usize,
+    /// The analyzed text's length, so an analyzed offset can be classified.
+    pub analyzed_len: usize,
+    /// The live buffer's length, so a live offset can be classified.
+    pub live_len: usize,
+}
+
+impl Anchor {
+    /// The anchor between the text an analysis ran on and the text the user is
+    /// looking at.
+    ///
+    /// Identical texts are the common case (every request between two
+    /// keystrokes) and answer with the whole file as prefix and an empty
+    /// window — a full re-serve of the landed answer at shift zero.
+    pub fn compute(analyzed: &str, live: &str) -> Anchor {
+        let analyzed_bytes = analyzed.as_bytes();
+        let live_bytes = live.as_bytes();
+        if analyzed_bytes == live_bytes {
+            return Anchor {
+                prefix: analyzed_bytes.len(),
+                suffix: 0,
+                analyzed_len: analyzed_bytes.len(),
+                live_len: live_bytes.len(),
+            };
+        }
+        let common_prefix = analyzed_bytes
+            .iter()
+            .zip(live_bytes)
+            .take_while(|(old, new)| old == new)
+            .count();
+        // Back to the start of the line holding the first difference. The
+        // result is 0 or one past a `\n`, so it is a char boundary in both
+        // texts (their bytes agree up to `common_prefix`).
+        let prefix = line_start(analyzed_bytes, common_prefix);
+
+        let common_suffix = analyzed_bytes
+            .iter()
+            .rev()
+            .zip(live_bytes.iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        // Clamp before trimming so the two anchors cannot overlap in EITHER
+        // text — `"aa"` → `"a"` shares a one-byte prefix and a one-byte
+        // suffix that are the same byte.
+        let room = analyzed_bytes
+            .len()
+            .min(live_bytes.len())
+            .saturating_sub(prefix);
+        let common_suffix = common_suffix.min(room);
+        // Forward to the start of the line after the last difference, in LIVE
+        // coordinates; the same trim in analyzed coordinates follows from the
+        // byte identity.
+        let live_suffix_start = next_line_start(live_bytes, live_bytes.len() - common_suffix);
+        let suffix = live_bytes.len() - live_suffix_start;
+
+        Anchor {
+            prefix,
+            suffix,
+            analyzed_len: analyzed_bytes.len(),
+            live_len: live_bytes.len(),
+        }
+    }
+
+    /// How far the tail anchor moved: the live buffer's length minus the
+    /// analyzed text's. A landed token inside the tail is *this many bytes*
+    /// later (or earlier) in the live buffer, exactly, by byte identity.
+    pub fn shift(&self) -> i64 {
+        self.live_len as i64 - self.analyzed_len as i64
+    }
+
+    /// Whether the anchor holds nothing: a paste (or a first analysis) left no
+    /// byte-identical line on either side, so no landed answer has an image.
+    /// This is [`Verdict::Unusable`]'s condition.
+    pub fn is_empty(&self) -> bool {
+        self.prefix == 0 && self.suffix == 0
+    }
+
+    /// The edit window in LIVE coordinates — the region served from syntax
+    /// alone. Empty when the texts are identical.
+    pub fn live_window(&self) -> Range<usize> {
+        let end = self.live_len.saturating_sub(self.suffix);
+        self.prefix.min(end)..end
+    }
+
+    /// Map an ANALYZED span into live coordinates, or `None` when it has no
+    /// image.
+    ///
+    /// A span maps only when it lies **entirely** inside one anchor: a span
+    /// that straddles a window edge is dropped rather than clamped, because
+    /// half of it describes bytes that are gone. That is what keeps the
+    /// mechanism a re-mapping instead of a guess.
+    pub fn map_span(&self, span: Span) -> Option<Span> {
+        if span.end <= self.prefix {
+            return Some(span);
+        }
+        if span.start >= self.analyzed_len.saturating_sub(self.suffix) {
+            let shift = self.shift();
+            let start = span.start as i64 + shift;
+            let end = span.end as i64 + shift;
+            if start < 0 || end < start || end as usize > self.live_len {
+                return None;
+            }
+            return Some(Span {
+                start: start as usize,
+                end: end as usize,
+            });
+        }
+        None
+    }
+
+    /// Map an ANALYZED byte offset into live coordinates, or `None` when it
+    /// falls in the window. The point form of [`Anchor::map_span`], for the
+    /// offset-keyed answers (inlay hints).
+    pub fn map_offset(&self, offset: usize) -> Option<usize> {
+        self.map_span(Span {
+            start: offset,
+            end: offset,
+        })
+        .map(|span| span.start)
+    }
+}
+
+/// The start of the line containing `at` — `0`, or one past the nearest
+/// preceding `\n`.
+fn line_start(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    while at > 0 && bytes[at - 1] != b'\n' {
+        at -= 1;
+    }
+    at
+}
+
+/// The start of the line AFTER the one containing `at` — the length when `at`
+/// is on the last line.
+fn next_line_start(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    if at > 0 && bytes[at - 1] == b'\n' {
+        return at;
+    }
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if byte == b'\n' {
+            return at;
+        }
+    }
+    bytes.len()
+}
+
+// ---------------------------------------------------------------------------
+// 2. The declaration-shape stamp
+// ---------------------------------------------------------------------------
+
+/// A hash of a module's **declaration shape**: every token the lexer produces
+/// outside a function body.
+///
+/// The rule is one sentence and it is the whole argument: *a module's
+/// name bindings live outside its function bodies*. `import` and `use` lines,
+/// `fun` signatures, `struct`/`enum`/`trait`/`impl` headers and their member
+/// declarations, module-scope `let`s, `mod`s, `macro`s and `type` aliases are
+/// all hashed token by token; a function body contributes one fixed marker and
+/// nothing else. So an equal stamp means the paper's §2.1.2 cases 1–3 — a
+/// top-level declaration added, removed or renamed; an `import` line changed;
+/// a signature or annotation changed — did not happen, and the landed
+/// analysis's classification of every name outside the edit window is still
+/// what the analyzer would say. Case 4 (another module moved) is a different
+/// question and `Document::depends_on` against the world revision answers it.
+///
+/// Two properties make it cheap enough for the keystroke path: it is computed
+/// off the **lexer**, not the parser, so it costs one linear pass and survives
+/// a mid-keystroke syntax error that would fail a parse; and every ambiguity
+/// resolves toward *changed*, which is the safe direction (a false "stale"
+/// costs a syntax-only paint that is never wrong, a false "exact" would keep a
+/// lie on screen).
+///
+/// What it deliberately does NOT cover: a `let` added inside a function body
+/// can shadow a later use of the same name in the same body. Both live in that
+/// body; the edit is in the window and the shadowed use is in the tail anchor,
+/// so it can be mis-coloured for one analysis. Q1 rules exactly this
+/// acceptable for tokens ("a briefly mis-coloured identifier is cosmetic"),
+/// and hints are withheld in the window where the risk is concentrated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct ShapeStamp(u64);
+
+/// The body marker: every function body hashes to this and nothing else, so
+/// typing inside one leaves the stamp alone.
+const BODY_MARKER: u64 = 0x5641_4c41_4e5f_424f;
+
+/// The declaration-shape stamp of `text`.
+pub fn shape_stamp(text: &str) -> ShapeStamp {
+    let (tokens, errors) = tokenize(text);
+    let mut hasher = vilan_core::fx::FxHasher::default();
+    // A lex error is a shape change by itself: the token stream below it is
+    // not trustworthy, and the safe direction is "changed".
+    errors.len().hash(&mut hasher);
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let (token, _span) = &tokens[index];
+        hash_token(token, &mut hasher);
+        if matches!(token, Token::Fun) {
+            index = hash_signature_and_skip_body(&tokens, index + 1, &mut hasher);
+            continue;
+        }
+        index += 1;
+    }
+    ShapeStamp(hasher.finish())
+}
+
+/// Hash the tokens of a `fun` signature starting at `index`, then skip its
+/// body (hashing [`BODY_MARKER`] in its place) and return the index just past
+/// it. A body-less `fun` — a trait requirement, an `external` declaration —
+/// ends at its `;` or at the next declaration and contributes no marker.
+fn hash_signature_and_skip_body(
+    tokens: &[(Token<'_>, Span)],
+    mut index: usize,
+    hasher: &mut vilan_core::fx::FxHasher,
+) -> usize {
+    let mut group_depth = 0i32;
+    while index < tokens.len() {
+        let (token, _) = &tokens[index];
+        match token {
+            Token::Ctrl('(' | '[') => group_depth += 1,
+            Token::Ctrl(')' | ']') => group_depth -= 1,
+            Token::Ctrl('{') if group_depth <= 0 => {
+                BODY_MARKER.hash(hasher);
+                return skip_braced(tokens, index);
+            }
+            Token::Ctrl(';') if group_depth <= 0 => {
+                hash_token(token, hasher);
+                return index + 1;
+            }
+            _ => {}
+        }
+        hash_token(token, hasher);
+        index += 1;
+    }
+    index
+}
+
+/// The index just past the `{ … }` group opening at `open` (which must be a
+/// `Ctrl('{')`), or the end of the stream when it never closes.
+fn skip_braced(tokens: &[(Token<'_>, Span)], open: usize) -> usize {
+    let mut depth = 0i32;
+    let mut index = open;
+    while index < tokens.len() {
+        match &tokens[index].0 {
+            Token::Ctrl('{') => depth += 1,
+            Token::Ctrl('}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    index
+}
+
+/// Hash one token by its shape: the discriminant, plus the text of the
+/// variants that carry one. Spans are deliberately excluded — moving a
+/// declaration down a line does not change what it binds.
+fn hash_token(token: &Token<'_>, hasher: &mut vilan_core::fx::FxHasher) {
+    std::mem::discriminant(token).hash(hasher);
+    match token {
+        Token::Ident(text) | Token::Op(text) | Token::String(text) => text.hash(hasher),
+        Token::MultilineString(text) => text.hash(hasher),
+        Token::Ctrl(character) => character.hash(hasher),
+        Token::Bool(value) => value.hash(hasher),
+        Token::Number(whole, fraction, suffix) => (whole, fraction, suffix).hash(hasher),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. The three verdicts
+// ---------------------------------------------------------------------------
+
+/// What the landed analysis is worth for the buffer as it stands — the
+/// vocabulary the paper's §2.1.2 table is written in, and the one decision
+/// every `keystroke_*` provider branches on.
+///
+/// | verdict | condition | tokens | hints | completion |
+/// |---|---|---|---|---|
+/// | [`Verdict::Exact`] | an anchor exists, the stamp matches, no dependency moved | landed tokens re-mapped through the anchor, **syntax-only inside the window** | landed hints re-mapped, **withheld inside the window** | index + the landed scope, members from the landed type |
+/// | [`Verdict::Stale`] | an anchor exists, but the stamp changed or a dependency moved | **syntax-only, whole file** | landed hints re-mapped, withheld inside the window — served unchanged rather than flickered off | index + the module's own names |
+/// | [`Verdict::Unusable`] | no anchor at all: a paste replaced the file, or nothing has landed | **syntax-only, whole file** | **withheld entirely** | index only |
+///
+/// The asymmetry between tokens and hints in the stale row is Q1's ruling and
+/// is not an oversight. A token has a syntax-only fallback that is *never
+/// wrong*, so degrading to it costs nothing; a hint has none — there is
+/// nothing to show — and VS Code's only available mark is removal, so
+/// withholding a stale hint makes hints strobe across a typing burst. A hint
+/// one analysis old is a smaller harm than a display that blinks, and
+/// `inlayHint/refresh` already corrects it when the analysis lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Positions are exact AND no name's resolution can have moved.
+    Exact,
+    /// Positions are exact, but a name binding changed: the landed
+    /// classification may be a lie, so tokens fall back to syntax.
+    Stale,
+    /// Nothing of the landed answer survives: no byte-identical anchor.
+    Unusable,
+}
+
+impl Verdict {
+    /// The verdict for one buffer against one landed snapshot.
+    ///
+    /// `dependency_moved` is the caller's answer to the paper's case 4 —
+    /// another module this file's analysis loaded has been edited — which no
+    /// amount of local anchoring can repair.
+    pub fn decide(anchor: &Anchor, stamp_matches: bool, dependency_moved: bool) -> Verdict {
+        if anchor.is_empty() {
+            return Verdict::Unusable;
+        }
+        if !stamp_matches || dependency_moved {
+            return Verdict::Stale;
+        }
+        Verdict::Exact
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Syntax-only classification
+// ---------------------------------------------------------------------------
+
+/// The semantic tokens the LIVE buffer's own syntax determines, for the byte
+/// range `window` — the answer served inside the edit window, and the whole
+/// answer in the stale and unusable states.
+///
+/// **What it emits and what it does not** is the load-bearing half of Q5. The
+/// LSP legend this server publishes (`document::TOKEN_TYPES`) carries only
+/// *semantic* classes — namespace, struct, function, variable and their
+/// siblings. It has no `comment`, `keyword`, `string`, `number` or `operator`,
+/// because those are the client's TextMate grammar's job, and the grammar is
+/// **never stale**: it re-highlights on the keystroke. So this function emits
+/// a token only where syntax alone determines a *semantic* role, and stays
+/// silent everywhere else.
+///
+/// That silence is exactly the owner's exhibit. `tokenize` produces no token
+/// for a comment at all (`lexing.rs`'s own pin: `lex("// just a comment")` is
+/// empty), so commenting a line out removes every semantic token that line
+/// had. The client then paints it with the grammar's comment colour on the
+/// very next keystroke instead of holding the line's function-and-variable
+/// colours for the whole staleness window — which is what "the highlighting
+/// lags" meant.
+///
+/// The rules, in priority order, and each decidable from the token stream:
+///
+/// - the identifier after `fun` / `struct` / `enum` / `trait` / `mod` /
+///   `macro` is that kind's **declaration**;
+/// - the identifier after `let` is a readonly variable declaration, after
+///   `mut` a mutable one;
+/// - `.name(` is a method, `.name` a property;
+/// - `name(` is a function call, `name::` a namespace;
+/// - every other identifier is a *plain* identifier and emits nothing —
+///   whether it is a variable, a type or a constant is a resolution question,
+///   and the anchors are where resolution answers come from.
+pub fn syntax_tokens_in(text: &str, window: Range<usize>) -> Vec<(Span, TokenKind, u32)> {
+    if window.is_empty() {
+        return Vec::new();
+    }
+    let (tokens, _errors) = tokenize(text);
+    let mut out: Vec<(Span, TokenKind, u32)> = Vec::new();
+    for (index, (token, span)) in tokens.iter().enumerate() {
+        let Token::Ident(_) = token else { continue };
+        // Full containment, so a syntax token can never overlap an anchor
+        // token: the two regions are disjoint by construction and the caller
+        // needs no arbitration between them.
+        if span.start < window.start || span.end > window.end {
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|before| &tokens[before].0);
+        let next = tokens.get(index + 1).map(|(token, _)| token);
+        let classified = match (previous, next) {
+            (Some(Token::Fun), _) => Some((TokenKind::Function, MODIFIER_DECLARATION)),
+            (Some(Token::Struct), _) => Some((TokenKind::Struct, MODIFIER_DECLARATION)),
+            (Some(Token::Enum), _) => Some((TokenKind::Enum, MODIFIER_DECLARATION)),
+            (Some(Token::Trait), _) => Some((TokenKind::Interface, MODIFIER_DECLARATION)),
+            (Some(Token::Mod), _) => Some((TokenKind::Namespace, MODIFIER_DECLARATION)),
+            (Some(Token::Macro), _) => Some((TokenKind::Macro, MODIFIER_DECLARATION)),
+            (Some(Token::Let), _) => Some((
+                TokenKind::Variable,
+                MODIFIER_DECLARATION | MODIFIER_READONLY,
+            )),
+            (Some(Token::Mut), _) => Some((TokenKind::Variable, MODIFIER_DECLARATION)),
+            (Some(Token::Ctrl('.')), Some(Token::Ctrl('('))) => Some((TokenKind::Method, 0)),
+            (Some(Token::Ctrl('.')), _) => Some((TokenKind::Property, 0)),
+            (_, Some(Token::Ctrl('('))) => Some((TokenKind::Function, 0)),
+            (_, Some(Token::Op("::"))) => Some((TokenKind::Namespace, 0)),
+            _ => None,
+        };
+        if let Some((kind, modifiers)) = classified {
+            out.push((*span, kind, modifiers));
+        }
+    }
+    out
+}
+
+/// Sort a token stream by position and drop overlaps, narrowest-first at each
+/// start — the shape the LSP requires, and the same rule
+/// `Document::semantic_tokens` applies to its own stream. Merging two sources
+/// (re-mapped anchors and the window's syntax) is the one place that can
+/// produce an out-of-order stream, so it is done in one named place.
+pub fn sort_and_deoverlap(mut tokens: Vec<(Span, TokenKind, u32)>) -> Vec<(Span, TokenKind, u32)> {
+    tokens.sort_by_key(|(span, _, _)| (span.start, span.end.saturating_sub(span.start)));
+    let mut kept: Vec<(Span, TokenKind, u32)> = Vec::new();
+    let mut last_end = 0usize;
+    for (span, kind, modifiers) in tokens {
+        if span.start >= last_end && span.start < span.end {
+            last_end = span.end;
+            kept.push((span, kind, modifiers));
+        }
+    }
+    kept
+}
+
+// ---------------------------------------------------------------------------
+// 5. The per-module symbol index
+// ---------------------------------------------------------------------------
+
+/// One name a module declares, with everything completion needs to offer it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolEntry {
+    pub name: String,
+    pub kind: CompletionKind,
+    /// The rendered signature (a function's declaration line, a variable's
+    /// type), where the source of this entry could produce one.
+    pub signature: Option<String>,
+    /// The parameter names a call-shaped insertion needs, `None` for a
+    /// non-callable.
+    pub call_parameters: Option<Vec<String>>,
+    /// Which analysis filled this entry's resolution-derived fields. **Zero
+    /// means purely syntactic** — read straight off a token stream, true of
+    /// the buffer as it stands this instant. A consumer can therefore always
+    /// tell a syntactic fact from a resolved one, which is the property the
+    /// paper asks the index to carry.
+    pub analysis_epoch: u64,
+}
+
+/// Every name one module declares, keyed by the module's own content.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleSymbols {
+    /// The module's canonical file path, when the analysis recorded one.
+    pub path: Option<PathBuf>,
+    /// The name a `path::` completion prefix spells this module with — the
+    /// file stem, which is what a vilan module path segment is.
+    pub module_name: String,
+    /// The declaration-shape stamp of the text these entries were read from —
+    /// `Some` only for a module whose text this process holds (the open
+    /// buffer). An entry with a stamp is invalidated by exactly one thing: a
+    /// change to that module's own declaration shape.
+    pub stamp: Option<ShapeStamp>,
+    pub entries: Vec<SymbolEntry>,
+}
+
+/// The keystroke path's completion source: declared names grouped by declaring
+/// module.
+///
+/// It replaces three whole-program sweeps the paper measured
+/// (`auto_import_completions`' per-module `name_to_id_map` walk, the scope
+/// enumeration, and `modules_in_root`'s per-request `read_dir`) with a lookup
+/// over a table whose size is the number of declarations, not the number of
+/// entities. Nothing on the keystroke path touches the filesystem to read it.
+#[derive(Clone, Debug, Default)]
+pub struct SymbolIndex {
+    pub by_module: Vec<ModuleSymbols>,
+}
+
+impl SymbolIndex {
+    /// The module the open buffer is, by convention index 0 — the analysis's
+    /// entry file.
+    pub const ENTRY: usize = 0;
+
+    /// The entries of the module spelled `name` in a `name::…` path.
+    pub fn module(&self, name: &str) -> Option<&ModuleSymbols> {
+        self.by_module
+            .iter()
+            .find(|module| module.module_name == name)
+    }
+
+    /// Replace the entry module's entries from the LIVE buffer's own syntax,
+    /// but only when its declaration shape actually moved.
+    ///
+    /// This is the mandate's "invalidated only by that module's own edits",
+    /// made exact: typing inside a function body leaves the stamp alone and
+    /// costs one lex and one hash, and only a keystroke that adds, removes,
+    /// renames or re-signs a declaration pays for a rebuild. It runs on the
+    /// keystroke thread (`Document::set_text`) and is O(file).
+    pub fn refresh_entry_from_syntax(&mut self, text: &str) -> bool {
+        let stamp = shape_stamp(text);
+        if let Some(entry) = self.by_module.get_mut(Self::ENTRY) {
+            if entry.stamp == Some(stamp) {
+                return false;
+            }
+            entry.stamp = Some(stamp);
+            entry.entries = syntax_symbols(text);
+            return true;
+        }
+        self.by_module.insert(
+            Self::ENTRY,
+            ModuleSymbols {
+                path: None,
+                module_name: String::new(),
+                stamp: Some(stamp),
+                entries: syntax_symbols(text),
+            },
+        );
+        true
+    }
+
+    /// The declaration-shape stamp of the LIVE buffer, as the last refresh
+    /// recorded it — maintained by [`SymbolIndex::refresh_entry_from_syntax`]
+    /// on every edit, so a verdict reads it instead of hashing the buffer
+    /// again. `None` only before the first refresh.
+    pub fn entry_stamp(&self) -> Option<ShapeStamp> {
+        self.by_module
+            .get(Self::ENTRY)
+            .and_then(|entry| entry.stamp)
+    }
+}
+
+/// The names a module declares, read straight off its token stream — no parse,
+/// no analysis, no filesystem.
+///
+/// The paper's property, restated: *a module's export list is determined by
+/// its own syntax*. `fun`, `struct`, `enum`, `trait`, `mod`, `macro`, `type`
+/// and a module-scope `let` all announce themselves with a keyword followed by
+/// a name, at brace depth zero. That makes this function the honest answer for
+/// the buffer as it stands **this instant** — a `fun` typed one keystroke ago
+/// completes, where an index built from the last analysis cannot know it
+/// exists.
+pub fn syntax_symbols(text: &str) -> Vec<SymbolEntry> {
+    let (tokens, _errors) = tokenize(text);
+    let mut entries: Vec<SymbolEntry> = Vec::new();
+    let mut depth = 0i32;
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match &tokens[index].0 {
+            Token::Ctrl('{') => depth += 1,
+            Token::Ctrl('}') => depth -= 1,
+            keyword if depth == 0 => {
+                let kind = match keyword {
+                    Token::Fun => Some(CompletionKind::Function),
+                    Token::Struct => Some(CompletionKind::Struct),
+                    Token::Enum => Some(CompletionKind::Enum),
+                    Token::Trait => Some(CompletionKind::Trait),
+                    Token::Mod => Some(CompletionKind::Module),
+                    Token::Macro => Some(CompletionKind::Macro),
+                    Token::Let | Token::Mut => Some(CompletionKind::Variable),
+                    _ => None,
+                };
+                if let Some(kind) = kind
+                    && let Some((Token::Ident(name), _)) = tokens.get(index + 1)
+                {
+                    let call_parameters = (kind == CompletionKind::Function)
+                        .then(|| parameter_names(&tokens, index + 2));
+                    let signature = call_parameters
+                        .as_ref()
+                        .map(|parameters| format!("fun {name}({})", parameters.join(", ")));
+                    entries.push(SymbolEntry {
+                        name: (*name).to_string(),
+                        kind,
+                        signature,
+                        call_parameters,
+                        analysis_epoch: 0,
+                    });
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    entries
+}
+
+/// The parameter names of the `( … )` group at or after `index` — the first
+/// identifier of each top-level comma group, which is a vilan parameter's
+/// name. An empty list for a zero-parameter callable; also empty when the
+/// group never opens (a mid-keystroke signature), which is the conservative
+/// answer.
+fn parameter_names(tokens: &[(Token<'_>, Span)], index: usize) -> Vec<String> {
+    let Some((Token::Ctrl('('), _)) = tokens.get(index) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut expecting_name = true;
+    for (token, _) in &tokens[index..] {
+        match token {
+            Token::Ctrl('(' | '[') => {
+                depth += 1;
+                if depth > 1 {
+                    expecting_name = false;
+                }
+            }
+            Token::Ctrl(')' | ']') => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            Token::Ctrl(',') if depth == 1 => expecting_name = true,
+            Token::Ident(name) if depth == 1 && expecting_name => {
+                names.push((*name).to_string());
+                expecting_name = false;
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The module name a `path::` prefix spells a file with: its stem.
+pub fn module_name_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// 5b. The landed snapshot
+// ---------------------------------------------------------------------------
+
+/// Everything the keystroke path is allowed to remember about the last landed
+/// analysis, computed **once when that analysis is built** and never again.
+///
+/// This is the change that makes the budget reachable, and it is worth stating
+/// plainly. The paper measured that `semantic_tokens()` re-walks
+/// `program.functions`, `structs`, `enums`, `traits`, `variables`,
+/// `parameters`, the whole `entity_map`, `member_name_spans` and
+/// `type_references` **on every request** — which is why one unchanged
+/// 468-token file costs 13.4 ms of CPU inside kolt's closure and 27.0 ms
+/// inside a 5,000-function one. Capturing the answer at land time moves that
+/// whole-program walk onto the analysis thread, where it happens once per
+/// analysis instead of once per keystroke, and leaves the request with an
+/// anchor, a shift and one lex of the edited window: **O(file)**, and flat in
+/// the size of the codebase.
+///
+/// A snapshot with no tokens and a default stamp is the "nothing has landed"
+/// state; every provider then answers from syntax alone.
+#[derive(Clone, Debug, Default)]
+pub struct LandedSnapshot {
+    /// The declaration shape of the text this analysis ran on.
+    pub stamp: ShapeStamp,
+    /// The analysis's semantic tokens, in ANALYZED coordinates.
+    pub tokens: Vec<(Span, TokenKind, u32)>,
+    /// The analysis's inlay hints, in ANALYZED coordinates.
+    pub hints: Vec<(usize, String)>,
+    /// The declared names of every module the analysis loaded.
+    pub index: SymbolIndex,
+    /// Whether an analysis produced this at all.
+    pub landed: bool,
+}
+
+impl LandedSnapshot {
+    /// The tokens the live buffer should be painted with, given `anchor` and
+    /// `verdict` — the §2.1.3 split, in one place.
+    ///
+    /// In **every** verdict the edit window is syntax-only, which is the
+    /// property Q5 turns on: whatever the analysis thinks, the region the
+    /// user's eyes are in is painted from the bytes on screen.
+    pub fn tokens_for(
+        &self,
+        live: &str,
+        anchor: &Anchor,
+        verdict: Verdict,
+    ) -> Vec<(Span, TokenKind, u32)> {
+        match verdict {
+            Verdict::Exact => {
+                let mut painted: Vec<(Span, TokenKind, u32)> = self
+                    .tokens
+                    .iter()
+                    .filter_map(|(span, kind, modifiers)| {
+                        anchor.map_span(*span).map(|span| (span, *kind, *modifiers))
+                    })
+                    .collect();
+                painted.extend(syntax_tokens_in(live, anchor.live_window()));
+                sort_and_deoverlap(painted)
+            }
+            // A name binding moved, so no landed classification is trustworthy
+            // — and syntax-only is never wrong, so the whole file takes it.
+            Verdict::Stale | Verdict::Unusable => {
+                sort_and_deoverlap(syntax_tokens_in(live, 0..live.len()))
+            }
+        }
+    }
+
+    /// The inlay hints the live buffer should show. Q1/Q4's ruling, in one
+    /// place: re-mapped through the anchor, **withheld inside the window**
+    /// (a hint on the line you are typing is the most likely to be wrong and
+    /// the least useful, and withholding there is invisible because the hint
+    /// was about to move anyway), served unchanged when stale rather than
+    /// flickered off, and withheld entirely when there is no anchor to serve
+    /// from.
+    pub fn hints_for(&self, anchor: &Anchor, verdict: Verdict) -> Vec<(usize, String)> {
+        if verdict == Verdict::Unusable {
+            return Vec::new();
+        }
+        let mut hints: Vec<(usize, String)> = self
+            .hints
+            .iter()
+            .filter_map(|(offset, label)| {
+                anchor
+                    .map_offset(*offset)
+                    .map(|offset| (offset, label.clone()))
+            })
+            .collect();
+        hints.sort();
+        hints
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. The cursor's syntactic context
+// ---------------------------------------------------------------------------
+
+/// What the cursor is asking for, decided from the LIVE buffer's **current
+/// line** alone.
+///
+/// Reading one line is the whole point: `completion.rs:1095` re-tokenizes the
+/// entire buffer on every keystroke to answer this, and the answer only ever
+/// depends on the few characters behind the cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CursorContext {
+    /// A bare word (possibly empty) in expression or statement position.
+    Scope { prefix: String },
+    /// `module::pre` — a path segment after `::`.
+    Path { module: String, prefix: String },
+    /// `receiver.pre` — a member after `.`. The receiver's type is a
+    /// resolution question, which is why this arm is the one that consults the
+    /// landed analysis.
+    Member { prefix: String },
+    /// Inside a comment, a string, or otherwise nowhere a name can go.
+    None,
+}
+
+/// Classify `offset` in `text`. Byte offsets; `offset` is clamped into range.
+pub fn cursor_context(text: &str, offset: usize) -> CursorContext {
+    let bytes = text.as_bytes();
+    let offset = offset.min(bytes.len());
+    let start = line_start(bytes, offset);
+    let line = &text[start..offset];
+    // A `//` anywhere earlier on the line puts the cursor in a comment, and a
+    // comment is nowhere a name can go. (An odd count of unescaped quotes says
+    // the same about a string, and is the cheap test that catches it.)
+    if line.contains("//") || line.bytes().filter(|byte| *byte == b'"').count() % 2 == 1 {
+        return CursorContext::None;
+    }
+    let identifier_start = line
+        .rfind(|character: char| !is_identifier_char(character))
+        .map_or(0, |position| {
+            position + line[position..].chars().next().map_or(1, char::len_utf8)
+        });
+    let prefix = line[identifier_start..].to_string();
+    let before = &line[..identifier_start];
+    if let Some(head) = before.strip_suffix("::") {
+        let module_start = head
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + head[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        let module = head[module_start..].to_string();
+        if !module.is_empty() {
+            return CursorContext::Path { module, prefix };
+        }
+    }
+    if before.ends_with('.') && !before.ends_with("..") {
+        return CursorContext::Member { prefix };
+    }
+    CursorContext::Scope { prefix }
+}
+
+fn is_identifier_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// Turn index entries into completion candidates, filtered by `prefix`.
+///
+/// A `Completion` the keystroke path produces carries no `needs_import` and no
+/// snippet: auto-import is a resolution question and belongs to the analysis's
+/// own completion, which the client gets on the next landing.
+pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
+    entries
+        .iter()
+        .filter(|entry| prefix.is_empty() || entry.name.starts_with(prefix))
+        .map(|entry| Completion {
+            label: entry.name.clone(),
+            kind: entry.kind,
+            detail: entry.signature.clone(),
+            documentation: None,
+            call_parameters: entry.call_parameters.clone(),
+            snippet: None,
+            needs_import: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- the two-sided anchor ---------------------------------------------
+
+    #[test]
+    fn identical_texts_anchor_the_whole_file() {
+        let text = "fun main() {\n\tlet x = 1;\n}\n";
+        let anchor = Anchor::compute(text, text);
+        assert_eq!(anchor.prefix, text.len());
+        assert_eq!(anchor.suffix, 0);
+        assert_eq!(anchor.shift(), 0);
+        assert!(anchor.live_window().is_empty());
+        // Every landed span survives, unmoved.
+        let span = Span { start: 4, end: 8 };
+        assert_eq!(anchor.map_span(span), Some(span));
+    }
+
+    #[test]
+    fn a_middle_edit_anchors_on_both_sides_and_the_window_is_one_line() {
+        let analyzed = "fun a() {\n\tlet x = 1;\n}\nfun b() {\n\tlet y = 2;\n}\n";
+        let live = "fun a() {\n\tlet xx = 1;\n}\nfun b() {\n\tlet y = 2;\n}\n";
+        let anchor = Anchor::compute(analyzed, live);
+        // The prefix stops at the start of the edited LINE, not at the edited
+        // byte — B38's trim, applied to the head.
+        assert_eq!(&analyzed[..anchor.prefix], "fun a() {\n");
+        assert_eq!(
+            &live[live.len() - anchor.suffix..],
+            "}\nfun b() {\n\tlet y = 2;\n}\n"
+        );
+        assert_eq!(anchor.shift(), 1);
+        assert_eq!(&live[anchor.live_window()], "\tlet xx = 1;\n");
+        // A head token maps to itself; a tail token maps by the shift.
+        assert_eq!(
+            anchor.map_span(Span { start: 4, end: 5 }),
+            Some(Span { start: 4, end: 5 })
+        );
+        let tail = Span {
+            start: analyzed.len() - 6,
+            end: analyzed.len() - 5,
+        };
+        assert_eq!(
+            anchor.map_span(tail),
+            Some(Span {
+                start: tail.start + 1,
+                end: tail.end + 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_span_inside_the_window_has_no_image() {
+        let analyzed = "fun a() {\n\tlet x = 1;\n}\n";
+        let live = "fun a() {\n\tlet xx = 1;\n}\n";
+        let anchor = Anchor::compute(analyzed, live);
+        // `x`'s own span is in the window: dropped, not clamped.
+        assert_eq!(anchor.map_span(Span { start: 15, end: 16 }), None);
+    }
+
+    #[test]
+    fn a_span_straddling_a_window_edge_is_dropped() {
+        let analyzed = "fun a() {\n\tlet x = 1;\n}\n";
+        let live = "fun a() {\n\tlet xx = 1;\n}\n";
+        let anchor = Anchor::compute(analyzed, live);
+        // A span from the head anchor across into the window.
+        let straddler = Span {
+            start: anchor.prefix - 2,
+            end: anchor.prefix + 4,
+        };
+        assert_eq!(anchor.map_span(straddler), None);
+    }
+
+    #[test]
+    fn a_wholesale_replacement_leaves_no_anchor() {
+        let anchor = Anchor::compute("fun a() {}\n", "struct B { x: i32 }");
+        assert!(anchor.is_empty());
+        assert_eq!(
+            Verdict::decide(&anchor, true, false),
+            Verdict::Unusable,
+            "a paste that shares no line is the unusable state, whatever the stamp says",
+        );
+    }
+
+    #[test]
+    fn the_two_anchors_never_overlap_on_a_repeating_text() {
+        // `"aa"` → `"a"`: the common prefix and the common suffix are the same
+        // byte, and an unclamped anchor would claim both.
+        let anchor = Anchor::compute("aa", "a");
+        assert!(anchor.prefix + anchor.suffix <= 1);
+        let anchor = Anchor::compute("\n\n\n", "\n\n");
+        assert!(anchor.prefix + anchor.suffix <= anchor.live_len);
+        assert!(anchor.prefix + anchor.suffix <= anchor.analyzed_len);
+    }
+
+    #[test]
+    fn a_multibyte_edit_lands_on_char_boundaries() {
+        // The trims must never split a UTF-8 sequence — the whole file is
+        // sliced by these offsets.
+        let analyzed = "let a = \"héllo wörld\";\nlet b = 1;\n";
+        let live = "let a = \"héllo wörld!\";\nlet b = 1;\n";
+        let anchor = Anchor::compute(analyzed, live);
+        assert!(analyzed.is_char_boundary(anchor.prefix));
+        assert!(live.is_char_boundary(anchor.prefix));
+        assert!(live.is_char_boundary(live.len() - anchor.suffix));
+        assert!(analyzed.is_char_boundary(analyzed.len() - anchor.suffix));
+        // And the window really is the edited line.
+        assert_eq!(&live[anchor.live_window()], "let a = \"héllo wörld!\";\n");
+    }
+
+    #[test]
+    fn an_append_anchors_the_whole_prefix() {
+        let analyzed = "fun a() {}\n";
+        let live = "fun a() {}\nfun b() {}\n";
+        let anchor = Anchor::compute(analyzed, live);
+        assert_eq!(anchor.prefix, analyzed.len());
+        assert_eq!(&live[anchor.live_window()], "fun b() {}\n");
+        assert_eq!(
+            anchor.map_span(Span { start: 4, end: 5 }),
+            Some(Span { start: 4, end: 5 })
+        );
+    }
+
+    // --- the declaration-shape stamp ---------------------------------------
+
+    #[test]
+    fn a_body_edit_leaves_the_stamp_alone() {
+        let before = "fun main() {\n\tlet x = 1;\n}\n";
+        let after = "fun main() {\n\tlet x = 1;\n\tlet y = 2;\n}\n";
+        assert_eq!(
+            shape_stamp(before),
+            shape_stamp(after),
+            "nothing outside a body changed, so no module-scope name's resolution can have moved",
+        );
+    }
+
+    #[test]
+    fn a_renamed_declaration_moves_the_stamp() {
+        assert_ne!(
+            shape_stamp("fun main() {\n\tlet x = 1;\n}\n"),
+            shape_stamp("fun other() {\n\tlet x = 1;\n}\n"),
+        );
+    }
+
+    #[test]
+    fn a_changed_signature_moves_the_stamp() {
+        assert_ne!(
+            shape_stamp("fun f(a: i32) {\n\ta;\n}\n"),
+            shape_stamp("fun f(a: str) {\n\ta;\n}\n"),
+            "a signature change re-classifies every call site in the anchors",
+        );
+    }
+
+    #[test]
+    fn a_changed_import_moves_the_stamp() {
+        assert_ne!(
+            shape_stamp("import std::io::print;\nfun f() {}\n"),
+            shape_stamp("import std::io::println;\nfun f() {}\n"),
+            "an import line moves the file's whole name resolution",
+        );
+    }
+
+    #[test]
+    fn a_new_declaration_moves_the_stamp() {
+        assert_ne!(
+            shape_stamp("fun f() {}\n"),
+            shape_stamp("fun f() {}\nfun g() {}\n"),
+        );
+    }
+
+    #[test]
+    fn struct_fields_are_shape_not_body() {
+        assert_ne!(
+            shape_stamp("struct S { x: i32 }\n"),
+            shape_stamp("struct S { y: i32 }\n"),
+            "a field name binds `.x`, so it is declaration shape and not a body",
+        );
+    }
+
+    #[test]
+    fn moving_a_declaration_down_a_line_leaves_the_stamp_alone() {
+        assert_eq!(
+            shape_stamp("fun f() {}\nfun g() {}\n"),
+            shape_stamp("fun f() {}\n\n\nfun g() {}\n"),
+            "spans are excluded: where a declaration sits does not change what it binds",
+        );
+    }
+
+    #[test]
+    fn a_body_only_stamp_survives_two_nested_bodies() {
+        let before = "fun outer() {\n\tfun inner() {\n\t\tlet a = 1;\n\t}\n}\nfun after() {}\n";
+        let after = "fun outer() {\n\tfun inner() {\n\t\tlet a = 2;\n\t}\n}\nfun after() {}\n";
+        assert_eq!(shape_stamp(before), shape_stamp(after));
+        // …but the trailing declaration is still seen: removing it moves it.
+        let trimmed = "fun outer() {\n\tfun inner() {\n\t\tlet a = 1;\n\t}\n}\n";
+        assert_ne!(shape_stamp(before), shape_stamp(trimmed));
+    }
+
+    #[test]
+    fn a_lex_error_is_a_shape_change() {
+        // Mid-keystroke garbage must not be reported as an unchanged shape.
+        assert_ne!(shape_stamp("fun f() {}\n"), shape_stamp("fun f() {}\n\"\n"));
+    }
+
+    // --- the verdicts -------------------------------------------------------
+
+    #[test]
+    fn the_three_verdicts_are_decided_by_anchor_then_stamp_then_dependency() {
+        let anchor = Anchor::compute(
+            "fun a() {\n\tlet x = 1;\n}\n",
+            "fun a() {\n\tlet y = 1;\n}\n",
+        );
+        assert!(!anchor.is_empty());
+        assert_eq!(Verdict::decide(&anchor, true, false), Verdict::Exact);
+        assert_eq!(Verdict::decide(&anchor, false, false), Verdict::Stale);
+        assert_eq!(
+            Verdict::decide(&anchor, true, true),
+            Verdict::Stale,
+            "another module moving is the paper's case 4 — no local anchoring repairs it",
+        );
+        let none = Anchor::compute("fun a() {}\n", "totally different");
+        assert_eq!(Verdict::decide(&none, true, false), Verdict::Unusable);
+    }
+
+    // --- syntax-only classification -----------------------------------------
+
+    #[test]
+    fn syntax_classifies_the_roles_syntax_can_decide() {
+        let text =
+            "fun greet(name) {\n\tlet who = name;\n\twho.trim();\n\twho.length;\n\tstd::io;\n}\n";
+        let tokens = syntax_tokens_in(text, 0..text.len());
+        let at = |needle: &str| -> Option<(TokenKind, u32)> {
+            let start = text.find(needle)?;
+            tokens
+                .iter()
+                .find(|(span, _, _)| span.start == start && span.end == start + needle.len())
+                .map(|(_, kind, modifiers)| (*kind, *modifiers))
+        };
+        assert_eq!(
+            at("greet"),
+            Some((TokenKind::Function, MODIFIER_DECLARATION))
+        );
+        assert_eq!(
+            at("who"),
+            Some((
+                TokenKind::Variable,
+                MODIFIER_DECLARATION | MODIFIER_READONLY
+            ))
+        );
+        assert_eq!(at("trim"), Some((TokenKind::Method, 0)));
+        assert_eq!(at("length"), Some((TokenKind::Property, 0)));
+        assert_eq!(at("std"), Some((TokenKind::Namespace, 0)));
+    }
+
+    #[test]
+    fn a_plain_identifier_gets_no_syntax_token() {
+        // `name` in `let who = name;` is a use of something syntax cannot
+        // classify — a variable, a constant, a unit struct. Emitting a guess
+        // would be the lie the anchors exist to avoid.
+        let text = "fun greet(name) {\n\tlet who = name;\n}\n";
+        let tokens = syntax_tokens_in(text, 0..text.len());
+        let use_site = text.rfind("name").expect("the use site");
+        assert!(
+            !tokens.iter().any(|(span, _, _)| span.start == use_site),
+            "syntax must stay silent where only resolution can answer",
+        );
+    }
+
+    /// **The owner's Q5 exhibit.** Commenting a line out must read as a comment
+    /// at once, not keep its semantic colours for the staleness window.
+    #[test]
+    fn commenting_a_line_out_removes_its_tokens_on_the_next_keystroke() {
+        let analyzed = "fun main() {\n\tgreet(who);\n\tgreet(who);\n}\n";
+        let live = "fun main() {\n\t// greet(who);\n\tgreet(who);\n}\n";
+        let anchor = Anchor::compute(analyzed, live);
+        let window = anchor.live_window();
+        assert_eq!(
+            &live[window.clone()],
+            "\t// greet(who);\n",
+            "the commented line is exactly the edit window",
+        );
+        let syntax = syntax_tokens_in(live, window);
+        assert!(
+            syntax.is_empty(),
+            "the lexer produces no token for a comment, so the window paints nothing and the \
+             client's grammar colours the line as a comment — {syntax:?}",
+        );
+        // And the second, still-live call keeps its function colouring: it is
+        // in the tail anchor, so the landed answer maps onto it.
+        let landed_call = analyzed.rfind("greet").expect("the second call");
+        let mapped = anchor
+            .map_span(Span {
+                start: landed_call,
+                end: landed_call + 5,
+            })
+            .expect("the second call is in the tail anchor");
+        assert_eq!(&live[mapped.into_range()], "greet");
+    }
+
+    #[test]
+    fn a_window_token_must_lie_wholly_inside_the_window() {
+        let text = "fun a() {\n\tlet x = 1;\n}\n";
+        // A window that cuts `let x` in half must not emit `x`.
+        let cut = text.find("x").expect("the binding") + 1;
+        let tokens = syntax_tokens_in(text, 0..cut);
+        assert!(tokens.iter().all(|(span, _, _)| span.end <= cut));
+    }
+
+    #[test]
+    fn sorting_drops_overlaps_narrowest_first() {
+        let stream = vec![
+            (Span { start: 5, end: 9 }, TokenKind::Function, 0),
+            (Span { start: 5, end: 7 }, TokenKind::Variable, 0),
+            (Span { start: 0, end: 3 }, TokenKind::Struct, 0),
+            (Span { start: 8, end: 8 }, TokenKind::Method, 0),
+        ];
+        let kept = sort_and_deoverlap(stream);
+        assert_eq!(
+            kept.iter().map(|(span, ..)| *span).collect::<Vec<_>>(),
+            vec![Span { start: 0, end: 3 }, Span { start: 5, end: 7 }],
+        );
+    }
+
+    // --- the symbol index ---------------------------------------------------
+
+    #[test]
+    fn syntax_symbols_read_a_modules_declarations_off_its_tokens() {
+        let text = "import std::io::print;\n\
+                    fun greet(name: str, times: i32) {}\n\
+                    struct Point { x: i32 }\n\
+                    enum Colour { Red }\n\
+                    trait Show {}\n\
+                    let TAU = 6.28;\n";
+        let entries = syntax_symbols(text);
+        let named = |name: &str| entries.iter().find(|entry| entry.name == name);
+        assert_eq!(
+            named("greet").map(|e| e.kind),
+            Some(CompletionKind::Function)
+        );
+        assert_eq!(
+            named("greet").and_then(|e| e.call_parameters.clone()),
+            Some(vec!["name".to_string(), "times".to_string()]),
+        );
+        assert_eq!(
+            named("greet").and_then(|e| e.signature.clone()),
+            Some("fun greet(name, times)".to_string()),
+        );
+        assert_eq!(named("Point").map(|e| e.kind), Some(CompletionKind::Struct));
+        assert_eq!(named("Colour").map(|e| e.kind), Some(CompletionKind::Enum));
+        assert_eq!(named("Show").map(|e| e.kind), Some(CompletionKind::Trait));
+        assert_eq!(named("TAU").map(|e| e.kind), Some(CompletionKind::Variable));
+        // A local inside a body is NOT an export.
+        assert!(
+            syntax_symbols("fun f() {\n\tlet inner = 1;\n}\n")
+                .iter()
+                .all(|entry| entry.name != "inner"),
+        );
+        // Everything read this way is marked syntactic.
+        assert!(entries.iter().all(|entry| entry.analysis_epoch == 0));
+    }
+
+    #[test]
+    fn the_entry_module_rebuilds_only_when_its_shape_moves() {
+        let mut index = SymbolIndex::default();
+        assert!(index.refresh_entry_from_syntax("fun f() {}\n"));
+        assert!(
+            !index.refresh_entry_from_syntax("fun f() {\n\tlet x = 1;\n}\n"),
+            "a body edit must not invalidate the module's export list",
+        );
+        assert!(
+            index.refresh_entry_from_syntax("fun f() {}\nfun g() {}\n"),
+            "a new declaration must",
+        );
+        let entry = &index.by_module[SymbolIndex::ENTRY];
+        assert_eq!(
+            entry
+                .entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f", "g"],
+        );
+    }
+
+    #[test]
+    fn a_module_is_looked_up_by_the_name_a_path_spells_it_with() {
+        let index = SymbolIndex {
+            by_module: vec![
+                ModuleSymbols::default(),
+                ModuleSymbols {
+                    path: Some(PathBuf::from("/pkg/src/style.vl")),
+                    module_name: module_name_of(Path::new("/pkg/src/style.vl")),
+                    stamp: None,
+                    entries: vec![SymbolEntry {
+                        name: "colour".to_string(),
+                        kind: CompletionKind::Function,
+                        signature: None,
+                        call_parameters: Some(Vec::new()),
+                        analysis_epoch: 7,
+                    }],
+                },
+            ],
+        };
+        let module = index.module("style").expect("style is indexed");
+        assert_eq!(module.entries.len(), 1);
+        assert_eq!(module.entries[0].analysis_epoch, 7);
+        assert!(index.module("nothing").is_none());
+    }
+
+    // --- the cursor's context -----------------------------------------------
+
+    #[test]
+    fn the_cursor_context_is_read_from_the_line_alone() {
+        let text = "fun f() {\n\tlet a = st\n}\n";
+        let offset = text.find("st\n").expect("the prefix") + 2;
+        assert_eq!(
+            cursor_context(text, offset),
+            CursorContext::Scope {
+                prefix: "st".to_string()
+            }
+        );
+
+        let text = "fun f() {\n\tstyle::col\n}\n";
+        let offset = text.find("col\n").expect("the prefix") + 3;
+        assert_eq!(
+            cursor_context(text, offset),
+            CursorContext::Path {
+                module: "style".to_string(),
+                prefix: "col".to_string()
+            }
+        );
+
+        let text = "fun f() {\n\twho.tr\n}\n";
+        let offset = text.find("tr\n").expect("the prefix") + 2;
+        assert_eq!(
+            cursor_context(text, offset),
+            CursorContext::Member {
+                prefix: "tr".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_inside_a_comment_or_string_asks_for_nothing() {
+        let text = "fun f() {\n\t// let a = st\n}\n";
+        let offset = text.find("st\n").expect("the prefix") + 2;
+        assert_eq!(cursor_context(text, offset), CursorContext::None);
+
+        let text = "fun f() {\n\tlet a = \"st\n}\n";
+        let offset = text.find("st\n").expect("the prefix") + 2;
+        assert_eq!(cursor_context(text, offset), CursorContext::None);
+    }
+
+    #[test]
+    fn candidates_filter_by_the_typed_prefix() {
+        let entries = syntax_symbols("fun greet() {}\nfun grow() {}\nfun other() {}\n");
+        let offered = candidates(&entries, "gr");
+        assert_eq!(
+            offered.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            vec!["greet", "grow"],
+        );
+        assert_eq!(candidates(&entries, "").len(), 3);
+    }
+}
+
+/// The keystroke path against a real analyzed `Document` — the pins that say
+/// the mechanism above is actually wired to the answers the server gives.
+///
+/// Every one of these is red without this lane: today every provider answers
+/// the ANALYZED snapshot and holds still until the next analysis lands
+/// (`main.rs`'s `snapshot_consistency_tests`, §1.5's measured 409 ms window),
+/// which is precisely what E121's Q5 ruling overturns for the edited region.
+#[cfg(test)]
+mod document_path {
+    use super::*;
+    use crate::document::Document;
+    use crate::document::tests::std_root;
+
+    const SOURCE: &str = "fun greet(name: str): str {\n\tlet who = name;\n\twho\n}\n\n\
+                          fun main() {\n\tlet first = greet(\"a\");\n\tlet second = greet(\"b\");\n}\n";
+
+    fn analyzed(text: &str) -> Document {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan_keystroke_{}_{:p}",
+            std::process::id(),
+            text.as_ptr()
+        ));
+        let _ = std::fs::create_dir_all(&directory);
+        let entry = directory.join("main.vl");
+        let document = Document::analyze(text, &std_root(), &entry);
+        let _ = std::fs::remove_dir_all(&directory);
+        document
+    }
+
+    fn token_at<'a>(
+        tokens: &'a [(Span, TokenKind, u32)],
+        text: &str,
+        needle: &str,
+    ) -> Option<&'a (Span, TokenKind, u32)> {
+        let start = text.find(needle)?;
+        tokens
+            .iter()
+            .find(|(span, ..)| span.start == start && span.end == start + needle.len())
+    }
+
+    #[test]
+    fn a_landed_analysis_captures_its_answers_once() {
+        let document = analyzed(SOURCE);
+        assert_eq!(
+            document.keystroke_verdict(false),
+            Verdict::Exact,
+            "an unedited buffer is exact against its own analysis",
+        );
+        let tokens = document.keystroke_tokens(false);
+        assert!(!tokens.is_empty(), "the fixture must produce tokens");
+        assert_eq!(
+            token_at(&tokens, SOURCE, "greet").map(|(_, kind, _)| *kind),
+            Some(TokenKind::Function),
+            "the landed classification is served whole when nothing has been typed",
+        );
+        assert!(
+            !document.keystroke_hints(false).is_empty(),
+            "the fixture must produce hints",
+        );
+    }
+
+    /// **The owner's Q5 exhibit, end to end.** Comment a line out and ask for
+    /// tokens on the very next keystroke: the line must carry none, so the
+    /// client paints it as a comment instead of holding its function-and-
+    /// variable colours for the whole staleness window.
+    #[test]
+    fn commenting_a_line_out_reads_as_a_comment_on_the_next_keystroke() {
+        let mut document = analyzed(SOURCE);
+        let landed = document.keystroke_tokens(false);
+        let call_line = SOURCE
+            .find("\tlet first = greet(\"a\");")
+            .expect("the call line");
+        assert!(
+            landed
+                .iter()
+                .any(|(span, ..)| span.start >= call_line && span.start < call_line + 23),
+            "the line must be coloured before it is commented out",
+        );
+
+        let edited = SOURCE.replace(
+            "\tlet first = greet(\"a\");",
+            "\t// let first = greet(\"a\");",
+        );
+        document.set_text(&edited);
+        let commented = edited
+            .find("\t// let first = greet(\"a\");")
+            .expect("the commented line");
+        let end = commented + "\t// let first = greet(\"a\");".len();
+        let tokens = document.keystroke_tokens(false);
+        let inside: Vec<_> = tokens
+            .iter()
+            .filter(|(span, ..)| span.start >= commented && span.start < end)
+            .collect();
+        assert!(
+            inside.is_empty(),
+            "a commented-out line must carry no semantic token on the very next keystroke — {inside:?}",
+        );
+        // …and the still-live sibling call keeps its colouring: it is in the
+        // tail anchor, so the landed answer maps onto it.
+        assert_eq!(
+            token_at(&tokens, &edited, "second").map(|(_, kind, _)| *kind),
+            Some(TokenKind::Variable),
+            "the tail anchor must keep serving the landed classification",
+        );
+    }
+
+    #[test]
+    fn a_body_edit_stays_exact_and_repaints_only_its_own_line() {
+        let mut document = analyzed(SOURCE);
+        let edited = SOURCE.replace("\tlet who = name;", "\tlet whom = name;");
+        document.set_text(&edited);
+        assert_eq!(
+            document.keystroke_verdict(false),
+            Verdict::Exact,
+            "renaming a LOCAL changes no module-scope binding, so the stamp holds",
+        );
+        let tokens = document.keystroke_tokens(false);
+        // The renamed local is painted from syntax — same class, new position.
+        assert_eq!(
+            token_at(&tokens, &edited, "whom").map(|(_, kind, _)| *kind),
+            Some(TokenKind::Variable),
+        );
+        // Everything after the edit moved by exactly one byte and kept its
+        // landed classification.
+        assert_eq!(
+            token_at(&tokens, &edited, "main").map(|(_, kind, _)| *kind),
+            Some(TokenKind::Function),
+        );
+    }
+
+    #[test]
+    fn renaming_a_declaration_degrades_the_file_to_syntax() {
+        let mut document = analyzed(SOURCE);
+        document.set_text(&SOURCE.replace("fun greet(", "fun greets("));
+        assert_eq!(
+            document.keystroke_verdict(false),
+            Verdict::Stale,
+            "a top-level rename re-classifies every use of that name",
+        );
+    }
+
+    #[test]
+    fn a_wholesale_paste_is_unusable_and_withholds_every_hint() {
+        let mut document = analyzed(SOURCE);
+        document.set_text("struct Replaced { field: i32 }");
+        assert_eq!(document.keystroke_verdict(false), Verdict::Unusable);
+        assert!(
+            document.keystroke_hints(false).is_empty(),
+            "with no anchor there is nothing to re-map a hint onto, and a hint is a claim \
+             about a type — withholding beats lying (Q4)",
+        );
+        // Tokens still answer, from syntax alone.
+        let tokens = document.keystroke_tokens(false);
+        assert_eq!(
+            token_at(&tokens, "struct Replaced { field: i32 }", "Replaced")
+                .map(|(_, kind, _)| *kind),
+            Some(TokenKind::Struct),
+        );
+    }
+
+    /// Q1/Q4: a hint on the line being typed disappears until the analysis
+    /// lands, and every hint outside the window keeps its landed label at an
+    /// exact position.
+    #[test]
+    fn hints_are_withheld_inside_the_edit_window_and_exact_outside_it() {
+        let mut document = analyzed(SOURCE);
+        let landed = document.keystroke_hints(false);
+        assert!(
+            landed.len() >= 2,
+            "the fixture must produce hints: {landed:?}"
+        );
+        let edited = SOURCE.replace(
+            "\tlet first = greet(\"a\");",
+            "\tlet first = greet(\"ab\");",
+        );
+        document.set_text(&edited);
+        let window = document.keystroke_anchor().live_window();
+        let hints = document.keystroke_hints(false);
+        assert!(
+            hints.iter().all(|(offset, _)| !window.contains(offset)),
+            "no hint may be served inside the edit window — {hints:?} against {window:?}",
+        );
+        // And the hint on the LAST line rode the shift: it still sits on
+        // `second`'s name, not one byte off it.
+        let second = edited.find("second").expect("the second binding");
+        assert!(
+            hints
+                .iter()
+                .any(|(offset, _)| *offset == second + "second".len()),
+            "a hint outside the window must be position-exact — {hints:?}",
+        );
+    }
+
+    #[test]
+    fn completion_offers_a_declaration_typed_one_keystroke_ago() {
+        let mut document = analyzed(SOURCE);
+        let edited = format!("{SOURCE}\nfun brand_new_helper() {{}}\n");
+        document.set_text(&edited);
+        let offset =
+            edited.find("brand_new_helper").expect("the new name") + "brand_new_helper".len();
+        assert!(
+            document
+                .keystroke_index()
+                .by_module
+                .first()
+                .is_some_and(|entry| entry
+                    .entries
+                    .iter()
+                    .any(|symbol| symbol.name == "brand_new_helper")),
+            "the index must follow the LIVE buffer — a `fun` typed one keystroke ago \
+             cannot be in the landed analysis",
+        );
+        let offered = document.keystroke_completion(offset, false);
+        assert!(
+            offered.iter().any(|item| item.label == "brand_new_helper"),
+            "the index's whole point: it answers what the analysis has not seen yet",
+        );
+    }
+}
+
+/// E121 §6: the gate.
+///
+/// A pin family under the **thread clock** — M15's method, and for M15's exact
+/// reason: this order recorded loadavg 8 to 80 on one 16-core machine, wall
+/// readings moved by 5×, and CPU readings did not. Every assertion here is on
+/// CPU time; wall and loadavg are recorded beside it and asserted on nowhere.
+///
+/// The subject is **generated** (Q6, and the owner's standing rule that kolt is
+/// never integrated into this codebase): a synthetic module of N functions of
+/// one shape over a shared wrapper, plus an app-shaped entry that calls four of
+/// them — the §6.1 method, at N = 1,791 because that is kolt-with-lucide's
+/// size. It is a generator in this file, not checked-in bulk.
+///
+/// **Why it is not vacuous.** Every run prints, beside the keystroke path's
+/// number, the cost of the whole-program walk the path replaces — the same
+/// `Document::semantic_tokens()` the paper measured at 13.4 ms of CPU on this
+/// exhibit's size. That walk IS the planted regression §6.2 asks for: it is the
+/// shape §2.1 removes, it is compiled in the same binary, and the gate asserts
+/// that the path is under budget while recording that the walk it replaced is
+/// not. Swapping which of the two is asserted reds the gate immediately.
+///
+/// Run the full gate deliberately:
+///
+/// ```text
+/// cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+///     -E 'test(keystroke_path)' --no-capture > gate.log 2>&1
+/// ```
+#[cfg(test)]
+mod gate {
+    use crate::document::Document;
+    use crate::document::tests::std_root;
+    use std::time::{Duration, Instant};
+
+    /// kolt-with-lucide's reachable-function count — §6.1's subject size.
+    const GATE_FUNCTIONS: usize = 1791;
+    /// The smoke subject: enough to exercise every seam, seconds to analyze.
+    const SMOKE_FUNCTIONS: usize = 24;
+    /// The mandate's budget, per request and for the burst.
+    const BUDGET_MS: f64 = 10.0;
+    /// Requests per measured window — amortized past any clock granularity,
+    /// the same discipline the paper's P8 used.
+    const REPETITIONS: usize = 50;
+
+    /// The calling thread's CPU time — the time it was actually ON a core, not
+    /// the time that passed (backlog M15). `None` where the host exposes no
+    /// such clock.
+    #[cfg(unix)]
+    fn thread_cpu_now() -> Option<Duration> {
+        let mut timespec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `clock_gettime` writes the `timespec` we hand it and reads
+        // nothing else; the pointer is to a live local.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timespec) };
+        (result == 0).then(|| {
+            Duration::new(
+                timespec.tv_sec.max(0) as u64,
+                timespec.tv_nsec.clamp(0, 999_999_999) as u32,
+            )
+        })
+    }
+
+    /// The Windows half: kernel + user time for the current thread.
+    #[cfg(windows)]
+    fn thread_cpu_now() -> Option<Duration> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: `GetThreadTimes` writes the four `FILETIME`s we hand it and
+        // reads nothing else; `GetCurrentThread` returns a pseudo-handle that
+        // needs no close. The pointers are to live locals.
+        let ok = unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let hundred_nanoseconds =
+            |time: FILETIME| ((time.dwHighDateTime as u64) << 32) | (time.dwLowDateTime as u64);
+        let ticks = hundred_nanoseconds(kernel) + hundred_nanoseconds(user);
+        Some(Duration::from_nanos(ticks.saturating_mul(100)))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn thread_cpu_now() -> Option<Duration> {
+        None
+    }
+
+    /// The 1-minute load average at report time — M13's provenance, printed
+    /// beside every number and asserted on nowhere.
+    fn loadavg_1m() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| text.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    }
+
+    /// **The generated exhibit** (§6.1, Q6). A module of `functions` functions
+    /// of one shape over a shared wrapper — lucide's shape, not lucide's
+    /// content, and nothing copied from anyone's checkout.
+    fn exhibit_module(functions: usize) -> String {
+        let mut text = String::from(
+            "// GENERATED by E121's keystroke-path gate: a synthetic module of one\n\
+             // repeated shape, sized like kolt-with-lucide. Nothing here is copied\n\
+             // from any application; the bodies are mechanical.\n\n\
+             fun frame(seed: i32): i32 {\n\tseed * 2 + 1\n}\n\n",
+        );
+        for index in 0..functions {
+            text.push_str(&format!(
+                "/// synthetic entry {index}\n\
+                 fun icon_{index:04}(): i32 {{\n\
+                 \tlet base = frame({});\n\
+                 \tbase + {}\n\
+                 }}\n\n",
+                index % 20,
+                index % 24,
+            ));
+        }
+        text
+    }
+
+    /// The app-shaped consumer: a small file that calls four of the module's
+    /// functions, held **fixed** across every subject size. Holding the file
+    /// fixed while the program grows around it is what isolates codebase size
+    /// from file size — §1.4's method, and the reason the paper's 6.4× means
+    /// anything.
+    const EXHIBIT_ENTRY: &str = "import pkg::table::{ icon_0000, icon_0001, icon_0002, icon_0003 };\n\n\
+         fun caption(prefix: str): str {\n\tlet rendered = prefix;\n\trendered\n}\n\n\
+         fun panel(): i32 {\n\
+         \tlet first = icon_0000();\n\
+         \tlet second = icon_0001();\n\
+         \tlet third = icon_0002();\n\
+         \tlet fourth = icon_0003();\n\
+         \tfirst + second + third + fourth\n}\n\n\
+         fun main() {\n\tlet total = panel();\n\tlet label = caption(\"panel\");\n}\n";
+
+    /// Write the exhibit to a fresh directory and land one analysis on the
+    /// entry. Returns the directory (the caller removes it), the document, and
+    /// how long the analysis took — recorded, never asserted.
+    fn land(functions: usize) -> (std::path::PathBuf, Document, Duration) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e121_gate_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(functions))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, EXHIBIT_ENTRY).expect("write the exhibit entry");
+        let started = Instant::now();
+        let document = Document::analyze(EXHIBIT_ENTRY, &std_root(), &entry);
+        (directory, document, started.elapsed())
+    }
+
+    /// One keystroke on the exhibit entry: a character typed inside a function
+    /// BODY, which is the shape the anchor and the stamp are built for.
+    fn one_keystroke() -> String {
+        EXHIBIT_ENTRY.replace("\tlet total = panel();", "\tlet totals = panel();")
+    }
+
+    /// Run `work` `REPETITIONS` times and return the per-call thread CPU and
+    /// wall time.
+    fn per_call(mut work: impl FnMut()) -> (Option<f64>, f64) {
+        let cpu_started = thread_cpu_now();
+        let wall_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            work();
+        }
+        let wall = wall_started.elapsed().as_secs_f64() * 1000.0 / REPETITIONS as f64;
+        let cpu = cpu_started.zip(thread_cpu_now()).map(|(before, after)| {
+            after.saturating_sub(before).as_secs_f64() * 1000.0 / REPETITIONS as f64
+        });
+        (cpu, wall)
+    }
+
+    /// One machine-readable row, the shape `perf_baseline`'s `PERF` lines have.
+    fn row(subject: &str, request: &str, cpu: Option<f64>, wall: f64, count: usize) {
+        println!(
+            "E121 {{\"section\":\"keystroke_path\",\"subject\":\"{subject}\",\
+             \"request\":\"{request}\",\"profile\":\"{}\",\"load\":\"{}\",\
+             \"reps\":{REPETITIONS},\"cpu_ms\":{},\"wall_ms\":{wall:.3},\"count\":{count}}}",
+            profile(),
+            loadavg_1m(),
+            cpu.map_or_else(|| "null".to_string(), |value| format!("{value:.3}")),
+        );
+    }
+
+    /// The gate's body, over whatever subject size it is given.
+    ///
+    /// `assert_budget` is false for the smoke subject: a 24-function exhibit
+    /// says nothing about a 1,791-function budget, and pretending otherwise
+    /// would be the vacuous green M12 taught this tree to refuse.
+    fn keystroke_path_budget_at(functions: usize, assert_budget: bool) {
+        let (directory, mut document, analysis) = land(functions);
+        let landed_tokens = document.keystroke_tokens(false).len();
+        assert!(
+            landed_tokens > 0,
+            "the exhibit produced no tokens — the fixture is not analyzing, so nothing below \
+             measures the keystroke path (diagnostics: {:?})",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .take(3)
+                .collect::<Vec<_>>(),
+        );
+        println!(
+            "E121 {{\"section\":\"keystroke_path\",\"subject\":\"syn{functions}\",\
+             \"request\":\"land\",\"profile\":\"{}\",\"load\":\"{}\",\"reps\":1,\
+             \"cpu_ms\":null,\"wall_ms\":{:.1},\"count\":{landed_tokens}}}",
+            profile(),
+            loadavg_1m(),
+            analysis.as_secs_f64() * 1000.0,
+        );
+
+        // The regression the gate exists to catch, measured in the same
+        // process on the same subject: the whole-program walk §2.1 removes.
+        let (baseline_cpu, baseline_wall) = per_call(|| {
+            std::hint::black_box(document.semantic_tokens());
+        });
+        row("syn", "landed_walk", baseline_cpu, baseline_wall, functions);
+
+        // One keystroke, then the burst an editor fires.
+        document.set_text(&one_keystroke());
+        let offset = one_keystroke().find("panel();").expect("a scope position");
+
+        let (tokens_cpu, tokens_wall) = per_call(|| {
+            std::hint::black_box(document.keystroke_tokens(false));
+        });
+        let count = document.keystroke_tokens(false).len();
+        row("syn", "semanticTokens", tokens_cpu, tokens_wall, count);
+
+        let (hints_cpu, hints_wall) = per_call(|| {
+            std::hint::black_box(document.keystroke_hints(false));
+        });
+        row(
+            "syn",
+            "inlayHint",
+            hints_cpu,
+            hints_wall,
+            document.keystroke_hints(false).len(),
+        );
+
+        let (completion_cpu, completion_wall) = per_call(|| {
+            std::hint::black_box(document.keystroke_completion(offset, false));
+        });
+        row(
+            "syn",
+            "completion",
+            completion_cpu,
+            completion_wall,
+            document.keystroke_completion(offset, false).len(),
+        );
+
+        // §1.2 measured that the server answers a burst SERIALLY, so the sum
+        // is what the editor experiences — that is the number to gate on.
+        let (burst_cpu, burst_wall) = per_call(|| {
+            std::hint::black_box(document.keystroke_tokens(false));
+            std::hint::black_box(document.keystroke_hints(false));
+            std::hint::black_box(document.keystroke_completion(offset, false));
+        });
+        row("syn", "burst", burst_cpu, burst_wall, 3);
+        let _ = std::fs::remove_dir_all(&directory);
+
+        if !assert_budget {
+            return;
+        }
+        let Some(burst_cpu) = burst_cpu else {
+            panic!(
+                "no thread CPU clock on this host, so the gate cannot assert anything \
+                 load-proof (M15); wall was {burst_wall:.3} ms at loadavg {}",
+                loadavg_1m()
+            );
+        };
+        for (request, cpu) in [
+            ("semanticTokens", tokens_cpu),
+            ("inlayHint", hints_cpu),
+            ("completion", completion_cpu),
+        ] {
+            let cpu = cpu.expect("the clock answered for the burst, so it answered here");
+            assert!(
+                cpu < BUDGET_MS,
+                "{request} cost {cpu:.3} ms of thread CPU per request on the {functions}-function \
+                 exhibit, over the {BUDGET_MS} ms budget (loadavg {}, the whole-program walk it \
+                 replaces cost {} ms)",
+                loadavg_1m(),
+                baseline_cpu.map_or_else(|| "?".to_string(), |value| format!("{value:.3}")),
+            );
+        }
+        assert!(
+            burst_cpu < BUDGET_MS,
+            "the five-provider burst cost {burst_cpu:.3} ms of thread CPU on the \
+             {functions}-function exhibit, over the {BUDGET_MS} ms budget — and the burst is what \
+             the editor experiences, because §1.2 measured that the server answers one serially \
+             (loadavg {})",
+            loadavg_1m(),
+        );
+        // Non-vacuity, on this run and this machine: the walk the path
+        // replaced is the planted regression, and it must be visibly worse.
+        if let Some(baseline_cpu) = baseline_cpu {
+            assert!(
+                baseline_cpu > burst_cpu,
+                "the whole-program walk ({baseline_cpu:.3} ms) did not cost more than the \
+                 keystroke path ({burst_cpu:.3} ms) — the instrument cannot tell the two apart, \
+                 so the green above proves nothing",
+            );
+        }
+    }
+
+    /// §6.2's `keystroke_path_budget`, on the exhibit at kolt's size.
+    #[test]
+    #[ignore = "E121: the keystroke-path gate — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    fn keystroke_path_budget() {
+        keystroke_path_budget_at(GATE_FUNCTIONS, true);
+    }
+
+    /// The seconds-long smoke pin the PR gate DOES pay: the harness builds its
+    /// exhibit, lands an analysis, drives every provider through the keystroke
+    /// path and produces rows. It asserts the mechanism, not the budget.
+    #[test]
+    fn keystroke_path_gate_smoke() {
+        keystroke_path_budget_at(SMOKE_FUNCTIONS, false);
+    }
+
+    /// §6.2's `diagnostics_budget`. CPU-clocked, which makes it
+    /// **debounce-exclusive by construction** (Q3): the debounce is a
+    /// `tokio::time::sleep` and accrues no CPU, so a CPU assertion cannot
+    /// include it. Ignored because it does not pass — the paper measures
+    /// 925 ms of CPU per keystroke at 1,791 reachable functions against a
+    /// 500 ms budget, and closing that is M21/M19's lane (perf-25), not this
+    /// one. Un-ignore it when the analysis lands under budget.
+    #[test]
+    #[ignore = "E121: the diagnostics budget is perf-25's to meet (M21/M19); 925 ms of CPU at 1,791 functions today against 500 ms (proposal/editor-latency.md §1.4b)"]
+    fn diagnostics_budget() {
+        let (directory, _document, _) = land(GATE_FUNCTIONS);
+        let entry = directory.join("main.vl");
+        let edited = one_keystroke();
+        let cpu_started = thread_cpu_now();
+        let wall_started = Instant::now();
+        let analyzed = Document::analyze(&edited, &std_root(), &entry);
+        let wall = wall_started.elapsed().as_secs_f64() * 1000.0;
+        let cpu = cpu_started
+            .zip(thread_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+        let count = analyzed.diagnostics.len();
+        row("syn", "publishDiagnostics", cpu, wall, count);
+        let _ = std::fs::remove_dir_all(&directory);
+        // The analysis runs on its own big-stack thread, so THIS thread's clock
+        // did not see it. Wall is the only honest number here until the
+        // analysis is instrumented on its own thread — recorded, and the
+        // assertion says so.
+        assert!(
+            wall < 500.0,
+            "one keystroke took {wall:.0} ms of wall to diagnostics on the {GATE_FUNCTIONS}-function \
+             exhibit, over the 500 ms budget (loadavg {}); the debounce is excluded by \
+             construction — it is not in this span at all",
+            loadavg_1m(),
+        );
+    }
+}
