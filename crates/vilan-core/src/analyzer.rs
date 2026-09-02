@@ -3186,6 +3186,35 @@ pub struct Analyzer<'src> {
     // receiver typed from a refused field IS this id, and so is the argument a
     // `[service]`/`[expose]` expansion passes on.
     refused_annotation_slots: HashMap<TypeId, (SourceId, Span)>,
+    // B189's second sibling: the TRAITS a refused annotation named, each with
+    // the site its one report was filed at. The map above is keyed on the
+    // annotation's SLOT, which is what every consumer that reads the annotated
+    // thing's TYPE meets. A derive meets something else: `[derive(Wire)]`
+    // templates its bodies from the field's SPELLING (`{type}::from_json_value`,
+    // `{type}::rebuild`), so the generated code re-writes `Greet` as a fresh
+    // path with a type id of its own — never the refused slot — and asks the
+    // trait for a member no trait has. The spelling is the provenance there,
+    // and the trait it names is what carries it.
+    refused_annotation_traits: HashMap<Id, (SourceId, Span)>,
+    // B189's third sibling: the declared slots of the `[expose]`d fields whose
+    // exposure `check_expose_fields` has already refused — E104's covered set,
+    // keyed on the field. Unlike the two maps above this is not an `Unknown`
+    // with provenance: the field has a perfectly good type, and it is the
+    // EXPOSURE that is refused. The generated subscription call is handed that
+    // same field, so it fails the same bound one pass later and says so in the
+    // vocabulary of code the author never wrote.
+    expose_refused_field_slots: HashSet<TypeId>,
+    // The ELEMENT each of those refusals named, as the refusal RENDERED it. The
+    // expansion writes two shapes per exposed field and only one of them is
+    // handed the field: `session.expose(self.tasks)` carries it, while the
+    // client's mirror (`let mirror: RemoteSource<Element> = reactive.source(
+    // channel)`) names only the element — a fresh annotation with a slot of its
+    // own, and so a `Type` whose nested ids are not the field's, even though
+    // both spell one type. The rendering is what the two share, and it is
+    // exactly the grain of the sentence being suppressed: the bound failure
+    // says "'List<Workspace>' does not implement trait 'Wire'" and the refusal
+    // says "its element `List<Workspace>` is not Wire" — one fact, one report.
+    expose_refused_elements: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -3861,6 +3890,9 @@ impl<'src> Analyzer<'src> {
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
             refused_annotation_slots: HashMap::default(),
+            refused_annotation_traits: HashMap::default(),
+            expose_refused_field_slots: HashSet::default(),
+            expose_refused_elements: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             implicit_generic_scopes: HashMap::default(),
@@ -4270,6 +4302,14 @@ impl<'src> Analyzer<'src> {
             .map(|(call_id, substitution)| (*call_id, substitution.clone()))
             .collect();
         for (call_id, substitution) in recorded {
+            // B189's third sibling: a GENERATED call handed an `[expose]`d
+            // field whose exposure is already refused. The bound it fails is
+            // the very thing that refusal is about, so restating it here — at
+            // the whole struct's span, about a call the author never wrote —
+            // is E104's covered set doing nothing for anyone.
+            if self.call_covered_by_expose_refusal(call_id) {
+                continue;
+            }
             for (&constraint_id, &value_type_id) in &substitution {
                 let bound_traits = self.generic_bound_traits(constraint_id);
                 let tuple_requirement = self.tuple_bounds.get(&constraint_id).cloned();
@@ -4284,6 +4324,22 @@ impl<'src> Analyzer<'src> {
                     value_type,
                     Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
                 ) {
+                    continue;
+                }
+                // B189's third sibling, the half the call's ARGUMENTS cannot
+                // answer. The client mirror the `[service]` expansion writes
+                // names the element and nothing else (`let mirror:
+                // RemoteSource<List<Workspace>> = reactive.source(channel)`),
+                // so no argument of it is the exposed field — but the bound it
+                // fails is the very sentence the field's refusal already said
+                // about that element. Generated code only: the author's own
+                // call on the same type is their own site.
+                if !self.expose_refused_elements.is_empty()
+                    && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                    && self
+                        .expose_refused_elements
+                        .contains(&self.pretty_print_type(&value_type, &HashMap::default()))
+                {
                     continue;
                 }
                 if let Some(requirement) = tuple_requirement {
@@ -5079,6 +5135,15 @@ impl<'src> Analyzer<'src> {
         let checks = std::mem::take(&mut self.wire_types_to_check);
         for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
+                // B189: the field's annotation was REFUSED, and that report
+                // already says what is wrong with it. "`inner` is `Greet`,
+                // which is not Wire" answers a question nobody asked — `Greet`
+                // is not a field type at all, which is the sentence the author
+                // already has. B182's stand-down at its own slot, reaching a
+                // consumer the derive sibling exposed.
+                if self.refused_annotation_slots.contains_key(field_type_id) {
+                    continue;
+                }
                 // A resource field is rejected with a resource-specific steer,
                 // taking precedence over the not-Wire message: a resource is not
                 // plain data, so it cannot cross the wire (destruction.md §8).
@@ -5198,6 +5263,13 @@ impl<'src> Analyzer<'src> {
         let checks = std::mem::take(&mut self.hashable_types_to_check);
         for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
+                // The Wire boundary's B189 stand-down, for the same reason at
+                // the same grain: a refused annotation has its one report, and
+                // "not Hashable" restates it about a type the author is
+                // already being told cannot be a field type.
+                if self.refused_annotation_slots.contains_key(field_type_id) {
+                    continue;
+                }
                 // A resource field is rejected with a resource-specific steer,
                 // taking precedence over the not-Hashable message: a resource
                 // cannot be hashed by value (destruction.md §8).
@@ -12475,6 +12547,14 @@ impl<'src> Analyzer<'src> {
                 Some(element) => {
                     let element_type = element.get_type(self);
                     let rendered = self.pretty_print_type(&element_type, &HashMap::default());
+                    // B189: this field's exposure is now reported, so the
+                    // generated subscription's bound failure on it is a
+                    // restatement and stands down (`call_covered_by_expose_
+                    // refusal`, consulted one pass later). Both keys: the
+                    // FIELD, for the call handed it, and the ELEMENT this
+                    // sentence names, for the mirror that only mentions it.
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.expose_refused_elements.insert(rendered.clone());
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -12491,6 +12571,10 @@ impl<'src> Analyzer<'src> {
                     );
                 }
                 None => {
+                    // Same covering, same reason: the field cannot be exposed
+                    // at all, so the generated subscription's own complaint
+                    // about it adds nothing the sentence below does not say.
+                    self.expose_refused_field_slots.insert(field_type_id);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -14791,6 +14875,20 @@ impl<'src> Analyzer<'src> {
         if self.refused_annotation_slots.is_empty() {
             return None;
         }
+        self.annotation_slots_behind(expr_id)
+            .into_iter()
+            .find_map(|slot| self.refused_annotation_slots.get(&slot).copied())
+    }
+
+    /// The annotation slots an expression reads, in the order a lookup should
+    /// try them — the shared half of every "was this already reported at the
+    /// annotation?" question ([`Self::refused_annotation_behind`] for B182's
+    /// refusals, [`Self::expose_refusal_behind`] for B189's exposed fields).
+    ///
+    /// The three fallbacks after the interned type are the same slot reached
+    /// without one — a binding or parameter naming the annotation directly, and
+    /// a field whose access resolved before the drain ran.
+    fn annotation_slots_behind(&self, expr_id: Id) -> Vec<TypeId> {
         let mut slots: Vec<TypeId> = Vec::new();
         slots.extend(self.type_id_of_expr(expr_id));
         match self.expr_id_to_expr_map.get(&expr_id) {
@@ -14817,8 +14915,47 @@ impl<'src> Analyzer<'src> {
             _ => {}
         }
         slots
+    }
+
+    /// B189's third sibling: was this expression the `[expose]`d FIELD whose
+    /// exposure `check_expose_fields` has already refused?
+    ///
+    /// E104's covered-set idea, keyed on the field. The curated refusal names
+    /// the field, its element and why the element cannot cross the wire — the
+    /// whole mistake, in the author's own vocabulary. What followed it was the
+    /// SAME mistake read off the generated subscription call, as a bound the
+    /// call's argument does not satisfy, over a span covering the whole struct.
+    /// The field's slot is what the two have in common, exactly as it is for a
+    /// refused annotation.
+    fn expose_refusal_behind(&self, expr_id: Id) -> bool {
+        if self.expose_refused_field_slots.is_empty() {
+            return false;
+        }
+        self.annotation_slots_behind(expr_id)
             .into_iter()
-            .find_map(|slot| self.refused_annotation_slots.get(&slot).copied())
+            .any(|slot| self.expose_refused_field_slots.contains(&slot))
+    }
+
+    /// [`Self::expose_refusal_behind`] asked of a GENERATED call: was it handed
+    /// the exposed field whose exposure is already reported?
+    ///
+    /// Generated only. The refusal covers the EXPOSURE — the calls the
+    /// `[service]` expansion writes to subscribe to the field — and nothing
+    /// else. A call the author wrote themselves that fails the same bound is
+    /// their own site and their own mistake, and it still reports.
+    fn call_covered_by_expose_refusal(&self, call_id: Id) -> bool {
+        if self.expose_refused_field_slots.is_empty()
+            || self.source_of_id(call_id) != Some(DERIVED_SOURCE)
+        {
+            return false;
+        }
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return false;
+        };
+        function_call
+            .argument_ids
+            .iter()
+            .any(|argument_id| self.expose_refusal_behind(*argument_id))
     }
 
     /// [`Self::refused_annotation_behind`], recording the refusal as one that
@@ -33223,6 +33360,15 @@ impl<'src> Analyzer<'src> {
                             // vocabulary of code the author never wrote.
                             self.refused_annotation_slots
                                 .insert(type_id, (source_id, span));
+                            // B189: and the SPELLING this report accounts for.
+                            // A derive does not read the slot — it templates
+                            // its bodies from the annotation's text, so the
+                            // generated `Greet::from_json_value(..)` is a
+                            // fresh path with a type id of its own. What the
+                            // two have in common is the trait, so that is
+                            // where the spelling's provenance is filed.
+                            self.refused_annotation_traits
+                                .insert(*trait_id, (source_id, span));
                         }
                     }
                     // A refused annotation resolves to `Unknown`, so the one
@@ -33276,6 +33422,17 @@ impl<'src> Analyzer<'src> {
                         },
                         source_id,
                     );
+                    // B189's first sibling: a name that does not resolve is a
+                    // REFUSED ANNOTATION like any other. B182 instrumented the
+                    // arm above and left this one, so `struct Holder { inner:
+                    // Nope }` reported the refusal AND "cannot call method
+                    // 'length' on unknown" at every use — the second in the
+                    // vocabulary of a type nobody wrote, and no more a fix than
+                    // the bare-trait cascade was. The slot is the same
+                    // provenance and the same three consumers meet it, so the
+                    // rule is the same: one mistake, one report.
+                    self.refused_annotation_slots
+                        .insert(type_id, (source_id, span));
                     self.write_type_slot(type_id, Type::Unknown);
                 }
             }
@@ -33575,6 +33732,34 @@ impl<'src> Analyzer<'src> {
                                         .insert(id, bindings.into_iter().collect());
                                 }
                             }
+                        }
+                        // B189's second sibling, and it stands ahead of every
+                        // other refusal below because it is not about this
+                        // path at all. The subject is a trait a REFUSED
+                        // ANNOTATION named, so this path was written by a
+                        // DERIVE, templated from that annotation's spelling
+                        // (`Greet::from_json_value`, `Greet::rebuild`) — the
+                        // one report at the annotation already accounts for
+                        // whatever the lookup would have said, and saying it
+                        // again in the vocabulary of generated code is what
+                        // B182 removed everywhere the SLOT reached. The
+                        // spelling reaches here instead: the derive re-writes
+                        // the trait's name as a fresh path, whose type id was
+                        // never the annotation's.
+                        //
+                        // Keyed on the TRAIT, which is E104's grain at this
+                        // family's scale: a miss on a DIFFERENT trait in the
+                        // same program is nobody's consequence and still
+                        // reports.
+                        None if matches!(&subject_type, Type::Trait(trait_id, _)
+                            if self.refused_annotation_traits.contains_key(trait_id)) =>
+                        {
+                            let Type::Trait(trait_id, _) = &subject_type else {
+                                unreachable!("just matched a refused trait subject");
+                            };
+                            let site = self.refused_annotation_traits[trait_id];
+                            self.stood_down_refusals.insert(site);
+                            self.expr_id_to_expr_map.insert(id, Expr::Error);
                         }
                         // B162: the trait declares the associated function but
                         // gives it no default body, so `Trait::func(..)` names

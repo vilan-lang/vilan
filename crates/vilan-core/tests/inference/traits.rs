@@ -469,30 +469,188 @@ fn a_refused_field_does_not_cascade_through_its_uses() {
 fn an_unrelated_unknown_still_reports_beside_a_refused_one() {
     // E104's lesson, at this family's grain: the stand-down is asked PER
     // RECEIVER, of the slot that receiver reads — never of "is this type
-    // unknown", which would silence a mistake nobody has been told about. The
-    // `Other` field's type failed to RESOLVE (a different refusal, a different
-    // family), so a call on it still refuses, in the same program whose
-    // `Kennel` field stands down.
+    // unknown", which would silence a mistake nobody has been told about.
+    //
+    // The unrelated unknown is B188's: `Holder` is written with no type
+    // argument, the arity refusal reports that, and the slot resolves to
+    // `Unknown` under a rule this family knows nothing about. So a call on it
+    // still refuses — in the same program whose `Kennel` field stands down.
+    //
+    // It used to be `thing: Nope`, an UNRESOLVED name. B189's first sibling
+    // gave that arm the same provenance the bare-trait arm has (a `cannot find
+    // type` refusal is a root like any other), which made the old shape
+    // vacuous: the pin would have passed by silencing both. The rule for
+    // choosing a replacement is the one that made this pin worth having —
+    // the unknown has to come from a refusal this map does not carry.
     let source = format!(
         r#"{GREET}
+        struct Holder<T> {{ v: T }}
         struct Kennel {{ inner: Greet }}
-        struct Other {{ thing: Nope }}
+        struct Other {{ held: Holder }}
         impl Kennel {{
             fun speak(self): str {{ self.inner.greet() }}
         }}
         fun main() {{
-            let other = Other {{ thing = 1 }};
-            print(other.thing.length());
+            let other = Other {{ held = 1 }};
+            print(other.held.length());
         }}
         main();
         "#
     );
     assert_fails_with(&source, "'Greet' is a trait, not a type");
-    assert_fails_with(&source, "cannot find type 'Nope'");
+    assert_fails_with(&source, "`Holder` takes 1 type argument, 0 given");
     assert_fails_with(&source, "cannot call method 'length' on unknown");
     // And the refused field's own use is still silent — the two answers are
     // independent, which is the whole point of keying on the slot.
     assert_fails_without(&source, "'greet' on unknown");
+}
+
+// --- B189: three siblings B182's stand-down did not reach --------------------
+//
+// Same pile, three provenances. B182 gave the bare-trait refusal's `Unknown`
+// slot a provenance and stood three consumers down on it; each sibling below is
+// a report that reaches its subject by a route the SLOT does not travel — a
+// second refusal arm that was never instrumented, a derive that templates from
+// the annotation's SPELLING, and a generated call whose argument has a
+// perfectly good type and a refused EXPOSURE.
+
+#[test]
+fn an_unresolved_field_annotation_does_not_cascade_through_its_uses() {
+    // The first sibling. `cannot find type 'Nope'` is a refusal exactly as
+    // "`Greet` is a trait, not a type" is, and it resolved to `Unknown` one
+    // match arm below the instrumented one — so every use of the field said
+    // "cannot call method 'length' on unknown", a second report about a type
+    // nobody wrote and no more a fix than the bare-trait cascade was.
+    let source = r#"
+        import std::io::print;
+        struct Holder { inner: Nope }
+        fun main() {
+            let holder = Holder { inner = 1 };
+            print(holder.inner.length());
+        }
+        main();
+        "#;
+    assert_fails_once_with(source, "cannot find type 'Nope'");
+    assert_fails_without(source, "on unknown");
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one unresolved annotation is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_derive_over_a_refused_field_writes_no_follow_ons() {
+    // The second sibling. `[derive(Wire)]` builds its bodies out of the field's
+    // ANNOTATION TEXT — `{type}::from_json_value(..)`, `{type}::rebuild(..)` —
+    // and the text survives the refusal, so the generated code asked the TRAIT
+    // for members no trait has. Those are not the annotation's slot: they are
+    // fresh paths with type ids of their own, which is why B182's provenance
+    // could not reach them and why this one is filed on the trait the spelling
+    // names.
+    //
+    // The derive's own field check goes with them: "`inner` is `Greet`, which
+    // is not Wire" answers a question nobody asked — `Greet` is not a field
+    // type at all, which the author has already been told.
+    let source = format!(
+        r#"{GREET}
+        [derive(Wire)]
+        struct Kennel {{ inner: Greet }}
+        fun main() {{ print(1); }}
+        main();
+        "#
+    );
+    assert_fails_once_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_without(&source, "from_json_value");
+    assert_fails_without(&source, "rebuild");
+    assert_fails_without(&source, "which is not Wire");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused annotation is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_static_miss_on_an_unrefused_trait_still_reports_beside_a_refused_one() {
+    // E104's lesson for the second sibling, keyed where that sibling keys: on
+    // the TRAIT. `Ping` was never written as a field type, so nobody has been
+    // told anything about it, and asking it for a member it does not declare is
+    // a mistake of its own — in the same program whose `Greet` paths are
+    // silent.
+    let source = format!(
+        r#"{GREET}
+        trait Ping {{ fun ping(self): str; }}
+        [derive(Wire)]
+        struct Kennel {{ inner: Greet }}
+        fun main() {{ print(Ping::pong()); }}
+        main();
+        "#
+    );
+    assert_fails_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_with(&source, "cannot find 'pong' in Ping");
+    assert_fails_without(&source, "in Greet");
+}
+
+#[test]
+fn an_expose_of_a_non_wire_element_reports_once() {
+    // The third sibling, and the one whose subject is not an `Unknown` at all:
+    // `SignalCell<List<Workspace>>` is a perfectly good type, and it is the
+    // EXPOSURE that is refused. The `[service]` expansion then writes two
+    // shapes that fail the same `Wire` bound — the server's
+    // `session.expose(self.workspaces)` and the client's mirror,
+    // `RemoteSource<List<Workspace>>` — and both reported it again, over a span
+    // covering the whole struct, as "in code generated by this attribute".
+    let source = r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+        struct Workspace { id: i32 }
+        [service(KoltClient)]
+        struct KoltStore {
+            [expose] workspaces: SignalCell<List<Workspace>>,
+        }
+        fun main() { print("kolt"); }
+        main();
+        "#;
+    assert_fails_once_with(source, "its element `List<Workspace>` is not Wire");
+    assert_fails_without(source, "in code generated by this attribute");
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused exposure is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_author_written_bound_failure_on_the_same_type_still_reports() {
+    // E104's lesson for the third sibling. The covered set covers the
+    // EXPOSURE — the calls the expansion writes — and nothing else. A call the
+    // author wrote themselves that fails the same bound is their own site, in
+    // their own file, and it still reports.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+        import std::wire::Wire;
+        struct Workspace { id: i32 }
+        fun send<T: Wire>(value: T): i32 { 1 }
+        [service(KoltClient)]
+        struct KoltStore {
+            [expose] workspaces: SignalCell<List<Workspace>>,
+        }
+        fun main() {
+            let one: List<Workspace> = [Workspace { id = 1 }];
+            print(i"{send(one)}");
+        }
+        main();
+        "#;
+    assert_fails_with(source, "its element `List<Workspace>` is not Wire");
+    assert_fails_with(
+        source,
+        "'List<Workspace>' does not implement trait 'Wire', required by a generic bound",
+    );
 }
 
 /// kolt's own shape, one file: a `[service]` struct whose fields are `[expose]`d
@@ -550,13 +708,54 @@ fn the_stand_down_does_not_hide_a_second_independent_offense() {
 }
 
 #[test]
+fn the_kolt_shaped_exhibit_is_one_diagnostic_per_mistake() {
+    // The exhibit's whole point, stated as a NUMBER so a regression in any of
+    // the parts shows up here rather than in a lane's reading of a log. Two
+    // mistakes were written into this struct on purpose — a bare `Signal`
+    // where the cell type belongs, and a `Workspace` that is not Wire — and
+    // after B189 there are exactly two diagnostics. It was 21 before B182, 4
+    // after it (the second mistake still restated at the whole struct's span
+    // by both halves of the expansion), and 2 now.
+    let diagnostics = failure_diagnostics(SERVICE_EXHIBIT);
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "two mistakes, two diagnostics: {diagnostics:#?}"
+    );
+}
+
+/// A `[service]` whose refused field is joined by an INDEPENDENT generated
+/// failure: the `[rpc]` method takes a `Workspace`, which is not Wire, so the
+/// expansion's own encode/decode code fails at the whole declaration's span.
+/// The ordering pin below needs exactly that shape — a diagnostic that ENCLOSES
+/// the refusal — and `SERVICE_EXHIBIT` stopped supplying one when B189's third
+/// sibling stood the exposure's generated restatements down. The enclosing
+/// diagnostics here are nobody's consequence, so they stay, and the rule they
+/// were always about (roots first) is still under test.
+const ORDERING_EXHIBIT: &str = r#"
+    import std::io::print;
+    import std::reactive::Signal;
+    struct Workspace { id: i32 }
+    [service(KoltClient)]
+    struct KoltStore {
+        [expose] tasks: Signal<List<i32>>,
+    }
+    impl KoltStore {
+        [rpc]
+        fun touch(self, w: Workspace): i32 { 1 }
+    }
+    fun main() { print("kolt"); }
+    main();
+"#;
+
+#[test]
 fn a_refusal_that_stood_something_down_prints_before_what_encloses_it() {
     // The ordering rule (`Program::normalize_diagnostic_order`). A generated
     // diagnostic re-anchors at the WHOLE declaration (standard A2), whose span
     // opens before the field annotation inside it — so plain positional order
     // printed the consequence first and buried the cause. kolt's owner read
     // "cannot infer 'S'" and never reached the refused field two pages down.
-    let diagnostics = failure_diagnostics(SERVICE_EXHIBIT);
+    let diagnostics = failure_diagnostics(ORDERING_EXHIBIT);
     let refusal = diagnostics
         .iter()
         .position(|(message, _)| message.contains("'Signal' is a trait, not a type"))
