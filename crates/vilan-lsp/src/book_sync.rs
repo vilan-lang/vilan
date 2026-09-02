@@ -347,12 +347,48 @@ fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
 }
 
 /// The mdBook this book's anchors are pinned to — the exact line
-/// `mdbook --version` prints. Two other places in the fleet hold the same pin:
-/// `scripts/regen-markdown-golden.py` (as `PINNED_MDBOOK`, a hard refusal) and
-/// the pages repo's `docs.yml` (a tarball fetched by sha256). This constant is
-/// the third consumer, and until N28 it was the one that shelled out
-/// unversioned.
+/// `mdbook --version` prints, and THE source of the pin: every other in-repo
+/// spelling of the version is held to this one by
+/// [`the_pin_agrees_with_every_in_repo_copy_of_it`], over
+/// [`PLACES_THAT_SPELL_THE_PIN`]. Outside the repository the pages repo's
+/// `docs.yml` holds it too (a tarball fetched by sha256), which no gate here
+/// can reach.
+///
+/// Until N28 this was the consumer that shelled out unversioned; until N42 it
+/// was held against one of the five copies and blind to the other three.
 const PINNED_MDBOOK: &str = "mdbook v0.5.4";
+
+/// Every other in-repo file that spells the pinned version, with what its copy
+/// is for (tracker N42).
+///
+/// The list is exact rather than a repository sweep on purpose: `CHANGELOG.md`
+/// names the version in entries that describe the tree AS IT WAS, and those
+/// spellings must not move when the pin does. A file that starts carrying the
+/// version is added here on purpose, in a diff — the same shape as every other
+/// exemption-adjacent list in this tree.
+const PLACES_THAT_SPELL_THE_PIN: &[(&str, &str)] = &[
+    (
+        "scripts/regen-markdown-golden.py",
+        "`PINNED_MDBOOK`, a hard refusal — it governs the anchors golden this \
+         crate's reimplementation is proven against",
+    ),
+    (
+        "README.md",
+        "the `cargo install mdbook` line a reader runs to build the book locally",
+    ),
+    (
+        "vilan/docs/README.md",
+        "the same install line, in the page that argues the pin",
+    ),
+    (
+        "vilan/std/src/markdown.vl",
+        "the heading-id algorithm's own header — the version it reimplements",
+    ),
+    (
+        "crates/vilan-core/tests/markdown_golden.rs",
+        "the golden's header, and the regeneration command it prints",
+    ),
+];
 
 /// The version `<program> --version` reported, or the refusal to fail with
 /// (N28). Absence and mismatch both REFUSE — loudly, naming the pin and how to
@@ -538,10 +574,90 @@ fn an_absent_renderer_is_refused_with_the_install_line() {
     );
 }
 
-// The pin is held in three places and this is one of them, so hold it to the
-// nearest sibling: `scripts/regen-markdown-golden.py`, whose `PINNED_MDBOOK`
-// governs the golden this crate's reimplementation is proven against. A tree
-// where the two disagree has one of them blessing a renderer the other refuses.
+/// The first `1.2.3`-shaped version in `text`, if it carries one.
+fn first_version(text: &str) -> Option<String> {
+    let characters: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        if !characters[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < characters.len()
+            && (characters[index].is_ascii_digit() || characters[index] == '.')
+        {
+            index += 1;
+        }
+        let run: String = characters[start..index].iter().collect();
+        let parts: Vec<&str> = run.split('.').collect();
+        if parts.len() == 3 && parts.iter().all(|part| !part.is_empty()) {
+            return Some(run);
+        }
+    }
+    None
+}
+
+// The pin the whole book's anchors rest on, held everywhere the tree spells it
+// (tracker N42). Before this it was held in ONE other place — the regeneration
+// script — while three more copies, including the two install lines a human
+// actually runs, could name a renderer this very file would refuse to trust.
+// That is the failure `pinned_mdbook_or_refusal`'s own refusal text warns
+// about, one file further out: it tells the reader to move the pin in five
+// places, and nothing checked that they did.
+//
+// A mention is read as carrying the version when a `1.2.3` follows `mdbook`
+// within the next few dozen characters, which is the distance in both
+// spellings this tree uses — `mdBook v0.5.4` and
+// `cargo install mdbook --version 0.5.4 --locked`. A mention with no version
+// near it (`mdbook serve vilan/docs`) is prose about the tool, not a copy of
+// the pin, and is passed over.
+#[test]
+fn the_pin_agrees_with_every_in_repo_copy_of_it() {
+    /// How far past `mdbook` a spelling of the version can sit.
+    const REACH: usize = 46;
+
+    let pinned = PINNED_MDBOOK
+        .rsplit_once(" v")
+        .map_or(PINNED_MDBOOK, |(_, version)| version);
+    let mut faults = Vec::new();
+    for (relative, purpose) in PLACES_THAT_SPELL_THE_PIN {
+        let text = read(&repo_root().join(relative));
+        let lowered = text.to_lowercase();
+        let mut copies = 0;
+        for (index, _) in lowered.match_indices("mdbook") {
+            let window: String = text[index..].chars().take(REACH).collect();
+            let Some(found) = first_version(&window) else {
+                continue;
+            };
+            copies += 1;
+            if found != pinned {
+                faults.push(format!(
+                    "  {relative}: names mdBook {found}, and the pin is {pinned} ({purpose})"
+                ));
+            }
+        }
+        if copies == 0 {
+            faults.push(format!(
+                "  {relative}: spells no mdBook version at all any more ({purpose}). \
+                 Either the copy moved — point this list at where it went — or it is \
+                 gone, and the entry should go with it."
+            ));
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "the mdBook pin is {PINNED_MDBOOK} here, and these copies of it disagree. A \
+         tree where they differ has one of them blessing a renderer another refuses, \
+         and the install line a reader follows is the copy that decides which \
+         renderer is actually on the machine:\n{}",
+        faults.join("\n")
+    );
+}
+
+// And the source of the pin is the constant, not a second hand-spelling of it:
+// the regeneration script's own `PINNED_MDBOOK` is held to this one verbatim,
+// line and all, which is more than the version-number check above can say.
 #[test]
 fn the_pin_agrees_with_the_golden_regeneration_script() {
     let script = read(&repo_root().join("scripts/regen-markdown-golden.py"));

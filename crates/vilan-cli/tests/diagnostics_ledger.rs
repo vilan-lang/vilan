@@ -40,6 +40,15 @@
 //!    ([`every_flagship_row_is_quoted_by_the_errors_appendix`]) — a row the
 //!    index marks `flagship` must be quoted by some appendix entry. Dropping an
 //!    entry, or marking a new row flagship without writing one, reds.
+//! 6. **The two exemptions expire** (N42, and N27's rule for `#[ignore]`
+//!    reasons applied to a list). Both
+//!    [`every_hand_rowed_row_is_still_out_of_the_enumerations_reach`] and
+//!    [`every_fragmentless_key_still_has_no_fragment`] ask the INVERSE
+//!    question: a row `ROWS_THE_ENUMERATION_CANNOT_REACH` names that the walk
+//!    now reaches, and a key `KEYS_WITHOUT_A_FRAGMENT` names that is now
+//!    searchable, are each an exemption subtracting a check for nothing — and
+//!    each stays green forever without this, because a list that only ever
+//!    subtracts work cannot red by being wrong.
 //!
 //! # What this file does NOT verify
 //!
@@ -852,6 +861,75 @@ fn every_hand_rowed_row_is_in_the_index() {
         "row(s) {missing:?} are recorded in ROWS_THE_ENUMERATION_CANNOT_REACH but \
          are not in `{INDEX}`. A message the enumeration cannot see is held by \
          its row and nothing else, so dropping the row drops the message."
+    );
+}
+
+#[test]
+fn every_hand_rowed_row_is_still_out_of_the_enumerations_reach() {
+    // The inverse (tracker N42), and the half the check above cannot make. An
+    // exemption is a claim about the WALK — "check (3) never sees this row's
+    // message" — and the walk is a thing that changes: widen an anchor, move a
+    // ladder's `format!` to the `msg:` site, and the row becomes reachable. It
+    // stays exempt forever regardless, because being listed here only ever
+    // subtracts work, so the rot is silent in exactly the direction nobody
+    // looks.
+    //
+    // Reached is asked the way check (3) asks it: some enumerated ERROR site
+    // this row's key describes. That is the same predicate, so a row this test
+    // calls reachable is a row check (3) would hold on its own.
+    let rows = index();
+    let sites = enumerated_sites();
+    let reached: Vec<String> = ROWS_THE_ENUMERATION_CANNOT_REACH
+        .iter()
+        .filter_map(|(number, _)| {
+            let row = rows.iter().find(|row| row.number.to_string() == *number)?;
+            sites
+                .iter()
+                .filter(|site| !site.is_note)
+                .find(|site| key_describes(&row.key, &site.message))
+                .map(|site| {
+                    format!(
+                        "  row {number}: now enumerated at {}:{}",
+                        site.file, site.line
+                    )
+                })
+        })
+        .collect();
+    assert!(
+        reached.is_empty(),
+        "row(s) recorded in ROWS_THE_ENUMERATION_CANNOT_REACH are reachable now — \
+         the walk found their message at its own site, so check (3) holds them and \
+         the hand-rowing is dead weight claiming otherwise. Delete the entry (and, \
+         if the list empties, the argument on it):\n{}",
+        reached.join("\n")
+    );
+}
+
+#[test]
+fn every_fragmentless_key_still_has_no_fragment() {
+    // The same inverse for the other list (tracker N42). `KEYS_WITHOUT_A_FRAGMENT`
+    // exempts a row from check (2) — from being searched for in the tree at all —
+    // and buys that with a much weaker check (3): a composed row may hold only
+    // its own site, matched verbatim. A key that has since been RE-KEYED onto a
+    // real literal run should get check (2) back, and nothing was asking.
+    let stale: Vec<String> = index()
+        .into_iter()
+        .filter(|row| {
+            KEYS_WITHOUT_A_FRAGMENT
+                .iter()
+                .any(|(number, _)| *number == row.number.to_string())
+        })
+        .filter_map(|row| {
+            longest_fragment(&row.key)
+                .map(|fragment| format!("  row {}: searchable as {fragment:?}", row.number))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "row(s) recorded in KEYS_WITHOUT_A_FRAGMENT now carry a literal run of \
+         {MIN_FRAGMENT} characters, so they are searchable and the exemption costs \
+         them check (2) for nothing. Delete the entry:\n{}",
+        stale.join("\n")
     );
 }
 
