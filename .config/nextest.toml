@@ -17,3 +17,59 @@ fail-fast = false
 [[profile.default.overrides]]
 filter = 'test(leak_measurement)'
 priority = 100
+
+# The watch-round family runs ONE AT A TIME (tracker N46).
+#
+# Every member of it drives a real `vilan build --watch` / `run --watch`
+# session in a child process and then waits, on the wall clock, for a ROUND to
+# fire — a compile plus the build commands, in another process, observed
+# through a file the round writes. The wait is bounded by
+# `support::WATCH_LIVENESS` (300 s), and that bound has now been paid three
+# times over: Order 20's close, Order 24's hygiene lane, and Order 24's
+# pre-seal union, each with the same 301 s red on a pin that costs 0.6 s alone.
+#
+# The suite is the only load this repository controls, and until now it piled
+# the family onto itself: 29 tests, each spawning a watcher and a compile, all
+# eligible to run at once inside an interleave already 16 wide. One thread for
+# the group ends that. It does not (and cannot) fix a box loaded by something
+# else — that is the honest limit of this lever, and the reason the pins keep
+# their own liveness bound rather than trusting the group for it.
+#
+# The other direction the item names — making the wait CPU-time-aware, the way
+# M15 fixed the const-pass gate — was MEASURED and rejected, because the shape
+# does not transfer. M15's subject is a computation, and preemption does not
+# accrue to a computation's own CPU clock. This subject is an EVENT delivered
+# by a 300 ms poll loop that sleeps between polls, and the numbers say so: at
+# loadavg 79, a watcher waiting with nothing to do burns 0.030 s of CPU per
+# 30 s of wall — 1.0 ms/s, set by the poll rate and not by the load — while the
+# round it is waiting for costs 0.33 s (round 1) and 0.02 s (round 2). A
+# deadline denominated in the watcher's own CPU is therefore a wall deadline
+# wearing different units, and it makes the two states the bound has to tell
+# apart — starved and stuck — indistinguishable rather than distinguishable.
+[test-groups]
+watch-rounds = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# `hmr`, `hmr_swap`, `hmr_css_matrix` and `watch_lifecycle` are watch sessions
+# end to end, so they join whole. The other five binaries are mostly one-shot
+# `build` pins with a watch family inside them, and the family is named the way
+# it is spelled: every one of these tests carries `watch` or `round` in its
+# name. A name filter can rot in silence, so it does not stand alone —
+# `build_hooks`'s `every_test_that_drives_a_watch_session_is_in_the_group`
+# reads all nine files and reds if a test spawns a watcher from outside the set
+# this line selects. It is what found `split` and `serve_build`, whose one
+# watch round each was invisible to a filter written off the HMR suites.
+filter = '''
+    binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
+    + ((binary(build_hooks) + binary(assets) + binary(asset_bundle) + binary(split)
+        + binary(serve_build)) & test(/watch|round/))
+'''
+test-group = 'watch-rounds'
+# Advisory at 120 s, killed at 8 minutes. The pins' own `WATCH_LIVENESS` (300 s)
+# is well inside that on purpose: a hung round should be reported by the pin,
+# which panics with the round counts and the watcher's whole log, not by a
+# runner that can only say "terminated". What `terminate-after` buys is the
+# case the pin's own bound cannot reach — a watcher child that never exits, a
+# wait somebody writes without a bound — where the alternative is a CI runner
+# held until the job timeout.
+slow-timeout = { period = "120s", terminate-after = 4 }
