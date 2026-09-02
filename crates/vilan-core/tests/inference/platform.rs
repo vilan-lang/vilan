@@ -8400,26 +8400,256 @@ fn b196_the_admitted_operators_of_each_left_type_still_run() {
     );
 }
 
+// --- B200: the unary operators' operands ------------------------------------
+//
+// B196's own find, closed here. The binary loop above reads
+// `prepped_binary_ops`; a unary was typed somewhere else entirely
+// (`Expr::Unary` in `infer_type_inner`, which simply returns the operand's
+// type) and reached no operand rule at all. Same defect, same family, one
+// operand to blame instead of two — and off the native path it is worse than
+// the binary case, because `-` on an aggregate is `NaN` rather than a
+// plausible wrong number.
+//
+// The pre-fix runs, recorded because a green pin proves only that the program
+// is refused NOW:
+//
+//   let flipped: bool = -true      →  -1. `== true` printed false and
+//                                      `== false` printed false: a `bool`
+//                                      that is neither value, exactly as
+//                                      `true - 3` was.
+//   let value: str = -"12"         →  -12, typed `str`.
+//   let level: Level = -Level::High →  -5 typed `Level`; `== Level::High` and
+//                                      `== Level::Low` both printed false.
+//   let p = -Point { x = 1, y = 2 } →  the host's `-[1, 2]`, `NaN`, and
+//                                      `p.x` printed `undefined`.
+//   fun negate<T: Sub>(v: T): T { -v } → compiled; `negate(5)` printed `-5`
+//                                      and `negate(Point { … }).x` printed
+//                                      `undefined`.
+//   print(!5) / print(!"hi") /
+//   print(!Point { x = 1, y = 2 }) →  false, false, false — the host's
+//                                      truthiness test, never the question
+//                                      the author asked.
+//
+// The admitted sets are stated, not read off an impl: vilan has no `Neg` and
+// no `Not` trait, so nothing here ever dispatches, and `-` admits the numeric
+// primitives while `!` admits `bool`. A type PARAMETER is refused for B179's
+// reason — no trait names either set, so no bound can prove membership.
+
 #[test]
-#[ignore = "B200 (found by lane b196)'s residual: the UNARY `-` takes its operand's type with no check \
-            at all (`Expr::Unary(_, operand)` in `infer_type_inner`), so `-true`, \
-            `-\"12\"` and `-Level::High` are the same miscompile at a different \
-            site — a second refusal family with a census and a ledger row of its \
-            own, not this binary gate's."]
 fn b196_a_unary_minus_on_a_non_numeric_operand_is_rejected() {
-    // KNOWN BUG, found on B196's path and deliberately not taken. The binary
-    // loop this lane fixed reads `prepped_binary_ops`; a unary is typed
-    // somewhere else entirely and reaches no operand rule at all, so `-true`
-    // is `-1` typed `bool`, `-"12"` is `-12` typed `str`, and
-    // `-Level::High` is `-5` typed `Level` — matching no variant, exactly as
-    // `Level::High ^ Level::Low` did.
-    assert_fails_with(
+    // The pin B200 was filed as (its `#[ignore]` reason named B200), kept
+    // under its found-as name. Pre-fix: `-1`, equal to neither `true` nor
+    // `false`.
+    assert_fails_spanning(
         r#"
         fun main() {
             let flipped: bool = -true;
             print(flipped);
         }
         "#,
-        "has no meaning",
+        "-true",
+        "`-` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_str_is_rejected() {
+    // Pre-fix: `-12`, typed `str`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let value: str = -"12";
+            print(value);
+        }
+        "#,
+        r#"-"12""#,
+        "`-` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_backed_enum_is_rejected() {
+    // Pre-fix: `-5` typed `Level`, matching neither variant — the silent
+    // shape, exactly as `Level::High ^ Level::Low` was.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = -Level::High;
+            print(level == Level::High);
+        }
+        "#,
+        "-Level::High",
+        "`-` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_struct_is_rejected() {
+    // The shape the binary family never had: no native coercion produces even
+    // a plausible number. Pre-fix this compiled and `p.x` printed `undefined`.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let p = -Point { x = 1, y = 2 };
+            print(p.x);
+        }
+        "#,
+        "-Point { x = 1, y = 2 }",
+        "vilan has no `Neg` trait",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_bounded_generic_is_rejected() {
+    // B179's rule at the unary site: the bound is IRRELEVANT, because no
+    // trait names the numeric set. Pre-fix `negate(5)` printed `-5` and
+    // `negate(Point { x = 1, y = 2 }).x` printed `undefined` — the same
+    // declaration, correct for one instantiation and garbage for the other.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Sub;
+
+        fun negate<T: Sub>(value: T): T {
+            -value
+        }
+
+        fun main() {
+            print(negate(5));
+        }
+        "#,
+        "-value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_an_unbounded_generic_is_rejected() {
+    // The unbounded half gets the same sentence for the same reason: a bound
+    // could not have rescued it either.
+    assert_fails_spanning(
+        r#"
+        fun negate<T>(value: T): T {
+            -value
+        }
+
+        fun main() {
+            print(negate(5));
+        }
+        "#,
+        "-value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_void_is_rejected() {
+    // B170's rule on the unary side: the refusal must be one the reader can
+    // act on, and `void` has no number inside it to negate.
+    assert_fails_with(
+        r#"
+        fun nothing() {}
+
+        fun main() {
+            print(-nothing());
+        }
+        "#,
+        "this operand is `void`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_number_is_rejected() {
+    // The twin. `!`'s RESULT was always typed `bool`, so nothing wore a type
+    // it was not — the defect is that the host's `!` admits every value, so
+    // `!5` compiled to `false` and the author's question was never asked.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            print(!5);
+        }
+        "#,
+        "!5",
+        "`!` negates a `bool`, and this operand is `i32`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_str_is_rejected() {
+    // Pre-fix: `false`. The emptiness test the author plausibly meant is
+    // `.is_empty()`, which the refusal names.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            print(!"hi");
+        }
+        "#,
+        r#"!"hi""#,
+        "`!` negates a `bool`, and this operand is `str`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_struct_is_rejected() {
+    // Pre-fix: `false`, and it would have been `false` for every struct ever
+    // written — an aggregate lowers to an array, and an array is always
+    // truthy.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            print(!Point { x = 1, y = 2 });
+        }
+        "#,
+        "!Point { x = 1, y = 2 }",
+        "`!` negates a `bool`, and this operand is `Point`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_generic_is_rejected() {
+    // B181's sentence at the unary site, and for B181's reason: `bool`'s set
+    // is `bool` itself and `!` models no operator trait to consult.
+    assert_fails_spanning(
+        r#"
+        fun negated<T>(value: T): bool {
+            !value
+        }
+
+        fun main() {
+            print(negated(true));
+        }
+        "#,
+        "!value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_the_admitted_unary_forms_still_compile_and_run() {
+    // The control. Every form the two admitted sets cover, including the
+    // negative literal (`-128i8` is `Unary('-')` OVER the literal, and the
+    // range check runs before the minus applies) and a `!` over a comparison.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            print(-5);
+            print(-5.5);
+            let x = 3;
+            print(-x);
+            print(-x - 1);
+            print(-128i8);
+            print(!true);
+            print(!(1 == 2));
+            print(!!true);
+        }
+        "#,
+        "-5\n-5.5\n-3\n-4\n-128\nfalse\ntrue\ntrue\n",
     );
 }

@@ -2903,6 +2903,11 @@ pub struct Analyzer<'src> {
     // resolved after typing to decide native JS arithmetic vs an operator-trait
     // method call (`Add::add`, ...).
     prepped_binary_ops: Vec<(Id, BinaryOp, Id)>,
+    // Unary expressions (`-x`, `!x`), as (unary id, operator, operand id),
+    // awaiting the post-solve operand check (B200). A unary takes its type
+    // from its OPERAND, so an unchecked one is the binary family's miscompile
+    // at a site with only one operand to blame.
+    prepped_unary_ops: Vec<(Id, char, Id)>,
     // `if`/`for` conditions awaiting the post-solve `bool` check (B28), with
     // the construct label the diagnostic names.
     prepped_conditions: Vec<(Id, &'static str)>,
@@ -3800,6 +3805,7 @@ impl<'src> Analyzer<'src> {
             for_each_views: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
+            prepped_unary_ops: Vec::new(),
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
@@ -20928,7 +20934,8 @@ impl<'src> Analyzer<'src> {
                 self.walk_expr_node(inner, scope_id);
                 None
             }
-            // Only `!` exists today and yields `bool`; full lowering deferred.
+            // `!` yields `bool`; `-` yields its operand's type. Both hold their
+            // operand to an admitted set, checked after the solve (B200).
             Node::Unary(operator, operand) => {
                 // B195: `!` swaps which of the `if`'s branches a capture inside
                 // it is bound in — the then-branch of `!(x is P)` runs exactly
@@ -20940,6 +20947,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let operand_id = self.walk_expr_node(operand, scope_id);
                 self.condition_polarity = outer_polarity;
+                self.prepped_unary_ops.push((id, *operator, operand_id));
                 Some(Expr::Unary(*operator, operand_id))
             }
             // `&x` / `&mut x` — a view of a place. For aggregates a view is the
@@ -34423,6 +34431,180 @@ impl<'src> Analyzer<'src> {
                     );
                 }
             }
+        }
+
+        // --- B200: a unary operator's operand has an admitted set too ---
+        //
+        // B196 closed the binary family — every native operator refuses a
+        // non-numeric LEFT operand — and left this site untouched, because a
+        // unary is typed somewhere else entirely (`Expr::Unary` in
+        // `infer_type_inner`) and reached no operand rule at all. The defect
+        // is the same one, at the site with only one operand to blame: a
+        // unary takes its type from its OPERAND, and the host's `-` returns a
+        // number, so `-true` was `-1` typed `bool` — truthy, and equal to
+        // neither `true` nor `false` — `-"12"` was `-12` typed `str`, and
+        // `-Level::High` was `-5` typed `Level`, matching no variant. Off the
+        // native path it was worse: `-Point { x = 1, y = 2 }` is the host's
+        // `-[1, 2]`, `NaN`, and reading a field of it is `undefined`.
+        //
+        // The admitted sets, stated rather than read off an impl (there is no
+        // `Neg` and no `Not` trait for a program to write, so nothing here
+        // ever dispatches):
+        //
+        //   * `-` admits the numeric primitives, and nothing else.
+        //   * `!` admits `bool`, and nothing else. The RESULT was always typed
+        //     `bool`, so `!` never miscompiled a type — but the host's `!` is
+        //     a truthiness test that admits every value, so `!5` was `false`
+        //     and `!"hi"` was `false` and a struct was always truthy: a test
+        //     the author could not have meant, silently compiled. Same rule as
+        //     B28's `if` condition, at the operator that produces the `bool`.
+        //
+        // A type PARAMETER is refused for B179's reason, which is the family's
+        // reason: membership in an admitted set is provable by bound only
+        // where a trait names the set. No trait names "the numeric primitives"
+        // and none names "`bool`", and neither operator models an operator
+        // trait to consult, so no bound can prove membership — a bound
+        // promises a trait's methods, never that the parameter IS a number.
+        for (unary_id, operator, operand_id) in std::mem::take(&mut self.prepped_unary_ops) {
+            let expected = if operator == '!' {
+                self.bool_type()
+            } else {
+                Type::Unknown
+            };
+            let operand_type = self.infer_type(operand_id, &expected, &HashMap::default());
+            // The shapes with no verdict to give, exactly as the binary loop
+            // lists them: `Any` absorbs and `Never` is unreachable (neither is
+            // a claim about a runtime value), `Unknown`/`Unresolved` have not
+            // settled, `Mapped` is still symbolic, and a `Module` is not a
+            // value — naming one as an operand is already someone else's
+            // diagnostic. `Trait` is left with the binary loop's own
+            // trait-typed shapes (B175/B193), which have their own refusals.
+            if matches!(
+                operand_type,
+                Type::Any
+                    | Type::Never
+                    | Type::Unknown
+                    | Type::Unresolved
+                    | Type::Module(_)
+                    | Type::Mapped(_, _, _)
+                    | Type::Trait(_, _)
+            ) {
+                continue;
+            }
+            let label = self.pretty_print_type(&operand_type, &HashMap::default());
+            let is_generic = matches!(operand_type, Type::Generic(_));
+            let is_bool =
+                matches!(&operand_type, Type::Enum(id, _) if self.bool_enum_id == Some(*id));
+            if operator == '!' {
+                if is_bool {
+                    continue;
+                }
+                let msg = if is_generic {
+                    format!(
+                        "`!` negates a `bool`, and `{label}` is a type parameter: `bool`'s set is \
+                         `bool` itself, no trait names it, and `!` models no operator trait to \
+                         consult, so no bound on `{label}` can prove membership — a bound promises \
+                         a trait's methods, never that the parameter IS `bool`. Test the value and \
+                         negate the `bool`, or declare this operand `bool`"
+                    )
+                } else if matches!(operand_type, Type::Void) {
+                    // B170's rule on the unary side: a refusal has to be one
+                    // the reader can act on, and `void` has no value to test.
+                    "`!` negates a `bool`, and this operand is `void`: the expression it comes \
+                     from produces no value — a function that returns nothing, an `if` with no \
+                     `else`, a statement — so there is nothing to negate"
+                        .to_string()
+                } else {
+                    format!(
+                        "`!` negates a `bool`, and this operand is `{label}`: the host's `!` is a \
+                         truthiness test that admits every value, so this compiles to a question \
+                         nobody asked — `!5` is `false`, `!\"\"` is `true`, and an aggregate is \
+                         always truthy, whatever it holds. Write the test you mean (`value == …`, \
+                         `value.is_empty()`) and negate that"
+                    )
+                };
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&unary_id).unwrap_or(&&EMPTY_SPAN),
+                        msg,
+                    },
+                    unary_id,
+                );
+                continue;
+            }
+            // `-`. A numeric primitive is the whole admitted set; `str` is a
+            // native operator primitive without being one of these, so it is
+            // excluded by name, and `bool` and a backed enum are native
+            // `Enum`s that never reach `is_native_operator_primitive` at all.
+            let numeric = self.is_native_operator_primitive(&operand_type)
+                && !self.is_str_type(&operand_type);
+            if numeric {
+                continue;
+            }
+            let msg = if is_generic {
+                format!(
+                    "`-` negates a number, and `{label}` is a type parameter: the set `-` admits \
+                     is the numeric primitives, no trait names it, and `-` models no operator \
+                     trait to consult, so no bound on `{label}` can prove membership — a bound \
+                     promises a trait's methods, never that the parameter IS a number. Declare \
+                     this operand a numeric type, or subtract from a zero the bound does provide"
+                )
+            } else if is_bool {
+                "`-` on `bool` has no meaning: `bool`'s admitted unary operator is `!`. A unary \
+                 takes its type from its OPERAND and the host operator returns a number, so this \
+                 expression is a number wearing `bool` — `true` and `false` compute as `1` and \
+                 `0`, so `-true` is `-1`: truthy, and equal to neither `true` nor `false`. Test \
+                 the value and compute on the numbers you mean (`if flag { 1 } else { 0 }`)"
+                    .to_string()
+            } else if self.is_str_type(&operand_type) {
+                "`-` on `str` has no meaning: `str`'s admitted operators are `+ == != < <= > >=`, \
+                 none of them unary. A unary takes its type from its OPERAND and the host coerces \
+                 the text, so `-\"12\"` is `-12` typed `str`, on which `.len()` is undefined. \
+                 Parse the text first (`.parse_i32()`, `.parse_f64()`) and negate the number"
+                    .to_string()
+            } else if self.is_native_operator_type(&operand_type) {
+                // A backed enum. Native for `==`/`<`, and a backing value is
+                // not a number to compute with.
+                let ordered = self.string_backed_enum(&operand_type).is_none();
+                let admitted = if ordered {
+                    "`== != < <= > >=`"
+                } else {
+                    "`== !=`"
+                };
+                format!(
+                    "`-` on `{label}` has no meaning: `{label}`'s admitted operators are \
+                     {admitted}, none of them unary. A unary takes its type from its OPERAND and \
+                     the host negates the backing value, so this expression is a number wearing \
+                     `{label}` — and the negation of a backing is rarely a backing any variant \
+                     has, so the result matches none of them. A backing value is a lowering \
+                     detail, not a number to compute with: match on the variant, or hold the \
+                     number you mean"
+                )
+            } else if matches!(operand_type, Type::Void) {
+                "`-` negates a number, and this operand is `void`: the expression it comes from \
+                 produces no value — a function that returns nothing, an `if` with no `else`, a \
+                 statement — so there is nothing to negate"
+                    .to_string()
+            } else {
+                format!(
+                    "`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so \
+                     there is no impl that could give `-` a meaning here — the host would negate \
+                     the value's runtime shape instead, which is `NaN` for every aggregate. Negate \
+                     the number inside it (`-value.field`), or give the type a method that returns \
+                     the negation"
+                )
+            };
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&unary_id).unwrap_or(&&EMPTY_SPAN),
+                    msg,
+                },
+                unary_id,
+            );
         }
 
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {

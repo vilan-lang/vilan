@@ -386,3 +386,12 @@ row	flagship	key
 360	flagship	element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` — rename it, or write this element as its lowered call, `ui::view(…)`
 361	-	`{symbol}` takes `bool` operands, and `{label}` is a type parameter: `bool`'s set is `bool` itself, no trait names it, and `{symbol}` models no operator trait to consult, so no bound on `{label}` can prove membership
 362	-	`{symbol}` on `{lhs_label}` has no meaning: `{lhs_label}`'s admitted operators are {admitted}. A binary takes its type from the LEFT operand and the host operator returns a number, so this expression is a number wearing `{lhs_label}` — {exhibit}. {steer}
+364	-	`!` negates a `bool`, and `{label}` is a type parameter: `bool`'s set is `bool` itself, no trait names it, and `!` models no operator trait to consult, so no bound on `{label}` can prove membership
+365	-	`!` negates a `bool`, and this operand is `void`: the expression it comes from produces no value
+366	-	`!` negates a `bool`, and this operand is `{label}`: the host's `!` is a truthiness test that admits every value, so this compiles to a question nobody asked
+367	-	`-` negates a number, and `{label}` is a type parameter: the set `-` admits is the numeric primitives, no trait names it, and `-` models no operator trait to consult, so no bound on `{label}` can prove membership
+368	-	`-` on `bool` has no meaning: `bool`'s admitted unary operator is `!`. A unary takes its type from its OPERAND and the host operator returns a number
+369	-	`-` on `str` has no meaning: `str`'s admitted operators are `+ == != < <= > >=`, none of them unary
+370	-	`-` on `{label}` has no meaning: `{label}`'s admitted operators are {admitted}, none of them unary
+371	-	`-` negates a number, and this operand is `void`: the expression it comes from produces no value
+372	-	`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so there is no impl that could give `-` a meaning here

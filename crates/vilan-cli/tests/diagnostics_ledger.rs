@@ -117,6 +117,29 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     ("355", "its plain no-string-form arm"),
     ("356", "its `str`-on-the-right arm"),
     ("357", "its same-type arm, the ladder's fallthrough"),
+    // B200's unary ladders, built the same way and handed over by the same
+    // field shorthand — one `let msg = if … else if …` per operator. Their
+    // arms differ in HEAD, not just in a slot (`-` on a native non-numeric
+    // states an admitted set; on an aggregate it states that no `Neg` trait
+    // exists to give the symbol a meaning; on a parameter it states why no
+    // bound can prove membership), so folding them into one templated
+    // `msg:` literal the enumeration could read would cost the sentences
+    // their accuracy. Rowed by hand instead, as the `+` ladder above is.
+    ("364", "`!`'s parameter arm (`analyzer.rs`)"),
+    ("365", "`!`'s `void` arm"),
+    (
+        "366",
+        "`!`'s truthiness arm — every other non-`bool` operand",
+    ),
+    ("367", "`-`'s parameter arm"),
+    ("368", "`-`'s `bool` arm"),
+    ("369", "`-`'s `str` arm"),
+    ("370", "`-`'s backed-enum arm"),
+    ("371", "`-`'s `void` arm"),
+    (
+        "372",
+        "`-`'s no-`Neg`-trait arm — every other non-numeric operand",
+    ),
 ];
 
 /// Ledger rows with no key at all, and so absent from the index, with the
