@@ -1326,8 +1326,10 @@ mod sweep_tests {
         assert_eq!(pause_action(None, 6, Some(1), 2), PauseAction::Superseded);
         assert_eq!(pause_action(Some(6), 6, Some(9), 9), PauseAction::Unchanged);
         assert_eq!(pause_action(Some(6), 6, Some(1), 2), PauseAction::Analyze);
-        // A document with no analysis yet (never possible today — `did_open`
-        // analyzes inline — but the skip must not swallow the work if it ever is).
+        // A document with no analysis yet. `did_open` makes exactly one (E123)
+        // and schedules its analysis in the same breath, so it reports the hash
+        // of the text being analyzed rather than `None`; the skip must not
+        // swallow the work if that ever changes.
         assert_eq!(pause_action(Some(6), 6, None, 2), PauseAction::Analyze);
     }
 }
@@ -2097,15 +2099,25 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        // Analyze inline and insert the document before the first `.await`, so a
-        // query that arrives right after open — before diagnostics are published
-        // — still finds it. (The debounced change path runs off the async thread,
-        // but there a previous analysis is always already in place.)
+        // Insert the document before the first `.await`, so a query that
+        // arrives right after open still finds it — and so `land`'s "a missing
+        // entry can only mean closed" stays true — then SCHEDULE the first
+        // analysis the way an edit's is scheduled.
+        //
+        // E123: this used to call `Document::analyze` right here, on the async
+        // handler. That call joins a 128 MiB analysis thread, so opening
+        // kolt's `views.vl` parked a tokio worker for the whole 1.1 s first
+        // analysis and every other request on that worker waited behind it
+        // (`proposal/editor-latency.md` §1.6; the session trace's "slow
+        // request: didOpen took 1112 ms"). The work is unchanged and the
+        // stamping is E117's; only its thread is different — `spawn_blocking`,
+        // like every other analysis in this file.
         let uri = params.text_document.uri;
-        // The synchronous prefix fences (B40); the trailing publish is pure
-        // message sending. A panicked open publishes nothing — the map entry
-        // it failed to make is what "open" means everywhere else.
-        let publish = self.fenced("didOpen", false, || {
+        // The synchronous prefix fences (B40) and hands back the text to
+        // analyze, or nothing when there is no analysis to schedule. A panicked
+        // open publishes nothing — the map entry it failed to make is what
+        // "open" means everywhere else.
+        let opened = self.fenced("didOpen", None, || {
             // A manifest is not a vilan source file: it feeds completion and
             // nothing else. It is deliberately NOT registered as a document
             // overlay either — project resolution reads `vilan.toml` from disk, so
@@ -2116,7 +2128,7 @@ impl LanguageServer for Backend {
                     uri.clone(),
                     ManifestDocument::new(params.text_document.text),
                 );
-                return false;
+                return None;
             }
             let path = uri.to_file_path().unwrap_or_default();
             // Register the buffer so OTHER documents' analyses load this one's
@@ -2125,28 +2137,54 @@ impl LanguageServer for Backend {
                 &path,
                 Some(params.text_document.text.clone()),
             );
-            // The overlay just changed what every analysis reads (E117).
-            let started_at = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-            let std_dir = discover_std_dir(&path);
-            let mut document = Document::analyze(&params.text_document.text, &std_dir, &path);
-            document.stamp_analysis(started_at);
+            // The overlay just changed what every analysis reads (E117). The
+            // analysis scheduled below samples the counter AFTER this bump, so
+            // it is stamped with the world it actually reads.
+            self.revision.fetch_add(1, Ordering::SeqCst);
             // The ONLY place a document enters the map. Every later analysis lands
             // by merge onto what is here (`land`), which is what lets a result
             // arriving after `did_close` be dropped instead of resurrecting the
             // file: a missing entry can only mean "closed", never "not opened yet".
-            self.documents.insert(uri.clone(), document);
-            true
+            // It holds the buffer and no analysis yet — the state the debounce
+            // window has always had between an edit and the analysis that
+            // answers it, and every query handler already reads it.
+            self.documents.insert(
+                uri.clone(),
+                Document::unanalyzed(&params.text_document.text),
+            );
+            Some(params.text_document.text)
         });
-        if publish {
-            publish_document(
-                &self.documents,
-                &self.client,
-                &self.publish_state,
-                &self.publish_gate,
-                &uri,
+        let Some(text) = opened else {
+            return;
+        };
+        // Spawned, not awaited: `did_change` returns the instant it has
+        // scheduled its analysis, and an open must too — the notification
+        // handler is on the same runtime every request is served from.
+        let documents = Arc::clone(&self.documents);
+        let publish_state = Arc::clone(&self.publish_state);
+        let publish_gate = Arc::clone(&self.publish_gate);
+        let revision = Arc::clone(&self.revision);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            // The shared path: `spawn_blocking`, stamped with the world it
+            // read, landed only if it is still the newest view of the live
+            // text (E117), then published.
+            let landed = analyze_and_publish(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &revision,
+                uri,
+                text,
             )
             .await;
-        }
+            // The analyzed snapshot moved under whatever the client asked for
+            // in the meantime — it opened the file and immediately asked for
+            // tokens and hints over a document that had none. Ask it to ask
+            // again (S5); this is what makes the empty first answer transient.
+            send_refreshes(&client, refresh_plan(landed)).await;
+        });
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -2375,8 +2413,10 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            let data =
-                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            let data = encode_semantic_tokens(
+                document.semantic_token_stream().tokens(),
+                document.analyzed_index(),
+            );
             drop(document);
             let id = fresh_result_id();
             self.semantic_token_cache
@@ -2405,8 +2445,10 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            let data =
-                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            let data = encode_semantic_tokens(
+                document.semantic_token_stream().tokens(),
+                document.analyzed_index(),
+            );
             drop(document);
             let id = fresh_result_id();
             // Swap the baseline for the new stream in one motion; the OLD
@@ -2454,23 +2496,23 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // Filter the ABSOLUTE tokens to the requested lines, then encode:
-            // the first kept token's delta is from the document start, which
-            // is exactly the encoding a range response specifies. Line
+            // SLICE the analyzed snapshot's stream to the requested lines, then
+            // encode: the first kept token's delta is from the document start,
+            // which is exactly the encoding a range response specifies. Line
             // granularity is what editors ask with (a viewport), and a token
             // never spans lines (the encoder drops any that would).
+            //
+            // E122: this used to compute the WHOLE file's stream and filter it
+            // — a whole-file walk of the program, plus a raw re-parse, plus one
+            // line lookup per token in the file — so twenty visible lines cost
+            // what the whole file cost (12.2 ms on kolt's `views.vl`). The
+            // stream is now built once per landed analysis and indexed by line
+            // (`SemanticTokenStream`), so the viewport costs the viewport.
             let index = document.analyzed_index();
-            let start_line = params.range.start.line;
-            let end_line = params.range.end.line;
-            let tokens: Vec<_> = document
-                .semantic_tokens()
-                .into_iter()
-                .filter(|(span, _, _)| {
-                    let line = index.range(span).start.line;
-                    line >= start_line && line <= end_line
-                })
-                .collect();
-            let data = encode_semantic_tokens(&tokens, index);
+            let tokens = document
+                .semantic_token_stream()
+                .lines(params.range.start.line, params.range.end.line);
+            let data = encode_semantic_tokens(tokens, index);
             Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
@@ -4617,6 +4659,216 @@ mod semantic_token_delta_protocol_tests {
     }
 }
 
+/// E122: `semantic_tokens_range` — the request an editor sends most, because it
+/// is the VIEWPORT one — used to compute the whole file's token stream and then
+/// filter it by line, so twenty visible lines cost exactly what the whole file
+/// cost (12.2 ms on kolt's `views.vl`, `proposal/editor-latency.md` §1.6). It
+/// now slices a stream built once per landed analysis
+/// (`document::SemanticTokenStream`).
+///
+/// Two pins, and they are the two halves of the claim: the answer did not
+/// change (byte-identical to the filter it replaces, over every window shape),
+/// and the cost follows the WINDOW rather than the file.
+#[cfg(test)]
+mod semantic_token_range_cost_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// A module of `functions` four-line functions — the synthetic series
+    /// `editor-latency.md` §1.4 scales with, in one file, so the token stream
+    /// is large and the viewport is a fixed twenty lines of it.
+    fn synthetic_module(functions: usize) -> String {
+        let mut text = String::with_capacity(functions * 60);
+        for index in 0..functions {
+            text.push_str(&format!(
+                "fun subject_{index}(input: i32): i32 {{\n\tlet doubled = input + input;\n\tdoubled\n}}\n"
+            ));
+        }
+        text
+    }
+
+    fn open(backend: &Backend, text: &str) -> Url {
+        let uri = Url::parse("file:///range/subject.vl").expect("a url");
+        backend.documents.insert(
+            uri.clone(),
+            Document::analyze(text, &std_root(), Path::new("subject.vl")),
+        );
+        uri
+    }
+
+    async fn range(backend: &Backend, uri: &Url, first: u32, last: u32) -> Vec<SemanticToken> {
+        let answer = backend
+            .semantic_tokens_range(SemanticTokensRangeParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(first, 0), Position::new(last, 0)),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("a range answer");
+        let SemanticTokensRangeResult::Tokens(tokens) = answer else {
+            panic!("expected tokens");
+        };
+        tokens.data
+    }
+
+    /// The calling thread's CPU time — the cycles it was actually given, not
+    /// the time that passed (backlog M15, `perf_baseline.rs`'s clock). A ratio
+    /// on wall clock is a claim about the compiler only on an idle machine, and
+    /// this one is gated on a box that runs a dozen lanes at once.
+    #[cfg(unix)]
+    fn thread_cpu_now() -> Option<Duration> {
+        let mut timespec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `clock_gettime` writes the `timespec` we hand it and reads
+        // nothing else; the pointer is to a live local.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timespec) };
+        (result == 0).then(|| {
+            Duration::new(
+                timespec.tv_sec.max(0) as u64,
+                timespec.tv_nsec.clamp(0, 999_999_999) as u32,
+            )
+        })
+    }
+
+    /// Every other host: no thread CPU clock, so the gate below says so and
+    /// asserts nothing rather than asserting on wall time.
+    #[cfg(not(unix))]
+    fn thread_cpu_now() -> Option<Duration> {
+        None
+    }
+
+    fn loadavg_1m() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| text.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// Half one: the answer is unchanged. The expected stream is written the
+    /// way the handler used to compute it — the WHOLE stream, filtered by the
+    /// start line of each token, then encoded — so this compares the slice
+    /// against the filter it replaced, byte for byte, over windows that start
+    /// mid-file, end past the end, land on a line with no tokens, and cover
+    /// everything.
+    #[tokio::test]
+    async fn a_window_answers_byte_for_byte_what_filtering_the_full_stream_answers() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let text = synthetic_module(40);
+        let uri = open(backend, &text);
+
+        for (first, last) in [(0, 0), (0, 19), (7, 7), (12, 31), (100, 400), (0, 100_000)] {
+            let sliced = range(backend, &uri, first, last).await;
+            let expected = {
+                let document = backend.documents.get(&uri).expect("open");
+                let index = document.analyzed_index();
+                let filtered: Vec<_> = document
+                    .semantic_tokens()
+                    .into_iter()
+                    .filter(|(span, _, _)| {
+                        let line = index.range(span).start.line;
+                        line >= first && line <= last
+                    })
+                    .collect();
+                encode_semantic_tokens(&filtered, index)
+            };
+            assert_eq!(
+                sliced, expected,
+                "lines {first}..={last}: the slice and the filter must answer identically",
+            );
+        }
+        // Non-vacuous: the windows above are not all the same answer.
+        let narrow = range(backend, &uri, 0, 3).await;
+        let whole = range(backend, &uri, 0, 100_000).await;
+        assert!(
+            !narrow.is_empty() && narrow.len() < whole.len(),
+            "the fixture must have tokens inside AND outside the narrow window \
+             ({} vs {})",
+            narrow.len(),
+            whole.len(),
+        );
+    }
+
+    /// Half two: the cost follows the window. Same handler, same document, same
+    /// warm stream — only the window differs, and a twenty-line viewport must
+    /// cost a small fraction of the whole file.
+    ///
+    /// Non-vacuous, measured on both sides at loadavg ~80: planting the
+    /// pre-fix mechanism — no memo, so every request recomputes the whole
+    /// stream — reads **0.923×** (20 lines 3799 ms, whole file 4114 ms of
+    /// thread CPU over 40 rounds), and the slice reads **0.006×** (2.67 ms vs
+    /// 479.86 ms). The 0.25 bound sits between two MECHANISMS, not two
+    /// tunings: no recompute-then-filter form can get under it, and the slice
+    /// has forty times the headroom it needs.
+    #[tokio::test]
+    async fn a_viewport_costs_the_viewport_and_not_the_file() {
+        const FUNCTIONS: usize = 1_500;
+        const ROUNDS: usize = 40;
+        const BOUND: f64 = 0.25;
+
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let text = synthetic_module(FUNCTIONS);
+        let lines = text.lines().count() as u32;
+        let uri = open(backend, &text);
+        // Warm the per-analysis stream, so what follows measures SERVING a
+        // window and not building the stream. An editor's first request pays
+        // this once per analysis whatever window it asks for; every request
+        // after it is what this gate is about.
+        let all = range(backend, &uri, 0, lines).await;
+        assert!(
+            all.len() > FUNCTIONS * 4,
+            "the synthetic module must produce a large stream for the ratio to \
+             mean anything (got {})",
+            all.len(),
+        );
+
+        let Some(start) = thread_cpu_now() else {
+            println!("PERF-SCALE semantic_tokens_range clock=none: no thread CPU clock, not gated");
+            return;
+        };
+        for _ in 0..ROUNDS {
+            let _ = range(backend, &uri, 100, 119).await;
+        }
+        let viewport = thread_cpu_now().expect("the clock does not disappear") - start;
+        let start = thread_cpu_now().expect("the clock does not disappear");
+        for _ in 0..ROUNDS {
+            let _ = range(backend, &uri, 0, lines).await;
+        }
+        let file = thread_cpu_now().expect("the clock does not disappear") - start;
+
+        let ratio = viewport.as_secs_f64() / file.as_secs_f64().max(f64::MIN_POSITIVE);
+        println!(
+            "PERF-SCALE semantic_tokens_range clock=thread load={} \
+             {FUNCTIONS} functions / {lines} lines / {} tokens, {ROUNDS} rounds: \
+             20 lines = {:.2} ms, whole file = {:.2} ms, ratio {ratio:.3}×",
+            loadavg_1m(),
+            all.len(),
+            viewport.as_secs_f64() * 1000.0,
+            file.as_secs_f64() * 1000.0,
+        );
+        assert!(
+            file > Duration::ZERO,
+            "the whole-file measurement read zero, so the ratio means nothing",
+        );
+        assert!(
+            ratio <= BOUND,
+            "a 20-line viewport cost {ratio:.3}× the whole file ({:.2} ms vs \
+             {:.2} ms of thread CPU over {ROUNDS} rounds, loadavg {}), over the \
+             {BOUND} bound: the range request is paying for the file again \
+             (editor-latency.md §1.6, E122)",
+            viewport.as_secs_f64() * 1000.0,
+            file.as_secs_f64() * 1000.0,
+            loadavg_1m(),
+        );
+    }
+}
+
 /// B39c: incremental sync through the handler — ordered ranged events
 /// rebuild the text a full sync would have sent (documents and manifests
 /// both), and the inlay viewport filter goes EXACT when the edit map holds:
@@ -4830,6 +5082,26 @@ mod session_leak_tests {
         }
     }
 
+    /// Waits for an open's analysis to land. E123 made an open SCHEDULE its
+    /// first analysis instead of running it on the handler, and without this
+    /// the scripted session below would open four files, close them, and
+    /// never once run the work whose residue it exists to measure — the pin
+    /// went from tens of seconds to 88 ms the day the open stopped blocking,
+    /// which is exactly the shape of a gate quietly becoming vacuous.
+    async fn analyzed(backend: &Backend, uri: &Url) -> bool {
+        for _ in 0..2_400 {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
     /// Every retained map's cardinality, as one comparable tuple.
     fn sizes(backend: &Backend) -> session_trace::StateSizes {
         session_trace::StateSizes {
@@ -4871,6 +5143,10 @@ mod session_leak_tests {
                 std::fs::write(&path, PROGRAM).expect("a source file");
                 let uri = Url::from_file_path(&path).expect("a file url");
                 backend.did_open(open_params(&uri, PROGRAM)).await;
+                assert!(
+                    analyzed(backend, &uri).await,
+                    "round {round}: the open's analysis lands",
+                );
                 open.push(uri);
             }
             assert_eq!(
@@ -4930,6 +5206,176 @@ mod session_leak_tests {
         }
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E123: `did_open` used to run `Document::analyze` INLINE on the async
+/// handler. That call joins a 128 MiB analysis thread, so opening kolt's
+/// `views.vl` parked a tokio worker for the whole 1.1 s first analysis and
+/// every other request scheduled on that worker waited behind it — the session
+/// trace's "slow request: didOpen took 1112 ms"
+/// (`proposal/editor-latency.md` §1.6). The open now inserts the buffer and
+/// schedules the analysis the way an edit's is scheduled: `spawn_blocking`,
+/// stamped with the world it read (E117), landed only if it is still the newest
+/// view.
+#[cfg(test)]
+mod open_scheduling_tests {
+    use super::session_leak_tests::open_params;
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// Big enough that its analysis is unmistakably work, and wrong, so the
+    /// diagnostic the open must still publish is unambiguous.
+    fn subject() -> String {
+        let mut text = String::from("fun main() {\n\tlet value = undefined_name;\n}\n");
+        for index in 0..200 {
+            text.push_str(&format!(
+                "fun helper_{index}(input: i32): i32 {{\n\tinput + input\n}}\n"
+            ));
+        }
+        text
+    }
+
+    fn workspace(name: &str) -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-open-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("opened.vl");
+        std::fs::write(&path, subject()).expect("a source file");
+        let uri = Url::from_file_path(&path).expect("a file url");
+        (directory, uri)
+    }
+
+    /// Polls for the open's analysis to land, rather than sleeping a fixed
+    /// span: it is real work on a blocking thread and a loaded machine is
+    /// exactly when a fixed sleep turns a pin into a flake
+    /// (`package_recolor_tests::settled`'s rule).
+    async fn landed(backend: &Backend, uri: &Url) -> bool {
+        for _ in 0..2_400 {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// The pin. A request issued while a fresh open's analysis is in flight is
+    /// ANSWERED — it does not queue behind the analysis — and the open's
+    /// diagnostics still publish once it lands.
+    ///
+    /// `#[tokio::test]` is a current-thread runtime, which is what makes this
+    /// exact rather than statistical: the analysis is spawned, so it cannot
+    /// have run before the request below is served, and on the pre-fix tree
+    /// `did_open().await` did not return until the analysis had landed —
+    /// the "not landed yet" assertion is red there by construction.
+    #[tokio::test]
+    async fn a_request_during_a_fresh_open_answers_before_the_analysis_lands() {
+        let (directory, uri) = workspace("inflight");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        let opened = std::time::Instant::now();
+        backend.did_open(open_params(&uri, &subject())).await;
+        let open_wall = opened.elapsed();
+
+        // The buffer is in the map immediately: a query finds the document,
+        // which is what `land`'s "a missing entry can only mean closed" rests
+        // on, and what the ordering of these two facts is about.
+        let document = backend.documents.get(&uri).expect("the open registered");
+        assert_eq!(
+            document.analysis_revision(),
+            0,
+            "the open's analysis must still be in flight — an open that has \
+             already analyzed blocked its worker to do it (E123)",
+        );
+        drop(document);
+
+        let answering = std::time::Instant::now();
+        let answer = backend
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the request is answered, not refused");
+        let answer_wall = answering.elapsed();
+        assert!(
+            answer.is_some(),
+            "the handler answers over the open document, empty stream and all",
+        );
+        assert!(
+            backend
+                .documents
+                .get(&uri)
+                .is_some_and(|document| document.analysis_revision() == 0),
+            "…and it answered while the analysis was still in flight",
+        );
+
+        assert!(landed(backend, &uri).await, "the open's analysis lands");
+        let published = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .published_diagnostics()
+            .len();
+        assert!(
+            published > 0,
+            "the open's diagnostics still publish: the subject has an \
+             undefined name in it",
+        );
+        println!(
+            "E123 open scheduling: load={} didOpen returned in {:.1} ms, the \
+             request answered in {:.1} ms, {published} diagnostics landed after",
+            std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|text| text.split_whitespace().next().map(str::to_string))
+                .unwrap_or_else(|| "?".to_string()),
+            open_wall.as_secs_f64() * 1000.0,
+            answer_wall.as_secs_f64() * 1000.0,
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other half of "route it through the same scheduling": an edit that
+    /// arrives while the open's analysis is still running wins. Both analyses
+    /// are stamped with the world they read (E117) and `land` keeps the newer
+    /// one, so the document does not settle on the opened text.
+    #[tokio::test]
+    async fn an_edit_during_a_fresh_open_is_the_analysis_that_settles() {
+        let (directory, uri) = workspace("superseded");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        backend.did_open(open_params(&uri, &subject())).await;
+        let edited = format!("{}\nfun added(): i32 {{\n\t1\n}}\n", subject());
+        backend
+            .did_change(super::session_leak_tests::whole_file_change(
+                &uri, 2, &edited,
+            ))
+            .await;
+
+        for _ in 0..2_400 {
+            let settled = backend.documents.get(&uri).is_some_and(|document| {
+                document.analysis_revision() > 0 && document.analyzed_text() == edited
+            });
+            if settled {
+                let _ = std::fs::remove_dir_all(&directory);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        panic!("the edit's analysis never became the analyzed snapshot");
     }
 }
 
@@ -5006,11 +5452,38 @@ mod package_recolor_tests {
     /// blocking thread, and a loaded machine is exactly when a fixed sleep
     /// turns a pin into a flake.
     async fn settled(backend: &Backend, uri: &Url, expected: bool) -> bool {
-        for _ in 0..200 {
+        // A minute of budget, widened from ten seconds when opens stopped
+        // analyzing inline (E123): the sweep this waits for is TWO full
+        // analyses — the edited entry's, then the dependent widget's — and on
+        // this box one has been measured at 11.3 s of wall at loadavg 86.
+        for _ in 0..1_200 {
             if colored_as_process(backend, uri) == expected {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Waits for an OPEN's own analysis to land (E123: it is scheduled, not
+    /// run on the notification handler). Distinct from [`settled`], which polls
+    /// a diagnostic: "no error yet" and "no analysis yet" look the same from
+    /// there, and the premise assertions below would be vacuous.
+    async fn analyzed(backend: &Backend, uri: &Url) -> bool {
+        // A minute of budget, not the ten seconds `settled` allows: two whole
+        // analyses of a two-file package now run CONCURRENTLY (each open
+        // schedules its own), and on the box this gate runs on they have been
+        // measured at 7.8 s and 11.3 s of wall at loadavg 86. The number the
+        // pin asserts is not a duration — it is that the analysis lands.
+        for _ in 0..2_400 {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
     }
@@ -5024,6 +5497,11 @@ mod package_recolor_tests {
         backend
             .did_open(open_params(&client_uri, CLIENT_WITHOUT_IMPORT))
             .await;
+        assert!(
+            analyzed(backend, &widget_uri).await && analyzed(backend, &client_uri).await,
+            "both opens' analyses land (they are scheduled, not inline — E123), \
+             which is the settled starting state this pin edits from",
+        );
         assert!(
             colored_as_process(backend, &widget_uri),
             "no entry reaches the widget yet, so `default-entry = \"server\"` colors it process \
@@ -5058,6 +5536,11 @@ mod package_recolor_tests {
         backend
             .did_open(open_params(&client_uri, CLIENT_WITH_IMPORT))
             .await;
+        assert!(
+            analyzed(backend, &widget_uri).await && analyzed(backend, &client_uri).await,
+            "both opens' analyses land (they are scheduled, not inline — E123), \
+             which is the settled starting state this pin edits from",
+        );
         assert!(
             !colored_as_process(backend, &widget_uri),
             "the browser entry reaches it, so it starts clean",

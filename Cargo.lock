@@ -1087,6 +1087,7 @@ name = "vilan-lsp"
 version = "0.40.0"
 dependencies = [
  "dashmap 6.2.1",
+ "libc",
  "serde_json",
  "tokio",
  "tower-lsp",

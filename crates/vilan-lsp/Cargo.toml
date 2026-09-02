@@ -23,6 +23,13 @@ dashmap = "6"
 # Already in the tree via tower-lsp — this only makes the edge direct.
 serde_json = "1"
 
+[dev-dependencies]
+# `CLOCK_THREAD_CPUTIME_ID` for E122's scaling gate — backlog M15's clock, the
+# same one `vilan-cli/tests/perf_baseline.rs` reads, because a wall-clock ratio
+# is a claim about the server only on an idle machine. Already in the tree
+# (vilan-cli depends on it), so the lockfile and the notices do not move.
+libc = "0.2"
+
 # The workspace clippy exception list (root Cargo.toml, backlog N21).
 [lints]
 workspace = true

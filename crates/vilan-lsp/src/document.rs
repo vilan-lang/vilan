@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Parameter, SourceId};
@@ -536,6 +536,11 @@ pub struct Document {
     /// Where the retained suffix begins in the CURRENT analyzed text;
     /// `usize::MAX` when nothing is retained.
     retained_tail_start: usize,
+    /// This snapshot's semantic tokens, computed on first demand and then
+    /// served to every request until the next analysis lands (E122). Reset —
+    /// never adopted — in [`adopt_analysis`](Document::adopt_analysis), which
+    /// is the ONE place the inputs above move; see [`SemanticTokenStream`].
+    semantic_token_stream: OnceLock<SemanticTokenStream>,
     /// Per-function platform requirements (`platform_color::requirements`),
     /// rendered lines like ``requires the `process` layer of `std` (via `…`)``
     /// — appended to the hover of any function that carries one.
@@ -706,6 +711,74 @@ pub enum TokenKind {
     /// A markup tag name (element-syntax S5) — rendered as the LSP `type`
     /// token, the class-ish color themes give components and tags.
     Tag,
+}
+
+/// One analyzed snapshot's whole semantic-token stream, together with the
+/// line index that makes a VIEWPORT request cost the viewport (E122).
+///
+/// The stream is a pure function of the analyzed snapshot — the `program`, the
+/// `analyzed_index` it spans, and B38's `retained_tail` — every one of which is
+/// replaced together, in one place ([`Document::adopt_analysis`]). So it is
+/// computed at most **once per landed analysis** and served from
+/// [`Document::semantic_token_stream`] to every request in between; a live edit
+/// deliberately does not invalidate it, because `set_text`/`apply_change` move
+/// the LIVE snapshot alone and these tokens describe the analyzed one (S1).
+///
+/// Before this, `semantic_tokens_range` recomputed the entire file's stream —
+/// every entity map, every type reference, a fresh raw parse for the markup
+/// spans — and then filtered it by line, so twenty visible lines cost exactly
+/// what the whole file cost (12.2 ms on kolt's `views.vl`,
+/// `proposal/editor-latency.md` §1.6). Now the filter is a slice.
+pub struct SemanticTokenStream {
+    /// Every token of the snapshot, ordered by start offset and
+    /// non-overlapping (`Document::compute_semantic_tokens` guarantees both).
+    tokens: Vec<(Span, TokenKind, u32)>,
+    /// `line_starts[line]` is the index in `tokens` of the first token whose
+    /// start line is at or after `line`. Non-decreasing, `tokens.len()` at the
+    /// end, and one longer than the highest token line — so a lookup is a
+    /// clamp and an index, never a scan.
+    line_starts: Vec<u32>,
+}
+
+impl SemanticTokenStream {
+    /// Builds the line index over an already-sorted stream. Start lines are
+    /// non-decreasing because start offsets are strictly increasing, which is
+    /// what lets a line window be a contiguous slice at all.
+    fn new(tokens: Vec<(Span, TokenKind, u32)>, index: &LineIndex) -> Self {
+        let mut lines: Vec<u32> = Vec::with_capacity(tokens.len());
+        for (span, ..) in &tokens {
+            lines.push(index.range(span).start.line);
+        }
+        let highest = lines.last().copied().unwrap_or(0) as usize;
+        let mut line_starts = vec![tokens.len() as u32; highest + 2];
+        // Backwards, so a line with several tokens keeps the FIRST of them and
+        // a line with none inherits the next line's start.
+        for (position, line) in lines.iter().enumerate().rev() {
+            line_starts[*line as usize] = position as u32;
+        }
+        for line in (0..line_starts.len() - 1).rev() {
+            line_starts[line] = line_starts[line].min(line_starts[line + 1]);
+        }
+        SemanticTokenStream {
+            tokens,
+            line_starts,
+        }
+    }
+
+    /// The whole stream.
+    pub fn tokens(&self) -> &[(Span, TokenKind, u32)] {
+        &self.tokens
+    }
+
+    /// The tokens whose start line lies in `start_line..=end_line` — the
+    /// viewport slice, byte-identical to filtering [`tokens`](Self::tokens) by
+    /// the same predicate, and costing the slice rather than the file.
+    pub fn lines(&self, start_line: u32, end_line: u32) -> &[(Span, TokenKind, u32)] {
+        let last = self.line_starts.len() - 1;
+        let first = self.line_starts[(start_line as usize).min(last)] as usize;
+        let past = self.line_starts[(end_line as usize).saturating_add(1).min(last)] as usize;
+        &self.tokens[first..past.max(first)]
+    }
 }
 
 /// Token-modifier bits, index-aligned with `TOKEN_MODIFIERS`.
@@ -921,10 +994,26 @@ impl Document {
             .unwrap_or_else(|_| Self::internal_error(&outer_text))
     }
 
-    /// The degraded document a panicked analysis lands on: no program, the
-    /// live text faithfully recorded (so position mapping and re-analysis on
-    /// the next edit behave), and one honest diagnostic.
-    fn internal_error(text: &str) -> Self {
+    /// A document holding `text` and NOTHING an analysis produces: no program,
+    /// no diagnostics, the live text faithfully recorded so position mapping
+    /// and the next re-analysis behave.
+    ///
+    /// Two callers, and they are the two ways a document can exist without an
+    /// analysis behind it: the degraded document a panicked analysis lands on
+    /// ([`internal_error`](Document::internal_error), which adds its one honest
+    /// diagnostic), and the entry `did_open` puts in the map before it schedules
+    /// the first analysis (E123). Every query handler already reads `program`
+    /// through an `Option` and answers emptily when there is none — the same
+    /// state the debounce window has always had between an edit and its
+    /// analysis.
+    ///
+    /// `text_hash` is the hash of `text`, which says "the analyzed text is
+    /// this" while nothing has been analyzed. That is deliberate and safe
+    /// because a document only ever reaches the map WITH an analysis of that
+    /// exact text scheduled: the skip it can produce (`pause_action`'s
+    /// `Unchanged`, when an edit is undone inside one debounce window) skips a
+    /// re-analysis that the open's own analysis is already doing.
+    pub fn unanalyzed(text: &str) -> Self {
         let line_index = Arc::new(LineIndex::new(text));
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
@@ -932,13 +1021,8 @@ impl Document {
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: AnalyzedProgram::none(),
-            diagnostics: vec![Error { trace: Vec::new(),
-                note: None,
-                span: vilan_core::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
-                    .to_string(),
-            }],
-            diagnostic_sources: vec![SourceId(0)],
+            diagnostics: Vec::new(),
+            diagnostic_sources: Vec::new(),
             warnings: Vec::new(),
             warning_sources: Vec::new(),
             text: text.to_string(),
@@ -947,6 +1031,7 @@ impl Document {
             reference_index: ReferenceIndex::default(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
+            semantic_token_stream: OnceLock::new(),
             platform_requirements: HashMap::default(),
             manifest_problem: None,
             shared_diagnostics: Vec::new(),
@@ -954,6 +1039,23 @@ impl Document {
             analysis_revision: 0,
             package_root: None,
         }
+    }
+
+    /// The degraded document a panicked analysis lands on: [`unanalyzed`], plus
+    /// the one honest diagnostic saying so.
+    ///
+    /// [`unanalyzed`]: Document::unanalyzed
+    fn internal_error(text: &str) -> Self {
+        let mut document = Self::unanalyzed(text);
+        document.diagnostics = vec![Error {
+            trace: Vec::new(),
+            note: None,
+            span: vilan_core::span::Span::new((), 0..0),
+            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
+                .to_string(),
+        }];
+        document.diagnostic_sources = vec![SourceId(0)];
+        document
     }
 
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
@@ -1148,6 +1250,7 @@ impl Document {
             reference_index,
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
+            semantic_token_stream: OnceLock::new(),
             platform_requirements,
             manifest_problem,
             shared_diagnostics,
@@ -1413,9 +1516,10 @@ impl Document {
     /// re-analyzing. Applied on every edit so live-text queries (notably
     /// completion's context scan) see the just-typed character immediately,
     /// while the heavier re-analysis stays debounced. The analyzed snapshot
-    /// (`program`, `analyzed_index`, `text_hash`) is deliberately untouched:
-    /// program answers stay exactly right for the text they were computed
-    /// from, and the pending re-analysis still fires.
+    /// (`program`, `analyzed_index`, `text_hash`, and with them the memoized
+    /// `semantic_token_stream`) is deliberately untouched: program answers stay
+    /// exactly right for the text they were computed from, and the pending
+    /// re-analysis still fires.
     pub fn set_text(&mut self, text: &str) {
         self.line_index = Arc::new(LineIndex::new(text));
         self.text = text.to_string();
@@ -1623,6 +1727,10 @@ impl Document {
             line_index: analyzed_live_index,
             retained_tail: _,
             retained_tail_start: _,
+            // Not adopted: the incoming analysis computed its stream (if it
+            // computed one at all) without the salvage tail this adoption is
+            // about to give it, so it would be wrong here. Reset below.
+            semantic_token_stream: _,
             analyzed_index,
             program,
             diagnostics,
@@ -1661,6 +1769,11 @@ impl Document {
         self.import_roots = import_roots;
         self.analysis_revision = analysis_revision;
         self.package_root = package_root;
+        // E122: the ONE place the token stream's inputs move, so the ONE place
+        // its memo is dropped. `compute_retained_tail` above already read the
+        // outgoing stream through it; the next request rebuilds from the
+        // adopted program and the tail just computed.
+        self.semantic_token_stream = OnceLock::new();
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -2087,13 +2200,32 @@ impl Document {
         hints
     }
 
+    /// This snapshot's semantic tokens with the line index a viewport request
+    /// slices (E122) — computed on first demand and reused until the next
+    /// analysis lands. See [`SemanticTokenStream`] for what invalidates it.
+    pub fn semantic_token_stream(&self) -> &SemanticTokenStream {
+        self.semantic_token_stream.get_or_init(|| {
+            SemanticTokenStream::new(self.compute_semantic_tokens(), self.analyzed_index())
+        })
+    }
+
+    /// The whole stream, owned — the shape B38's salvage tail and the pins
+    /// want. A request handler slices [`semantic_token_stream`] instead.
+    ///
+    /// [`semantic_token_stream`]: Document::semantic_token_stream
+    pub fn semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
+        self.semantic_token_stream().tokens().to_vec()
+    }
+
     /// The entry document's semantic tokens (E2), name-sized and
     /// non-overlapping, sorted by position. Classification comes from the
     /// ANALYZED program: declaration name spans, identifier-sized reference
     /// entities, method-call name spans, and type-position references (whose
     /// definitions also cover macro names — they share trait names by design,
     /// and only semantics can tell them apart).
-    pub fn semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
+    ///
+    /// Called once per landed analysis, through the memo above.
+    fn compute_semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
