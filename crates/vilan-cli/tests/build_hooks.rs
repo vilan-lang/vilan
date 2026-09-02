@@ -2456,13 +2456,16 @@ fn a_relative_directory_symlink_inside_the_project_is_followed() {
     );
 }
 
-// ── The watch-round family's suite placement (tracker N46) ────────────────────
+// ── The wall-clock waits' suite placement (tracker N46) ───────────────────────
 //
 // Every test that drives a live `--watch` session and then waits for a ROUND
-// belongs to `.config/nextest.toml`'s `watch-rounds` group, which runs them one
-// at a time. The reason is the 301 s red this file's own pins have paid three
-// times: 29 watch sessions, each spawning a watcher and a compile, all eligible
-// to run at once inside an interleave already 16 wide.
+// belongs to `.config/nextest.toml`'s `wall-clock-waits` group, which runs them
+// one at a time. The reason is the 301 s red this file's own pins have paid
+// three times: watch sessions, each spawning a watcher and a compile, all
+// eligible to run at once inside an interleave already 16 wide. The language
+// server's `package_recolor_tests` are in the group for the same reason and
+// join it from the other side of the workspace; they are named directly in the
+// filterset, and this file's scan does not reach them.
 //
 // The group is selected by a filterset, and part of that filterset is a NAME
 // pattern — which is exactly the kind of thing that rots when somebody adds a
@@ -2580,22 +2583,29 @@ fn every_test_that_drives_a_watch_session_is_in_the_group() {
     );
 }
 
+/// Members the scan above cannot reach, because they live outside this crate's
+/// suite directory: the language server's package-recolor pins, which wait on a
+/// debounced re-analysis instead of on a watch round. Named here so the config
+/// check below covers them, and so dropping them from the filterset is a red
+/// rather than a silence.
+const MEMBERS_OUTSIDE_THIS_CRATE: &[&str] = &["binary(vilan-lsp) & test(/package_recolor_tests/)"];
+
 #[test]
-fn the_watch_rounds_group_is_declared_the_way_this_file_reads_it() {
+fn the_group_is_declared_the_way_this_file_reads_it() {
     // The other half. The check above is worth nothing if the filterset it
     // describes is not the filterset that ships — a group renamed, a binary
     // dropped from the union, `max-threads` raised back to the default — so the
-    // config is read and held against the same three lists.
+    // config is read and held against the same lists.
     let config = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.config/nextest.toml"),
     )
     .expect("the committed nextest profile");
     assert!(
-        config.contains("watch-rounds = { max-threads = 1 }"),
+        config.contains("wall-clock-waits = { max-threads = 1 }"),
         "the group must exist and must be ONE thread — that is the whole fix:\n{config}"
     );
     assert!(
-        config.contains("test-group = 'watch-rounds'"),
+        config.contains("test-group = 'wall-clock-waits'"),
         "an override must actually join the group:\n{config}"
     );
     assert!(
@@ -2606,6 +2616,13 @@ fn the_watch_rounds_group_is_declared_the_way_this_file_reads_it() {
         assert!(
             config.contains(&format!("binary({binary})")),
             "`{binary}` holds watch sessions but the filterset does not name it"
+        );
+    }
+    for member in MEMBERS_OUTSIDE_THIS_CRATE {
+        assert!(
+            config.contains(member),
+            "`{member}` waits on a wall clock for another thread's work and the \
+             filterset does not select it"
         );
     }
 }

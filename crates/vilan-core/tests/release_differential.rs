@@ -43,7 +43,20 @@ fn std_spec() -> PackageSpec {
 }
 
 /// How long a corpus program gets under node before the run is declared hung.
-const NODE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// A LIVENESS bound, not a performance assertion — this gate's claim is that
+/// the two presets print the same thing, never that either prints it quickly —
+/// so the number only has to be too large for a healthy program and finite for
+/// a hung one. A green run never pays it: the loop breaks the moment the child
+/// exits.
+///
+/// It was 30 s, and 30 s is not too large for a healthy corpus program on a
+/// contended box: this binary was one of the >120 s members of two sibling
+/// lanes' unions under ten-lane load (tracker N46), which is the same disease
+/// E39/E40 treated across the watch family — a fixed clock around real work,
+/// measuring the runner rather than the program. 300 s is the value that family
+/// settled on and the reasoning transfers unchanged.
+const NODE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Corpus programs this gate does not run, with the reason — `infer_differential.
 /// rs`'s list plus one: their output is not a function of their source alone, so
