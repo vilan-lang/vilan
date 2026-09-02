@@ -2590,13 +2590,38 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.parse_atom()
     }
 
-    /// `Name<Args>? { field, … }` — a struct initializer (expression mode only).
-    /// Backtracks when no `{` follows the name (+ optional generics), so a bare name
-    /// falls through to the atom.
+    /// `type-path { field, … }` — a struct initializer (expression mode only).
+    /// Backtracks when no `{` follows the head, so a bare name — or a qualified
+    /// path that is not a literal, `shapes::make()` — falls through to the atom.
+    ///
+    /// The head is the SAME production B172 gave every type position
+    /// (`IDENT { "::" IDENT } [ generic-args ]`, [`Parser::parse_path_type`]).
+    /// B190: the literal was the one spelling left keyed on a bare identifier,
+    /// in a language where `shapes::Dot` is a type and `shapes::make()` is a
+    /// call — so `shapes::Dot { x = 1 }` was a parse error ("expected `;` to
+    /// end this statement"), and two pins in B172's own lane had to construct
+    /// through a `make()` helper to say what they meant.
+    ///
+    /// The condition-position rule is untouched and did not need restating: a
+    /// condition parses through `no_struct`, which does not call this at all,
+    /// so a qualified path before a `{` there stays an operand exactly as the
+    /// bare form does (§3.8).
     fn parse_struct_initializer(&mut self) -> Option<Spanned<Node<'src>>> {
         self.attempt(|parser| {
             let start = parser.position;
-            let name = parser.eat_ident()?;
+            // A `::` continues the path only when a NAME follows it — probing
+            // BOTH tokens before committing, exactly as `parse_path_type`
+            // does, so a trailing `::` is left where the caller can see it.
+            let mut namespace: Vec<&'src str> = Vec::new();
+            let mut name_start = parser.position;
+            let mut name = parser.eat_ident()?;
+            while parser.peek_is_op("::") && matches!(parser.peek_at(1), Some(Token::Ident(_))) {
+                namespace.push(name);
+                parser.bump(); // `::`
+                name_start = parser.position;
+                name = parser.eat_ident().expect("peeked as an identifier");
+            }
+            let name_span = parser.span_from(name_start);
             let generic_arguments = parser.parse_generic_arguments();
             if !parser.peek_is_ctrl('{') {
                 return None;
@@ -2627,7 +2652,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }
             };
             Some((
-                Node::StructInitializer(name, generic_arguments, fields),
+                Node::StructInitializer(namespace, (name, name_span), generic_arguments, fields),
                 parser.span_from(start),
             ))
         })
@@ -6074,7 +6099,7 @@ mod tests {
         // In expression position the same head with a brace IS a struct literal.
         assert!(matches!(
             expr("Foo { x = 1 }").0,
-            Node::StructInitializer("Foo", _, _)
+            Node::StructInitializer(_, ("Foo", _), _, _)
         ));
         // A parenthesised struct literal is admitted even in a condition.
         assert!(matches!(
@@ -6758,7 +6783,7 @@ mod tests {
             ),
             (
                 "fun main() { let p = Point { 1 2 3 }; }\n",
-                "StructInitializer(\"Point\", None, ([], 27..36)",
+                "StructInitializer([], (\"Point\", 21..26), None, ([], 27..36)",
             ),
             ("fun main() { let x = (1 +); }\n", "Some((Error, 21..26))"),
             ("fun main() { let x = [1 +]; }\n", "Some((Error, 21..26))"),

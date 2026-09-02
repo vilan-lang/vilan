@@ -156,7 +156,7 @@ fn recovers_garbled_struct_initializer_fields() {
                 "[{name}] garbled struct-init fields must report (c): {tree}"
             );
             assert!(
-                tree.contains("StructInitializer(\"Point\", None, ([]"),
+                tree.contains("StructInitializer([], (\"Point\", 21..26), None, ([]"),
                 "[{name}] recovered to empty struct-initializer fields (b); got: {tree}"
             );
         },

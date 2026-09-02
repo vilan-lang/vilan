@@ -447,7 +447,7 @@ secondary-expr = closure | block | if-expr | for-expr | match-expr
                | operator-expr ;           (* §3.7 levels 1–12 *)
 condition-expr = secondary-expr ;    (* struct-init and css-block excluded *)
 
-struct-init   = IDENT [ generic-args ]
+struct-init   = type-path                      (* §3.9; qualified heads too *)
                 "{" [ init-field { "," init-field } [ "," ] ] "}" ;
 init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
@@ -473,7 +473,10 @@ Two consequences of the tier split are normative:
   condition, a `for … in` iterable, and a `match` subject parse
   `condition-expr`, whose operands exclude struct initializers, so the
   `{` after `if Foo` is the block. Parenthesize a literal to use it in a
-  condition (`if p == (Point { x = 1 }) { … }`). A **`css` block**
+  condition (`if p == (Point { x = 1 }) { … }`). The head is a
+  `type-path`, so a **qualified** literal (`shapes::Dot { x = 1 }`) is the
+  same production and takes the same exclusion — `if k ==
+  shapes::Kind::Flat { … }` reads the `{` as the block. A **`css` block**
   (§3.6) is brace-initial for the same reason and is excluded in the
   same three places, with the same escape: `if (css { … }).class_list()
   != "" { … }`.

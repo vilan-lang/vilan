@@ -388,3 +388,5 @@ row	flagship	key
 362	-	`{symbol}` on `{lhs_label}` has no meaning: `{lhs_label}`'s admitted operators are {admitted}. A binary takes its type from the LEFT operand and the host operator returns a number, so this expression is a number wearing `{lhs_label}` — {exhibit}. {steer}
 363	flagship	; `{name}` is in the prelude of the web set — set `prelude = "{}"` in vilan.toml
 364	-	; `{name}` is in the prelude of the web set — switch the playground's prelude to the web set{import}
+365	-	`{name}` takes no type arguments, {written_count} given — it declares no generics, so there is nothing here for this list to bind; write `{name}(…)`
+366	-	`{name}` takes at most {declared_count} type {argument(s)}, {written_count} given — a SHORTER list is fine (the parameters it does not reach are inferred from the arguments), but there is no parameter left for the extra {one(s)} to bind

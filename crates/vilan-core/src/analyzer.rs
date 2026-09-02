@@ -1908,7 +1908,16 @@ pub struct StructInitializerConstraint<'src> {
     /// The lexical scope the initializer appears in, so the struct name resolves
     /// from there (walking parents) rather than scanning every scope by name.
     pub scope_id: Id,
+    /// The modules the head was reached through, in source order — empty for
+    /// the bare spelling (B190). The name below is the LAST segment either way,
+    /// which is what every message about the DECLARATION says.
+    pub namespace: Vec<&'src str>,
     pub struct_name: &'src str,
+    /// The name's own span. With a namespace in front of it the literal no
+    /// longer begins where its name does, so the reference record that
+    /// go-to-definition and semantic tokens ride reads this instead of
+    /// measuring the name's length from the literal's start.
+    pub struct_name_span: Span,
     pub struct_fields: Vec<Field<'src>>,
     pub generic_argument_ids: Vec<TypeId>,
     pub generic_parameter_constraint_ids: Vec<TypeId>,
@@ -2215,7 +2224,8 @@ impl<'src> StructInitializerConstraint<'src> {
     fn from_walk(
         initializer_id: Id,
         scope_id: Id,
-        name: &'src str,
+        namespace: Vec<&'src str>,
+        name: Spanned<&'src str>,
         generic_argument_ids: Vec<TypeId>,
         e_fields: Vec<(&'src str, Id, Span, Span)>,
         fields_span: Span,
@@ -2224,12 +2234,24 @@ impl<'src> StructInitializerConstraint<'src> {
             initializer_id,
             struct_id: Id(0),
             scope_id,
-            struct_name: name,
+            namespace,
+            struct_name: name.0,
+            struct_name_span: name.1,
             struct_fields: Vec::new(),
             generic_argument_ids,
             generic_parameter_constraint_ids: Vec::new(),
             fields: e_fields,
             fields_span,
+        }
+    }
+
+    /// The head as the author WROTE it, for the two messages that report the
+    /// head rather than a field (B190). Every other message names the
+    /// declaration, whose name is the last segment on its own.
+    fn written_path(&self) -> String {
+        match self.namespace.is_empty() {
+            true => self.struct_name.to_string(),
+            false => format!("{}::{}", self.namespace.join("::"), self.struct_name),
         }
     }
 }
@@ -3190,6 +3212,35 @@ pub struct Analyzer<'src> {
     // receiver typed from a refused field IS this id, and so is the argument a
     // `[service]`/`[expose]` expansion passes on.
     refused_annotation_slots: HashMap<TypeId, (SourceId, Span)>,
+    // B189's second sibling: the TRAITS a refused annotation named, each with
+    // the site its one report was filed at. The map above is keyed on the
+    // annotation's SLOT, which is what every consumer that reads the annotated
+    // thing's TYPE meets. A derive meets something else: `[derive(Wire)]`
+    // templates its bodies from the field's SPELLING (`{type}::from_json_value`,
+    // `{type}::rebuild`), so the generated code re-writes `Greet` as a fresh
+    // path with a type id of its own — never the refused slot — and asks the
+    // trait for a member no trait has. The spelling is the provenance there,
+    // and the trait it names is what carries it.
+    refused_annotation_traits: HashMap<Id, (SourceId, Span)>,
+    // B189's third sibling: the declared slots of the `[expose]`d fields whose
+    // exposure `check_expose_fields` has already refused — E104's covered set,
+    // keyed on the field. Unlike the two maps above this is not an `Unknown`
+    // with provenance: the field has a perfectly good type, and it is the
+    // EXPOSURE that is refused. The generated subscription call is handed that
+    // same field, so it fails the same bound one pass later and says so in the
+    // vocabulary of code the author never wrote.
+    expose_refused_field_slots: HashSet<TypeId>,
+    // The ELEMENT each of those refusals named, as the refusal RENDERED it. The
+    // expansion writes two shapes per exposed field and only one of them is
+    // handed the field: `session.expose(self.tasks)` carries it, while the
+    // client's mirror (`let mirror: RemoteSource<Element> = reactive.source(
+    // channel)`) names only the element — a fresh annotation with a slot of its
+    // own, and so a `Type` whose nested ids are not the field's, even though
+    // both spell one type. The rendering is what the two share, and it is
+    // exactly the grain of the sentence being suppressed: the bound failure
+    // says "'List<Workspace>' does not implement trait 'Wire'" and the refusal
+    // says "its element `List<Workspace>` is not Wire" — one fact, one report.
+    expose_refused_elements: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -3866,6 +3917,9 @@ impl<'src> Analyzer<'src> {
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
             refused_annotation_slots: HashMap::default(),
+            refused_annotation_traits: HashMap::default(),
+            expose_refused_field_slots: HashSet::default(),
+            expose_refused_elements: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             implicit_generic_scopes: HashMap::default(),
@@ -4275,6 +4329,14 @@ impl<'src> Analyzer<'src> {
             .map(|(call_id, substitution)| (*call_id, substitution.clone()))
             .collect();
         for (call_id, substitution) in recorded {
+            // B189's third sibling: a GENERATED call handed an `[expose]`d
+            // field whose exposure is already refused. The bound it fails is
+            // the very thing that refusal is about, so restating it here — at
+            // the whole struct's span, about a call the author never wrote —
+            // is E104's covered set doing nothing for anyone.
+            if self.call_covered_by_expose_refusal(call_id) {
+                continue;
+            }
             for (&constraint_id, &value_type_id) in &substitution {
                 let bound_traits = self.generic_bound_traits(constraint_id);
                 let tuple_requirement = self.tuple_bounds.get(&constraint_id).cloned();
@@ -4289,6 +4351,22 @@ impl<'src> Analyzer<'src> {
                     value_type,
                     Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
                 ) {
+                    continue;
+                }
+                // B189's third sibling, the half the call's ARGUMENTS cannot
+                // answer. The client mirror the `[service]` expansion writes
+                // names the element and nothing else (`let mirror:
+                // RemoteSource<List<Workspace>> = reactive.source(channel)`),
+                // so no argument of it is the exposed field — but the bound it
+                // fails is the very sentence the field's refusal already said
+                // about that element. Generated code only: the author's own
+                // call on the same type is their own site.
+                if !self.expose_refused_elements.is_empty()
+                    && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                    && self
+                        .expose_refused_elements
+                        .contains(&self.pretty_print_type(&value_type, &HashMap::default()))
+                {
                     continue;
                 }
                 if let Some(requirement) = tuple_requirement {
@@ -5084,6 +5162,15 @@ impl<'src> Analyzer<'src> {
         let checks = std::mem::take(&mut self.wire_types_to_check);
         for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
+                // B189: the field's annotation was REFUSED, and that report
+                // already says what is wrong with it. "`inner` is `Greet`,
+                // which is not Wire" answers a question nobody asked — `Greet`
+                // is not a field type at all, which is the sentence the author
+                // already has. B182's stand-down at its own slot, reaching a
+                // consumer the derive sibling exposed.
+                if self.refused_annotation_slots.contains_key(field_type_id) {
+                    continue;
+                }
                 // A resource field is rejected with a resource-specific steer,
                 // taking precedence over the not-Wire message: a resource is not
                 // plain data, so it cannot cross the wire (destruction.md §8).
@@ -5203,6 +5290,13 @@ impl<'src> Analyzer<'src> {
         let checks = std::mem::take(&mut self.hashable_types_to_check);
         for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
+                // The Wire boundary's B189 stand-down, for the same reason at
+                // the same grain: a refused annotation has its one report, and
+                // "not Hashable" restates it about a type the author is
+                // already being told cannot be a field type.
+                if self.refused_annotation_slots.contains_key(field_type_id) {
+                    continue;
+                }
                 // A resource field is rejected with a resource-specific steer,
                 // taking precedence over the not-Hashable message: a resource
                 // cannot be hashed by value (destruction.md §8).
@@ -12480,6 +12574,14 @@ impl<'src> Analyzer<'src> {
                 Some(element) => {
                     let element_type = element.get_type(self);
                     let rendered = self.pretty_print_type(&element_type, &HashMap::default());
+                    // B189: this field's exposure is now reported, so the
+                    // generated subscription's bound failure on it is a
+                    // restatement and stands down (`call_covered_by_expose_
+                    // refusal`, consulted one pass later). Both keys: the
+                    // FIELD, for the call handed it, and the ELEMENT this
+                    // sentence names, for the mirror that only mentions it.
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.expose_refused_elements.insert(rendered.clone());
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -12496,6 +12598,10 @@ impl<'src> Analyzer<'src> {
                     );
                 }
                 None => {
+                    // Same covering, same reason: the field cannot be exposed
+                    // at all, so the generated subscription's own complaint
+                    // about it adds nothing the sentence below does not say.
+                    self.expose_refused_field_slots.insert(field_type_id);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -14796,6 +14902,20 @@ impl<'src> Analyzer<'src> {
         if self.refused_annotation_slots.is_empty() {
             return None;
         }
+        self.annotation_slots_behind(expr_id)
+            .into_iter()
+            .find_map(|slot| self.refused_annotation_slots.get(&slot).copied())
+    }
+
+    /// The annotation slots an expression reads, in the order a lookup should
+    /// try them — the shared half of every "was this already reported at the
+    /// annotation?" question ([`Self::refused_annotation_behind`] for B182's
+    /// refusals, [`Self::expose_refusal_behind`] for B189's exposed fields).
+    ///
+    /// The three fallbacks after the interned type are the same slot reached
+    /// without one — a binding or parameter naming the annotation directly, and
+    /// a field whose access resolved before the drain ran.
+    fn annotation_slots_behind(&self, expr_id: Id) -> Vec<TypeId> {
         let mut slots: Vec<TypeId> = Vec::new();
         slots.extend(self.type_id_of_expr(expr_id));
         match self.expr_id_to_expr_map.get(&expr_id) {
@@ -14822,8 +14942,47 @@ impl<'src> Analyzer<'src> {
             _ => {}
         }
         slots
+    }
+
+    /// B189's third sibling: was this expression the `[expose]`d FIELD whose
+    /// exposure `check_expose_fields` has already refused?
+    ///
+    /// E104's covered-set idea, keyed on the field. The curated refusal names
+    /// the field, its element and why the element cannot cross the wire — the
+    /// whole mistake, in the author's own vocabulary. What followed it was the
+    /// SAME mistake read off the generated subscription call, as a bound the
+    /// call's argument does not satisfy, over a span covering the whole struct.
+    /// The field's slot is what the two have in common, exactly as it is for a
+    /// refused annotation.
+    fn expose_refusal_behind(&self, expr_id: Id) -> bool {
+        if self.expose_refused_field_slots.is_empty() {
+            return false;
+        }
+        self.annotation_slots_behind(expr_id)
             .into_iter()
-            .find_map(|slot| self.refused_annotation_slots.get(&slot).copied())
+            .any(|slot| self.expose_refused_field_slots.contains(&slot))
+    }
+
+    /// [`Self::expose_refusal_behind`] asked of a GENERATED call: was it handed
+    /// the exposed field whose exposure is already reported?
+    ///
+    /// Generated only. The refusal covers the EXPOSURE — the calls the
+    /// `[service]` expansion writes to subscribe to the field — and nothing
+    /// else. A call the author wrote themselves that fails the same bound is
+    /// their own site and their own mistake, and it still reports.
+    fn call_covered_by_expose_refusal(&self, call_id: Id) -> bool {
+        if self.expose_refused_field_slots.is_empty()
+            || self.source_of_id(call_id) != Some(DERIVED_SOURCE)
+        {
+            return false;
+        }
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return false;
+        };
+        function_call
+            .argument_ids
+            .iter()
+            .any(|argument_id| self.expose_refusal_behind(*argument_id))
     }
 
     /// [`Self::refused_annotation_behind`], recording the refusal as one that
@@ -20006,6 +20165,47 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// A CALL's written generic-argument list checked against the callee's
+    /// generic parameters (B192), as the refusal message when it is too long.
+    ///
+    /// The rule is one-sided on purpose, and it is not the one
+    /// [`Self::written_application_arity_error`] applies to a TYPE application.
+    /// A type application is the whole binding — nothing else can supply a
+    /// missing argument, so an under-supplied `Holder` is refused. A call has a
+    /// second channel: its arguments. So a SHORT list is not missing anything —
+    /// it binds the parameters it reaches, positionally, and inference fills
+    /// the rest exactly as it does when nothing is written at all. Only a list
+    /// LONGER than the parameter list has a written argument with nothing to
+    /// bind, and until B192 that argument was silently dropped: `tag<Dog, Fox>`
+    /// on a one-generic `tag` compiled and ran as though `<Dog>` had been
+    /// written.
+    fn written_call_generic_arity_error(
+        &self,
+        function_id: Id,
+        declared_count: usize,
+        written_count: usize,
+    ) -> Option<String> {
+        if written_count <= declared_count {
+            return None;
+        }
+        let name = self.callable_name(function_id).unwrap_or("this call");
+        // The zero-generic callee has no prefix at all, so every written
+        // argument is an extra one and there is no shorter list to steer to.
+        if declared_count == 0 {
+            return Some(format!(
+                "`{name}` takes no type arguments, {written_count} given — it declares no \
+                 generics, so there is nothing here for this list to bind; write `{name}(…)`"
+            ));
+        }
+        Some(format!(
+            "`{name}` takes at most {declared_count} type {}, {written_count} given — a \
+             SHORTER list is fine (the parameters it does not reach are inferred from the \
+             arguments), but there is no parameter left for the extra {} to bind",
+            plural(declared_count, "argument", "arguments"),
+            plural(written_count - declared_count, "one", "ones"),
+        ))
+    }
+
     /// The declared generic-parameter constraint ids of the named type (struct,
     /// enum, or trait), in order — for inheriting a subject binder's bound from
     /// the type it implements. `None` if the name does not resolve to such a type
@@ -21960,7 +22160,7 @@ impl<'src> Analyzer<'src> {
                 // patterns have been resolved.
                 None
             }
-            Node::StructInitializer(name, generic_arguments, fields) => {
+            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
                 let generic_argument_ids = generic_arguments
                     .as_ref()
                     .map(|x| {
@@ -22007,7 +22207,8 @@ impl<'src> Analyzer<'src> {
                     StructInitializerConstraint::from_walk(
                         id,
                         scope_id,
-                        name,
+                        namespace.clone(),
+                        (name.0, name.1),
                         generic_argument_ids,
                         e_fields,
                         fields.1,
@@ -28384,6 +28585,24 @@ impl<'src> Analyzer<'src> {
                 if let Some((function_id, parameters, generic_parameter_constraint_ids)) =
                     function_data
                 {
+                    // B192: the written generic list is a PREFIX. Only one
+                    // length is wrong — longer than what it prefixes — and it
+                    // is checked here, before anything binds, so the extra
+                    // argument is refused rather than dropped on the floor.
+                    if let Some(msg) = self.written_call_generic_arity_error(
+                        function_id,
+                        generic_parameter_constraint_ids.len(),
+                        generic_argument_ids.len(),
+                    ) {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: self.declared_here_note(function_id),
+                            span: self.clamp_span_to_first_line(arguments_span, call_id),
+                            msg,
+                        });
+                        self.expr_id_to_expr_map.insert(call_id, Expr::Error);
+                        return Resolution::Failed;
+                    }
                     // `...` is a call convention over an ordinary tuple
                     // parameter: collect the pack here and the rest of this
                     // function — and every pass after it — sees the tuple form.
@@ -32125,6 +32344,53 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The declaration a struct literal's head names: a bare name resolved
+    /// LEXICALLY, or a module-qualified path walked through the modules that
+    /// declare it (B190). `None` when a segment does not name a module, or the
+    /// last name is not declared where the path says it is — the caller reports
+    /// it as the unknown struct it is, spelled the way the author wrote it.
+    ///
+    /// A path addresses exactly what the named module declares (B52), so the
+    /// walk never falls outward the way the lexical lookup does. That is the
+    /// same rule B172's type-path drain applies one level up, and the same
+    /// primitive answers both: `member_in_namespace` over the module's own body
+    /// scope.
+    fn resolve_initializer_head(
+        &mut self,
+        constraint: &StructInitializerConstraint<'src>,
+    ) -> Option<Id> {
+        let Some((first, rest)) = constraint.namespace.split_first() else {
+            return self.try_get_expr_id_by_name(constraint.struct_name, constraint.scope_id);
+        };
+        let head = self.try_get_expr_id_by_name(first, constraint.scope_id)?;
+        let mut scope_id = self.namespace_body_scope(head)?;
+        for segment in rest {
+            let member = self.member_in_namespace(segment, scope_id)?;
+            scope_id = self.namespace_body_scope(member)?;
+        }
+        self.member_in_namespace(constraint.struct_name, scope_id)
+    }
+
+    /// The scope an entity NAMESPACES: a module's body, or an enum's variants.
+    /// `None` for anything else, which is how a path through a segment that
+    /// namespaces nothing declines.
+    ///
+    /// The enum arm is not a widening of what a literal may name — a variant is
+    /// still not a struct, and the caller refuses it as one. It is what lets
+    /// the refusal SAY that: `shapes::Kind::Round { r = 1 }` walks to the
+    /// variant and is told "`Round` is not a struct", where declining at `Kind`
+    /// would report the whole path as an unknown struct and leave the author
+    /// looking for a declaration that is right where they said it was. An enum
+    /// namespaces its variants elsewhere too (a `use` statement reads one), so
+    /// this is that rule, not a second one.
+    fn namespace_body_scope(&self, entity_id: Id) -> Option<Id> {
+        match self.expr_id_to_expr_map.get(&entity_id)? {
+            Expr::Module(module_id) => self.modules.get(module_id).map(|module| module.body.1),
+            Expr::Enum(enum_id) => self.enums.get(enum_id).map(|enum_| enum_.variants_scope_id),
+            _ => None,
+        }
+    }
+
     /// `Struct { field = value, .. }`: resolve the struct by name (lexically),
     /// check field count, infer each value against its declared field type
     /// (binding the struct's type arguments), and record the initializer. Defers
@@ -32135,27 +32401,33 @@ impl<'src> Analyzer<'src> {
         &mut self,
         constraint: &StructInitializerConstraint<'src>,
     ) -> Resolution {
-        let struct_id =
-            match self.try_get_expr_id_by_name(constraint.struct_name, constraint.scope_id) {
-                Some(expr_id) => expr_id,
-                None => {
-                    let span = self
-                        .span_map
-                        .get(&constraint.initializer_id)
-                        .map(|span| **span)
-                        .unwrap_or(constraint.fields_span);
-                    let steer = self
+        let struct_id = match self.resolve_initializer_head(constraint) {
+            Some(expr_id) => expr_id,
+            None => {
+                let span = self
+                    .span_map
+                    .get(&constraint.initializer_id)
+                    .map(|span| **span)
+                    .unwrap_or(constraint.fields_span);
+                // The import steer answers "which module declares this name",
+                // which a QUALIFIED head has already answered — and answered
+                // wrongly, which is what the message says. Only the bare
+                // spelling takes it.
+                let steer = match constraint.namespace.is_empty() {
+                    true => self
                         .import_steer(constraint.struct_name)
-                        .unwrap_or_default();
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span,
-                        msg: format!("unknown struct: {}{}", constraint.struct_name, steer),
-                    });
-                    return Resolution::Failed;
-                }
-            };
+                        .unwrap_or_default(),
+                    false => String::new(),
+                };
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!("unknown struct: {}{}", constraint.written_path(), steer),
+                });
+                return Resolution::Failed;
+            }
+        };
         // Existence check only — the struct itself is re-fetched below, after
         // `record_reference`'s `&mut self` borrow.
         if !self.structs.contains_key(&struct_id) {
@@ -32168,19 +32440,20 @@ impl<'src> Analyzer<'src> {
                 trace: Vec::new(),
                 note: None,
                 span,
-                msg: format!("cannot initialize a non-struct: {}", constraint.struct_name),
+                msg: format!(
+                    "cannot initialize a non-struct: {}",
+                    constraint.written_path()
+                ),
             });
             return Resolution::Failed;
         }
-        // Record the literal's NAME as a reference (the literal starts with
-        // it, so the name span is the initializer's head) — semantic tokens
-        // and go-to-definition on `Point { .. }`'s name ride this.
-        if let Some(initializer_span) = self.span_map.get(&constraint.initializer_id) {
-            let start = initializer_span.into_range().start;
-            let name_span: Span = (start..start + constraint.struct_name.len()).into();
-            if let Some(source) = self.source_of_id(constraint.initializer_id) {
-                self.record_reference(source, name_span, struct_id);
-            }
+        // Record the literal's NAME as a reference — semantic tokens and
+        // go-to-definition on `Point { .. }`'s name ride this. The span comes
+        // from the parser (B190): a qualified head means the literal no longer
+        // starts where its name does, so measuring the name's length from the
+        // literal's start would have drawn the label over the module prefix.
+        if let Some(source) = self.source_of_id(constraint.initializer_id) {
+            self.record_reference(source, constraint.struct_name_span, struct_id);
         }
         let struct_ = self.structs.get(&struct_id).expect("checked above");
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
@@ -33205,6 +33478,15 @@ impl<'src> Analyzer<'src> {
                             // vocabulary of code the author never wrote.
                             self.refused_annotation_slots
                                 .insert(type_id, (source_id, span));
+                            // B189: and the SPELLING this report accounts for.
+                            // A derive does not read the slot — it templates
+                            // its bodies from the annotation's text, so the
+                            // generated `Greet::from_json_value(..)` is a
+                            // fresh path with a type id of its own. What the
+                            // two have in common is the trait, so that is
+                            // where the spelling's provenance is filed.
+                            self.refused_annotation_traits
+                                .insert(*trait_id, (source_id, span));
                         }
                     }
                     // A refused annotation resolves to `Unknown`, so the one
@@ -33258,6 +33540,17 @@ impl<'src> Analyzer<'src> {
                         },
                         source_id,
                     );
+                    // B189's first sibling: a name that does not resolve is a
+                    // REFUSED ANNOTATION like any other. B182 instrumented the
+                    // arm above and left this one, so `struct Holder { inner:
+                    // Nope }` reported the refusal AND "cannot call method
+                    // 'length' on unknown" at every use — the second in the
+                    // vocabulary of a type nobody wrote, and no more a fix than
+                    // the bare-trait cascade was. The slot is the same
+                    // provenance and the same three consumers meet it, so the
+                    // rule is the same: one mistake, one report.
+                    self.refused_annotation_slots
+                        .insert(type_id, (source_id, span));
                     self.write_type_slot(type_id, Type::Unknown);
                 }
             }
@@ -33557,6 +33850,34 @@ impl<'src> Analyzer<'src> {
                                         .insert(id, bindings.into_iter().collect());
                                 }
                             }
+                        }
+                        // B189's second sibling, and it stands ahead of every
+                        // other refusal below because it is not about this
+                        // path at all. The subject is a trait a REFUSED
+                        // ANNOTATION named, so this path was written by a
+                        // DERIVE, templated from that annotation's spelling
+                        // (`Greet::from_json_value`, `Greet::rebuild`) — the
+                        // one report at the annotation already accounts for
+                        // whatever the lookup would have said, and saying it
+                        // again in the vocabulary of generated code is what
+                        // B182 removed everywhere the SLOT reached. The
+                        // spelling reaches here instead: the derive re-writes
+                        // the trait's name as a fresh path, whose type id was
+                        // never the annotation's.
+                        //
+                        // Keyed on the TRAIT, which is E104's grain at this
+                        // family's scale: a miss on a DIFFERENT trait in the
+                        // same program is nobody's consequence and still
+                        // reports.
+                        None if matches!(&subject_type, Type::Trait(trait_id, _)
+                            if self.refused_annotation_traits.contains_key(trait_id)) =>
+                        {
+                            let Type::Trait(trait_id, _) = &subject_type else {
+                                unreachable!("just matched a refused trait subject");
+                            };
+                            let site = self.refused_annotation_traits[trait_id];
+                            self.stood_down_refusals.insert(site);
+                            self.expr_id_to_expr_map.insert(id, Expr::Error);
                         }
                         // B162: the trait declares the associated function but
                         // gives it no default body, so `Trait::func(..)` names

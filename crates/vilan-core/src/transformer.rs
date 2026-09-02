@@ -8255,6 +8255,18 @@ impl<'src> Transformer<'src> {
     /// from the enclosing instantiation, the inherited slice of the active
     /// substitution. `None` means the callee is non-generic (or nothing binds it),
     /// so it is emitted as a plain function.
+    ///
+    /// B192: the written list is a PREFIX, not the whole binding. It binds the
+    /// parameters it reaches and NOTHING about the ones it does not — those are
+    /// inference's, exactly as they are when nothing is written at all. So the
+    /// three channels are MERGED rather than raced: the written prefix is laid
+    /// over the recorded substitution instead of replacing it. Racing them left
+    /// every unwritten parameter abstract in the emitted instance, where a call
+    /// through its bound resolved to the trait's bodyless requirement — an
+    /// internal error at emission for a program the analyzer had fully typed.
+    /// (The analyzer seeds its own context with the same written arguments, so
+    /// the two agree wherever both speak; the overlay states the precedence
+    /// rather than relying on that.)
     fn call_substitution(
         &self,
         call_id: Id,
@@ -8263,22 +8275,22 @@ impl<'src> Transformer<'src> {
     ) -> Option<HashMap<TypeId, TypeId>> {
         let function = self.program.functions.get(&target_id);
         let is_generic = function.is_some_and(|f| !f.generic_parameter_constraint_ids.is_empty());
+        let mut substitution = match self.program.method_call_substitution.get(&call_id) {
+            Some(recorded) => recorded.clone(),
+            None => self.inherited_substitution(target_id),
+        };
         if is_generic && !generic_argument_ids.is_empty() {
-            return Some(
-                function
-                    .unwrap()
-                    .generic_parameter_constraint_ids
-                    .iter()
-                    .copied()
-                    .zip(generic_argument_ids.iter().copied())
-                    .collect(),
-            );
+            for (constraint_id, argument_id) in function
+                .expect("a generic callee is a function")
+                .generic_parameter_constraint_ids
+                .iter()
+                .copied()
+                .zip(generic_argument_ids.iter().copied())
+            {
+                substitution.insert(constraint_id, argument_id);
+            }
         }
-        if let Some(recorded) = self.program.method_call_substitution.get(&call_id) {
-            return Some(recorded.clone());
-        }
-        let inherited = self.inherited_substitution(target_id);
-        (!inherited.is_empty()).then_some(inherited)
+        (!substitution.is_empty()).then_some(substitution)
     }
 
     /// Emits (or reuses) a monomorphized instance of `function_id` specialized by
