@@ -9059,6 +9059,79 @@ fn b200_a_bang_on_a_generic_is_rejected() {
 }
 
 #[test]
+fn b200_a_unary_minus_on_a_trait_typed_operand_is_rejected() {
+    // The trait-typed shape, which the BINARY site can rescue and this one
+    // cannot: B193 dispatches a default body's `self + self` on the type being
+    // specialized, because a supertrait can promise `Add`. Nothing can promise
+    // `-` — there is no `Neg` trait to declare — so every specialization would
+    // reach the host's `-` over a lowered value. Pre-fix,
+    // `Money { cents = 21 }.flipped().cents` printed `undefined`.
+    assert_fails_spanning(
+        r#"
+        trait Flipper {
+            fun flipped(self): Self { -self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Flipper {}
+
+        fun main() {
+            print(Money { cents = 21 }.flipped().cents);
+        }
+        "#,
+        "-self",
+        "vilan has no `Neg` for one to require",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_trait_typed_operand_is_rejected() {
+    // Its twin: no `Not` trait either, so `!self` in a default body was the
+    // host's truthiness test over a lowered value — `false` for every
+    // specialization, whatever it held.
+    assert_fails_spanning(
+        r#"
+        trait Negator {
+            fun negated(self): bool { !self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Negator {}
+
+        fun main() {
+            print(Money { cents = 21 }.negated());
+        }
+        "#,
+        "!self",
+        "vilan has no `Not` for one to require",
+    );
+}
+
+#[test]
+fn b200_a_bare_trait_unary_operand_gets_the_bound_steer() {
+    // B175's rule about WHICH refusal, on the unary side: the two ways of
+    // arriving at a trait-typed operand need different steers, because only
+    // the default body has a trait to add a method to. A bare trait outside
+    // one gets B175's own sentence.
+    let source = r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            print(-Maker::make());
+        }
+        "#;
+    assert_fails_with(source, "A trait is a bound, not a value type");
+    assert_fails_with(source, "(`<T: Maker>`)");
+    assert_fails_without(source, "Inside a default body");
+}
+
+#[test]
 fn b200_the_admitted_unary_forms_still_compile_and_run() {
     // The control. Every form the two admitted sets cover, including the
     // negative literal (`-128i8` is `Unary('-')` OVER the literal, and the

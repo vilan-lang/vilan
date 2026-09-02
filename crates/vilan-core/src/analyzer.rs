@@ -34602,8 +34602,21 @@ impl<'src> Analyzer<'src> {
             // a claim about a runtime value), `Unknown`/`Unresolved` have not
             // settled, `Mapped` is still symbolic, and a `Module` is not a
             // value — naming one as an operand is already someone else's
-            // diagnostic. `Trait` is left with the binary loop's own
-            // trait-typed shapes (B175/B193), which have their own refusals.
+            // diagnostic.
+            //
+            // `Trait` is NOT on that list, and the reason is the difference
+            // between this site and the binary one. There, a trait-typed
+            // operand may still have somewhere to go — B193 dispatches a
+            // default body's `self` on the type being specialized, because a
+            // supertrait can promise `Add`. Nothing can promise `-` or `!`:
+            // vilan has neither a `Neg` nor a `Not` trait, so no trait a
+            // program can write gives either symbol a meaning, and a
+            // trait-typed operand here has no dispatch to reach at any
+            // specialization. Skipping it would leave the family's own
+            // miscompile behind at the one shape that can never be rescued —
+            // `trait Flipper { fun flipped(self): Self { -self } }` printed
+            // `undefined` for every specialization, and `!self` printed
+            // `false` for all of them.
             if matches!(
                 operand_type,
                 Type::Any
@@ -34612,7 +34625,6 @@ impl<'src> Analyzer<'src> {
                     | Type::Unresolved
                     | Type::Module(_)
                     | Type::Mapped(_, _, _)
-                    | Type::Trait(_, _)
             ) {
                 continue;
             }
@@ -34639,6 +34651,33 @@ impl<'src> Analyzer<'src> {
                      from produces no value — a function that returns nothing, an `if` with no \
                      `else`, a statement — so there is nothing to negate"
                         .to_string()
+                } else if matches!(operand_type, Type::Trait(_, _)) {
+                    // B175's shape, and B193's — `self` inside a trait default
+                    // body is `Type::Trait` too. The binary site can dispatch
+                    // such an operand on the type being specialized, because a
+                    // supertrait can promise `Add`; nothing can promise `!`,
+                    // since vilan has no `Not` trait, so this one has no
+                    // dispatch to reach at any specialization. B175's rule
+                    // about WHICH refusal applies: the two ways of arriving
+                    // need different steers, because only one of them has a
+                    // trait body to add a method to.
+                    let steer = if self.is_in_trait_default(unary_id) {
+                        "Inside a default body `self` IS the trait, so this would reach the host's \
+                         truthiness test over a lowered value: ask the trait for the `bool` you \
+                         mean (a required method returning one) and negate that"
+                            .to_string()
+                    } else {
+                        format!(
+                            "A trait is a bound, not a value type (vilan has no trait objects): \
+                             hold the value in a generic bounded by the trait (`<T: {label}>`) and \
+                             test what the bound provides"
+                        )
+                    };
+                    format!(
+                        "`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — \
+                         vilan has no `Not` for one to require — so `!` can never resolve through \
+                         a trait, at any specialization. {steer}"
+                    )
                 } else {
                     format!(
                         "`!` negates a `bool`, and this operand is `{label}`: the host's `!` is a \
@@ -34706,6 +34745,29 @@ impl<'src> Analyzer<'src> {
                      has, so the result matches none of them. A backing value is a lowering \
                      detail, not a number to compute with: match on the variant, or hold the \
                      number you mean"
+                )
+            } else if matches!(operand_type, Type::Trait(_, _)) {
+                // The `!` arm's twin, and the same reason: there is no `Neg`
+                // for a trait to require, so a trait-typed operand has no
+                // dispatch to reach at any specialization — and the same split
+                // over WHICH steer, since only the default body has a trait to
+                // add a method to.
+                let steer = if self.is_in_trait_default(unary_id) {
+                    "Inside a default body `self` IS the trait, so this would reach the host's `-` \
+                     over a lowered value: ask the trait for the number you mean (a required \
+                     method returning one) and negate that"
+                        .to_string()
+                } else {
+                    format!(
+                        "A trait is a bound, not a value type (vilan has no trait objects): hold \
+                         the value in a generic bounded by the trait (`<T: {label}>`) and negate \
+                         what the bound provides"
+                    )
+                };
+                format!(
+                    "`-` negates a number, and `{label}` is a trait: no trait names the numeric \
+                     set — vilan has no `Neg` for one to require — so `-` can never resolve \
+                     through a trait, at any specialization. {steer}"
                 )
             } else if matches!(operand_type, Type::Void) {
                 "`-` negates a number, and this operand is `void`: the expression it comes from \

@@ -147,6 +147,8 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
         "374",
         "the operator arm of the trait-conformance refusal (`analyzer.rs`)",
     ),
+    ("375", "`!`'s trait-typed arm"),
+    ("376", "`-`'s trait-typed arm"),
 ];
 
 /// Ledger rows with no key at all, and so absent from the index, with the

@@ -397,3 +397,5 @@ row	flagship	key
 372	-	`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so there is no impl that could give `-` a meaning here
 373	-	`{symbol}` models `{trait_name}`, and `{trait_label}` does not require it: inside a default body `self` is the trait itself, so the operator resolves through what `{trait_label}` promises
 374	-	`impl {subject_name} with {trait}`{inherited} provides no `{member_name}`: an operator trait's method is required at impl time
+375	-	`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — vilan has no `Not` for one to require
+376	-	`-` negates a number, and `{label}` is a trait: no trait names the numeric set — vilan has no `Neg` for one to require
