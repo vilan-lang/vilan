@@ -8056,6 +8056,266 @@ fn b193_a_trait_default_operator_its_trait_never_promised_is_refused() {
     );
 }
 
+// --- B197: an operator trait's method is required at impl time ---------------
+//
+// Audit run 7's F12, RULED. `std::operators`'s ten traits carry
+// `panic("not implemented yet")` bodies — deliberately, so the declarations
+// type-check (`ret-checking.md`) — and a body is a body, so the conformance
+// check's "a default is inherited" rule let `impl P with Add { }` through.
+//
+// Pre-fix, that program:
+//
+//   vilan check   →  `no errors`.
+//   vilan run     →  an uncaught `not implemented yet` from node, with no
+//                    type, no method and no span — the one diagnostic in the
+//                    surface that names nothing at all.
+//
+// while the refusal a type with NO impl gets reads "add `impl P with Add`
+// providing `add`": advice this program had followed to the letter, minus the
+// providing half.
+//
+// The ruling: the method is REQUIRED at the impl. The panicking bodies stay
+// (they are what the compound-assignment derivation reads, and `+=` still
+// derives from `+`), but there is no coherent program in which an operator
+// impl omits its method, because the default's only behaviour is to throw.
+
+#[test]
+fn b197_an_operator_impl_with_no_method_is_refused() {
+    // The exhibit the item was filed on. Pre-fix: `check` clean, `run`
+    // throwing `not implemented yet`.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add { }
+
+        fun main() {
+            let sum = P { n = 1 } + P { n = 2 };
+            print(sum.n);
+        }
+        "#,
+        "`impl P with Add` provides no `add`",
+    );
+}
+
+#[test]
+fn b197_the_refusal_names_the_type_and_the_signature_to_write() {
+    // The least the item asked for, which the ruling gets for free: the
+    // runtime panic named nothing, and this names the type, the method, the
+    // reason the default exists, and the exact signature. The signature is
+    // rendered here rather than read off the trait, because the trait's own
+    // `b: B` renders as `b: Add` — not a signature anyone can write.
+    let source = r#"
+        import std::operators::Mul;
+
+        struct Money { cents: i32 }
+
+        impl Money with Mul { }
+
+        fun main() {}
+        "#;
+    assert_fails_with(source, "Declare `fun mul(self, b: Money): Money`");
+    assert_fails_with(source, "it exists so `*=` can derive from `*`");
+    assert_fails_without(source, "b: Mul");
+}
+
+#[test]
+fn b197_a_declared_operand_type_is_named_in_the_signature() {
+    // `impl Meters with Add<Feet>` declares its own `B`, so the signature the
+    // refusal names is not the `Self`-defaulted one.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> { }
+
+        fun main() {}
+        "#,
+        "Declare `fun add(self, b: Feet): Meters`",
+    );
+}
+
+#[test]
+fn b197_the_requirement_reaches_through_a_supertrait() {
+    // Reached through `trait Doubler with Add`, the requirement comes from a
+    // trait the impl does not name — so the sentence says whose it is, and
+    // names the other way to satisfy it.
+    let source = r#"
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Doubler {}
+
+        fun main() {}
+        "#;
+    assert_fails_with(source, "(`Doubler` requires `Add`) provides no `add`");
+    assert_fails_with(source, "in an `impl Money with Add` of its own");
+}
+
+#[test]
+fn b197_a_separate_impl_of_the_operator_trait_satisfies_it() {
+    // And it does satisfy it: the conformance check's existing
+    // provided-elsewhere rule covers the operator family unchanged, which is
+    // what B193's own programs rely on.
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b197_every_operator_trait_requires_its_own_method() {
+    // Per case, not per example: the item is one rule over ten traits, and a
+    // rule pinned at one of them is a rule pinned nowhere.
+    for (trait_name, method, symbol) in [
+        ("Add", "add", "+"),
+        ("Sub", "sub", "-"),
+        ("Mul", "mul", "*"),
+        ("Div", "div", "/"),
+        ("Rem", "rem", "%"),
+        ("Shl", "shl", "<<"),
+        ("Shr", "shr", ">>"),
+        ("BitAnd", "bit_and", "&"),
+        ("BitXor", "bit_xor", "^"),
+        ("BitOr", "bit_or", "|"),
+    ] {
+        let source = format!(
+            r#"
+            import std::operators::{trait_name};
+
+            struct P {{ n: i32 }}
+
+            impl P with {trait_name} {{ }}
+
+            fun main() {{}}
+            "#
+        );
+        assert_fails_with(
+            &source,
+            &format!("`impl P with {trait_name}` provides no `{method}`"),
+        );
+        assert_fails_with(
+            &source,
+            &format!("so `{symbol}=` can derive from `{symbol}`"),
+        );
+    }
+}
+
+#[test]
+fn b197_an_operator_impl_that_writes_its_method_still_runs() {
+    // The control the requirement must not break.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add {
+            fun add(self, other: P): P { P { n = self.n + other.n } }
+        }
+
+        fun main() {
+            print((P { n = 1 } + P { n = 2 }).n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b197_the_compound_form_still_derives_from_the_operator() {
+    // The reason the panicking defaults stay, pinned so a later lane cannot
+    // delete them and call the suite green: `+=` derives from `+`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add {
+            fun add(self, other: P): P { P { n = self.n + other.n } }
+        }
+
+        fun main() {
+            mut total = P { n = 1 };
+            total += P { n = 2 };
+            print(total.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b197_a_non_operator_traits_default_is_still_inherited() {
+    // The rule is the operator family's, not "every default is now required":
+    // an ordinary trait's default body is inherited exactly as before, and so
+    // is a non-operator default of an operator trait's own supertrait chain
+    // (`PartialOrd`'s `lt`/`le`/`gt`/`ge` over `partial_compare`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::{ Option, Some };
+
+        trait Greeter {
+            fun greet(self): str { "hello" }
+        }
+
+        struct Meters { m: i32 }
+
+        impl Meters with Greeter {}
+
+        impl Meters with PartialEq {
+            fun eq(self, other: Meters): bool { self.m == other.m }
+        }
+
+        impl Meters with PartialOrd {
+            fun partial_compare(self, other: Meters): Option<Ordering> {
+                if self.m < other.m {
+                    Some(Ordering::Less)
+                } else {
+                    if self.m > other.m { Some(Ordering::Greater) } else { Some(Ordering::Equal) }
+                }
+            }
+        }
+
+        fun main() {
+            print(Meters { m = 1 }.greet());
+            print(Meters { m = 1 } < Meters { m = 2 });
+        }
+        "#,
+        "hello\ntrue\n",
+    );
+}
+
 // --- B181: `&&`/`||` accepted a generic RIGHT operand and emitted the value --
 //
 // The same membership principle B179 settled for the native family, on the two

@@ -140,6 +140,13 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
         "372",
         "`-`'s no-`Neg`-trait arm — every other non-numeric operand",
     ),
+    // B197's operator-conformance refusal shares the missing-member push with
+    // the ordinary one, choosing between them in a `let msg = if …` the walk
+    // cannot read for the same reason.
+    (
+        "374",
+        "the operator arm of the trait-conformance refusal (`analyzer.rs`)",
+    ),
 ];
 
 /// Ledger rows with no key at all, and so absent from the index, with the

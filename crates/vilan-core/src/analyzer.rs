@@ -3678,6 +3678,40 @@ fn operator_trait_method(op: BinaryOp) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The method an operator trait REQUIRES of an impl, by trait name — the one
+/// the use-site refusal already names ("add `impl P with Add` providing
+/// `add`"), and the one B197 makes required at the impl.
+///
+/// Only the ten `std::operators` traits are listed, because they are the only
+/// ones whose required method carries a DEFAULT body: `panic("not implemented
+/// yet")`, written so the declarations type-check (`ret-checking.md`). Every
+/// other operator trait already requires its method the ordinary way —
+/// `PartialEq`'s `eq` and `PartialOrd`'s `partial_compare` are declared
+/// bodyless, and their comparison defaults derive from those — so listing
+/// them here would say nothing the conformance check does not already do.
+///
+/// Matched by NAME, which is how the whole operator family resolves its traits
+/// (`operator_method`, `operator_trait_method`): a program's own `trait Add`
+/// is reached by the same lookups.
+/// Paired with the operator's own symbol, so the refusal can name the
+/// compound form the panicking default actually exists for (`+=`, not
+/// "`add`-assignment").
+fn operator_trait_required_method(trait_name: &str) -> Option<(&'static str, &'static str)> {
+    match trait_name {
+        "Add" => Some(("add", "+")),
+        "Sub" => Some(("sub", "-")),
+        "Mul" => Some(("mul", "*")),
+        "Div" => Some(("div", "/")),
+        "Rem" => Some(("rem", "%")),
+        "Shl" => Some(("shl", "<<")),
+        "Shr" => Some(("shr", ">>")),
+        "BitAnd" => Some(("bit_and", "&")),
+        "BitXor" => Some(("bit_xor", "^")),
+        "BitOr" => Some(("bit_or", "|")),
+        _ => None,
+    }
+}
+
 /// Flattens an `import`/`use` tree into (path, leaf-name) pairs, e.g.
 /// `a::{ b, c::d }` becomes `([a], b)` and `([a, c], d)`.
 pub(crate) fn flatten_namespace_branch<'src>(
@@ -33848,18 +33882,44 @@ impl<'src> Analyzer<'src> {
             // AND its supertraits (a member with a default body is inherited, so
             // an impl need not provide it). Implementing `X with Ord` thus
             // requires the members of `Ord` plus `Eq`/`PartialOrd`/`PartialEq`.
-            let required: Vec<(&'src str, Id)> = self
-                .trait_with_supertraits(trait_id)
-                .into_iter()
-                .filter_map(|id| self.traits.get(&id).map(|trait_| (id, trait_)))
-                .flat_map(|(declaring_trait_id, trait_)| {
-                    trait_
-                        .declarations
-                        .iter()
-                        .filter(|(_, member_id)| !self.member_has_default_body(**member_id))
-                        .map(move |(name, _)| (*name, declaring_trait_id))
-                })
-                .collect();
+            //
+            // B197 adds ONE exception to "a default body is inherited": an
+            // operator trait's own method. `std::operators`'s ten traits carry
+            // `panic("not implemented yet")` bodies — deliberately, so the
+            // declarations type-check — and a body is a body, so
+            // `impl P with Add { }` satisfied every check the compiler had.
+            // `check` was clean, and `P { n = 1 } + P { n = 2 }` threw
+            // `not implemented yet` at RUNTIME with no type, no method and no
+            // span: the one diagnostic in the surface that names nothing at
+            // all. Meanwhile the use-site refusal for a type with no impl at
+            // all says "add `impl P with Add` providing `add`" — advice this
+            // program had followed to the letter, minus the providing half.
+            //
+            // Those bodies stay: the compound-assignment derivation reads
+            // them, and `+=` still derives from `+`. What changes is that an
+            // impl of an operator trait must WRITE the method, because there
+            // is no coherent program in which it does not — the default's
+            // only behaviour is to throw.
+            let required: Vec<(&'src str, Id)> = {
+                let analyzer = &*self;
+                analyzer
+                    .trait_with_supertraits(trait_id)
+                    .into_iter()
+                    .filter_map(|id| analyzer.traits.get(&id).map(|trait_| (id, trait_)))
+                    .flat_map(|(declaring_trait_id, trait_)| {
+                        let operator_method =
+                            operator_trait_required_method(trait_.name).map(|(name, _)| name);
+                        trait_
+                            .declarations
+                            .iter()
+                            .filter(move |(name, member_id)| {
+                                !analyzer.member_has_default_body(**member_id)
+                                    || operator_method == Some(**name)
+                            })
+                            .map(move |(name, _)| (*name, declaring_trait_id))
+                    })
+                    .collect()
+            };
             // B177: a conformance diagnostic that cannot say WHOSE member it
             // means is barely a diagnostic (B170's rule, on the impl side). A
             // non-struct subject used to fall back to the literal word "type",
@@ -34006,14 +34066,79 @@ impl<'src> Analyzer<'src> {
                         ))
                     })
                     .unwrap_or((String::new(), None));
+                // B197: the operator family gets its own sentence, because its
+                // REASON is not the ordinary one. The trait does declare a body
+                // here, so "missing" would read as wrong to anyone who has read
+                // `std::operators` — what is missing is the only body that can
+                // do anything, since the declared one throws. The message says
+                // that, and says what the default is actually for, so nobody
+                // reads the requirement as an oversight to work around.
+                let declaring_trait_name = self
+                    .traits
+                    .get(&declaring_trait_id)
+                    .map(|trait_| trait_.name)
+                    .unwrap_or(check.trait_name);
+                let operator = operator_trait_required_method(declaring_trait_name)
+                    .filter(|(method, _)| *method == member_name);
+                let msg = if let Some((_, symbol)) = operator {
+                    // The signature to write, rendered HERE rather than read
+                    // off the trait's declaration: every one of the ten reads
+                    // `fun m(self, b: B): Self`, and `function_signature_label`
+                    // renders a `B = Self` parameter as the trait's own name
+                    // (`fun add(self, b: Add): Add`) — which is not a signature
+                    // anyone can write. `Self` is this impl's subject, and `B`
+                    // is whatever the `with` clause supplied, defaulting to it.
+                    let operand = check
+                        .trait_arguments
+                        .first()
+                        .map(|argument| {
+                            let argument = argument.get_type(self);
+                            self.pretty_print_type(&argument, &HashMap::default())
+                        })
+                        .unwrap_or_else(|| subject_name.clone());
+                    // The head names the impl the AUTHOR wrote. Reached
+                    // through a supertrait (`trait Doubler with Add`, then
+                    // `impl Money with Doubler {}`) the requirement comes from
+                    // a trait the impl does not name, so the sentence says
+                    // whose it is — and says the other way to satisfy it,
+                    // which is the separate impl the conformance check already
+                    // accepts.
+                    let (inherited, steer) = if declaring_trait_name == check.trait_name {
+                        (String::new(), String::new())
+                    } else {
+                        (
+                            format!(
+                                " (`{}` requires `{declaring_trait_name}`)",
+                                check.trait_name
+                            ),
+                            format!(
+                                ", here or in an `impl {subject_name} with \
+                                 {declaring_trait_name}` of its own"
+                            ),
+                        )
+                    };
+                    format!(
+                        "`impl {subject_name} with {}`{inherited} provides no `{member_name}`: an \
+                         operator trait's method is required at impl time. \
+                         `{declaring_trait_name}` declares a body for it, but that body is \
+                         `panic(\"not implemented yet\")` — it exists so `{symbol}=` can derive \
+                         from `{symbol}`, not so `{member_name}` can go unwritten — so this impl \
+                         compiles clean and the first `{symbol}` on a `{subject_name}` throws at \
+                         runtime, naming neither the type nor the method. Declare `fun \
+                         {member_name}(self, b: {operand}): {subject_name}`{steer}",
+                        check.trait_name
+                    )
+                } else {
+                    format!(
+                        "'{}' does not implement trait '{}': missing '{}'{}",
+                        subject_name, check.trait_name, member_name, expected_signature
+                    )
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note,
                     span: check.span,
-                    msg: format!(
-                        "'{}' does not implement trait '{}': missing '{}'{}",
-                        subject_name, check.trait_name, member_name, expected_signature
-                    ),
+                    msg,
                 });
             }
         }
