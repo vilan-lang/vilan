@@ -1940,6 +1940,16 @@ pub struct Trait<'src> {
     pub supertraits: Vec<TypeId>,
 }
 
+/// The impl a trait member's signature is being rendered FOR (B206): the trait
+/// that DECLARES the member, the impl's subject type, and the arguments the
+/// `with` clause supplied. Without it a `Self` position renders as the trait's
+/// own name, which is a signature nobody can write.
+struct SignatureSubject<'a> {
+    declaring_trait_id: Id,
+    subject: TypeId,
+    trait_arguments: &'a [TypeId],
+}
+
 /// B161: a TRAIT written as a `let` binding's annotation. The annotation is
 /// not the binding's type and not a widening — the binding keeps the concrete
 /// type its initializer infers — it is a CONSTRAINT that type is checked
@@ -14034,6 +14044,69 @@ impl<'src> Analyzer<'src> {
         self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
+    /// [`declaration_type_label`] rendered FOR an impl (B206): an ambiguous
+    /// `Self` / `= Self`-defaulted position resolves to what it means there.
+    fn declaration_type_label_for(
+        &self,
+        type_id: TypeId,
+        subject: Option<&SignatureSubject<'_>>,
+    ) -> String {
+        match subject.and_then(|subject| self.signature_position_type(type_id, subject)) {
+            Some(resolved) => self.declaration_type_label(resolved),
+            None => self.declaration_type_label(type_id),
+        }
+    }
+
+    /// What an ambiguous `Self` / `= Self`-defaulted position of a trait member
+    /// means in a given impl — `None` for every other position, which renders as
+    /// written.
+    ///
+    /// The rule is `ambiguous_position_expectation`'s, the B29 residue, applied
+    /// to a rendered LABEL instead of to a check. A `= Self`-defaulted trait
+    /// generic (`trait Add<B = Self>`, `trait PartialEq<B = Self>`) resolves to
+    /// the very same type as `Self` — both are `Type::Trait(trait, [])` — so the
+    /// resolved type cannot tell a declared `b: B` from a declared `Self`, and
+    /// rendering it printed the TRAIT's name: `declare `fun eq(self, b:
+    /// PartialEq): bool``, which is not a signature anyone can write (B206). The
+    /// WRITTEN name separates them: `Self` is the impl's subject, and the
+    /// parameter's own name is the matching `with`-clause argument, falling back
+    /// to the subject when the clause supplied none — which is precisely what
+    /// the `= Self` default means.
+    fn signature_position_type(
+        &self,
+        type_id: TypeId,
+        subject: &SignatureSubject<'_>,
+    ) -> Option<TypeId> {
+        // Only a position that resolves to the declaring trait's OWN abstract
+        // type is ambiguous. A `b: i32` renders as written, and so does a
+        // mention of some other trait.
+        match type_id.get_type(self) {
+            Type::Trait(trait_id, ref arguments)
+                if trait_id == subject.declaring_trait_id && arguments.is_empty() => {}
+            _ => return None,
+        }
+        let written = self
+            .written_type_spellings
+            .iter()
+            .find(|(written_id, _)| *written_id == type_id)
+            .map(|(_, name)| *name)?;
+        if written == "Self" {
+            return Some(subject.subject);
+        }
+        let trait_ = self.traits.get(&subject.declaring_trait_id)?;
+        let index = trait_
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written)?;
+        Some(
+            subject
+                .trait_arguments
+                .get(index)
+                .copied()
+                .unwrap_or(subject.subject),
+        )
+    }
+
     /// The generic-parameter list of a declaration (`<T: Greeter, U>`), empty
     /// string when there are none.
     ///
@@ -14074,6 +14147,19 @@ impl<'src> Analyzer<'src> {
     /// Declared `async` renders here; INFERRED async is prepended by the
     /// language server (inference runs after this label is built).
     fn function_signature_label(&self, function: &Function) -> String {
+        self.function_signature_label_for(function, None)
+    }
+
+    /// [`function_signature_label`] rendered FOR an impl: a `Self` position, and
+    /// a `= Self`-defaulted parameter, take what they mean there rather than the
+    /// trait's own name (B206). `None` renders the declaration as written, which
+    /// is what hover wants — there is no impl in hand, and `Self` is exactly
+    /// what the author typed.
+    fn function_signature_label_for(
+        &self,
+        function: &Function,
+        subject: Option<&SignatureSubject<'_>>,
+    ) -> String {
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &function.parameters {
             let Some(parameter) = self.parameters.get(parameter_id) else {
@@ -14090,7 +14176,7 @@ impl<'src> Analyzer<'src> {
                     "{}{}: {}",
                     if parameter.spread { "..." } else { "" },
                     parameter.name,
-                    self.declaration_type_label(parameter.type_id)
+                    self.declaration_type_label_for(parameter.type_id, subject)
                 );
                 // A `context` clause is part of the signature's contract —
                 // render it (E9: hover shows clauses).
@@ -14113,7 +14199,12 @@ impl<'src> Analyzer<'src> {
         let generics = self.generic_list_label(&function.generic_parameter_constraint_ids);
         let return_label = function
             .return_type_id
-            .map(|return_type_id| format!(": {}", self.declaration_type_label(return_type_id)))
+            .map(|return_type_id| {
+                format!(
+                    ": {}",
+                    self.declaration_type_label_for(return_type_id, subject)
+                )
+            })
             .unwrap_or_default();
         // The inferred (or declared) `borrows` root-set is part of the signature's
         // contract — render it like the source clause (E9: hover shows clauses),
@@ -34869,20 +34960,26 @@ impl<'src> Analyzer<'src> {
                 }
                 // Render the signature to write, and point at the trait's own
                 // declaration of it — cross-file when the trait is std's
-                // (standard B4 + C3's cross-source note).
-                let (expected_signature, note) = self
+                // (standard B4 + C3's cross-source note). Rendered FOR this
+                // impl (B206): `Self`, and a `= Self`-defaulted parameter,
+                // resolve to the subject and to the `with`-clause argument
+                // rather than to the trait's own name.
+                let signature_subject = SignatureSubject {
+                    declaring_trait_id,
+                    subject: check.subject_type_id,
+                    trait_arguments: &check.trait_arguments,
+                };
+                let (signature, note) = self
                     .traits
                     .get(&declaring_trait_id)
                     .and_then(|trait_| trait_.declarations.get(member_name).copied())
                     .and_then(|member_id| {
-                        let function_id = match self.expr_id_to_expr_map.get(&member_id) {
-                            Some(Expr::Function(function_id)) => *function_id,
-                            _ => member_id,
-                        };
+                        let function_id = self.resolve_member_function_id(member_id);
                         let function = self.functions.get(&function_id)?;
-                        let signature = self.function_signature_label(function);
+                        let signature =
+                            self.function_signature_label_for(function, Some(&signature_subject));
                         Some((
-                            format!("; declare `{signature}`"),
+                            Some(signature),
                             Some(crate::error::Note {
                                 span: function.name_span,
                                 msg: "the trait declares it here".to_string(),
@@ -34890,7 +34987,11 @@ impl<'src> Analyzer<'src> {
                             }),
                         ))
                     })
-                    .unwrap_or((String::new(), None));
+                    .unwrap_or((None, None));
+                let expected_signature = signature
+                    .as_deref()
+                    .map(|signature| format!("; declare `{signature}`"))
+                    .unwrap_or_default();
                 // B197: the operator family gets its own sentence, because its
                 // REASON is not the ordinary one. The trait does declare a body
                 // here, so "missing" would read as wrong to anyone who has read
@@ -34906,21 +35007,19 @@ impl<'src> Analyzer<'src> {
                 let operator = operator_trait_required_method(declaring_trait_name)
                     .filter(|(method, _)| *method == member_name);
                 let msg = if let Some((_, symbol)) = operator {
-                    // The signature to write, rendered HERE rather than read
-                    // off the trait's declaration: every one of the ten reads
-                    // `fun m(self, b: B): Self`, and `function_signature_label`
-                    // renders a `B = Self` parameter as the trait's own name
-                    // (`fun add(self, b: Add): Add`) — which is not a signature
-                    // anyone can write. `Self` is this impl's subject, and `B`
-                    // is whatever the `with` clause supplied, defaulting to it.
-                    let operand = check
-                        .trait_arguments
-                        .first()
-                        .map(|argument| {
-                            let argument = argument.get_type(self);
-                            self.pretty_print_type(&argument, &HashMap::default())
-                        })
-                        .unwrap_or_else(|| subject_name.clone());
+                    // The signature to write comes off the trait's own
+                    // declaration like every other arm's. B197 rendered it here
+                    // instead, because `function_signature_label` printed a
+                    // `B = Self` parameter as the trait's name (`fun add(self,
+                    // b: Add): Add`) — a signature nobody can write. B206 fixed
+                    // that at the label, so the duplicate is gone: one rendering
+                    // serves both arms, and an operator trait whose shape is not
+                    // `fun m(self, b: B): Self` can no longer be described
+                    // wrongly by a template that assumed it was.
+                    let declare = signature
+                        .as_deref()
+                        .map(|signature| format!(" Declare `{signature}`"))
+                        .unwrap_or_default();
                     // The head names the impl the AUTHOR wrote. Reached
                     // through a supertrait (`trait Doubler with Add`, then
                     // `impl Money with Doubler {}`) the requirement comes from
@@ -34949,8 +35048,7 @@ impl<'src> Analyzer<'src> {
                          `panic(\"not implemented yet\")` — it exists so `{symbol}=` can derive \
                          from `{symbol}`, not so `{member_name}` can go unwritten — so this impl \
                          compiles clean and the first `{symbol}` on a `{subject_name}` throws at \
-                         runtime, naming neither the type nor the method. Declare `fun \
-                         {member_name}(self, b: {operand}): {subject_name}`{steer}",
+                         runtime, naming neither the type nor the method.{declare}{steer}",
                         check.trait_name
                     )
                 } else {

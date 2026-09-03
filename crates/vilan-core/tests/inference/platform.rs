@@ -8465,9 +8465,10 @@ fn b197_an_operator_impl_with_no_method_is_refused() {
 fn b197_the_refusal_names_the_type_and_the_signature_to_write() {
     // The least the item asked for, which the ruling gets for free: the
     // runtime panic named nothing, and this names the type, the method, the
-    // reason the default exists, and the exact signature. The signature is
-    // rendered here rather than read off the trait, because the trait's own
-    // `b: B` renders as `b: Add` — not a signature anyone can write.
+    // reason the default exists, and the exact signature. The signature came
+    // from a rendering of this arm's own until B206 taught the shared label to
+    // resolve a `= Self` position against the impl; both arms read the one
+    // rendering now.
     let source = r#"
         import std::operators::Mul;
 
@@ -9516,5 +9517,99 @@ fn b200_the_admitted_unary_forms_still_compile_and_run() {
         }
         "#,
         "-5\n-5.5\n-3\n-4\n-128\nfalse\ntrue\ntrue\n",
+    );
+}
+
+// --- B206: a `= Self`-defaulted parameter renders as the impl's subject -------
+//
+// `impl P with PartialEq { }` advised ``declare `fun eq(self, b: PartialEq):
+// bool` `` — a signature nobody can write, because `PartialEq` is a trait and a
+// trait is not a type. The cause is the `= Self` default: `trait PartialEq<B =
+// Self>` resolves `B` to the very same type as `Self` (both are
+// `Type::Trait(PartialEq, [])`), so rendering the RESOLVED type printed the
+// trait's own name. `function_signature_label` now renders FOR the impl, by the
+// WRITTEN name — the B29 residue's own rule: `Self` is the subject, and a
+// parameter's own name is the matching `with`-clause argument, falling back to
+// the subject when the clause supplied none, which is exactly what `= Self`
+// means. B197's arm had rendered its own signature to route around this; with
+// the label fixed, both arms read the one rendering.
+
+#[test]
+fn b206_a_self_defaulted_parameter_renders_as_the_subject() {
+    let source = r#"
+        import std::compare::PartialEq;
+        struct P { x: i32 }
+        impl P with PartialEq { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "declare `fun eq(self, b: P): bool`");
+    assert_fails_without(source, "b: PartialEq");
+}
+
+#[test]
+fn b206_a_self_return_renders_as_the_subject_too() {
+    // `Add`'s shape has BOTH ambiguous positions — `b: B` and a `Self` return —
+    // and it is the arm B197 was rendering by hand, now routed through the
+    // shared label.
+    let source = r#"
+        import std::operators::Add;
+        struct P { x: i32 }
+        impl P with Add { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "Declare `fun add(self, b: P): P`");
+    assert_fails_without(source, "b: Add");
+}
+
+#[test]
+fn b206_a_user_traits_self_defaulted_parameter_renders_the_same_way() {
+    // Not a std shape and not an operator: the rule is the `= Self` default's,
+    // wherever it is declared.
+    let source = r#"
+        trait Combine<B = Self> {
+            fun merge(self, b: B): Self;
+        }
+        struct P { x: i32 }
+        impl P with Combine { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "declare `fun merge(self, b: P): P`");
+    assert_fails_without(source, "b: Combine");
+}
+
+#[test]
+fn b206_a_written_with_clause_argument_wins_over_the_default() {
+    // The half the written name is needed for: `B` and `Self` resolve to one
+    // type, and here they mean two different ones. The subject fallback would
+    // have rendered `b: Meters`.
+    assert_fails_with(
+        r#"
+        trait Combine<B = Self> {
+            fun merge(self, b: B): Self;
+        }
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+        impl Meters with Combine<Feet> { }
+        fun main() {}
+        "#,
+        "declare `fun merge(self, b: Feet): Meters`",
+    );
+}
+
+#[test]
+fn b206_an_ordinary_parameter_still_renders_as_written() {
+    // The control. Only a position that resolves to the DECLARING trait's own
+    // abstract type is ambiguous; everything else renders as the author wrote
+    // it, and a rule that rewrote more than that would show up here.
+    assert_fails_with(
+        r#"
+        trait Tagger {
+            fun tag(self, name: str): str;
+        }
+        struct P { x: i32 }
+        impl P with Tagger { }
+        fun main() {}
+        "#,
+        "declare `fun tag(self, name: str): str`",
     );
 }
