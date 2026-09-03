@@ -25891,10 +25891,38 @@ impl<'src> Analyzer<'src> {
             Expr::Variable(variable_id) => {
                 let variable = self.variables.get(variable_id).unwrap();
                 let variable_type = variable.type_id.get_type(self);
-                if let Type::Unknown = variable_type {
-                    Type::Unresolved
-                } else {
-                    variable_type
+                // B191: a binding with no type YET is read through what it was
+                // bound to, rather than answering "not yet". Deferring is right
+                // when someone else will land the type, and wrong when this ask
+                // is what that someone is waiting for: an unannotated recursive
+                // body's return inference reads its tail, the tail reads `x`,
+                // and `x`'s own constraint is waiting on the self-call whose
+                // type IS the answer under construction. Following the
+                // initializer breaks the deadlock the way the direct-tail form
+                // (`g(n - 1) + 1`) never had it — the re-entrant ask answers
+                // `never`, which constrains nothing, and the other return
+                // evidence decides. It is the hop B185 gave
+                // `unfilled_closure_parameter`, and it takes the same two
+                // guards: an ANNOTATED binding is not followed (the annotation
+                // is the binding's own answer, and outranks the initializer),
+                // and `exprs_seen` ends a binding CYCLE (`let p = q; let q =
+                // p;`, writable because module bindings resolve in any order).
+                //
+                // Read UNDIRECTED, which is how `resolve_variable` grounds the
+                // same initializer: the hop must answer what the binding is
+                // going to BE, not what this particular consumer was hoping
+                // for, or a reader could ground on a type the binding never
+                // takes.
+                let initializer_id = variable.initial.filter(|_| !variable.annotated);
+                match (&variable_type, initializer_id) {
+                    (Type::Unknown, Some(initializer_id)) => self.infer_type_inner(
+                        initializer_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    ),
+                    (Type::Unknown, None) => Type::Unresolved,
+                    _ => variable_type,
                 }
             }
             Expr::Parameter(parameter_id) => {

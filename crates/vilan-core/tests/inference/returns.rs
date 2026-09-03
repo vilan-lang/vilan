@@ -853,19 +853,24 @@ fn b126_mutually_recursive_unannotated_functions_infer_together() {
     );
 }
 
-// B126 residue (2026-08-22), KNOWN, NOT FIXED: a self-call bound by a `let`
-// and read in the tail. The inference path does not read a `let` binding
-// through its initializer, so the tail `x + 1` is unresolved while `x`'s own
-// constraint is waiting on `g(n - 1)` — and the function's answer never
-// lands: "type of variable 'x' could not be resolved". Same on `next` before
-// the amendment. Asserts what SHOULD hold; goes green when the binding is
-// read through its initializer on the inference path.
+// --- B191 (B126's residue): a `let`-bound self-call in an unannotated body ----
+//
+// `fun g(n: i32) { if n == 0 { ret 1; } let x = g(n - 1); x + 1 }` deadlocked:
+// `x`'s own constraint waits on `g(n - 1)`, which waits on `g`'s inferred
+// return, which reads the tail `x + 1`, which read `x` — and a binding whose
+// type slot is still `Unknown` answered `Unresolved` rather than looking at
+// what it was bound TO. Nothing ever landed: "type of variable 'x' could not
+// be resolved", on the binding and on every caller.
+//
+// The direct-tail form (`g(n - 1) + 1`) always worked, because there the
+// self-call is read where it is written and the re-entrant ask answers
+// `never` — evidence that constrains nothing, which the other evidence (`ret
+// 1`) then decides. The fix gives the `let` the same reading: an unannotated
+// binding with no type yet is read THROUGH its initializer, which is the move
+// B185 gave `unfilled_closure_parameter` for closure parameters.
+
 #[test]
-#[ignore = "B191 (B126's residue, re-owned 2026-09-01): a self-call bound by a `let` and read in the tail \
-            (`let x = g(n - 1); x + 1`) in an unannotated recursive body still fails \
-            \"could not be resolved\" — a `let` binding is not read through its \
-            initializer on the inference path"]
-fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
+fn b191_a_let_bound_self_call_read_in_the_tail_resolves() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -884,6 +889,173 @@ fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
         }
         "#,
         "4\n",
+    );
+}
+
+#[test]
+fn b191_a_let_bound_self_call_read_in_a_ret_resolves() {
+    // The read need not be the tail — a `ret` is return evidence too, and it
+    // reached the binding by the same path.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	ret x + 1;
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_a_let_bound_mutual_call_resolves() {
+    // The re-entrant ask is not only the direct self-call: `a` reaches itself
+    // through `b`, and the binding sits on that cycle exactly the same way.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun a(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = b(n - 1);
+        	x + 1
+        }
+
+        fun b(n: i32) {
+        	a(n)
+        }
+
+        fun main() {
+        	let y: i32 = a(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_a_chain_of_let_bindings_is_followed_to_the_self_call() {
+    // Rebindings count, for the reason B185 gives: `y`'s type is `Unknown`
+    // *because* `x`'s is, so the hop has to walk the chain rather than stop at
+    // the first binding.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	let y = x;
+        	y + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_the_direct_tail_form_still_resolves() {
+    // The control the item is measured against: the shape that always worked,
+    // and still gives the same answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	g(n - 1) + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_an_annotated_binding_still_reads_its_annotation() {
+    // The hop is for a binding with nothing written on it. An annotation is
+    // the binding's own answer and outranks whatever the initializer would
+    // have said, so the hop must not reach past it — here the `u53` the
+    // literal alone would not have chosen.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun take(value: u53): u53 { value }
+
+        fun main() {
+        	let x: u53 = 7;
+        	print(take(x));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b191_a_binding_cycle_is_still_refused_rather_than_followed_forever() {
+    // Following initializers can meet a cycle — module bindings resolve in any
+    // order, so `let p = q; let q = p;` is writable. It stays the ordinary
+    // refusal; the walk does not chase it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        let p = q;
+        let q = p;
+
+        fun main() {
+        	print("ok");
+        }
+        "#,
+        "could not be resolved",
+    );
+}
+
+#[test]
+fn b191_a_let_bound_self_call_with_no_base_case_is_still_never() {
+    // The companion to `b126_a_function_that_only_calls_itself_is_never`: the
+    // hop hands the fold a `never`, which constrains nothing, so a body whose
+    // only evidence is itself keeps that answer through a `let`.
+    assert_compiles(
+        r#"
+        fun forever(n: i32) {
+        	let x = forever(n - 1);
+        	x
+        }
+
+        fun main() {
+        	if false {
+        		let y: i32 = forever(5);
+        	}
+        }
+        "#,
     );
 }
 
