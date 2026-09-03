@@ -330,7 +330,11 @@ fn source_blob() -> String {
 // --- The index -------------------------------------------------------------
 
 struct Row {
-    number: u32,
+    /// The ledger row's id: its number, or the literal `NEW` for a row a lane
+    /// has added and the integrator has not yet numbered. A lane never mints a
+    /// number — two lanes landing in one order would collide on it — so a new
+    /// message rows as `NEW` and is numbered when the order is assembled.
+    number: String,
     flagship: bool,
     key: String,
 }
@@ -346,10 +350,12 @@ fn index() -> Vec<Row> {
         let number = fields.next().expect("a row number");
         let flagship = fields.next().expect("a flagship column");
         let key = fields.next().expect("a key");
+        assert!(
+            number == "NEW" || number.parse::<u32>().is_ok(),
+            "a row's id is its number, or `NEW` for one awaiting a number: {number:?}"
+        );
         rows.push(Row {
-            number: number
-                .parse()
-                .unwrap_or_else(|_| panic!("row number: {number:?}")),
+            number: number.to_string(),
             flagship: match flagship {
                 "flagship" => true,
                 "-" => false,
@@ -661,12 +667,15 @@ fn the_index_is_well_formed() {
     assert!(rows.len() > 300, "the index lost rows: {}", rows.len());
     let mut previous = 0u32;
     for row in &rows {
-        assert!(
-            row.number > previous,
-            "row {} is out of order (after {previous})",
-            row.number
-        );
-        previous = row.number;
+        // A `NEW` row has no number to order by — it takes one at integration,
+        // which is where the ordering is re-established.
+        if let Ok(number) = row.number.parse::<u32>() {
+            assert!(
+                number > previous,
+                "row {number} is out of order (after {previous})"
+            );
+            previous = number;
+        }
         assert!(
             !row.key.trim().is_empty(),
             "row {} has an empty key",
@@ -674,7 +683,7 @@ fn the_index_is_well_formed() {
         );
         let exempt = KEYS_WITHOUT_A_FRAGMENT
             .iter()
-            .any(|(number, _)| *number == row.number.to_string());
+            .any(|(number, _)| *number == row.number);
         assert!(
             exempt || longest_fragment(&row.key).is_some(),
             "row {}'s key has no literal run of {MIN_FRAGMENT} characters to search for: {:?}.\n\
@@ -686,7 +695,7 @@ fn the_index_is_well_formed() {
     }
     for (number, _) in ROWS_WITHOUT_A_KEY {
         assert!(
-            !rows.iter().any(|row| row.number.to_string() == *number),
+            !rows.iter().any(|row| row.number == *number),
             "row {number} is recorded as keyless but appears in the index"
         );
     }
@@ -732,7 +741,7 @@ fn every_diagnostic_the_compiler_builds_is_indexed() {
         .map(|row| {
             let composed = KEYS_WITHOUT_A_FRAGMENT
                 .iter()
-                .any(|(number, _)| *number == row.number.to_string());
+                .any(|(number, _)| *number == row.number);
             (row, composed)
         })
         .collect();
@@ -886,7 +895,7 @@ fn every_hand_rowed_row_is_in_the_index() {
     let missing: Vec<&str> = ROWS_THE_ENUMERATION_CANNOT_REACH
         .iter()
         .map(|(number, _)| *number)
-        .filter(|number| !rows.iter().any(|row| row.number.to_string() == *number))
+        .filter(|number| !rows.iter().any(|row| row.number == *number))
         .collect();
     assert!(
         missing.is_empty(),
@@ -914,7 +923,7 @@ fn every_hand_rowed_row_is_still_out_of_the_enumerations_reach() {
     let reached: Vec<String> = ROWS_THE_ENUMERATION_CANNOT_REACH
         .iter()
         .filter_map(|(number, _)| {
-            let row = rows.iter().find(|row| row.number.to_string() == *number)?;
+            let row = rows.iter().find(|row| row.number == *number)?;
             sites
                 .iter()
                 .filter(|site| !site.is_note)
@@ -949,7 +958,7 @@ fn every_fragmentless_key_still_has_no_fragment() {
         .filter(|row| {
             KEYS_WITHOUT_A_FRAGMENT
                 .iter()
-                .any(|(number, _)| *number == row.number.to_string())
+                .any(|(number, _)| *number == row.number)
         })
         .filter_map(|row| {
             longest_fragment(&row.key)

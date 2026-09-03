@@ -6122,3 +6122,121 @@ fn a_parenthesised_qualified_literal_is_admitted_in_a_condition() {
         "one\n",
     );
 }
+
+// --- B212: one module may declare a name once ------------------------------
+//
+// Two `struct N`, two `trait N`, a `struct N` beside an `enum N`, a `trait N`
+// beside a `struct N` — every pair was accepted with no diagnostic at all.
+// `name_to_id_map` kept the LAST, so `x: N` resolved by DECLARATION ORDER and
+// the loser's uses failed downstream with messages about something else. Each
+// pin below ran clean before the check existed; the cross-module control is in
+// `tests/module_resolution.rs`, where a second module is a second file.
+
+#[test]
+fn b212_two_structs_of_one_name_are_refused() {
+    assert_fails_with(
+        r#"
+        struct N { a: i32 }
+        struct N { b: i32 }
+        fun main() { print("hi"); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_two_traits_of_one_name_are_refused() {
+    assert_fails_with(
+        r#"
+        trait N { fun go(self): i32; }
+        trait N { fun go2(self): i32; }
+        fun main() { print("hi"); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_a_struct_and_an_enum_of_one_name_are_refused() {
+    // Different SORTS collide too: one name, one meaning, per module.
+    assert_fails_with(
+        r#"
+        struct N { a: i32 }
+        enum N { One, Two }
+        fun main() { print("hi"); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_a_trait_and_a_struct_of_one_name_are_refused_naming_the_first() {
+    // The B184 ambiguity, and the case that shows why the note matters: with
+    // the trait first, `N { a = 41 }` ran (the struct won the map); with the
+    // struct first, the same program failed at the literal with `cannot
+    // initialize a non-struct: N`, which names neither declaration. The note
+    // names the first, at its own span.
+    assert_fails_noting(
+        r#"
+        trait N { fun go(self): i32; }
+        struct N { a: i32 }
+        fun main() { let x = N { a = 41 }; print(x.a); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+        // The first `N` in the source is the TRAIT's name: the note points at
+        // the name, not the block (A1/A4).
+        "N",
+        "'N' is already declared here, as a trait",
+    );
+}
+
+#[test]
+fn b212_two_functions_of_one_name_are_refused() {
+    // Functions were the same silence — `dup()` called the second one — and
+    // they are declarations of a sort like any other.
+    assert_fails_with(
+        r#"
+        fun dup(): i32 { 1 }
+        fun dup(): i32 { 2 }
+        fun main() { print(dup()); }
+        "#,
+        "'dup' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_three_declarations_of_one_name_report_twice() {
+    // Each later declaration is reported against the FIRST, so three copies
+    // produce two reports rather than one or three (the duplicate family's
+    // shape).
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct N { a: i32 }
+        struct N { b: i32 }
+        struct N { c: i32 }
+        fun main() { print("hi"); }
+        "#,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(message, _)| message.contains("'N' is already declared in this module"))
+            .count(),
+        2,
+        "three declarations, two reports; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b212_a_name_declared_once_beside_an_import_of_the_same_name_is_not_a_duplicate() {
+    // An import is not a declaration: it binds a name that another module
+    // declared. The rule counts what THIS module declares.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Show { v: i32 }
+        fun main() { print(Show { v = 3 }.v); }
+        "#,
+        "3\n",
+    );
+}

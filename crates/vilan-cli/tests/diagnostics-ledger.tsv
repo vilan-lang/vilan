@@ -404,3 +404,5 @@ row	flagship	key
 378	-	`impl {subject_name} with {trait}`{inherited} provides no `{member_name}`: an operator trait's method is required at impl time
 379	-	`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — vilan has no `Not` for one to require
 380	-	`-` negates a number, and `{label}` is a trait: no trait names the numeric set — vilan has no `Neg` for one to require
+NEW	-	'{name}' is already declared in this module; remove or rename this one
+NEW	-	'{name}' is {sort}, not a trait: a bound names a trait.

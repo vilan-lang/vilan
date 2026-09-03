@@ -3504,3 +3504,59 @@ fn a_deeper_std_path_is_not_mistaken_for_a_removed_alias() {
         "{errors:#?}"
     );
 }
+
+#[test]
+fn b212_the_same_type_name_in_two_modules_is_allowed() {
+    // The control B212's duplicate rule is scoped by: a module IS a namespace,
+    // and it owns its own scope, so `shapes::N` and `colors::N` are two types
+    // the program can name apart. The rule counts what ONE module declares —
+    // which is why it needs a real second FILE to check, a module being one
+    // source file (`spec/names.md`).
+    let errors = analyze_package(
+        &[
+            ("shapes.vl", "struct N { a: i32 }\n"),
+            ("colors.vl", "struct N { b: str }\n"),
+            (
+                "main.vl",
+                "import std::io::print;\n\
+                 import pkg::shapes;\n\
+                 import pkg::colors;\n\
+                 fun main() {\n\
+                 \tprint((shapes::N { a = 1 }).a);\n\
+                 \tprint((colors::N { b = \"two\" }).b);\n\
+                 }\n\
+                 main();\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "two modules may each declare `N`; got: {errors:#?}"
+    );
+}
+
+#[test]
+fn b212_one_module_declaring_a_name_twice_is_refused_on_disk_too() {
+    // The same rule through the real loader, so the check is not an artifact of
+    // the single-source harness: the module scope a file walks into is the one
+    // the duplicate rule reads.
+    let errors = analyze_package(
+        &[
+            ("shapes.vl", "struct N { a: i32 }\nstruct N { b: str }\n"),
+            (
+                "main.vl",
+                "import pkg::shapes::N;\nfun main() { }\nmain();\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("'N' is already declared in this module")),
+        "{errors:#?}"
+    );
+}

@@ -636,6 +636,10 @@ enclosing `fun`, `impl` or `trait` declares. A parameter that carries a
 bound still **satisfies** a position declared as that trait (the bound is
 what it promises); satisfying is not binding.
 
+A bound names a **trait**. A struct or an enum written in bound position
+(`fun f<T: S>`) is an error naming the sort, not a silent parameter with
+an unusable constraint.
+
 Bounds cut both ways. At a call they are an **obligation** (4 above); at
 a declaration they are an **assumption**: inside the body of whatever
 declares the parameter — a function, an impl, or a trait — the bound

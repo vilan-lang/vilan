@@ -85,6 +85,14 @@ Items within one module share the module scope and are visible
 call one declared later). Local `let` bindings are visible only after
 their declaration.
 
+One module declares a name **once**, whatever the sorts: two `struct N`,
+two `fun n`, a `struct N` beside an `enum N` or a `trait N` are all an
+error at the second declaration, naming the first. Order is not a rule a
+reader can see, and without this it decided which declaration a name
+meant. Two *modules* may each declare `N` freely — a module is a
+namespace, and `shapes::N` and `colors::N` are two types the program can
+name apart.
+
 The full ladder, weakest first: the **prelude** (§4.7) → module items and
 explicit **imports** → enclosing scopes → the innermost local binding.
 Two rungs deserve stating outright, because both are silent:

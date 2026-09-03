@@ -7442,3 +7442,82 @@ fn a_generic_bound_checked_at_many_call_sites_is_evaluated_once_per_type() {
          ({few} -> {many})"
     );
 }
+
+// --- B212: a bound names a trait -------------------------------------------
+//
+// `fun f<T: S>(…)` with `S` a struct was accepted; the only sign was `cannot
+// access field 'v' on type T` at some downstream use, which names neither the
+// bound nor its sort. The refusal goes at the bound, where the fix is.
+
+#[test]
+fn b212_a_struct_written_as_a_bound_is_refused() {
+    assert_fails_with(
+        r#"
+        struct S { v: i32 }
+        fun f<T: S>(x: T): i32 { 1 }
+        fun main() { print(f(S { v = 3 })); }
+        "#,
+        "'S' is a struct, not a trait: a bound names a trait.",
+    );
+}
+
+#[test]
+fn b212_an_enum_written_as_a_bound_is_refused() {
+    assert_fails_with(
+        r#"
+        enum E { One, Two }
+        fun f<T: E>(x: T): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "'E' is an enum, not a trait: a bound names a trait.",
+    );
+}
+
+#[test]
+fn b212_a_bound_one_edit_from_a_trait_steers_to_it() {
+    // The steer runs the `closest_name` channel over the TRAITS in scope, so a
+    // near miss names the trait the author meant rather than leaving them to
+    // find it.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Shov { v: i32 }
+        fun f<T: Shov>(x: T): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "'Shov' is a struct, not a trait: a bound names a trait. Did you mean 'Show'?",
+    );
+}
+
+#[test]
+fn b212_an_impl_binders_bound_is_held_to_the_same_rule() {
+    // The same channel registers an impl binder's bound (`impl Box<type T: S>`),
+    // so the rule reaches it without a second site.
+    assert_fails_with(
+        r#"
+        struct S { v: i32 }
+        struct Box<type T> { value: T }
+        impl Box<type T: S> {
+            fun get(self): T { self.value }
+        }
+        fun main() { print(1); }
+        "#,
+        "'S' is a struct, not a trait: a bound names a trait.",
+    );
+}
+
+#[test]
+fn b212_a_trait_bound_still_binds_and_dispatches() {
+    // The control: a bound that names a trait is untouched.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Show { fun show(self): str; }
+        struct Cat { n: i32 }
+        impl Cat with Show { fun show(self): str { "cat" } }
+        fun tell<T: Show>(x: T): str { x.show() }
+        fun main() { print(tell(Cat { n = 1 })); }
+        "#,
+        "cat\n",
+    );
+}

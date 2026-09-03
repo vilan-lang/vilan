@@ -3418,6 +3418,12 @@ pub struct Analyzer<'src> {
     // Marked here rather than the reverse so the default is the safe one: a
     // type position added later is checked until it says otherwise.
     trait_position_type_ids: HashSet<TypeId>,
+    /// Type ids written in a generic parameter's BOUND position — `<T: S>`, an
+    /// impl binder's `impl Box<type T: S>`. The narrower half of
+    /// `trait_position_type_ids`, which also holds an impl's SUBJECT (`impl Cat
+    /// with Greet`), where a struct is exactly what belongs. A bound is the
+    /// position where only a trait does, and B212 is the refusal that says so.
+    bound_position_type_ids: HashSet<TypeId>,
     // Type ids written as a path HEAD — the subject of a `::` (`Option::None`,
     // `List::from_json_value(..)`, `math::min(..)`, `A::pick(..)`). A head
     // NAMES a namespace to look a member up in; it is not a written type
@@ -4187,6 +4193,7 @@ impl<'src> Analyzer<'src> {
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
+            bound_position_type_ids: HashSet::default(),
             path_head_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
@@ -6005,6 +6012,92 @@ impl<'src> Analyzer<'src> {
         self.report_duplicate_declarations(duplicates);
     }
 
+    /// **One module may declare a name once (B212).** Two `struct N`, two
+    /// `trait N`, a `struct N` beside an `enum N`, a `trait N` beside a
+    /// `struct N` — every pair was accepted in silence. `name_to_id_map` is a
+    /// lookup index and cannot hold two entries for one name, so it kept the
+    /// LAST and `x: N` resolved by DECLARATION ORDER: `trait N` first made `N`
+    /// the struct (and ran), `struct N` first made it the trait (and failed at
+    /// a struct literal with `cannot initialize a non-struct: N`, a message
+    /// that names neither declaration). Order is not a rule anyone can read.
+    ///
+    /// The pair this needs survives in `declaration_order`, which records EVERY
+    /// declaration where the map records a surface — B84's channel, built for
+    /// exactly this shape one scope in. Reported at the SECOND site, naming the
+    /// first (C3), like the rest of the duplicate family; three copies produce
+    /// two reports, each pointing at the original.
+    ///
+    /// Cross-module same-name stays legal, and deliberately: a module IS a
+    /// namespace and owns its own scope, so `a::N` and `b::N` are two types the
+    /// program can name apart. A definition-site check, so it skips frozen std
+    /// entities (S1).
+    fn check_duplicate_module_declarations(&mut self) {
+        // (name, first declaration, second declaration).
+        let mut duplicates: Vec<(&'src str, Id, Id)> = Vec::new();
+        // `module_scope_ids` is a set; sort so the report order is the
+        // program's, not the hasher's (the C1 discipline the duplicate family
+        // already keeps).
+        let mut module_scope_ids: Vec<Id> = self.module_scope_ids.iter().copied().collect();
+        module_scope_ids.sort_by_key(|scope_id| scope_id.0);
+        for scope_id in module_scope_ids {
+            let Some(declarations) = self
+                .scopes
+                .get(&scope_id)
+                .map(|scope| scope.declaration_order.clone())
+            else {
+                continue;
+            };
+            let mut first_by_name: HashMap<&'src str, Id> = HashMap::default();
+            for (name, id) in declarations {
+                if self.declaration_sort(id).is_none() {
+                    continue;
+                }
+                match first_by_name.get(name) {
+                    // ONE entity re-declared into this scope is not two
+                    // declarations: a macro expansion moves its generated items
+                    // into the module scope by name, under the id they already
+                    // have (`walk_generated_expansion`).
+                    Some(first_id) if *first_id == id => {}
+                    Some(first_id) => duplicates.push((name, *first_id, id)),
+                    None => {
+                        first_by_name.insert(name, id);
+                    }
+                }
+            }
+        }
+        duplicates.sort_by_key(|(_, _, second_id)| {
+            let span = self.declaration_name_span(*second_id);
+            (
+                self.source_of_id(*second_id).map(|source| source.0),
+                span.start,
+                span.end,
+            )
+        });
+        for (name, first_id, second_id) in duplicates {
+            if self.frozen_entity(second_id) {
+                continue;
+            }
+            let first_sort =
+                Self::sort_with_article(self.declaration_sort(first_id).unwrap_or("declaration"));
+            let note = Some(crate::error::Note {
+                span: self.declaration_name_span(first_id),
+                msg: format!("'{name}' is already declared here, as {first_sort}"),
+                source: self.source_of_id(first_id),
+            });
+            let msg =
+                format!("'{name}' is already declared in this module; remove or rename this one");
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note,
+                    span: self.declaration_name_span(second_id),
+                    msg,
+                },
+                second_id,
+            );
+        }
+    }
+
     /// **One block may declare a name once (B84).** Two `fun which()` in one
     /// `impl` used to overwrite each other in the scope map, so the program
     /// compiled to the second definition and the first simply did not exist —
@@ -6453,6 +6546,12 @@ impl<'src> Analyzer<'src> {
                 .external_functions
                 .get(external_function_id)
                 .map(|external| external.name_span),
+            // The nominal declarations, for B212's module-level duplicate rule
+            // and its bound refusal: both name a declaration, and A1/A4 wants
+            // the NAME, not the whole `struct { .. }` block.
+            Expr::Struct(struct_id) => self.structs.get(struct_id).map(|struct_| struct_.name_span),
+            Expr::Enum(enum_id) => self.enums.get(enum_id).map(|enum_| enum_.name_span),
+            Expr::Trait(trait_id) => self.traits.get(trait_id).map(|trait_| trait_.name_span),
             _ => None,
         };
         name_span.unwrap_or_else(|| **self.span_map.get(&member_id).unwrap_or(&&EMPTY_SPAN))
@@ -20357,7 +20456,15 @@ impl<'src> Analyzer<'src> {
     ) -> TypeId {
         let bound_type_ids: Vec<TypeId> = bounds
             .iter()
-            .map(|bound| self.walk_trait_position_type_node(bound, scope_id))
+            .map(|bound| {
+                let bound_type_id = self.walk_trait_position_type_node(bound, scope_id);
+                // B212: a bound must name a trait. Recorded here, at the one
+                // place every written bound walks through, so the refusal can
+                // fire in the `prepped_type_locals` drain — where the name has
+                // resolved to a declaration and its sort is known.
+                self.bound_position_type_ids.insert(bound_type_id);
+                bound_type_id
+            })
             .collect();
         let constraint_type_id = bound_type_ids
             .first()
@@ -28440,6 +28547,78 @@ impl<'src> Analyzer<'src> {
     /// "this type" and reached for the trait's name. Inside an unrelated
     /// `impl`, `Self` is that impl's subject and the steer would be wrong, so
     /// only the generic form is offered there.
+    /// A declaration sort with its article — `a struct`, `an enum` — so a
+    /// message built from [`declaration_sort`] reads as English.
+    fn sort_with_article(sort: &str) -> String {
+        match sort.starts_with(['a', 'e', 'i', 'o', 'u']) {
+            true => format!("an {sort}"),
+            false => format!("a {sort}"),
+        }
+    }
+
+    /// What SORT of declaration an entity is, for a message that has to name it
+    /// — `None` for anything that is not a top-level declaration (a generic
+    /// parameter, a local, `Self`).
+    fn declaration_sort(&self, id: Id) -> Option<&'static str> {
+        match self.expr_id_to_expr_map.get(&id) {
+            Some(Expr::Struct(_)) => Some("struct"),
+            Some(Expr::Enum(_)) => Some("enum"),
+            Some(Expr::Trait(_)) => Some("trait"),
+            Some(Expr::Function(_) | Expr::ExternalFunction(_)) => Some("function"),
+            Some(Expr::Module(_)) => Some("module"),
+            _ => None,
+        }
+    }
+
+    /// B212's refusal for a non-trait written as a bound, with the steer to the
+    /// trait the author probably meant when one is in scope under a near name
+    /// (the `closest_name` channel the field-typo steer uses). The note points
+    /// at the declaration, exactly as the bare-trait refusal's does.
+    fn non_trait_in_bound_position(
+        &self,
+        name: &str,
+        sort: &'static str,
+        subject_id: Id,
+        scope_id: Id,
+    ) -> (String, Option<crate::error::Note>) {
+        let sort = Self::sort_with_article(sort);
+        let mut message = format!("'{name}' is {sort}, not a trait: a bound names a trait.");
+        if let Some(suggestion) = self.nearest_trait_name(name, scope_id) {
+            message.push_str(&format!(" Did you mean '{suggestion}'?"));
+        }
+        let note = Some(crate::error::Note {
+            span: self.declaration_name_span(subject_id),
+            msg: format!("'{name}' is declared here, as {sort}"),
+            source: self.source_of_id(subject_id),
+        });
+        (message, note)
+    }
+
+    /// The nearest TRAIT name to `name` among the traits visible from
+    /// `scope_id` — the steer B212's refusal offers when a bound names a
+    /// struct whose spelling is one edit from a trait's.
+    fn nearest_trait_name(&self, name: &str, scope_id: Id) -> Option<&'src str> {
+        let mut candidates: Vec<&'src str> = Vec::new();
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let Some(scope) = self.scopes.get(&id) else {
+                break;
+            };
+            for (candidate, entity_id) in &scope.name_to_id_map {
+                if matches!(
+                    self.expr_id_to_expr_map.get(entity_id),
+                    Some(Expr::Trait(_))
+                ) {
+                    candidates.push(candidate);
+                }
+            }
+            current = scope.parent_id;
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        closest_name::closest_name(name, candidates)
+    }
+
     fn bare_trait_in_value_position(
         &self,
         trait_id: Id,
@@ -33841,6 +34020,29 @@ impl<'src> Analyzer<'src> {
                             argument_type_ids.len(),
                         ),
                     };
+                    // B212: a STRUCT or an ENUM written where a bound belongs.
+                    // It was accepted in silence — `fun f<T: S>(x: T)` bound `T`
+                    // by a struct, and the only sign was `cannot access field
+                    // 'v' on type T` at some use, which names neither the bound
+                    // nor its sort. The mirror of the bare-trait-in-value-
+                    // position refusal below, and it goes at the same place:
+                    // the declaration, where the fix is.
+                    if self.bound_position_type_ids.contains(&type_id)
+                        && let Some(sort) = self.declaration_sort(subject_id)
+                        && sort != "trait"
+                    {
+                        let (message, note) =
+                            self.non_trait_in_bound_position(name, sort, subject_id, scope_id);
+                        self.push_in_source(
+                            Error {
+                                trace: Vec::new(),
+                                note,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                        );
+                    }
                     let refused_arity = arity_error.is_some();
                     if let Some(message) = arity_error {
                         // Attributed to the walk that wrote the annotation, for
@@ -43700,6 +43902,10 @@ fn analyze_over_world<'src>(
     // convention, arity, parameter conventions/types, and return type. Runs
     // post-build so declared types are resolved.
     analyzer.check_trait_conformance();
+    // One module declaring one name twice (B212) — the outermost member of the
+    // duplicate family, and the one whose absence made declaration ORDER decide
+    // which of two same-named types a name meant.
+    analyzer.check_duplicate_module_declarations();
     // Two impls declaring one name for one subject (B57): a coherence rule, so
     // it runs at the definition site rather than waiting for a call to pick
     // between them. After conformance, so an impl's `with`-clause traits are
