@@ -784,7 +784,14 @@ macro fun struct_json_impls(target: StructItem): str {
 	// Decoding is fallible (I3): `from_json` parses the text without crashing,
 	// `from_json_value` checks each field is present (naming a missing one) and
 	// threads a leaf failure with `!`.
-	let result_type = i"Result<{target.name}, str>";
+	//
+	// The subject is spelled as an APPLICATION of its own parameters
+	// (`Handle<T>`) in every type role, and the impl binds them with the
+	// derived trait (B194's rule). A path head (`Handle::from_json_value(..)`)
+	// and a struct literal head name a namespace, not an application, so they
+	// keep the bare name.
+	let subject = target.subject();
+	let result_type = i"Result<{subject}, str>";
 	let from_json = fun_of("from_json")
 		.parameter("text: str")
 		.returns(result_type)
@@ -806,10 +813,12 @@ macro fun struct_json_impls(target: StructItem): str {
 	}
 	from_json_value = from_json_value.expr(i"Result::Ok({literal.render()})");
 	impl_of(target.name)
+		.generics(target.binders("Json"))
 		.implements("Json")
 		.method(to_json)
 		.render()
 		+ impl_of(target.name)
+			.generics(target.binders("FromJson"))
 			.implements("FromJson")
 			.method(from_json)
 			.method(from_json_value)
@@ -833,7 +842,7 @@ macro fun struct_wire_impls(target: StructItem): str {
 	mut rebuild = fun_of("rebuild")
 		.generics("<D: Deserialize>")
 		.parameter("deserializer: D")
-		.returns(target.name)
+		.returns(target.subject())
 		.line("deserializer.begin_struct();");
 	mut literal = init_of(target.name);
 	for field in target.fields {
@@ -843,13 +852,24 @@ macro fun struct_wire_impls(target: StructItem): str {
 		literal = literal.field(field.name, field.name);
 	}
 	rebuild = rebuild.line("deserializer.end_struct();").expr(literal.render());
-	impl_of(target.name).implements("Wire").method(describe).method(rebuild).render()
+	impl_of(target.name)
+		.generics(target.binders("Wire"))
+		.implements("Wire")
+		.method(describe)
+		.method(rebuild)
+		.render()
 }
 
 macro fun enum_json_impls(target: EnumItem): str {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, quote, join };
 
+	// The subject spelled as an APPLICATION of its own parameters
+	// (`Either<L, R>`) in every type role, with the impl binding them under the
+	// derived trait (B194's rule). Variant paths (`Either::Left`) and the
+	// static `from_json_value` head name a namespace, not an application, and
+	// keep the bare name.
+	let subject = target.subject();
 	// A BACKED enum encodes AS ITS BACKING VALUE (proposal/backed-enums.md
 	// §3.9): `Align::Start` is `"start"` on the wire, not `"Start"`, and it
 	// round-trips through the synthesized `parse`. Both directions delegate —
@@ -862,7 +882,7 @@ macro fun enum_json_impls(target: EnumItem): str {
 		} else if target.backing_type == "i53" {
 			coerce = "coerce_i53";
 		}
-		let backed_result = i"Result<{target.name}, str>";
+		let backed_result = i"Result<{subject}, str>";
 		let backed_to_json = fun_of("to_json").parameter("self").returns("str").expr("self.value().to_json()");
 		let backed_from_json = fun_of("from_json")
 			.parameter("text: str")
@@ -873,10 +893,12 @@ macro fun enum_json_impls(target: EnumItem): str {
 			.returns(backed_result)
 			.expr(i"{target.name}::parse({coerce}(value)).ok_or(\"unknown value in JSON for enum {target.name}\")");
 		ret impl_of(target.name)
+			.generics(target.binders("Json"))
 			.implements("Json")
 			.method(backed_to_json)
 			.render()
 			+ impl_of(target.name)
+				.generics(target.binders("FromJson"))
 				.implements("FromJson")
 				.method(backed_from_json)
 				.method(backed_from_json_value)
@@ -934,7 +956,7 @@ macro fun enum_json_impls(target: EnumItem): str {
 		}
 	}
 	from_arms = from_arms.arm("_", i"Result::Err(\"unknown variant in JSON for enum {target.name}\")");
-	let result_type = i"Result<{target.name}, str>";
+	let result_type = i"Result<{subject}, str>";
 	let to_json = fun_of("to_json").parameter("self").returns("str").expr(to_arms.render());
 	let from_json = fun_of("from_json")
 		.parameter("text: str")
@@ -945,10 +967,12 @@ macro fun enum_json_impls(target: EnumItem): str {
 		.returns(result_type)
 		.expr(from_arms.render());
 	impl_of(target.name)
+		.generics(target.binders("Json"))
 		.implements("Json")
 		.method(to_json)
 		.render()
 		+ impl_of(target.name)
+			.generics(target.binders("FromJson"))
 			.implements("FromJson")
 			.method(from_json)
 			.method(from_json_value)
@@ -963,6 +987,9 @@ macro fun enum_wire_impls(target: EnumItem): str {
 	if target.variants.len() == 0 {
 		ret "";
 	}
+	// The subject as an application of its own parameters (B194), the impl
+	// binding them under `Wire`.
+	let subject = target.subject();
 	// §3.9's backed form: the backing value is what crosses, so both directions
 	// delegate to the backing type's own `Wire` impl and to `parse`. The
 	// unknown-value path is the tagged form's, kept: a host sending a value
@@ -992,11 +1019,16 @@ macro fun enum_wire_impls(target: EnumItem): str {
 		mut backed_rebuild = fun_of("rebuild")
 			.generics("<D: Deserialize>")
 			.parameter("deserializer: D")
-			.returns(target.name);
+			.returns(subject);
 		for line in rebuild_body {
 			backed_rebuild = backed_rebuild.line(line);
 		}
-		ret impl_of(target.name).implements("Wire").method(backed_describe).method(backed_rebuild).render();
+		ret impl_of(target.name)
+			.generics(target.binders("Wire"))
+			.implements("Wire")
+			.method(backed_describe)
+			.method(backed_rebuild)
+			.render();
 	}
 	mut describe_arms = match_of("self");
 	for variant in target.variants {
@@ -1074,10 +1106,15 @@ macro fun enum_wire_impls(target: EnumItem): str {
 	let rebuild = fun_of("rebuild")
 		.generics("<D: Deserialize>")
 		.parameter("deserializer: D")
-		.returns(target.name)
+		.returns(subject)
 		.line("let tag = deserializer.variant_tag();")
 		.expr(rebuild_arms.render());
-	impl_of(target.name).implements("Wire").method(describe).method(rebuild).render()
+	impl_of(target.name)
+		.generics(target.binders("Wire"))
+		.implements("Wire")
+		.method(describe)
+		.method(rebuild)
+		.render()
 }
 
 macro fun Json(item: Item): Source {

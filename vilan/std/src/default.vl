@@ -29,8 +29,13 @@ macro fun Default(item: Item): Source {
 		for field in target.fields {
 			literal = literal.field(field.name, i"{field.type_.render()}::default()");
 		}
-		let constructor = fun_of("default").returns(target.name).expr(literal.render());
+		// The subject is spelled as an application of its own parameters
+		// (`Holder<T>`) where a TYPE is wanted, and the impl binds them under
+		// `Default` (B194's rule); the struct literal's head names a namespace
+		// and stays bare.
+		let constructor = fun_of("default").returns(target.subject()).expr(literal.render());
 		ret source("import std::default::Default;\n" + impl_of(target.name)
+			.generics(target.binders("Default"))
 			.implements("Default")
 			.method(constructor)
 			.render());

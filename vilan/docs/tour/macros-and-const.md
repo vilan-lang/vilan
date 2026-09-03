@@ -96,7 +96,7 @@ macro fun derive_display(item: Item): Source {
 
 	let target = match item.as_struct() {
 		Some(let found) => found,
-		None => StructItem { name = "?", fields = [] },
+		None => StructItem { name = "?", fields = [], generics = [] },
 	};
 	mut arms = "";
 	mut first = true;

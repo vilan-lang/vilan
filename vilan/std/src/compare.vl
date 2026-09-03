@@ -226,12 +226,17 @@ macro fun PartialEq(item: Item): Source {
 		if comparison == "" {
 			comparison = "true";
 		}
+		// `other` is the subject spelled as an application of its own
+		// parameters (`Holder<T>`), and the impl binds them under `PartialEq`
+		// (B194's rule) — a bare `Holder` there is an under-supplied
+		// application (B188).
 		let eq = fun_of("eq")
 			.parameter("self")
-			.parameter(i"other: {target.name}")
+			.parameter(i"other: {target.subject()}")
 			.returns("bool")
 			.expr(comparison);
 		ret source("import std::compare::PartialEq;\n" + impl_of(target.name)
+			.generics(target.binders("PartialEq"))
 			.implements("PartialEq")
 			.method(eq)
 			.render());
@@ -263,10 +268,11 @@ macro fun PartialEq(item: Item): Source {
 		arms = arms.arm("_", "false");
 		let eq = fun_of("eq")
 			.parameter("self")
-			.parameter(i"other: {target.name}")
+			.parameter(i"other: {target.subject()}")
 			.returns("bool")
 			.expr(arms.render());
 		ret source("import std::compare::PartialEq;\n" + impl_of(target.name)
+			.generics(target.binders("PartialEq"))
 			.implements("PartialEq")
 			.method(eq)
 			.render());

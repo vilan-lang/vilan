@@ -47,9 +47,152 @@ export struct Field {
 	exposed: bool,
 }
 
+// One declared generic parameter of a struct or enum: its name, its written
+// trait bounds (`T: Json + Debug` collects both), and its default AS WRITTEN
+// (the `Self` in `<B = Self>`) or `""` when it has none. A parameter carrying
+// a TUPLE bound (`T: (2..)`) reads with an empty `bounds` — the tuple form
+// replaces the trait-bound list and has no v1 spelling here.
+//
+// The subject's parameters are what keep a generated impl from spelling the
+// subject BARE in an applied position: `[derive(Wire)]` on `struct Handle<T>`
+// must emit `impl Handle<type T>` over `Handle<T>`, never `impl Handle` over
+// `Handle` (B194; the erasure that let the bare form type-check is B188).
+export struct GenericParameter {
+	name: str,
+	bounds: List<TypeExpr>,
+	default_: str,
+}
+
+// The subject as a derived impl must spell it in EVERY applied role — a
+// parameter's type, a return type, a `Result` argument: `Handle<T>` for a
+// generic type, `Point` for a plain one. A path HEAD (`Handle::rebuild(..)`)
+// and a struct LITERAL head name a namespace rather than an application, and
+// keep the bare name.
+fun subject_spelling(name: str, generics: List<GenericParameter>): str {
+	if generics.len() == 0 {
+		ret name;
+	}
+	mut rendered = name + "<";
+	mut first = true;
+	for parameter in generics {
+		if first {
+			first = false;
+		} else {
+			rendered = rendered + ", ";
+		}
+		rendered = rendered + parameter.name;
+	}
+	rendered + ">"
+}
+
+// A derived impl's binder list, brackets included: `<type T: Json>`. THE RULE
+// (B194): the derived trait is required on every REACHED parameter — one the
+// generated body can call that trait's members on, because some field or
+// variant payload is typed by it — and a parameter nothing reaches gets a bare
+// binder, `<type T>`.
+//
+// This DEPARTS from Rust's derive rule (the trait on every parameter, reached
+// or not), and the departure is C7's. A `[derive(Wire)]` subject's parameter
+// may be PHANTOM — `std::arena`'s `Handle<T>` is two integers and its `T`
+// names the arena, never the payload — and C7 rules that a handle is sendable
+// whatever it names ("a name is not the thing it names"), which is the whole
+// point of the naming layer: the entity stays on the server and never has to
+// be Wire. Rust's rule would make `Handle<Session>` un-sendable for a
+// `Session` that is not Wire, contradicting that ruling, `docs/std/cells.md`
+// and `docs/guide/services.md`. Reachability is exact here in a way it cannot
+// be in Rust, where `PhantomData<T>` mentions `T`: a vilan phantom parameter
+// appears in no field type at all, so "mentioned by a written member type" IS
+// the test.
+//
+// The declaration's own bounds and defaults belong to the declaration, not to
+// the impl, so neither is repeated here. A non-generic subject binds nothing
+// and renders `""`.
+fun derive_binders(generics: List<GenericParameter>, reached: List<str>, trait_name: str): str {
+	if generics.len() == 0 {
+		ret "";
+	}
+	mut rendered = "<";
+	mut first = true;
+	for parameter in generics {
+		if first {
+			first = false;
+		} else {
+			rendered = rendered + ", ";
+		}
+		mut is_reached = false;
+		for name in reached {
+			if name == parameter.name {
+				is_reached = true;
+			}
+		}
+		if is_reached {
+			rendered = rendered + i"type {parameter.name}: {trait_name}";
+		} else {
+			rendered = rendered + i"type {parameter.name}";
+		}
+	}
+	rendered + ">"
+}
+
+// Whether a written type MENTIONS a parameter, at any depth: `T` does,
+// `List<T>` does, `Option<Map<str, T>>` does, `i32` does not. A parameter no
+// member type mentions is PHANTOM — the generated body never has a value of it
+// to call anything on — and takes a bare binder.
+fun mentions(type_: TypeExpr, parameter: str): bool {
+	if type_.name == parameter {
+		ret true;
+	}
+	// A type form this surface cannot decompose — a tuple, a closure, a
+	// reference, a mapped type — arrives as opaque SOURCE TEXT in `name` with
+	// no arguments (see `construct_type_expr`). It may mention any parameter,
+	// so it is read as reaching all of them. That falls back to Rust's rule
+	// (over-constrain, and the use site says so plainly) rather than to a bare
+	// binder over a body the generated code cannot compile.
+	if opaque_type_text(type_.name) {
+		ret true;
+	}
+	for argument in type_.arguments {
+		if mentions(argument, parameter) {
+			ret true;
+		}
+	}
+	false
+}
+
+// Whether a `TypeExpr` name is raw source text rather than a written type's
+// head identifier — the punctuation no named head can contain.
+fun opaque_type_text(name: str): bool {
+	name.contains("(") || name.contains("[") || name.contains("|") || name.contains("&")
+		|| name.contains(",") || name.contains(" ") || name.contains("*")
+}
+
 export struct StructItem {
 	name: str,
 	fields: List<Field>,
+	generics: List<GenericParameter>,
+}
+
+impl StructItem {
+	// `Handle<T>` — this struct spelled as an application of its own
+	// parameters, for every role in a derived impl that takes a type.
+	fun subject(self): str {
+		subject_spelling(self.name, self.generics)
+	}
+
+	// `<type T: Json>` — the binder list for an `impl .. with {trait_name}`
+	// over this struct. A parameter some FIELD type mentions is bound under
+	// the trait; a phantom one takes a bare binder.
+	fun binders(self, trait_name: str): str {
+		mut reached: List<str> = [];
+		for parameter in self.generics {
+			for field in self.fields {
+				if mentions(field.type_, parameter.name) {
+					reached.push(parameter.name);
+				}
+			}
+		}
+		derive_binders(self.generics, reached, trait_name)
+	}
 }
 
 // One enum variant: its name, its payload types (empty for a bare variant), and
@@ -73,6 +216,33 @@ export struct EnumItem {
 	name: str,
 	variants: List<Variant>,
 	backing_type: str,
+	generics: List<GenericParameter>,
+}
+
+impl EnumItem {
+	// `Either<L, R>` — this enum spelled as an application of its own
+	// parameters, for every role in a derived impl that takes a type.
+	fun subject(self): str {
+		subject_spelling(self.name, self.generics)
+	}
+
+	// `<type L: Json, type R: Json>` — the binder list for an
+	// `impl .. with {trait_name}` over this enum. A parameter some variant
+	// PAYLOAD mentions is bound under the trait; a phantom one takes a bare
+	// binder.
+	fun binders(self, trait_name: str): str {
+		mut reached: List<str> = [];
+		for parameter in self.generics {
+			for variant in self.variants {
+				for payload in variant.payload {
+					if mentions(payload, parameter.name) {
+						reached.push(parameter.name);
+					}
+				}
+			}
+		}
+		derive_binders(self.generics, reached, trait_name)
+	}
 }
 
 export struct FunctionItem {

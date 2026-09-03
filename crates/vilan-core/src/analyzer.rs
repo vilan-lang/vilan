@@ -5461,11 +5461,22 @@ impl<'src> Analyzer<'src> {
     /// A derived type's generic arguments are deliberately unconstrained (C7's
     /// phantom-parameter condition): a `[derive(Wire)]` type can only ever have
     /// PHANTOM parameters, because a field typed by a parameter (`value: T`, or
-    /// `List<T>`) fails this very check at the type's own declaration — the
-    /// derive emits no generic impls. So the arguments cannot reach the payload,
-    /// and `Handle<Database>` is as sendable as `Handle<i32>` (a name is not the
-    /// thing it names). If generic Wire derives ever land, the argument check
-    /// lands with them.
+    /// `List<T>`) fails this very check at the type's own declaration. So the
+    /// arguments cannot reach the payload, and `Handle<Database>` is as sendable
+    /// as `Handle<i32>` (a name is not the thing it names).
+    ///
+    /// B194 made the derive generators generic-aware, and this rule is what
+    /// decides how. A derived impl now BINDS the subject's parameters under the
+    /// trait it derives — but only the parameters the generated body REACHES,
+    /// and the paragraph above is exactly why the exception exists: for `Wire`
+    /// the reached case is unreachable (this check refuses it first), so binding
+    /// every parameter the way Rust does would buy nothing and would cost C7 —
+    /// `Handle<Session>` would need `Session: Wire`. The phantom parameter
+    /// therefore takes a bare binder, `impl Handle<type T> with Wire`, and this
+    /// check remains the whole of the Wire argument story. If the declaration
+    /// rule above is ever relaxed to admit a parameter-typed field, the argument
+    /// check lands with it AND `Wire`'s reached parameters start binding, both
+    /// on the same day.
     fn is_wire_type(&self, node: &Node) -> bool {
         match node {
             Node::Accessor(name) => {
@@ -33622,31 +33633,31 @@ impl<'src> Analyzer<'src> {
                     // family: annotations are checked, never inferred) — the
                     // missing argument has nothing to come from.
                     //
-                    // WRITTEN is the operative word, and the two exemptions
-                    // both fall out of it. A path HEAD (`Option::None`,
-                    // `List::from_json_value(..)`) names a namespace, not a
-                    // type, so its arity is nobody's to supply. And GENERATED
-                    // code is not written by the author at all: today's derive
-                    // generators spell a subject by its bare name in every
-                    // role, so `[derive(Wire)]` on `struct Handle<T>`
-                    // (`std/src/arena.vl`) emits `impl Handle with Json` and
-                    // `Result<Handle, str>` — under-supplied applications the
-                    // erasure this fix removes is exactly what let type-check.
-                    // Refusing them would report, at a span the author cannot
-                    // edit, a defect in the GENERATOR; and making the
-                    // generators generic-aware is a ruling rather than a fix
-                    // (the reflection surface a macro sees —
-                    // `macro_std/src/meta.vl`'s `StructItem`/`EnumItem` —
-                    // carries no generic parameters at all, and a derived impl
-                    // over a parameter needs BOUNDS nothing computes:
-                    // `impl Box<type T: Json> with Json`). So the rule is total
-                    // over what a program writes, and the generator half is
-                    // filed rather than half-shipped.
-                    let written_by_the_author =
-                        source_id != DERIVED_SOURCE && !self.path_head_type_ids.contains(&type_id);
-                    let arity_error = match written_by_the_author {
-                        false => None,
-                        true => self.written_application_arity_error(
+                    // ONE exemption survives, and it falls out of what an
+                    // application IS: a path HEAD (`Option::None`,
+                    // `List::from_json_value(..)`) names a namespace to look a
+                    // member up in, not a type, so its arity is nobody's to
+                    // supply.
+                    //
+                    // GENERATED code is held to the same rule (B194). B188
+                    // shipped with a second exemption for it, because the
+                    // derive generators spelled a subject by its bare name in
+                    // EVERY role — `[derive(Wire)]` on `struct Handle<T>`
+                    // (`std/src/arena.vl`) emitted `impl Handle with Json` and
+                    // `Result<Handle, str>`, under-supplied applications that
+                    // the erasure B188 removed was exactly what let
+                    // type-check. B194 closed that at the source instead: the
+                    // macro reflection surface carries the subject's generic
+                    // parameters (`macro_std/src/meta.vl`'s `GenericParameter`),
+                    // both backends spell the subject as an application of them
+                    // (`Handle<T>`), and each derived impl binds them under the
+                    // trait it derives (`impl Handle<type T: Json> with Json`).
+                    // With the generators generic-aware, exempting them would
+                    // only hide the next generator that forgets.
+                    let is_path_head = self.path_head_type_ids.contains(&type_id);
+                    let arity_error = match is_path_head {
+                        true => None,
+                        false => self.written_application_arity_error(
                             subject_id,
                             &subject_type,
                             name,
@@ -39271,14 +39282,17 @@ fn render_type(node: &Node<'_>) -> String {
 
 /// The synthesized trait impls for a `[derive(..)]` enum. Each derive is built
 /// from the variants (their names and payload arities) via a `match`. `Default`
-/// is skipped — an enum has no unambiguous default variant. (Generic enums are
-/// not yet handled; the missing impl surfaces naturally at the use site.)
+/// is skipped — an enum has no unambiguous default variant. A GENERIC enum is
+/// spelled through its [`DerivedSubject`]: `Either<L, R>` in every type role,
+/// `impl Either<type L: Debug, type R: Debug>` on the header (B194).
 fn derive_enum_impls(
     derives: &[&str],
-    enum_name: &str,
+    subject: &DerivedSubject<'_>,
     variants: &Spanned<Vec<Spanned<crate::node::EnumVariant<'_>>>>,
     backing_type: Option<&'static str>,
 ) -> String {
+    let enum_name = subject.name;
+    let applied = subject.applied();
     // §3.9: a BACKED enum serializes AS ITS BACKING VALUE, for both `Json` and
     // `Wire`. `Align::Start` encodes as `"start"`, not `"Start"`.
     //
@@ -39312,11 +39326,12 @@ fn derive_enum_impls(
             // The canonical key is the JSON of the value (I1).
             "Hashable" => {
                 out.push_str(&format!(
-                    "impl {enum_name} with Hashable {{\n\
+                    "impl {enum_name}{} with Hashable {{\n\
                      \tfun hash(self): Hash {{\n\
                      \t\tcanonical_hash(self)\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("Hashable"),
                 ));
             }
             "PartialEq" => {
@@ -39349,11 +39364,12 @@ fn derive_enum_impls(
                 }
                 arms.push_str("\t\t\t_ => false,\n");
                 out.push_str(&format!(
-                    "impl {enum_name} with PartialEq {{\n\
-                     \tfun eq(self, other: {enum_name}): bool {{\n\
+                    "impl {enum_name}{} with PartialEq {{\n\
+                     \tfun eq(self, other: {applied}): bool {{\n\
                      \t\tmatch (self, other) {{\n{arms}\t\t}}\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("PartialEq"),
                 ));
             }
             "Debug" => {
@@ -39379,11 +39395,12 @@ fn derive_enum_impls(
                     }
                 }
                 out.push_str(&format!(
-                    "impl {enum_name} with Debug {{\n\
+                    "impl {enum_name}{} with Debug {{\n\
                      \tfun debug(self): str {{\n\
                      \t\tmatch self {{\n{arms}\t\t}}\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("Debug"),
                 ));
             }
             "Json" | "Wire" => {
@@ -39394,11 +39411,12 @@ fn derive_enum_impls(
                 // neither direction re-implements JSON quoting here.
                 if let Some(backing_type) = backing_type {
                     out.push_str(&format!(
-                        "impl {enum_name} with Json {{\n\
+                        "impl {enum_name}{} with Json {{\n\
                          \tfun to_json(self): str {{\n\
                          \t\tself.value().to_json()\n\
                          \t}}\n\
-                         }}\n"
+                         }}\n",
+                        subject.binders("Json"),
                     ));
                     let coerce = match backing_type {
                         "str" => "coerce_str",
@@ -39406,20 +39424,21 @@ fn derive_enum_impls(
                         _ => "coerce_i32",
                     };
                     out.push_str(&format!(
-                        "impl {enum_name} with FromJson {{\n\
-                         \tfun from_json(text: str): Result<{enum_name}, str> {{\n\
+                        "impl {enum_name}{} with FromJson {{\n\
+                         \tfun from_json(text: str): Result<{applied}, str> {{\n\
                          \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
                          \t}}\n\
-                         \tfun from_json_value(value: JsonValue): Result<{enum_name}, str> {{\n\
+                         \tfun from_json_value(value: JsonValue): Result<{applied}, str> {{\n\
                          \t\t{enum_name}::parse({coerce}(value)).ok_or(\"unknown value in JSON for enum {enum_name}\")\n\
                          \t}}\n\
-                         }}\n"
+                         }}\n",
+                        subject.binders("FromJson"),
                     ));
                     if *derive == "Wire" {
                         let first_variant =
                             variants.first().map(|(name, _)| *name).unwrap_or(enum_name);
                         out.push_str(&backed_enum_wire_visitor_impls(
-                            enum_name,
+                            subject,
                             backing_type,
                             first_variant,
                         ));
@@ -39454,11 +39473,12 @@ fn derive_enum_impls(
                     }
                 }
                 out.push_str(&format!(
-                    "impl {enum_name} with Json {{\n\
+                    "impl {enum_name}{} with Json {{\n\
                      \tfun to_json(self): str {{\n\
                      \t\tmatch self {{\n{arms}\t\t}}\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("Json"),
                 ));
                 // The reverse direction: read the externally-tagged discriminator,
                 // then rebuild that variant from the host value. A no-payload tag is
@@ -39499,19 +39519,20 @@ fn derive_enum_impls(
                     "\t\t\t_ => Result::Err(\"unknown variant in JSON for enum {enum_name}\"),\n"
                 ));
                 out.push_str(&format!(
-                    "impl {enum_name} with FromJson {{\n\
-                     \tfun from_json(text: str): Result<{enum_name}, str> {{\n\
+                    "impl {enum_name}{} with FromJson {{\n\
+                     \tfun from_json(text: str): Result<{applied}, str> {{\n\
                      \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
                      \t}}\n\
-                     \tfun from_json_value(value: JsonValue): Result<{enum_name}, str> {{\n\
+                     \tfun from_json_value(value: JsonValue): Result<{applied}, str> {{\n\
                      \t\tmatch value.tag() {{\n{arms}\t\t}}\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("FromJson"),
                 ));
                 // `[derive(Wire)]` also targets the §6.1 visitor (see the
                 // struct arm's note).
                 if *derive == "Wire" {
-                    out.push_str(&enum_wire_visitor_impls(enum_name, &variants));
+                    out.push_str(&enum_wire_visitor_impls(subject, &variants));
                 }
             }
             _ => {}
@@ -40061,15 +40082,137 @@ fn integer_backing_type(variants: &[VariantBacking<'_>]) -> &'static str {
     }
 }
 
+/// How a derive generator must SPELL its subject (B194). A generic subject is
+/// an APPLICATION of its own parameters in every type role — `Handle<T>`, never
+/// the bare `Handle`, which is an under-supplied application (B188) — and each
+/// generated impl BINDS those parameters under the trait it derives:
+/// `impl Handle<type T: Wire> with Wire`.
+///
+/// THE RULE (ruled, B194): the derived trait is required on EVERY parameter —
+/// Rust's derive rule — because the generated body calls that trait's members
+/// on every field, and a field may be typed by any parameter. The declaration's
+/// own bounds and defaults belong to the declaration, not to the impl, so
+/// neither is repeated in the binder list.
+///
+/// A path HEAD (`Handle::from_json_value(..)`), a struct LITERAL head
+/// (`Handle { index = .. }`) and display text name a namespace or a word rather
+/// than an application, and keep the bare name.
+///
+/// The mirror of `macro_std::meta`'s `subject_spelling` / `derive_binders`,
+/// which the vilan derive macros spell their subjects with; the two backends
+/// must not disagree.
+struct DerivedSubject<'a> {
+    name: &'a str,
+    /// Each declared parameter and whether the generated body REACHES it —
+    /// some field type (struct) or variant payload (enum) is written in terms
+    /// of it, so the body will call the derived trait's members on a value of
+    /// that type. A parameter nothing reaches is PHANTOM.
+    parameters: Vec<(&'a str, bool)>,
+}
+
+impl<'a> DerivedSubject<'a> {
+    /// `member_types` is every written field type or variant payload type — it
+    /// is what decides reachability, so a caller that cannot supply them would
+    /// call every parameter phantom and under-bind.
+    fn of(
+        name: &'a str,
+        generic_parameters: &'a Option<GenericParameters<'a>>,
+        member_types: &[&Spanned<Node<'a>>],
+    ) -> Self {
+        let parameters = generic_parameters
+            .iter()
+            .flat_map(|parameters| &parameters.0)
+            .map(|parameter| {
+                let reached = member_types
+                    .iter()
+                    .any(|member| type_mentions(&member.0, parameter.name));
+                (parameter.name, reached)
+            })
+            .collect();
+        Self { name, parameters }
+    }
+
+    /// `Handle<T>` — the subject in a type role; the bare name when it has no
+    /// parameters.
+    fn applied(&self) -> String {
+        match self.parameters.is_empty() {
+            true => self.name.to_string(),
+            false => format!(
+                "{}<{}>",
+                self.name,
+                self.parameters
+                    .iter()
+                    .map(|(parameter, _)| *parameter)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// `<type T: Wire>` — the binder list of an impl deriving `trait_name`;
+    /// empty for a non-generic subject. A REACHED parameter carries the trait;
+    /// a phantom one takes a bare binder (`<type T>`), which is the C7
+    /// departure from Rust's rule that `derive_binders` in
+    /// `macro_std/src/meta.vl` documents in full.
+    fn binders(&self, trait_name: &str) -> String {
+        match self.parameters.is_empty() {
+            true => String::new(),
+            false => format!(
+                "<{}>",
+                self.parameters
+                    .iter()
+                    .map(|(parameter, reached)| match reached {
+                        true => format!("type {parameter}: {trait_name}"),
+                        false => format!("type {parameter}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// Whether a written type MENTIONS `parameter` at any depth: `T` does,
+/// `List<T>` does, `Option<Map<str, T>>` does, `i32` does not.
+///
+/// Every form this cannot decompose answers `true` — a tuple, a closure, a
+/// reference may mention any parameter, and reading them as reaching all of
+/// them falls back to Rust's rule (over-constrain, which the use site reports
+/// plainly) rather than to a bare binder over a body that will not compile.
+/// The mirror of `mentions` / `opaque_type_text` in `macro_std/src/meta.vl`.
+fn type_mentions(node: &Node<'_>, parameter: &str) -> bool {
+    match node {
+        Node::Accessor(name) => *name == parameter,
+        Node::AccessorWithGenerics(name, arguments) => {
+            *name == parameter
+                || arguments
+                    .0
+                    .iter()
+                    .any(|argument| type_mentions(&argument.0, parameter))
+        }
+        _ => true,
+    }
+}
+
 pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> String {
     if let Node::Enum(name, generic_parameters, resource, variants) = &item.0 {
         let backing_type = enum_backing_type(name.0, generic_parameters, *resource, &variants.0);
-        return derive_enum_impls(derives, name.0, variants, backing_type);
+        let payloads: Vec<&Spanned<Node>> =
+            variants.0.iter().flat_map(|variant| &variant.0.1).collect();
+        let subject = DerivedSubject::of(name.0, generic_parameters, &payloads);
+        return derive_enum_impls(derives, &subject, variants, backing_type);
     }
-    let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
+    let Node::Struct(name, generic_parameters, _external, _resource, Some(fields)) = &item.0 else {
         return String::new();
     };
     let struct_name = name.0;
+    let field_types: Vec<&Spanned<Node>> = fields
+        .0
+        .iter()
+        .filter_map(|field| field.0.1.as_ref())
+        .collect();
+    let subject = DerivedSubject::of(struct_name, generic_parameters, &field_types);
+    let applied = subject.applied();
     let fields: Vec<(&str, String)> = fields
         .0
         .iter()
@@ -40099,9 +40242,10 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                         .collect::<Vec<_>>()
                         .join(" && ")
                 };
+                let binders = subject.binders("PartialEq");
                 out.push_str(&format!(
-                    "impl {struct_name} with PartialEq {{\n\
-                     \tfun eq(self, other: {struct_name}): bool {{\n\
+                    "impl {struct_name}{binders} with PartialEq {{\n\
+                     \tfun eq(self, other: {applied}): bool {{\n\
                      \t\t{comparison}\n\
                      \t}}\n\
                      }}\n"
@@ -40110,8 +40254,9 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
             // The canonical key is the JSON of the value (I1); the all-fields
             // check has already rejected any non-Hashable field.
             "Hashable" => {
+                let binders = subject.binders("Hashable");
                 out.push_str(&format!(
-                    "impl {struct_name} with Hashable {{\n\
+                    "impl {struct_name}{binders} with Hashable {{\n\
                      \tfun hash(self): Hash {{\n\
                      \t\tcanonical_hash(self)\n\
                      \t}}\n\
@@ -40125,9 +40270,10 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                     .map(|(field, type_)| format!("{field} = {type_}::default()"))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let binders = subject.binders("Default");
                 out.push_str(&format!(
-                    "impl {struct_name} with Default {{\n\
-                     \tfun default(): {struct_name} {{\n\
+                    "impl {struct_name}{binders} with Default {{\n\
+                     \tfun default(): {applied} {{\n\
                      \t\t{struct_name} {{ {initializers} }}\n\
                      \t}}\n\
                      }}\n"
@@ -40146,8 +40292,9 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                         .join(" + \", \" + ");
                     format!("\"{struct_name} {{ \" + {parts} + \" }}\"")
                 };
+                let binders = subject.binders("Debug");
                 out.push_str(&format!(
-                    "impl {struct_name} with Debug {{\n\
+                    "impl {struct_name}{binders} with Debug {{\n\
                      \tfun debug(self): str {{\n\
                      \t\t{body}\n\
                      \t}}\n\
@@ -40171,11 +40318,12 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                 }
                 body.push_str(" + \"}\"");
                 out.push_str(&format!(
-                    "impl {struct_name} with Json {{\n\
+                    "impl {struct_name}{} with Json {{\n\
                      \tfun to_json(self): str {{\n\
                      \t\t{body}\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("Json"),
                 ));
                 // The reverse direction (I3): decoding is fallible, so `from_json`
                 // yields a `Result`. Each field is checked present (naming a
@@ -40196,19 +40344,20 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                     .collect::<Vec<_>>()
                     .join(", ");
                 out.push_str(&format!(
-                    "impl {struct_name} with FromJson {{\n\
-                     \tfun from_json(text: str): Result<{struct_name}, str> {{\n\
+                    "impl {struct_name}{} with FromJson {{\n\
+                     \tfun from_json(text: str): Result<{applied}, str> {{\n\
                      \t\t{struct_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
                      \t}}\n\
-                     \tfun from_json_value(value: JsonValue): Result<{struct_name}, str> {{\n\
+                     \tfun from_json_value(value: JsonValue): Result<{applied}, str> {{\n\
                      {presence}\t\tResult::Ok({struct_name} {{ {initializers} }})\n\
                      \t}}\n\
-                     }}\n"
+                     }}\n",
+                    subject.binders("FromJson"),
                 ));
                 // `[derive(Wire)]` also targets the §6.1 visitor — additive
                 // beside the JSON impls until the codec re-plumb consumes it.
                 if *derive == "Wire" {
-                    out.push_str(&struct_wire_visitor_impls(struct_name, &fields));
+                    out.push_str(&struct_wire_visitor_impls(&subject, &fields));
                 }
             }
             _ => {}
@@ -40221,7 +40370,10 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
 /// each field (name, then the value's own describe) to the serializer, and
 /// `rebuild` pulls them back in declaration order — the field's source type
 /// text carries the static dispatch, exactly like the derived `from_json`.
-fn struct_wire_visitor_impls(struct_name: &str, fields: &[(&str, String)]) -> String {
+fn struct_wire_visitor_impls(subject: &DerivedSubject<'_>, fields: &[(&str, String)]) -> String {
+    let struct_name = subject.name;
+    let applied = subject.applied();
+    let binders = subject.binders("Wire");
     let mut describe = format!("\t\tserializer.begin_struct({});\n", fields.len());
     for (field, _) in fields {
         describe.push_str(&format!("\t\tserializer.field(\"{field}\");\n"));
@@ -40243,9 +40395,9 @@ fn struct_wire_visitor_impls(struct_name: &str, fields: &[(&str, String)]) -> St
         .join(", ");
     rebuild.push_str(&format!("\t\t{struct_name} {{ {initializers} }}"));
     format!(
-        "impl {struct_name} with Wire {{\n\
+        "impl {struct_name}{binders} with Wire {{\n\
          \tfun describe<S: Serialize>(self, serializer: S) {{\n{describe}\n\t}}\n\
-         \tfun rebuild<D: Deserialize>(deserializer: D): {struct_name} {{\n{rebuild}\n\t}}\n\
+         \tfun rebuild<D: Deserialize>(deserializer: D): {applied} {{\n{rebuild}\n\t}}\n\
          }}\n"
     )
 }
@@ -40293,16 +40445,19 @@ fn backing_type_name(read: &EnumBacking<'_>) -> &'static str {
 /// sending a value outside the set decodes to a reported failure plus a poisoned
 /// zero-construction, not to garbage.
 fn backed_enum_wire_visitor_impls(
-    enum_name: &str,
+    subject: &DerivedSubject<'_>,
     backing_type: &str,
     first_variant: &str,
 ) -> String {
+    let enum_name = subject.name;
+    let applied = subject.applied();
+    let binders = subject.binders("Wire");
     format!(
-        "impl {enum_name} with Wire {{\n\
+        "impl {enum_name}{binders} with Wire {{\n\
          \tfun describe<S: Serialize>(self, serializer: S) {{\n\
          \t\tself.value().describe(serializer);\n\
          \t}}\n\
-         \tfun rebuild<D: Deserialize>(deserializer: D): {enum_name} {{\n\
+         \tfun rebuild<D: Deserialize>(deserializer: D): {applied} {{\n\
          \t\tlet raw = {backing_type}::rebuild(deserializer);\n\
          \t\tmatch {enum_name}::parse(raw) {{\n\
          \t\t\tOption::Some(let variant) => variant,\n\
@@ -40322,10 +40477,16 @@ fn backed_enum_wire_visitor_impls(
 /// first variant through the (now poisoned) deserializer — the caller
 /// discards the value on `Err`. An empty enum gets no impls (nothing to
 /// construct; the missing impl surfaces naturally at a use site).
-fn enum_wire_visitor_impls(enum_name: &str, variants: &[(&str, Vec<String>)]) -> String {
+fn enum_wire_visitor_impls(
+    subject: &DerivedSubject<'_>,
+    variants: &[(&str, Vec<String>)],
+) -> String {
     if variants.is_empty() {
         return String::new();
     }
+    let enum_name = subject.name;
+    let applied = subject.applied();
+    let binders = subject.binders("Wire");
     let mut describe_arms = String::new();
     for (name, payload_types) in variants {
         let arity = payload_types.len();
@@ -40396,11 +40557,11 @@ fn enum_wire_visitor_impls(enum_name: &str, variants: &[(&str, Vec<String>)]) ->
          \t\t\t}},\n"
     ));
     format!(
-        "impl {enum_name} with Wire {{\n\
+        "impl {enum_name}{binders} with Wire {{\n\
          \tfun describe<S: Serialize>(self, serializer: S) {{\n\
          \t\tmatch self {{\n{describe_arms}\t\t}}\n\
          \t}}\n\
-         \tfun rebuild<D: Deserialize>(deserializer: D): {enum_name} {{\n\
+         \tfun rebuild<D: Deserialize>(deserializer: D): {applied} {{\n\
          \t\tlet tag = deserializer.variant_tag();\n\
          \t\tmatch tag {{\n{rebuild_arms}\t\t}}\n\
          \t}}\n\

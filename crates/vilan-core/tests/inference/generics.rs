@@ -5442,16 +5442,15 @@ fn b188_a_non_generic_type_is_untouched() {
 
 #[test]
 fn b188_generated_code_is_not_held_to_the_written_arity() {
-    // The boundary, and it is deliberate. The derive generators spell a
-    // subject by its bare name in every role — `[derive(PartialEq)]` on
-    // `struct Holder<T>` emits `impl Holder with PartialEq` and
-    // `fun eq(self, other: Holder)` — so the erasure this fix removes is
-    // precisely what let the generated impls type-check. Refusing them would
-    // report a GENERATOR's defect at a `[derive(..)]` the author cannot edit,
-    // and making the generators generic-aware is a ruling rather than a fix:
-    // the reflection surface a macro sees carries no generic parameters, and a
-    // derived impl over a parameter needs bounds nothing computes. So the rule
-    // covers what a program WRITES, and this shape keeps working meanwhile.
+    // B188 shipped an exemption here and B194 removed it: generated code now
+    // meets the SAME arity rule as written code, because the generators became
+    // generic-aware. `[derive(PartialEq)]` on `struct Holder<T>` used to emit
+    // `impl Holder with PartialEq` over a bare `fun eq(self, other: Holder)` —
+    // under-supplied applications that only B188's erasure let type-check —
+    // and now emits `impl Holder<type T: PartialEq> with PartialEq` over
+    // `other: Holder<T>`. So this shape still compiles and still runs, but for
+    // the opposite reason: the subject is spelled as an application of its own
+    // parameter rather than exempted from having to be.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -5468,6 +5467,222 @@ fn b188_generated_code_is_not_held_to_the_written_arity() {
         main();
         "#,
         "true\n",
+    );
+}
+
+#[test]
+fn b194_a_derived_json_impl_over_a_generic_round_trips_at_two_instantiations() {
+    // The capability B194 buys. Before it, the derive spelled its subject bare
+    // in every role and the body called `to_json` on a parameter nothing bound
+    // — `cannot call method 'to_json' on T`, reported inside code the author
+    // never wrote. Now the impl binds the parameter under the trait it derives
+    // (`impl Box<type T: Json> with Json`) and the subject is an application
+    // of it (`Result<Box<T>, str>`), so ONE derive serves every instantiation.
+    // Two of them here, encode and decode, because a single one cannot tell a
+    // real generic impl from an erased one that happens to fit.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result;
+
+        [derive(Json)]
+        struct Box<T> {
+            value: T,
+        }
+
+        fun main() {
+            print(Box { value = 7 }.to_json());
+            print(Box { value = "hi" }.to_json());
+            let whole: Result<Box<i32>, str> = Box::from_json("{\"value\":42}");
+            match whole {
+                Result::Ok(let box_) => print(box_.value),
+                Result::Err(let failure) => print(failure),
+            }
+            let text: Result<Box<str>, str> = Box::from_json("{\"value\":\"hey\"}");
+            match text {
+                Result::Ok(let box_) => print(box_.value),
+                Result::Err(let failure) => print(failure),
+            }
+        }
+        main();
+        "#,
+        "{\"value\":7}\n{\"value\":\"hi\"}\n42\nhey\n",
+    );
+}
+
+#[test]
+fn b194_the_whole_derive_family_works_over_a_generic_subject() {
+    // Not just `Json`: every generator that reaches a parameter-typed field
+    // was refused the same way, so each is pinned at two instantiations (or,
+    // for `Default`, at the one that has a default). `Debug` reads the field,
+    // `PartialEq` compares it, `Default` constructs it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [derive(Debug, PartialEq, Default)]
+        struct Pair<T> {
+            a: T,
+            b: i32,
+        }
+
+        fun main() {
+            let numbers = Pair { a = 1, b = 2 };
+            print(numbers.debug());
+            print(Pair { a = "s", b = 3 }.debug());
+            print(numbers == Pair { a = 1, b = 2 });
+            let empty: Pair<i32> = Pair::default();
+            print(empty.debug());
+        }
+        main();
+        "#,
+        "Pair { a = 1, b = 2 }\nPair { a = \"s\", b = 3 }\ntrue\nPair { a = 0, b = 0 }\n",
+    );
+}
+
+#[test]
+fn b194_an_unmet_derived_bound_is_refused_at_the_use_site() {
+    // The bound has to bite, and it has to bite where the author can act. The
+    // refusal names the concrete argument and the trait it does not implement,
+    // anchored at the CALL (`held.debug()`) — not inside the generated impl,
+    // and not at the `[derive(..)]`, which is what the old
+    // `cannot call method 'debug' on T` did.
+    assert_fails_spanning(
+        r#"
+        struct Opaque { tag: i32 }
+
+        [derive(Debug)]
+        struct Pair<T> {
+            a: T,
+        }
+
+        fun main() {
+            let held = Pair { a = Opaque { tag = 1 } };
+            print(held.debug());
+        }
+        "#,
+        "held.debug()",
+        "'Opaque' does not implement trait 'Debug'",
+    );
+}
+
+#[test]
+fn b194_a_phantom_parameter_takes_a_bare_binder() {
+    // THE DEPARTURE from Rust's derive rule, and C7 is why. `Handle<T>`'s `T`
+    // names the arena a handle belongs to and never reaches the payload — two
+    // integers cross the wire — so C7 rules a handle sendable whatever it
+    // names. Rust would bind `T: Wire` anyway (every parameter, reached or
+    // not) and make this program fail; the reached-parameters rule emits
+    // `impl Handle<type T>` and it compiles and runs. `Session` here holds a
+    // closure, so it is emphatically not Wire.
+    //
+    // `borrows::a_handle_names_an_entity_whose_type_is_not_itself_wire` is the
+    // compile-only half of this; this one runs the round trip.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::arena::{ Arena, Handle };
+        import std::wire::{ encode, decode };
+        import std::json::json_codec;
+        import std::result::Result;
+
+        struct Session { socket: |str| void }
+
+        fun main() {
+            mut sessions: Arena<Session> = Arena::new();
+            let live = sessions.insert(Session { socket = |line| {} });
+            let carried: Result<Handle<Session>, str> =
+                decode(json_codec(), encode(json_codec(), live));
+            match carried {
+                Result::Ok(let named) => print(sessions.contains(named)),
+                Result::Err(let failure) => print(failure),
+            }
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b194_a_mixed_subject_binds_only_the_reached_parameter() {
+    // The two rules meeting in one declaration: `K` is reached (a field is
+    // typed by it) and takes `type K: Debug`; `P` is phantom and takes a bare
+    // `type P`. So `P` may be instantiated with a type that implements
+    // nothing, while `K` still has to satisfy the bound — which is exactly
+    // what neither "every parameter" nor "no parameter" can express.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Opaque { tag: i32 }
+
+        [derive(Debug)]
+        struct Tagged<K, P> {
+            key: K,
+            count: i32,
+        }
+
+        fun main() {
+            let labelled: Tagged<i32, Opaque> = Tagged { key = 7, count = 2 };
+            print(labelled.debug());
+        }
+        main();
+        "#,
+        "Tagged { key = 7, count = 2 }\n",
+    );
+}
+
+#[test]
+fn b194_a_mixed_subject_still_refuses_the_reached_parameter() {
+    // The other half of the mixed case: bare-binding the phantom must not
+    // relax the reached one. Swapping the arguments — `Opaque` into `K` —
+    // refuses, so the bare `type P` is not quietly disabling the check.
+    assert_fails_with(
+        r#"
+        struct Opaque { tag: i32 }
+
+        [derive(Debug)]
+        struct Tagged<K, P> {
+            key: K,
+            count: i32,
+        }
+
+        fun main() {
+            let labelled: Tagged<Opaque, i32> = Tagged { key = Opaque { tag = 1 }, count = 2 };
+            print(labelled.debug());
+        }
+        "#,
+        "'Opaque' does not implement trait 'Debug'",
+    );
+}
+
+#[test]
+fn b194_a_parameter_reached_only_through_a_generic_argument_is_bound() {
+    // Reachability is structural, not shallow: `Inner<T>` mentions `T`, so `T`
+    // is reached and carries the bound even though no field of `Slot` is typed
+    // `T` outright. It has to be: `Inner`'s own derived impl demands
+    // `T: Debug`, and nothing but `Slot`'s binder can supply it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [derive(Debug)]
+        struct Inner<T> {
+            v: T,
+        }
+
+        [derive(Debug)]
+        struct Slot<T> {
+            held: Inner<T>,
+        }
+
+        fun main() {
+            print(Slot { held = Inner { v = 4 } }.debug());
+        }
+        main();
+        "#,
+        "Slot { held = Inner { v = 4 } }\n",
     );
 }
 

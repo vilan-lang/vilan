@@ -3430,7 +3430,7 @@ fn a_macro_emits_source_from_an_interpolated_triple_quoted_string() {
             import macro_std::option::Option::{ self, Some, None };
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             source(i"""
                 fun describe_{target.name}(): str \{

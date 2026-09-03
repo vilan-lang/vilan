@@ -1044,6 +1044,12 @@ fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
     // generic argument is deliberately unconstrained, which is sound only
     // because a derived type's parameters are necessarily phantom
     // (`a_wire_type_with_a_parameter_typed_field_is_rejected` is the other half).
+    //
+    // B194 is why this still holds now that derived impls carry bounds: the
+    // trait binds only the parameters the generated body REACHES, and a phantom
+    // one takes a bare binder. Rust's rule (bind every parameter) would refuse
+    // this program. `generics::b194_a_phantom_parameter_takes_a_bare_binder`
+    // runs the round trip this compiles.
     assert_compiles(
         r#"
         import std::arena::{ Arena, Handle };
@@ -1063,9 +1069,11 @@ fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
 fn a_wire_type_with_a_parameter_typed_field_is_rejected() {
     // The guard behind C7's unconstrained generic arguments: a `[derive(Wire)]`
     // type whose field is typed by a PARAMETER is rejected at its own
-    // declaration (the derive emits no generic impls), so no derived type can
-    // put a generic argument on the wire. If generic Wire derives ever land,
-    // `is_wire_type` must start checking the arguments.
+    // declaration, so no derived type can put a generic argument on the wire.
+    // B194 made the generators generic-aware, and this guard is what keeps
+    // `Wire`'s parameters phantom-only, so a `Wire` impl never binds one. If
+    // this rule is ever relaxed, `is_wire_type` must start checking the
+    // arguments on the same day.
     assert_fails_with(
         r#"
         [derive(Wire)]

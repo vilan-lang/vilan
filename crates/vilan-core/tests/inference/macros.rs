@@ -538,6 +538,61 @@ fn a_body_import_of_a_missing_module_errors_cleanly() {
 // expansion interpreter; `[name(args)]` and `[derive(Name)]` splice their
 // returned Source before analysis.
 
+// B194's reflection surface: a struct's own GENERIC PARAMETERS reach a macro —
+// names, written bounds, and defaults — plus the two spellings every derive
+// generator needs from them. Without these a generator can only name its
+// subject bare, which is an under-supplied application (B188).
+#[test]
+fn a_macro_reads_its_subjects_generic_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::debug::Debug;
+
+        macro fun report(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+            import macro_std::build::{ impl_of, fun_of, quote, join };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            mut described: List<str> = [];
+            for parameter in target.generics {
+                mut bounds: List<str> = [];
+                for bound in parameter.bounds {
+                    bounds.push(bound.render());
+                }
+                described.push(parameter.name + "/" + join(bounds, "+") + "/" + parameter.default_);
+            }
+            let binder_list = target.binders("Debug");
+            let reporter = fun_of("report")
+                .parameter("self")
+                .returns("str")
+                .expr(quote(target.subject() + " " + binder_list + " " + join(described, " ")));
+            source(impl_of(target.name).generics(binder_list).member(reporter.render()).render())
+        }
+
+        // `K` is reached (a field is typed by it) and carries a written bound
+        // and no default; `P` is phantom and carries a default and no bound.
+        [report]
+        struct Pack<K: Debug, P = i32> {
+            key: K,
+            count: i32,
+        }
+
+        fun main() {
+            print(Pack { key = 1, count = 2 }.report());
+        }
+
+        main();
+        "#,
+        "Pack<K, P> <type K: Debug, type P> K/Debug/ P//i32\n",
+    );
+}
+
 // The whole pipeline: hermetic world compile, attribute dispatch, reflection,
 // interpreter run, splice, and dispatch INTO the generated impl.
 #[test]
@@ -554,7 +609,7 @@ fn a_macro_attribute_expands_and_the_generated_impl_dispatches() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             mut arms = "";
             mut first = true;
@@ -605,7 +660,7 @@ fn a_derive_name_dispatches_to_a_registered_macro() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             source("impl " + target.name + " {\nfun tag(self): str {\n\"" + target.name + "\"\n}\n}\n")
         }
@@ -639,7 +694,7 @@ fn a_macro_receives_its_arguments_as_source_text() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             mut body = "";
             mut first = true;
@@ -1207,7 +1262,7 @@ fn a_user_macro_shadows_a_prelude_derive_in_its_file() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             source(i"impl {target.name} \{\nfun shadowed(self): str \{\n\"local\"\n\}\n\}\n")
         }
