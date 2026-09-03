@@ -405,3 +405,5 @@ row	flagship	key
 379	-	`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — vilan has no `Not` for one to require
 380	-	`-` negates a number, and `{label}` is a trait: no trait names the numeric set — vilan has no `Neg` for one to require
 381	-	{label} is `[expose]`d, and its type `{rendered_field}` does implement `std::Source`, but its element is not written as a type argument: the `[service]` expansion builds the client's mirror before any type resolves, so it reads the element off the annotation's sole type argument and has nothing to name here. Spell the source with its element as that argument (`SignalCell<Note>`), or expose a field whose type is written that way
+382	-	'{name}' is already declared in this module; remove or rename this one
+383	-	'{name}' is {sort}, not a trait: a bound names a trait.

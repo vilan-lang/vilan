@@ -5705,3 +5705,280 @@ fn b188_a_path_head_is_not_an_under_supplied_application() {
         "1\n",
     );
 }
+
+// --- B211: a generic parameter is RIGID inside its own body ----------------
+//
+// `reconcile_type`'s `(_, Type::Generic(constraint_id))` arm bound a generic
+// wherever it reconciled — including inside the function that DECLARES the
+// parameter, where the caller has already chosen it and the body has no right
+// to choose again. Two garbage runs, both reproduced on 0.40.0 (@635e3728) with
+// written generics (bounded AND unbounded), so neither is B186's sugar's doing;
+// the printed garbage is recorded in each pin. The arm is the one
+// `trait-objects.md` §1.4 flagged as "the leak", leaking in a second direction.
+//
+// The rule now: a parameter an ENCLOSING declaration owns may not be bound —
+// only the parameters a site is INFERRING (a callee's at a call, a struct's at
+// a literal, an enum's at a constructor, an impl's at a subject match) are
+// open. The controls below hold each of those open.
+
+const B211_TRAIT_AND_TWO_IMPLS: &str = r#"
+        import std::io::print;
+        trait X { fun who(self): str; }
+        struct A { tag: str }
+        impl A with X { fun who(self): str { "A/" + self.tag } }
+        struct B { n: i32, label: str }
+        impl B with X { fun who(self): str { "B/" + self.label } }
+"#;
+
+#[test]
+fn b211_a_body_may_not_cross_assign_two_trait_typed_parameters() {
+    // GARBAGE RUN, B186's sugar. Before the fix this compiled and printed
+    // `A/7` — `A`'s `who` reading field 0 of a `B`, so an `i32` came out
+    // through a declared `: str`.
+    //
+    // Both parameters are implicit generics of the SAME trait, and B186's
+    // display rule renders each under the trait's name, so the mismatch reads
+    // `Expected X, but got X instead.` The two ARE different parameters; the
+    // display collision is trait-typed-fields.md's revision-2 Q3, an open
+    // question for the owner, and is deliberately not settled here.
+    assert_fails_with(
+        &format!(
+            "{B211_TRAIT_AND_TWO_IMPLS}
+        fun swap(a: X, b: X): str {{
+            mut c = a;
+            c = b;
+            c.who()
+        }}
+        fun main() {{ print(swap(A {{ tag = \"aa\" }}, B {{ n = 7, label = \"bb\" }})); }}
+        "
+        ),
+        "Expected X, but got X instead.",
+    );
+}
+
+#[test]
+fn b211_a_body_may_not_cross_assign_two_written_generics() {
+    // The same garbage run with WRITTEN generics — `A/7` before the fix, so the
+    // defect is the reconcile arm's, not the parameter sugar's. Two distinct
+    // binders, so the mismatch names them apart.
+    assert_fails_with(
+        &format!(
+            "{B211_TRAIT_AND_TWO_IMPLS}
+        fun swap<P: X, Q: X>(a: P, b: Q): str {{
+            mut c = a;
+            c = b;
+            c.who()
+        }}
+        fun main() {{ print(swap(A {{ tag = \"aa\" }}, B {{ n = 7, label = \"bb\" }})); }}
+        "
+        ),
+        "Expected P, but got Q instead.",
+    );
+}
+
+#[test]
+fn b211_three_trait_typed_parameters_are_three_types() {
+    // Mutual assignment among three: each cross-assignment is its own mismatch,
+    // so two reports. Before the fix this ran and printed `A/7B/undefined` —
+    // `B`'s `who` reading a field a `C` does not have.
+    let source = format!(
+        "{B211_TRAIT_AND_TWO_IMPLS}
+        struct C {{ flag: bool }}
+        impl C with X {{ fun who(self): str {{ \"C\" }} }}
+        fun rotate<P: X, Q: X, R: X>(a: P, b: Q, c: R): str {{
+            mut first = a;
+            first = b;
+            mut second = b;
+            second = c;
+            first.who() + second.who()
+        }}
+        fun main() {{
+            print(rotate(A {{ tag = \"aa\" }}, B {{ n = 7, label = \"bb\" }}, C {{ flag = true }}));
+        }}
+        "
+    );
+    assert_fails_with(&source, "Expected P, but got Q instead.");
+    assert_fails_with(&source, "Expected Q, but got R instead.");
+}
+
+#[test]
+fn b211_a_body_may_not_narrow_a_trait_typed_parameter_to_a_struct() {
+    // The second garbage run, B186's sugar: `need_a(x)` bound the caller's
+    // parameter to `A` with no check that the argument IS an `A`. Before the
+    // fix this compiled and printed `9` — an `i32` through a declared `: str`.
+    assert_fails_with(
+        &format!(
+            "{B211_TRAIT_AND_TWO_IMPLS}
+        fun need_a(a: A): str {{ a.tag }}
+        fun f(x: X): str {{ need_a(x) }}
+        fun main() {{ print(f(B {{ n = 9, label = \"bb\" }})); }}
+        "
+        ),
+        "Expected A, but got X instead.",
+    );
+}
+
+#[test]
+fn b211_a_body_may_not_narrow_a_written_bounded_generic() {
+    // The same, with the bound written out — `9` before the fix.
+    assert_fails_with(
+        &format!(
+            "{B211_TRAIT_AND_TWO_IMPLS}
+        fun need_a(a: A): str {{ a.tag }}
+        fun f<T: X>(x: T): str {{ need_a(x) }}
+        fun main() {{ print(f(B {{ n = 9, label = \"bb\" }})); }}
+        "
+        ),
+        "Expected A, but got T instead.",
+    );
+}
+
+#[test]
+fn b211_a_body_may_not_narrow_an_unbounded_generic() {
+    // And with no bound at all — `9` before the fix. Nothing about the trait,
+    // the sugar or the bound is load-bearing: the arm bound any generic.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct A { tag: str }
+        struct B { n: i32, label: str }
+        fun need_a(a: A): str { a.tag }
+        fun f<T>(x: T): str { need_a(x) }
+        fun main() { print(f(B { n = 9, label = "bb" })); }
+        "#,
+        "Expected A, but got T instead.",
+    );
+}
+
+#[test]
+fn b211_an_impl_binder_is_rigid_in_its_own_body() {
+    // The impl half of the same rule. Before the fix this compiled and printed
+    // `9` — a `Box<B>`'s field handed to a function declaring `a: A`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct A { tag: str }
+        struct B { n: i32, label: str }
+        struct Box<type T> { value: T }
+        fun need_a(a: A): str { a.tag }
+        impl Box<type T> {
+            fun leak(self): str { need_a(self.value) }
+        }
+        fun main() {
+            let boxed = Box { value = B { n = 9, label = "bb" } };
+            print(boxed.leak());
+        }
+        "#,
+        "Expected A, but got T instead.",
+    );
+}
+
+#[test]
+fn b211_a_call_site_still_binds_a_callees_generic_from_its_argument() {
+    // The control the rule turns on: a CALLEE's parameter is open at the call,
+    // including when the argument's own type is a rigid parameter of the
+    // caller. `relay<S>` forwarding to `identity<T>` binds `T := S`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun identity<T>(value: T): T { value }
+        fun relay<S>(value: S): S { identity(value) }
+        fun main() {
+            print(identity(41));
+            print(relay("ok"));
+        }
+        "#,
+        "41\nok\n",
+    );
+}
+
+#[test]
+fn b211_a_bounded_generic_still_satisfies_a_trait_typed_parameter() {
+    // A rigid `T: Ord` meets `Ord::compare(self, b: Self)` — whose parameter is
+    // the trait's abstract `Self`, which interns as the bare trait — through
+    // its own declared BOUND, not by binding `T := Ord`. §1.4's rule: a trait
+    // may satisfy a bound; it may not BE the binding. std's `List::sort` and
+    // `List::contains` are the same shape and are why this must hold.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ Ord, Ordering };
+        fun smaller<T: Ord>(a: T, b: T): T {
+            if a.compare(b) <= Ordering::Equal { a } else { b }
+        }
+        fun main() { print(smaller(3, 9)); print(smaller("b", "a")); }
+        "#,
+        "3\na\n",
+    );
+}
+
+#[test]
+fn b211_a_sibling_member_of_the_enclosing_impl_still_binds_its_binder() {
+    // An impl's binder deliberately INHERITS the subject declaration's
+    // constraint id (`register_subject_binders`, B77's relation), so inside
+    // `impl Cell<Cell<type U>>` the `T` of `impl Cell<type T>` IS `U`. Matching
+    // a DECLARATION's subject binds it whatever the body holds rigid — without
+    // that, `self.get()` returned `U` instead of `Cell<U>` and `Cell::make` in
+    // a sibling method could not bind at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Cell<type T> { value: T }
+        impl Cell<type T> {
+            fun make(value: T): Cell<T> { Cell { value = value } }
+            fun get(self): T { self.value }
+            fun swap<U>(self, other: U): Cell<U> { Cell::make(other) }
+        }
+        impl Cell<Cell<type U>> {
+            fun flatten(self): U { self.get().get() }
+        }
+        fun main() {
+            print(Cell::make(Cell::make(7)).flatten());
+            print(Cell::make(1).swap("two").get());
+        }
+        "#,
+        "7\ntwo\n",
+    );
+}
+
+#[test]
+fn b211_a_let_annotated_by_a_trait_keeps_b161s_verdict() {
+    // B161's per-binding local: `mut c: X = A {}` fixes `c` at `A` (the
+    // annotation is a CONSTRAINT, not a type), so the reassignment was already
+    // a mismatch and still is — the same message, before and after. Pinned to
+    // show the rigidity rule did not move this position.
+    assert_fails_with(
+        &format!(
+            "{B211_TRAIT_AND_TWO_IMPLS}
+        fun main() {{
+            mut c: X = A {{ tag = \"aa\" }};
+            c = B {{ n = 7, label = \"bb\" }};
+            print(c.who());
+        }}
+        "
+        ),
+        "Expected A, but got B instead.",
+    );
+}
+
+#[test]
+fn b211_an_identity_mapped_type_is_its_source() {
+    // `(U in T: U)` maps every element of `T` to itself, so it IS `T`. std's
+    // `combine` returns exactly this against a declared `SignalCell<T>`, and
+    // met it by BINDING `T` before B211 — the reduction is what lets it agree
+    // instead. (The std shape; the user-level twin runs the same reduction.)
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun echo<T: (2..)>(items: (U in T: U)): T {
+            (item in items => item)
+        }
+        fun main() {
+            let (a, b) = echo((1, "two"));
+            print(a);
+            print(b);
+        }
+        "#,
+        "1\ntwo\n",
+    );
+}

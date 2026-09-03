@@ -624,6 +624,22 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 5. A call whose generics cannot all be grounded (no argument or
    expectation determines them) is an error at the call.
 
+A generic parameter is **rigid inside its own body**. The caller chose it,
+once, for this instantiation; nothing in the body may choose again. So a
+parameter's type unifies with itself and with nothing else: assigning a
+value of one parameter's type to a binding of another's is a mismatch,
+and passing it where a concrete type is declared is a mismatch, exactly
+as `str` and `i32` are. The parameters a site may bind are the ones it is
+*inferring* — a callee's at a call, a struct's at a literal, an enum's at
+a constructor, a declaration's own at an `impl` head — never one an
+enclosing `fun`, `impl` or `trait` declares. A parameter that carries a
+bound still **satisfies** a position declared as that trait (the bound is
+what it promises); satisfying is not binding.
+
+A bound names a **trait**. A struct or an enum written in bound position
+(`fun f<T: S>`) is an error naming the sort, not a silent parameter with
+an unusable constraint.
+
 Bounds cut both ways. At a call they are an **obligation** (4 above); at
 a declaration they are an **assumption**: inside the body of whatever
 declares the parameter — a function, an impl, or a trait — the bound
