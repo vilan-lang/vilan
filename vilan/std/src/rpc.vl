@@ -305,7 +305,6 @@ fun parse_announced(text: str): i32 {
 		Some(let id) => id,
 		None => {
 			panic("malformed connection announcement: " + text);
-			0 - 1 // unreachable — the panic throws
 		},
 	}
 }
@@ -1249,7 +1248,7 @@ impl ReactiveServer with Disposable {
 	/// drops.
 	fun dispose(self) {
 		for entry in self.live.read() {
-			let (channel, subscription) = entry;
+			let (_channel, subscription) = entry;
 			subscription.dispose();
 		}
 		self.live.write() = [];
