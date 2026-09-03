@@ -1362,9 +1362,17 @@ fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
 /// The exemption set, end to end and at runtime: an `external struct` whose
 /// runtime shape is the host's (`List` — a JS array; `str` — a JS string,
 /// yielding characters; `Bytes` — a `Uint8Array`), `Set` (the `__set_iter`
-/// lowering over the backing map's stored originals), and the two shapes that
-/// never reach the struct/enum arm at all (`[T; n]` and a tuple). None of these
-/// declares a `next`, and every one of them must keep iterating.
+/// lowering over the backing map's stored originals), and `[T; n]`, which
+/// never reaches the struct/enum arm at all. None of these declares a `next`,
+/// and every one of them must keep iterating.
+///
+/// A TUPLE used to be listed here beside `[T; n]`, on the strength of the same
+/// "it is a JS array at runtime" argument — and running was all this pin ever
+/// checked. B209 measured what the binder was while it ran: `any`, so
+/// `for item in (5, "six")` printed `6` for one element and `six1` for the
+/// other. Being natively iterable is a fact about the EMISSION; having one
+/// element type is the question the loop's typing asks, and only `[T; n]`
+/// answers it. The tuple's refusal is pinned in `tuples.rs`.
 #[test]
 fn the_deliberate_native_iteration_forms_still_iterate() {
     assert_compiles_and_runs(
@@ -1378,15 +1386,13 @@ fn the_deliberate_native_iteration_forms_still_iterate() {
             for character in "ab" { print(character); }
             let fixed: [i32; 2] = [3, 4];
             for item in fixed { print(item); }
-            let pair = (5, 6);
-            for item in pair { print(item); }
             mut seen: Set<i32> = Set::new();
             seen.insert(7);
             for item in seen { print(item); }
             for byte in encode_utf8("h") { print(byte); }
         }
         "#,
-        "1\n2\na\nb\n3\n4\n5\n6\n7\n104\n",
+        "1\n2\na\nb\n3\n4\n7\n104\n",
     );
 }
 

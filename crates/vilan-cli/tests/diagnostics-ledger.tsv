@@ -8,7 +8,12 @@
 # message, or the suite is red.
 #
 # Columns, tab-separated:
-#   row       the ledger row number
+#   row       the ledger row number, or `NEW` for a row whose number
+#             integration assigns. A lane owes its message a row in the
+#             change that ships it, but every lane of an order appends to
+#             this same tail, so a minted number is a merge collision and a
+#             renumbering after it. `NEW` rows sit at the END of the file and
+#             are checked exactly like numbered ones.
 #   flagship  `flagship` when the errors appendix documents this message,
 #             `-` otherwise. The appendix is a CURATED SUBSET, by three
 #             criteria (stated in `vilan/docs/appendix/errors.md` itself):
@@ -407,3 +412,4 @@ row	flagship	key
 381	-	{label} is `[expose]`d, and its type `{rendered_field}` does implement `std::Source`, but its element is not written as a type argument: the `[service]` expansion builds the client's mirror before any type resolves, so it reads the element off the annotation's sole type argument and has nothing to name here. Spell the source with its element as that argument (`SignalCell<Note>`), or expose a field whose type is written that way
 382	-	'{name}' is already declared in this module; remove or rename this one
 383	-	'{name}' is {sort}, not a trait: a bound names a trait.
+384	-	cannot iterate `{rendered}`: a tuple is a fixed sequence of independently typed elements, not a container of one element type, so a `for` binder has no single type to take and one body cannot be checked for every element. {steer}

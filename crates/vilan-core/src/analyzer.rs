@@ -24313,6 +24313,30 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The type a `for` binder takes when the iterable hands back no element
+    /// type — the give-up default, and there are two of them.
+    ///
+    /// `any` is the one this walk was written with, for the one iterable whose
+    /// element genuinely is not knowable yet: an empty, never-pushed list.
+    /// That loop runs zero times and its body is checked against nothing, so
+    /// an absorbing type is the honest answer.
+    ///
+    /// A TUPLE is the opposite case (B209) and must not share it. There the
+    /// loop is REFUSED at the loop head, so the binder's only remaining job is
+    /// to add no SECOND diagnostic on top of the first — and `any` is exactly
+    /// the wrong type for that, because it absorbs INCONSISTENTLY: `x + 1` and
+    /// `let s: str = x` pass silently while `x.0` and `x.len()` refuse "on
+    /// type any", so a nested-tuple loop reported the same broken loop twice.
+    /// `Unresolved` is the analyzer's own "no answer here", which every body
+    /// check already stands down on, so the curated refusal is all the reader
+    /// sees.
+    fn for_each_give_up_type(iterable_type: &Type) -> Type {
+        match iterable_type {
+            Type::Tuple(_) | Type::Mapped(_, _, _) => Type::Unresolved,
+            _ => Type::Any,
+        }
+    }
+
     /// The element type of an iterable, when recoverable: a `List<T>` yields
     /// `T`. Returns `None` for an erased `List` (no arguments) or a non-list
     /// iterable whose protocol method can't be found, whose element the caller
@@ -24405,6 +24429,17 @@ impl<'src> Analyzer<'src> {
                 .find_map(|(trait_id, arguments)| {
                     self.trait_iterator_element(trait_id, &arguments, next_method)
                 }),
+            // A tuple has NO single element type, and that is the point (B209).
+            // The absence of this arm was read as "not yet classified" rather
+            // than as an answer: a tuple fell to `_ => None` and the caller's
+            // `.unwrap_or(Type::Any)` — the give-up default written for an
+            // empty, never-pushed list — handed the binder `any`, which the
+            // spec produces at host boundaries only. The arm is written out so
+            // the next reader sees a DECISION: there is nothing to hand back
+            // here, and `finalize_build` refuses the loop rather than letting
+            // the default stand. A `Mapped` is the same tuple still written
+            // symbolically, so it answers the same way.
+            Type::Tuple(_) | Type::Mapped(_, _, _) => None,
             _ => None,
         }
     }
@@ -24564,6 +24599,62 @@ impl<'src> Analyzer<'src> {
             format!(
                 "cannot iterate `{rendered}`: {source}, but the `for` protocol drives \
                  `{next_method}(&mut self): Option<T>` and stops at `None`. {steer}"
+            ),
+        );
+    }
+
+    /// A `for` over a TUPLE (B209). Nothing refused it and nothing typed it:
+    /// a flat tuple IS a JS array, so the native `for...of` lowering ran, and
+    /// `iterable_element_type` had no tuple arm, so the binder took the `Any`
+    /// give-up default. `any` absorbs by spec, so the body then checked at
+    /// every type and at none — `for x in (1, "two", true) { print(x + 1) }`
+    /// printed `2`, `two1`, `2`; `let s: str = x` was accepted and printed
+    /// `undefined`; and `for e in &mut xs { e = e + 1 }` compiled to
+    /// `__replace(e, e + 1)` over a JS number, ran, and silently discarded the
+    /// write.
+    ///
+    /// This is the CONSERVATIVE half of the two answers on the paper's
+    /// question list (`tuple-comprehension.md` §R8 Q2): refuse the loop, or
+    /// UNROLL it — check and emit the body once per element, each at that
+    /// element's own type. A refusal is forward-compatible with an unroll and
+    /// `any` is not, so the refusal ships now and an unroll can replace it
+    /// without a migration: every program this rejects, an unroll would
+    /// accept.
+    ///
+    /// The rule is one rule and the STEER is two, because the two tuple
+    /// spellings admit opposite spellings of the same walk (B4: name the edit
+    /// that resolves THIS program).
+    ///
+    /// Over a CONCRETE tuple, positional access and destructuring both work
+    /// and the comprehension does not — `(x in t => e)` over one answers "must
+    /// be a mapped tuple", so promising it would be a steer nobody can take;
+    /// the message says it is not yet available instead. Over a MAPPED tuple
+    /// `(U in T: F<U>)` it is exactly the other way round: the element
+    /// sequence is still symbolic, so `t.0` is refused ("cannot access field
+    /// '0' on type `(U in T: Option<U>)`") and the comprehension is the
+    /// shipped form for precisely this source.
+    fn report_tuple_for_each(&mut self, for_each_id: Id, iterable_id: Id, iterable_type: &Type) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::default());
+        let steer = match iterable_type {
+            Type::Mapped(_, _, _) => {
+                "A mapped tuple's elements have no positions to read yet, so the \
+                 element-wise form here is the comprehension `(x in t => e)` — the \
+                 value-level mapping form, whose body IS checked once per element"
+            }
+            _ => {
+                "Read the elements positionally (`t.0`, `t.1`), or destructure the \
+                 tuple into its elements; `(x in t => e)`, the value-level mapping \
+                 form, is not yet available over a concrete tuple"
+            }
+        };
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: a tuple is a fixed sequence of \
+                 independently typed elements, not a container of one element type, so \
+                 a `for` binder has no single type to take and one body cannot be \
+                 checked for every element. {steer}"
             ),
         );
     }
@@ -27591,7 +27682,22 @@ impl<'src> Analyzer<'src> {
             // implements that trait — e.g. a `Counter` (which `impl`s `Combine`)
             // passed where a `Combine` is expected, including a `Self`-defaulted
             // generic that resolved to the trait.
-            (Type::Struct(..) | Type::Enum(..), Type::Trait(trait_id, template_arguments)) => {
+            //
+            // A TUPLE is such a value (B210). `impl (i32, i32) with PartialOrd`
+            // makes one, `type_implements_trait` has always agreed (it compares
+            // impl subjects of every shape), and `smaller<T: PartialOrd>((1, 2),
+            // (3, 4))` already ran — but the arm listed only the nominal shapes,
+            // so the ONE place the tuple was rejected was a parameter typed by
+            // the trait itself. That is exactly how `PartialOrd<B = Self>`'s
+            // inherited `lt` declares its operand when the impl writes no
+            // argument, so `(1, 2) < (3, 4)` ran while `(1, 2).lt((3, 4))` was
+            // "Expected PartialOrd, but got (i32, i32) instead" — the operator/
+            // method asymmetry this item exists to remove, surviving one level
+            // below the method lookup.
+            (
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..),
+                Type::Trait(trait_id, template_arguments),
+            ) => {
                 if !self.type_implements_trait(a, *trait_id) {
                     return None;
                 }
@@ -29936,7 +30042,9 @@ impl<'src> Analyzer<'src> {
         {
             return Resolution::Deferred;
         }
-        let element_type_id = element_type.unwrap_or(Type::Any).get_type_id(self);
+        let element_type_id = element_type
+            .unwrap_or_else(|| Self::for_each_give_up_type(&iterable_type))
+            .get_type_id(self);
         if let Some(variable) = self.variables.get_mut(&item_id) {
             variable.type_id = element_type_id;
         }
@@ -30140,7 +30248,28 @@ impl<'src> Analyzer<'src> {
         // competing traits, which override whatever the arm returns.
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
-            Type::Struct(_, _) | Type::Enum(_, _) => {
+            // B210: a TUPLE receiver belongs here, with the nominal ones. It
+            // used to fall to `_ => NotCallable` at the bottom, so `(1, 2)`
+            // resolved NO method at any arity — not an inherent impl, not a
+            // trait impl, not B170's own `impl (i32, i32) with Add` by name:
+            // `(1, 2).add((3, 4))` was "cannot call method 'add' on
+            // (i32, i32)" while `(1, 2) + (3, 4)` ran and answered `4` / `6`.
+            //
+            // Nothing about the LOOKUP needed teaching. B170's operator
+            // dispatch finds a tuple impl by scanning `implementations` and
+            // comparing the receiver against each `implementation.subject`
+            // with `compare_type`, and `impl_member_candidates` — the method
+            // path's collector — scans `implementations_by_member` and
+            // compares with the SAME `compare_type`. One table, one identity
+            // (arity, then elements structurally), already reached by the
+            // operator half; only the receiver shape was missing from the
+            // dispatch above it, so a tuple never asked. Everything the arm
+            // does is shape-agnostic: the impl's generics bind by reconciling
+            // its subject against the receiver, which is what types
+            // `impl (type T, T)` at `(i32, i32)`, and `list_element_slot`
+            // answers `None` for a tuple, so the `push`/`run` slot branch is
+            // inert here.
+            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) => {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.
@@ -35686,7 +35815,7 @@ impl<'src> Analyzer<'src> {
             let element_type = self
                 .iterable_element_type(&iterable_type, next_method)
                 .filter(|element| !matches!(element, Type::Unknown | Type::Unresolved))
-                .unwrap_or(Type::Any);
+                .unwrap_or_else(|| Self::for_each_give_up_type(&iterable_type));
             let element_type_id = element_type.get_type_id(self);
             if let Some(variable) = self.variables.get_mut(&item_id) {
                 variable.type_id = element_type_id;
@@ -35899,6 +36028,25 @@ impl<'src> Analyzer<'src> {
                             next_method,
                         ),
                     }
+                }
+                // B209. `Type::Array` and `Type::Tuple` both reach a native
+                // `for...of` over a JS array, and both used to sit silently in
+                // the wildcard below — but only one of them is a container.
+                // `[T; n]` has ONE element type and iterates soundly; a tuple
+                // has one type per slot and had no answer at all, so the
+                // binder took `any`. Refused here, at the loop head, which is
+                // where the subject's type is known and where the two loops
+                // that DO refuse a concrete subject already report.
+                //
+                // `Mapped` is the same defect one type-shape over: a mapped
+                // tuple `(U in T: F<U>)` is a tuple whose elements are still
+                // written symbolically, and a loop over one printed each
+                // element's raw runtime shape (`[ 0, 1 ]`, `[ 0, 'two' ]` over
+                // a pack of `Option`s). Refusing the concrete spelling and not
+                // the abstract one would be a special case, and the abstract
+                // one is the half a LIBRARY writes.
+                Type::Tuple(_) | Type::Mapped(_, _, _) => {
+                    self.report_tuple_for_each(for_each_id, iterable_id, &iterable_type)
                 }
                 _ => {}
             }

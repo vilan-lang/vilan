@@ -5523,3 +5523,496 @@ fn b177_a_tuple_impl_of_the_same_shape_still_compiles_and_runs() {
         "4\n5\n",
     );
 }
+
+// --- B209: `for x in tuple` bound the binder to `any` -----------------------
+//
+// The loop existed, was undocumented, and was unsound three ways. A flat tuple
+// IS a JS array, so the native `for...of` lowering ran; `iterable_element_type`
+// had no `Type::Tuple` arm, so the binder fell to the `Any` give-up default
+// written for an empty, never-pushed list. The spec produces `any` at host
+// boundaries only, and a tuple literal is not one.
+//
+// The fix is the CONSERVATIVE half of the paper's two answers
+// (`tuple-comprehension.md` §R8 Q2): the loop is REFUSED at its head, with a
+// steer to the two spellings that work today. The other answer — UNROLL the
+// body once per element, at that element's own type — is still open, and every
+// program these pins reject is one an unroll would accept, so the refusal can
+// be replaced without a migration.
+
+#[test]
+fn b209_a_heterogeneous_tuple_loop_is_refused() {
+    // Probe R1. `x + 1` over `(1, "two", true)` printed `2`, then `two1`, then
+    // `2`: the same body, three types, no complaint. Not a B174 hit — B174
+    // bounds an unbounded GENERIC left operand, and `any` unifies with
+    // everything in both directions by spec, so no bound check can see it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, "two", true);
+            for x in xs {
+                print(x + 1);
+            }
+        }
+        "#,
+        "cannot iterate `(i32, str, bool)`: a tuple is a fixed sequence of \
+         independently typed elements",
+    );
+}
+
+#[test]
+fn b209_the_refusal_names_the_two_spellings_that_work_and_the_one_that_does_not() {
+    // B4: the steer has to be actionable. Positional access and destructuring
+    // both work today; the comprehension does NOT accept a concrete tuple (it
+    // answers "must be a mapped tuple, got (i32, str)"), so the message says
+    // so rather than sending the reader at a form that refuses them again.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, "two");
+            for x in xs {
+                print(x);
+            }
+        }
+        "#,
+        "Read the elements positionally (`t.0`, `t.1`), or destructure the tuple into \
+         its elements; `(x in t => e)`, the value-level mapping form, is not yet \
+         available over a concrete tuple",
+    );
+}
+
+#[test]
+fn b209_an_annotation_can_no_longer_launder_the_binder_into_a_type() {
+    // Probe R18. `let s: str = x` was ACCEPTED off an `any` binder and printed
+    // `undefined` for the `i32` element — `any` launders into any type through
+    // an ordinary annotation, so the loop handed the body a value of a type it
+    // did not have.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, "two");
+            for x in xs {
+                let s: str = x;
+                print(s.len());
+            }
+        }
+        "#,
+        "cannot iterate `(i32, str)`",
+    );
+}
+
+#[test]
+fn b209_a_lending_walk_over_a_tuple_is_refused() {
+    // Probe R17, the miscompile with no diagnostic at all: `for e in &mut xs`
+    // compiled, emitted `__replace(e, e + 1)` with `e` bound to a JS number,
+    // ran to completion, and DISCARDED every write — `Object.assign` on a
+    // primitive target coerces to a wrapper and the tuple slot is never
+    // touched. `xs.0` was still `1` afterwards.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs = (1, 2, 3);
+            for e in &mut xs {
+                e = e + 1;
+            }
+            print(xs.0);
+        }
+        "#,
+        "cannot iterate `(i32, i32, i32)`",
+    );
+}
+
+#[test]
+fn b209_a_homogeneous_tuple_loop_is_refused_too() {
+    // The rule is about the TYPE, not about whether this particular tuple's
+    // elements happen to agree. `(1, 2, 3)` ran and summed correctly (probe
+    // R12) while `(1, "two", 3)` under the same fold printed `1two3` (R13) —
+    // one form, two outcomes, decided by data the type does not fix. A rule
+    // that fires only on a heterogeneous tuple would leave the fold looking
+    // supported right up until someone changed an element.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, 2, 3);
+            mut total = 0;
+            for x in xs {
+                total = total + x;
+            }
+            print(total);
+        }
+        "#,
+        "cannot iterate `(i32, i32, i32)`",
+    );
+}
+
+#[test]
+fn b209_a_nested_tuple_loop_is_refused_exactly_once() {
+    // Probe R23, and the reason the binder's give-up type had to change with
+    // the refusal. Field access on `any` was ALREADY refused ("cannot access
+    // field '0' on type any"), so an `any` binder reported this one broken
+    // loop twice — the curated head, then a restatement of it in the body.
+    // `Unresolved` stands down instead, so the reader gets the head alone.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            for pair in ((1, 2), (3, 4)) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "cannot iterate `((i32, i32), (i32, i32))`",
+    );
+    assert_fails_without(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            for pair in ((1, 2), (3, 4)) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "on type any",
+    );
+}
+
+#[test]
+fn b209_a_mapped_tuple_loop_is_refused_and_steered_to_the_comprehension() {
+    // The same defect one type-shape over, and the half a LIBRARY writes: a
+    // mapped tuple `(U in T: F<U>)` is a tuple whose elements are still
+    // symbolic, so it fell through the same wildcard and the loop printed each
+    // element's raw runtime shape (`[ 0, 1 ]`, then `[ 0, 'two' ]`, over a
+    // pack of `Option`s).
+    //
+    // Its STEER is the concrete one's inverted, which is why the two are not
+    // one sentence: a mapped tuple has no positions to read (`items.0` is
+    // refused, "cannot access field '0' on type `(U in T: Option<U>)`") and
+    // the comprehension is the shipped form for exactly this source, where
+    // over a concrete tuple it is the other way round.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::{ Option, Some };
+
+        fun walk<T: (2..)>(items: (U in T: Option<U>)) {
+            for item in items {
+                print(item);
+            }
+        }
+
+        fun main() {
+            walk((Some(1), Some("two")));
+        }
+        "#,
+        "cannot iterate `(U in T: Option<U>)`: a tuple is a fixed sequence of \
+         independently typed elements",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::{ Option, Some };
+
+        fun walk<T: (2..)>(items: (U in T: Option<U>)) {
+            for item in items {
+                print(item);
+            }
+        }
+
+        fun main() {
+            walk((Some(1), Some("two")));
+        }
+        "#,
+        "A mapped tuple's elements have no positions to read yet, so the element-wise \
+         form here is the comprehension `(x in t => e)`",
+    );
+}
+
+#[test]
+fn b209_the_container_loops_beside_it_are_untouched() {
+    // The control. A `List`, a `Range` and a `[T; n]` all have ONE element
+    // type and must keep iterating — `[T; n]` in particular sat in the same
+    // wildcard arm the tuple fell through, so the refusal had to be added
+    // without catching it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::list;
+        import std::range::Range;
+
+        fun main() {
+            let items: List<i32> = [1, 2];
+            for item in items { print(item); }
+            for index in Range::new(0, 2) { print(index); }
+            let fixed: [i32; 2] = [3, 4];
+            for item in fixed { print(item); }
+        }
+        "#,
+        "1\n2\n0\n1\n3\n4\n",
+    );
+}
+
+#[test]
+fn b209_an_empty_list_loop_still_takes_the_any_give_up_default() {
+    // The give-up default is not deleted, only narrowed. A list that is never
+    // pushed has no knowable element type, its loop runs zero times, and `any`
+    // stays the honest answer there — which is the case the default was
+    // written for in the first place.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::list;
+
+        fun main() {
+            mut items: List<i32> = [];
+            for item in items { print(item); }
+            print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+// --- B210: a tuple receiver resolved no methods at any arity ----------------
+//
+// B170 made a tuple reachable as an impl SUBJECT, and `impl (i32, i32) with
+// Add` has dispatched `(1, 2) + (3, 4)` ever since — through the OPERATOR path
+// only. The method path never looked at a tuple receiver: `resolve_method_call`
+// dispatched on the receiver's shape and its arms were `Struct`/`Enum`,
+// `Trait`, `Generic` and the deferring `Unknown`s, so a tuple fell to
+// `_ => NotCallable` and EVERY spelling was "cannot call method 'X' on
+// (i32, i32)" — an inherent impl, a trait impl, and B170's own `add` by name.
+//
+// Nothing about the LOOKUP needed teaching: the operator path finds a tuple
+// impl by comparing the receiver against each `implementation.subject` with
+// `compare_type`, and the method path's candidate collector compares with the
+// same function over the same table. Only the receiver shape was missing from
+// the dispatch above it. Three more nominal-only sets sat below it on the way
+// to a running program — the emission-side re-dispatch, and the arm that lets
+// a value satisfy a trait-typed slot — and each is pinned by the case that
+// reaches it.
+
+#[test]
+fn b210_an_inherent_method_on_a_tuple_resolves_at_two_arities() {
+    // The plainest spelling, and one of the paper's refused probes (R2).
+    // Arity is part of a tuple's type, so the two impls are two subjects and
+    // each call must reach its own.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        impl (i32, i32) {
+            fun first(self): i32 { self.0 }
+        }
+
+        impl (i32, i32, i32) {
+            fun first(self): i32 { self.0 + 100 }
+        }
+
+        fun main() {
+            print((1, 2).first());
+            print((1, 2, 3).first());
+        }
+        "#,
+        "1\n101\n",
+    );
+}
+
+#[test]
+fn b210_a_trait_method_on_a_tuple_resolves_at_two_arities() {
+    // Probe R5's shape: a trait impl fared no better than an inherent one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Doubled { fun doubled(self): Self; }
+
+        impl (i32, i32) with Doubled {
+            fun doubled(self): (i32, i32) { (self.0 * 2, self.1 * 2) }
+        }
+
+        impl (i32, i32, i32) with Doubled {
+            fun doubled(self): (i32, i32, i32) { (self.0 * 2, self.1 * 2, self.2 * 2) }
+        }
+
+        fun main() {
+            print((4, 5).doubled().0);
+            print((1, 2, 3).doubled().2);
+        }
+        "#,
+        "8\n6\n",
+    );
+}
+
+#[test]
+fn b210_an_operator_traits_method_resolves_by_name_on_a_tuple() {
+    // Probe R10, the exhibit that named the item: B170's OWN impl, reached by
+    // method name. `(1, 2) + (3, 4)` ran and answered `4` / `6` while
+    // `(1, 2).add((3, 4))` was "cannot call method 'add' on (i32, i32)" — one
+    // impl, two spellings, one of them refused. Both spellings, both arities,
+    // in one program, so the operator control travels with its method twin.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl (i32, i32) with Add {
+            fun add(self, b: (i32, i32)): (i32, i32) { (self.0 + b.0, self.1 + b.1) }
+        }
+
+        impl (i32, i32, i32) with Add {
+            fun add(self, b: (i32, i32, i32)): (i32, i32, i32) {
+                (self.0 + b.0, self.1 + b.1, self.2 + b.2)
+            }
+        }
+
+        fun main() {
+            let summed = (1, 2) + (3, 4);
+            print(summed.0);
+            print((1, 2).add((3, 4)).1);
+            let triple = (1, 2, 3) + (10, 20, 30);
+            print(triple.2);
+            print((1, 2, 3).add((10, 20, 30)).0);
+        }
+        "#,
+        "4\n6\n33\n11\n",
+    );
+}
+
+#[test]
+fn b210_an_inherited_operator_default_resolves_by_name_on_a_tuple() {
+    // The asymmetry one level below the method lookup. `PartialOrd<B = Self>`
+    // declares `lt`'s operand as the trait's own parameter, and an impl that
+    // writes no argument leaves that parameter as the bare trait — which a
+    // struct receiver satisfied (it implements the trait) and a tuple did not,
+    // because the arm admitting a value into a trait-typed slot listed the
+    // nominal shapes only. So `(1, 2) < (3, 4)` ran and `(1, 2).lt((3, 4))`
+    // was "Expected PartialOrd, but got (i32, i32) instead" — the same
+    // operator/method split, surviving the fix above it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialOrd, PartialEq, Ordering };
+        import std::option::{ Option, Some };
+
+        impl (i32, i32) with PartialEq {
+            fun eq(self, b: (i32, i32)): bool { self.0 == b.0 && self.1 == b.1 }
+        }
+
+        impl (i32, i32) with PartialOrd {
+            fun partial_compare(self, b: (i32, i32)): Option<Ordering> {
+                if self.0 < b.0 { Some(Ordering::Less) } else { Some(Ordering::Equal) }
+            }
+        }
+
+        fun main() {
+            print((1, 2) < (3, 4));
+            print((1, 2).lt((3, 4)));
+            print((3, 4).lt((1, 2)));
+        }
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b210_a_trait_default_specialized_for_a_tuple_reaches_the_impls_member() {
+    // Gap E on a tuple receiver, which is the EMISSION half of the item. The
+    // analyzer resolves `label` to the trait's default and records the
+    // concrete receiver for codegen to re-dispatch against; the transformer's
+    // re-dispatch then admitted nominal receivers only, so the default's own
+    // `self.tag()` walked past `impl (i32, i32) with Tagged` to the trait's
+    // BODYLESS requirement. The emitter's never-silent check caught it rather
+    // than shipping an empty function, so the symptom was an `internal:` error
+    // — but the cause is the same missing shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        trait Tagged {
+            fun tag(self): str;
+            fun label(self): str { "<" + self.tag() + ">" }
+        }
+
+        impl (i32, i32) with Tagged {
+            fun tag(self): str { self.0.to_string() }
+        }
+
+        fun main() {
+            print((7, 8).label());
+        }
+        "#,
+        "<7>\n",
+    );
+}
+
+#[test]
+fn b210_a_generic_element_tuple_impl_monomorphizes_and_holds_its_bound() {
+    // `impl (type T: Display, T)` — the impl's binder is bound by reconciling
+    // its subject against the receiver, exactly as `impl List<T>` binds `T`
+    // from a `List<i32>`, so nothing in the arm is shape-specific. Both
+    // instantiations run, and a receiver whose elements do not satisfy the
+    // bound does not reach the member.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        impl (type T: Display, T) {
+            fun shown(self): str { self.0.to_string() + "|" + self.1.to_string() }
+        }
+
+        fun main() {
+            print((1, 2).shown());
+            print(("a", "b").shown());
+        }
+        "#,
+        "1|2\na|b\n",
+    );
+}
+
+#[test]
+fn b210_a_tuple_impls_method_is_not_reachable_at_another_arity() {
+    // The refusal that has to survive the fix. A tuple's arity is part of its
+    // type, so `impl (i32, i32)` says nothing about a 3-tuple — and the
+    // message is the ordinary no-method one, naming the receiver's spelling.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        impl (i32, i32) {
+            fun first(self): i32 { self.0 }
+        }
+
+        fun main() {
+            print((1, 2, 3).first());
+        }
+        "#,
+        "(i32, i32, i32) has no method 'first'",
+    );
+}
+
+#[test]
+fn b210_a_tuple_with_no_impl_at_all_still_has_no_methods() {
+    // Probe R27's control: admitting the receiver shape must not invent a
+    // member surface. A tuple has no built-in methods, `len` included.
+    assert_fails_with(
+        r#"
+        fun main() {
+            print((1, 2).len());
+        }
+        "#,
+        "(i32, i32) has no method 'len'",
+    );
+}

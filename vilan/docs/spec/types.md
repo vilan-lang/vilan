@@ -721,6 +721,16 @@ and one without the impl is the same error a struct without it is — the
 operators are never the host's. `void` is refused outright: an
 expression that produces no value has no operand to be.
 
+A **method** dispatches on the receiver's type by the same rule, and the
+receiver's shape does not enter into it either: a member an impl declares
+on a tuple subject is callable by name on a tuple receiver, and a trait
+default inherited by that impl is reached the same way. So one impl serves
+both spellings — `impl (i32, i32) with Add` gives `(1, 2) + (3, 4)` and
+`(1, 2).add((3, 4))` alike. A tuple's **arity is part of its type**, so an
+impl answers only for the arity its subject names, and a tuple has no
+members of its own: with no impl declaring one, a method call on it is the
+same "no method" error any other type gets.
+
 The primitives do not dispatch — native machine operators *are* their
 semantics — so their admitted operand pairs are stated rather than read
 off an impl. For `+` those pairs are exactly two:
@@ -1046,6 +1056,9 @@ type-level spread `(..T, U)` are recorded future work.*
 element and, through a `mut` binding, assigns it. Tuples store flat: a
 tuple-typed element occupies its elements' slots, so accessing one
 yields its region as a value (destructuring reads the same layout).
+Positional access and destructuring are the element-wise spellings a
+tuple has: a tuple is **not iterable**, and `for x in t` is refused
+because the binder would have no single type to take (§3.5).
 
 ## 5.10 `!` and `?.`
 

@@ -8866,14 +8866,23 @@ impl<'src> Transformer<'src> {
     /// `List<Generic(T)>`) so the caller can bind the impl's generics from the
     /// concrete type's arguments.
     fn resolve_member_on_type(&self, type_id: TypeId, member: &str) -> Option<(Id, TypeId)> {
-        // Nominal RECEIVERS only (the check below is on the receiver's type;
-        // impl subjects of every shape, blankets included, are admitted past
-        // it by select_member): a re-dispatch with no trait to steer by is
-        // the fallback path, and widening the receiver set would change which
-        // body existing programs reach without a bound asking.
+        // Nominal receivers, and a TUPLE (the check below is on the receiver's
+        // type; impl subjects of every shape, blankets included, are admitted
+        // past it by select_member). A re-dispatch with no trait to steer by
+        // is the fallback path, so the receiver set is widened only where a
+        // bound asks — and B210 asks. A tuple is an impl subject like any
+        // other (spec §5.7), and once method resolution admits a tuple
+        // receiver, a call inside a trait DEFAULT specialized for one has to
+        // find the impl that provides it: `impl (i32, i32) with Tagged`
+        // reached the default `label`, whose body calls `self.tag()`, and this
+        // guard sent that inner call past the impl to the trait's bodyless
+        // requirement — which the emitter's never-silent check caught rather
+        // than shipping an empty function. Nothing existing changes body: a
+        // tuple receiver reached NO method call before B210, and the operator
+        // path that did reach a tuple impl records its member id directly.
         if !matches!(
             self.program.type_id_to_type_map.get(&type_id),
-            Some(Type::Struct(..) | Type::Enum(..))
+            Some(Type::Struct(..) | Type::Enum(..) | Type::Tuple(..))
         ) {
             return None;
         }
