@@ -27108,7 +27108,22 @@ impl<'src> Analyzer<'src> {
             // implements that trait — e.g. a `Counter` (which `impl`s `Combine`)
             // passed where a `Combine` is expected, including a `Self`-defaulted
             // generic that resolved to the trait.
-            (Type::Struct(..) | Type::Enum(..), Type::Trait(trait_id, template_arguments)) => {
+            //
+            // A TUPLE is such a value (B210). `impl (i32, i32) with PartialOrd`
+            // makes one, `type_implements_trait` has always agreed (it compares
+            // impl subjects of every shape), and `smaller<T: PartialOrd>((1, 2),
+            // (3, 4))` already ran — but the arm listed only the nominal shapes,
+            // so the ONE place the tuple was rejected was a parameter typed by
+            // the trait itself. That is exactly how `PartialOrd<B = Self>`'s
+            // inherited `lt` declares its operand when the impl writes no
+            // argument, so `(1, 2) < (3, 4)` ran while `(1, 2).lt((3, 4))` was
+            // "Expected PartialOrd, but got (i32, i32) instead" — the operator/
+            // method asymmetry this item exists to remove, surviving one level
+            // below the method lookup.
+            (
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..),
+                Type::Trait(trait_id, template_arguments),
+            ) => {
                 if !self.type_implements_trait(a, *trait_id) {
                     return None;
                 }
@@ -29565,7 +29580,28 @@ impl<'src> Analyzer<'src> {
         // competing traits, which override whatever the arm returns.
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
-            Type::Struct(_, _) | Type::Enum(_, _) => {
+            // B210: a TUPLE receiver belongs here, with the nominal ones. It
+            // used to fall to `_ => NotCallable` at the bottom, so `(1, 2)`
+            // resolved NO method at any arity — not an inherent impl, not a
+            // trait impl, not B170's own `impl (i32, i32) with Add` by name:
+            // `(1, 2).add((3, 4))` was "cannot call method 'add' on
+            // (i32, i32)" while `(1, 2) + (3, 4)` ran and answered `4` / `6`.
+            //
+            // Nothing about the LOOKUP needed teaching. B170's operator
+            // dispatch finds a tuple impl by scanning `implementations` and
+            // comparing the receiver against each `implementation.subject`
+            // with `compare_type`, and `impl_member_candidates` — the method
+            // path's collector — scans `implementations_by_member` and
+            // compares with the SAME `compare_type`. One table, one identity
+            // (arity, then elements structurally), already reached by the
+            // operator half; only the receiver shape was missing from the
+            // dispatch above it, so a tuple never asked. Everything the arm
+            // does is shape-agnostic: the impl's generics bind by reconciling
+            // its subject against the receiver, which is what types
+            // `impl (type T, T)` at `(i32, i32)`, and `list_element_slot`
+            // answers `None` for a tuple, so the `push`/`run` slot branch is
+            // inert here.
+            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) => {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.
