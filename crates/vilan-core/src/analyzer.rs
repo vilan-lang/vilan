@@ -41562,10 +41562,10 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
 /// its own claims (which `base_cache_lookup` guarantees by refusing to serve
 /// a claimed world to an analysis that cannot hold them).
 unsafe fn release_stored_world(stored: StoredWorld) {
-    crate::leak_tally::release(
-        crate::leak_tally::LeakSite::BaseCacheWorld,
-        base_cache_world_bytes(&stored.world),
-    );
+    // The figure the STORE recorded, carried on the world since M24 — so the
+    // release can never give back a different number from the one that went
+    // in, whatever else has happened to the world's texts in between.
+    crate::leak_tally::release(crate::leak_tally::LeakSite::BaseCacheWorld, stored.bytes);
     for claim in stored.overlay_claims {
         // SAFETY: the caller's contract — this world is gone, and every
         // analysis served from it holds its own claim.
