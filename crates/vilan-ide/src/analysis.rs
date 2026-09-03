@@ -52,6 +52,11 @@ pub struct Analysis<'a, 'src> {
     /// the analysis resolved no package tree (the language server's degraded
     /// internal-error document).
     pub import_roots: Option<&'a ImportRoots>,
+    /// What completion may read that is a function of the ANALYSIS alone,
+    /// derived once when it landed (M25, E121 §2.1.4): the auto-import
+    /// candidate table and the origins' module listings. A request reads it;
+    /// nothing in a request rebuilds it.
+    pub index: &'a crate::completion::CompletionIndex,
     /// Non-entry source texts already materialized FOR THIS QUERY — the one
     /// owned field on this otherwise reference-only struct, so the cache
     /// lives exactly as long as the query does (E83). [`Analysis::doc_comment_of`]

@@ -29,8 +29,10 @@
 //! 3. **The per-module symbol index** ([`SymbolIndex`]) — declared names,
 //!    kinds and signature labels, grouped by the module that declares them,
 //!    built once when an analysis lands and refreshed for the edited module
-//!    from its own syntax. Completion reads it instead of sweeping every
-//!    module's name map and instead of `read_dir`.
+//!    from its own syntax, together with the `Program`-side half
+//!    ([`vilan_ide::CompletionIndex`]: the auto-import candidate table and the
+//!    origins' module listings, M25). Completion reads it instead of sweeping
+//!    every module's name map and instead of `read_dir`.
 //!
 //! The three combine into three verdicts ([`Verdict`]), which are the honest
 //! vocabulary for what an answer is worth mid-keystroke. `Document`'s
@@ -39,11 +41,12 @@
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use vilan_core::Span;
 use vilan_core::lexing::tokenize;
 use vilan_core::token::Token;
-use vilan_ide::{Completion, CompletionKind};
+use vilan_ide::{Completion, CompletionIndex, CompletionKind};
 
 use crate::document::{MODIFIER_DECLARATION, MODIFIER_READONLY, TokenKind};
 use crate::line_index::LineIndex;
@@ -545,6 +548,17 @@ pub struct ModuleSymbols {
 #[derive(Clone, Debug, Default)]
 pub struct SymbolIndex {
     pub by_module: Vec<ModuleSymbols>,
+    /// The half of the index that lives over the analyzed `Program` rather
+    /// than over a token stream (M25): the auto-import candidate table and the
+    /// origins' module listings, derived once on the analysis thread by
+    /// [`vilan_ide::CompletionIndex::build`].
+    ///
+    /// It is here, and not a second memo beside the snapshot, because it
+    /// answers the same question `by_module` does — *which names exist, and
+    /// under which module* — for the arm that reaches names this file has not
+    /// imported. Held behind an `Arc` because a `SymbolIndex` is cloned with
+    /// the document it belongs to and this table is the large part of it.
+    pub completion: Arc<CompletionIndex>,
 }
 
 impl SymbolIndex {
@@ -775,21 +789,29 @@ impl LandedSnapshot {
         self.token_lines = token_lines;
     }
 
-    /// The captured tokens whose start line lies in `first_line..=last_line` —
-    /// the viewport slice `semanticTokens/range` answers with (E122).
+    /// The positions in [`tokens`](Self::tokens) of the captured tokens whose
+    /// start line lies in `first_line..=last_line` — the viewport slice
+    /// `semanticTokens/range` is built from (E122, E125).
     ///
-    /// Byte-identical to filtering [`tokens`](Self::tokens) by the same
-    /// predicate, and costing the slice rather than the file: this used to be
-    /// a whole-file walk of the program plus one line lookup per token in the
-    /// file, so twenty visible lines cost what the whole file cost (12.2 ms on
-    /// kolt's `views.vl`, `proposal/editor-latency.md` §1.6).
-    pub fn tokens_in_lines(&self, first_line: u32, last_line: u32) -> &[(Span, TokenKind, u32)] {
+    /// Selecting the same tokens by filtering the whole stream is what this
+    /// replaces, and it cost the FILE rather than the window: a whole-file walk
+    /// of the program plus one line lookup per token in the file, so twenty
+    /// visible lines cost what the whole file cost (12.2 ms on kolt's
+    /// `views.vl`, `proposal/editor-latency.md` §1.6). Here it is a clamp and
+    /// two index reads.
+    ///
+    /// Positions rather than a slice because a LIVE viewport can be carried by
+    /// two disjoint stretches of the capture — the analyzed lines that reach it
+    /// through the anchor's head, and the ones that reach it through its tail
+    /// (E125, `Document::keystroke_tokens_in_lines`) — and merging two index
+    /// ranges is arithmetic where merging two slices would be a copy.
+    pub fn token_positions_in_lines(&self, first_line: u32, last_line: u32) -> Range<usize> {
         let Some(last) = self.token_lines.len().checked_sub(1) else {
-            return &[];
+            return 0..0;
         };
         let first = self.token_lines[(first_line as usize).min(last)] as usize;
         let past = self.token_lines[(last_line as usize).saturating_add(1).min(last)] as usize;
-        &self.tokens[first..past.max(first)]
+        first..past.max(first)
     }
 
     /// The tokens the live buffer should be painted with, given `anchor` and
@@ -1336,6 +1358,7 @@ mod tests {
                     }],
                 },
             ],
+            ..SymbolIndex::default()
         };
         let module = index.module("style").expect("style is indexed");
         assert_eq!(module.entries.len(), 1);
@@ -1658,6 +1681,16 @@ mod gate {
     const SMOKE_FUNCTIONS: usize = 24;
     /// The mandate's budget, per request and for the burst.
     const BUDGET_MS: f64 = 10.0;
+    /// M25's own bound on completion, which the mandate's 10 ms does not
+    /// discriminate: at the end of the keystroke-path tranche completion WAS
+    /// the whole remaining budget, and the tranche's claim is that it stopped
+    /// costing the codebase. Measured on this exhibit, same machine, same
+    /// instrument: **0.628 ms** with the per-request sweep of every `std`/`pkg`
+    /// child module's `name_to_id_map` (loadavg 66), **0.126 ms** reading the
+    /// table that sweep now fills once per analysis (loadavg 82). The bound
+    /// sits between two MECHANISMS rather than between two tunings — no
+    /// per-request sweep of a 1,791-function program gets under it.
+    const COMPLETION_BUDGET_MS: f64 = 0.2;
     /// Requests per measured window — amortized past any clock granularity,
     /// the same discipline the paper's P8 used.
     const REPETITIONS: usize = 50;
@@ -1915,16 +1948,16 @@ mod gate {
                 loadavg_1m()
             );
         };
-        for (request, cpu) in [
-            ("semanticTokens", tokens_cpu),
-            ("inlayHint", hints_cpu),
-            ("completion", completion_cpu),
+        for (request, cpu, budget) in [
+            ("semanticTokens", tokens_cpu, BUDGET_MS),
+            ("inlayHint", hints_cpu, BUDGET_MS),
+            ("completion", completion_cpu, COMPLETION_BUDGET_MS),
         ] {
             let cpu = cpu.expect("the clock answered for the burst, so it answered here");
             assert!(
-                cpu < BUDGET_MS,
+                cpu < budget,
                 "{request} cost {cpu:.3} ms of thread CPU per request on the {functions}-function \
-                 exhibit, over the {BUDGET_MS} ms budget (loadavg {}, the whole-program walk it \
+                 exhibit, over the {budget} ms budget (loadavg {}, the whole-program walk it \
                  replaces cost {} ms)",
                 loadavg_1m(),
                 baseline_cpu.map_or_else(|| "?".to_string(), |value| format!("{value:.3}")),
@@ -1948,6 +1981,137 @@ mod gate {
                  so the green above proves nothing",
             );
         }
+    }
+
+    /// M25: the candidates the captured completion index serves are the ones
+    /// DERIVING it per request would serve — the same candidates, in the same
+    /// order, with the same import edits — at every shape of position.
+    ///
+    /// This is the property the tranche's whole speed-up rests on, and the only
+    /// one it can break. Before M25 the engine derived two tables inside every
+    /// request: `auto_import_completions` swept every `std`/`pkg` child
+    /// module's `name_to_id_map`, classified each name and sorted the result,
+    /// and an import path's origin arm called `modules_in_root` — a `read_dir`
+    /// per source root. Both are functions of the analyzed program and the
+    /// package tree it resolved, so both moved to the analysis that produced
+    /// them (`Document::capture_landed`). What could go wrong is not the speed
+    /// but the ANSWER: an order that ranks differently, a cap that truncates
+    /// somewhere else, a listing that lost a module.
+    ///
+    /// So the reference is the old mechanism itself.
+    /// `keystroke_completion_rebuilding_index` derives the index at request
+    /// time, which is exactly what the engine used to do, and the two answers
+    /// must be one answer. The subject is the generated exhibit — a real
+    /// package on disk, analyzed, with a keystroke typed into a function body
+    /// so the verdict is `Exact` and every arm is live.
+    ///
+    /// Ordering is asserted, not just membership: [`AUTO_IMPORT_COMPLETION_CAP`]
+    /// caps the popup at 20, so *which* 20 survive is a ranking question, and a
+    /// pin that compared sets would pass while the cap kept the wrong ones.
+    #[test]
+    fn the_captured_index_serves_what_deriving_it_per_request_would() {
+        let (directory, mut document, _) = land(SMOKE_FUNCTIONS);
+        // A word typed into a function BODY: the declaration shape does not
+        // move, so the verdict is `Exact` and every arm below answers under
+        // the capture rather than degrading to syntax. This buffer PARSES,
+        // which the auto-import arm requires — its edits come from one parse
+        // of the live text, and a buffer that does not parse has no safe
+        // import edit to offer at all.
+        let live = EXHIBIT_ENTRY.replace(
+            "\tfirst + second + third + fourth\n",
+            "\tlet ic = 0;\n\tfirst + second + third + fourth\n",
+        );
+        document.set_text(&live);
+        assert_eq!(
+            document.keystroke_verdict(false),
+            crate::keystroke::Verdict::Exact,
+            "the corpus below is about the captured index, not about degrading",
+        );
+
+        let at = |text: &str, needle: &str| {
+            text.find(needle).unwrap_or_else(|| panic!("{needle}")) + needle.len()
+        };
+        let corpus = [
+            // A bare scope position — the arm that carries auto-import.
+            ("scope", at(&live, "\tlet ic = ")),
+            ("scope-prefix", at(&live, "\tlet i")),
+            // An import path, at its origin and past a module of it — the arm
+            // that used to `read_dir` per request.
+            ("import-origin", at(&live, "import pkg::")),
+            ("import-module", at(&live, "import pkg::table")),
+        ];
+
+        let mut saw_import_edit = false;
+        for (label, offset) in corpus {
+            let served = document.keystroke_completion(offset, false);
+            let derived = document.keystroke_completion_rebuilding_index(offset, false);
+            saw_import_edit |= served.iter().any(|item| item.needs_import.is_some());
+            assert_eq!(
+                render_candidates(&served),
+                render_candidates(&derived),
+                "at the {label} position the captured index answered differently \
+                 from deriving it per request",
+            );
+        }
+        // Non-vacuous: the corpus reaches the arms it claims to. A scope
+        // position that offered no auto-import candidate would compare two
+        // empty tables and prove nothing about the order.
+        assert!(
+            saw_import_edit,
+            "no position in the corpus offered an auto-import candidate, so the \
+             ordered table was never read",
+        );
+        let origin = document.keystroke_completion(at(&live, "import pkg::"), false);
+        assert!(
+            origin.iter().any(|item| item.label == "table"),
+            "the import-origin position must reach the exhibit's own module \
+             through the captured listing — got {:?}",
+            origin.iter().map(|item| &item.label).collect::<Vec<_>>(),
+        );
+
+        // The member arm, which needs a `.` the buffer cannot parse around —
+        // its own phase, because an unparseable buffer suppresses the
+        // auto-import edits the phase above is about.
+        let member = live.replace("\tlet ic = 0;\n", "\tlet ic = 0;\n\tfirst.\n");
+        document.set_text(&member);
+        let offset = at(&member, "\tfirst.");
+        let served = document.keystroke_completion(offset, false);
+        assert!(
+            !served.is_empty(),
+            "the member position must offer the receiver's members, or the \
+             equality below is vacuous",
+        );
+        assert_eq!(
+            render_candidates(&served),
+            render_candidates(&document.keystroke_completion_rebuilding_index(offset, false)),
+            "at the member position the captured index answered differently \
+             from deriving it per request",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Every field of a candidate a client can see, as one comparable line —
+    /// the label, its icon, its detail, its call shape, and the whole
+    /// auto-import edit it carries.
+    fn render_candidates(items: &[vilan_ide::Completion]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| {
+                let import = item.needs_import.as_ref().map(|import| {
+                    (
+                        import.module_path.join("::"),
+                        import.edit_span.start,
+                        import.edit_span.end,
+                        import.edit_replacement.as_str(),
+                        import.origin_tier,
+                    )
+                });
+                format!(
+                    "{}|{:?}|{:?}|{:?}|{import:?}",
+                    item.label, item.kind, item.detail, item.call_parameters
+                )
+            })
+            .collect()
     }
 
     /// §6.2's `keystroke_path_budget`, on the exhibit at kolt's size.

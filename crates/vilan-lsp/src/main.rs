@@ -2490,12 +2490,11 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // SLICE the analyzed snapshot's captured stream to the requested
-            // lines, then encode: the first kept token's delta is from the
-            // document start, which is exactly the encoding a range response
-            // specifies. Line granularity is what editors ask with (a
-            // viewport), and a token never spans lines (the encoder drops any
-            // that would).
+            // SLICE the captured stream to the requested lines, then encode:
+            // the first kept token's delta is from the document start, which is
+            // exactly the encoding a range response specifies. Line granularity
+            // is what editors ask with (a viewport), and a token never spans
+            // lines (the encoder drops any that would).
             //
             // E122: this used to compute the WHOLE file's stream and filter it
             // — a whole-file walk of the program, plus a raw re-parse, plus one
@@ -2509,13 +2508,20 @@ impl LanguageServer for Backend {
             // when the analysis landed — one capture, not a second memo of the
             // same tokens.
             //
-            // ANALYZED coordinates, like every other reader of the capture: a
-            // range response is positioned against the analyzed index, which is
-            // what `full`'s keystroke path deliberately is not (S1).
-            let index = document.analyzed_index();
-            let tokens =
-                document.semantic_tokens_in_lines(params.range.start.line, params.range.end.line);
-            let data = encode_semantic_tokens(tokens, index);
+            // E125: LIVE coordinates, through the same two-sided anchor `full`
+            // answers through — because it is answering the same picture, and
+            // a viewport that disagreed with the full stream about where a
+            // token is is exactly the drift the keystroke path exists to
+            // remove. Slicing the capture in the ANALYZED snapshot's
+            // coordinates, which is what this did, left every token below an
+            // unlanded edit at the line it occupied before the edit until the
+            // next analysis landed — on the request an editor sends most.
+            let tokens = document.keystroke_tokens_in_lines(
+                params.range.start.line,
+                params.range.end.line,
+                false,
+            );
+            let data = encode_semantic_tokens(&tokens, &document.line_index);
             Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
@@ -4730,11 +4736,17 @@ mod semantic_token_delta_protocol_tests {
 /// when the analysis landed — one capture, one invalidation point
 /// (`Document::adopt_analysis`), no second memo of the same tokens.
 ///
-/// Three pins over two halves of the claim. The answer did not change:
+/// E125 then moved the request's COORDINATES: it now answers through the same
+/// two-sided anchor `full` does, so a viewport is the window of `full`'s own
+/// stream instead of a second picture positioned against the analyzed snapshot.
+///
+/// Four pins over three halves of the claim. The answer did not change:
 /// byte-identical to the filter it replaces over every window shape, and
 /// byte-identical across an adoption that retains B38's salvage tail — the one
 /// shape a single analysis cannot reach, and the one the fold had to repair to
-/// serve `full` and `range` from a single capture. And the cost follows the
+/// serve `full` and `range` from a single capture. The answer FOLLOWS THE
+/// BUFFER: a viewport below an unlanded edit is `full`'s window byte for byte,
+/// and is not what the pre-E125 mechanism answered. And the cost follows the
 /// WINDOW rather than the file.
 #[cfg(test)]
 mod semantic_token_range_cost_tests {
@@ -4884,6 +4896,14 @@ mod semantic_token_range_cost_tests {
                 &std_root(),
                 Path::new("subject.vl"),
             ));
+            // The state a server is actually in once that analysis lands: the
+            // buffer holds the text it ran on. E125 answers a viewport against
+            // the LIVE buffer, so leaving the document with `whole` in it and
+            // `broken` analyzed would compare a live answer with an analyzed
+            // filter — a difference about the ANCHOR, which is the next pin's
+            // subject, not this one's. Here the two coincide and the equality
+            // is about the salvage fold alone.
+            document.set_text(broken);
         }
 
         for (first, last) in [(0, 0), (4, 4), (3, 5), (0, 100_000)] {
@@ -4913,6 +4933,101 @@ mod semantic_token_range_cost_tests {
             !range(backend, &uri, 4, 4).await.is_empty(),
             "the salvaged tail line must still be painted, or the equality \
              above holds because both sides are empty",
+        );
+    }
+
+    /// E125: a viewport answered after an UNLANDED EDIT ABOVE IT agrees with
+    /// `semanticTokens/full`'s own window, byte for byte.
+    ///
+    /// This is the drift the keystroke path exists to remove, on the request an
+    /// editor sends most. `full` re-serves the landed capture through the
+    /// two-sided anchor, so it is positioned against the buffer on screen;
+    /// `range` sliced the same capture by ANALYZED line and encoded it against
+    /// the analyzed index, so every token below an inserted line was painted
+    /// one line high until the next analysis landed. Two requests, one
+    /// capture, two pictures.
+    ///
+    /// The edit is a whole line inserted inside a function BODY, which is the
+    /// shape the anchor is built for: the declaration-shape stamp does not
+    /// move, so the verdict is `Exact` and the landed classification below the
+    /// edit is still true — it has only moved down a line.
+    ///
+    /// **Non-vacuous by construction**: the pre-E125 mechanism is computed
+    /// beside the answer (the capture sliced by analyzed line, encoded against
+    /// the analyzed index) and asserted to DIFFER. If the anchor ever became a
+    /// no-op here, that assertion reds before the equality does.
+    #[tokio::test]
+    async fn a_viewport_follows_an_unlanded_edit_above_it() {
+        const FUNCTIONS: usize = 40;
+        // The viewport, in LIVE lines — far enough below the edit that every
+        // token in it comes from the anchor's TAIL.
+        const FIRST: u32 = 100;
+        const LAST: u32 = 119;
+
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let analyzed = synthetic_module(FUNCTIONS);
+        let uri = open(backend, &analyzed);
+        // One line typed into the FIRST function's body, above the viewport.
+        let live = analyzed.replacen(
+            "\tlet doubled = input + input;\n",
+            "\tlet doubled = input + input;\n\tlet spare = input;\n",
+            1,
+        );
+        assert_eq!(
+            live.lines().count(),
+            analyzed.lines().count() + 1,
+            "the edit must add exactly one line above the viewport",
+        );
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+
+        let sliced = range(backend, &uri, FIRST, LAST).await;
+        let (full_window, stale_mechanism) = {
+            let document = backend.documents.get(&uri).expect("open");
+            let live_index = &document.line_index;
+            let window: Vec<_> = document
+                .keystroke_tokens(false)
+                .into_iter()
+                .filter(|(span, ..)| {
+                    let line = live_index.range(span).start.line;
+                    (FIRST..=LAST).contains(&line)
+                })
+                .collect();
+            // The pre-E125 mechanism, written the way its own pins write it:
+            // the capture selected by ANALYZED line and encoded against the
+            // analyzed index.
+            let analyzed_index = document.analyzed_index();
+            let stale: Vec<_> = document
+                .semantic_tokens()
+                .into_iter()
+                .filter(|(span, ..)| {
+                    let line = analyzed_index.range(span).start.line;
+                    (FIRST..=LAST).contains(&line)
+                })
+                .collect();
+            (
+                encode_semantic_tokens(&window, live_index),
+                encode_semantic_tokens(&stale, analyzed_index),
+            )
+        };
+        assert!(
+            !sliced.is_empty(),
+            "the viewport must hold tokens, or the equality below is vacuous",
+        );
+        assert_eq!(
+            sliced, full_window,
+            "a viewport after an unlanded edit above it must be exactly \
+             `full`'s window — one capture, one picture (E125)",
+        );
+        assert_ne!(
+            sliced, stale_mechanism,
+            "the pre-E125 mechanism — the capture sliced by ANALYZED line — \
+             answered the same bytes here, so this pin proves nothing about \
+             the anchor",
         );
     }
 

@@ -22,7 +22,7 @@ use vilan_core::{
 
 use crate::keystroke::{
     Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
-    candidates, cursor_context, module_name_of, shape_stamp,
+    candidates, cursor_context, module_name_of, shape_stamp, sort_and_deoverlap, syntax_tokens_in,
 };
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
@@ -854,6 +854,40 @@ pub struct PublishedHop {
     pub call: bool,
 }
 
+/// A line number moved by `shift`, clamped into `u32` — the line arithmetic
+/// [`Document::keystroke_tokens_in_lines`] does against
+/// [`Document::tail_line_shift`]. Saturating on both ends: a window shifted
+/// off the top of the file names line 0, which is a wider ANALYZED range than
+/// needed and therefore still a superset of what can map into the viewport.
+fn shift_line(line: u32, shift: i64) -> u32 {
+    (line as i64 + shift).clamp(0, u32::MAX as i64) as u32
+}
+
+/// The union of two position ranges in one stream, as ranges — merged when
+/// they meet, both when they do not, and empty ones dropped.
+///
+/// The two are the head anchor's window and the tail anchor's window into the
+/// same capture; for an unedited buffer they are the same range, and for an
+/// edit above the viewport they are two. Merging keeps a token from being
+/// mapped (and offered) twice.
+fn merge_positions(
+    left: std::ops::Range<usize>,
+    right: std::ops::Range<usize>,
+) -> impl Iterator<Item = usize> {
+    let mut ranges: Vec<std::ops::Range<usize>> = [left, right]
+        .into_iter()
+        .filter(|range| range.start < range.end)
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    if let [first, second] = ranges.as_mut_slice()
+        && first.end >= second.start
+    {
+        let merged = first.start..first.end.max(second.end);
+        ranges = vec![merged];
+    }
+    ranges.into_iter().flatten()
+}
+
 /// B38, the salvage signature: when `stream` is entirely silent within the
 /// retained suffix — the shape of a parse break truncating the file to a
 /// prefix — the previous analysis's tokens for the byte-identical tail fill
@@ -1424,7 +1458,18 @@ impl Document {
                 &mut by_module,
             );
         }
-        let mut index = SymbolIndex { by_module };
+        let mut index = SymbolIndex {
+            by_module,
+            // M25: the arms that reach names this file has NOT imported —
+            // auto-import candidates and an origin's module listing — are
+            // functions of the analyzed program and the package tree it
+            // resolved, so they are derived here, on the analysis thread, and
+            // never in a request.
+            completion: Arc::new(vilan_ide::CompletionIndex::build(
+                program,
+                self.import_roots.as_ref(),
+            )),
+        };
         index.refresh_entry_from_syntax(self.analyzed_text());
         index
     }
@@ -1767,6 +1812,18 @@ impl Document {
     /// analyzed program read against both snapshots. A struct of references,
     /// built per query.
     fn analysis<'a, 'src>(&'a self, program: &'a Program<'src>) -> Analysis<'a, 'src> {
+        self.analysis_over(program, &self.landed.index.completion)
+    }
+
+    /// The same query surface against a NAMED completion index, which is the
+    /// only thing about an [`Analysis`] a caller ever needs to vary: the pins
+    /// that prove the captured table answers what deriving it per request
+    /// would (M25) hand in a freshly built one and compare.
+    fn analysis_over<'a, 'src>(
+        &'a self,
+        program: &'a Program<'src>,
+        index: &'a vilan_ide::CompletionIndex,
+    ) -> Analysis<'a, 'src> {
         Analysis {
             program,
             analyzed: self.analyzed_index.shared(),
@@ -1774,6 +1831,7 @@ impl Document {
             entity_spans: &self.entity_spans,
             platform_requirements: &self.platform_requirements,
             import_roots: self.import_roots.as_ref(),
+            index,
             source_texts: Default::default(),
         }
     }
@@ -2407,18 +2465,6 @@ impl Document {
         hints
     }
 
-    /// The analyzed snapshot's tokens whose start line lies in
-    /// `first_line..=last_line`, sliced out of the capture by E122's line
-    /// index — what `semanticTokens/range` answers with, in ANALYZED
-    /// coordinates like every other reader of the capture.
-    pub fn semantic_tokens_in_lines(
-        &self,
-        first_line: u32,
-        last_line: u32,
-    ) -> &[(Span, TokenKind, u32)] {
-        self.landed.tokens_in_lines(first_line, last_line)
-    }
-
     /// The entry document's semantic tokens (E2), name-sized and
     /// non-overlapping, sorted by position. Classification comes from the
     /// ANALYZED program: declaration name spans, identifier-sized reference
@@ -2695,6 +2741,103 @@ impl Document {
         self.landed.tokens_for(&self.text, &anchor, verdict)
     }
 
+    /// Semantic tokens for the LIVE buffer over one VIEWPORT, in LIVE
+    /// coordinates — `semanticTokens/range`'s answer (E125).
+    ///
+    /// Byte for byte the window of [`keystroke_tokens`](Self::keystroke_tokens)
+    /// whose tokens START on a line in `first_line..=last_line`, and that
+    /// equality is the whole point of the method. Before E125 this request
+    /// sliced the capture in the ANALYZED snapshot's coordinates while `full`
+    /// re-served the same capture through the anchor, so the two answered two
+    /// pictures: a viewport request after an unlanded edit ABOVE the window
+    /// painted the window's tokens at the lines they occupied before the edit,
+    /// and they stayed there until the next analysis landed — the exact drift
+    /// the keystroke path exists to remove, on the request an editor sends
+    /// most.
+    ///
+    /// The cost still follows the WINDOW, which is what E122 bought and what
+    /// this must not spend. The capture is indexed by ANALYZED line, and the
+    /// anchor moves an analyzed line by a constant — zero through the head,
+    /// [`tail_line_shift`](Self::tail_line_shift) through the tail — so the
+    /// analyzed lines that can carry a token into a live window are two
+    /// contiguous stretches of that index, and the viewport is read as at most
+    /// two slices rather than as a scan. The edit window's syntax is lexed
+    /// only when the window's own lines meet the requested ones.
+    pub fn keystroke_tokens_in_lines(
+        &self,
+        first_line: u32,
+        last_line: u32,
+        dependency_moved: bool,
+    ) -> Vec<(Span, TokenKind, u32)> {
+        if first_line > last_line {
+            return Vec::new();
+        }
+        let anchor = self.keystroke_anchor();
+        let verdict = self.keystroke_verdict(dependency_moved);
+        let requested = |span: &Span| {
+            let line = self.line_index.range(span).start.line;
+            line >= first_line && line <= last_line
+        };
+        let mut painted: Vec<(Span, TokenKind, u32)> = Vec::new();
+        if verdict == Verdict::Exact {
+            let shift = self.tail_line_shift(&anchor);
+            let head = self.landed.token_positions_in_lines(first_line, last_line);
+            let tail = self.landed.token_positions_in_lines(
+                shift_line(first_line, -shift),
+                shift_line(last_line, -shift),
+            );
+            for position in merge_positions(head, tail) {
+                let (span, kind, modifiers) = self.landed.tokens[position];
+                if let Some(span) = anchor.map_span(span)
+                    && requested(&span)
+                {
+                    painted.push((span, kind, modifiers));
+                }
+            }
+            // Q5: the edit window is syntax-only in every verdict. A window
+            // that does not reach the requested lines can contribute nothing
+            // to them — every token it holds starts inside it — so the lex is
+            // not paid at all for a viewport away from the cursor.
+            let window = anchor.live_window();
+            if !window.is_empty() {
+                let window_first = self.line_index.position(window.start).line;
+                let window_last = self.line_index.position(window.end - 1).line;
+                if window_first <= last_line && window_last >= first_line {
+                    painted.extend(
+                        syntax_tokens_in(&self.text, window)
+                            .into_iter()
+                            .filter(|(span, _, _)| requested(span)),
+                    );
+                }
+            }
+        } else {
+            // Stale and Unusable degrade exactly as `full` does — the whole
+            // file from syntax alone — and the viewport is that answer's
+            // window. Syntax is never wrong, so no line of it is withheld.
+            painted.extend(
+                syntax_tokens_in(&self.text, 0..self.text.len())
+                    .into_iter()
+                    .filter(|(span, _, _)| requested(span)),
+            );
+        }
+        sort_and_deoverlap(painted)
+    }
+
+    /// How many LINES the anchor's tail moved: the live line of the first byte
+    /// of the common suffix, minus its analyzed line.
+    ///
+    /// Byte identity gives the offset shift; this is the same fact counted in
+    /// lines, which is what a viewport is addressed in. Zero when the two
+    /// texts are identical (the suffix is empty and both offsets are the end
+    /// of their text), so an unedited buffer reads the capture's own line
+    /// index unchanged.
+    fn tail_line_shift(&self, anchor: &Anchor) -> i64 {
+        let analyzed_suffix_start = anchor.analyzed_len.saturating_sub(anchor.suffix);
+        let live_suffix_start = anchor.live_len.saturating_sub(anchor.suffix);
+        self.line_index.position(live_suffix_start).line as i64
+            - self.analyzed_index.position(analyzed_suffix_start).line as i64
+    }
+
     /// Inlay hints for the LIVE buffer, in LIVE coordinates — Q1/Q4's ruling:
     /// re-mapped through the anchor, withheld inside the edit window, served
     /// unchanged rather than flickered off when stale, withheld entirely when
@@ -2733,6 +2876,22 @@ impl Document {
     /// declares: a `fun` typed one keystroke ago is in it and cannot be in the
     /// landed analysis.
     pub fn keystroke_completion(&self, offset: usize, dependency_moved: bool) -> Vec<Completion> {
+        self.keystroke_completion_over(offset, dependency_moved, &self.landed.index.completion)
+    }
+
+    /// The whole answer, with the analysis-side completion index named rather
+    /// than taken from the capture.
+    ///
+    /// M25's identity pin hands in an index derived AT REQUEST TIME — which is
+    /// what the engine used to do on every keystroke — and asserts the two
+    /// answers are the same candidates. That is the one property capturing the
+    /// table can break, so it is the one the pin holds.
+    fn keystroke_completion_over(
+        &self,
+        offset: usize,
+        dependency_moved: bool,
+        completion_index: &vilan_ide::CompletionIndex,
+    ) -> Vec<Completion> {
         let verdict = self.keystroke_verdict(dependency_moved);
         let context = cursor_context(&self.text, offset);
         if context == CursorContext::None {
@@ -2774,10 +2933,12 @@ impl Document {
         };
         // The landed engine's resolution-derived candidates, deduplicated by
         // label. It reads the last completed analysis and never runs
-        // `Analyzer`; retiring its own whole-program sweeps behind the index
-        // (`auto_import_completions`, `modules_in_root`'s per-request
-        // `read_dir`) is the next tranche, and this is the seam it happens at.
-        for candidate in self.completion(offset) {
+        // `Analyzer`, and since M25 it derives nothing whole-program per
+        // request either: `auto_import_completions` reads the captured
+        // candidate table and an import path's origin arm reads the captured
+        // module listing, so neither the per-module `name_to_id_map` sweep nor
+        // `modules_in_root`'s `read_dir` is on this path any more.
+        for candidate in self.completion_over(offset, completion_index) {
             if !offered
                 .iter()
                 .any(|existing| existing.label == candidate.label)
@@ -2786,6 +2947,22 @@ impl Document {
             }
         }
         offered
+    }
+
+    /// The same answer with the completion index derived from THIS request
+    /// instead of read from the capture — the pre-M25 engine, for the pin that
+    /// holds the two to one answer.
+    #[cfg(test)]
+    pub(crate) fn keystroke_completion_rebuilding_index(
+        &self,
+        offset: usize,
+        dependency_moved: bool,
+    ) -> Vec<Completion> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        let index = vilan_ide::CompletionIndex::build(program, self.import_roots.as_ref());
+        self.keystroke_completion_over(offset, dependency_moved, &index)
     }
 
     /// The keystroke path's own view of the symbol index, for the pins.
@@ -3912,11 +4089,27 @@ impl Document {
     /// The engine is `vilan_ide`'s, shared with the playground (K9); it
     /// converts to the ANALYZED offset itself wherever it touches `program`
     /// data (E52).
-    pub fn completion(&self, offset: usize) -> Vec<Completion> {
+    ///
+    /// The server reaches it through [`keystroke_completion`](Self::keystroke_completion),
+    /// which offers the index's own candidates first and these after; this is
+    /// the engine on its own, which is what the completion pins drive.
+    #[cfg(test)]
+    pub(crate) fn completion(&self, offset: usize) -> Vec<Completion> {
+        self.completion_over(offset, &self.landed.index.completion)
+    }
+
+    /// [`completion`](Self::completion) against a NAMED completion index —
+    /// the seam M25's identity pin measures the capture against, by handing in
+    /// one derived on the spot.
+    fn completion_over(
+        &self,
+        offset: usize,
+        index: &vilan_ide::CompletionIndex,
+    ) -> Vec<Completion> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        self.analysis(program).completion(offset)
+        self.analysis_over(program, index).completion(offset)
     }
 }
 
@@ -11718,7 +11911,8 @@ pub(crate) mod tests {
         );
 
         let line = document.analyzed_index().position(zeta).line;
-        let sliced = document.semantic_tokens_in_lines(line, line);
+        let window = document.landed.token_positions_in_lines(line, line);
+        let sliced = &document.landed.tokens[window];
         let filtered: Vec<_> = document
             .semantic_tokens()
             .into_iter()
