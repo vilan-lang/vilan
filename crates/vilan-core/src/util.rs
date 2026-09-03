@@ -707,12 +707,25 @@ mod tests {
              `canonical_path` — it answers the link's own spelling here"
         );
 
-        // Nothing on the path exists: both degrade lexically, together.
+        // Nothing BELOW the probe directory exists, so the whole tail is
+        // re-attached to the deepest ancestor that does — resolved, and with the
+        // tail's `.` folded. Windows spells its temp directory with an 8.3 short
+        // name (`RUNNER~1`) that resolves to the long one, which is exactly the
+        // difference this function exists for: `base` is the caller's spelling,
+        // `root` is what is really there.
         let nowhere = base.join("absent/pkg/./src/main.vl");
         assert_eq!(
             canonical_path_of_unwritten(&nowhere),
-            canonical_path(&nowhere),
-            "with no anchor there is nothing to resolve, so the two agree"
+            root.join("absent/pkg/src/main.vl"),
+            "the unwritten tail rides the RESOLVED ancestor"
+        );
+        // From an ancestor that is already canonical there is nothing left to
+        // resolve, so the two functions agree — on every platform.
+        let nowhere_canonical = root.join("absent/pkg/./src/main.vl");
+        assert_eq!(
+            canonical_path_of_unwritten(&nowhere_canonical),
+            canonical_path(&nowhere_canonical),
+            "with a canonical anchor there is nothing to resolve, so the two agree"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

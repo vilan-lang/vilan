@@ -2253,7 +2253,14 @@ impl DeclaredHook {
     /// Content, never mtime. Not a new rule here: the watch loop's leg reuse
     /// already decides by content and says why, and a hook stamp that trusted
     /// mtime would reintroduce the bug the watcher refused.
-    fn fingerprint(&self, dir: &Path) -> Option<HookFingerprint> {
+    /// The declared inputs' digests as they are NOW. Taken BEFORE the hook
+    /// runs, because the stamp must record what the hook CONSUMED: an input
+    /// edited while the hook's commands are still running belongs to the next
+    /// round, and a stamp that re-read the inputs afterwards would swallow
+    /// that edit — the next round would find the digests equal and call the
+    /// hook fresh. An unreadable input is `None` for the whole map, and such
+    /// a hook is never stamped.
+    fn input_digests(&self, dir: &Path) -> Option<BTreeMap<String, Option<String>>> {
         let mut inputs = BTreeMap::new();
         for declared in &self.inputs {
             // A declared input that is MISSING is recorded as missing rather
@@ -2261,6 +2268,20 @@ impl DeclaredHook {
             // way `asset::read`'s reader records its misses.
             inputs.insert(declared.clone(), file_digest(&dir.join(declared))?);
         }
+        Some(inputs)
+    }
+
+    /// The hook's stamp: its command text, the inputs as digested by
+    /// [`Self::input_digests`] (before the run), and its outputs as they are
+    /// on disk NOW — after the run, when the caller is stamping a hook that
+    /// ran. `None` when an output is missing: nothing is recorded for a hook
+    /// whose output is missing, so it re-runs on every build.
+    fn fingerprint(
+        &self,
+        dir: &Path,
+        inputs: Option<BTreeMap<String, Option<String>>>,
+    ) -> Option<HookFingerprint> {
+        let inputs = inputs?;
         let mut outputs = BTreeMap::new();
         for declared in &self.outputs {
             outputs.insert(declared.clone(), file_digest(&dir.join(declared))??);
@@ -2513,7 +2534,8 @@ impl BuildHooks {
         let mut next: BTreeMap<String, HookFingerprint> = BTreeMap::new();
         for hook in &self.declared {
             let label = format!("`[[build.hook]]` `{}`", hook.name);
-            let before = hook.fingerprint(&self.dir);
+            let inputs_before = hook.input_digests(&self.dir);
+            let before = hook.fingerprint(&self.dir, inputs_before.clone());
             let fresh = !rerun
                 && hook.is_skippable()
                 && before.is_some()
@@ -2573,7 +2595,10 @@ impl BuildHooks {
             // Fingerprinted AFTER the run: the outputs recorded are the ones
             // the run actually produced. A hook that did not produce a
             // declared output records nothing and re-runs next build.
-            if let Some(after) = hook.fingerprint(&self.dir) {
+            // Inputs as digested BEFORE the run, outputs as written by it: an
+            // input edited while the commands ran is the next round's, not this
+            // stamp's (the race Windows CI exposed at Order 25's seal).
+            if let Some(after) = hook.fingerprint(&self.dir, inputs_before) {
                 next.insert(hook.name.clone(), after);
             }
         }
