@@ -2509,16 +2509,17 @@ impl CallSubjectConstraint {
 /// The START is `proposal/local-shadowing.md` §2 — the end of the declaring
 /// construct, so an initializer never reads the binding it declares. The END is
 /// B171: almost every binding runs to the end of its scope
-/// ([`LocalDeclaration::FOREVER`]), and the one exception is a pattern capture
-/// bound inside an operand of `||`, whose test is not known to have passed
-/// anywhere outside that operand.
+/// ([`LocalDeclaration::FOREVER`]), and the exceptions are pattern captures
+/// whose test is not known to have passed past some point — inside an operand of
+/// `||` (B171), under a negation (B195), or off the condition's boolean spine
+/// (B199).
 #[derive(Debug, Clone, Copy)]
 pub struct LocalDeclaration {
     /// Where the name starts resolving to this entity.
     pub visible_from: usize,
     /// Where it stops — EXCLUSIVE, so a use at exactly this offset already
-    /// misses. [`LocalDeclaration::FOREVER`] for everything but a `||`-arm
-    /// capture.
+    /// misses. [`LocalDeclaration::FOREVER`] for everything but a pattern
+    /// capture the condition does not carry that far.
     pub visible_until: usize,
     pub id: Id,
 }
@@ -2618,6 +2619,24 @@ impl ConditionPolarity {
             ..self
         }
     }
+
+    /// OFF the spine, into a subtree ending at `subtree_end` (B199): the
+    /// condition's truth says nothing about a test down here — `always(x is P)`
+    /// is true whatever `P` answered — so the capture reaches NEITHER branch.
+    ///
+    /// It is capped rather than erased because one rule survives the step off:
+    /// `&&` short-circuits wherever it is written, so `f(x is P(let n) && n > 0)`
+    /// still binds its own right operand. Both ends take the minimum, so a
+    /// nested drop can only tighten — a recovered tree with a widened span never
+    /// hands the capture back its reach.
+    fn off_spine(self, subtree_end: usize) -> Self {
+        Self {
+            same_until: self.same_until.min(subtree_end),
+            flip_until: self.flip_until.min(subtree_end),
+            same_in_else: false,
+            flip_in_else: false,
+        }
+    }
 }
 
 /// Whether a node is part of an `if` condition's BOOLEAN SPINE — the operators
@@ -2625,8 +2644,9 @@ impl ConditionPolarity {
 ///
 /// [`ConditionPolarity`] follows the spine and no further: a capture reached
 /// through anything else (a call argument, a nested `if`) is bound by an
-/// evaluation the condition's truth says nothing about, so the frame is dropped
-/// for that subtree and the capture keeps the plain B171 treatment.
+/// evaluation the condition's truth says nothing about, so the frame narrows to
+/// that subtree ([`ConditionPolarity::off_spine`]) and the capture reaches
+/// neither branch (B199).
 fn is_condition_spine(node: &Node<'_>) -> bool {
     matches!(
         node,
@@ -14845,8 +14865,9 @@ impl<'src> Analyzer<'src> {
     }
 
     /// [`Analyzer::declare_scope_value`] with an explicit end to the name's
-    /// visibility (B171). Only a pattern capture inside a `||` operand passes
-    /// anything but [`LocalDeclaration::FOREVER`].
+    /// visibility (B171). Only a pattern capture whose test the condition stops
+    /// carrying — a `||` operand's (B171), a negation's (B195), an off-spine
+    /// subtree's (B199) — passes anything but [`LocalDeclaration::FOREVER`].
     fn declare_scope_value_until(
         &mut self,
         scope_id: Id,
@@ -20861,14 +20882,17 @@ impl<'src> Analyzer<'src> {
             return id;
         }
         // B195: the branch bookkeeping travels the condition's boolean spine
-        // only. Stepping off it (into a call argument, a nested `if`) drops the
-        // frame for the subtree and restores it on the way out, so a capture
+        // only. Stepping off it (into a call argument, a nested `if`) narrows
+        // the frame to the subtree and restores it on the way out, so a capture
         // down there is never credited to a branch its evaluation is not tied
-        // to.
+        // to. B199: "narrowed" is the capture's WHOLE answer — it reaches
+        // neither branch, only the rest of the off-spine subtree.
         let dropped_polarity = if is_condition_spine(&node.0) {
             None
         } else {
-            Some(self.condition_polarity.take())
+            let outer = self.condition_polarity;
+            self.condition_polarity = outer.map(|polarity| polarity.off_spine(node.1.end));
+            Some(outer)
         };
         let id = self.walk_expr_node_inner(node, scope_id);
         if let Some(polarity) = dropped_polarity {
@@ -23165,7 +23189,9 @@ impl<'src> Analyzer<'src> {
                     let or_cap = self.or_operand_end.unwrap_or(LocalDeclaration::FOREVER);
                     // B195: and a capture under a negation stops where the
                     // negation stops carrying the match — before the
-                    // then-branch, which runs when the test FAILED.
+                    // then-branch, which runs when the test FAILED. B199: a
+                    // capture off the condition's spine stops at that subtree's
+                    // end, reaching neither branch.
                     let polarity = self.condition_polarity;
                     let visible_until =
                         polarity.map_or(or_cap, |polarity| or_cap.min(polarity.same_until));

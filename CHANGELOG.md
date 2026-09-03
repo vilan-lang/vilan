@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**An `is` capture reached through a call argument is unbound in both branches.** `if always(maybe is Some(let n)) { print(n); }` compiled and printed `undefined` — a read of a payload slot the subject does not have — because the branch bookkeeping travels the condition's boolean spine (`!`, `&&`/`||`, the `is` test) and *dropping* it for anything else meant falling back to the plain then-branch default. A call's truth proves nothing about a test inside its argument, so the capture now reaches neither branch: stepping off the spine narrows the capture's visibility to the subtree it stepped into rather than clearing the frame. The one rule that survives the step is `&&`'s, and only inside that subtree — `always(maybe is Some(let n) && n > 1)` still binds its own right operand, because `&&` short-circuits wherever it is written. The same cap closes `always(maybe is Some(let n)) && n > 0`, which read the missing payload from the `&&` written around the call. The spec's `is` section states the spine rule (B199).
+
 <!-- family: fix -->
 **A build hook's stamp records the inputs it consumed, not the inputs on disk after it ran.** An input edited while the hook's commands were still running was digested into the stamp as already consumed, so the next watch round called the hook `Fresh` and the edit was lost — a window Windows's slower process spawns opened on every run (`build_hooks::an_edited_hook_input_starts_a_watch_round_and_reruns_the_hook`, red on Windows CI at Order 25's seal, green on Linux). The inputs are now digested before the run and the outputs after.
 

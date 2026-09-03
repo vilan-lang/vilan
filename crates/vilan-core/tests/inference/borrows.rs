@@ -7481,14 +7481,43 @@ fn b195_the_guard_clause_shape_is_refused_in_both_places() {
     );
 }
 
+// --- B199: an `is` capture reached OFF the condition's boolean spine ---------
+//
+// B195 made the negation bookkeeping travel the spine — `!`, `&&`/`||` and the
+// `is` test — and drop for anything else. What "drop" meant was B171's default,
+// which left the capture visible in the THEN branch: `if always(maybe is
+// Some(let n)) { print(n); }` compiled and printed `undefined`, a read of a
+// payload slot the subject does not have.
+//
+// The rule: off the spine, the condition's truth proves NOTHING about the test
+// — `always(…)` is true whatever the `is` answered — so the capture reaches
+// neither branch. It keeps exactly one thing, the short-circuit rule INSIDE the
+// off-spine subtree: `maybe is Some(let n) && n > 0` still binds its own right
+// operand wherever it is written, because `&&` really does only evaluate its
+// right operand where the left one passed. So the capture's visibility is
+// capped at the end of the subtree analysis stepped off the spine into.
+
 #[test]
-fn b195_a_capture_off_the_conditions_boolean_spine_keeps_its_b171_answer() {
-    // The negation bookkeeping travels `!`, `&&`/`||` and the `is` test, and
-    // stops there: a capture inside a CALL ARGUMENT is bound by an evaluation
-    // the condition's truth says nothing about, so it gets neither a negated
-    // cut nor an else-branch declaration — it keeps exactly the answer B171
-    // gave it. (The then-branch read that leaves standing is B171's own
-    // approximation, not this fix's.)
+fn b199_a_capture_in_a_call_argument_is_unbound_in_the_then_branch() {
+    // The exhibit. Before the fix this compiled and printed `undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe: Option<i32> = None;
+            if always(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_capture_in_a_call_argument_is_unbound_in_the_else_branch() {
+    // The half B195 already refused, kept: the else runs when the CALL was
+    // false, which says nothing about the test either.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -7500,5 +7529,115 @@ fn b195_a_capture_off_the_conditions_boolean_spine_keeps_its_b171_answer() {
         }
         "#,
         "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_call_argument_capture_does_not_reach_the_and_right_operand() {
+    // The cap is the argument's end, so the `&&` written AROUND the call does
+    // not see the capture either. Before the fix this printed `undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe: Option<i32> = None;
+            if always(maybe is Some(let n)) && n > 0 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_an_and_inside_a_call_argument_still_binds_its_own_right_operand() {
+    // The control that keeps the drop from swallowing B171's `&&` rule: the
+    // capture and its use are both inside the argument, and `&&` short-circuits
+    // there exactly as it does on the spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe = Some(2);
+            if always(maybe is Some(let n) && n > 1) { print("hit"); }
+        }
+        "#,
+        "hit\n",
+    );
+}
+
+#[test]
+fn b199_a_capture_nested_two_calls_deep_is_unbound_in_the_then_branch() {
+    // The cap takes the TIGHTER of the two off-spine subtrees, so nesting can
+    // only shrink the capture's reach — never widen it back out.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe: Option<i32> = None;
+            if always(always(maybe is Some(let n))) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_negated_call_argument_capture_reaches_neither_branch() {
+    // A `!` on the spine above an off-spine drop still swaps nothing into
+    // existence: the drop clears BOTH else flags, so the negation has no
+    // else-branch declaration left to make.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe = Some(2);
+            if !always(maybe is Some(let n)) { print("hit"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_capture_inside_a_closure_argument_stays_in_the_closure() {
+    // The closure body is its own scope, so the capture never escaped it even
+    // before B199 — the control that says the fix did not have to reach here.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun apply(f: || bool): bool { f() }
+        fun main() {
+            let maybe = Some(2);
+            if apply(|| maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_capture_on_the_spine_is_untouched() {
+    // The control for the whole item: nothing about the drop reaches a capture
+    // that stayed on the spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) && always(n > 1) { print(n); }
+        }
+        "#,
+        "2\n",
     );
 }

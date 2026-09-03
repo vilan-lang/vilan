@@ -845,6 +845,14 @@ then-branch, since reaching it proves only that *some* arm was true.
 Outside its scope the name is simply unbound, and reading it is the
 ordinary "cannot find" error.
 
+The rule follows the condition's **boolean spine** — `!`, `&&`, `||` and
+the `is` test itself — and stops there. A capture reached through
+anything else (a call argument, a nested `if`) is bound by an evaluation
+the condition's truth says nothing about: `always(x is P(let n))` is true
+whether or not `P` matched, so `n` reaches **neither** branch. Only the
+`&&` rule survives the step off the spine, and only *inside* the subtree
+it stepped into, because `&&` short-circuits wherever it is written.
+
 A **negation swaps the two branches**, and nothing else: `!(x is P)` is
 true exactly where `P` failed, so the capture is *not* in that `if`'s
 then-branch — it is in the **`else`** branch (and on down an `else if`
@@ -863,6 +871,8 @@ if slot is Some(let n) && n > 0 { use(n); }       // yes: `&&` short-circuits
 if slot is Some(let n) { … } else { use(n); }     // error: unbound here
 if slot is Some(let n) || n > 0 { … }             // error: unbound here
 if slot is Some(let n) { … } use(n);              // error: the `if` ended
+if always(slot is Some(let n)) { use(n); }        // error: off the spine
+if always(slot is Some(let n) && n > 0) { … }     // yes for `n > 0`: `&&` still holds
 
 if !(slot is Some(let n)) { use(n); }             // error: the test failed
 if !(slot is Some(let n)) { … } else { use(n); }  // yes: it matched
