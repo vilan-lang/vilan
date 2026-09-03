@@ -235,9 +235,15 @@ fn canonicalized(path: &Path) -> Option<PathBuf> {
 /// path that IS on disk it costs exactly what `canonical_path` costs: the first
 /// attempt succeeds.
 pub fn canonical_path_of_unwritten(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
+    // The tail is folded lexically FIRST: a `.` or `..` component has no file
+    // name, so climbing the spelled path would give up at it and answer the
+    // whole thing lexically — while the plain spelling of the same file
+    // resolved through its ancestor. Two spellings of one unsaved buffer
+    // disagreed exactly there (B207's pin, red on Windows, whose temp root is
+    // an 8.3 short name that resolution rewrites).
+    let normalized = normalize_components(path.as_ref());
     let mut unwritten: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut ancestor = path;
+    let mut ancestor: &Path = &normalized;
     loop {
         if let Some(mut resolved) = canonicalized(ancestor) {
             for name in unwritten.iter().rev() {
@@ -246,9 +252,9 @@ pub fn canonical_path_of_unwritten(path: impl AsRef<Path>) -> PathBuf {
             return resolved;
         }
         // Nothing on this path exists: there is no anchor, so the whole thing
-        // normalizes lexically, exactly as `canonical_path` would answer.
+        // stays lexical, exactly as `canonical_path` would answer.
         let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
-            return normalize_components(path);
+            return normalized;
         };
         unwritten.push(name);
         ancestor = parent;
@@ -726,6 +732,40 @@ mod tests {
             canonical_path_of_unwritten(&nowhere_canonical),
             canonical_path(&nowhere_canonical),
             "with a canonical anchor there is nothing to resolve, so the two agree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn two_spellings_of_an_unwritten_path_agree_through_a_resolved_ancestor() {
+        // B207's Windows red at Order 26's seal, made runnable here: an
+        // ancestor whose canonical form differs from its spelling — a symlink
+        // on unix, an 8.3 short name on Windows. A `..` in the unwritten tail
+        // used to send the spelled path down the lexical arm while the plain
+        // spelling resolved through the link, and `same_file` disagreed.
+        let base = std::env::temp_dir().join(format!(
+            "vilan-unwritten-spellings-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).expect("create the probe directory");
+        let root = canonical_path(&base);
+        std::os::unix::fs::symlink(root.join("real"), root.join("link"))
+            .expect("link the probe directory");
+        let spelled = root.join("link/src/./pkg/../pkg/main.vl");
+        let plain = root.join("link/src/pkg/main.vl");
+        assert!(!plain.exists(), "the probe file must not be on disk");
+        assert_eq!(
+            canonical_path_of_unwritten(&spelled),
+            canonical_path_of_unwritten(&plain),
+            "one file, two spellings, one answer"
+        );
+        assert_eq!(
+            canonical_path_of_unwritten(&plain),
+            root.join("real/src/pkg/main.vl"),
+            "and the answer rides the RESOLVED ancestor"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
