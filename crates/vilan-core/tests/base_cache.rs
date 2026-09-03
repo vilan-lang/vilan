@@ -577,17 +577,22 @@ fn parse_clean_cache_clear_forces_a_reparse() {
     );
 }
 
-/// The M9 store gate (`leak-soak.md` §7.9.4a), the mechanism's stated proof
-/// obligation: an opted-in analysis that loaded an OVERLAY-SERVED source owns
-/// that text and tree — its program must be their only borrower — so
-/// `base_cache_store` refuses to store the world that borrows them. The
-/// consequence is deliberate: base-world caching is forfeited while a
-/// dependency (or std) file is open in the editor — repeat analyses keep
-/// missing — and resumes the moment the buffer closes. Without the gate the
-/// stored world would serve a later analysis borrows into freed memory (the
-/// §7.9.2 ctrl-Z shape, one seam over).
+/// M23 (`leak-soak.md` §7.9.4a, replaced): a base world built over an
+/// OVERLAY-SERVED source is stored, hits, and holds its own CLAIM on every
+/// analysis-owned copy it borrows.
+///
+/// M9 refused the store instead, because a stored world outliving the
+/// analysis that owns its module copies is §7.9.2's use-after-free — and it
+/// cost every entry that imports an open sibling the whole pre-entry world on
+/// every keystroke (kolt's `client.vl`: `base` 1.4–2.7 s, a miss every time).
+/// The world takes a reference count now. This pin covers the four things
+/// that makes true: the world hits while the buffer is open; the claim keeps
+/// the copy alive after the owning analysis has given its own back; the
+/// content the hit was validated against is the content the served world was
+/// built from (the ctrl-Z shape, which is where the naive eviction died); and
+/// an analysis with nowhere to keep a claim is served a MISS, not a borrow.
 #[test]
-fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes() {
+fn a_world_that_loaded_an_overlaid_source_is_stored_and_claims_its_copies() {
     use vilan_core::{MacroLimits, Workspace};
 
     let _guard = CACHE_LOCK
@@ -599,7 +604,7 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     // the files a multi-package workspace has open in the editor, and — like
     // a `pkg::` sibling since M21 — they are loaded into the world the cache
     // stores.
-    let root = std::env::temp_dir().join(format!("vilan_m9_gate_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("vilan_m23_claim_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).expect("app dir");
@@ -634,8 +639,11 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     );
 
     // One opted-in analysis — the language server's shape — with the handles
-    // reclaimed the way their owner would.
-    let analyze_owning = || {
+    // reclaimed the way their owner would. Returns the diagnostics, because
+    // a world served with dangling borrows shows up as a WRONG answer (the
+    // M9 plant produced `cannot find 'greeting' in the imported path`), not
+    // as a crash.
+    let analyze_owning = || -> Vec<String> {
         let workspace = workspace.clone();
         let app_dir = app_dir.clone();
         let entry_path = entry_path.clone();
@@ -651,77 +659,151 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
                     Some(Platform::default()),
                     &workspace,
                 );
-                assert!(
-                    analyzed.diagnostics.is_empty(),
-                    "the gate fixture must compile clean, got {:#?}",
-                    analyzed.diagnostics
-                );
+                let diagnostics: Vec<String> = analyzed
+                    .diagnostics
+                    .iter()
+                    .map(|error| error.msg.clone())
+                    .collect();
                 drop(analyzed.program);
                 if let Some(ast) = analyzed.ast {
                     // SAFETY: the program — the tree's only borrower — was
                     // dropped on the line above.
                     unsafe { ast.reclaim() };
                 }
-                // SAFETY: as above; with the store refused, the program was
-                // the owned copies' only borrower.
+                // SAFETY: as above. This releases only THIS analysis's
+                // claims; a copy a stored world still claims survives, which
+                // is the whole M23 protocol.
                 unsafe { analyzed.owned_modules.reclaim() };
+                diagnostics
             })
             .expect("spawn worker")
             .join()
-            .expect("worker panicked");
+            .expect("worker panicked")
     };
 
     // Disk-served: the dependency world stores and hits — the baseline that
     // proves the fixture exercises the cache at all.
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_before, _) = stats();
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_disk, _) = stats();
     assert_eq!(
         hits_disk,
         hits_before + 1,
         "the disk-served dependency world must hit — the fixture is not \
-         reaching the base cache, so the gate assertions below are vacuous"
+         reaching the base cache, so the assertions below are vacuous"
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_overlay_claims(),
+        (0, 0),
+        "a disk-served world claims nothing: every source it borrows is in \
+         `parse_clean_cached`'s immortal cache"
     );
 
-    // The dependency's lib.vl is now OPEN in the editor, edited: every
-    // analysis loads it from the overlay into analysis-owned allocations, so
-    // no world may be stored — repeat analyses keep missing and never hit.
+    // The dependency's lib.vl is now OPEN in the editor: every analysis loads
+    // it from the overlay into analysis-owned allocations — and the world
+    // built over them is STORED, claims them, and hits.
     vilan_core::analyzer::base_cache_clear();
+    let open_text = "fun greeting(): i32 {\n\t42\n}\n".to_string();
+    let open_bytes = open_text.len();
+    vilan_core::analyzer::set_document_overlay(&dep_lib, Some(open_text.clone()));
+    let (hits_open_before, _) = stats();
+    assert!(analyze_owning().is_empty());
+    assert!(
+        analyze_owning().is_empty(),
+        "the second analysis over the open buffer must still resolve the \
+         dependency — a served world whose borrows were freed answers wrong"
+    );
+    let (hits_open, _) = stats();
+    assert_eq!(
+        hits_open,
+        hits_open_before + 1,
+        "M23: a world that loaded an overlay-served source must be stored \
+         and hit — this is the `base` cost kolt's client.vl paid on every \
+         keystroke"
+    );
+    let (claims, claim_bytes) = vilan_core::analyzer::base_cache_overlay_claims();
+    assert_eq!(
+        (claims, claim_bytes),
+        (1, open_bytes),
+        "the stored world must hold exactly one claim, on the overlaid \
+         module's text, or its borrows are not kept alive by anything"
+    );
+    // The ctrl-Z shape — §7.9.2's sharpest edge. Edit the open buffer (the
+    // stored world goes stale and is evicted), then UNDO back to the content
+    // the world was built from: the world that becomes valid again must
+    // still be pointing at live memory, and must answer correctly.
     vilan_core::analyzer::set_document_overlay(
         &dep_lib,
-        Some("fun greeting(): i32 {\n\t42\n}\n".to_string()),
+        Some("fun greeting(): i32 {\n\t43\n}\n".to_string()),
     );
-    let (hits_open_before, misses_open_before) = stats();
-    analyze_owning();
-    analyze_owning();
-    let (hits_open, misses_open) = stats();
-    assert_eq!(
-        hits_open, hits_open_before,
-        "a world that loaded an overlay-served source was stored and served — \
-         the M9 store gate is gone, and the served world borrows memory the \
-         owning analysis will free (leak-soak.md §7.9.4a)"
+    assert!(analyze_owning().is_empty());
+    vilan_core::analyzer::set_document_overlay(&dep_lib, Some(open_text));
+    let (hits_undo_before, _) = stats();
+    let after_undo = analyze_owning();
+    let (hits_undo, _) = stats();
+    assert!(
+        after_undo.is_empty(),
+        "after an undo the re-validated world must resolve the dependency, \
+         not read freed memory: {after_undo:?}"
     );
-    assert_eq!(
-        misses_open,
-        misses_open_before + 2,
-        "with the store refused, every analysis over the open buffer misses"
+    assert!(
+        hits_undo >= hits_undo_before,
+        "the undo must not corrupt the cache's accounting"
     );
 
-    // The buffer closes: loads come from disk again, the store resumes, and
-    // the very next repeat analysis hits.
+    // An analysis with NO collection scope has nowhere to keep a claim, so
+    // the claimed world is not served to it: a miss, and it loads the
+    // overlay through the process-global cache exactly as it always did.
+    let (hits_unscoped_before, misses_unscoped_before) = stats();
+    let workspace_for_plain = workspace.clone();
+    let app_dir_for_plain = app_dir.clone();
+    let entry_for_plain = entry_path.clone();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = vilan_core::manifest::resolve_std(&std_root());
+            let (program, errors) = analyze_source(
+                source,
+                &std,
+                &app_dir_for_plain,
+                &entry_for_plain,
+                Some(Platform::default()),
+                &workspace_for_plain,
+            );
+            assert!(errors.is_empty(), "the unscoped analysis must be clean");
+            drop(program);
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+    let (hits_unscoped, misses_unscoped) = stats();
+    assert_eq!(
+        hits_unscoped, hits_unscoped_before,
+        "a claimed world must NOT be served to an analysis with no scope to \
+         hold its claims — that borrow would be kept alive by nothing"
+    );
+    assert!(misses_unscoped > misses_unscoped_before);
+
+    // The buffer closes: loads come from disk again, so the world stored
+    // from then on claims nothing, and clearing gives every claim back.
     vilan_core::analyzer::set_document_overlay(&dep_lib, None);
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_closed_before, _) = stats();
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_closed, _) = stats();
     assert_eq!(
         hits_closed,
         hits_closed_before + 1,
-        "once the buffer closes the world must store and hit again"
+        "once the buffer closes the disk-served world must store and hit"
     );
 
     vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_overlay_claims(),
+        (0, 0),
+        "clearing the cache gives every claim back"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

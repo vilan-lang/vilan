@@ -41184,17 +41184,31 @@ struct BaseCacheKey {
     entry_pkg: Option<(PathBuf, Vec<&'static str>)>,
 }
 
+/// One retained base world and the claims that keep its borrows alive (M23).
+///
+/// A stored world borrows every module it loaded. Disk-served modules live in
+/// `parse_clean_cached`'s immortal cache, so they need nothing; an
+/// OVERLAY-served module is analysis-owned (M9) and would be freed under the
+/// stored world's feet, which is what §7.9.4a's store gate refused to allow
+/// and what `overlay_claims` allows instead: one claim per overlay-served
+/// allocation the storing analysis held, taken while that analysis still held
+/// its own, released on every path that removes this value from the map.
+struct StoredWorld {
+    world: World<'static>,
+    overlay_claims: Vec<crate::owned_modules::ModuleClaim>,
+}
+
 /// The base cache (S3c, analysis-reuse.md §6.10): resolved pre-entry worlds
 /// keyed by [`BaseCacheKey`], each hit re-validated against the loaded files'
 /// CONTENT hashes (the E12 rule) and then cloned with the three entry slots
 /// patched. Worlds are stored SCRUBBED — entry path, hash, and text emptied —
-/// and every reference a stored world still holds is 'static in fact: std/dep
-/// texts live in `parse_clean_cached`'s leaked cache (a world whose analysis
-/// loaded any ANALYSIS-OWNED overlay copy instead is never stored — the M9
-/// gate in `base_cache_store`), and the entry-derived strings that reach the
-/// world's maps (seeded module names, dependency display names) are interned
-/// above.
-static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, World<'static>>>> =
+/// and every reference a stored world still holds is live for as long as the
+/// world is: std/dep texts live in `parse_clean_cached`'s leaked cache,
+/// analysis-owned overlay copies are held by the world's own
+/// [`StoredWorld::overlay_claims`] (M23), and the entry-derived strings that
+/// reach the world's maps (seeded module names, dependency display names) are
+/// interned above.
+static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, StoredWorld>>> =
     std::sync::OnceLock::new();
 static BASE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BASE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -41227,6 +41241,35 @@ pub fn base_cache_retained() -> usize {
         .unwrap_or(0)
 }
 
+/// How many ANALYSIS-OWNED overlay module allocations the retained worlds are
+/// holding claims on right now (M23), and what their texts are worth — the
+/// retention M9's store gate used to trade away, made countable in the same
+/// terms as [`base_cache_retained`]. The bytes are already inside
+/// `leak_tally`'s `OwnedModuleText` outstanding balance; this splits out the
+/// base cache's share of it.
+#[doc(hidden)]
+pub fn base_cache_overlay_claims() -> (usize, usize) {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.values().fold((0, 0), |(count, bytes), stored| {
+                (
+                    count + stored.overlay_claims.len(),
+                    bytes
+                        + stored
+                            .overlay_claims
+                            .iter()
+                            .map(crate::owned_modules::ModuleClaim::text_bytes)
+                            .sum::<usize>(),
+                )
+            })
+        })
+        .unwrap_or((0, 0))
+}
+
 /// The bytes a stored world is recorded as retaining (backlog M11): the module
 /// texts it was built from, summed. Source-proportional rather than a heap
 /// audit, for the reason [`crate::leak_tally::LeakSite::BaseCacheWorld`]
@@ -41255,13 +41298,13 @@ pub fn base_cache_clear() {
         // record — a test clears from the runner's thread, a world was stored
         // on an analysis thread — which is the cross-thread shape
         // `leak_tally::outstanding` is signed for.
-        for world in cache.values() {
-            crate::leak_tally::release(
-                crate::leak_tally::LeakSite::BaseCacheWorld,
-                base_cache_world_bytes(world),
-            );
+        for (_, stored) in cache.drain() {
+            // SAFETY (M23): the world is removed from the map and dropped
+            // right here, so nothing borrows through its claims any more.
+            // Other holders' claims — a live analysis's — keep their own
+            // allocations alive.
+            unsafe { release_stored_world(stored) };
         }
-        cache.clear();
     }
 }
 
@@ -41322,7 +41365,8 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let stale = if let Some(world) = cache.get(key) {
+    let stale = if let Some(stored) = cache.get(key) {
+        let world = &stored.world;
         let entry_canonical = crate::util::canonical_path(entry_path);
         let entry_is_a_loaded_module = world
             .sources
@@ -41340,54 +41384,106 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
                         .is_ok_and(|text| crate::content_hash(&text) == *expected)
                 });
         if contents_match {
-            BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Some(world.clone());
+            // M23: the clone borrows every module this world loaded,
+            // including the analysis-owned overlay copies the storing
+            // analysis parsed. The receiving analysis must hold its OWN claim
+            // on each before this lock is released — and an analysis with no
+            // collection scope (the CLI, the wasm front end, a transient
+            // reader) or a macro-world compile (whose world is immortal by
+            // design, §7.9.4b) has nowhere to keep one, so it is served a
+            // MISS instead of a borrow nothing keeps alive. A world with no
+            // overlay claims is served to everyone, exactly as before.
+            let claimable = stored.overlay_claims.is_empty()
+                || (!crate::macros::in_macro_world()
+                    && crate::owned_modules::adopt_claims(
+                        stored
+                            .overlay_claims
+                            .iter()
+                            .map(crate::owned_modules::ModuleClaim::clone_claim)
+                            .collect(),
+                    ));
+            if claimable {
+                BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Some(world.clone());
+            }
+            // Not stale — just not servable to THIS caller. Leave it stored
+            // for the analyses that can claim it.
+            BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
         }
         true
     } else {
         false
     };
     if stale {
-        // A removed world stops being retained, so its bytes go back (M11).
+        // A removed world stops being retained, so its bytes go back (M11)
+        // and its overlay claims with them (M23).
         if let Some(evicted) = cache.remove(key) {
-            crate::leak_tally::release(
-                crate::leak_tally::LeakSite::BaseCacheWorld,
-                base_cache_world_bytes(&evicted),
-            );
+            // SAFETY (M23): the world is removed and dropped here, so no
+            // reference taken through its claims survives; every analysis
+            // that was ever served a clone of it holds claims of its own.
+            unsafe { release_stored_world(evicted) };
         }
     }
     BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     None
 }
 
+/// Drops one retained world and gives back everything it was retaining: the
+/// M11 byte record and the M23 overlay claims.
+///
+/// # Safety
+///
+/// `stored` must already be out of [`BASE_CACHE`] and about to be dropped —
+/// no clone of its world may still be in use by a caller that did not take
+/// its own claims (which `base_cache_lookup` guarantees by refusing to serve
+/// a claimed world to an analysis that cannot hold them).
+unsafe fn release_stored_world(stored: StoredWorld) {
+    crate::leak_tally::release(
+        crate::leak_tally::LeakSite::BaseCacheWorld,
+        base_cache_world_bytes(&stored.world),
+    );
+    for claim in stored.overlay_claims {
+        // SAFETY: the caller's contract — this world is gone, and every
+        // analysis served from it holds its own claim.
+        unsafe { claim.release() };
+    }
+}
+
 /// Stores a scrubbed clone of `world` under its key.
 fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
-    // The M9 gate (leak-soak.md §7.9.4a), the mechanism's stated proof
-    // obligation: an opted-in analysis that loaded any overlay-served source
-    // OWNS that text and tree — its program must be their ONLY borrower,
-    // because they are freed when it drops — and this world borrows every
-    // module it loaded. A stored world outlives the analysis, so refuse the
-    // store. The consequence is deliberate and bounded: base-world caching
-    // is forfeited while a std or dependency file is open in the editor,
-    // visible in the stats as misses that never turn into hits. A
-    // macro-world compile is exempt: its loads keep the global caches
+    // M23, replacing §7.9.4a's store gate. An opted-in analysis that loaded
+    // an overlay-served source OWNS that text and tree, and this world
+    // borrows every module it loaded — so M9 refused the store outright,
+    // which cost every entry importing an OPEN sibling the whole pre-entry
+    // world on every keystroke (kolt's `client.vl`: `base` 1.4–2.7 s, always
+    // a miss). The world takes its OWN CLAIM on each of those allocations
+    // instead: they are freed when the last claim is released, and this
+    // world's claim is released only when it leaves the map. The clones are
+    // taken here, inside the analysis that still holds the originals, so no
+    // count is ever resurrected from zero.
+    //
+    // A macro-world compile takes none: its loads keep the global caches
     // (§7.9.4b), so ITS world borrows nothing analysis-owned even when the
     // outer analysis does.
-    if !crate::macros::in_macro_world() && crate::owned_modules::analysis_owns_overlay_loads() {
-        return;
-    }
+    let overlay_claims = if crate::macros::in_macro_world() {
+        Vec::new()
+    } else {
+        crate::owned_modules::claim_overlay_loads()
+    };
     let mut scrubbed = world.clone();
     scrubbed.sources[0] = PathBuf::new();
     scrubbed.source_hashes[0] = 0;
     scrubbed.analyzer.source_texts[0] = (SourceId(0), "");
     scrubbed.generated_by_source.remove(&SourceId(0));
     // SAFETY: lifetime-only transmute. After the scrub, every reference the
-    // world holds is 'static in fact: module/dep texts and ASTs live in
+    // world holds outlives this store: module/dep texts and ASTs live in
     // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
     // file through it, EXCEPT an opted-in analysis's overlay-served loads —
-    // which are analysis-owned and freed, and exactly why the gate above
-    // refuses to store a world that made any: the M9 clause this argument
-    // now rests on), the entry-derived strings that reach the world's maps
+    // which are analysis-owned, and which this world therefore CLAIMS above,
+    // so they are freed only after the claim taken here is released: the M23
+    // clause this argument now rests on, replacing M9's outright refusal),
+    // the entry-derived strings that reach the world's maps
     // — a seeded module name, whether it seeded `std`, a `pkg::` SIBLING
     // (M21) or a DEPENDENCY — go through `interned_display_name`, dependency
     // namespace display names go through it too, and the three entry slots
@@ -41406,12 +41502,17 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     let displaced = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, static_world);
-    if let Some(displaced) = displaced {
-        crate::leak_tally::release(
-            crate::leak_tally::LeakSite::BaseCacheWorld,
-            base_cache_world_bytes(&displaced),
+        .insert(
+            key,
+            StoredWorld {
+                world: static_world,
+                overlay_claims,
+            },
         );
+    if let Some(displaced) = displaced {
+        // SAFETY (M23): the displaced world is out of the map and dropped
+        // here; any analysis it was ever served to took claims of its own.
+        unsafe { release_stored_world(displaced) };
     }
     crate::leak_tally::record(crate::leak_tally::LeakSite::BaseCacheWorld, stored_bytes);
 }

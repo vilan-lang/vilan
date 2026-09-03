@@ -1,4 +1,5 @@
-//! Analysis-owned module allocations (M9, `leak-soak.md` §7.9.4).
+//! Analysis-owned module allocations (M9, `leak-soak.md` §7.9.4), shared with
+//! the stored base worlds that borrow them (M23).
 //!
 //! `parse_clean_cached` and the loader's error cache are process-global and
 //! content-keyed with no eviction — right for what they were built for (E12:
@@ -18,24 +19,48 @@
 //! open-document overlay bypasses the process-global caches and parses into
 //! allocations collected on this thread-local scope: [`Leaked`] handles for
 //! the text and tree, plus the rendered errors when the content does not
-//! parse clean. The scope drains into `AnalyzedEntry` beside the entry's own
-//! two handles, the server's `AnalyzedProgram` owns the lot, and its `Drop`
-//! reclaims them after the program — M7's proven pattern one level down. The
-//! bound is the open set: outstanding module bytes are the sum, over open
-//! documents, of the overlay-served modules their CURRENT analysis loaded,
-//! and per-distinct-content growth is zero.
+//! parse clean. The scope drains into `AnalyzedEntry`, the server's
+//! `AnalyzedProgram` owns the lot, and its `Drop` gives them back — M7's
+//! proven pattern one level down.
+//!
+//! **M23 — the claim.** M9's first shape gave each allocation exactly one
+//! owner, and paid for it with §7.9.4a's store gate: a base world that
+//! loaded an overlay-served source was never stored, so an entry importing
+//! any OPEN sibling rebuilt the whole pre-entry world on every keystroke
+//! (kolt's `client.vl`: `base` 1.4–2.7 s, every keystroke, forever). The
+//! ownership is a REFERENCE COUNT now. Every party that holds a reference
+//! derived from an allocation holds a [`ModuleClaim`] on it: the analysis
+//! that parsed it (drained into `AnalyzedEntry`, released by
+//! `AnalyzedProgram::drop`), and any stored base world built over it
+//! (claimed at `base_cache_store`, released when the world is displaced,
+//! evicted stale, evicted by the byte budget, or cleared). The allocation is
+//! freed exactly when the LAST claim is released, so no live program, no
+//! in-flight analysis and no stored world can ever read freed memory —
+//! §7.9.2's hazards all land on a claim rather than on an ordering rule.
+//! Nothing is shared by CONTENT: a claim is a claim on one allocation, so
+//! §7.9.2's content-aliasing hazard has nothing to alias.
+//!
+//! The bound moves accordingly: outstanding module bytes are the overlay-
+//! served modules the open documents' CURRENT analyses loaded, PLUS one set
+//! per retained base world — which is what M24's byte budget bounds. Per-
+//! distinct-content growth is still zero.
 //!
 //! With no scope active — the CLI, the wasm front end (which serves
 //! everything from the overlay and must keep the global caches), tests, and
 //! transient editor queries (`module_importables`, platform inference) —
 //! nothing changes, byte for byte: activation is the explicit opt-in, not an
-//! ambient property of the overlay. A macro-world compile keeps the global
-//! caches even under an active scope (`in_macro_world` marks the region):
-//! its world outlives every analysis by design (§7.9.4b).
+//! ambient property of the overlay. Such an analysis has nowhere to put a
+//! claim, so the base cache refuses to SERVE it a claimed world (a miss,
+//! counted) rather than handing out an unclaimed borrow. A macro-world
+//! compile keeps the global caches even under an active scope
+//! (`in_macro_world` marks the region): its world outlives every analysis by
+//! design (§7.9.4b), and for the same reason it is never served a claimed
+//! world either.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::analyzer::LoadedModule;
 use crate::leak_tally::Leaked;
@@ -52,14 +77,85 @@ pub(crate) struct OwnedModuleAllocation {
     pub(crate) parse_errors: Option<Leaked<[crate::analyzer::ModuleParseError]>>,
 }
 
-/// Every allocation one analysis's overlay-served module loads made — the
-/// drained scope, carried on `AnalyzedEntry` and owned by whoever owns the
-/// `Program` built over it (the server's `AnalyzedProgram`). Dropping it
-/// WITHOUT [`reclaim`](OwnedModules::reclaim) keeps the allocations leaked —
-/// the same contract as every [`Leaked`] handle, and the panic path's story.
+impl OwnedModuleAllocation {
+    /// Frees the three allocations and releases their recorded bytes.
+    ///
+    /// # Safety
+    ///
+    /// Every reference derived from this load must be dead — which is what
+    /// the claim count decides, so the only caller is
+    /// [`ModuleClaim::release`] on the last claim.
+    unsafe fn free(self) {
+        // SAFETY: the caller's contract. The tree borrows the text, so
+        // nothing here reads either: reclaim only frees.
+        unsafe {
+            self.text.reclaim();
+            self.ast.reclaim();
+            if let Some(parse_errors) = self.parse_errors {
+                parse_errors.reclaim();
+            }
+        }
+    }
+}
+
+/// One party's claim on an [`OwnedModuleAllocation`] — the license to hold a
+/// reference derived from it (M23).
+///
+/// Two kinds of party take one: the analysis that parsed the module (through
+/// the collection scope, drained into `AnalyzedEntry` and released by the
+/// server's `AnalyzedProgram::drop`) and a stored base world that borrows it
+/// (taken in `base_cache_store`, released on every eviction path). A claim is
+/// taken by CLONING an existing one, always while the cloner already holds a
+/// live claim, so the count can never be resurrected from zero.
+///
+/// Like [`Leaked`], this has **no `Drop`**: dropping a claim keeps the
+/// allocation leaked, which is the unwound analysis's story (M7's, one level
+/// down) and what makes reclaiming an explicit, `unsafe` act rather than an
+/// accident of scope. [`release`](ModuleClaim::release) is the only way back.
+pub(crate) struct ModuleClaim(Arc<OwnedModuleAllocation>);
+
+impl ModuleClaim {
+    /// A second claim on the same allocation, for a second party.
+    pub(crate) fn clone_claim(&self) -> ModuleClaim {
+        ModuleClaim(Arc::clone(&self.0))
+    }
+
+    /// The text bytes this allocation records — what a release at the last
+    /// claim gives back at `OwnedModuleText`. The measurement surface for the
+    /// retention a stored world's claims represent.
+    pub(crate) fn text_bytes(&self) -> usize {
+        self.0.text.bytes()
+    }
+
+    /// Gives this claim back. Frees the allocation only if it was the LAST
+    /// one — `Arc::into_inner` is the whole protocol.
+    ///
+    /// # Safety
+    ///
+    /// Every reference this claim's holder derived from the allocation must
+    /// be dead: for an analysis, the `Program` built over it has been
+    /// dropped; for a stored base world, the world has been removed from the
+    /// cache and dropped. Other holders' references stay valid — that is what
+    /// the count is for.
+    pub(crate) unsafe fn release(self) {
+        if let Some(allocation) = Arc::into_inner(self.0) {
+            // SAFETY: this was the last claim, so by the contract above no
+            // reference derived from the allocation survives anywhere.
+            unsafe { allocation.free() };
+        }
+    }
+}
+
+/// Every claim one analysis holds on an overlay-served module allocation —
+/// the drained scope, carried on `AnalyzedEntry` and owned by whoever owns
+/// the `Program` built over it (the server's `AnalyzedProgram`). One claim
+/// per module the analysis PARSED, plus one per module a base-cache hit
+/// served it out of a stored world (M23). Dropping it WITHOUT
+/// [`reclaim`](OwnedModules::reclaim) keeps the allocations leaked — the same
+/// contract as every [`Leaked`] handle, and the panic path's story.
 #[derive(Default)]
 pub struct OwnedModules {
-    allocations: Vec<OwnedModuleAllocation>,
+    claims: Vec<ModuleClaim>,
 }
 
 impl OwnedModules {
@@ -69,39 +165,33 @@ impl OwnedModules {
         OwnedModules::default()
     }
 
-    /// How many overlay-served modules this analysis owns.
+    /// How many overlay-served module allocations this analysis holds a
+    /// claim on.
     pub fn len(&self) -> usize {
-        self.allocations.len()
+        self.claims.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.allocations.is_empty()
+        self.claims.is_empty()
     }
 
-    /// Frees every owned allocation and releases its recorded bytes at the
-    /// `OwnedModule*` sites (on the CURRENT thread — the release may be
-    /// cross-thread, like every reclaim).
+    /// Gives back every claim this analysis holds. An allocation whose LAST
+    /// claim this was is freed and its bytes released at the `OwnedModule*`
+    /// sites (on the CURRENT thread — the release may be cross-thread, like
+    /// every reclaim); one a stored base world still claims survives, and is
+    /// freed when that world is evicted (M23).
     ///
     /// # Safety
     ///
-    /// Every reference derived from these loads must be dead: the `Program`
-    /// built by the analysis that collected them has been dropped, and no
-    /// global retains one — which is the mechanism's own invariant (the
-    /// base-world store gate refuses to store a world that loaded any
-    /// overlay-served source, and a macro-world compile never loads through
-    /// the scope; `leak-soak.md` §7.9.4a/b).
+    /// Every reference THIS analysis derived from these loads must be dead:
+    /// the `Program` it built has been dropped. Nothing else is required —
+    /// the other holders' claims are exactly what keeps their references
+    /// valid.
     pub unsafe fn reclaim(self) {
-        for allocation in self.allocations {
-            // SAFETY: the caller's contract above — no borrower of any of
-            // the three survives. The tree borrows the text, so nothing
-            // here reads either: reclaim only frees.
-            unsafe {
-                allocation.text.reclaim();
-                allocation.ast.reclaim();
-                if let Some(parse_errors) = allocation.parse_errors {
-                    parse_errors.reclaim();
-                }
-            }
+        for claim in self.claims {
+            // SAFETY: the caller's contract above — this analysis's program,
+            // the only thing that borrowed through this claim, is gone.
+            unsafe { claim.release() };
         }
     }
 }
@@ -115,7 +205,7 @@ impl OwnedModules {
 /// needs it; this map is an optimization), and a miss on a second spelling
 /// is harmless — the analysis owns and reclaims one more copy.
 struct ScopeState {
-    allocations: Vec<OwnedModuleAllocation>,
+    claims: Vec<ModuleClaim>,
     memo: HashMap<PathBuf, LoadedModule>,
 }
 
@@ -149,7 +239,7 @@ impl CollectionScope {
                 "an owned-modules collection scope is already active on this thread"
             );
             *scope = Some(ScopeState {
-                allocations: Vec::new(),
+                claims: Vec::new(),
                 memo: HashMap::new(),
             });
         });
@@ -164,7 +254,7 @@ impl CollectionScope {
         // deactivation happens exactly once, here.
         std::mem::forget(self);
         OwnedModules {
-            allocations: state.map(|state| state.allocations).unwrap_or_default(),
+            claims: state.map(|state| state.claims).unwrap_or_default(),
         }
     }
 }
@@ -185,15 +275,45 @@ pub(crate) fn collecting() -> bool {
     SCOPE.with(|scope| scope.borrow().is_some())
 }
 
-/// Whether the active analysis loaded any overlay-served source — the flag
-/// the base-world store gate reads (§7.9.4a): a stored world outlives the
-/// analysis, so it must never borrow what the analysis owns.
-pub(crate) fn analysis_owns_overlay_loads() -> bool {
+/// A second claim on every allocation the active analysis holds — what
+/// `base_cache_store` takes for the world it is about to store (M23).
+///
+/// Taken from inside the analysis that already holds the originals, so every
+/// clone happens while the count is provably nonzero. A superset of what the
+/// world actually borrows is fine and is what this is: the store runs right
+/// after the load loop, so the scope holds exactly that loop's loads, and an
+/// unnecessary claim costs one retained copy until the world is evicted, not
+/// soundness. Empty (and cheap) for the overwhelmingly common analysis that
+/// loaded no overlay-served module at all.
+pub(crate) fn claim_overlay_loads() -> Vec<ModuleClaim> {
     SCOPE.with(|scope| {
         scope
             .borrow()
             .as_ref()
-            .is_some_and(|state| !state.allocations.is_empty())
+            .map(|state| state.claims.iter().map(ModuleClaim::clone_claim).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Hands the active analysis its own claims on the allocations a base-cache
+/// HIT just served it (M23), returning `false` — and taking nothing — when
+/// there is no scope to hold them.
+///
+/// A world's clone borrows every module the stored world loaded, so the
+/// analysis that receives it must hold a claim on each before the cache lock
+/// is released. `false` is the caller's signal to treat the hit as a miss:
+/// an analysis with nowhere to put a claim (the CLI, the wasm front end, a
+/// transient reader) must never be handed a borrow it cannot keep alive.
+pub(crate) fn adopt_claims(claims: Vec<ModuleClaim>) -> bool {
+    SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        match scope.as_mut() {
+            Some(state) => {
+                state.claims.extend(claims);
+                true
+            }
+            None => false,
+        }
     })
 }
 
@@ -218,7 +338,7 @@ pub(crate) fn adopt(path: &Path, allocation: OwnedModuleAllocation, loaded: Load
         let state = scope
             .as_mut()
             .expect("owned_modules::adopt requires an active collection scope");
-        state.allocations.push(allocation);
+        state.claims.push(ModuleClaim(Arc::new(allocation)));
         state.memo.insert(path.to_path_buf(), loaded);
     });
 }
@@ -260,10 +380,10 @@ mod tests {
         assert!(memoized(Path::new("/m9/probe.vl")).is_none());
         let scope = CollectionScope::activate();
         assert!(collecting());
-        assert!(!analysis_owns_overlay_loads(), "no load yet");
+        assert!(claim_overlay_loads().is_empty(), "no load yet");
         let (allocation, loaded) = owned_allocation("owned probe text");
         adopt(Path::new("/m9/probe.vl"), allocation, loaded);
-        assert!(analysis_owns_overlay_loads());
+        assert_eq!(claim_overlay_loads().len(), 1);
         let memoized_loaded =
             memoized(Path::new("/m9/probe.vl")).expect("the adopted path memoizes");
         assert!(
@@ -280,6 +400,50 @@ mod tests {
         assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
         assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
         leak_tally::reset();
+    }
+
+    /// M23's protocol at its own level: a SECOND claim on the allocation —
+    /// the one a stored base world takes — keeps it alive after the analysis
+    /// gives its claim back, and the last release is what frees it.
+    #[test]
+    fn the_last_claim_frees_and_no_earlier_one_does() {
+        leak_tally::reset();
+        let scope = CollectionScope::activate();
+        let (allocation, loaded) = owned_allocation("claimed probe text");
+        let text_bytes = loaded.text.len();
+        adopt(Path::new("/m23/claimed.vl"), allocation, loaded);
+        // The store's claim, taken while the analysis still holds its own.
+        let stored: Vec<ModuleClaim> = claim_overlay_loads();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].text_bytes(), text_bytes);
+        let owned = scope.drain();
+
+        // SAFETY: this analysis's borrows are dead; the stored claim's are
+        // not, and it is what keeps the allocation alive.
+        unsafe { owned.reclaim() };
+        assert_eq!(
+            leak_tally::outstanding(LeakSite::OwnedModuleText),
+            text_bytes as isize,
+            "the analysis's release must NOT free an allocation a stored \
+             world still claims"
+        );
+        for claim in stored {
+            // SAFETY: the stored world has been dropped; this is the last
+            // claim.
+            unsafe { claim.release() };
+        }
+        assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+        assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
+        leak_tally::reset();
+    }
+
+    /// `adopt_claims` refuses when there is no scope — the caller's signal to
+    /// treat a base-cache hit on a CLAIMED world as a miss rather than hand
+    /// out a borrow nothing keeps alive.
+    #[test]
+    fn adopting_claims_without_a_scope_refuses() {
+        assert!(!collecting());
+        assert!(!adopt_claims(Vec::new()));
     }
 
     /// Dropping the guard without draining (the unwind path) deactivates the

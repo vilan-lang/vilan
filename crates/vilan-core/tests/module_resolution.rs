@@ -2025,14 +2025,16 @@ fn a_macro_worlds_tree_records_at_its_own_site_not_the_entrys() {
         .expect("worker panicked");
 }
 
-/// M9 (`leak-soak.md` §7.9.4): the opted-in entry point
+/// M9 (`leak-soak.md` §7.9.4) with M23's claim: the opted-in entry point
 /// (`analyze_source_owning_overlay_modules`) parses an overlay-served module
 /// into ANALYSIS-OWNED allocations — no growth at either process-global cache
-/// site, one owned copy per analysis (no cross-analysis sharing), reclaimed
-/// to a zero balance once the program is dropped. The non-opted entry points
+/// site — and the base world built over them CLAIMS them, so a second
+/// analysis of the same content is served that world and parses nothing.
+/// Every claim released, the balance nets to zero. The non-opted entry points
 /// keep today's behavior byte for byte: the same overlaid load goes through
 /// `parse_clean_cached` exactly as before (§7.9.4c — the CLI, the wasm front
-/// end, and every transient reader must not switch).
+/// end, and every transient reader must not switch), and they are never
+/// served a CLAIMED world, having nowhere to keep its claims.
 #[test]
 fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
     use vilan_core::leak_tally::{self, LeakSite};
@@ -2075,8 +2077,11 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
             };
             // Warmup: fill the process-global caches with std's parses (and
             // the disk helper), so the measured window below reads only what
-            // the OVERLAY loads do.
+            // the OVERLAY loads do. Its base world is cleared before the
+            // window opens (M23 stores one now), so `first` below is a MISS
+            // and really does parse the overlay.
             let _ = analyze_owning();
+            vilan_core::analyzer::base_cache_clear();
             leak_tally::reset();
             let first = analyze_owning();
             assert!(
@@ -2102,15 +2107,30 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
                 "the owned copy records the overlaid text to the byte"
             );
 
-            // A second opted-in analysis of the SAME content parses and owns
-            // its own copy — nothing is shared across analyses, which is the
-            // whole soundness story.
+            // M23: the world the first analysis built was STORED and claims
+            // that copy, so a second opted-in analysis of the same content
+            // hits it — it holds a claim on the same allocation and parses
+            // nothing. (Before M23 the store was refused and this analysis
+            // paid the whole pre-entry world again.)
             let second = analyze_owning();
-            assert_eq!(second.owned_modules.len(), 1);
+            assert_eq!(
+                second.owned_modules.len(),
+                1,
+                "the hitting analysis must hold its own claim on the copy the \
+                 stored world served it"
+            );
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                2 * overlaid_bytes,
-                "a second analysis must own its own copy, not share the first's"
+                overlaid_bytes,
+                "M23: the second analysis is served the stored world's copy \
+                 and parses nothing — a claim, not a second copy"
+            );
+            let (claims, claim_bytes) = vilan_core::analyzer::base_cache_overlay_claims();
+            assert_eq!(
+                (claims, claim_bytes),
+                (1, overlaid_bytes),
+                "the stored world holds exactly one claim, on the overlaid \
+                 module's text"
             );
 
             // Reclaim in the owner's order: program first, then the handles.
@@ -2121,23 +2141,31 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
                     // dropped on the line above.
                     unsafe { ast.reclaim() };
                 }
-                // SAFETY: as above — the owned copies' only borrower (the
-                // program; the store gate and macro carve-out keep every
-                // global out of them) is gone.
+                // SAFETY: as above. Only this analysis's claims are given
+                // back; the stored world's keeps the allocation alive.
                 unsafe { analyzed.owned_modules.reclaim() };
             }
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                overlaid_bytes as isize,
+                "the stored world's claim is the one still outstanding — M23's \
+                 retention, and what M24's budget bounds"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                2 * overlaid_bytes,
+                overlaid_bytes,
                 "the gross record stands after the reclaim"
             );
 
             // The NON-opted path, same overlay: the process-global cache is
             // used exactly as before — the §7.5 leak is the recorded,
             // deliberate behavior for every caller that does not opt in.
+            // (M23: it is also never served a CLAIMED base world, having no
+            // scope to keep the claims in — so it really does load.)
             leak_tally::reset();
             let (program, errors) = analyze_source(
                 source,
@@ -2239,6 +2267,10 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
                 )
             };
             let _warmup = analyze_owning();
+            // M23: the warmup's base world is stored and claims its copy, so
+            // clear it — the measured analysis below must MISS and really
+            // parse the overlay for the byte assertion to mean anything.
+            vilan_core::analyzer::base_cache_clear();
             leak_tally::reset();
             let analyzed = analyze_owning();
             assert!(
@@ -2261,8 +2293,15 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
                 // SAFETY: the program was dropped on the line above.
                 unsafe { ast.reclaim() };
             }
-            // SAFETY: as above — the program was the owned copy's only borrower.
+            // SAFETY: as above. This releases only this analysis's claim.
             unsafe { analyzed.owned_modules.reclaim() };
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                overlaid_bytes as isize,
+                "M23: the base world stored for this analysis claims the copy, \
+                 so the analysis's own release does not free it"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
 
             vilan_core::analyzer::set_document_overlay(&dep_helper, None);
