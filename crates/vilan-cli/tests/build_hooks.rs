@@ -1130,6 +1130,19 @@ fn watch_manifest_failing(command: &str) -> String {
     )
 }
 
+/// A hook command that takes a few seconds, in the platform's shell — the
+/// widened round B208's queued-during-a-round pin needs, so an edit the test
+/// makes the moment it sees the hook START lands INSIDE the round rather than
+/// after it. `ping` rather than `timeout` on Windows: `timeout` refuses to run
+/// without a console, which a spawned hook does not have.
+fn slow_command() -> String {
+    if cfg!(windows) {
+        "ping -n 4 127.0.0.1 >nul".to_string()
+    } else {
+        "sleep 3".to_string()
+    }
+}
+
 /// A hook command that fails ONCE and then succeeds: while `marker` exists it
 /// removes it and exits non-zero, so the very next invocation passes. The
 /// transient failure G14 is about, made deterministic — no sleeps, no load
@@ -1162,12 +1175,20 @@ fn fail_while(marker: &str, attempts: &str) -> String {
 /// section has had was undiagnosable precisely for want of that log; the
 /// name is not `.vl` and not a declared input, so the watched set is
 /// unperturbed.
+///
+/// `VILAN_WATCH_LOG` turns on the loop's own trace beside it (B208): the
+/// narration says a round happened, and only the trace says what the POLL saw
+/// — which entries moved, which did not, and whether the loop was polling at
+/// all. N46's strike was "round 2 never fired", a symptom four different bugs
+/// share, and it was unfalsifiable without this. Both files are named so they
+/// are neither `.vl` nor a declared input, so the watched set is unperturbed.
 fn spawn_watch(dir: &Path) -> Watcher {
     let log = std::fs::File::create(dir.join("watch.log")).expect("create watch.log");
     Watcher(
         Command::new(env!("CARGO_BIN_EXE_vilan"))
             .args(["build", "--watch", dir.to_str().unwrap()])
             .env("NO_COLOR", "1")
+            .env("VILAN_WATCH_LOG", dir.join("watch-trace.log"))
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()
@@ -1183,7 +1204,7 @@ fn spawn_watch(dir: &Path) -> Watcher {
 /// verdict rather than a mystery (the first Windows red here cost a blind
 /// diagnosis for want of exactly this).
 fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duration {
-    wait_nudged(dir, label, || {}, condition)
+    wait_nudged(dir, label, |_attempt| {}, condition)
 }
 
 /// [`wait_for_in`], re-invoking `nudge` every ~20 s while it waits. A one-shot
@@ -1199,6 +1220,18 @@ fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duratio
 /// this is belt-and-braces against the shapes that remain (a filesystem whose
 /// mtime granularity swallows a rewrite, a snapshot read racing a write).
 ///
+/// **The nudge is handed its attempt number, and every file-writing caller
+/// uses it** (B208). A nudge that rewrote IDENTICAL BYTES could rescue a lost
+/// round only at the mtime gate, because that is the only gate identical bytes
+/// move: the watcher polls mtimes, but the freshness stamp digests CONTENT, so
+/// a hook whose stamp had swallowed the edit stayed `Fresh` through every
+/// re-touch — rounds firing, the hook never running, and re-touching provably
+/// unable to help however long the bound was. That is the shape of the strike
+/// B208 was filed on, and a rescue that cannot reach the second gate is a
+/// rescue that hides which gate failed. Writing new bytes each time re-triggers
+/// both and weakens nothing: every pin here asserts a COUNT of runs, never the
+/// content of the file it counted.
+///
 /// Two callers never use it, each for its own reason: the negative pin, whose
 /// whole claim is that nothing fires, and the retry pins, whose claim is that
 /// the RETRY landed the change — a re-touch there would start a fresh round
@@ -1206,24 +1239,27 @@ fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duratio
 fn wait_nudged(
     dir: &Path,
     label: &str,
-    nudge: impl Fn(),
+    nudge: impl Fn(u32),
     condition: impl Fn() -> bool,
 ) -> Duration {
     let started = Instant::now();
     let mut last_nudge = Instant::now();
+    let mut attempt = 0;
     while started.elapsed() < support::WATCH_LIVENESS {
         if condition() {
             return started.elapsed();
         }
         if last_nudge.elapsed() > Duration::from_secs(20) {
-            nudge();
+            attempt += 1;
+            nudge(attempt);
             last_nudge = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let log = std::fs::read_to_string(dir.join("watch.log")).unwrap_or_default();
+    let trace = std::fs::read_to_string(dir.join("watch-trace.log")).unwrap_or_default();
     panic!(
-        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n--- watch.log ---\n{log}",
+        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n         --- watch.log ---\n{log}\n--- watch-trace.log (VILAN_WATCH_LOG, B208) ---\n{trace}",
         runs(dir, "rounds.txt"),
         runs(dir, "ran.txt"),
     );
@@ -1250,12 +1286,95 @@ fn an_edited_hook_input_starts_a_watch_round_and_reruns_the_hook() {
     wait_nudged(
         &dir,
         "the round the edited input starts",
-        || write(&dir, "input.txt", "two\n"),
+        |attempt| write(&dir, "input.txt", &format!("two {attempt}\n")),
         || runs(&dir, "rounds.txt") >= 2,
     );
     wait_for_in(&dir, "the hook the edited input re-runs", || {
         runs(&dir, "ran.txt") >= 2
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_edit_landing_while_a_round_runs_starts_exactly_one_more_round() {
+    // B208. The loop reads its snapshot BEFORE the action and consumes the
+    // difference only when the round succeeds (E20's rule), so an edit made
+    // while a round is compiling is still a difference at the next poll. That is
+    // the *loop's* half. The other half is the freshness STAMP, which digests a
+    // hook's declared inputs — and recorded them AFTER the hook ran until
+    // Order 25's seal, so an edit landing between the hook's last command and
+    // that re-hash was stamped as already consumed: the round fired, the stamp
+    // said `Fresh`, and the edit was gone. Re-touching could not rescue it,
+    // because a re-touch of the same bytes moves the mtime and not the digest.
+    //
+    // So the pin measures BOTH observables across one edit made mid-round: a
+    // ROUND started (`rounds.txt`, the undeclared `[build] run`) and the HOOK
+    // re-ran (`ran.txt`). And exactly one more of each — the edit must not
+    // start a cascade either.
+    //
+    // The hook's middle command is deliberately slow, so the edit the test
+    // makes on seeing `ran.txt` lands while round 1 is still executing the
+    // hook. The claim holds whichever side of the round's end the edit lands
+    // on, so a box too loaded to place it inside cannot make this flake; the
+    // assertion below records which case ran.
+    let dir = temp_project("watch_edit_during_round");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[build]\nrun = [{}]\n\n[[build.hook]]\nname = \"gen\"\n\
+             run = [{}, {}, {}]\ninputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+            toml_string(&append("rounds.txt")),
+            toml_string(&append("ran.txt")),
+            toml_string(&slow_command()),
+            toml_string(&write_line("generated.txt", "generated")),
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    let _watcher = spawn_watch(&dir);
+
+    // `ran.txt` is the hook's FIRST command, so seeing it means the round is
+    // inside the hook and has not reached the stamp.
+    let first_round = wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
+    write(&dir, "input.txt", "two\n");
+    // Round 1 writes `generated.txt` as its LAST hook command, so its absence
+    // right now is the proof the edit landed mid-round.
+    let landed_mid_round = !dir.join("generated.txt").exists();
+
+    // Not nudged, and that is the whole pin: one edit, one round, one hook run.
+    // A re-touch would start a fresh round and prove nothing about the first.
+    wait_for_in(&dir, "the round the mid-round edit starts", || {
+        runs(&dir, "rounds.txt") >= 2
+    });
+    wait_for_in(&dir, "the hook the mid-round edit re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
+    assert!(
+        landed_mid_round,
+        "the edit was meant to land while round 1 was still running its hook — \
+         `generated.txt` already existed, so this run measured the ordinary \
+         between-rounds edit instead. The counts above still hold; only the \
+         mid-round case went unexercised."
+    );
+
+    // EXACTLY one more: the difference is consumed by the round that dealt with
+    // it, so nothing cascades. The window is this machine's own round scaled up
+    // (E32's rule), and it has to outlast the hook's own slow command.
+    let quiet = Instant::now();
+    let window = support::round_budget(first_round);
+    while quiet.elapsed() < window {
+        assert_eq!(
+            runs(&dir, "rounds.txt"),
+            2,
+            "one edit is one round: a second round here is a difference the \
+             successful round failed to consume"
+        );
+        assert_eq!(runs(&dir, "ran.txt"), 2, "and one hook run");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1320,7 +1439,13 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
     wait_nudged(
         &dir,
         "the round the new icon starts",
-        || write(&dir, "icons/close.svg", "<svg/>\n"),
+        |attempt| {
+            write(
+                &dir,
+                "icons/close.svg",
+                &format!("<svg id=\"{attempt}\"/>\n"),
+            )
+        },
         || runs(&dir, "rounds.txt") >= 2,
     );
     wait_for_in(&dir, "the hook the new icon re-runs", || {
@@ -1359,8 +1484,10 @@ fn an_empty_directory_added_under_a_declared_input_rounds_and_reruns_the_hook() 
         "the round the empty subdirectory starts",
         // The re-touch N30's pin uses, for the same reason: remove and
         // re-create is the only edit an empty directory has, and either half is
-        // a difference on its own.
-        || {
+        // a difference on its own. The one nudge with no CONTENT to vary
+        // (B208's rule above): an empty directory has none, and its identity
+        // moving is what both consumers key on.
+        |_attempt| {
             let _ = std::fs::remove_dir(dir.join("icons/empty"));
             let _ = std::fs::create_dir(dir.join("icons/empty"));
         },
@@ -1521,8 +1648,9 @@ fn a_declared_directory_input_appearing_empty_starts_a_watch_round() {
         // The re-touch a lost round needs, in the one form available to a
         // directory with nothing in it: remove and re-create. Either half is a
         // snapshot difference on its own, so a poll landing between them is
-        // fine, and a missing declared input builds cleanly.
-        || {
+        // fine, and a missing declared input builds cleanly. No CONTENT to vary
+        // (B208's rule on `wait_nudged`): an empty directory has none.
+        |_attempt| {
             let _ = std::fs::remove_dir(dir.join("icons"));
             let _ = std::fs::create_dir(dir.join("icons"));
         },
@@ -2022,6 +2150,90 @@ fn fmt_follows_a_directory_link_that_stays_inside_the_project() {
         !text.contains("outside this project"),
         "and nothing is said about it:\n{text}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_counts_a_file_reached_under_two_names_once() {
+    // G22. G18 gave the walk a cycle guard keyed on DIRECTORY identity, which
+    // is the whole question for a cycle and only half of it for a link: a
+    // filesystem hands one FILE to a walk under as many names as point at it,
+    // and the collector took every one. `vilan fmt --check` then printed two
+    // `would reformat` lines for one file and counted it twice (so the exit
+    // code was right for the wrong reason), and `vilan fmt` formatted it twice.
+    //
+    // Two link shapes in one tree, and they are not the same measurement:
+    //
+    //   * a DIRECTORY link inside the project (`src/shared -> ../shared`) —
+    //     supported layout, walked since G19. G18's guard already covers it,
+    //     because the second name reaches a directory it has seen; this half is
+    //     the CONTROL that says the new guard did not break the old one.
+    //   * a FILE link beside its target (`src/alias.vl -> real.vl`) — one file,
+    //     two names, in one directory, and no directory-keyed guard can see it.
+    //     This is G22, and it is the half that was red: the old walk reported
+    //     `src/alias.vl` and `src/real.vl` as two files.
+    //
+    // Two distinct files need formatting, so the pin is not "reports once" — it
+    // is "reports each FILE once", and a guard that collapsed the two real files
+    // into one would fail it exactly as the missing guard did.
+    let dir = temp_project("two_names");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/main.vl", "fun main() {}\n");
+    write(&dir, "shared/helper.vl", "fun  helper( ) { }\n");
+    write(&dir, "src/real.vl", "fun  real( ) { }\n");
+    std::os::unix::fs::symlink("../shared", dir.join("src/shared"))
+        .expect("a directory link inside the project");
+    std::os::unix::fs::symlink("real.vl", dir.join("src/alias.vl"))
+        .expect("a file link beside its target");
+
+    let output = vilan(&["fmt", "--check", dir.to_str().unwrap()]);
+    let text = combined(&output);
+
+    assert_eq!(
+        text.matches("would reformat").count(),
+        2,
+        "two files need formatting and there are two of them however many names \
+         reach them — one through a directory link, one through a file link:\n{text}"
+    );
+    assert!(
+        text.contains("helper.vl"),
+        "the file under the linked directory is one of the two:\n{text}"
+    );
+    assert!(
+        text.contains("real.vl") || text.contains("alias.vl"),
+        "and the doubly-named file is the other, under whichever name the walk \
+         reached first:\n{text}"
+    );
+    assert!(
+        !output.status.success(),
+        "`--check` still fails when something would be reformatted:\n{text}"
+    );
+
+    // The rewrite agrees with the count: one file, formatted once, and reachable
+    // as formatted under BOTH names — the link is layout, not a second file.
+    let rewrite = fmt(&dir);
+    let rewritten = combined(&rewrite);
+    assert!(rewrite.status.success(), "{rewritten}");
+    assert_eq!(
+        rewritten.matches("formatted").count(),
+        2,
+        "the rewrite formats each file once:\n{rewritten}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/real.vl")).unwrap(),
+        "fun real() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/alias.vl")).unwrap(),
+        "fun real() {}\n",
+        "the link's spelling reaches the same formatted bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("shared/helper.vl")).unwrap(),
+        "fun helper() {}\n"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

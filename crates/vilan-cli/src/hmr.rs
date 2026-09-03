@@ -51,7 +51,7 @@
 //! each rebuild; it is unit-tested without processes.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::net::TcpListener;
@@ -759,6 +759,62 @@ pub fn leg_is_current(
 /// Kept as a pure function so the safety cases stay pinned as logic.
 pub fn round_forces_full(first_round: bool, prior_failed: bool, manifest_changed: bool) -> bool {
     first_round || prior_failed || manifest_changed
+}
+
+/// The order a round must compile its legs in (tracker B203).
+///
+/// `reads_the_artifacts_of[b]` names every leg whose `dist/` output leg `b`
+/// reads — a server leg that `const asset::bundle`s the client's bundle reads
+/// the client's. Answers a permutation of `0..reads_the_artifacts_of.len()` in
+/// which a producer always precedes its consumer.
+///
+/// **Why order matters at all.** [`leg_is_current`] asks whether a leg's
+/// recorded sources still hash to what they were compiled with, and one of
+/// those sources may be another leg's ARTIFACT. Decided for every leg before
+/// any leg compiles — which is what both watch loops did — the consumer is
+/// measured against the producer's OLD artifact, judged fresh, and then the
+/// producer rewrites the file underneath it: the consumer's `dist/` entry
+/// embeds bytes that no longer exist, and stays that way until some later edit
+/// happens to reach it. Compiling the producer first, and asking the consumer's
+/// question at the consumer's own turn, makes the answer true when it is given.
+///
+/// **Stable.** Ties keep declaration order, so a workspace with no artifact
+/// dependencies compiles exactly as it always did, and `dist/` is written in
+/// the order the manifest lists — which is what the `--explain` report and
+/// every ordering-sensitive pin already read.
+///
+/// **Cycle-tolerant.** Two legs that each read the other's artifact have no
+/// valid order, and a build is not the place to refuse a layout over it: the
+/// stall is broken by taking the lowest remaining index, so the round is one
+/// the old code would also have produced and no leg is ever dropped. Such a
+/// round cannot be *correct* for both legs — nothing can be — but it is
+/// deterministic, complete, and no worse than the behavior this replaces.
+pub fn legs_in_artifact_order(reads_the_artifacts_of: &[BTreeSet<usize>]) -> Vec<usize> {
+    let count = reads_the_artifacts_of.len();
+    let mut ordered = Vec::with_capacity(count);
+    let mut placed = vec![false; count];
+    while ordered.len() < count {
+        // The lowest-numbered leg whose producers have all been placed —
+        // Kahn's algorithm with the declaration order as the tie-break, which
+        // is what makes the result stable.
+        let ready = (0..count).find(|leg| {
+            !placed[*leg]
+                && reads_the_artifacts_of[*leg]
+                    .iter()
+                    .all(|producer| placed[*producer] || *producer == *leg)
+        });
+        // Nothing is ready: every remaining leg waits on another remaining one,
+        // which is a cycle. Take the lowest remaining index and carry on.
+        let next = match ready {
+            Some(leg) => leg,
+            None => (0..count)
+                .find(|leg| !placed[*leg])
+                .expect("the loop runs only while a leg is unplaced"),
+        };
+        placed[next] = true;
+        ordered.push(next);
+    }
+    ordered
 }
 
 /// What the browser is told changed this round.
@@ -2130,5 +2186,66 @@ mod tests {
         assert!(round_forces_full(false, true, false), "prior failure");
         assert!(round_forces_full(false, false, true), "manifest change");
         assert!(!round_forces_full(false, false, false));
+    }
+
+    // --- The leg compile order (tracker B203) ---------------------------------
+
+    fn reads(edges: &[&[usize]]) -> Vec<BTreeSet<usize>> {
+        edges
+            .iter()
+            .map(|row| row.iter().copied().collect())
+            .collect()
+    }
+
+    #[test]
+    fn legs_with_no_artifact_dependency_keep_declaration_order() {
+        // The property every existing workspace relies on: nothing about B203
+        // may reorder a round that has no artifact edges in it.
+        assert_eq!(
+            legs_in_artifact_order(&reads(&[&[], &[], &[]])),
+            vec![0, 1, 2]
+        );
+        assert_eq!(legs_in_artifact_order(&reads(&[])), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_producer_compiles_before_the_leg_that_reads_its_artifact() {
+        // Leg 0 reads leg 1's artifact, so leg 1 goes first — and leg 2, which
+        // reads nothing, keeps its place as early as the order allows.
+        assert_eq!(
+            legs_in_artifact_order(&reads(&[&[1], &[], &[]])),
+            vec![1, 0, 2]
+        );
+        // A chain: 0 reads 1, 1 reads 2.
+        assert_eq!(
+            legs_in_artifact_order(&reads(&[&[1], &[2], &[]])),
+            vec![2, 1, 0]
+        );
+        // A fan-in: 2 reads both 0 and 1, which keep declaration order.
+        assert_eq!(
+            legs_in_artifact_order(&reads(&[&[], &[], &[0, 1]])),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_ordered_deterministically_rather_than_refused() {
+        // Two legs each reading the other's artifact have no valid order, and a
+        // build is not the place to refuse a layout over it: every leg still
+        // appears exactly once, lowest index first.
+        assert_eq!(legs_in_artifact_order(&reads(&[&[1], &[0]])), vec![0, 1]);
+        // A leg outside the cycle is still placed by the rule.
+        let order = legs_in_artifact_order(&reads(&[&[1], &[0], &[]]));
+        assert_eq!(order.len(), 3);
+        assert_eq!(
+            order.iter().copied().collect::<BTreeSet<_>>(),
+            (0..3).collect()
+        );
+        assert_eq!(
+            order[0], 2,
+            "the leg that is ready goes before the stalled pair"
+        );
+        // A self-edge is not a cycle: a leg cannot wait on itself.
+        assert_eq!(legs_in_artifact_order(&reads(&[&[0], &[]])), vec![0, 1]);
     }
 }
