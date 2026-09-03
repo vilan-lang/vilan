@@ -30,10 +30,13 @@
 //!    referenced from some other production, or is the start symbol. A
 //!    production that names a rule nobody wrote, and a rule nothing reaches,
 //!    are both drift.
-//! 5. **The exemption expires** (N42). `TOKEN_CLASSES_NOT_IN_LEXICAL` widens
-//!    check 4, and a widening is only worth its ink while what it covers is
-//!    still uncovered: a class recorded there that §2 has since declared with
-//!    a production of its own reds, by name.
+//! 5. **The exemptions expire** (N42, N50). Every table at the top of this file
+//!    widens one of the checks above, and a widening is only worth its ink
+//!    while what it covers is still uncovered: a `TOKEN_CLASSES_NOT_IN_LEXICAL`
+//!    class §2 has since declared, a `NON_KEYWORD_TERMINALS` word the compiler
+//!    now has a table for, a `PROSE_DEFINED` name §3 now writes a production
+//!    for, a `PROSE_RIGHT_HAND_SIDES` side that reads as grammar after all, a
+//!    `UNREACHED_PRODUCTIONS` root something reaches — each reds, by name.
 //!
 //! # What this file does NOT verify
 //!
@@ -514,5 +517,194 @@ fn every_recorded_token_class_still_needs_recording() {
          classes `{LEXICAL}` does not declare — and it declares them. The exemption \
          covers nothing now: delete the entry, and §2's production carries the class \
          on its own."
+    );
+}
+
+// --- The exemptions' inverses (tracker N50) ---------------------------------
+//
+// Four of the five tables at the top of this file WIDEN a gate, and the fifth
+// (`TOKEN_CLASSES_NOT_IN_LEXICAL`) already has the check that keeps a widening
+// honest: `every_recorded_token_class_still_needs_recording`, N42's shape. The
+// other four rot in the same silent direction and for the same reason — being
+// listed only ever SUBTRACTS work, so an entry whose reason has stopped holding
+// goes on subtracting it forever, and the gate stays green either way. N39
+// removed a rotted entry from the fifth list BY HAND, having noticed it in a
+// read-through, which is how long the silence lasts otherwise.
+//
+// Each check below asks its table's own question — "is this still exempting
+// anything?" — with the predicate the gate it widens uses, so an entry these
+// tests call dead is an entry the gate would hold on its own.
+
+#[test]
+fn every_recorded_non_keyword_terminal_still_needs_recording() {
+    // `NON_KEYWORD_TERMINALS` widens check 1: a quoted terminal listed here is
+    // allowed to be a word no compiler table knows. Two ways that stops being
+    // true — the word becomes a keyword, a marker or an extern form word (the
+    // table now covers it, and the entry claims otherwise), or the grammar
+    // stops quoting it at all (there is nothing left to exempt).
+    let quoted = terminals(&ebnf());
+    let known: BTreeSet<String> = KEYWORDS
+        .iter()
+        .map(|(word, _)| (*word).to_string())
+        .chain(
+            KNOWN_ATTRIBUTE_MARKERS
+                .iter()
+                .map(|word| (*word).to_string()),
+        )
+        .chain(extern_form_words())
+        .collect();
+    let stale: Vec<String> = NON_KEYWORD_TERMINALS
+        .iter()
+        .filter_map(|(word, _)| {
+            if !quoted.contains(*word) {
+                Some(format!(
+                    "  {word:?}: spec §3's EBNF no longer quotes it, so the entry \
+                     exempts nothing"
+                ))
+            } else if known.contains(*word) {
+                Some(format!(
+                    "  {word:?}: the compiler has a table for it now, so check 1 \
+                     accepts it on its own"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in NON_KEYWORD_TERMINALS record a word as contextual that is \
+         no longer one. Delete the entry — the word's own table carries it:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_prose_defined_name_still_needs_recording() {
+    // `PROSE_DEFINED` widens check 4's first half: a name listed here may be
+    // referenced without any production writing it, because the prose beneath
+    // its fence defines it. The claim dies when §3 grows a production for the
+    // name — the fence is no longer the definition — and the entry stops
+    // exempting anything when no production references the name at all.
+    let productions = productions(&ebnf());
+    let referenced: BTreeSet<String> = productions
+        .iter()
+        .flat_map(|(name, body)| {
+            references(body)
+                .into_iter()
+                .filter(move |reference| reference != name)
+        })
+        .collect();
+    let stale: Vec<String> = PROSE_DEFINED
+        .iter()
+        .filter_map(|(name, _)| {
+            if productions.contains_key(*name) {
+                Some(format!(
+                    "  `{name}`: spec §3 writes a production for it now, so check 4 \
+                     resolves it on its own"
+                ))
+            } else if !referenced.contains(*name) {
+                Some(format!(
+                    "  `{name}`: no production names it any more, so there is \
+                     nothing left to resolve"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in PROSE_DEFINED record a name as defined in prose that no \
+         longer needs it. Delete the entry:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_prose_right_hand_side_still_needs_recording() {
+    // `PROSE_RIGHT_HAND_SIDES` widens check 4 the hard way: it drops a whole
+    // production's right-hand side out of the scan, because that side is
+    // English rather than shape. So the question is the one check 4 would ask —
+    // read as grammar, does this side name anything undefined? A production
+    // rewritten into real shape names nothing undefined, and then the exemption
+    // is blinding the check over a side it would pass.
+    let productions = productions(&ebnf());
+    let classes = token_classes();
+    let stale: Vec<String> = PROSE_RIGHT_HAND_SIDES
+        .iter()
+        .filter_map(|(name, _)| {
+            let Some(body) = productions.get(*name) else {
+                return Some(format!(
+                    "  `{name}`: spec §3 no longer writes this production, so the \
+                     entry exempts nothing"
+                ));
+            };
+            let undefined: Vec<String> = references(body)
+                .into_iter()
+                .filter(|reference| {
+                    !productions.contains_key(reference)
+                        && !classes.contains(reference)
+                        && !PROSE_DEFINED
+                            .iter()
+                            .any(|(word, _)| *word == reference.as_str())
+                })
+                .collect();
+            undefined.is_empty().then(|| {
+                format!(
+                    "  `{name}`: read as grammar its right-hand side names nothing \
+                     undefined, so check 4 holds it as written"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in PROSE_RIGHT_HAND_SIDES take a production out of check 4 \
+         that check 4 would pass. Delete the entry — the production is shape now, \
+         and hiding it from the check hides its future drift too:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_unreached_production_is_still_written_and_still_unreached() {
+    // `UNREACHED_PRODUCTIONS` widens check 4's second half for the start symbol
+    // and nothing else. A production some other production reaches now needs no
+    // exemption, and one the grammar no longer writes cannot be reached or
+    // unreached — either way the entry is a claim about a document that has
+    // moved on.
+    let productions = productions(&ebnf());
+    let referenced: BTreeSet<String> = productions
+        .iter()
+        .flat_map(|(name, body)| {
+            references(body)
+                .into_iter()
+                .filter(move |reference| reference != name)
+        })
+        .collect();
+    let stale: Vec<String> = UNREACHED_PRODUCTIONS
+        .iter()
+        .filter_map(|(name, _)| {
+            if !productions.contains_key(*name) {
+                Some(format!(
+                    "  `{name}`: spec §3 no longer writes this production"
+                ))
+            } else if referenced.contains(*name) {
+                Some(format!(
+                    "  `{name}`: some production reaches it now, so check 4 holds \
+                     it on its own"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in UNREACHED_PRODUCTIONS record a production as unreachable \
+         that is not. Delete the entry — the start symbol is the only one there \
+         should ever be:\n{}",
+        stale.join("\n")
     );
 }

@@ -17,6 +17,11 @@
 //! only by reading test attributes. So every reason must LEAD with a tracker
 //! item id, or be one of the few ignores that are deliberately not bugs.
 //!
+//! The allow-list has the inverse check the same rule needs (N50): being on it
+//! only ever SUBTRACTS work, so an entry whose reason has expired — the ignore
+//! names a bug item now, or no `#[ignore]` carries those words any more — goes
+//! on subtracting it forever, and the green tick says nothing either way.
+//!
 //! The leading id, and the scanner's fence around this file's own fixture, are
 //! N33: run 5 found the first version of both halves too weak to be worth the
 //! green tick. "Capitals then a digit" accepted `ARM64` and `UTF8`, and let a
@@ -439,6 +444,50 @@ fn every_ignored_pin_names_a_tracker_item_or_is_a_declared_non_bug() {
          deliberately not a bug, be added to `DELIBERATE_NON_BUG_IGNORES` here, on \
          purpose. Offending:\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+// The inverse of the allow-list (tracker N50, N42's shape). Being listed here
+// only ever SUBTRACTS work — the gate above stops asking anything of the
+// reason — so an entry whose reason has stopped holding goes on subtracting it
+// forever, and the green tick says nothing either way. Two ways it stops
+// holding: the reason grows a leading item id, and the gate would hold it on
+// its own (that is the WHOLE point of the list — an ignore that turns out to
+// be a bug leaves it); or no `#[ignore]` in the tree carries the reason any
+// more, and the entry is an exact string matching nothing, waiting to excuse
+// whoever writes those words next.
+#[test]
+fn every_declared_non_bug_ignore_is_still_one() {
+    let sources = tracked_rust_sources();
+    let stale: Vec<String> = DELIBERATE_NON_BUG_IGNORES
+        .iter()
+        .filter_map(|reason| {
+            if names_a_tracker_item(reason) {
+                return Some(format!(
+                    "  {reason:?}\n      leads with a tracker item id now, so the gate \
+                     holds it without the exemption"
+                ));
+            }
+            let carried = sources.iter().any(|(_, text)| {
+                ignore_attributes(text)
+                    .iter()
+                    .any(|(_, found)| found.as_deref() == Some(*reason))
+            });
+            (!carried).then(|| {
+                format!(
+                    "  {reason:?}\n      no `#[ignore]` in the tree carries this reason \
+                     any more"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in DELIBERATE_NON_BUG_IGNORES no longer exempt what they say \
+         they exempt. Delete the entry — the list is a decision somebody makes on \
+         purpose, and one nobody has to make any more is dead weight that will \
+         quietly excuse the next pin to reuse its words:\n{}",
+        stale.join("\n")
     );
 }
 
