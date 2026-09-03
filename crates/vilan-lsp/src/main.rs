@@ -10,6 +10,7 @@ mod line_index;
 mod manifest_completion;
 mod publish;
 mod references;
+mod schedule;
 mod session_trace;
 mod uri;
 
@@ -29,6 +30,7 @@ use vilan_core::analyzer::SourceId;
 use crate::document::{Document, Symbol, SymbolKind as VilanSymbolKind, hash_text};
 use crate::line_index::LineIndex;
 use crate::publish::PublishState;
+use crate::schedule::Schedule;
 use vilan_ide::{Completion, CompletionFunctionCall, CompletionKind as VilanCompletionKind};
 
 /// How long to wait after the last edit before re-analyzing, so a burst of
@@ -464,9 +466,17 @@ struct Backend {
     /// `Document::analyze`, which would publish a wall of lexer errors on a
     /// perfectly good manifest. Completion is all it feeds.
     manifests: Arc<DashMap<Url, ManifestDocument>>,
-    /// The latest edit generation per document, so a debounced analysis can tell
-    /// whether a newer edit (or a close) has superseded it before it runs.
-    pending: Arc<DashMap<Url, u64>>,
+    /// M26: what analysis each open document owes, and how to stop the ones it
+    /// no longer does — the edit generation a debounced pause compares itself
+    /// against, plus the cancellation token of every analysis in flight for
+    /// that document. `did_open` registers a generation here like an edit does
+    /// (E123 routed it through the same scheduling, but it registered nothing),
+    /// so an edit right after an open supersedes the open's analysis instead of
+    /// racing it.
+    schedule: Arc<Schedule>,
+    /// M26: how many analyses this session started, landed and cancelled — the
+    /// session trace's second line, and what the cancellation pins read.
+    analyses: Arc<session_trace::AnalysisTally>,
     /// The publish planner (backlog E6): every open document's last
     /// diagnostic groups, merged per target URI so shared dependencies show
     /// the union of their importers' views, and stale targets get explicit
@@ -1335,39 +1345,113 @@ mod sweep_tests {
     }
 }
 
+/// Everything one scheduled analysis touches, cloned out of the [`Backend`] so
+/// a spawned task can own it. Cheap — six `Arc`s and a `Client` handle — and it
+/// replaces the five-to-seven separate clones every scheduling site used to
+/// make by hand, which is what kept [`analyze_and_publish`]'s parameter list
+/// growing with each item that gave the analysis path one more thing to reach.
+#[derive(Clone)]
+struct AnalysisContext {
+    documents: Arc<DashMap<Url, Document>>,
+    client: Client,
+    publish_state: Arc<std::sync::Mutex<PublishState>>,
+    publish_gate: Arc<tokio::sync::Mutex<()>>,
+    revision: Arc<AtomicU64>,
+    schedule: Arc<Schedule>,
+    analyses: Arc<session_trace::AnalysisTally>,
+}
+
+/// What one scheduled analysis did (M26).
+///
+/// The three are not a ranking of the same axis. `Landed` and `Dropped` are
+/// E117's outcomes — the analysis ran to the end, and `land` either adopted it
+/// or found the world had moved past it. `Cancelled` is M26's: the analysis
+/// stopped at a checkpoint because a newer generation of its document had
+/// arrived, and there is no result at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnalysisOutcome {
+    /// Adopted as the document's analyzed snapshot, and published.
+    Landed,
+    /// Ran to the end and was dropped by [`land`] — superseded, or the
+    /// document closed under it.
+    Dropped,
+    /// Stopped part-way: a newer generation of this document arrived while it
+    /// ran. Nothing landed and nothing published.
+    Cancelled,
+}
+
+impl AnalysisOutcome {
+    /// Whether the analyzed snapshot moved — what the client's token and hint
+    /// refresh (S5) keys off.
+    fn landed(self) -> bool {
+        matches!(self, AnalysisOutcome::Landed)
+    }
+}
+
 /// Analyze `text` as the document at `uri`, land the result on the open
 /// document, and publish its diagnostics (grouped per file — backlog E1). The
 /// analysis is CPU-bound, so it runs on a blocking thread to keep the async
-/// runtime responsive. Returns whether the analysis landed (see [`land`]).
+/// runtime responsive.
+///
+/// `generation` is the document's edit generation this analysis answers, from
+/// [`Schedule::supersede`]. The scheduler hands back the cancellation token the
+/// analysis runs under and cancels it the moment a newer generation arrives, so
+/// a superseded analysis stops at its next checkpoint instead of finishing a
+/// whole program's work for a result [`land`] would drop (M26,
+/// `proposal/editor-latency.md` §4.2). If the generation is ALREADY stale when
+/// the analysis is registered, the token comes back cancelled and the analysis
+/// stops almost immediately — the race between scheduling and superseding is
+/// closed inside the scheduler, not here.
 async fn analyze_and_publish(
-    documents: &DashMap<Url, Document>,
-    client: &Client,
-    publish_state: &std::sync::Mutex<PublishState>,
-    publish_gate: &tokio::sync::Mutex<()>,
-    revision: &AtomicU64,
+    context: &AnalysisContext,
     uri: Url,
     text: String,
-) -> bool {
+    generation: u64,
+) -> AnalysisOutcome {
     let path = uri.to_file_path().unwrap_or_default();
     let std_dir = discover_std_dir(&path);
+    let started = context.schedule.start(&uri, generation);
+    context.analyses.record_started();
     // E117: the world this analysis is about to read, sampled BEFORE it starts.
     // A later notification bumps the counter, so a result stamped lower is by
     // construction a view of an older world — whatever its own text says.
-    let started_at = revision.load(Ordering::SeqCst);
-    let mut analysis = match tokio::task::spawn_blocking(move || {
-        Document::analyze(&text, &std_dir, &path)
+    let started_at = context.revision.load(Ordering::SeqCst);
+    let token = started.token.clone();
+    let analysis = tokio::task::spawn_blocking(move || {
+        Document::analyze_cancellable(&text, &std_dir, &path, &token)
     })
-    .await
-    {
-        Ok(analysis) => analysis,
-        Err(_) => return false,
+    .await;
+    // The registration goes whatever the outcome: a joined task is an analysis
+    // that is over, and leaving its ticket behind would make the next
+    // supersede cancel a token nobody holds.
+    context.schedule.finish(&uri, &started);
+    let Ok(analysis) = analysis else {
+        return AnalysisOutcome::Dropped;
+    };
+    let Some(mut analysis) = analysis else {
+        // Cancelled: there is no result. The truncated one was destroyed on the
+        // analysis thread, so nothing here can land or publish it even by
+        // mistake.
+        context.analyses.record_cancelled();
+        return AnalysisOutcome::Cancelled;
     };
     analysis.stamp_analysis(started_at);
-    if !land(documents, &uri, analysis) {
-        return false;
+    if !land(&context.documents, &uri, analysis) {
+        return AnalysisOutcome::Dropped;
     }
-    publish_document(documents, client, publish_state, publish_gate, &uri).await;
-    true
+    context.analyses.record_landed();
+    // The landed snapshot was built over the edited dependency, so this
+    // document's keystroke-path answers are current again (§2.1.2's case 4).
+    context.schedule.clear_dependency_moved(&uri);
+    publish_document(
+        &context.documents,
+        &context.client,
+        &context.publish_state,
+        &context.publish_gate,
+        &uri,
+    )
+    .await;
+    AnalysisOutcome::Landed
 }
 
 /// Land a completed analysis on the open document at `uri`
@@ -1483,16 +1567,23 @@ async fn publish_document(
 /// a restart. It passes its own directory, which every package root beneath it
 /// is under.
 async fn reanalyze_dependents(
-    documents: &DashMap<Url, Document>,
-    client: &Client,
-    publish_state: &std::sync::Mutex<PublishState>,
-    publish_gate: &tokio::sync::Mutex<()>,
-    revision: &AtomicU64,
+    context: &AnalysisContext,
     changed: &Url,
     recolored: Option<&Path>,
 ) -> bool {
     let changed_path = changed.to_file_path().ok();
-    let dependents: Vec<(Url, String)> = documents
+    // The URIs only — each dependent's text is read inside the loop, AFTER its
+    // supersede. Capturing the texts here instead would let an edit that lands
+    // mid-sweep be starved: the sweep would supersede that dependent (skipping
+    // the pause the edit scheduled) and then analyze the text as it was before
+    // the edit, which `land` drops for a text mismatch — leaving the newest
+    // buffer with nothing scheduled to analyze it. Reading late makes the sweep
+    // answer the live buffer; the residual race (an edit landing between the
+    // supersede and the read) is closed on the other side, by `Schedule::start`
+    // refusing a generation that is no longer current, which hands the buffer
+    // back to the edit's own pause.
+    let dependents: Vec<Url> = context
+        .documents
         .iter()
         .filter(|entry| entry.key() != changed)
         .filter(|entry| {
@@ -1509,20 +1600,54 @@ async fn reanalyze_dependents(
                 None => true,
             }
         })
-        .map(|entry| (entry.key().clone(), entry.value().text.clone()))
+        .map(|entry| entry.key().clone())
         .collect();
+    // M26, the DEPENDENCY seam (`editor-latency.md` §2.1.2 case 4). Each
+    // dependent's own buffer is untouched, so its anchor against its landed
+    // snapshot is the identity and the keystroke path would go on serving
+    // answers computed over the module as it was BEFORE the edit. Mark them all
+    // now — before the first re-analysis, so the window opens the moment the
+    // edit lands rather than when the sweep reaches that file — and each clears
+    // its own mark when its analysis lands. Inside the window the verdict is
+    // `Stale`: whole-file syntax-only tokens, hints still served (Q1/Q4).
+    for uri in &dependents {
+        context.schedule.mark_dependency_moved(uri);
+    }
+    // §4.2: the sweep used to await one FULL analysis per dependent with no
+    // supersession check between them, so on a shared module an edit landing
+    // mid-sweep cost an entire analysis per remaining dependent. The world this
+    // sweep answers is the one it started in; if the counter has moved, a newer
+    // edit has landed and is bringing its own sweep, so this one stops. The
+    // dependents it did not reach keep their `dependency_moved` mark until that
+    // sweep re-lands them, which is exactly the state they are in.
+    let swept_at = context.revision.load(Ordering::SeqCst);
     let mut landed = false;
-    for (uri, text) in dependents {
-        landed |= analyze_and_publish(
-            documents,
-            client,
-            publish_state,
-            publish_gate,
-            revision,
-            uri,
-            text,
-        )
-        .await;
+    for uri in dependents {
+        if context.revision.load(Ordering::SeqCst) != swept_at {
+            break;
+        }
+        // Supersede rather than merely schedule: an analysis of this dependent
+        // already in flight read the edited module in its pre-edit state, and
+        // the one about to start replaces it. One cancel and one re-schedule
+        // per sweep — the sweep itself runs once per landed edit. The text is
+        // read after, and synchronously, so what this analyzes is the buffer as
+        // it stands now (see the collection above).
+        let generation = context.schedule.supersede(&uri);
+        let Some(text) = context
+            .documents
+            .get(&uri)
+            .map(|document| document.text.clone())
+        else {
+            // Closed under the sweep. `supersede` above created a schedule
+            // entry for it (it is an upsert — `did_open` needs that), so put it
+            // back: a document with no buffer has no analysis to owe, and the
+            // session trace counts these entries.
+            context.schedule.close(&uri);
+            continue;
+        };
+        landed |= analyze_and_publish(context, uri, text, generation)
+            .await
+            .landed();
     }
     landed
 }
@@ -1689,15 +1814,16 @@ impl Backend {
         let text = match session_trace::record(request, elapsed_ms) {
             session_trace::TraceEvent::Quiet => return,
             session_trace::TraceEvent::Slow(line) => line,
-            session_trace::TraceEvent::Summarize => {
-                session_trace::summary(session_trace::StateSizes {
+            session_trace::TraceEvent::Summarize => session_trace::summary(
+                session_trace::StateSizes {
                     documents: self.documents.len(),
                     semantic_token_cache: self.semantic_token_cache.len(),
                     manifests: self.manifests.len(),
-                    pending: self.pending.len(),
+                    pending: self.schedule.len(),
                     line_indices: self.line_indices.len(),
-                })
-            }
+                },
+                self.analyses.counts(),
+            ),
         };
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -1708,27 +1834,41 @@ impl Backend {
         });
     }
 
+    /// The shared state one scheduled analysis needs, cloned out of `self` so a
+    /// spawned task owns it.
+    fn analysis_context(&self) -> AnalysisContext {
+        AnalysisContext {
+            documents: Arc::clone(&self.documents),
+            client: self.client.clone(),
+            publish_state: Arc::clone(&self.publish_state),
+            publish_gate: Arc::clone(&self.publish_gate),
+            revision: Arc::clone(&self.revision),
+            schedule: Arc::clone(&self.schedule),
+            analyses: Arc::clone(&self.analyses),
+        }
+    }
+
     /// Schedule a debounced re-analysis. A burst of edits collapses to a single
     /// analysis once typing pauses, and an edit that leaves the buffer unchanged
     /// is skipped entirely.
     fn on_change(&self, uri: Url, text: String) {
-        let generation = {
-            let mut entry = self.pending.entry(uri.clone()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        let documents = Arc::clone(&self.documents);
-        let pending = Arc::clone(&self.pending);
-        let publish_state = Arc::clone(&self.publish_state);
-        let publish_gate = Arc::clone(&self.publish_gate);
-        let revision = Arc::clone(&self.revision);
-        let client = self.client.clone();
+        // M26: superseding does two things now — it advances the generation the
+        // pause below compares itself against, and it CANCELS whatever analysis
+        // of this document is already in flight. Before, an analysis started by
+        // the previous keystroke ran to the end on its 128 MiB thread and was
+        // dropped at `land`; a burst paid one whole analysis per debounce
+        // window for answers nobody would see.
+        let generation = self.schedule.supersede(&uri);
+        let context = self.analysis_context();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
             // Read both facts synchronously (no map guard may cross an await),
             // then decide.
-            let current_generation = pending.get(&uri).map(|current| *current);
-            let analyzed_hash = documents.get(&uri).map(|document| document.text_hash);
+            let current_generation = context.schedule.generation(&uri);
+            let analyzed_hash = context
+                .documents
+                .get(&uri)
+                .map(|document| document.text_hash);
             match pause_action(
                 current_generation,
                 generation,
@@ -1738,33 +1878,26 @@ impl Backend {
                 PauseAction::Superseded | PauseAction::Unchanged => return,
                 PauseAction::Analyze => {}
             }
-            let reach_before = package_reach(&documents, &uri);
-            let landed = analyze_and_publish(
-                &documents,
-                &client,
-                &publish_state,
-                &publish_gate,
-                &revision,
-                uri.clone(),
-                text,
-            )
-            .await;
+            let reach_before = package_reach(&context.documents, &uri);
+            let outcome = analyze_and_publish(&context, uri.clone(), text, generation).await;
+            if outcome == AnalysisOutcome::Cancelled {
+                // A newer edit stopped this analysis, and it is bringing its own
+                // sweep behind its own debounce. Sweeping now would re-analyze
+                // every dependent against a module whose analysis never landed
+                // — work the newer sweep would immediately supersede — and the
+                // refresh below has nothing to announce either.
+                return;
+            }
+            let landed = outcome.landed();
             // The edit may change what other open files see (they import this
             // one, or a file it re-exports) — bring their diagnostics up to date.
-            let recolored = recolored_package(reach_before, package_reach(&documents, &uri));
-            let dependents_landed = reanalyze_dependents(
-                &documents,
-                &client,
-                &publish_state,
-                &publish_gate,
-                &revision,
-                &uri,
-                recolored.as_deref(),
-            )
-            .await;
+            let recolored =
+                recolored_package(reach_before, package_reach(&context.documents, &uri));
+            let dependents_landed =
+                reanalyze_dependents(&context, &uri, recolored.as_deref()).await;
             // The analyzed snapshot moved under the client's highlighting and
             // hints; ask for them again (S5). Every guard is long dropped here.
-            send_refreshes(&client, refresh_plan(landed || dependents_landed)).await;
+            send_refreshes(&context.client, refresh_plan(landed || dependents_landed)).await;
         });
     }
 
@@ -2153,38 +2286,33 @@ impl LanguageServer for Backend {
                 uri.clone(),
                 Document::unanalyzed(&params.text_document.text),
             );
-            Some(params.text_document.text)
+            // M26: register the open's generation, exactly as an edit registers
+            // its own. E123 routed the open through the same SCHEDULING but it
+            // registered nothing, so an edit arriving before the open's
+            // analysis finished did not supersede it — the two ran to
+            // completion side by side and E117's stamp decided which landed
+            // last. Now the edit cancels the open, like any other supersession.
+            Some((params.text_document.text, self.schedule.supersede(&uri)))
         });
-        let Some(text) = opened else {
+        let Some((text, generation)) = opened else {
             return;
         };
         // Spawned, not awaited: `did_change` returns the instant it has
         // scheduled its analysis, and an open must too — the notification
         // handler is on the same runtime every request is served from.
-        let documents = Arc::clone(&self.documents);
-        let publish_state = Arc::clone(&self.publish_state);
-        let publish_gate = Arc::clone(&self.publish_gate);
-        let revision = Arc::clone(&self.revision);
-        let client = self.client.clone();
+        let context = self.analysis_context();
         tokio::spawn(async move {
             // The shared path: `spawn_blocking`, stamped with the world it
-            // read, landed only if it is still the newest view of the live
-            // text (E117), then published.
-            let landed = analyze_and_publish(
-                &documents,
-                &client,
-                &publish_state,
-                &publish_gate,
-                &revision,
-                uri,
-                text,
-            )
-            .await;
+            // read, under the scheduler's cancellation token, landed only if it
+            // is still the newest view of the live text (E117), then published.
+            let landed = analyze_and_publish(&context, uri, text, generation)
+                .await
+                .landed();
             // The analyzed snapshot moved under whatever the client asked for
             // in the meantime — it opened the file and immediately asked for
             // tokens and hints over a document that had none. Ask it to ask
             // again (S5); this is what makes the empty first answer transient.
-            send_refreshes(&client, refresh_plan(landed)).await;
+            send_refreshes(&context.client, refresh_plan(landed)).await;
         });
     }
 
@@ -2264,35 +2392,30 @@ impl LanguageServer for Backend {
         let reach_before = package_reach(&self.documents, &saved);
         // `.map` consumes the map guard inside the closure, so nothing is held
         // across the awaits below (which take the same key for writing).
+        let context = self.analysis_context();
         let mut landed = false;
         if let Some((uri, text)) = self
             .documents
             .get(&saved)
             .map(|document| (saved.clone(), document.text.clone()))
         {
-            landed = analyze_and_publish(
-                &self.documents,
-                &self.client,
-                &self.publish_state,
-                &self.publish_gate,
-                &self.revision,
-                uri,
-                text,
-            )
-            .await;
+            // A save is a supersession like any other: whatever analysis of
+            // this document is in flight read the pre-save world.
+            let generation = self.schedule.supersede(&uri);
+            let outcome = analyze_and_publish(&context, uri, text, generation).await;
+            if outcome == AnalysisOutcome::Cancelled {
+                // An edit landed on top of the save and stopped its analysis;
+                // that edit's own pause sweeps the dependents. (A manifest save
+                // reaches neither this branch nor this `if` — it has no open
+                // document of its own — and still sweeps below, which is the
+                // whole point of its directory standing in for the edge.)
+                return;
+            }
+            landed = outcome.landed();
         }
         let recolored = saved_manifest_directory
             .or_else(|| recolored_package(reach_before, package_reach(&self.documents, &saved)));
-        landed |= reanalyze_dependents(
-            &self.documents,
-            &self.client,
-            &self.publish_state,
-            &self.publish_gate,
-            &self.revision,
-            &saved,
-            recolored.as_deref(),
-        )
-        .await;
+        landed |= reanalyze_dependents(&context, &saved, recolored.as_deref()).await;
         // Same sweep rule as a typing pause (S5).
         send_refreshes(&self.client, refresh_plan(landed)).await;
     }
@@ -2315,8 +2438,11 @@ impl LanguageServer for Backend {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.documents.remove(&uri);
         self.semantic_token_cache.remove(&uri);
-        // Drop the edit generation so any in-flight debounced analysis bails.
-        self.pending.remove(&uri);
+        // Drop the edit generation so any in-flight debounced analysis bails,
+        // and CANCEL whatever is already past its pause (M26): a closed
+        // document's analysis is dropped by `land` in any case, so finishing it
+        // is a whole program's work for a result with nowhere to go.
+        self.schedule.close(&uri);
         // Clear this document's diagnostics AND the ones it published onto
         // other files — each target republishes as the remaining owners'
         // merged view (empty where this was the only contributor). Under the
@@ -2364,7 +2490,7 @@ impl LanguageServer for Backend {
                 // so one index answers both the hint's position and the
                 // viewport compare, and there is no approximation left to
                 // fall back to.
-                .keystroke_hints(false)
+                .keystroke_hints(self.schedule.dependency_moved(&uri))
                 .into_iter()
                 .filter_map(|(offset, label)| {
                     let position = document.line_index.position(offset);
@@ -2409,8 +2535,10 @@ impl LanguageServer for Backend {
             // LIVE coordinates — so the encode goes through the LIVE index, not
             // the analyzed one. That index switch IS the change: an answer that
             // describes the buffer on screen has to be positioned against it.
-            let data =
-                encode_semantic_tokens(&document.keystroke_tokens(false), &document.line_index);
+            let data = encode_semantic_tokens(
+                &document.keystroke_tokens(self.schedule.dependency_moved(&uri)),
+                &document.line_index,
+            );
             drop(document);
             let id = fresh_result_id();
             self.semantic_token_cache
@@ -2441,8 +2569,10 @@ impl LanguageServer for Backend {
             };
             // The same stream `semantic_tokens_full` answers with (E121), or
             // the delta chain would compare two different pictures.
-            let data =
-                encode_semantic_tokens(&document.keystroke_tokens(false), &document.line_index);
+            let data = encode_semantic_tokens(
+                &document.keystroke_tokens(self.schedule.dependency_moved(&uri)),
+                &document.line_index,
+            );
             drop(document);
             let id = fresh_result_id();
             // Swap the baseline for the new stream in one motion; the OLD
@@ -2612,7 +2742,7 @@ impl LanguageServer for Backend {
             // `modules_in_root`'s per-request `read_dir`) is the next tranche;
             // this is the seam it happens at.
             let items = document
-                .keystroke_completion(offset, false)
+                .keystroke_completion(offset, self.schedule.dependency_moved(&uri))
                 .into_iter()
                 .map(|completion| {
                     to_completion_item(completion, mode, snippet_support, &document.line_index)
@@ -3130,7 +3260,8 @@ mod snapshot_consistency_tests {
             semantic_token_cache: Arc::new(DashMap::new()),
             manifests: Arc::new(DashMap::new()),
             publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
-            pending: Arc::new(DashMap::new()),
+            schedule: Arc::new(Schedule::default()),
+            analyses: Arc::new(session_trace::AnalysisTally::default()),
             line_indices: Arc::new(DashMap::new()),
             config: Arc::new(std::sync::RwLock::new(Config::default())),
             snippet_support: Arc::new(AtomicBool::new(false)),
@@ -4588,7 +4719,8 @@ async fn main() {
         semantic_token_cache: Arc::new(DashMap::new()),
         manifests: Arc::new(DashMap::new()),
         publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
-        pending: Arc::new(DashMap::new()),
+        schedule: Arc::new(Schedule::default()),
+        analyses: Arc::new(session_trace::AnalysisTally::default()),
         line_indices: Arc::new(DashMap::new()),
         config: Arc::new(std::sync::RwLock::new(Config::default())),
         snippet_support: Arc::new(AtomicBool::new(false)),
@@ -5375,7 +5507,7 @@ mod session_leak_tests {
             documents: backend.documents.len(),
             semantic_token_cache: backend.semantic_token_cache.len(),
             manifests: backend.manifests.len(),
-            pending: backend.pending.len(),
+            pending: backend.schedule.len(),
             line_indices: backend.line_indices.len(),
         }
     }
@@ -5645,6 +5777,918 @@ mod open_scheduling_tests {
         }
         let _ = std::fs::remove_dir_all(&directory);
         panic!("the edit's analysis never became the analyzed snapshot");
+    }
+}
+
+/// M26 (`proposal/editor-latency.md` §4.2): a superseded analysis is
+/// CANCELLED, not merely dropped when it finishes.
+///
+/// E117 stamped every analysis with the world revision it read and taught
+/// `land` to drop a result the world has moved past. That is the correctness
+/// half and it is untouched here — every pin below still passes with every
+/// checkpoint removed, more slowly. What the checkpoints buy is the CPU: before
+/// them, the superseded analysis ran to the end on its 128 MiB thread, so a
+/// keystroke burst paid one WHOLE analysis per debounce window for answers
+/// nobody would ever see, and `did_open` (E123) registered no generation at all,
+/// so an edit arriving right after an open raced the open's analysis instead of
+/// superseding it.
+///
+/// The scheduler's own decisions are pinned without a server in `schedule.rs`;
+/// these are the pins that need the real notification handlers, because what is
+/// being pinned is which analyses the server chooses to start and to stop.
+#[cfg(test)]
+mod cancellation_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// Big enough that one analysis is unmistakably work — the burst pin needs
+    /// an analysis that outlives the gap between two keystrokes, or there is
+    /// nothing in flight for the next one to cancel — and wrong, so the
+    /// diagnostic a landed analysis publishes is unambiguous.
+    fn subject(helpers: usize) -> String {
+        let mut text = String::from("fun main() {\n\tlet value = undefined_name;\n}\n");
+        for index in 0..helpers {
+            text.push_str(&format!(
+                "fun helper_{index}(input: i32): i32 {{\n\tinput + input\n}}\n"
+            ));
+        }
+        text
+    }
+
+    /// The default subject size for the pins that only need "an analysis takes
+    /// a moment".
+    const HELPERS: usize = 200;
+
+    fn workspace(name: &str) -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-cancel-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("edited.vl");
+        std::fs::write(&path, subject(HELPERS)).expect("a source file");
+        let uri = Url::from_file_path(&path).expect("a file url");
+        (directory, uri)
+    }
+
+    /// Polls for an analysis of `uri` to land, rather than sleeping a fixed
+    /// span (`package_recolor_tests::settled`'s rule).
+    async fn landed(backend: &Backend, uri: &Url) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Polls for `uri`'s analyzed snapshot to become `text`.
+    async fn settled_on(backend: &Backend, uri: &Url, text: &str) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            let settled = backend.documents.get(uri).is_some_and(|document| {
+                document.analysis_revision() > 0 && document.analyzed_text() == text
+            });
+            if settled {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// **A cancelled analysis lands nothing and publishes nothing.**
+    ///
+    /// Exact, with no clock in it: the generation is superseded BEFORE the
+    /// analysis registers, so `Schedule::start` hands back an already-cancelled
+    /// token and the analysis stops at its first checkpoint whatever the
+    /// machine is doing. What the pin asserts is the contract — the outcome is
+    /// `Cancelled`, the analyzed snapshot is exactly where it was, and the
+    /// published diagnostics are exactly what they were — which is the claim
+    /// "cancellation is an optimisation on a correctness mechanism, not a new
+    /// way for a wrong answer to reach the editor" reduced to something a test
+    /// can check.
+    #[tokio::test]
+    async fn a_cancelled_analysis_lands_nothing_and_publishes_nothing() {
+        let (directory, uri) = workspace("nothing");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&uri, &subject(HELPERS))).await;
+        assert!(landed(backend, &uri).await, "the open's analysis lands");
+
+        let before_text = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .analyzed_text()
+            .to_string();
+        let before_revision = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .analysis_revision();
+        let before_published = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .published_diagnostics()
+            .len();
+        assert!(
+            before_published > 0,
+            "the subject has an undefined name in it, so the open published something \
+             for the cancelled analysis below to be unable to disturb",
+        );
+        let before_counts = backend.analyses.counts();
+
+        // The supersession happens first, so the analysis scheduled for the
+        // older generation is born cancelled. This is the ordering the debounce
+        // makes possible in the shipped server — an edit landing between a
+        // pause's decision to analyze and its registration — made deterministic.
+        let stale = backend.schedule.supersede(&uri);
+        backend.schedule.supersede(&uri);
+        let edited = format!("{}\nfun added(): i32 {{\n\t1\n}}\n", subject(HELPERS));
+        let outcome =
+            analyze_and_publish(&backend.analysis_context(), uri.clone(), edited, stale).await;
+
+        assert_eq!(
+            outcome,
+            AnalysisOutcome::Cancelled,
+            "an analysis registered for a superseded generation stops at its first checkpoint",
+        );
+        let document = backend.documents.get(&uri).expect("still open");
+        assert_eq!(
+            document.analyzed_text(),
+            before_text,
+            "the analyzed snapshot did not move: there was no result to move it",
+        );
+        assert_eq!(
+            document.analysis_revision(),
+            before_revision,
+            "and nothing re-stamped it",
+        );
+        assert_eq!(
+            document.published_diagnostics().len(),
+            before_published,
+            "and nothing was published — a cancelled analysis has no diagnostics to publish",
+        );
+        drop(document);
+        let counts = backend.analyses.counts();
+        assert_eq!(
+            counts.cancelled,
+            before_counts.cancelled + 1,
+            "the session trace counts it as cancelled",
+        );
+        assert_eq!(
+            counts.landed, before_counts.landed,
+            "and not as landed: {counts:?}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **The open-then-edit case.** `did_open` registers its generation, so an
+    /// edit arriving before the open's analysis finishes SUPERSEDES it rather
+    /// than racing it.
+    ///
+    /// E123 routed the open through the same scheduling as an edit, but it
+    /// registered nothing: both analyses ran to completion side by side and
+    /// E117's revision stamp decided which one landed last. The correctness of
+    /// that is `an_edit_during_a_fresh_open_is_the_analysis_that_settles`, which
+    /// still passes and still must. This pin is about the CPU: exactly one of
+    /// the two analyses is allowed to finish.
+    #[tokio::test]
+    async fn an_edit_right_after_an_open_cancels_the_opens_analysis() {
+        let (directory, uri) = workspace("openedit");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        backend.did_open(open_params(&uri, &subject(HELPERS))).await;
+        let edited = format!("{}\nfun added(): i32 {{\n\t1\n}}\n", subject(HELPERS));
+        backend
+            .did_change(whole_file_change(&uri, 2, &edited))
+            .await;
+
+        assert!(
+            settled_on(backend, &uri, &edited).await,
+            "the edit's analysis is the one that settles",
+        );
+        let counts = backend.analyses.counts();
+        assert!(
+            counts.cancelled >= 1,
+            "the open's analysis was cancelled by the edit, not left to run to the end \
+             and be dropped at `land`: {counts:?}",
+        );
+        assert_eq!(
+            counts.landed, 1,
+            "and exactly one analysis landed — the edit's: {counts:?}",
+        );
+        println!(
+            "M26 open-then-edit: load={} {counts:?}",
+            crate::keystroke::gate::loadavg_1m(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A burst of N edits performs ONE complete analysis plus at most one
+    /// partial.**
+    ///
+    /// The edits are spaced a debounce window apart, which is the shape the
+    /// item names: closer together and the debounce alone collapses them (that
+    /// path is `pause_action`'s and was always cheap); further apart and each
+    /// analysis finishes before the next edit, which is a session that is not
+    /// behind. In between — typing at about the rate the debounce is tuned for,
+    /// on a file whose analysis outlasts the gap — every keystroke used to
+    /// start a whole analysis and all but the last were wasted.
+    ///
+    /// What is asserted is a COUNT, not a duration: of the analyses the burst
+    /// started, at most two ran to completion (the one that answers the last
+    /// keystroke, plus at most one that outran its own cancellation), and the
+    /// rest were cancelled. A slow machine makes MORE of them cancelled, never
+    /// fewer, so there is no bound here for load to break.
+    #[tokio::test]
+    async fn a_burst_of_edits_performs_one_complete_analysis_plus_at_most_one_partial() {
+        const KEYSTROKES: usize = 8;
+        let (directory, uri) = workspace("burst");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        let base = subject(HELPERS);
+        backend.did_open(open_params(&uri, &base)).await;
+        assert!(landed(backend, &uri).await, "the open's analysis lands");
+        let settled_counts = backend.analyses.counts();
+
+        // One keystroke per debounce window, as a person typing does.
+        let mut last = base.clone();
+        for keystroke in 0..KEYSTROKES {
+            last = format!("{base}\nfun typed_{keystroke}(): i32 {{\n\t{keystroke}\n}}\n");
+            backend
+                .did_change(whole_file_change(&uri, 2 + keystroke as i32, &last))
+                .await;
+            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS + 20)).await;
+        }
+        assert!(
+            settled_on(backend, &uri, &last).await,
+            "the last keystroke's analysis lands",
+        );
+
+        let counts = backend.analyses.counts();
+        let started = counts.started - settled_counts.started;
+        let landed_count = counts.landed - settled_counts.landed;
+        let cancelled = counts.cancelled - settled_counts.cancelled;
+        println!(
+            "M26 burst of {KEYSTROKES}: load={} started={started} landed={landed_count} \
+             cancelled={cancelled}",
+            crate::keystroke::gate::loadavg_1m(),
+        );
+        assert!(
+            started >= 2,
+            "the burst must actually schedule analyses, or the numbers below are vacuous \
+             — {started} started",
+        );
+        assert!(
+            landed_count <= 2,
+            "a burst of {KEYSTROKES} keystrokes performed {landed_count} complete analyses; \
+             the contract is ONE (the last keystroke's) plus at most one partial that outran \
+             its own cancellation",
+        );
+        assert!(
+            landed_count >= 1,
+            "the burst must still answer the last keystroke",
+        );
+        assert!(
+            started - cancelled <= 2,
+            "of the {started} analyses the burst started, {} ran to the end and only \
+             {cancelled} were stopped part-way; the contract is at most two complete ones. \
+             Before the checkpoints EVERY one of them ran to the end on its 128 MiB thread \
+             and all but the last were dropped by `land`'s revision check, which is the \
+             number this pin exists to hold down",
+            started - cancelled,
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The dependency fixture: `widget.vl` defines a function, `app.vl` imports
+    /// it. An edit to the widget is an edit to a module the app's analysis
+    /// loaded, and the app's own buffer never moves.
+    const WIDGET: &str = "export fun widget_value(): i32 {\n\t7\n}\n";
+    const WIDGET_EDITED: &str = "export fun widget_value(): i32 {\n\t8\n}\n";
+
+    fn dependency_workspace(name: &str) -> (PathBuf, Url, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-cancel-dep-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        let mut app = String::from(
+            "import pkg::widget::widget_value;\n\nfun main() {\n\tlet value = widget_value();\n}\n",
+        );
+        for index in 0..HELPERS {
+            app.push_str(&format!(
+                "fun app_helper_{index}(input: i32): i32 {{\n\tinput + input\n}}\n"
+            ));
+        }
+        std::fs::write(directory.join("vilan.toml"), "[package]\nname = \"dep\"\n")
+            .expect("a manifest");
+        std::fs::write(directory.join("src/widget.vl"), WIDGET).expect("a source file");
+        std::fs::write(directory.join("src/app.vl"), &app).expect("a source file");
+        let widget = Url::from_file_path(directory.join("src/widget.vl")).expect("a file url");
+        let app_uri = Url::from_file_path(directory.join("src/app.vl")).expect("a file url");
+        (directory, widget, app_uri)
+    }
+
+    /// **The dependency case.** An edit to an imported module cancels the
+    /// dependent's in-flight analysis and re-lands it ONCE.
+    ///
+    /// The dependent's own buffer never moves, so nothing about its generation
+    /// changes on its own account and text equality cannot tell "read the
+    /// module before the edit" from "read it after" — the same blindness E117's
+    /// revision stamp exists for. The sweep therefore supersedes each dependent
+    /// explicitly, which cancels whatever it had in flight and schedules the one
+    /// replacement.
+    ///
+    /// A registration stands in for an analysis already in flight: it holds the
+    /// scheduler's token exactly as a real one does, which makes the pin exact
+    /// about WHAT the sweep stops without having to win a race to observe it.
+    /// The edit itself goes through the real notification handler, so the sweep
+    /// under test is the shipped one.
+    #[tokio::test]
+    async fn a_dependency_edit_cancels_the_dependents_analysis_and_relands_it_once() {
+        let (directory, widget_uri, app_uri) = dependency_workspace("cancel");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let app_text = std::fs::read_to_string(directory.join("src/app.vl")).expect("the app");
+
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend.did_open(open_params(&app_uri, &app_text)).await;
+        assert!(
+            landed(backend, &widget_uri).await && landed(backend, &app_uri).await,
+            "both opens' analyses land — the settled state this pin edits from",
+        );
+        assert!(
+            backend
+                .documents
+                .get(&app_uri)
+                .expect("open")
+                .depends_on(&widget_uri.to_file_path().expect("a path")),
+            "the app must actually import the widget, or the sweep below finds nothing \
+             and every assertion after it is vacuous",
+        );
+        assert!(
+            !backend.schedule.dependency_moved(&app_uri),
+            "nothing has moved under the app yet",
+        );
+
+        // A stand-in for an analysis of the app already in flight: it holds the
+        // scheduler's registration exactly as a real one does, which is what the
+        // sweep has to find and stop.
+        let generation = backend
+            .schedule
+            .generation(&app_uri)
+            .expect("the open registered a generation");
+        let in_flight = backend.schedule.start(&app_uri, generation);
+        assert!(!in_flight.token.is_cancelled(), "it has only just started");
+
+        let before = backend.analyses.counts();
+        let app_revision = backend
+            .documents
+            .get(&app_uri)
+            .expect("open")
+            .analysis_revision();
+
+        // The widget's edit, through the real handler: its own analysis lands,
+        // then the sweep re-analyzes the one open document that imports it.
+        std::fs::write(directory.join("src/widget.vl"), WIDGET_EDITED).expect("the edit");
+        backend
+            .did_change(whole_file_change(&widget_uri, 2, WIDGET_EDITED))
+            .await;
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        let mut swept = false;
+        while std::time::Instant::now() < deadline {
+            swept = backend
+                .documents
+                .get(&app_uri)
+                .is_some_and(|document| document.analysis_revision() > app_revision);
+            if swept {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            swept,
+            "the sweep must re-land the dependent over the edited widget",
+        );
+
+        assert!(
+            in_flight.token.is_cancelled(),
+            "the app's in-flight analysis read the widget before the edit; the sweep \
+             stopped it rather than letting it finish and be dropped at `land`",
+        );
+        let after = backend.analyses.counts();
+        assert_eq!(
+            after.landed - before.landed,
+            2,
+            "exactly two analyses landed for this edit — the widget's own, and its one \
+             dependent re-analyzed ONCE: {before:?} -> {after:?}",
+        );
+        assert!(
+            !backend.schedule.dependency_moved(&app_uri),
+            "the mark is cleared by the re-landing — the app's landed snapshot is built \
+             over the edited widget again, so its keystroke answers are current",
+        );
+        println!(
+            "M26 dependency sweep: load={} {before:?} -> {after:?}",
+            crate::keystroke::gate::loadavg_1m(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A dependent edited while its dependency is being swept still settles
+    /// on its own live text.**
+    ///
+    /// The sweep SUPERSEDES each dependent (M26), which is what cancels the
+    /// analysis that read the module in its pre-edit state — and which also
+    /// takes the dependent's own debounced pause out of the running, because
+    /// that pause skips the moment its generation is no longer the latest. So
+    /// the sweep inherits an obligation the old one did not have: whatever it
+    /// analyzes has to be the buffer as it stands, not as it stood when the
+    /// sweep collected its list. It reads each dependent's text after
+    /// superseding it, for exactly that reason, and this is the pin that says
+    /// the buffer is never left with an analysis nobody is scheduled to make.
+    #[tokio::test]
+    async fn a_dependent_edited_during_a_sweep_still_settles_on_its_live_text() {
+        let (directory, widget_uri, app_uri) = dependency_workspace("starve");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let app_text = std::fs::read_to_string(directory.join("src/app.vl")).expect("the app");
+
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend.did_open(open_params(&app_uri, &app_text)).await;
+        assert!(
+            landed(backend, &widget_uri).await && landed(backend, &app_uri).await,
+            "both opens' analyses land",
+        );
+
+        // The dependent is edited, and the dependency is edited right behind it
+        // — so the app's own pause and the widget's sweep are both in flight for
+        // the app at once, which is the collision the late read exists for.
+        let app_edited = format!("{app_text}\nfun app_added(): i32 {{\n\t1\n}}\n");
+        backend
+            .did_change(whole_file_change(&app_uri, 2, &app_edited))
+            .await;
+        std::fs::write(directory.join("src/widget.vl"), WIDGET_EDITED).expect("the edit");
+        backend
+            .did_change(whole_file_change(&widget_uri, 2, WIDGET_EDITED))
+            .await;
+
+        assert!(
+            settled_on(backend, &app_uri, &app_edited).await,
+            "the dependent's own edit must reach an analysis: the sweep either analyzed \
+             the live buffer itself or stood aside for the pause that would",
+        );
+        assert!(
+            settled_on(backend, &widget_uri, WIDGET_EDITED).await,
+            "and the dependency settles on its own edit",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **The `dependency_moved` seam** (§2.1.2's case 4, the keystroke path's
+    /// fourth verdict input). The server passed a hard-coded `false` for it
+    /// because nothing knew when a dependency had moved; the sweep now does, and
+    /// says so for exactly the window between the dependency's edit and the
+    /// dependent's re-landing.
+    ///
+    /// Inside the window the verdict is `Stale`: whole-file syntax-only tokens,
+    /// and hints STILL SERVED (Q1's anti-flicker, Q4's "a withheld hint beats a
+    /// possibly-wrong one" applying only inside the edit window). Driven at the
+    /// scheduler + document seam rather than through a race, so what is pinned
+    /// is the rule and not a timing.
+    #[tokio::test]
+    async fn a_moved_dependency_degrades_the_keystroke_verdict_to_stale() {
+        let (directory, widget_uri, app_uri) = dependency_workspace("verdict");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let app_text = std::fs::read_to_string(directory.join("src/app.vl")).expect("the app");
+
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend.did_open(open_params(&app_uri, &app_text)).await;
+        assert!(
+            landed(backend, &app_uri).await,
+            "the app's analysis lands, so there is a snapshot to degrade",
+        );
+
+        let exact = backend
+            .documents
+            .get(&app_uri)
+            .expect("open")
+            .keystroke_verdict(backend.schedule.dependency_moved(&app_uri));
+        assert_eq!(
+            exact,
+            crate::keystroke::Verdict::Exact,
+            "nothing has moved: the buffer is the analyzed text and no dependency was edited",
+        );
+        let tokens_when_exact = backend
+            .documents
+            .get(&app_uri)
+            .expect("open")
+            .keystroke_tokens(false)
+            .len();
+
+        backend.schedule.mark_dependency_moved(&app_uri);
+        let document = backend.documents.get(&app_uri).expect("open");
+        let moved = backend.schedule.dependency_moved(&app_uri);
+        assert!(moved, "the sweep marked it");
+        assert_eq!(
+            document.keystroke_verdict(moved),
+            crate::keystroke::Verdict::Stale,
+            "an edited dependency is exactly what no amount of local anchoring can repair",
+        );
+        let stale_tokens = document.keystroke_tokens(moved).len();
+        assert!(
+            stale_tokens < tokens_when_exact,
+            "Stale means the whole file falls back to syntax, which classifies strictly \
+             fewer tokens than the landed semantic stream ({stale_tokens} vs \
+             {tokens_when_exact})",
+        );
+        assert!(
+            !document.keystroke_hints(moved).is_empty(),
+            "…and hints are still served: Q1's anti-flicker ruling — a hint one analysis \
+             old is a smaller harm than a display that blinks",
+        );
+        drop(document);
+
+        backend.schedule.clear_dependency_moved(&app_uri);
+        assert_eq!(
+            backend
+                .documents
+                .get(&app_uri)
+                .expect("open")
+                .keystroke_verdict(backend.schedule.dependency_moved(&app_uri)),
+            crate::keystroke::Verdict::Exact,
+            "and the window closes when the dependent re-lands",
+        );
+
+        // The WIRING, not just the rule: the handlers are what pass the flag,
+        // and they used to pass a hard-coded `false`. Asserted through the real
+        // request path so a handler that stops asking the scheduler reds here.
+        let tokens = |result: Option<SemanticTokensResult>| match result {
+            Some(SemanticTokensResult::Tokens(tokens)) => tokens.data.len(),
+            _ => 0,
+        };
+        let request = || SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: app_uri.clone(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let current = tokens(
+            backend
+                .semantic_tokens_full(request())
+                .await
+                .expect("the handler answers"),
+        );
+        backend.schedule.mark_dependency_moved(&app_uri);
+        let degraded = tokens(
+            backend
+                .semantic_tokens_full(request())
+                .await
+                .expect("the handler answers"),
+        );
+        assert!(
+            degraded < current,
+            "`semantic_tokens_full` must ASK the scheduler whether a dependency moved: it \
+             answered the same {current} tokens either way, which is the hard-coded `false` \
+             the keystroke path shipped with",
+        );
+        assert!(
+            !backend
+                .inlay_hint(InlayHintParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: app_uri.clone(),
+                    },
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(u32::MAX, 0),
+                    },
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .expect("the handler answers")
+                .unwrap_or_default()
+                .is_empty(),
+            "…and hints keep coming through it: Q1's anti-flicker ruling reaches the wire, \
+             not just the document",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The exhibit the latency gate uses, written to a fresh directory: a
+    /// generated module of `functions` functions sized like kolt-with-lucide,
+    /// plus the app-shaped entry that calls four of them (§6.1, Q6 — kolt is
+    /// never integrated into this codebase, so the subject is GENERATED).
+    fn exhibit(functions: usize) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-m26-exhibit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the exhibit directory");
+        std::fs::write(
+            directory.join("table.vl"),
+            crate::keystroke::gate::exhibit_module(functions),
+        )
+        .expect("the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, crate::keystroke::gate::EXHIBIT_ENTRY).expect("the exhibit entry");
+        (directory, entry)
+    }
+
+    /// One machine-readable row, the shape the gate's `PERF`/`E121` lines have.
+    fn row(subject: &str, measure: &str, cpu_ms: Option<f64>, wall_ms: f64, count: usize) {
+        println!(
+            "M26 {{\"section\":\"cancellation\",\"subject\":\"{subject}\",\
+             \"measure\":\"{measure}\",\"profile\":\"{}\",\"load\":\"{}\",\
+             \"cpu_ms\":{},\"wall_ms\":{wall_ms:.1},\"count\":{count}}}",
+            crate::keystroke::gate::profile(),
+            crate::keystroke::gate::loadavg_1m(),
+            cpu_ms.map_or_else(|| "null".to_string(), |value| format!("{value:.1}")),
+        );
+    }
+
+    /// The burst instrument (M26's numbers), over one subject.
+    ///
+    /// Two numbers, and the second is the one the lane is about:
+    ///
+    /// - **`warm_analysis`** — one uncancelled analysis of an EDITED buffer,
+    ///   after the open's analysis has already warmed the base-world cache
+    ///   (M21). This is what every keystroke of a burst used to cost: before
+    ///   the checkpoints, a superseded analysis ran to the end and was thrown
+    ///   away at `land`, so a burst of N keystrokes a debounce window apart cost
+    ///   N of these. The COLD first analysis is recorded beside it as
+    ///   `first_analysis` and is deliberately NOT the reference — comparing a
+    ///   burst of warm analyses against a cold one would credit cancellation
+    ///   with M21's saving.
+    /// - **`burst_per_keystroke`** — the same burst driven through the real
+    ///   notification handlers, measured in PROCESS CPU (the analyses run on
+    ///   their own threads; the calling thread's clock cannot see them) and
+    ///   divided by N.
+    ///
+    /// Plus **`last_keystroke`**: the wall from the final `did_change` to that
+    /// keystroke's diagnostics landing — the one latency the user actually
+    /// experiences, since the earlier ones' answers are overwritten before they
+    /// are read.
+    ///
+    /// The assertion is the lane's claim reduced to a comparison, and it is
+    /// non-vacuous by construction: swap the two operands and it reds on any
+    /// machine. Everything else is recorded, not asserted — a burst's wall
+    /// clock is the machine's business, and the CPU clocks are load-proof for
+    /// the reason M15 gives.
+    async fn burst_measurement(name: &str, entry: &Path, entry_text: &str, keystrokes: usize) {
+        use crate::keystroke::gate::{loadavg_1m, process_cpu_now};
+
+        let uri = Url::from_file_path(entry).expect("a file url");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        // The cold first analysis, on its own server so no other scheduling
+        // overlaps it. Recorded, not the reference.
+        let cpu_before = process_cpu_now();
+        let wall_before = std::time::Instant::now();
+        backend.did_open(open_params(&uri, entry_text)).await;
+        assert!(landed(backend, &uri).await, "the subject analyzes");
+        let first_wall = wall_before.elapsed().as_secs_f64() * 1000.0;
+        let first_cpu = cpu_before
+            .zip(process_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+        let diagnostics = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .published_diagnostics()
+            .len();
+        row(name, "first_analysis", first_cpu, first_wall, diagnostics);
+
+        // ONE keystroke, waited out to its landing: a warm, complete analysis,
+        // which is the reference the burst is measured against.
+        let warm_text = format!("{entry_text}\n// warm\n");
+        let cpu_before = process_cpu_now();
+        let wall_before = std::time::Instant::now();
+        backend
+            .did_change(whole_file_change(&uri, 2, &warm_text))
+            .await;
+        assert!(
+            settled_on(backend, &uri, &warm_text).await,
+            "the warm analysis lands",
+        );
+        let warm_wall = wall_before.elapsed().as_secs_f64() * 1000.0;
+        let full_cpu = cpu_before
+            .zip(process_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+        row(name, "warm_analysis", full_cpu, warm_wall, 1);
+
+        // The burst: one keystroke per debounce window, the shape §4.2 names.
+        let settled_counts = backend.analyses.counts();
+        let cpu_before = process_cpu_now();
+        let wall_before = std::time::Instant::now();
+        let mut last = warm_text.clone();
+        let mut last_edit_at = std::time::Instant::now();
+        for keystroke in 0..keystrokes {
+            last = format!("{entry_text}\n// keystroke {keystroke}\n");
+            last_edit_at = std::time::Instant::now();
+            backend
+                .did_change(whole_file_change(&uri, 3 + keystroke as i32, &last))
+                .await;
+            if keystroke + 1 < keystrokes {
+                tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS + 20)).await;
+            }
+        }
+        assert!(
+            settled_on(backend, &uri, &last).await,
+            "the last keystroke's analysis lands",
+        );
+        let last_keystroke_wall = last_edit_at.elapsed().as_secs_f64() * 1000.0;
+        let burst_wall = wall_before.elapsed().as_secs_f64() * 1000.0;
+        let burst_cpu = cpu_before
+            .zip(process_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+
+        let counts = backend.analyses.counts();
+        let started = counts.started - settled_counts.started;
+        let landed_count = counts.landed - settled_counts.landed;
+        let cancelled = counts.cancelled - settled_counts.cancelled;
+        row(
+            name,
+            "burst_per_keystroke",
+            burst_cpu.map(|cpu| cpu / keystrokes as f64),
+            burst_wall / keystrokes as f64,
+            keystrokes,
+        );
+        row(name, "last_keystroke", None, last_keystroke_wall, 1);
+        println!(
+            "M26 burst {name}: load={} keystrokes={keystrokes} started={started} \
+             landed={landed_count} cancelled={cancelled}",
+            loadavg_1m(),
+        );
+
+        let (Some(full_cpu), Some(burst_cpu)) = (full_cpu, burst_cpu) else {
+            panic!(
+                "no process CPU clock on this host, so the instrument cannot say anything \
+                 load-proof (M15's rule); wall was {burst_wall:.1} ms at loadavg {}",
+                loadavg_1m(),
+            );
+        };
+        let per_keystroke = burst_cpu / keystrokes as f64;
+        assert!(
+            per_keystroke < full_cpu,
+            "a keystroke of the burst cost {per_keystroke:.1} ms of process CPU against \
+             {full_cpu:.1} ms for one WARM whole analysis of the same buffer — which is what \
+             every keystroke of a burst cost before the checkpoints, so the two being equal \
+             means nothing was cancelled (started={started} landed={landed_count} \
+             cancelled={cancelled}, loadavg {})",
+            loadavg_1m(),
+        );
+    }
+
+    /// **The cancel latency**: how long after the token is set does the
+    /// analysis thread actually stop?
+    ///
+    /// The checkpoints are placed at the phase boundaries the
+    /// `VILAN_PHASE_TIMING` line names and per call site inside the checks that
+    /// dominate them, so the answer depends on WHERE in the analysis the cancel
+    /// lands — which is why this measures at several points through one
+    /// analysis's own duration rather than at one. A cancel that arrives during
+    /// the module load waits for the entry tail to begin; one that arrives in
+    /// the checks stops within a call site.
+    ///
+    /// Recorded, and asserted only on the two facts that make the number mean
+    /// anything: the analysis really was cancelled (it answered `None`), and it
+    /// stopped in less time than it had left to run.
+    #[test]
+    #[ignore = "M26: the cancel-latency instrument — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
+    fn cancel_latency_on_the_exhibit() {
+        use crate::keystroke::gate::loadavg_1m;
+        use vilan_core::cancel::CancelToken;
+
+        let (directory, entry) = exhibit(crate::keystroke::gate::GATE_FUNCTIONS);
+        let text = crate::keystroke::gate::EXHIBIT_ENTRY;
+        let std_dir = crate::document::tests::std_root();
+
+        // The reference: whole analyses, uncancelled, so the fractions below
+        // are fractions of something measured on THIS machine — WARM, because
+        // that is what the cancelled runs below are, and the FASTEST of three,
+        // because the failure mode of an over-long reference is a sleep that
+        // outlasts the analysis it was meant to interrupt. That reads as "the
+        // cancel did not land" when what happened is that there was nothing
+        // left to cancel, so the rows say which (`count` is 1 when the analysis
+        // really was stopped) and assert nothing when they missed.
+        let mut whole = Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let document =
+                Document::analyze_cancellable(text, &std_dir, &entry, &CancelToken::new())
+                    .expect("an uncancelled analysis answers");
+            whole = whole.min(started.elapsed());
+            assert!(document.program.is_some(), "the exhibit analyzes");
+            drop(document);
+        }
+        row(
+            "syn1791",
+            "whole_analysis",
+            None,
+            whole.as_secs_f64() * 1000.0,
+            1,
+        );
+
+        for percent in [10u32, 25, 50, 75, 90] {
+            let token = CancelToken::new();
+            let analysis = {
+                let token = token.clone();
+                let std_dir = std_dir.clone();
+                let entry = entry.clone();
+                std::thread::spawn(move || {
+                    Document::analyze_cancellable(text, &std_dir, &entry, &token)
+                })
+            };
+            std::thread::sleep(whole.mul_f64(f64::from(percent) / 100.0));
+            let cancelled_at = std::time::Instant::now();
+            token.cancel();
+            let answer = analysis.join().expect("the analysis thread");
+            let latency = cancelled_at.elapsed();
+            let stopped = answer.is_none();
+            row(
+                "syn1791",
+                &format!("cancel_at_{percent}pct"),
+                None,
+                latency.as_secs_f64() * 1000.0,
+                usize::from(stopped),
+            );
+            println!(
+                "M26 cancel latency: load={} at {percent}% of {:.0} ms the thread stopped \
+                 {:.0} ms after the token was set (cancelled={stopped})",
+                loadavg_1m(),
+                whole.as_secs_f64() * 1000.0,
+                latency.as_secs_f64() * 1000.0,
+            );
+            if stopped {
+                assert!(
+                    latency < whole,
+                    "a cancel at {percent}% took {latency:?} to land, which is longer than the \
+                     whole analysis ({whole:?}) — the checkpoints are not where the time is",
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// M26's numbers on the generated exhibit at kolt's size (1,791 functions).
+    /// Minutes of analysis — run deliberately, like the latency gate it shares
+    /// its subject with.
+    #[tokio::test]
+    #[ignore = "M26: the cancellation instrument — a generated 1,791-function exhibit and a ten-keystroke burst, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
+    async fn cancellation_measurement_on_the_exhibit() {
+        let (directory, entry) = exhibit(crate::keystroke::gate::GATE_FUNCTIONS);
+        burst_measurement("syn1791", &entry, crate::keystroke::gate::EXHIBIT_ENTRY, 10).await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The same instrument over a REAL file, named by `VILAN_M26_SUBJECT`.
+    ///
+    /// An environment variable rather than a fixture, and that is the point:
+    /// the owner's standing rule is that kolt is never integrated into this
+    /// codebase — no fixture, no golden, no copy — so the application evidence
+    /// is produced by pointing this at a checkout that lives elsewhere and
+    /// reading the rows. With the variable unset there is nothing to measure
+    /// and the test says so rather than pretending.
+    #[tokio::test]
+    #[ignore = "M26: the cancellation instrument over an external subject; set VILAN_M26_SUBJECT to a .vl file in its own package and run deliberately"]
+    async fn cancellation_measurement_on_an_external_subject() {
+        let Ok(path) = std::env::var("VILAN_M26_SUBJECT") else {
+            panic!(
+                "VILAN_M26_SUBJECT is unset: this instrument measures a file that lives \
+                 outside this repository (the owner's rule — kolt is read-only evidence, \
+                 never a fixture here), so there is nothing for it to measure",
+            );
+        };
+        let entry = PathBuf::from(path);
+        let text = std::fs::read_to_string(&entry).expect("the subject is readable");
+        let name = entry
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("external")
+            .to_string();
+        burst_measurement(&name, &entry, &text, 10).await;
     }
 }
 

@@ -94,12 +94,20 @@ wall-clock-waits = { max-threads = 1 }
 # a `did_change` on one open buffer, and then a poll waiting for the language
 # server's debounced analysis and its package sweep to recolor a DIFFERENT open
 # buffer. Same bound, same failure, same cure.
+#
+# `cancellation_tests` (M26) is that same shape again, and one of them adds a
+# reason of its own: `a_burst_of_edits_...` types eight keystrokes a debounce
+# window apart and counts how many of the analyses they started ran to the end.
+# Its assertion is a COUNT and load can only push it the safe way — a slower box
+# cancels MORE — but the burst itself is eight debounce windows of wall clock
+# with real analyses behind them, which is precisely the work this group exists
+# to stop the suite from piling onto itself.
 filter = '''
     binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
     + binary(watch_leg_reuse)
     + ((binary(build_hooks) + binary(assets) + binary(asset_bundle) + binary(split)
         + binary(serve_build)) & test(/watch|round/))
-    + (binary(vilan-lsp) & test(/package_recolor_tests/))
+    + (binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests/))
 '''
 test-group = 'wall-clock-waits'
 # Advisory at 120 s, killed at 8 minutes. The pins' own `WATCH_LIVENESS` (300 s)

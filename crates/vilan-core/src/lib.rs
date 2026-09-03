@@ -6,6 +6,7 @@ pub mod analyzer;
 pub mod async_infer;
 pub mod bindgen;
 pub mod call_graph;
+pub mod cancel;
 pub mod chunks;
 pub mod closest_name;
 pub mod const_eval;
@@ -635,16 +636,36 @@ fn analyze_source_unfenced(
     // cross-platform import (e.g. `std::http` in a file that also reaches for
     // `std::dom`).
     let platform = platform.unwrap_or_else(|| infer_platform(&root.0, std));
+    // M26's PARSE boundary (`editor-latency.md` §4.2): the first of the
+    // checkpoints, and the cheapest place to stop — the tree is parsed and the
+    // analysis proper has not begun. The handle rides out with the (empty)
+    // entry so the caller reclaims the tree exactly as it does on the panic
+    // path below; skipping the analysis is the whole saving.
+    if cancel::cancelled() {
+        return AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: Some(ast),
+            owned_modules: OwnedModules::none(),
+        };
+    }
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut program = analyze(root, source, std, pkg_root, entry_path, platform, workspace);
+        // M26: `None` is a CANCELLED analysis — a newer revision of this
+        // document arrived while it ran, so it stopped at a checkpoint and
+        // there is no program. It reaches the caller the same way the panic
+        // path below does: no program, and the tree handle still in hand to
+        // reclaim.
+        let mut program = analyzer::analyze_cancellable(
+            root, source, std, pkg_root, entry_path, platform, workspace,
+        )?;
         // The post-pass half of the `VILAN_PHASE_TIMING` split prints inside
         // `post_analysis_passes` itself (backlog M5), so BOTH pipelines —
         // this one (LSP, wasm, the test harnesses) and the CLI's — show it.
         post_analysis_passes(&mut program, platform, &options::BuildOptions::default());
-        program
+        Some(program)
     }));
     match analyzed {
-        Ok(program) => {
+        Ok(Some(program)) => {
             diagnostics.extend(program.diagnostics.iter().cloned());
             AnalyzedEntry {
                 program: Some(program),
@@ -653,6 +674,13 @@ fn analyze_source_unfenced(
                 owned_modules: OwnedModules::none(),
             }
         }
+        // Cancelled inside the analyzer, past the parse checkpoint above.
+        Ok(None) => AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: Some(ast),
+            owned_modules: OwnedModules::none(),
+        },
         // The analysis unwound inside its fence: every analyzer local went
         // with it and nothing global borrowed the tree (leak-soak.md §7.2),
         // so the handle is still the caller's to reclaim.
@@ -715,10 +743,31 @@ pub fn post_analysis_passes(
     // both. Zero the accumulator here — the top of the only region that calls
     // it — so the `dispatch-refine` bucket is this analysis's total.
     dispatch_refine::reset_refine_time();
+    // M26's POST-PASS boundary, the outermost of the three the phase line names
+    // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
+    // through the first two, so cancelling either cancels it). The passes are
+    // 0.31–0.46 s of a superseded analysis on kolt, and every one of them
+    // writes only diagnostics and result tables onto a `Program` this analysis
+    // owns and the caller is about to drop — so returning here leaves nothing
+    // half-written that anyone else can read. `call_graph_memo` is a memo: a
+    // consumer that asks an uninstalled program for the graph builds it, so
+    // skipping the install below is a missing OPTIMISATION, not a missing fact.
+    if cancel::cancelled() {
+        return;
+    }
     let phase_contexts_start = PhaseClock::now();
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
     let phase_contexts = phase_contexts_start.elapsed();
+    // M26's `contexts+graph` boundary, the first the phase line names and the
+    // largest post-pass (171–242 ms on kolt): a cancel that arrived while the
+    // graph was being built stops here rather than paying the six passes that
+    // read it. The graph is dropped with the frame — it is installed on the
+    // program only at the bottom of this function, which a cancelled analysis
+    // never reaches.
+    if cancel::cancelled() {
+        return;
+    }
     let phase_async_start = PhaseClock::now();
     async_infer::infer(program, &call_graph);
     let phase_async = phase_async_start.elapsed();
@@ -745,6 +794,14 @@ pub fn post_analysis_passes(
     let phase_platform_start = PhaseClock::now();
     platform_color::check(program, platform, &call_graph);
     let phase_platform = phase_platform_start.elapsed();
+    // M26's `const-pass` boundary, the second the phase line names: the pass
+    // costs 65–158 ms on kolt and most of it is `check_const_only`'s dispatch
+    // refinement (N43). Skipping it leaves `const_results` and its siblings
+    // empty, which for a cancelled analysis is the same nothing the whole
+    // program is about to become.
+    if cancel::cancelled() {
+        return;
+    }
     // The const pass (proposal/const-eval.md): evaluate `const`-marked
     // expressions in dependency order; results serialize in place at
     // transform time, failures are ordinary diagnostics. Runs here so
