@@ -4802,3 +4802,265 @@ fn the_match_control_refuses_the_same_mismatch() {
         "match legs have mismatched types: expected i32, but got str instead.",
     );
 }
+
+// --- B204: `never` erases, and the checker counts what paint counts ----------
+//
+// `panic(..)` types as `Never`, the bottom type that reconciles with every
+// type, and the checker's divergence analysis now has the two leaves the
+// editor's unreachable-code paint has had since E114: a `panic(..)` call and a
+// `for { … }` nothing breaks out of. Each pin below is one join `Never` erases
+// out of, or one place the widening must NOT reach.
+
+// The headline: a body that is nothing but a `panic` satisfies a declared
+// return type — and really does throw, so no value was owed. Before B204 this
+// wanted an `i32` after the panic (std's `rpc.vl` carried `0 - 1 // unreachable`
+// for exactly this, N48).
+#[test]
+fn a_panic_tail_satisfies_a_declared_return_type_and_throws() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun answer(): i32 {
+        	panic("no answer")
+        }
+
+        fun main() {
+        	print(answer());
+        }
+        "#,
+        "no answer",
+    );
+}
+
+// The same body written as a STATEMENT (`panic("…");`), whose synthesized void
+// tail follows it. The tail is dead code, not a missing return value.
+#[test]
+fn a_panic_statement_leaves_no_value_owed_at_the_tail() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun answer(): i32 {
+        	print("checking");
+        	panic("no answer");
+        }
+
+        fun main() {
+        	print(answer());
+        }
+        "#,
+        "no answer",
+    );
+}
+
+// std's own shape (N48, `rpc.vl:308`): a `match` whose failure leg panics and
+// whose success leg produces the value. The panic leg erases from the merge, so
+// the leg needs no unreachable value after it.
+#[test]
+fn a_panic_match_leg_erases_from_the_merge() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::panic;
+
+        fun parse_announced(text: str): i32 {
+        	match text.parse_i32() {
+        		Some(let id) => id,
+        		None => {
+        			panic("malformed: " + text);
+        		},
+        	}
+        }
+
+        fun main() {
+        	print(parse_announced("7"));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+// The `if` twin of the leg above: a panicking `else` erases, and the `if` takes
+// its type from the arm that survives.
+#[test]
+fn a_panic_if_arm_erases_from_the_merge() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::panic;
+
+        fun pick(c: bool): i32 {
+        	let value: i32 = if c { 1 } else { panic("no"); };
+        	value + 1
+        }
+
+        fun main() {
+        	print(pick(true));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// `never + i32 = i32` — the erasure rule stated on an OPERATOR, where the
+// diverging side is an operand rather than a branch.
+#[test]
+fn never_erases_as_an_operator_operand() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun total(): i32 {
+        	panic("no total") + 1
+        }
+
+        fun main() {
+        	print(total());
+        }
+        "#,
+        "no total",
+    );
+}
+
+// And as a call ARGUMENT: the parameter's type is never reached, so the call
+// site is legal whatever the parameter says.
+#[test]
+fn never_erases_as_a_call_argument() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun shout(word: str): i32 {
+        	print(word);
+        	1
+        }
+
+        fun main() {
+        	print(shout(panic("no word")));
+        }
+        "#,
+        "no word",
+    );
+}
+
+// Erasure removes the DIVERGING participant and nothing else: with the panic
+// arm gone the join is still `i32` against the annotation's `str`, and that is
+// what is reported. The `1` is the mistake, not the `panic`.
+#[test]
+fn erasure_does_not_hide_the_mismatch_in_the_arm_that_survives() {
+    assert_fails_with(
+        r#"
+        import std::io::panic;
+
+        fun main() {
+        	let c = false;
+        	let v: str = if c { 1 } else { panic("no") };
+        	print(v);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// The second leaf: a `for { … }` nothing breaks out of never falls through, so
+// a body that ends in one owes no return value.
+#[test]
+fn an_endless_for_tail_satisfies_a_declared_return_type() {
+    assert_compiles(
+        r#"
+        fun serve(): i32 {
+        	for {
+        		print("tick");
+        	}
+        }
+
+        fun main() {
+        	print("started");
+        }
+        "#,
+    );
+}
+
+// The control that keeps the leaf honest: a loop something DOES break out of
+// falls through, so the tail is reachable and still owes its value.
+#[test]
+fn a_for_with_a_break_still_owes_its_tail_value() {
+    assert_fails_with(
+        r#"
+        fun serve(c: bool): i32 {
+        	for {
+        		if c {
+        			jump break;
+        		}
+        	}
+        }
+
+        fun main() {
+        	print(serve(true));
+        }
+        "#,
+        "Expected i32, but got void instead.",
+    );
+}
+
+// `jump break` binds to the NEAREST enclosing loop, so an inner break leaves the
+// OUTER loop endless — the nesting the reader sees is the nesting the checker
+// reads.
+#[test]
+fn a_break_binds_to_its_own_loop_and_leaves_the_outer_one_endless() {
+    assert_compiles(
+        r#"
+        fun serve(c: bool): i32 {
+        	for {
+        		for {
+        			if c {
+        				jump break;
+        			}
+        		}
+        	}
+        }
+
+        fun main() {
+        	print("started");
+        }
+        "#,
+    );
+}
+
+// A `for cond { … }` is the `while`, not the endless form: it can finish, so the
+// tail after it is reachable and owes its value.
+#[test]
+fn a_conditional_for_is_not_an_endless_loop() {
+    assert_fails_with(
+        r#"
+        fun count_up(limit: i32): i32 {
+        	mut count = 0;
+        	for count < limit {
+        		count += 1;
+        	}
+        }
+
+        fun main() {
+        	print(count_up(3));
+        }
+        "#,
+        "Expected i32, but got void instead.",
+    );
+}
+
+// The control for the whole widening: a tail that neither leaves nor loops still
+// has to produce the declared type. Nothing about `Never` weakened that.
+#[test]
+fn a_non_diverging_tail_still_owes_its_value() {
+    assert_fails_with(
+        r#"
+        fun answer(): i32 {
+        	print("checking");
+        }
+
+        fun main() {
+        	print(answer());
+        }
+        "#,
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
