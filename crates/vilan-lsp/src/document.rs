@@ -4428,6 +4428,30 @@ pub(crate) mod tests {
     /// `Document::analyze` gives the pipeline, for tests that drive
     /// `analyze_on_this_thread` directly (to read the thread-local leak tally
     /// on the thread that analyzed).
+    /// Serializes the pins that read or write the compiler's PROCESS-GLOBAL
+    /// base-cache state — its worlds, its M23 overlay claims, its M24 byte
+    /// budget (`vilan-core/tests/base_cache.rs` keeps its own `CACHE_LOCK`
+    /// for exactly this reason).
+    ///
+    /// `cargo nextest` gives every test its own process, so under the
+    /// project's gate this lock is never contended. Plain `cargo test` runs a
+    /// binary's tests as threads in ONE process, and CLAUDE.md records that
+    /// as a correct, slower equivalent — which it stops being the moment two
+    /// tests clear each other's cache or lower each other's budget. Acquire
+    /// it in the test body, before `on_big_stack`: the guard is not `Send`,
+    /// and it does not need to be, because that call blocks until its thread
+    /// joins.
+    pub(crate) static BASE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes [`BASE_CACHE_LOCK`], recovering from a poisoned one: a pin that
+    /// panicked has already reported, and the next pin's own setup (a clear,
+    /// a budget reset) is what puts the cache back in a known state.
+    pub(crate) fn base_cache_guard() -> std::sync::MutexGuard<'static, ()> {
+        BASE_CACHE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
@@ -11946,7 +11970,7 @@ mod entry_reclaim {
 #[cfg(test)]
 mod overlay_module_reclaim {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
     use vilan_core::leak_tally::{self, LeakSite};
@@ -12055,6 +12079,7 @@ mod overlay_module_reclaim {
     /// outstanding balances read after the document drops.
     #[test]
     fn dependent_edit_measurement() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12249,6 +12274,7 @@ mod overlay_module_reclaim {
     /// nets every owned site to zero.
     #[test]
     fn a_dependent_edits_module_copies_are_analysis_owned_and_reclaimed() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12323,6 +12349,7 @@ mod overlay_module_reclaim {
     /// document reclaims the error slice with the rest.
     #[test]
     fn a_broken_buffers_copies_and_errors_are_owned_and_reclaimed() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12392,6 +12419,7 @@ mod overlay_module_reclaim {
     /// pre-entry world on every keystroke.
     #[test]
     fn a_repeated_content_is_loaded_once_and_served_from_the_stored_world() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12435,6 +12463,7 @@ mod overlay_module_reclaim {
     /// dies only when the LAST claim goes, which here is the cache's.
     #[test]
     fn open_dependents_share_one_claimed_copy_that_outlives_each_of_them() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         let second_entry_path = dir.join("other.vl");
         const SECOND_ENTRY: &str = "import pkg::helper::value;
@@ -12502,6 +12531,7 @@ fun main() {
     /// stores claims nothing.
     #[test]
     fn an_analysis_that_loads_no_overlay_module_owns_nothing() {
+        let _cache = base_cache_guard();
         let unrelated =
             std::env::temp_dir().join(format!("vilan_m9_unrelated_{}.vl", std::process::id()));
         on_big_stack(move || {
@@ -12552,7 +12582,7 @@ fun main() {
 #[cfg(test)]
 mod m23_scripted_session {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// The open sibling `client.vl` imports — big enough that rebuilding the
@@ -12610,6 +12640,7 @@ mod m23_scripted_session {
     /// (the served world answers what a cleared cache answers).
     #[test]
     fn the_scripted_sessions_third_file_hits_from_its_second_analysis() {
+        let _cache = base_cache_guard();
         let (dir, views_path, theme_path, client_path) = scratch_session();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12760,7 +12791,7 @@ mod m23_scripted_session {
 #[cfg(test)]
 mod m24_budget_eviction {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use std::sync::atomic::{AtomicU32, Ordering};
     use vilan_core::leak_tally::{self, LeakSite};
 
@@ -12770,6 +12801,7 @@ mod m24_budget_eviction {
 
     #[test]
     fn an_evicted_world_releases_its_overlay_claims_and_the_live_analysis_survives() {
+        let _cache = base_cache_guard();
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
@@ -12853,7 +12885,7 @@ mod m24_budget_eviction {
 #[cfg(all(test, target_os = "linux"))]
 mod leak_measurement {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use vilan_core::leak_tally::{self, LeakSite};
 
     /// Resident set size in KiB, from /proc/self/statm (Linux pages × 4).
@@ -13261,6 +13293,7 @@ mod leak_measurement {
     // still out.
     #[test]
     fn per_analysis_leak_is_bounded_by_named_sites_and_the_entry_is_reclaimed() {
+        let _cache = base_cache_guard();
         let warmup = 20;
         let measured = 200;
         let report = on_big_stack(move || measure(no_macro_text, warmup, measured));
@@ -13344,6 +13377,7 @@ mod leak_measurement {
     // content cache (keyed on the site-stamped text) makes it plateau to zero.
     #[test]
     fn gensym_expansion_leak_plateaus() {
+        let _cache = base_cache_guard();
         // `tail` stays four digits so the blanked world source is byte-stable.
         let warmup = 8;
         let measured = 40;
@@ -13389,6 +13423,7 @@ mod leak_measurement {
     // analysis: the whole macro path plateaus.
     #[test]
     fn world_leak_plateaus_under_length_changing_edits() {
+        let _cache = base_cache_guard();
         let warmup = 8;
         let measured = 40;
         let report = on_big_stack(move || {
@@ -13433,6 +13468,7 @@ mod leak_measurement {
     // definition recompiles once per layout — recorded, accepted.)
     #[test]
     fn broken_world_failure_plateaus_without_releaking() {
+        let _cache = base_cache_guard();
         fn broken_macro_text(i: usize) -> String {
             format!(
                 "import std::io::print;\n\n\
@@ -13517,6 +13553,7 @@ mod leak_measurement {
     // over warm-window noise.
     #[test]
     fn const_evaluations_in_use_bytes_plateau() {
+        let _cache = base_cache_guard();
         let warmup = 8;
         let window = 75;
         let (reports, scopes_alive) = on_big_stack(move || {
@@ -13697,6 +13734,7 @@ mod leak_measurement {
     #[test]
     #[ignore = "the leak soak: thousands of analyses per corpus, run deliberately (proposal/leak-soak.md §5)"]
     fn leak_soak_corpus_plateaus() {
+        let _cache = base_cache_guard();
         soak_corpora(SOAK_CORPORA);
     }
 
