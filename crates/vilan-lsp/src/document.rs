@@ -698,15 +698,19 @@ pub struct Document {
 /// `Drop`): the program borrows only `text`, `ast`, its `owned_modules`, and
 /// allocations that are immortal (std and module texts served from
 /// `parse_clean_cached`, interned names, cached macro worlds); and nothing
-/// outside this value borrows `text`, `ast`, or any owned module copy — no
-/// process-global cache, no thread-local, nothing the server retains.
-/// `leak-soak.md` §7.2 is the audit that establishes the second half for the
-/// entry pair, global by global; for the owned modules it is the mechanism's
-/// own construction (§7.9.4): the base-world store gate refuses to store a
-/// world that loaded one, and a macro-world compile never loads through the
-/// scope. The first half is what `analyze_source_owning_overlay_modules`
-/// returns. Every `Document` query returns owned values, so nothing borrowed
-/// from the program outlives the borrow of `self` that produced it.
+/// outside this value borrows `text` or `ast` — no process-global cache, no
+/// thread-local, nothing the server retains. `leak-soak.md` §7.2 is the audit
+/// that establishes that second half for the entry pair, global by global.
+/// The first half is what `analyze_source_owning_overlay_modules` returns.
+/// Every `Document` query returns owned values, so nothing borrowed from the
+/// program outlives the borrow of `self` that produced it.
+///
+/// The owned modules are the one place the invariant is a COUNT rather than
+/// an exclusivity (M23): a stored base world may borrow the same copies, and
+/// says so by holding its own claim. `owned_modules` is this document's
+/// claims, `Drop` gives back exactly those, and an allocation another holder
+/// still claims survives — which is precisely why the reclaim below is sound
+/// without knowing anything about the base cache.
 ///
 /// `Drop` does the ordering in one visible place — program first, then the
 /// reclaims — rather than leaning on field declaration order.
@@ -730,11 +734,14 @@ impl AnalyzedProgram {
     /// # Safety
     ///
     /// `program` must borrow nothing with a non-`'static` life other than
-    /// `*text`, `*ast`, and the `owned_modules` allocations — it is the
-    /// program `analyze_source_owning_overlay_modules` built over exactly
-    /// that text and returned with exactly these handles — and nothing else
-    /// may hold a reference derived from any of them: when this value drops,
-    /// all are freed.
+    /// `*text`, `*ast`, and the allocations `owned_modules` holds claims on —
+    /// it is the program `analyze_source_owning_overlay_modules` built over
+    /// exactly that text and returned with exactly these handles. Nothing
+    /// else may hold a reference derived from `*text` or `*ast`: when this
+    /// value drops, both are freed. An owned module allocation is freed only
+    /// if this document's claim was the LAST (M23), so another holder's
+    /// reference into one is fine — and is what the claim protocol exists
+    /// for.
     unsafe fn new(
         program: Option<Program<'static>>,
         text: Option<Leaked<str>>,
@@ -783,9 +790,10 @@ impl Drop for AnalyzedProgram {
             // SAFETY: as above; the tree's only borrower is gone.
             unsafe { ast.reclaim() };
         }
-        // SAFETY: as above — the program was the owned modules' only
-        // borrower (the `new` contract; leak-soak.md §7.9.4's store gate and
-        // macro carve-out are what keep every global out of them).
+        // SAFETY: as above — the program was the only thing borrowing
+        // through THIS document's claims (the `new` contract). Giving them
+        // back frees an allocation only if no stored base world still claims
+        // it (M23); one that does keeps it, correctly, alive.
         unsafe { std::mem::take(&mut self.owned_modules).reclaim() };
     }
 }
@@ -4708,6 +4716,30 @@ pub(crate) mod tests {
     /// `Document::analyze` gives the pipeline, for tests that drive
     /// `analyze_on_this_thread` directly (to read the thread-local leak tally
     /// on the thread that analyzed).
+    /// Serializes the pins that read or write the compiler's PROCESS-GLOBAL
+    /// base-cache state — its worlds, its M23 overlay claims, its M24 byte
+    /// budget (`vilan-core/tests/base_cache.rs` keeps its own `CACHE_LOCK`
+    /// for exactly this reason).
+    ///
+    /// `cargo nextest` gives every test its own process, so under the
+    /// project's gate this lock is never contended. Plain `cargo test` runs a
+    /// binary's tests as threads in ONE process, and CLAUDE.md records that
+    /// as a correct, slower equivalent — which it stops being the moment two
+    /// tests clear each other's cache or lower each other's budget. Acquire
+    /// it in the test body, before `on_big_stack`: the guard is not `Send`,
+    /// and it does not need to be, because that call blocks until its thread
+    /// joins.
+    pub(crate) static BASE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes [`BASE_CACHE_LOCK`], recovering from a poisoned one: a pin that
+    /// panicked has already reported, and the next pin's own setup (a clear,
+    /// a budget reset) is what puts the cache back in a known state.
+    pub(crate) fn base_cache_guard() -> std::sync::MutexGuard<'static, ()> {
+        BASE_CACHE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
@@ -12383,7 +12415,7 @@ mod entry_reclaim {
 #[cfg(test)]
 mod overlay_module_reclaim {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
     use vilan_core::leak_tally::{self, LeakSite};
@@ -12492,6 +12524,7 @@ mod overlay_module_reclaim {
     /// outstanding balances read after the document drops.
     #[test]
     fn dependent_edit_measurement() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12564,9 +12597,10 @@ mod overlay_module_reclaim {
             assert_no_global_cache_growth("repeated-clean");
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                30 * clean_helper(1).len(),
-                "a repeated content is parsed and owned per analysis — the \
-                 mechanism's stated, bounded cost"
+                clean_helper(1).len(),
+                "M23: an unchanged buffer is parsed and owned ONCE — the base \
+                 world stored for the first analysis claims that copy and \
+                 serves the other 29, which is the cost M9 paid per analysis"
             );
 
             // Phase 3: 20 DISTINCT broken contents — the file mid-edit.
@@ -12626,6 +12660,11 @@ mod overlay_module_reclaim {
             );
             report("repeated-clean-large", 30, wall);
             assert_no_global_cache_growth("repeated-clean-large");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                large_helper(1).len(),
+                "M23, at the realistic size: one parse for 30 analyses"
+            );
 
             // The raw parse cost of the module under edit, isolated from the
             // analysis around it: what one overlay-resident import adds to
@@ -12646,15 +12685,25 @@ mod overlay_module_reclaim {
             }
 
             leak_tally::reset();
+            let claims_before_drop = vilan_core::analyzer::base_cache_overlay_claims();
             drop(document);
             println!(
                 "[m9 after-drop] outstanding: LspEntryText {} B, EntryAst {} B, \
-                 OwnedModuleText {} B, OwnedModuleAst {} B, OwnedModuleErrors {} B",
+                 OwnedModuleText {} B, OwnedModuleAst {} B, OwnedModuleErrors {} B; \
+                 base-cache overlay claims {claims_before_drop:?}",
                 leak_tally::outstanding(LeakSite::LspEntryText),
                 leak_tally::outstanding(LeakSite::EntryAst),
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
                 leak_tally::outstanding(LeakSite::OwnedModuleAst),
                 leak_tally::outstanding(LeakSite::OwnedModuleErrors),
+            );
+            vilan_core::analyzer::base_cache_clear();
+            println!(
+                "[m23 after-clear] outstanding: OwnedModuleText {} B, \
+                 OwnedModuleAst {} B, base-cache overlay claims {:?}",
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                leak_tally::outstanding(LeakSite::OwnedModuleAst),
+                vilan_core::analyzer::base_cache_overlay_claims(),
             );
 
             vilan_core::analyzer::set_document_overlay(&helper_path, None);
@@ -12666,9 +12715,11 @@ mod overlay_module_reclaim {
     /// landed keystroke) grows neither process-global cache; each analysis
     /// owns exactly one copy of the edited module; supersession
     /// (`adopt_analysis`) reclaims the previous analysis's copy; and closing
-    /// the document nets every owned site to zero.
+    /// the document, then the base cache that claims the last copy (M23),
+    /// nets every owned site to zero.
     #[test]
     fn a_dependent_edits_module_copies_are_analysis_owned_and_reclaimed() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12704,13 +12755,28 @@ mod overlay_module_reclaim {
                 "no owned tree was recorded — the pin is vacuous"
             );
             // Supersession reclaimed every previous copy: only the CURRENT
-            // analysis's is still out.
+            // analysis's is still out — and the base world stored for it
+            // holds a second claim on that same copy (M23), not a copy of
+            // its own.
             assert_eq!(
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
                 helper_bytes as isize,
                 "adoption must reclaim the superseded analysis's module copy"
             );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, helper_bytes),
+                "the stored base world claims the live copy — one claim, no \
+                 second copy"
+            );
             drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                helper_bytes as isize,
+                "M23: closing the document releases the ANALYSIS's claim; the \
+                 stored world's keeps the allocation alive"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
@@ -12728,6 +12794,7 @@ mod overlay_module_reclaim {
     /// document reclaims the error slice with the rest.
     #[test]
     fn a_broken_buffers_copies_and_errors_are_owned_and_reclaimed() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12776,6 +12843,10 @@ mod overlay_module_reclaim {
                 "no owned error slice was recorded — the pin is vacuous"
             );
             drop(document);
+            // M23: the base world stored for the last analysis claims that
+            // analysis's copies — text, tree AND the rendered error slice —
+            // so the balance nets to zero only once the cache lets go.
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
@@ -12785,12 +12856,15 @@ mod overlay_module_reclaim {
         });
     }
 
-    /// The repeated-content pin: the mechanism's honest cost is one parse and
-    /// one owned copy per analysis even when the buffer has not changed —
-    /// bounded by the open set, reclaimed on supersession, never cached
-    /// globally.
+    /// The repeated-content pin, and M23's win at its sharpest: an unchanged
+    /// buffer is parsed and owned ONCE, not once per analysis. The base world
+    /// stored for the first analysis claims that copy, so every later
+    /// analysis is served the world and its claim — which is exactly what
+    /// M9's store gate forbade, at the price of rebuilding the whole
+    /// pre-entry world on every keystroke.
     #[test]
-    fn a_repeated_content_is_owned_per_analysis_and_reclaimed() {
+    fn a_repeated_content_is_loaded_once_and_served_from_the_stored_world() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -12807,10 +12881,17 @@ mod overlay_module_reclaim {
             assert_no_global_cache_growth("repeated-content pin");
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                5 * helper_bytes,
-                "a repeated content is parsed and owned per analysis"
+                helper_bytes,
+                "M23: five analyses over one unchanged buffer parse it once — \
+                 four of them are served the stored world's claim"
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, helper_bytes),
+                "one stored world, one claim, on the one copy"
             );
             drop(document);
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
 
@@ -12819,12 +12900,15 @@ mod overlay_module_reclaim {
         });
     }
 
-    /// The multi-dependent pin: two open documents importing the edited
-    /// module each own their OWN copy — the bound is the open set — and each
-    /// copy dies with its document: dropping one leaves the other's analysis
-    /// answering from its own, live copy.
+    /// The multi-dependent pin, and M23's reference count at work: two open
+    /// documents importing the edited module hold a claim EACH on one copy —
+    /// they share the base world the first of them stored — and the copy
+    /// outlives every individual release. Dropping one document leaves the
+    /// other answering from memory its own claim keeps alive; the allocation
+    /// dies only when the LAST claim goes, which here is the cache's.
     #[test]
-    fn each_open_dependent_owns_and_reclaims_its_own_copy() {
+    fn open_dependents_share_one_claimed_copy_that_outlives_each_of_them() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         let second_entry_path = dir.join("other.vl");
         const SECOND_ENTRY: &str = "import pkg::helper::value;
@@ -12852,24 +12936,32 @@ fun main() {
             );
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                2 * helper_bytes,
-                "each open dependent owns its own copy of the module"
+                helper_bytes,
+                "M23: the second dependent is served the first's stored world \
+                 — one copy, two claims"
             );
             assert_eq!(
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
-                2 * helper_bytes as isize,
+                helper_bytes as isize,
             );
             drop(first);
             assert_eq!(
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
                 helper_bytes as isize,
-                "dropping one dependent must reclaim exactly its own copy"
+                "dropping one dependent releases ITS claim only — the other \
+                 dependent is still reading this allocation"
             );
             assert!(
                 !second.semantic_tokens().is_empty(),
                 "the surviving dependent no longer answers from its program"
             );
             drop(second);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                helper_bytes as isize,
+                "the stored world's claim is the last one standing"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
 
@@ -12880,10 +12972,11 @@ fun main() {
 
     /// The no-dependent pin: an analysis that loads no overlay-served module
     /// — the ordinary open document, whatever unrelated overlays exist —
-    /// owns nothing, so the mechanism costs it nothing and the base-world
-    /// cache keeps working for it (the store gate reads the same emptiness).
+    /// owns nothing, so the mechanism costs it nothing and the world it
+    /// stores claims nothing.
     #[test]
     fn an_analysis_that_loads_no_overlay_module_owns_nothing() {
+        let _cache = base_cache_guard();
         let unrelated =
             std::env::temp_dir().join(format!("vilan_m9_unrelated_{}.vl", std::process::id()));
         on_big_stack(move || {
@@ -12920,6 +13013,314 @@ fun main() {
     }
 }
 
+/// M23's gate: the three-file scripted session the perf-25 lane measured on
+/// kolt — `views.vl` → `theme.vl` → `client.vl`, each opened, edited a few
+/// times, all three left OPEN — asserted on a package of the same shape.
+///
+/// `client.vl` imports `pkg::views`, and `views.vl` is an open buffer, so
+/// every one of `client.vl`'s loads of it is OVERLAY-served. Under M9's store
+/// gate that meant `client.vl` never stored a base world and never hit one:
+/// measured on kolt, `base` 1,357–2,713 ms on EVERY `client.vl` keystroke,
+/// against `base 0.0 ms` for its two siblings, which import no open file. The
+/// claim protocol (M23) is what closes it, and this pin is the shape the
+/// number came from.
+#[cfg(test)]
+mod m23_scripted_session {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The open sibling `client.vl` imports — big enough that rebuilding the
+    /// world around it is real work, and it imports nothing itself, so its
+    /// OWN analyses store a world that claims nothing.
+    fn views(keystroke: usize) -> String {
+        let mut text = format!(
+            "export fun app_shell(): i32 {{\n\t{}\n}}\n",
+            1000 + keystroke
+        );
+        for ordinal in 0..40 {
+            text.push_str(&format!(
+                "export fun view_{ordinal:02}(input: i32): i32 {{\n\tlet scaled = input * {};\n\tscaled + {ordinal}\n}}\n",
+                ordinal + 1
+            ));
+        }
+        text
+    }
+
+    /// The const-heavy sibling that reaches no package module — kolt's
+    /// `theme.vl`, the control that already read `base 0.0 ms`.
+    fn theme(keystroke: usize) -> String {
+        format!("export fun accent(): i32 {{\n\t{}\n}}\n", 2000 + keystroke)
+    }
+
+    /// The subject: it imports the OPEN sibling, which is the whole point.
+    fn client(keystroke: usize) -> String {
+        format!(
+            "import pkg::views::app_shell;\n\nfun main() {{\n\tlet shell = app_shell() + {};\n}}\n",
+            3000 + keystroke
+        )
+    }
+
+    /// A scratch package of the three files, on disk and unique per call (the
+    /// overlay map is process-global).
+    fn scratch_session() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_m23_session_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let views_path = dir.join("views.vl");
+        let theme_path = dir.join("theme.vl");
+        let client_path = dir.join("client.vl");
+        std::fs::write(&views_path, views(0)).expect("write views.vl");
+        std::fs::write(&theme_path, theme(0)).expect("write theme.vl");
+        std::fs::write(&client_path, client(0)).expect("write client.vl");
+        (dir, views_path, theme_path, client_path)
+    }
+
+    /// The session, and the assertion the item names: `client.vl` hits the
+    /// base cache from its SECOND analysis, with its two open siblings still
+    /// overlaid — plus the observation identity that makes a hit legitimate
+    /// (the served world answers what a cleared cache answers).
+    #[test]
+    fn the_scripted_sessions_third_file_hits_from_its_second_analysis() {
+        let _cache = base_cache_guard();
+        let (dir, views_path, theme_path, client_path) = scratch_session();
+        on_big_stack(move || {
+            let std_dir = std_root();
+            vilan_core::analyzer::base_cache_clear();
+
+            // File 1: views.vl opened and edited. It imports no sibling, so
+            // it hits from its own second analysis — M21's behavior, and the
+            // vacuity guard for everything below.
+            vilan_core::analyzer::set_document_overlay(&views_path, Some(views(0)));
+            let mut views_document =
+                Document::analyze_on_this_thread(&views(0), &std_dir, &views_path);
+            for keystroke in 1..=4 {
+                let text = views(keystroke);
+                vilan_core::analyzer::set_document_overlay(&views_path, Some(text.clone()));
+                let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+                views_document.adopt_analysis(Document::analyze_on_this_thread(
+                    &text,
+                    &std_dir,
+                    &views_path,
+                ));
+                let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+                assert!(
+                    hits_after > hits_before,
+                    "views.vl keystroke {keystroke} must hit the base cache \
+                     (M21) — without it this pin cannot tell M23 apart from a \
+                     cache that never works"
+                );
+            }
+            assert!(
+                views_document.diagnostics.is_empty(),
+                "views.vl must compile clean, got {:?}",
+                views_document.diagnostics
+            );
+
+            // File 2: theme.vl, opened and edited while views.vl stays open.
+            vilan_core::analyzer::set_document_overlay(&theme_path, Some(theme(0)));
+            let mut theme_document =
+                Document::analyze_on_this_thread(&theme(0), &std_dir, &theme_path);
+            for keystroke in 1..=4 {
+                let text = theme(keystroke);
+                vilan_core::analyzer::set_document_overlay(&theme_path, Some(text.clone()));
+                theme_document.adopt_analysis(Document::analyze_on_this_thread(
+                    &text,
+                    &std_dir,
+                    &theme_path,
+                ));
+            }
+            assert!(theme_document.diagnostics.is_empty());
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (0, 0),
+                "neither sibling imports an open file, so neither world \
+                 claims anything — the claims below are client.vl's"
+            );
+
+            // File 3: client.vl, which imports the OPEN views.vl. Its first
+            // analysis is a miss that stores; every one after it hits.
+            let client_text = client(0);
+            vilan_core::analyzer::set_document_overlay(&client_path, Some(client_text.clone()));
+            let (hits_open, misses_open) = vilan_core::analyzer::base_cache_stats();
+            let mut client_document =
+                Document::analyze_on_this_thread(&client_text, &std_dir, &client_path);
+            let (hits_first, misses_first) = vilan_core::analyzer::base_cache_stats();
+            assert!(
+                client_document.diagnostics.is_empty(),
+                "client.vl must compile clean over its open sibling, got {:?}",
+                client_document.diagnostics
+            );
+            assert_eq!(
+                (hits_first, misses_first > misses_open),
+                (hits_open, true),
+                "the first analysis of a new key must MISS and store"
+            );
+            let views_bytes = views(4).len();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, views_bytes),
+                "the stored world must claim the overlay-served views.vl copy \
+                 it borrows — that claim is what M9's store gate refused to \
+                 make, at the price of `base` 1.4-2.7 s per keystroke"
+            );
+
+            for keystroke in 1..=8 {
+                let text = client(keystroke);
+                vilan_core::analyzer::set_document_overlay(&client_path, Some(text.clone()));
+                let (hits_before, misses_before) = vilan_core::analyzer::base_cache_stats();
+                client_document.adopt_analysis(Document::analyze_on_this_thread(
+                    &text,
+                    &std_dir,
+                    &client_path,
+                ));
+                let (hits_after, misses_after) = vilan_core::analyzer::base_cache_stats();
+                assert!(
+                    hits_after > hits_before,
+                    "M23: client.vl keystroke {keystroke} must HIT the base \
+                     cache — it imports an open sibling, which is exactly the \
+                     case §7.9.4a's store gate refused"
+                );
+                assert_eq!(
+                    misses_after, misses_before,
+                    "client.vl keystroke {keystroke} must not also miss"
+                );
+                assert!(
+                    client_document.diagnostics.is_empty(),
+                    "client.vl keystroke {keystroke} must stay clean over the \
+                     served world, got {:?}",
+                    client_document.diagnostics
+                );
+            }
+
+            // Observation identity: what the served world answers must be
+            // what a cold build answers. A world whose borrows had been freed
+            // answered `cannot find 'greeting' in the imported path` when the
+            // M9 gate was planted away, so this is the assertion that tells a
+            // legitimate hit from a corrupt one.
+            let final_text = client(8);
+            let hot_tokens = format!("{:?}", client_document.semantic_tokens());
+            let hot_diagnostics = format!("{:?}", client_document.diagnostics);
+            vilan_core::analyzer::base_cache_clear();
+            let cold = Document::analyze_on_this_thread(&final_text, &std_dir, &client_path);
+            assert_eq!(
+                (
+                    format!("{:?}", cold.semantic_tokens()),
+                    format!("{:?}", cold.diagnostics)
+                ),
+                (hot_tokens, hot_diagnostics),
+                "a base-cache hit over an open sibling must be \
+                 observation-identical to a build with the cache cleared"
+            );
+
+            drop(cold);
+            drop(client_document);
+            drop(theme_document);
+            drop(views_document);
+            vilan_core::analyzer::base_cache_clear();
+            for path in [&views_path, &theme_path, &client_path] {
+                vilan_core::analyzer::set_document_overlay(path, None);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+}
+
+/// M24, where it meets M23: a world evicted by the BYTE BUDGET lets go of the
+/// overlay claims it held, exactly as a displaced or stale one does — and the
+/// live analysis that was served from that world goes on reading, because its
+/// own claim is what keeps the allocation alive.
+#[cfg(test)]
+mod m24_budget_eviction {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    const SIBLING: &str = "export fun app_shell(): i32 {\n\t7\n}\n";
+    const IMPORTER: &str =
+        "import pkg::views::app_shell;\n\nfun main() {\n\tlet shell = app_shell();\n}\n";
+
+    #[test]
+    fn an_evicted_world_releases_its_overlay_claims_and_the_live_analysis_survives() {
+        let _cache = base_cache_guard();
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_m24_claims_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let sibling_path = dir.join("views.vl");
+        let importer_path = dir.join("client.vl");
+        std::fs::write(&sibling_path, SIBLING).expect("write views.vl");
+        std::fs::write(&importer_path, IMPORTER).expect("write client.vl");
+
+        on_big_stack(move || {
+            let std_dir = std_root();
+            vilan_core::analyzer::set_base_cache_budget(
+                vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            );
+            vilan_core::analyzer::base_cache_clear();
+            // The sibling is OPEN, so the importer's world claims its copy.
+            vilan_core::analyzer::set_document_overlay(&sibling_path, Some(SIBLING.to_string()));
+            leak_tally::reset();
+            let document = Document::analyze_on_this_thread(IMPORTER, &std_dir, &importer_path);
+            assert!(
+                document.diagnostics.is_empty(),
+                "the fixture must compile clean, got {:?}",
+                document.diagnostics
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, SIBLING.len()),
+                "the stored world must claim the open sibling's copy (M23) — \
+                 without that this pin has nothing to evict"
+            );
+
+            // Evict it by budget rather than by staleness or displacement.
+            vilan_core::analyzer::set_base_cache_budget(1);
+            assert_eq!(
+                vilan_core::analyzer::base_cache_retained(),
+                0,
+                "the budget must evict the world"
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (0, 0),
+                "an evicted world must give its overlay claims back — every \
+                 eviction path releases through the same routine"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                SIBLING.len() as isize,
+                "the LIVE analysis's own claim keeps the allocation alive: \
+                 evicting a world must not free what a program is reading"
+            );
+            assert!(
+                !document.semantic_tokens().is_empty(),
+                "the analysis served from the evicted world must go on \
+                 answering from memory its own claim holds"
+            );
+
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                0,
+                "the last claim released is what frees the copy"
+            );
+
+            vilan_core::analyzer::set_base_cache_budget(
+                vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            );
+            vilan_core::analyzer::set_document_overlay(&sibling_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+}
+
 // Linux-only, and specifically Linux rather than unix: the harness reads
 // resident-set size from `/proc/self/statm`, which Windows does not have (the
 // CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1
@@ -12929,7 +13330,7 @@ fun main() {
 #[cfg(all(test, target_os = "linux"))]
 mod leak_measurement {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use vilan_core::leak_tally::{self, LeakSite};
 
     /// Resident set size in KiB, from /proc/self/statm (Linux pages × 4).
@@ -13337,6 +13738,7 @@ mod leak_measurement {
     // still out.
     #[test]
     fn per_analysis_leak_is_bounded_by_named_sites_and_the_entry_is_reclaimed() {
+        let _cache = base_cache_guard();
         let warmup = 20;
         let measured = 200;
         let report = on_big_stack(move || measure(no_macro_text, warmup, measured));
@@ -13420,6 +13822,7 @@ mod leak_measurement {
     // content cache (keyed on the site-stamped text) makes it plateau to zero.
     #[test]
     fn gensym_expansion_leak_plateaus() {
+        let _cache = base_cache_guard();
         // `tail` stays four digits so the blanked world source is byte-stable.
         let warmup = 8;
         let measured = 40;
@@ -13465,6 +13868,7 @@ mod leak_measurement {
     // analysis: the whole macro path plateaus.
     #[test]
     fn world_leak_plateaus_under_length_changing_edits() {
+        let _cache = base_cache_guard();
         let warmup = 8;
         let measured = 40;
         let report = on_big_stack(move || {
@@ -13509,6 +13913,7 @@ mod leak_measurement {
     // definition recompiles once per layout — recorded, accepted.)
     #[test]
     fn broken_world_failure_plateaus_without_releaking() {
+        let _cache = base_cache_guard();
         fn broken_macro_text(i: usize) -> String {
             format!(
                 "import std::io::print;\n\n\
@@ -13593,6 +13998,7 @@ mod leak_measurement {
     // over warm-window noise.
     #[test]
     fn const_evaluations_in_use_bytes_plateau() {
+        let _cache = base_cache_guard();
         let warmup = 8;
         let window = 75;
         let (reports, scopes_alive) = on_big_stack(move || {
@@ -13773,6 +14179,7 @@ mod leak_measurement {
     #[test]
     #[ignore = "the leak soak: thousands of analyses per corpus, run deliberately (proposal/leak-soak.md §5)"]
     fn leak_soak_corpus_plateaus() {
+        let _cache = base_cache_guard();
         soak_corpora(SOAK_CORPORA);
     }
 

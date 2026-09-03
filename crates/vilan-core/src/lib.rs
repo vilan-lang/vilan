@@ -368,10 +368,12 @@ pub struct AnalyzedEntry {
     pub program: Option<Program<'static>>,
     pub diagnostics: Vec<Error>,
     pub ast: Option<LeakedEntryAst>,
-    /// The overlay-served module allocations this analysis OWNS (M9,
-    /// `leak-soak.md` §7.9.4) — drained from the collection scope, reclaimable
-    /// with `ast` once the program is dropped. Empty unless the analysis
-    /// opted in ([`analyze_source_owning_overlay_modules`]).
+    /// The claims this analysis holds on overlay-served module allocations
+    /// (M9, `leak-soak.md` §7.9.4; M23's claim protocol) — drained from the
+    /// collection scope, reclaimable with `ast` once the program is dropped.
+    /// One per module the analysis parsed, plus one per module a base-cache
+    /// hit served it out of a stored world. Empty unless the analysis opted
+    /// in ([`analyze_source_owning_overlay_modules`]).
     pub owned_modules: OwnedModules,
 }
 
@@ -461,10 +463,14 @@ pub fn analyze_source_reclaimable(
 /// end serves everything from the overlay and must keep the global caches,
 /// as must every transient reader. A macro-world compile inside the analysis
 /// keeps the global caches too — its world outlives every analysis
-/// (§7.9.4b) — and a base world is never stored for an analysis that loaded
-/// an overlay-served source (§7.9.4a, `base_cache_store`'s gate), which is
-/// what makes the returned handles' reclaim sound: the program is their only
-/// borrower.
+/// (§7.9.4b).
+///
+/// What makes the returned handles' reclaim sound is a reference count, not
+/// exclusivity (M23): a base world stored for this analysis DOES borrow these
+/// allocations, and holds its own claim on each, so `reclaim` frees only what
+/// nothing else still claims. §7.9.4a's outright refusal to store such a
+/// world is what this replaces — it cost every entry importing an open
+/// sibling the whole pre-entry world on every keystroke.
 pub fn analyze_source_owning_overlay_modules(
     source: &'static str,
     std: &PackageSpec,

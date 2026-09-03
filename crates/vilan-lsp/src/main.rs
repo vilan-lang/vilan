@@ -4709,8 +4709,113 @@ mod cross_document_reach_tests {
     }
 }
 
+/// The retained-world byte budget knob (M24), read once at server start and
+/// named beside the other `VILAN_*` instruments (`VILAN_PHASE_TIMING`,
+/// `VILAN_LEAK_REPORT`, `VILAN_LEAK_SOAK_WINDOW`): the value is MEBIBYTES,
+/// because that is the unit anyone reasoning about a language server's
+/// footprint reaches for, and `0` is honoured as "retain nothing but the
+/// world just stored" rather than rejected — a legitimate way to take the
+/// cache out of a measurement.
+///
+/// The default lives in the compiler (`BASE_CACHE_DEFAULT_BUDGET`), so a
+/// front end that never sets it gets the bound anyway. A value that does not
+/// parse is a typo, not a policy: it is reported on stderr and the default
+/// stands.
+const BASE_CACHE_BUDGET_ENV: &str = "VILAN_BASE_CACHE_BUDGET_MIB";
+
+fn apply_base_cache_budget_from_env() {
+    let Ok(value) = std::env::var(BASE_CACHE_BUDGET_ENV) else {
+        return;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    match value.parse::<usize>() {
+        Ok(mebibytes) => {
+            let bytes = mebibytes.saturating_mul(1024 * 1024);
+            vilan_core::analyzer::set_base_cache_budget(bytes);
+            eprintln!("[vilan lsp] base-cache budget set to {mebibytes} MiB ({bytes} bytes)");
+        }
+        Err(_) => eprintln!(
+            "[vilan lsp] ignoring {BASE_CACHE_BUDGET_ENV}={value:?}: expected a whole number of \
+             mebibytes; the default of {} MiB stands",
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET / (1024 * 1024),
+        ),
+    }
+}
+
+/// M24: the budget knob is read once, in mebibytes, and a typo does not
+/// silently reconfigure the cache.
+#[cfg(test)]
+mod base_cache_budget_knob {
+    /// Sets or clears the knob for the duration of one assertion. The whole
+    /// process belongs to this test under nextest, so the environment is not
+    /// shared with anything.
+    fn with_knob(value: Option<&str>, body: impl FnOnce()) {
+        // SAFETY: nextest runs each test in its own process, and nothing else
+        // in this one reads the environment concurrently.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(super::BASE_CACHE_BUDGET_ENV, value),
+                None => std::env::remove_var(super::BASE_CACHE_BUDGET_ENV),
+            }
+        }
+        body();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(super::BASE_CACHE_BUDGET_ENV) };
+    }
+
+    #[test]
+    fn the_budget_knob_reads_mebibytes_and_a_typo_leaves_the_default() {
+        let default = vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET;
+        vilan_core::analyzer::set_base_cache_budget(default);
+
+        with_knob(None, || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                default,
+                "an unset knob leaves the compiler's default in force"
+            );
+        });
+
+        with_knob(Some("7"), || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                7 * 1024 * 1024,
+                "the knob is read in MEBIBYTES"
+            );
+        });
+
+        vilan_core::analyzer::set_base_cache_budget(default);
+        with_knob(Some("512MiB"), || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                default,
+                "a value that does not parse is a typo, not a policy"
+            );
+        });
+
+        with_knob(Some("0"), || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                0,
+                "zero is honoured — a legitimate way to take the cache out of \
+                 a measurement"
+            );
+        });
+
+        vilan_core::analyzer::set_base_cache_budget(default);
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    apply_base_cache_budget_from_env();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(|client| Backend {
