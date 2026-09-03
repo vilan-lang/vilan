@@ -7796,15 +7796,17 @@ fn b187_the_continuation_binding_stops_at_the_enclosing_block() {
 }
 
 #[test]
-#[ignore = "B204: `Divergence::checker` does not count `panic` as a leaf yet"]
+#[ignore = "B222: the guard's continuation binding is decided during the walk, before B204's divergence leaves settle"]
 fn b187_a_panicking_guard_binds_the_continuation() {
-    // The guard clause's other idiomatic ending. `Divergence::paint` already
-    // treats a `panic(…)` call as a leaf; the CHECKER deliberately does not
-    // (widening it changes what satisfies a declared return type), and lane
-    // b204 is the one moving that line this order. Un-ignore when it lands.
+    // The guard clause's other idiomatic ending. B204 made a `panic(…)` call a
+    // leaf of the ONE `Divergence` walk — but the continuation binding is
+    // decided while the body is walked, and the leaves are settled after the
+    // walk (`resolve_world`), so at that moment the panic is not yet a leaf.
+    // Un-ignore when B222 moves the decision after the leaves settle.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::io::panic;
         import std::option::Option::{ self, Some, None };
         fun guard(maybe: Option<i32>) {
             if !(maybe is Some(let n)) { panic("missing"); }

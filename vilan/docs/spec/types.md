@@ -921,10 +921,11 @@ match. A then-branch that can fall through reaches it on a miss. And an
 `if` with an `else` reaches it through whichever arm did not diverge,
 which is a different question and is not part of this rule.
 
-*Implementation note (tracked gap): the divergence the guard clause reads
-counts `ret` and `jump` and not yet `panic(..)`, so a guard ending in a
-panic does not publish its captures. Tracked as B204/B187; pinned as an
-`#[ignore]`d test.*
+*Implementation note (tracked gap): the guard clause's continuation
+binding is decided while the body is walked, and the divergence leaves
+that make `panic(..)` count (§5.1) are settled after the walk — so a
+guard ending in a panic does not yet publish its captures. Tracked as
+B222; pinned as an `#[ignore]`d test.*
 
 ```vilan,fragment
 if slot is Some(let n) { use(n); }                // yes: the test passed
