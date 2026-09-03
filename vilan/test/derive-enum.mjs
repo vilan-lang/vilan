@@ -142,5 +142,7 @@ console.log($r[0] === 0 && eq($r[1], r));
 const $s = from_json(to_json(e));
 console.log($s[0] === 0 && eq($s[1], e));
 const $t = from_json("\"Hexagon\"");
-console.log($t[0] === 1);
-console.log($t[1]);
+if ($t[0] === 1) {
+	console.log(true);
+	console.log($t[1]);
+}

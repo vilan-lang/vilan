@@ -413,3 +413,4 @@ row	flagship	key
 382	-	'{name}' is already declared in this module; remove or rename this one
 383	-	'{name}' is {sort}, not a trait: a bound names a trait.
 384	-	cannot iterate `{rendered}`: a tuple is a fixed sequence of independently typed elements, not a container of one element type, so a `for` binder has no single type to take and one body cannot be checked for every element. {steer}
+NEW	-	'{name}' is bound only inside the `is` test that captured it: outside a condition that test is an ordinary `bool`, and nothing after it proves the payload is there{steer}

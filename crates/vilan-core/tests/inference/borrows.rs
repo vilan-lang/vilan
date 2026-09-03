@@ -7978,3 +7978,278 @@ fn b199_a_capture_on_the_spine_is_untouched() {
         "2\n",
     );
 }
+
+// --- B215: an `is` capture bound in EXPRESSION position ----------------------
+//
+// Every rule above is about a CONDITION, because a condition is the only thing
+// that selects on a test's answer. `condition_polarity` could not say so: `None`
+// meant both "outside every condition" and "in a condition that installed no
+// frame" — the `while`-shaped `for` and the `match` guard, which never did — so
+// an `is` written as a plain expression fell back to B171's answer and its
+// capture ran to the end of the scope. `let b = x is Some(let n); print(n);`
+// compiled and read the payload slot of a value that may have no payload:
+// `print(n)` on a `None` printed `undefined`, and `print(n + 1)` printed `NaN`
+// where the program's own type said `i32`.
+//
+// The rule: a capture bound in expression position reaches the rest of THAT
+// expression and nothing after it. There is no narrowing that could make the
+// later read work — vilan has no flow typing, so "`n` where `b` is true" is not
+// something it can say.
+
+const B215_STEER: &str = "is bound only inside the `is` test that captured it";
+
+// The exhibit. Refused, and the refusal quotes the author's own test back.
+#[test]
+fn b215_a_bare_let_bound_is_binds_nothing_afterwards() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let present = maybe is Some(let n);
+            print(present);
+            print(n);
+        }
+        "#,
+        "'n' is bound only inside the `is` test that captured it: outside a condition \
+         that test is an ordinary `bool`, and nothing after it proves the payload is \
+         there. Put the test where a branch depends on it — `if maybe is Some(let n) \
+         { … }` — and read 'n' inside",
+    );
+}
+
+// The same read, one diagnostic and not two: the refusal replaces the generic
+// "cannot find", it does not stand beside it.
+#[test]
+fn b215_the_refusal_replaces_the_name_miss_rather_than_joining_it() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let present = maybe is Some(let n);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let present = maybe is Some(let n);
+            print(n);
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+// The `&&` rule holds wherever the operator is written — B195's answer, and the
+// half of the expression-position frame that is deliberately NOT cut. The right
+// operand is reached only when the left matched, whether the `&&` sits in a
+// condition or in a `let`'s initializer.
+#[test]
+fn b215_an_and_initializer_still_binds_its_own_right_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let big = maybe is Some(let n) && n > 1;
+            print(big);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// ...and the read AFTER that statement is still refused, which is the line the
+// rule draws: the `&&` carries the capture through its own right operand and no
+// further.
+#[test]
+fn b215_an_and_initializer_binds_nothing_past_the_statement() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let big = maybe is Some(let n) && n > 1;
+            print(big);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// The control the rule steers to: the same test as an `if` condition binds, and
+// the branch is entered only where it matched.
+#[test]
+fn b215_the_same_test_as_an_if_condition_still_binds() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) {
+                print(n);
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// A `while`-shaped `for`'s condition is a condition for the same reason —
+// reaching the body IS the test having passed. It installs no polarity frame, so
+// it is exactly the state B215 had to tell apart from expression position.
+#[test]
+fn b215_a_while_shaped_for_condition_still_binds_in_the_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = Some(4);
+            for slot is Some(let n) {
+                print(n);
+                slot = None;
+            }
+        }
+        "#,
+        "4\n",
+    );
+}
+
+// A `match` guard is the third such condition: the leg body runs only where the
+// guard held, so the guard's capture reaches it.
+#[test]
+fn b215_a_match_guard_still_binds_in_its_leg() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(3);
+            let scale = 5;
+            match scale {
+                let s if maybe is Some(let n) => print(n + s),
+                _ => print(0),
+            }
+        }
+        "#,
+        "8\n",
+    );
+}
+
+// A `match` LEG pattern's captures are untouched — the leg body is the branch
+// the pattern selected, which is the whole of the question.
+#[test]
+fn b215_a_match_leg_capture_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = Some(6);
+            match maybe {
+                Some(let n) => print(n),
+                None => print(0),
+            }
+        }
+        "#,
+        "6\n",
+    );
+}
+
+// B199's shape in expression position: a test buried in a call ARGUMENT, with no
+// condition anywhere. It was accepted (B199 only reaches a capture under a
+// condition) and is now refused by the expression-position rule instead.
+#[test]
+fn b215_a_call_argument_test_outside_a_condition_binds_nothing_afterwards() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun report(flag: bool) { print(flag); }
+        fun main() {
+            let maybe: Option<i32> = None;
+            report(maybe is Some(let n));
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// A MODULE-scope initializer is the same test and the same answer. It took the
+// rule's other half to reach: a module scope keeps no positional record (B33 —
+// its bindings are order-independent), so the capture was declared as an
+// ordinary module binding and `main` could read it. A declaration with a real
+// END is the exception, because an end is meaningless without positions.
+#[test]
+fn b215_a_module_level_test_binds_nothing_for_the_program() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        let slot: Option<i32> = None;
+        let present = slot is Some(let n);
+
+        fun main() {
+            print(present);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// ...and the `&&` half survives at module scope too, so the positional record is
+// a narrowing and not a ban.
+#[test]
+fn b215_a_module_level_and_initializer_still_binds_its_right_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        let slot: Option<i32> = Some(9);
+        let big = slot is Some(let n) && n > 1;
+
+        fun main() {
+            print(big);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// A `||` in expression position was already refused — B171 caps each operand at
+// its own end — but with the generic "cannot find". It now gets the refusal that
+// says why, which is the same reason.
+#[test]
+fn b215_an_or_initializer_is_refused_in_the_rules_own_terms() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let either = true || maybe is Some(let n);
+            print(either);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}

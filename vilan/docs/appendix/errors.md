@@ -34,7 +34,11 @@ when the pattern *didn't* match, so `n` is this error there and is in
 scope in the `else` — read it there, or drop the `!` and swap the two
 branches. A negated test whose branch **leaves** (`{ ret; }`, no `else`)
 is the guard clause, and there the capture *is* in scope after the `if`;
-this error after one usually means the branch can fall through.
+this error after one usually means the branch can fall through. An `is`
+written OUTSIDE a condition — `let ok = x is Some(let n);` — reads
+differently and gets a message of its own ("is bound only inside the `is`
+test that captured it"): a plain `bool` does not carry the payload, so
+the capture reaches the rest of that expression and nothing after it.
 → [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
