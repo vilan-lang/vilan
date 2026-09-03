@@ -12898,8 +12898,7 @@ impl<'src> Analyzer<'src> {
                 .map(render_type)
                 .unwrap_or_else(|| self.pretty_print_type(&field_type, &HashMap::default()));
             match element {
-                Some(element) if self.resolved_type_is_wire(element) => {}
-                Some(element) => {
+                Some(element) if !self.resolved_type_is_wire(element) => {
                     let element_type = element.get_type(self);
                     let rendered = self.pretty_print_type(&element_type, &HashMap::default());
                     // B189: this field's exposure is now reported, so the
@@ -12925,6 +12924,45 @@ impl<'src> Analyzer<'src> {
                         declaration_id,
                     );
                 }
+                // The element is Wire, and one thing is still needed: the
+                // `[service]` expansion has to be able to NAME it. That
+                // expansion runs before any type resolves, so it cannot read
+                // the `Source` impl this check just read — it reads the
+                // annotation's sole type argument, and a source whose element
+                // is not written there leaves it nothing to build the client's
+                // mirror from. It used to render the placeholder `_` and hand
+                // the author `cannot find type '_'`; B202 stopped it generating
+                // for such a field at all, which is why the refusal has to be
+                // said HERE, in the vocabulary of the field, or the exposure
+                // would simply not happen and nothing would say so.
+                Some(_)
+                    if !matches!(
+                        type_node,
+                        Some(Node::AccessorWithGenerics(_, arguments))
+                            if arguments.0.len() == 1
+                    ) =>
+                {
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "{label} is `[expose]`d, and its type `{rendered_field}` does \
+                             implement `std::Source`, but its element is not written as a \
+                             type argument: the `[service]` expansion builds the client's \
+                             mirror before any type resolves, so it reads the element off \
+                             the annotation's sole type argument and has nothing to name \
+                             here. Spell the source with its element as that argument \
+                             (`SignalCell<Note>`), or expose a field whose type is written \
+                             that way"
+                            ),
+                        },
+                        declaration_id,
+                    );
+                }
+                Some(_) => {}
                 None => {
                     // Same covering, same reason: the field cannot be exposed
                     // at all, so the generated subscription's own complaint
@@ -39607,21 +39645,25 @@ pub(crate) fn service_impl_source(
     // resolves, so the element is read off the field's SOLE type argument —
     // `SignalCell<Note>`, `StorageSignal<str>`, any single-parameter source.
     // Whether the field is exposable at all is the analyzer's
-    // `check_expose_fields`, which reconciles it against `std::Source`; a source
-    // whose element is not its one type argument renders `_` here and surfaces a
-    // clear error at the generated use site.
+    // `check_expose_fields`, which reconciles it against `std::Source`; a field
+    // whose element cannot be read HERE generates nothing at all — no surface
+    // entry, no mirror, no `expose` call (B202, and the `service` macro in
+    // `std/src/rpc.vl` reads the same rule). It used to render the literal `_`,
+    // which is not a type, so a field exposing something that is no source at
+    // all drew `cannot find type '_'` twice over on top of the compiler's own
+    // curated refusal.
     let exposed: Vec<(&str, String)> = fields
         .0
         .iter()
         .filter(|field| field.0.2)
-        .map(|field| {
+        .filter_map(|field| {
             let element = match field.0.1.as_ref().map(|type_node| &type_node.0) {
                 Some(Node::AccessorWithGenerics(_, arguments)) if arguments.0.len() == 1 => {
                     render_type(&arguments.0[0].0)
                 }
-                _ => "_".to_string(),
+                _ => return None,
             };
-            (field.0.0.0, element)
+            Some((field.0.0.0, element))
         })
         .collect();
     // The `[rpc]` methods: (name, [(parameter, type)], return type), from this

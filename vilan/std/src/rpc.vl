@@ -1781,20 +1781,25 @@ macro fun service(item: Item): Source {
 	};
 	// The [expose]d fields: each source's SOLE type argument is its element —
 	// `SignalCell<Note>`, `StorageSignal<str>`. Whether the field is exposable is
-	// the compiler's `std::Source` reconciliation; a field whose element is not
-	// its one type argument renders `_`, erroring clearly at the generated site.
+	// the compiler's `std::Source` reconciliation, and a field whose element
+	// cannot be read here generates NOTHING: no surface entry, no mirror, no
+	// `session.expose` call (B202). It used to push the literal `_` and carry it
+	// into all three, but `_` is not a type — so a field exposing something that
+	// is no source at all was told so once by the compiler and then twice more
+	// as `cannot find type '_'`, in code the author never wrote. The curated
+	// refusal stands alone.
 	mut exposed_names: List<str> = [];
 	mut exposed_elements: List<str> = [];
 	for field in target.fields {
 		if field.exposed {
-			exposed_names.push(field.name);
 			if field.type_.arguments.len() == 1 {
 				match field.type_.arguments.get(0) {
-					Some(let element) => exposed_elements.push(element.render()),
-					None => exposed_elements.push("_"),
+					Some(let element) => {
+						exposed_names.push(field.name);
+						exposed_elements.push(element.render());
+					},
+					None => {},
 				}
-			} else {
-				exposed_elements.push("_");
 			}
 		}
 	}

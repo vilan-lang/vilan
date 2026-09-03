@@ -404,3 +404,4 @@ row	flagship	key
 378	-	`impl {subject_name} with {trait}`{inherited} provides no `{member_name}`: an operator trait's method is required at impl time
 379	-	`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — vilan has no `Not` for one to require
 380	-	`-` negates a number, and `{label}` is a trait: no trait names the numeric set — vilan has no `Neg` for one to require
+NEW	-	{label} is `[expose]`d, and its type `{rendered_field}` does implement `std::Source`, but its element is not written as a type argument: the `[service]` expansion builds the client's mirror before any type resolves, so it reads the element off the annotation's sole type argument and has nothing to name here. Spell the source with its element as that argument (`SignalCell<Note>`), or expose a field whose type is written that way
