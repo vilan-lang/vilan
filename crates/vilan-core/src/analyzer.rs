@@ -14922,6 +14922,29 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The scope an inline-`mod` path names inside `scope_id` — where a
+    /// generated list belongs when the item that produced it was written inside
+    /// one (B201). A `[derive(..)]` writes an `impl` naming its subject by the
+    /// bare name the author wrote, and that name resolves in exactly one scope:
+    /// the `mod`'s. Falls back to the enclosing scope for a segment that does
+    /// not resolve to a module — the pre-B201 placement, and the right answer
+    /// for a path no walk created (generated code declaring its own `mod`).
+    fn declaring_module_scope(&self, scope_id: Id, module_path: &[String]) -> Id {
+        let mut scope_id = scope_id;
+        for name in module_path {
+            let Some(module) = self
+                .scopes
+                .get(&scope_id)
+                .and_then(|scope| scope.name_to_id_map.get(name.as_str()).copied())
+                .and_then(|module_id| self.modules.get(&module_id))
+            else {
+                return scope_id;
+            };
+            scope_id = module.body.1;
+        }
+        scope_id
+    }
+
     /// One expansion, walked into `scope_id` with the whole attribution its
     /// output needs — the ONE place a generated walk is set up, so a fourth
     /// caller cannot get half of it (the three that existed before this was
@@ -41486,7 +41509,8 @@ fn expand_entry_over_world<'src>(
             .analyzer
             .attribute_new_diagnostics(before, defining_source);
     }
-    for (_, list) in &output.items {
+    for generated in &output.items {
+        let list = generated.nodes;
         for (module, _) in collect_module_refs(list, "std") {
             if !world.module_scopes.contains_key(module) {
                 return true;
@@ -41548,7 +41572,7 @@ struct World<'src> {
     /// the same way it answers it for `std::` (M21), instead of rebuilding the
     /// world for every derive that reaches a sibling.
     pkg_module_names: HashSet<&'src str>,
-    generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>>,
+    generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>>,
     // The std intrinsics the tail keys passes off (resolved from the loaded
     // world's scopes; `None` when the module never loaded).
     list_struct_id: Option<Id>,
@@ -42337,7 +42361,7 @@ fn analyze_inner<'src>(
     }
     // Splice sites are stamped with a per-analysis counter (gensym hygiene, §7).
     let mut macro_site_counter: u32 = 0;
-    let mut generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>> =
+    let mut generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>> =
         HashMap::default();
     loop {
         // Canonical drain (WO-1b): load the smallest-key module still pending
@@ -42698,10 +42722,10 @@ fn analyze_inner<'src>(
             // dependencies). Runs even with an empty registry: an unknown
             // `[attribute]` must error, not silently skip.
             let seed_generated_refs =
-                |generated: &[(Span, &'static NodeList<'static>)],
+                |generated: &[crate::macros::GeneratedItems],
                  origin: Origin,
                  to_load: &mut Vec<(Origin, &str)>| {
-                    for (_, list) in generated {
+                    for list in generated.iter().map(|items| items.nodes) {
                         to_load.extend(
                             collect_module_refs(list, "std")
                                 .into_iter()
@@ -42885,10 +42909,18 @@ fn analyze_inner<'src>(
             source: *source_id,
         });
         // Macro-generated items (derives included — expansion is unified) walk
-        // into the module's own scope right after its body, so they see its
-        // types.
-        for (origin, generated) in generated_by_source.get(source_id).into_iter().flatten() {
-            analyzer.walk_generated_expansion(generated, *module_scope_id, *origin, *source_id);
+        // into the DECLARING scope right after its body, so they see its types:
+        // the module's own scope, or the inline `mod` the deriving item was
+        // written inside (B201).
+        for generated in generated_by_source.get(source_id).into_iter().flatten() {
+            let scope_id =
+                analyzer.declaring_module_scope(*module_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                *source_id,
+            );
         }
     }
     if let Some(lib_ast) = lib_ast {
@@ -42915,9 +42947,17 @@ fn analyze_inner<'src>(
             end: analyzer.entity_id,
             source: *source_id,
         });
-        // Macro-generated items (derives included) walk into the lib's namespace.
-        for (origin, generated) in generated_by_source.get(source_id).into_iter().flatten() {
-            analyzer.walk_generated_expansion(generated, *namespace_scope_id, *origin, *source_id);
+        // Macro-generated items (derives included) walk into the lib's namespace
+        // — or into the inline `mod` that declared the deriving item (B201).
+        for generated in generated_by_source.get(source_id).into_iter().flatten() {
+            let scope_id =
+                analyzer.declaring_module_scope(*namespace_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                *source_id,
+            );
         }
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
@@ -43345,9 +43385,16 @@ fn analyze_over_world<'src>(
             source: SourceId(0),
         });
         // Synthesized `[derive(..)]` impls are walked into the same (entry) scope,
-        // right after the user's items, so they see the derived types.
-        for (origin, generated) in generated_by_source.get(&SourceId(0)).into_iter().flatten() {
-            analyzer.walk_generated_expansion(generated, global_scope_id, *origin, SourceId(0));
+        // right after the user's items, so they see the derived types — or into
+        // the inline `mod` that declared the deriving item (B201).
+        for generated in generated_by_source.get(&SourceId(0)).into_iter().flatten() {
+            let scope_id = analyzer.declaring_module_scope(global_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                SourceId(0),
+            );
         }
     }
     // Constraint resolution and the post-passes attribute their diagnostics per
