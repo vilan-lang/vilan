@@ -40,13 +40,14 @@
 //!    ([`every_flagship_row_is_quoted_by_the_errors_appendix`]) — a row the
 //!    index marks `flagship` must be quoted by some appendix entry. Dropping an
 //!    entry, or marking a new row flagship without writing one, reds.
-//! 6. **The two exemptions expire** (N42, and N27's rule for `#[ignore]`
-//!    reasons applied to a list). Both
-//!    [`every_hand_rowed_row_is_still_out_of_the_enumerations_reach`] and
-//!    [`every_fragmentless_key_still_has_no_fragment`] ask the INVERSE
-//!    question: a row `ROWS_THE_ENUMERATION_CANNOT_REACH` names that the walk
-//!    now reaches, and a key `KEYS_WITHOUT_A_FRAGMENT` names that is now
-//!    searchable, are each an exemption subtracting a check for nothing — and
+//! 6. **The exemptions expire** (N42/N50, and N27's rule for `#[ignore]`
+//!    reasons applied to a list). Four checks ask the INVERSE question, each
+//!    with the predicate of the check it widens: a row
+//!    `ROWS_THE_ENUMERATION_CANNOT_REACH` names that the walk now reaches, a
+//!    key `KEYS_WITHOUT_A_FRAGMENT` names that is now searchable, a needle
+//!    `APPENDIX_HEADS_NOT_HELD` names whose entries the tree now holds
+//!    literally, and a head `HEADS_THAT_ARE_NOT_MESSAGES` names that now quotes
+//!    a message, are each an exemption subtracting a check for nothing — and
 //!    each stays green forever without this, because a list that only ever
 //!    subtracts work cannot red by being wrong.
 //!
@@ -653,6 +654,32 @@ fn appendix_fragments(head: &str, code_spans_are_holes: bool) -> Vec<String> {
         .collect()
 }
 
+/// Whether `line` opens an appendix ENTRY: a line that is nothing but bold
+/// (plus an optional italic aside). A bold word leading a sentence of prose is
+/// not one.
+fn is_entry_head(line: &str) -> bool {
+    line.starts_with("**")
+        && line
+            .trim_end()
+            .trim_end_matches([')', '*', '('])
+            .ends_with("**")
+        || line.starts_with("**") && line.trim_end().ends_with("**")
+}
+
+/// Whether the tree holds `head` literally: its runs as written, or — second
+/// pass — with its code spans read as holes, because a head may quote an
+/// illustrative filling where the message has a slot. One predicate, so the
+/// check that reports a stale entry and the check that reports a stale
+/// EXEMPTION cannot drift apart.
+fn appendix_head_is_held(head: &str, blob: &str) -> bool {
+    appendix_fragments(head, false)
+        .iter()
+        .all(|fragment| blob.contains(fragment))
+        || appendix_fragments(head, true)
+            .iter()
+            .all(|fragment| blob.contains(fragment))
+}
+
 // --- The gates -------------------------------------------------------------
 
 #[test]
@@ -771,20 +798,13 @@ fn every_errors_appendix_entry_still_names_a_live_message() {
     let blob = source_blob();
     let mut stale = Vec::new();
     for (line, head) in appendix_heads() {
-        // Two passes: the head as written, then with its code spans read as
-        // holes, because an entry may quote an illustrative filling.
-        let strict: Vec<String> = appendix_fragments(&head, false);
-        if strict.iter().all(|fragment| blob.contains(fragment)) {
+        if appendix_head_is_held(&head, &blob) {
             continue;
         }
-        let relaxed: Vec<String> = appendix_fragments(&head, true);
-        let missing: Vec<String> = relaxed
+        let missing: Vec<String> = appendix_fragments(&head, true)
             .into_iter()
             .filter(|fragment| !blob.contains(fragment))
             .collect();
-        if missing.is_empty() {
-            continue;
-        }
         if APPENDIX_HEADS_NOT_HELD
             .iter()
             .any(|(needle, _)| head.contains(needle))
@@ -848,15 +868,7 @@ fn every_appendix_entry_carries_a_quoted_head() {
     let text = read(APPENDIX);
     let mut headless = Vec::new();
     for (number, line) in text.lines().enumerate() {
-        // An ENTRY head is a line that is nothing but bold (plus an optional
-        // italic aside). A bold word leading a sentence of prose is not one.
-        let is_entry_head = line.starts_with("**")
-            && line
-                .trim_end()
-                .trim_end_matches([')', '*', '('])
-                .ends_with("**")
-            || line.starts_with("**") && line.trim_end().ends_with("**");
-        if !is_entry_head || line.starts_with("**\"") {
+        if !is_entry_head(line) || line.starts_with("**\"") {
             continue;
         }
         if HEADS_THAT_ARE_NOT_MESSAGES
@@ -985,4 +997,103 @@ fn the_enumeration_reaches_the_message_surface_it_claims() {
     );
     let files: BTreeSet<&str> = sites.iter().map(|site| site.file.as_str()).collect();
     assert!(files.len() > 5, "the enumeration reaches only {files:?}");
+}
+
+#[test]
+fn every_unheld_appendix_head_still_cannot_be_held() {
+    // The inverse for `APPENDIX_HEADS_NOT_HELD` (tracker N50, N42's shape).
+    // The entry's reason is a claim about the TREE — "the sentence this entry
+    // quotes is composed from literals that live apart, so it appears nowhere
+    // as one run" — and the tree is a thing that changes: join the two literals
+    // into one `format!` and the head becomes holdable, while the exemption
+    // goes on excusing it from the check forever.
+    //
+    // Held is asked the way `every_errors_appendix_entry_still_names_a_live_message`
+    // asks it, through the same predicate, so a head this test calls holdable is
+    // a head that check would hold on its own.
+    let blob = source_blob();
+    let heads = appendix_heads();
+    let stale: Vec<String> = APPENDIX_HEADS_NOT_HELD
+        .iter()
+        .filter_map(|(needle, _)| {
+            let covered: Vec<&(usize, String)> = heads
+                .iter()
+                .filter(|(_, head)| head.contains(needle))
+                .collect();
+            if covered.is_empty() {
+                return Some(format!(
+                    "  {needle:?}: no errors-appendix entry quotes it any more, so \
+                     the entry exempts nothing"
+                ));
+            }
+            covered
+                .iter()
+                .all(|(_, head)| appendix_head_is_held(head, &blob))
+                .then(|| {
+                    format!(
+                        "  {needle:?}: every entry it covers is held literally by the \
+                         tree now (errors.md:{})",
+                        covered
+                            .iter()
+                            .map(|(line, _)| line.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in APPENDIX_HEADS_NOT_HELD excuse a head from the literal \
+         check that the literal check would pass. Delete the entry — an entry the \
+         tree holds should be held, so the next rewording of its message is \
+         red:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_non_message_head_still_names_a_headless_entry() {
+    // The inverse for `HEADS_THAT_ARE_NOT_MESSAGES` (tracker N50). The entry
+    // exempts one appendix line from the rule that an entry opens with the
+    // message it documents, quoted. Reword that line into a quoted head — which
+    // is what happens when the condition it names finally gets a message of its
+    // own — and the exemption covers a line the gate no longer looks at; delete
+    // the entry from the appendix and it covers nothing at all.
+    //
+    // Asked with `is_entry_head`, the gate's own predicate, so a line this test
+    // calls covered is a line the gate would reach.
+    let text = read(APPENDIX);
+    let stale: Vec<String> = HEADS_THAT_ARE_NOT_MESSAGES
+        .iter()
+        .filter_map(|(head, _)| {
+            let named: Vec<usize> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains(head))
+                .map(|(number, _)| number + 1)
+                .collect();
+            if named.is_empty() {
+                return Some(format!(
+                    "  {head:?}: no line of `{APPENDIX}` carries it any more"
+                ));
+            }
+            let still_flagged = text.lines().any(|line| {
+                line.contains(head) && is_entry_head(line) && !line.starts_with("**\"")
+            });
+            (!still_flagged).then(|| {
+                format!(
+                    "  {head:?}: errors.md:{named:?} opens with a quoted message now, \
+                     so the gate skips it on its own"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in HEADS_THAT_ARE_NOT_MESSAGES record an appendix entry as \
+         naming a CONDITION that does not. Delete the entry — an entry that quotes \
+         its message is checkable, and this list is what says it is not:\n{}",
+        stale.join("\n")
+    );
 }

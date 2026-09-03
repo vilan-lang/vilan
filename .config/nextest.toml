@@ -21,17 +21,25 @@ priority = 100
 # The stragglers start FIRST, for the same reason the leak plateaus do
 # (tracker N46, from two sibling lanes' unions).
 #
-# None of these three asserts anything about TIME — `dependent_edit_measurement`
-# prints its per-analysis wall clocks and asserts on leak-tally BYTES, and the
-# other two have no clock in them at all — so there is nothing here for a
+# Neither of these asserts anything about TIME — `dependent_edit_measurement`
+# prints its per-analysis wall clocks and asserts on leak-tally BYTES, and
+# `style_chain_order` has no clock in it at all — so there is nothing here for a
 # liveness bound or a CPU clock to fix. They are simply long, and a long test
 # scheduled late is the critical path: `dependent_edit_measurement` was the sole
 # straggler of a 5455-test union at 246.6 s, holding the run open about four
 # minutes after everything else had finished.
+#
+# `release_differential` was the third member and is not one any more (tracker
+# N49). It was 607.3 s of a 698.7 s union, and priority was the only lever there
+# was while the leg was ONE test; split into one test per corpus program, 600 of
+# those seconds turned out to be `watch.vl` waiting out two 300 s node deadlines
+# for a filesystem change that never comes. With that program compiled-but-not-
+# run, the binary's longest member is 9.6 s and there is no straggler left to
+# schedule around — a priority that names it would be a claim about a shape that
+# is gone.
 [[profile.default.overrides]]
 filter = '''
     test(dependent_edit_measurement) + binary(style_chain_order)
-    + binary(release_differential)
 '''
 priority = 100
 
