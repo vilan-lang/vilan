@@ -36159,26 +36159,37 @@ impl<'src> Analyzer<'src> {
                         // there the bound cannot be added locally: it moves the
                         // trait, and every `impl` and every bound naming it.
                         //
-                        // GENERATED code is exempt, on B188's already-shipped
-                        // boundary and for its stated reason. `[derive(
-                        // PartialEq)]` on `struct Holder<T>` emits `fun eq(
-                        // self, other: Holder)` comparing a `T`-typed field, so
-                        // the generators would trip this rule wholesale — and
-                        // the diagnostic anchors at the `[derive(..)]`, which
-                        // is not where the fix goes, so it would tell a reader
-                        // to bound a parameter from a span that is not the
-                        // parameter's declaration. Making the generators
-                        // generic-aware is a ruling rather than a fix (the
-                        // reflection surface a macro sees carries no generic
-                        // parameters, and a derived impl over a parameter needs
-                        // bounds nothing computes), and B174's census priced
-                        // what a program WRITES. So the rule is total over
-                        // that, and the generator half is filed rather than
-                        // half-shipped — exactly as B188 left the same
-                        // generators on the same ground.
-                        if self.source_of_id(binary_id) == Some(DERIVED_SOURCE) {
-                            continue;
-                        }
+                        // GENERATED code is held to the same rule, and the
+                        // exemption B174 shipped here is GONE (B194). It was
+                        // B188's boundary, taken for B188's reason:
+                        // `[derive(PartialEq)]` on `struct Holder<T>` emitted
+                        // `fun eq(self, other: Holder)` comparing a `T`-typed
+                        // field, and `T` was bound by nothing — the derive
+                        // generators spelled a subject bare in every role and
+                        // no generated impl bound a parameter at all — so the
+                        // rule would have refused the derive surface wholesale,
+                        // from a span (`[derive(..)]`) that is not where a
+                        // bound goes. B174 filed the generator half rather than
+                        // half-shipping it.
+                        //
+                        // B194 shipped it, at the source rather than here: a
+                        // derived impl now BINDS every parameter its generated
+                        // body reaches, under the trait it derives
+                        // (`impl Holder<type T: PartialEq> with PartialEq`), so
+                        // the `T` this `eq` compares arrives BOUNDED and
+                        // `provides` is true above — the body dispatches
+                        // through the bound like any other, and an
+                        // instantiation that cannot supply it is refused at the
+                        // author's own call site (`'Opaque' does not implement
+                        // trait 'PartialEq', required by a generic bound of
+                        // this call`), which is exactly the span the exemption
+                        // existed to avoid. A phantom parameter takes a bare
+                        // binder, and needs no bound: the body that never
+                        // reaches it writes no operator on it.
+                        //
+                        // So the rule is total, and a generator that forgets a
+                        // binder is refused here rather than silently emitting
+                        // the host's operator over a lowered struct.
                         let label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let (trait_name, _) =
                             operator_trait_method(op).expect("matched just above");
