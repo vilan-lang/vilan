@@ -41,7 +41,12 @@ fun main() {
 	print(Shape::from_json(r.to_json()) is Ok(let back_r) && back_r == r); // true
 	print(Shape::from_json(e.to_json()) is Ok(let back_e) && back_e == e); // true
 
-	// An unknown tag is a decode error, not a crash.
-	print(Shape::from_json("\"Hexagon\"") is Err(let unknown)); // true
-	print(unknown); // unknown variant in JSON for enum Shape
+	// An unknown tag is a decode error, not a crash. The capture is read INSIDE
+	// the branch the test selects: an `is` written outside a condition yields a
+	// plain `bool` and binds nothing after itself (B215), because nothing there
+	// proves the test passed.
+	if Shape::from_json("\"Hexagon\"") is Err(let unknown) {
+		print(true);
+		print(unknown); // unknown variant in JSON for enum Shape
+	}
 }

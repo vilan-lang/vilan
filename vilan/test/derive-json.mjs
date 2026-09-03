@@ -138,8 +138,12 @@ console.log(text);
 const $t = from_json(text);
 console.log($t[0] === 0 && to_json2($t[1]) === text && $t[1][3][1] === 4 && $t[1][0] === "Ada \"A\"");
 const $u = from_json("{\"name\":\"x\",\"age\":1,\"active\":true}");
-console.log($u[0] === 1);
-console.log($u[1]);
+if ($u[0] === 1) {
+	console.log(true);
+	console.log($u[1]);
+}
 const $v = from_json("{\"name\":5,\"age\":1,\"active\":true,\"home\":{\"x\":0,\"y\":0}}");
-console.log($v[0] === 1);
-console.log($v[1]);
+if ($v[0] === 1) {
+	console.log(true);
+	console.log($v[1]);
+}

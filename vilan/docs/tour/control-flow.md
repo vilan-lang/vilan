@@ -113,6 +113,17 @@ scope in both branches:
 if ready(slot is Some(let task)) { start(task); }          // error: unbound
 ```
 
+For the same reason, a test written outside a condition altogether binds
+nothing after itself. `let ready = slot is Some(let task);` gives you a
+`bool`, and a `bool` does not carry the payload — nothing later in the
+block proves the test passed, so reading `task` there is refused and the
+error points you at the shape that works:
+
+```vilan,fragment
+let ready = slot is Some(let task); start(task);           // error: not a condition
+let ready = slot is Some(let task) && task.ready;          // fine: `&&`, as always
+```
+
 Negating the test swaps the two branches: `!(slot is Some(let task))` is
 true where the pattern *didn't* match, so the capture is unbound in that
 branch and in scope in the `else` — the branch reached only by a match.

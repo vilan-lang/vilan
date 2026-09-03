@@ -67,6 +67,31 @@ open (a listening server does so inherently; a socket-holding client
 must await something that ends with the app). On the browser platform,
 `main`'s completion leaves installed handlers and subscriptions live.
 
+**`ret` inside `main` leaves the program**, exactly as it leaves any
+other function — including from inside a loop, where it is distinct from
+that loop's own `break`. In a `main` that declares a return type, the
+value it carries is the exit status, the same as the value `main` falls
+off its end with; in a `void` `main`, `ret` takes no value and the
+status is zero. A `ret` inside a *closure* written in `main` returns
+from that closure, not from `main`.
+
+```vilan
+import std::io::print;
+
+fun main(): i32 {
+	mut attempts = 0;
+	for attempts < 5 {
+		if attempts == 2 {
+			ret 3;                 // leaves `main`; the status is 3
+		}
+		print(attempts);
+		attempts = attempts + 1;
+	}
+	print("not reached");
+	0
+}
+```
+
 `panic(message)` aborts execution with the message; it types as `any`
 (§5.1). Failed `assert`s panic.
 

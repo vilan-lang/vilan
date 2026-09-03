@@ -2497,6 +2497,11 @@ struct ConditionPolarity {
     same_in_else: bool,
     /// The same for an odd-parity capture.
     flip_in_else: bool,
+    /// The byte range of the boolean expression this frame was rooted at, when
+    /// it was rooted in EXPRESSION position (B215) — what the refusal quotes
+    /// back to the author. `None` for a frame rooted at a condition, where the
+    /// capture's answer is a branch rather than a refusal.
+    expression_root: Option<(usize, usize)>,
 }
 
 impl ConditionPolarity {
@@ -2510,6 +2515,7 @@ impl ConditionPolarity {
             flip_until: condition_end,
             same_in_else: false,
             flip_in_else: true,
+            expression_root: None,
         }
     }
 
@@ -2520,6 +2526,7 @@ impl ConditionPolarity {
             flip_until: self.same_until,
             same_in_else: self.flip_in_else,
             flip_in_else: self.same_in_else,
+            ..self
         }
     }
 
@@ -2532,6 +2539,26 @@ impl ConditionPolarity {
             flip_until: self.flip_until.min(operand_end),
             flip_in_else: false,
             ..self
+        }
+    }
+
+    /// An `is` in EXPRESSION position — no condition above it anywhere (B215).
+    /// The test's answer is an ordinary `bool`, so nothing PAST this expression
+    /// knows it passed: the capture reaches the rest of the expression that
+    /// contains it and no further, and neither branch of anything.
+    ///
+    /// The rest of the expression, rather than nothing at all, because `&&`
+    /// short-circuits wherever it is written — the same reason B199 caps its
+    /// off-spine frame instead of erasing it. `let ok = x is Some(let n) && n > 1;`
+    /// keeps binding its own right operand; only the read AFTER the statement
+    /// misses, and there is no flow typing that could narrow it there.
+    fn expression(expression: std::ops::Range<usize>) -> Self {
+        Self {
+            same_until: expression.end,
+            flip_until: expression.end,
+            same_in_else: false,
+            flip_in_else: false,
+            expression_root: Some((expression.start, expression.end)),
         }
     }
 
@@ -2563,6 +2590,7 @@ impl ConditionPolarity {
             flip_until: self.flip_until.min(subtree_end),
             same_in_else: false,
             flip_in_else: false,
+            ..self
         }
     }
 }
@@ -2846,6 +2874,23 @@ pub struct Analyzer<'src> {
     /// capture bound HERE relates to the two branches. `None` everywhere else —
     /// off the spine, and outside a condition entirely.
     condition_polarity: Option<ConditionPolarity>,
+    /// Whether the walk is inside a CONDITION — an `if`'s, a `while`-shaped
+    /// `for`'s, or a `match` guard's — as opposed to an ordinary expression.
+    ///
+    /// B215: [`Analyzer::condition_polarity`] alone could not tell those apart.
+    /// `None` meant both "outside every condition" and "in a condition that has
+    /// not installed a frame" — the `for` and the guard, which never did — so an
+    /// `is` capture in either fell back to B171's plain answer, visible to the
+    /// end of its scope. That is right for the two conditions (reaching the loop
+    /// body or the leg body IS the test having passed) and wrong for an
+    /// expression (`let b = x is Some(let n);` proves nothing afterwards). This
+    /// flag is the half that separates them.
+    in_condition: bool,
+    /// The `is` tests whose captures were bound in expression position (B215),
+    /// as capture id → the byte range of the whole test. A read past the test's
+    /// own expression misses, and this is what turns that miss into B215's
+    /// curated refusal instead of a bare "cannot find".
+    expression_position_captures: HashMap<Id, std::ops::Range<usize>>,
     /// B195: the captures the condition being walked binds in the `if`'s ELSE
     /// branch — the ones under a negation — as `(name, entity, visible_until)`.
     /// Drained by the `if` walk, which declares them into the else branch's own
@@ -4054,6 +4099,8 @@ impl<'src> Analyzer<'src> {
             current_source_id: SourceId(0),
             or_operand_end: None,
             condition_polarity: None,
+            in_condition: false,
+            expression_position_captures: HashMap::default(),
             else_visible_captures: Vec::new(),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
@@ -15223,7 +15270,16 @@ impl<'src> Analyzer<'src> {
         visible_from: usize,
         visible_until: usize,
     ) {
-        let positional = !self.module_scope_ids.contains(&scope_id);
+        // B33: a module scope keeps no positional record — its bindings are
+        // order-independent, and a `let` there is visible to the whole module
+        // however it was written. B215: a declaration with a real END is the
+        // exception, because an end is meaningless without positions — a pattern
+        // capture bound inside a module-level initializer is visible over a byte
+        // RANGE of that initializer and nowhere else, and recording it as an
+        // ordinary module binding is what let `let b = x is Some(let n);` at
+        // module scope hand `n` to `main`.
+        let positional = !self.module_scope_ids.contains(&scope_id)
+            || visible_until != LocalDeclaration::FOREVER;
         let scope = self.mut_scope_for_scope_id(scope_id);
         scope.name_to_id_map.insert(name, id);
         if positional {
@@ -20500,6 +20556,48 @@ impl<'src> Analyzer<'src> {
         Some(resolved)
     }
 
+    /// The `is` test that captured `name` in EXPRESSION position, when a use at
+    /// `use_offset` sits PAST the expression that bound it (B215): the byte range
+    /// of the whole test, so the refusal can quote it back.
+    ///
+    /// Past it, never before it — a use ahead of the capture is an ordinary
+    /// use-before-declaration and already has a note of its own that says so.
+    fn expression_position_capture(
+        &self,
+        name: &str,
+        scope_id: Id,
+        use_offset: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = self.scopes.get(&id)?;
+            let found = scope
+                .local_value_declarations
+                .get(name)
+                .and_then(|entries| {
+                    entries.iter().rev().find(|entry| {
+                        entry.visible_from <= use_offset
+                            && use_offset >= entry.visible_until
+                            && self.expression_position_captures.contains_key(&entry.id)
+                    })
+                })
+                .and_then(|entry| self.expression_position_captures.get(&entry.id));
+            if let Some(range) = found {
+                return Some(range.clone());
+            }
+            current = scope.parent_id;
+        }
+        None
+    }
+
+    /// The source text over `range`, so a steer can quote the author's own
+    /// spelling back (B4: copy-pasteable, not generic advice). `None` when the
+    /// text is unavailable, or too unwieldy to paste into one line of prose.
+    fn spelling_at(&self, source: SourceId, range: std::ops::Range<usize>) -> Option<&'src str> {
+        let text = self.source_text(source)?.get(range)?;
+        (!text.is_empty() && text.len() <= 60 && !text.contains('\n')).then_some(text)
+    }
+
     /// The nearest declaration of `name` that a use at `use_offset` cannot see
     /// *yet* — a positional entry later in the use's scope chain. Feeds the
     /// declared-later note on the `cannot find` diagnostic.
@@ -21299,8 +21397,19 @@ impl<'src> Analyzer<'src> {
         // down there is never credited to a branch its evaluation is not tied
         // to. B199: "narrowed" is the capture's WHOLE answer — it reaches
         // neither branch, only the rest of the off-spine subtree.
+        // B215: and the ROOT of a boolean spine written OUTSIDE every condition
+        // installs the expression-position frame — the one answer B199's fix
+        // left conflated with "no frame yet", because a `for` condition and a
+        // `match` guard reach here with `None` too (`in_condition` is what tells
+        // those apart). Only the root: a spine node under one already has a
+        // frame, and narrowing is the operators' own job below.
         let dropped_polarity = if is_condition_spine(&node.0) {
-            None
+            if self.condition_polarity.is_none() && !self.in_condition {
+                self.condition_polarity = Some(ConditionPolarity::expression(node.1.into_range()));
+                Some(None)
+            } else {
+                None
+            }
         } else {
             let outer = self.condition_polarity;
             self.condition_polarity = outer.map(|polarity| polarity.off_spine(node.1.end));
@@ -21616,9 +21725,15 @@ impl<'src> Analyzer<'src> {
                 if let Some(condition) = condition.as_ref() {
                     self.reject_lift_region_condition(condition);
                 }
+                // B215: a `while`-shaped `for`'s condition installs no polarity
+                // frame — reaching the body IS the test having passed, so a
+                // capture keeps B171's plain answer — but it IS a condition, and
+                // must not be mistaken for expression position.
+                let outer_condition = std::mem::replace(&mut self.in_condition, true);
                 let condition_id = condition
                     .as_ref()
                     .map(|condition| self.walk_expr_node(condition, body_scope_id));
+                self.in_condition = outer_condition;
                 if let (Some(condition_id), Some(condition)) = (condition_id, condition.as_ref())
                     && !matches!(condition.0, Node::LiftRegion(..))
                 {
@@ -21976,9 +22091,11 @@ impl<'src> Analyzer<'src> {
                             let outer_polarity = s
                                 .condition_polarity
                                 .replace(ConditionPolarity::root(if_.condition.1.end));
+                            let outer_condition = std::mem::replace(&mut s.in_condition, true);
                             let outer_captures = std::mem::take(&mut s.else_visible_captures);
                             let condition_id = s.walk_expr_node(&if_.condition, body_scope_id);
                             s.condition_polarity = outer_polarity;
+                            s.in_condition = outer_condition;
                             let negated_captures =
                                 std::mem::replace(&mut s.else_visible_captures, outer_captures);
                             // A lifted condition was already rejected above
@@ -22956,9 +23073,13 @@ impl<'src> Analyzer<'src> {
                             self.walk_pattern(&pattern.0, &pattern.1, leg_scope_id, pattern.1.end)
                         })
                         .collect();
+                    // B215: a guard is a condition for the same reason — the leg
+                    // body runs only where the guard held.
+                    let outer_condition = std::mem::replace(&mut self.in_condition, true);
                     let guard_id = guard
                         .as_ref()
                         .map(|guard| self.walk_expr_node(guard, leg_scope_id));
+                    self.in_condition = outer_condition;
                     let body_id = self.walk_expr_node(body, leg_scope_id);
                     walked_legs.push(WalkLeg {
                         patterns: walked_patterns,
@@ -23655,9 +23776,18 @@ impl<'src> Analyzer<'src> {
                     // then-branch, which runs when the test FAILED. B199: a
                     // capture off the condition's spine stops at that subtree's
                     // end, reaching neither branch.
+                    // B215: and an `is` written in EXPRESSION position stops at
+                    // that expression's own end — the `bool` it produced does not
+                    // carry the payload, and nothing after it proves the test
+                    // passed. The capture is recorded so the read that misses can
+                    // be refused in those terms rather than as a name typo.
                     let polarity = self.condition_polarity;
                     let visible_until =
                         polarity.map_or(or_cap, |polarity| or_cap.min(polarity.same_until));
+                    if let Some((start, end)) = polarity.and_then(|p| p.expression_root) {
+                        self.expression_position_captures
+                            .insert(capture_id, start..end);
+                    }
                     self.declare_scope_value_until(
                         scope_id,
                         name,
@@ -34401,6 +34531,43 @@ impl<'src> Analyzer<'src> {
                 }
                 None => {
                     let diagnostics_before = self.diagnostics.len();
+                    // B215: the name is not missing — it was captured by an `is`
+                    // written in EXPRESSION position, whose answer is an ordinary
+                    // `bool`. Nothing past that expression proves the test
+                    // passed, so the capture stops there; refusing this read as a
+                    // name typo would send its author looking for a spelling
+                    // mistake instead of at the shape of the test.
+                    if let Some(test) = self.expression_position_capture(name, scope_id, use_offset)
+                    {
+                        let spelling = self
+                            .source_of_id(id)
+                            .and_then(|source| self.spelling_at(source, test));
+                        let steer = match spelling {
+                            Some(test) => format!(
+                                ". Put the test where a branch depends on it — \
+                                 `if {test} {{ … }}` — and read '{name}' inside"
+                            ),
+                            None => format!(
+                                ". Put the test where a branch depends on it — an `if`, a \
+                                 `while`-shaped `for`, a `match` guard — and read '{name}' inside"
+                            ),
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "'{name}' is bound only inside the `is` test that captured it: \
+                                 outside a condition that test is an ordinary `bool`, and nothing \
+                                 after it proves the payload is there{steer}"
+                            ),
+                        });
+                        if let Some(source) = self.source_of_id(id) {
+                            self.attribute_new_diagnostics(diagnostics_before, source);
+                        }
+                        self.expr_id_to_expr_map.insert(id, Expr::Error);
+                        continue;
+                    }
                     let steer = self.import_steer(name).unwrap_or_default();
                     // A use before the name's only declaration gets pointed at
                     // it: the visibility rule is new information.

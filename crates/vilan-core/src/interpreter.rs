@@ -421,6 +421,7 @@ pub fn run_program<'a>(program: &'a JsProgram<'a>, limits: Limits) -> Result<Run
         Ok(Flow::Break | Flow::Continue) => {
             Err(Failure::internal("`break`/`continue` outside a loop"))
         }
+        Ok(Flow::BreakLabel(_)) => Err(Failure::internal("`break <label>` outside its block")),
         Err(failure) => Err(failure),
     }
 }
@@ -729,6 +730,11 @@ enum Flow<'a> {
     Normal,
     Return(Value<'a>),
     Break,
+    /// `break <label>` — B214's `main` wrapper. It propagates outward through
+    /// every loop and body (each one's `other => return Ok(other)` arm) until
+    /// the [`js::Node::Labeled`] block naming it swallows it, which is what
+    /// makes it leave `main` rather than the loop it was written inside.
+    BreakLabel(&'a str),
     Continue,
 }
 
@@ -995,6 +1001,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Flow::Return(value))
             }
             js::Node::Break => Ok(Flow::Break),
+            js::Node::BreakLabel(label) => Ok(Flow::BreakLabel(label.as_str())),
+            // `<label>: { <body> }` (B214). Its own break lands here and
+            // completes normally; anything else — a break for an enclosing
+            // label, a `return`, a loop's `break`/`continue` — passes through.
+            js::Node::Labeled(label, body) => {
+                let scope = self.child_scope(env);
+                match self.exec_body(body, &scope)? {
+                    Flow::BreakLabel(broken) if broken == label.as_str() => Ok(Flow::Normal),
+                    other => Ok(other),
+                }
+            }
             js::Node::Continue => Ok(Flow::Continue),
             js::Node::Throw(value) => {
                 let value = self.eval(value, env)?;
@@ -1326,7 +1343,7 @@ impl<'a> Interpreter<'a> {
         match flow {
             Flow::Return(value) => Ok(value),
             Flow::Normal => Ok(Value::Undefined),
-            Flow::Break | Flow::Continue => {
+            Flow::Break | Flow::Continue | Flow::BreakLabel(_) => {
                 Err(Failure::internal("`break`/`continue` escaped a function"))
             }
         }

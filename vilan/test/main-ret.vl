@@ -1,0 +1,32 @@
+// An early `ret` inside `main` (B214). `main` is INLINED at module scope, where
+// a bare `return` is a `SyntaxError` that refuses the whole module at parse
+// time — so this program used to compile clean and then never run. Its body is
+// wrapped in a labeled block instead and each of those `ret`s lowers to
+// `break main`, which is legal there and means the same thing.
+//
+// The distinction the loop makes: a plain `break` would leave the LOOP and run
+// the tail, where `ret` leaves the program — so the label is what keeps the
+// loop's own `break` and this one apart. The closure above it is the other
+// half: a `ret` inside a real JS function is a real `return` and is untouched.
+//
+// Sync and host-free, so the interpreter equivalence gate checks it against
+// `node` too — which is what exercises the two new emitted node forms.
+// witness: main: { const clamp = (x) =>
+// witness: if (i === 2) { break main;
+// witness: if (x > 1) { return 9;
+import std::io::print;
+
+fun main() {
+	let clamp = |x: i32| { if x > 1 { ret 9; } x };
+	print(clamp(0));
+	print(clamp(5));
+	mut i = 0;
+	for i < 5 {
+		if i == 2 {
+			ret;
+		}
+		print(i);
+		i = i + 1;
+	}
+	print("not reached");
+}

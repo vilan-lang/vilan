@@ -5064,3 +5064,187 @@ fn a_non_diverging_tail_still_owes_its_value() {
         "Expected i32, but got void instead: this body ends without producing a value.",
     );
 }
+
+// --- B214: a `ret` inside `main` ----------------------------------------------
+//
+// `main` is INLINED at module scope, where `return` is a `SyntaxError` that
+// refuses the whole module at parse time — so every program here compiled clean
+// and then died before a line of it ran:
+//
+//     SyntaxError: Illegal return statement
+//         at compileSourceTextModule (node:internal/modules/esm/utils)
+//
+// The fix wraps `main`'s inlined body in a labeled block and lowers those `ret`s
+// to `break main`, which is legal at module scope and costs a `main` without one
+// nothing (the corpus is byte-identical).
+
+// The exhibit: the guard leaves, and what follows it does not run.
+#[test]
+fn an_early_ret_in_main_leaves_and_skips_the_rest() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let flag = true;
+        	print("before");
+        	if flag {
+        		ret;
+        	}
+        	print("after");
+        }
+        "#,
+        "before\n",
+    );
+}
+
+// The same `ret` nested in a LOOP inside `main`. A bare `break` would have left
+// the loop and run the tail; `break main` leaves the program, which is what `ret`
+// means — so the loop's own `break` and this one stay distinguishable.
+#[test]
+fn a_ret_inside_a_loop_in_main_leaves_the_program_not_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	mut i = 0;
+        	for i < 5 {
+        		if i == 2 {
+        			ret;
+        		}
+        		print(i);
+        		i = i + 1;
+        	}
+        	print("after");
+        }
+        "#,
+        "0\n1\n",
+    );
+}
+
+// The control: a `ret` inside a CLOSURE in `main` is a real JS `return` in a real
+// JS function, and is left exactly as it was — the rewrite stops at every
+// function boundary, so the closure's early exit still returns a value to its
+// caller rather than leaving `main`.
+#[test]
+fn a_ret_inside_a_closure_in_main_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let clamp = |x: i32| { if x > 1 { ret 9; } x };
+        	print(clamp(0));
+        	print(clamp(5));
+        	print("after");
+        }
+        "#,
+        "0\n9\nafter\n",
+    );
+}
+
+// A VALUED `ret` in a `main` that carries an exit code: the value is the code, so
+// it is held in a temp inside the block and handed to `process.exit` after it —
+// breaking out must not skip the exit the way a plain wrap would.
+#[test]
+fn a_valued_ret_in_main_becomes_the_exit_code() {
+    let (stdout, _stderr, exit_code) = compile_and_run_status(
+        r#"
+        import std::io::print;
+
+        fun main(): i32 {
+        	let flag = true;
+        	if flag {
+        		ret 2;
+        	}
+        	print("after");
+        	0
+        }
+        "#,
+    );
+    assert_eq!(stdout, "");
+    assert_eq!(exit_code, 2, "the early `ret`'s value is the exit code");
+}
+
+// The tail still decides the code when nothing leaves early — the same program
+// with the guard off runs to the end and exits on its trailing expression.
+#[test]
+fn a_main_that_does_not_ret_early_still_exits_on_its_tail() {
+    let (stdout, _stderr, exit_code) = compile_and_run_status(
+        r#"
+        import std::io::print;
+
+        fun main(): i32 {
+        	let flag = false;
+        	if flag {
+        		ret 2;
+        	}
+        	print("after");
+        	7
+        }
+        "#,
+    );
+    assert_eq!(stdout, "after\n");
+    assert_eq!(exit_code, 7);
+}
+
+// A `main` that owns a RESOURCE is restructured into `try`/`finally` teardown
+// (destruction.md §7). The label wraps that whole structure, so breaking out of
+// it runs the `finally` on the way — an early `ret` destroys what `main` owns
+// exactly as falling off the end does.
+#[test]
+fn an_early_ret_in_a_resource_owning_main_still_runs_teardown() {
+    let (stdout, _stderr, exit_code) = compile_and_run_status(
+        r#"
+        import std::io::print;
+        import std::drop::{ Drop };
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+        	fun drop(&mut self) {
+        		print(i"drop {self.tag}");
+        	}
+        }
+
+        fun main(): i32 {
+        	let held = Res { tag = "held" };
+        	let flag = true;
+        	print(held.tag);
+        	if flag {
+        		ret 3;
+        	}
+        	print("after");
+        	0
+        }
+        "#,
+    );
+    assert_eq!(stdout, "held\ndrop held\n");
+    assert_eq!(exit_code, 3);
+}
+
+// An ASYNC `main` already runs inside an invoked `async () => { … }`
+// (execution.md §7.1), which is a real function — so its `ret` was legal all
+// along and the wrapper is not applied. This pins that it stays that way: the
+// program runs, and the emission carries no labeled block.
+#[test]
+fn an_async_main_keeps_its_plain_return() {
+    let source = r#"
+        import std::io::print;
+
+        async fun main() {
+        	let flag = true;
+        	print("before");
+        	if flag {
+        		ret;
+        	}
+        	print("after");
+        }
+        "#;
+    assert_compiles_and_runs(source, "before\n");
+    let javascript = compile(source).expect("expected a clean compile");
+    assert!(
+        javascript.contains("return;") && !javascript.contains("main:"),
+        "an async `main` keeps its `return` and gains no label:\n{javascript}"
+    );
+}
