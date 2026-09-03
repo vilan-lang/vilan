@@ -151,6 +151,7 @@ fn next_round(
     label: &str,
     mut retouch: Option<(&Path, &str, &mut u32)>,
     budget: Duration,
+    trace_path: &Path,
 ) -> Vec<LegLine> {
     let deadline = Instant::now() + budget;
     let mut collected: Vec<String> = Vec::new();
@@ -184,12 +185,128 @@ fn next_round(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    let trace = std::fs::read_to_string(trace_path).unwrap_or_default();
     panic!(
         "timed out waiting for {label} ({} of {legs} leg lines). \
-         Watcher stdout so far:\n{}",
+         Watcher stdout so far:\n{}\n\
+         --- watch-trace.log (VILAN_WATCH_LOG, B208) ---\n{trace}",
         lines.len(),
         collected.join("\n")
     );
+}
+
+/// B203's fixture: two legs where the SERVER's compile reads the CLIENT's
+/// `dist/` bundle — the shape the item names, a server leg serving the client
+/// bundle it was built beside.
+///
+/// `root = "."` puts the package's source root at the project directory, so
+/// `dist/` is inside it and `const asset::read("dist/client.js")` names the
+/// client's artifact by the ordinary rule (const paths resolve against the
+/// package root and may not climb out of it). Nothing about the bug needs that
+/// layout — it is simply the shortest spelling of "one leg reads another leg's
+/// output" that the const channel's own path rule allows.
+fn build_artifact_dependent_fixture(dir: &Path) {
+    write(
+        dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\nroot = \".\"\n\n\
+         [entry.client]\npath = \"client.vl\"\ntarget = \"browser\"\n\n\
+         [entry.server]\npath = \"server.vl\"\n",
+    );
+    write(dir, "only_client.vl", "fun client_value(): i32 {\n\t2\n}\n");
+    write(
+        dir,
+        "client.vl",
+        "import std::io::print;\nimport pkg::only_client::client_value;\n\n\
+         fun main() {\n\tprint(client_value());\n}\n",
+    );
+    write(
+        dir,
+        "server.vl",
+        "import std::asset;\nimport std::io::print;\n\n\
+         let BUNDLE = const asset::read(\"dist/client.js\");\n\n\
+         fun main() {\n\tprint(BUNDLE);\n}\n",
+    );
+    // The bundle the server's const read consumes on ROUND 1. A compile-time
+    // read of a file that is not there fails the compile, and a project shaped
+    // like this one has its last build's `dist/` on disk — so the fixture puts
+    // one there rather than pretending the first round can invent it.
+    write(dir, "dist/client.js", "// the previous build's bundle\n");
+}
+
+/// B203 — the leg-skip set was decided for EVERY leg before ANY leg compiled.
+///
+/// The server's recorded sources include `dist/client.js`, which the client leg
+/// writes. Asked before the round began, the server's freshness question was
+/// answered against the bundle the client was about to overwrite: every source
+/// re-hashed, the server was judged Fresh, the client then recompiled, and the
+/// server's own artifact went on embedding a bundle that no longer existed —
+/// until some later edit happened to reach the server's own modules.
+///
+/// So the pin is the item's: edit a module ONLY THE CLIENT loads, and the
+/// server must recompile in the SAME round. It is the exact edit M22's first row
+/// uses to prove the opposite ("one leg, not three"), which is what makes the
+/// pair honest — reuse is still by content, and the server recompiles here
+/// because one of its contents is about to change, not because reuse was
+/// weakened.
+#[test]
+fn a_leg_that_reads_another_legs_artifact_recompiles_in_the_same_round() {
+    let dir = temp_project("artifact_dep");
+    build_artifact_dependent_fixture(&dir);
+
+    let trace_path = dir.join("watch-trace.log");
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", "--watch", dir.to_str().unwrap()])
+        .env("VILAN_WATCH_LOG", &trace_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the watcher");
+    let receiver = spawn_reader(watcher.stdout.take().expect("piped stdout"));
+
+    let started = Instant::now();
+    let first = next_round(
+        &receiver,
+        2,
+        "the initial build",
+        None,
+        support::WATCH_LIVENESS,
+        &trace_path,
+    );
+    let budget = support::round_budget(started.elapsed());
+    assert!(
+        first.iter().all(|leg| leg.rebuilt),
+        "the first round must compile both legs: {first:?}"
+    );
+
+    const ONLY_CLIENT: &str = "fun client_value(): i32 {\n\t3\n}\n";
+    let only_client = dir.join("only_client.vl");
+    let mut retouches = 0;
+    std::fs::write(&only_client, ONLY_CLIENT).expect("edit the client-only module");
+    let round = next_round(
+        &receiver,
+        2,
+        "the round the client-only edit starts",
+        Some((&only_client, ONLY_CLIENT, &mut retouches)),
+        budget,
+        &trace_path,
+    );
+
+    assert!(
+        round.iter().all(|leg| leg.rebuilt),
+        "the client recompiled and the server READS the client's bundle, so the \
+         server recompiles in the same round — a `Fresh` server here is an \
+         artifact built from a bundle that no longer exists (B203): {round:?}"
+    );
+    // And the producer went first, which is what makes the consumer's compile
+    // read this round's bundle rather than the last one's.
+    assert!(
+        round[0].entry.ends_with("client.vl"),
+        "the leg whose artifact the other reads compiles first: {round:?}"
+    );
+
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// M22, both rows: a client-only module edit re-emits the client leg only; a
@@ -199,8 +316,14 @@ fn a_watch_round_recompiles_the_legs_the_edit_reached() {
     let dir = temp_project("legs");
     build_fixture(&dir);
 
+    let trace_path = dir.join("watch-trace.log");
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["build", "--watch", dir.to_str().unwrap()])
+        // The loop's own trace of what each poll SAW (B208). stderr is nulled
+        // here — the pin reads leg lines off stdout — so without this a timeout
+        // could say only "no leg lines", which is the symptom four different
+        // bugs share. The name is not `.vl`, so the watched set is unperturbed.
+        .env("VILAN_WATCH_LOG", &trace_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -217,6 +340,7 @@ fn a_watch_round_recompiles_the_legs_the_edit_reached() {
         "the initial build",
         None,
         support::WATCH_LIVENESS,
+        &trace_path,
     );
     let budget = support::round_budget(started.elapsed());
     assert!(
@@ -235,6 +359,7 @@ fn a_watch_round_recompiles_the_legs_the_edit_reached() {
         "the client-only round",
         Some((&only_client, ONLY_CLIENT, &mut retouches)),
         budget,
+        &trace_path,
     );
     let rebuilt: Vec<&LegLine> = round.iter().filter(|leg| leg.rebuilt).collect();
     assert_eq!(
@@ -260,6 +385,7 @@ fn a_watch_round_recompiles_the_legs_the_edit_reached() {
         "the shared round",
         Some((&shared, SHARED, &mut shared_retouches)),
         budget,
+        &trace_path,
     );
     assert!(
         round.iter().all(|leg| leg.rebuilt),

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Mutex,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ariadne::{Color, Label, Report, ReportKind, sources};
@@ -16,6 +16,7 @@ mod init;
 mod job;
 mod paint;
 mod upgrade;
+mod watch_log;
 
 use job::ManagedChild;
 use vilan_core::analyzer::{Program, SourceId, analyze, check_library_contract};
@@ -553,6 +554,14 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
 /// How often the watcher polls for changes.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
+/// How often `VILAN_WATCH_LOG`'s trace says the loop is alive and found nothing
+/// (tracker B208). Not a poll rate: the loop still polls every
+/// [`WATCH_POLL_INTERVAL`], and every poll that finds a DIFFERENCE is traced
+/// whenever it happens. This only rate-limits the silence, so a 300 s wait
+/// leaves ~30 heartbeat lines instead of ~1000 — enough to separate "the loop
+/// was polling and the file never moved" from "the loop was not polling".
+const WATCH_LOG_HEARTBEAT: Duration = Duration::from_secs(10);
+
 /// The build inputs a round declared or read beyond its `.vl` sources — the
 /// **recorded-inputs** set the watcher polls alongside [`scan_vl`]. Two
 /// producers feed it, and they are the whole list:
@@ -940,16 +949,28 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
     // the initial build causes one extra round — which is the correct behavior.
     let started = SystemTime::now();
     let mut snapshot = watch_snapshot(roots);
+    watch_log::session_start(roots, snapshot.len());
     // The first round has no difference to keep — the baseline below is built
     // after it either way — so its verdict is nothing this loop can act on.
-    let _ = action();
+    watch_log::line("round 1 (the initial build) start");
+    let round_started = Instant::now();
+    let first = action();
+    watch_log::line(&format!(
+        "round 1 end verdict={first:?} in {:.3}s",
+        round_started.elapsed().as_secs_f64()
+    ));
     // The first build just revealed which `asset::read` inputs exist — paths
     // the baseline could not contain. Seed them in with E20's rule intact: an
     // input whose mtime predates the build joins the baseline (no spurious
     // round), one modified at or after the build's start does NOT, so the
     // next poll sees it and fires the round that re-reads it.
     for (path, modified) in watch_snapshot(roots) {
-        if !snapshot.contains_key(&path) && modified < started {
+        if snapshot.contains_key(&path) {
+            continue;
+        }
+        let seeded = modified < started;
+        watch_log::seed(&path, modified, started, seeded);
+        if seeded {
             snapshot.insert(path, modified);
         }
     }
@@ -957,12 +978,35 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
     // failed. This flag is the spin guard: the difference is kept for exactly
     // one re-fire, and the failure that ends a retry consumes it.
     let mut retrying = false;
+    // Round 1 is counted, so the trace's round numbers match the session's.
+    let mut round = 1_u64;
+    // The trace's heartbeat: the polls that found nothing are the ones that
+    // prove the loop is alive, and one line per 300 ms poll would bury the
+    // ones that found something. One line per `WATCH_LOG_HEARTBEAT` says both.
+    let mut last_heartbeat = Instant::now();
     loop {
         std::thread::sleep(WATCH_POLL_INTERVAL);
         let next = watch_snapshot(roots);
         if next == snapshot {
+            if watch_log::enabled() && last_heartbeat.elapsed() >= WATCH_LOG_HEARTBEAT {
+                last_heartbeat = Instant::now();
+                watch_log::line(&format!(
+                    "poll: no difference ({} entries watched, retrying={retrying})",
+                    next.len()
+                ));
+            }
             continue;
         }
+        if watch_log::enabled() {
+            last_heartbeat = Instant::now();
+            watch_log::line(&format!(
+                "poll: {}",
+                watch_log::snapshot_diff(&snapshot, &next)
+            ));
+        }
+        round += 1;
+        watch_log::line(&format!("round {round} start (retry={retrying})"));
+        let round_started = Instant::now();
         eprintln!(
             "\n{}",
             paint::err(
@@ -974,7 +1018,12 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
                 }
             )
         );
-        match action() {
+        let outcome = action();
+        watch_log::line(&format!(
+            "round {round} end verdict={outcome:?} in {:.3}s",
+            round_started.elapsed().as_secs_f64()
+        ));
+        match outcome {
             // Consumed by a round that dealt with it. `next` was read BEFORE the
             // action, so an edit landing while the round ran is still a
             // difference at the next poll — E20's rule, unchanged.
@@ -1231,18 +1280,53 @@ fn hmr_round(
             .ok()
             .map(|text| vilan_core::content_hash(&text))
     };
-    let skip: BTreeSet<String> = if force_full {
-        BTreeSet::new()
-    } else {
-        members
+    // B203 — the legs in artifact-dependency order, and the edges the skip
+    // decision consults at each leg's own turn. The HMR round writes `dist/`
+    // AFTER the whole compile loop (the shim carries a version the classifier
+    // has not decided yet), so re-hashing against the disk can never see this
+    // round's own work: here the edge itself is the instrument, and a leg that
+    // reads a recompiling leg's artifact recompiles with it.
+    let dist_directory = root.join("dist");
+    let schedule = {
+        let scheduled: Vec<ScheduledLeg> = members
             .iter()
-            .filter(|(_, platform)| !platform.is_none())
-            .filter_map(|(unit, _)| {
-                let previous = state.legs.iter().find(|leg| leg.name == unit.name)?;
-                hmr::leg_is_current(&previous.sources, current_hash).then(|| unit.name.clone())
+            .map(|(unit, platform)| {
+                let previous = state.legs.iter().find(|leg| leg.name == unit.name);
+                ScheduledLeg {
+                    name: &unit.name,
+                    extension: platform.script_extension(),
+                    bundled: previous.map(|leg| leg.bundled.as_slice()).unwrap_or(&[]),
+                    sources: previous.map(|leg| &leg.sources),
+                }
             })
-            .collect()
+            .collect();
+        leg_schedule(&dist_directory, &scheduled)
     };
+    // Walked in SCHEDULE order, so a leg's answer is given after every leg it
+    // reads has already given one — which is what makes
+    // `downstream_of_a_recompile` a statement about this round rather than a
+    // guess about it. A leg with no record recompiles by construction, and is
+    // recorded as recompiling so the legs downstream of it recompile too.
+    let mut recompiled: BTreeSet<usize> = BTreeSet::new();
+    let mut skip: BTreeSet<String> = BTreeSet::new();
+    for index in &schedule.order {
+        let (unit, platform) = &members[*index];
+        if platform.is_none() {
+            continue;
+        }
+        let reusable = !force_full
+            && !schedule.downstream_of_a_recompile(*index, &recompiled)
+            && state
+                .legs
+                .iter()
+                .find(|leg| leg.name == unit.name)
+                .is_some_and(|previous| hmr::leg_is_current(&previous.sources, current_hash));
+        if reusable {
+            skip.insert(unit.name.clone());
+        } else {
+            recompiled.insert(*index);
+        }
+    }
 
     // Compile every host leg (skipped legs excepted), capturing the RAW bundle
     // bytes (before the shim is prepended — the shim embeds the version, so
@@ -1250,7 +1334,10 @@ fn hmr_round(
     // as a swap).
     let mut next = Vec::new();
     let mut other_assets: Vec<(String, BTreeMap<String, String>)> = Vec::new();
-    for (unit, platform) in &members {
+    // B203's order: a leg whose artifact another leg reads compiles first, so
+    // `next` — and therefore `dist/` — is written producer before consumer.
+    for index in schedule.order.clone() {
+        let (unit, platform) = &members[index];
         if platform.is_none() {
             continue;
         }
@@ -1350,8 +1437,9 @@ fn hmr_round(
     // Write `dist/` from the freshly-compiled legs: browser bundles carry the
     // shim (with the current port + version embedded) so every served browser
     // bundle's version matches what the channel reports on connect; node bundles
-    // and CSS sidecars are written verbatim.
-    let dist = root.join("dist");
+    // and CSS sidecars are written verbatim. The directory is the one the leg
+    // schedule already named, so the round has ONE idea of where `dist/` is.
+    let dist = dist_directory;
     if let Err(error) = fs::create_dir_all(&dist) {
         eprintln!(
             "{} cannot create {}: {error}",
@@ -1992,21 +2080,33 @@ fn display_relative(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// A directory's identity for [`TreeWalk`]'s cycle guard: `(device, inode)` on
-/// unix, which answers "the same directory" whatever chain of names reached it,
-/// and the resolved path elsewhere — the portable spelling of the same question,
+/// An entry's identity for [`TreeWalk`]'s two guards: `(device, inode)` on
+/// unix, which answers "the same entry" whatever chain of names reached it, and
+/// the resolved path elsewhere — the portable spelling of the same question,
 /// since Windows exposes no stable inode through `std`. Either way the key is
-/// the DIRECTORY and never its name, which is the whole point: a cycle is one
-/// directory wearing many names.
+/// the ENTRY and never its name, which is the whole point: a cycle is one
+/// directory wearing many names, and G22 is one FILE wearing two.
+///
+/// Directories alone until G22. The guard read the tree as though only a
+/// directory could be reached twice, so a file link inside the project
+/// (`src/alias.vl -> src/real.vl`, or a linked directory beside the real one)
+/// handed the SAME FILE to the collector under both names: `vilan fmt --check`
+/// printed two `would reformat` lines for one file and counted it twice,
+/// `vilan fmt` formatted it twice, and [`manifest_fingerprint`] hashed one
+/// `vilan.toml` twice. The identity is the same value for both kinds — a
+/// filesystem object is a filesystem object — so the set is one set.
 #[cfg(unix)]
-type DirectoryIdentity = (u64, u64);
+type EntryIdentity = (u64, u64);
 #[cfg(not(unix))]
-type DirectoryIdentity = PathBuf;
+type EntryIdentity = PathBuf;
 
+/// `metadata` is the entry's own, already **followed** through any link by
+/// [`TreeWalk::walk`] — which is what makes the link and its target answer
+/// alike, and what keeps the guard from costing a second `stat` per entry on
+/// the watcher's 300 ms poll.
 #[cfg(unix)]
-fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+fn entry_identity(_path: &Path, metadata: &fs::Metadata) -> Option<EntryIdentity> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = fs::metadata(path).ok()?;
     Some((metadata.dev(), metadata.ino()))
 }
 
@@ -2016,7 +2116,9 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
 /// `normalize_components`, which is the right answer for a comparison KEY over a
 /// path that may not be on disk, and the wrong one for an IDENTITY. The two
 /// agree while the resolution succeeds — and while it does, an ordinary junction
-/// cycle is caught either way, because both spellings resolve to one directory.
+/// cycle is caught either way, because both spellings resolve to one directory,
+/// and a file reached through two names resolves to one path for the same
+/// reason (G22).
 ///
 /// It is the failure that mattered, and the old code could not express it. A
 /// cycle spells one directory `src/l1`, `src/l1/l1`, `src/l1/l1/l1`, …, so the
@@ -2025,20 +2127,24 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
 /// below never runs — it was unreachable, since `Some` was the only value this
 /// function could return — and the walk fans out with nothing behind it, because
 /// [`TreeWalk::walk`] has no depth cap and there is no ELOOP on this side to
-/// backstop it. `None` is the sentence "I cannot identify this directory", and
-/// to the consumer it means STOP: the same thing the unix arm above already says
-/// when `fs::metadata` fails, and the safe answer to every way resolution can
+/// backstop it. `None` is the sentence "I cannot identify this entry", and what
+/// the consumer does with it now depends on WHICH entry: a directory it cannot
+/// identify is not descended into (stopping beats re-walking a tree it cannot
+/// recognize), a file it cannot identify is visited anyway (a duplicate line
+/// beats a source file that is never formatted). That asymmetry is
+/// [`TreeWalk::walk`]'s and is spelled there; this function's job is only to say
+/// honestly that it does not know. The unix arm above says the same when
+/// `fs::metadata` fails, and it is the safe answer to every way resolution can
 /// fail (an ACL that lets `read_dir` list a directory `CreateFileW` cannot open,
-/// a volume going away mid-walk). Stopping at a directory it cannot identify
-/// beats re-walking a tree it cannot recognize.
+/// a volume going away mid-walk).
 ///
 /// The verbatim (`\\?\`) prefix `canonicalize` returns is kept. This value is
 /// only ever compared with another produced right here, so the one property it
-/// needs is that one directory yields one key however it was reached; stripping
+/// needs is that one entry yields one key however it was reached; stripping
 /// is [`vilan_core::util::canonical_path`]'s job, for the keys that have to meet
 /// join-built paths.
 #[cfg(not(unix))]
-fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+fn entry_identity(path: &Path, _metadata: &fs::Metadata) -> Option<EntryIdentity> {
     fs::canonicalize(path).ok()
 }
 
@@ -2071,7 +2177,11 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
 struct TreeWalk {
     /// The resolved tree the walk may not leave.
     scope: PathBuf,
-    visited: BTreeSet<DirectoryIdentity>,
+    /// Every entry already handed to the visitor, or already descended into,
+    /// by [`EntryIdentity`]. One set for files and directories alike: the
+    /// question "have I been here before" is the same question about both, and
+    /// the answers cannot collide, since one filesystem object has one identity.
+    visited: BTreeSet<EntryIdentity>,
     /// Directory links whose target resolves outside [`scope`](Self::scope), in
     /// the spelling they were reached by — what a command tells the user about
     /// rather than skipping in silence.
@@ -2133,11 +2243,28 @@ impl TreeWalk {
         } else {
             entry
         };
+        let identity = entry_identity(path, &metadata);
         if !metadata.is_dir() {
+            // G22 — one file, one visit, whichever name reached it. A file
+            // symlink inside the project resolves to the same `(device, inode)`
+            // as its target, so the second spelling is recognized and dropped.
+            //
+            // An UNIDENTIFIABLE file is visited (the `None` arm falls through),
+            // which is the opposite of the directory arm below, and deliberately
+            // so: the cost of visiting a directory twice is an unbounded walk,
+            // while the cost of visiting a file twice is one duplicate line — and
+            // the cost of SKIPPING one is a source file the formatter never
+            // formats and the watcher never watches. Each arm takes its own safe
+            // direction rather than one rule taking the wrong one twice.
+            if let Some(identity) = identity
+                && !self.visited.insert(identity)
+            {
+                return;
+            }
             visit(path);
             return;
         }
-        let Some(identity) = directory_identity(path) else {
+        let Some(identity) = identity else {
             return;
         };
         if !self.visited.insert(identity) {
@@ -4005,46 +4132,78 @@ fn build_workspace_artifacts(
     // files to one output name is one `dist/` asked to serve two files on one
     // url, which `asset::bundle_as` made expressible (const-eval.md §3.1).
     let mut bundled_names: BTreeMap<String, PathBuf> = BTreeMap::new();
-    // M22 — which legs this round may SKIP. Same decision, same two functions
-    // and the same safety cases as the HMR round's: reuse is by CONTENT (every
-    // source the leg's artifact was compiled from re-hashes to what it was
-    // compiled with), never by mtime — the watcher's scan only TRIGGERS
-    // rounds. `--explain` forces a full round: the report is a statement about
-    // what THIS build wrote, and a skipped leg has no facts to contribute, so
-    // reusing one would silently shorten the report rather than speed it up.
+    // M22 — whether this round may SKIP a leg at all. Same decision, same two
+    // functions and the same safety cases as the HMR round's: reuse is by
+    // CONTENT (every source the leg's artifact was compiled from re-hashes to
+    // what it was compiled with), never by mtime — the watcher's scan only
+    // TRIGGERS rounds. `--explain` forces a full round: the report is a
+    // statement about what THIS build wrote, and a skipped leg has no facts to
+    // contribute, so reusing one would silently shorten the report rather than
+    // speed it up.
+    //
+    // **Whether**, not *which*: B203. The per-leg question is asked at each
+    // leg's own turn, below, because one leg's sources can include another
+    // leg's artifact.
     let mut watch_state = watch_state;
     // The tree walk it costs is paid once per round, whatever it decides.
     let manifest = watch_state.is_some().then(|| manifest_fingerprint(root));
-    let skip: BTreeSet<String> = match watch_state.as_deref() {
-        Some(state)
-            if !explain::asked()
+    let may_reuse = match watch_state.as_deref() {
+        Some(state) => {
+            !explain::asked()
                 && !hmr::round_forces_full(
                     state.legs.is_empty(),
                     state.failed,
                     state
                         .manifest
                         .is_some_and(|previous| Some(previous) != manifest),
-                ) =>
-        {
-            state
-                .legs
-                .iter()
-                .filter(|leg| hmr::leg_is_current(&leg.sources, current_source_hash))
-                .map(|leg| leg.name.clone())
-                .collect()
+                )
         }
-        _ => BTreeSet::new(),
+        None => false,
     };
+    // B203 — a producer leg compiles before the leg that reads its artifact.
+    let schedule = {
+        let scheduled: Vec<ScheduledLeg> = members
+            .iter()
+            .map(|(unit, platform)| {
+                let previous = state_leg(watch_state.as_deref(), &unit.name);
+                ScheduledLeg {
+                    name: &unit.name,
+                    extension: platform.script_extension(),
+                    bundled: previous.map(|leg| leg.bundled.as_slice()).unwrap_or(&[]),
+                    sources: previous.map(|leg| &leg.sources),
+                }
+            })
+            .collect();
+        leg_schedule(&dist, &scheduled)
+    };
+    // Which legs this round actually recompiled, in schedule order — read by
+    // `downstream_of_a_recompile` at each later leg's turn.
+    let mut recompiled: BTreeSet<usize> = BTreeSet::new();
     if let Some(state) = watch_state.as_deref_mut() {
         state.manifest = manifest;
     }
-    // This round's record, built as the legs are compiled (or carried over).
-    let mut recorded: Vec<BuildWatchLeg> = Vec::new();
-    for (unit, platform) in members {
+    // This round's record, built as the legs are compiled (or carried over) and
+    // kept in DECLARATION order however the round chose to compile them: the
+    // record is a statement about the workspace, not about one round's schedule.
+    let mut recorded: Vec<Option<BuildWatchLeg>> = (0..members.len()).map(|_| None).collect();
+    for index in schedule.order.clone() {
+        let (unit, platform) = &members[index];
         if platform.is_none() {
             continue;
         }
-        if skip.contains(&unit.name) {
+        // B203 — asked HERE, at this leg's turn, and not for every leg before
+        // the round began. A leg's recorded sources can include another leg's
+        // `dist/` artifact (a server leg bundling the client's bundle), and a
+        // freshness question asked before that producer compiled is answered
+        // against the artifact it is about to overwrite: the consumer was
+        // judged fresh, skipped, and left holding bytes that no longer exist.
+        // The order above puts the producer first; asking at this turn is what
+        // makes the answer describe the `dist/` this round will ship.
+        let fresh = may_reuse
+            && !schedule.downstream_of_a_recompile(index, &recompiled)
+            && state_leg(watch_state.as_deref(), &unit.name)
+                .is_some_and(|leg| hmr::leg_is_current(&leg.sources, current_source_hash));
+        if fresh {
             // Reuse: the leg's artifact in `dist/` was compiled from exactly
             // these bytes, so a recompile would rewrite the file it already
             // holds. Its bundled names still have to occupy the collision map
@@ -4052,7 +4211,7 @@ fn build_workspace_artifacts(
             // just as they were last round — and they are already on disk, so
             // no copy is repeated.
             let previous = state_leg(watch_state.as_deref(), &unit.name)
-                .expect("the skip set is built from the recorded legs");
+                .expect("`fresh` is decided off the recorded leg");
             for (source, name) in &previous.bundled {
                 bundled_names.insert(name.clone(), source.clone());
             }
@@ -4063,13 +4222,14 @@ fn build_workspace_artifacts(
                 unit.entry.display(),
                 paint::out(paint::Style::BOLD, &output.display().to_string())
             );
-            recorded.push(BuildWatchLeg {
+            recorded[index] = Some(BuildWatchLeg {
                 name: previous.name.clone(),
                 sources: previous.sources.clone(),
                 bundled: previous.bundled.clone(),
             });
             continue;
         }
+        recompiled.insert(index);
         if emission == Emission::WholeBundles {
             note_split_ignored(unit);
         }
@@ -4081,7 +4241,7 @@ fn build_workspace_artifacts(
         // Recorded whether or not a watch is running: the cost is a clone of
         // the loaded-file list, and a state to write it into is what makes it
         // a watch.
-        recorded.push(BuildWatchLeg {
+        recorded[index] = Some(BuildWatchLeg {
             name: unit.name.clone(),
             sources: compiled.sources.iter().cloned().collect(),
             bundled: compiled.bundled.clone(),
@@ -4125,7 +4285,7 @@ fn build_workspace_artifacts(
         explain::bundle(output, &unit.name);
     }
     if let Some(state) = watch_state {
-        state.legs = recorded;
+        state.legs = recorded.into_iter().flatten().collect();
     }
     Ok(())
 }
@@ -4136,6 +4296,144 @@ fn state_leg<'state>(
     name: &str,
 ) -> Option<&'state BuildWatchLeg> {
     state?.legs.iter().find(|leg| leg.name == name)
+}
+
+/// One leg as the round's schedule sees it (B203): what it is called, what it
+/// writes into `dist/`, and what the PREVIOUS round compiled it from.
+///
+/// Both watch loops build this from their own state — `build --watch` from
+/// [`BuildWatchState`], the HMR round from [`WatchState`] — because the
+/// question "which leg reads which leg's artifact" is one question and must not
+/// be answered two ways.
+struct ScheduledLeg<'round> {
+    name: &'round str,
+    /// The bundle's extension, which is half of what [`LegNamespace`] needs to
+    /// say what a leg's output names are.
+    extension: &'static str,
+    /// The names this leg's `const asset::bundle` copies took in `dist/` last
+    /// round. Not derivable from anything: the leg's own sources chose them.
+    bundled: &'round [(PathBuf, String)],
+    /// What the leg was compiled from last round, or `None` for a leg with no
+    /// record (a `none` platform, or a first round).
+    sources: Option<&'round BTreeMap<PathBuf, u64>>,
+}
+
+/// Whether `path` is a file `leg` WRITES into `dist/` — the edge the round's
+/// leg ordering is built from (B203).
+///
+/// Two kinds of output, and they come from two places because they are known
+/// two different ways:
+///
+/// * the leg's **own namespace** — its bundle, its style sidecar, its build
+///   manifest, its whole route-chunk pattern. [`LegNamespace::claims`] already
+///   answers exactly this question, for the cross-leg collision fence, and
+///   reusing it is what keeps one leg's idea of what it owns from drifting
+///   from another's.
+/// * the leg's **bundled copies**, whose names the leg's sources chose. Those
+///   are not a pattern and cannot be derived; they are read off the previous
+///   round's record, which is the same place the dependency itself is read
+///   from.
+///
+/// Both sides are resolved, because the recorded source path came from the
+/// const channel's own resolution and this one is built by joining — the seam
+/// `util::canonical_path` exists for. `canonical_path_of_unwritten` on the
+/// subject: a `dist/` entry a round has not written yet still has to compare
+/// equal to the same name spelled through a resolved root (B198's rule).
+fn leg_writes(dist: &Path, leg: &ScheduledLeg, path: &Path) -> bool {
+    let path = vilan_core::util::canonical_path_of_unwritten(path);
+    let Ok(relative) = path.strip_prefix(vilan_core::util::canonical_path(dist)) else {
+        return false;
+    };
+    let Some(relative) = relative.to_str() else {
+        return false;
+    };
+    LegNamespace {
+        leg: leg.name.to_string(),
+        extension: leg.extension,
+    }
+    .claims(relative)
+    .is_some()
+        || leg
+            .bundled
+            .iter()
+            .any(|(_, bundled)| bundled.as_str() == relative)
+}
+
+/// How a round compiles its legs, and which of them may be reused (B203).
+///
+/// Both watch loops decided "fresh" for every leg BEFORE any leg compiled, off
+/// hashes recorded in the previous round. When one leg's recorded sources
+/// include another leg's `dist/` artifact — a server leg bundling the client's
+/// bundle — the consumer was measured against the producer's OLD artifact,
+/// judged fresh, and skipped; the producer then rewrote that file, and the
+/// consumer's own artifact went on embedding bytes that no longer exist until
+/// some unrelated edit happened to reach it.
+///
+/// The schedule answers both halves of the cure:
+///
+/// * [`order`](Self::order) — the producer compiles FIRST, so `dist/` holds
+///   this round's bytes by the time anything downstream is asked about it, and
+///   the report reads in dependency order;
+/// * [`reads_the_artifacts_of`](Self::reads_the_artifacts_of) — from which
+///   [`downstream_of_a_recompile`](Self::downstream_of_a_recompile) says, at
+///   each leg's own turn, whether a leg it reads has already recompiled in
+///   THIS round. That is the half the HMR round needs on its own: it writes
+///   `dist/` after the whole compile loop, so a re-hash against the disk cannot
+///   see the round's own work however the legs are ordered.
+struct LegSchedule {
+    order: Vec<usize>,
+    reads_the_artifacts_of: Vec<BTreeSet<usize>>,
+}
+
+impl LegSchedule {
+    /// Whether a leg already-recompiled this round produces something `leg`
+    /// reads. Conservative on purpose: a producer that recompiled to
+    /// byte-identical output still costs its consumer a recompile, because the
+    /// alternative — comparing the bytes the round is about to write against
+    /// the ones it has not written yet — is exactly the reasoning-ahead that
+    /// caused this bug. A spurious recompile of one leg is the cheap direction;
+    /// a stale artifact that survives every later round is the expensive one.
+    fn downstream_of_a_recompile(&self, leg: usize, recompiled: &BTreeSet<usize>) -> bool {
+        !self.reads_the_artifacts_of[leg].is_disjoint(recompiled)
+    }
+}
+
+/// Builds a round's [`LegSchedule`] from the previous round's records.
+///
+/// The edges come from the PREVIOUS round's record, which is the only place
+/// they can come from — a leg's sources are what compiling it reveals. That is
+/// not a gap in the fix but the same boundary the skip decision has: a round
+/// with no record forces a full recompile of every leg
+/// ([`hmr::round_forces_full`]), so the round that cannot know the edges is
+/// also the round in which no leg is reused and the order is a schedule rather
+/// than a correctness question. From the second round on, the record is there.
+///
+/// Ties keep declaration order ([`hmr::legs_in_artifact_order`] is stable), so a
+/// workspace whose legs read nothing of each other's compiles exactly as it
+/// always did, and `dist/` is written in the order the manifest lists.
+fn leg_schedule(dist: &Path, legs: &[ScheduledLeg]) -> LegSchedule {
+    let reads_the_artifacts_of: Vec<BTreeSet<usize>> = legs
+        .iter()
+        .map(|consumer| {
+            let Some(sources) = consumer.sources else {
+                return BTreeSet::new();
+            };
+            legs.iter()
+                .enumerate()
+                .filter(|(_, producer)| {
+                    producer.name != consumer.name
+                        && sources
+                            .keys()
+                            .any(|source| leg_writes(dist, producer, source))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    LegSchedule {
+        order: hmr::legs_in_artifact_order(&reads_the_artifacts_of),
+        reads_the_artifacts_of,
+    }
 }
 
 /// A watched source's content hash RIGHT NOW, read the way the compiler reads

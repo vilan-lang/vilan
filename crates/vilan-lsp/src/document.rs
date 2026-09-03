@@ -282,8 +282,16 @@ fn resolve_dependencies(
 /// with like whether or not the file is on disk yet — the raw-string fallback
 /// this replaces made a not-yet-saved buffer invisible whenever the two
 /// spellings differed by a `.` or a `..`.
+///
+/// [`canonical_path_of_unwritten`](vilan_core::util::canonical_path_of_unwritten)
+/// rather than `canonical_path`, for the reason spelled on [`is_within`]: the
+/// editor's subject is an OPEN BUFFER, which need not be on disk, and
+/// `canonical_path` answers a resolved spelling for one side and a lexical one
+/// for the other the moment only one of them exists. Identical for a path that
+/// IS on disk, so the on-disk case is byte-for-byte the comparison it was.
 fn same_file(a: &Path, b: &Path) -> bool {
-    vilan_core::util::canonical_path(a) == vilan_core::util::canonical_path(b)
+    vilan_core::util::canonical_path_of_unwritten(a)
+        == vilan_core::util::canonical_path_of_unwritten(b)
 }
 
 /// The smallest span covering both — E114's unreachable third builds one range
@@ -350,8 +358,30 @@ fn block_regions<'a>(
 }
 
 /// Whether `file` lives within `directory`, through the same helper.
+///
+/// **Both sides resolve the same way, and the helper is
+/// [`canonical_path_of_unwritten`](vilan_core::util::canonical_path_of_unwritten)**
+/// (B207, B198's shape in the LSP). `canonical_path` never fails: where the
+/// resolution fails it degrades to the LEXICAL spelling, which is the right
+/// answer for a comparison key and the wrong one for one side of a containment
+/// test whose other side resolved. The editor's `file` is an open BUFFER and
+/// need not be on disk — an untitled document, a file created in the editor and
+/// not yet saved — while `directory` is a layer root that always is, so a
+/// project root reached through a symlink (or, on a case-insensitive
+/// filesystem, spelled in another case) made the two sides a resolved path and
+/// a spelled one and this answered NO for a buffer plainly inside its own
+/// package. The document then lost its project context: no package root, no
+/// platform, `pkg::` imports unresolved.
+///
+/// `canonical_path_of_unwritten` resolves the deepest ancestor that IS on disk
+/// and re-attaches the tail as spelled, so both sides are resolved down to the
+/// part no filesystem has an opinion about, and a tree where nothing exists
+/// degrades to G17's spelled ladder on BOTH sides rather than to a mixed
+/// comparison. For a path that is on disk it costs exactly what `canonical_path`
+/// costs and answers exactly what it answered.
 fn is_within(directory: &Path, file: &Path) -> bool {
-    vilan_core::util::canonical_path(file).starts_with(vilan_core::util::canonical_path(directory))
+    vilan_core::util::canonical_path_of_unwritten(file)
+        .starts_with(vilan_core::util::canonical_path_of_unwritten(directory))
 }
 
 /// A package source root for a file with no manifest: its own directory.
@@ -4644,6 +4674,72 @@ pub(crate) mod tests {
         assert!(!file.exists(), "the pin needs a path not on disk");
         assert!(is_within(&directory, &file));
         assert!(!is_within(&root.join("pkg/other"), &file));
+    }
+
+    /// B207 — the shape B198 fixed in the build, unaudited in the editor: the
+    /// subject of a containment test here is an OPEN BUFFER, and an open buffer
+    /// need not be on disk.
+    ///
+    /// A project root reached through a symlink is supported layout (`const.md`
+    /// §9.2), so `link/pkg/src/untitled.vl` — a file the user created in the
+    /// editor and has not saved — is a file inside `pkg/src`. With
+    /// `canonical_path` on both sides the buffer degraded to its LEXICAL
+    /// spelling (nothing on disk to resolve) while the layer root resolved
+    /// through the link, and the containment answered NO: the document lost its
+    /// package root, its platform and every `pkg::` import.
+    ///
+    /// Unix-only for the link; [`is_within_holds_for_an_unsaved_buffer_under_a_real_root`]
+    /// is the control that runs everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn is_within_holds_for_an_unsaved_buffer_under_a_symlinked_root() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-b207-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/pkg/src")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        // The layer root as the manifest scan found it: on disk, real spelling.
+        let directory = root.join("real/pkg/src");
+        // The open buffer, reached through the link and NOT on disk.
+        let unsaved = root.join("link/pkg/src/untitled.vl");
+        assert!(!unsaved.exists(), "the pin needs a buffer not on disk");
+        assert!(
+            is_within(&directory, &unsaved),
+            "an unsaved buffer under a symlinked project root is inside its own package"
+        );
+        // The link's own spelling of the root answers the same, in both
+        // directions: one file, two honest ancestries.
+        assert!(is_within(&root.join("link/pkg/src"), &unsaved));
+        assert!(is_within(
+            &root.join("link/pkg/src"),
+            &root.join("real/pkg/src/untitled.vl")
+        ));
+        // And the same buffer is the same file whichever name reached it.
+        assert!(same_file(&unsaved, &root.join("real/pkg/src/untitled.vl")));
+        // Still a real test: a sibling package does not contain it.
+        std::fs::create_dir_all(root.join("real/other/src")).unwrap();
+        assert!(!is_within(&root.join("real/other/src"), &unsaved));
+        assert!(!is_within(&root.join("link/other/src"), &unsaved));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The control for [`is_within_holds_for_an_unsaved_buffer_under_a_symlinked_root`]:
+    /// no link anywhere, so both sides resolve the same way whatever helper is
+    /// used, and the unsaved buffer is inside its package on every platform.
+    /// It is what says the symlink pin above is about the LINK and not about
+    /// the file being missing.
+    #[test]
+    fn is_within_holds_for_an_unsaved_buffer_under_a_real_root() {
+        let root =
+            std::env::temp_dir().join(format!("vilan-lsp-b207-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        let unsaved = root.join("pkg/src/untitled.vl");
+        assert!(!unsaved.exists(), "the pin needs a buffer not on disk");
+        assert!(is_within(&root.join("pkg/src"), &unsaved));
+        assert!(!is_within(&root.join("pkg/other"), &unsaved));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
