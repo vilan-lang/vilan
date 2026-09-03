@@ -166,7 +166,7 @@ impl Drop for Fixture {
     }
 }
 
-/// One entry of each family, deliberately out of §7.2's order, and every
+/// One entry of each of the six families, deliberately out of §7.2's order, and every
 /// separator irregularity a week of lane merges actually produces: a `---`
 /// with no blank line after it, a doubled rule where two lanes each brought
 /// their own, and a trailing rule before the next section's heading.
@@ -192,11 +192,20 @@ A second paragraph, which belongs to the breaking entry.
 **A feature entry.** What is newly possible.
 
 ---
+<!-- family: performance -->
+**A performance entry.** What costs less now.
+
+---
 
 ---
 
 <!-- family: miscompile -->
 **A miscompile entry.** What the compiler was wrong about.
+
+---
+
+<!-- family: fix -->
+**A fix entry.** What was wrongly refused or reported.
 
 ---
 
@@ -224,8 +233,8 @@ fn the_cut_retitles_the_section_and_orders_it_by_family() {
     // Sweep (a): every entry traces to the commit that introduced it.
     assert_eq!(
         traced_entries(&report),
-        4,
-        "expected four traced entries:\n{report}"
+        6,
+        "expected six traced entries:\n{report}"
     );
 
     // The whole file, byte for byte. The retitle, §7.2's family order, the
@@ -250,8 +259,18 @@ A second paragraph, which belongs to the breaking entry.
 
 ---
 
+<!-- family: fix -->
+**A fix entry.** What was wrongly refused or reported.
+
+---
+
 <!-- family: feature -->
 **A feature entry.** What is newly possible.
+
+---
+
+<!-- family: performance -->
+**A performance entry.** What costs less now.
 
 ---
 
@@ -302,7 +321,7 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
     );
     // Refusing is not a reason to stop reporting: the sweep still runs, so one
     // run tells the operator everything that is wrong.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
     assert!(!out.exists(), "a refused cut must write nothing");
 
     // An unknown family is refused the same way, naming what it does not know.
@@ -375,7 +394,7 @@ fn the_cut_refuses_a_marker_that_opens_no_entry() {
     );
     // Refusing is not a reason to stop reporting: the sweep still traces the
     // four entries the section does hold.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
 
     // A `commit:` marker is a marker too.
     let stranded = SCRAMBLED.replace(
@@ -525,7 +544,7 @@ fn the_cut_accepts_a_commit_marker_on_either_side_of_the_family_marker() {
         ok,
         "the cut refused a commit marker beside a family marker:\n{report}"
     );
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
     let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
     for family in ["breaking", "feature"] {
         let expected =
@@ -816,7 +835,7 @@ fn refuse_ci(name: &str, verdict: &str) -> String {
     assert!(!out.exists(), "a refused cut must write nothing");
     // Fail-closed is not fail-degraded: the sweep still traces every entry,
     // so one run tells the operator everything.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
     report
 }
 
@@ -920,7 +939,7 @@ fn the_cut_refuses_when_no_gh_can_read_ci_at_all() {
     );
     assert!(report.contains("refusing to cut"), "{report}");
     // Fail-closed is not fail-degraded here either.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
 }
 
 #[test]
