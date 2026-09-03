@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A single request is called slow past this, and says so by name and duration.
 /// Tighter than the extension's own threshold, because this measures the
@@ -55,6 +56,62 @@ pub struct StateSizes {
     pub manifests: usize,
     pub pending: usize,
     pub line_indices: usize,
+}
+
+/// M26: what the analysis scheduler did this session.
+///
+/// `started` counts every analysis the server began; `landed` those that
+/// became the document's analyzed snapshot; `cancelled` those a newer edit
+/// stopped part-way (`proposal/editor-latency.md` §4.2). The three do not sum:
+/// an analysis that ran to the end and was then dropped by `land`'s revision
+/// check — E117's correctness path, which cancellation sits on top of and never
+/// replaces — is counted as started and as neither of the others.
+///
+/// The line it prints is a diagnosis in itself. `cancelled` climbing with
+/// `started` while `landed` barely moves is a session typing faster than it can
+/// analyze: before M26 that state cost a whole analysis per superseded
+/// keystroke, and the number is how the owner sees whether it still does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnalysisCounts {
+    pub started: u64,
+    pub landed: u64,
+    pub cancelled: u64,
+}
+
+/// The live counters behind [`AnalysisCounts`], incremented from the analysis
+/// tasks.
+///
+/// An owned value the server holds one of, not a bare `static`, for the reason
+/// [`RequestTally`] gives: a process-global counter shared across a parallel
+/// test runner is the classic flaky measurement, and the cancellation pins read
+/// these numbers as assertions.
+#[derive(Debug, Default)]
+pub struct AnalysisTally {
+    started: AtomicU64,
+    landed: AtomicU64,
+    cancelled: AtomicU64,
+}
+
+impl AnalysisTally {
+    pub fn record_started(&self) {
+        self.started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_landed(&self) {
+        self.landed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cancelled(&self) {
+        self.cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn counts(&self) -> AnalysisCounts {
+        AnalysisCounts {
+            started: self.started.load(Ordering::Relaxed),
+            landed: self.landed.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// What the caller should log after recording one request, if anything.
@@ -132,7 +189,7 @@ impl RequestTally {
     /// "what is this session waiting on", where a per-call mean would hide a
     /// cheap request being sent thousands of times (semantic tokens on every
     /// keystroke is exactly that shape).
-    pub fn summary(&self, state: StateSizes) -> String {
+    pub fn summary(&self, state: StateSizes, analyses: AnalysisCounts) -> String {
         let mut ordered: Vec<(&&'static str, &RequestStat)> = self.methods.iter().collect();
         // Name breaks the tie so the line is stable between two equal totals,
         // which is what makes two summaries in one session comparable by eye.
@@ -148,6 +205,7 @@ impl RequestTally {
             "session trace after {} requests\n  \
              retained state: documents={} semantic_token_cache={} manifests={} \
              pending={} line_indices={}\n  \
+             analyses: started={} landed={} cancelled={}\n  \
              requests (count / mean ms / max ms), slowest total first:",
             self.total_requests,
             state.documents,
@@ -155,6 +213,9 @@ impl RequestTally {
             state.manifests,
             state.pending,
             state.line_indices,
+            analyses.started,
+            analyses.landed,
+            analyses.cancelled,
         );
         if ordered.is_empty() {
             out.push_str("\n    (none yet)");
@@ -191,12 +252,15 @@ pub fn record(request: &'static str, elapsed_ms: u128) -> TraceEvent {
         .record(request, elapsed_ms)
 }
 
-/// The process tally's summary, given the caller's state cardinalities.
-pub fn summary(state: StateSizes) -> String {
+/// The process tally's summary, given the caller's state cardinalities and
+/// analysis counts.
+pub fn summary(state: StateSizes, analyses: AnalysisCounts) -> String {
     let mut guard = TALLY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.get_or_insert_with(RequestTally::new).summary(state)
+    guard
+        .get_or_insert_with(RequestTally::new)
+        .summary(state, analyses)
 }
 
 #[cfg(test)]
@@ -290,13 +354,20 @@ mod tests {
         }
         tally.record("formatting", 200);
 
-        let summary = tally.summary(StateSizes {
-            documents: 4,
-            semantic_token_cache: 4,
-            manifests: 1,
-            pending: 0,
-            line_indices: 37,
-        });
+        let summary = tally.summary(
+            StateSizes {
+                documents: 4,
+                semantic_token_cache: 4,
+                manifests: 1,
+                pending: 0,
+                line_indices: 37,
+            },
+            AnalysisCounts {
+                started: 9,
+                landed: 3,
+                cancelled: 5,
+            },
+        );
         let tokens_at = summary
             .find("semantic_tokens_full")
             .expect("the token row is present");
@@ -315,6 +386,12 @@ mod tests {
             ),
             "the retained-state cardinalities are the growth evidence: {summary}",
         );
+        assert!(
+            summary.contains("analyses: started=9 landed=3 cancelled=5"),
+            "M26: the scheduler's own counts ride the same line — the three do \
+             not sum, because an analysis that finished and was then dropped by \
+             `land` is started and neither of the others: {summary}",
+        );
     }
 
     // A mean that is not a whole number still renders — the tenths are computed
@@ -324,7 +401,7 @@ mod tests {
         let mut tally = RequestTally::new();
         tally.record("hover", 1);
         tally.record("hover", 2);
-        let summary = tally.summary(StateSizes::default());
+        let summary = tally.summary(StateSizes::default(), AnalysisCounts::default());
         assert!(
             summary.contains("hover: 2 / 1.5 / 2"),
             "1 and 2 average to 1.5: {summary}",
@@ -336,7 +413,7 @@ mod tests {
     #[test]
     fn an_empty_tally_summarizes_without_dividing_by_zero() {
         let tally = RequestTally::new();
-        let summary = tally.summary(StateSizes::default());
+        let summary = tally.summary(StateSizes::default(), AnalysisCounts::default());
         assert!(summary.contains("(none yet)"), "{summary}");
     }
 }

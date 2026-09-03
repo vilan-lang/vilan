@@ -2591,10 +2591,12 @@ fn every_test_that_drives_a_watch_session_is_in_the_group() {
 
 /// Members the scan above cannot reach, because they live outside this crate's
 /// suite directory: the language server's package-recolor pins, which wait on a
-/// debounced re-analysis instead of on a watch round. Named here so the config
-/// check below covers them, and so dropping them from the filterset is a red
-/// rather than a silence.
-const MEMBERS_OUTSIDE_THIS_CRATE: &[&str] = &["binary(vilan-lsp) & test(/package_recolor_tests/)"];
+/// debounced re-analysis instead of on a watch round, and M26's cancellation
+/// pins, which wait on the same thing plus a keystroke burst of debounce
+/// windows. Named here so the config check below covers them, and so dropping
+/// either from the filterset is a red rather than a silence.
+const MEMBERS_OUTSIDE_THIS_CRATE: &[&str] =
+    &["binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests/)"];
 
 #[test]
 fn the_group_is_declared_the_way_this_file_reads_it() {

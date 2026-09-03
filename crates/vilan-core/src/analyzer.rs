@@ -4621,6 +4621,19 @@ impl<'src> Analyzer<'src> {
         let mut satisfaction_memo: SatisfactionMemo = HashMap::default();
         let mut unrankable_memo: UnrankableMemo = HashMap::default();
         for (call_id, substitution) in recorded {
+            // M26's per-site checkpoint (`editor-latency.md` §4.2). This is the
+            // loop the `checks` phase is mostly made of — every recorded call
+            // site of the whole program, 63% of the phase before M19's memo and
+            // still its largest single item — so a cancel that only landed
+            // BETWEEN checks would wait out most of a superseded analysis here.
+            // One relaxed atomic load per site against a walk that resolves
+            // types and ranks impls: below the noise floor, and it bounds the
+            // cancel latency at one call site rather than one whole-program
+            // sweep. The `errors` collected so far go with the frame — a
+            // cancelled analysis publishes nothing.
+            if crate::cancel::cancelled() {
+                return;
+            }
             // B189's third sibling: a GENERATED call handed an `[expose]`d
             // field whose exposure is already refused. The bound it fails is
             // the very thing that refusal is about, so restating it here — at
@@ -10086,6 +10099,12 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (statements, tail, parameters) in &bodies {
+            // M26's per-FUNCTION checkpoint: `bodies` is one entry per function
+            // with a body, so a cancel lands within one function's move scan.
+            // The violations collected so far go with the frame.
+            if crate::cancel::cancelled() {
+                return violations;
+            }
             let mut flow = MoveFlow::new();
             for parameter in parameters {
                 if scan.resource_bindings.contains(parameter) {
@@ -41607,6 +41626,44 @@ pub fn analyze<'src>(
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
+    analyze_cancellable(
+        nodes,
+        entry_source,
+        std,
+        pkg_root,
+        entry_path,
+        platform,
+        workspace,
+    )
+    .expect(
+        "`analyze` is the door for a caller with no cancellation token installed on this \
+         thread (the CLI's compile); a caller that installs one calls `analyze_cancellable`, \
+         which is the one that can answer `None`",
+    )
+}
+
+/// [`analyze`], answering `None` when the analysis was CANCELLED (M26,
+/// `proposal/editor-latency.md` §4.2): a newer revision of this document
+/// arrived while it ran, so what it had computed is a truncated view of the
+/// program and there is nothing worth handing back.
+///
+/// Cancellation is checked at the phase boundaries the `VILAN_PHASE_TIMING`
+/// line names — the walk, `build()`, the check sequence — and per call site
+/// inside the checks that dominate it. A truncated analyzer is not a valid
+/// input to the extraction tail that follows (it reads types the constraint
+/// fixpoint would have installed), which is exactly why the cancelled path
+/// answers `None` here rather than falling through with an empty-ish program:
+/// the tail is skipped because it CANNOT run, and skipping it is most of the
+/// saving anyway.
+pub fn analyze_cancellable<'src>(
+    nodes: &'src Spanned<NodeList<'src>>,
+    entry_source: &'src str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Platform,
+    workspace: &Workspace,
+) -> Option<Program<'src>> {
     let (sanitized, refusals) = drop_reserved_dependency_edges(workspace);
     let workspace = sanitized.as_ref().unwrap_or(workspace);
     let mut program = analyze_inner(
@@ -41618,12 +41675,12 @@ pub fn analyze<'src>(
         platform,
         workspace,
         true,
-    );
+    )?;
     for refusal in refusals {
         program.diagnostics.push(refusal);
         program.diagnostic_sources.push(SourceId(0));
     }
-    program
+    Some(program)
 }
 
 /// The dependency-edge names the analyzer refuses to register (E88, defensive
@@ -41703,7 +41760,7 @@ fn analyze_inner<'src>(
     platform: Platform,
     workspace: &Workspace,
     allow_cache: bool,
-) -> Program<'src> {
+) -> Option<Program<'src>> {
     // The std-tax arc's instrument (proposal/analysis-reuse.md §6): wall-clock
     // marks at the phase boundaries, printed at the end when
     // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
@@ -43293,7 +43350,7 @@ fn analyze_over_world<'src>(
     pkg_root: &Path,
     platform: Platform,
     workspace: &Workspace,
-) -> Program<'src> {
+) -> Option<Program<'src>> {
     let World {
         mut analyzer,
         macro_registry: _,
@@ -43321,7 +43378,14 @@ fn analyze_over_world<'src>(
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
     analyzer.prelude_repair = workspace.prelude_repair;
-    if !entry_is_module {
+    // M26's RESOLVE boundary (`editor-latency.md` §4.2, `crate::cancel`). The
+    // world is resolved and — on the store path — already in the base cache,
+    // which is what makes the whole entry tail below skippable: from here every
+    // product belongs to THIS analysis and nothing outside it can read one. So
+    // the tail's three phases each open with a checkpoint (this one, `build`,
+    // and the check sequence), the long check loops carry their own per-call-
+    // site and per-function ones, and the whole thing ends in the `None` below.
+    if !entry_is_module && !crate::cancel::cancelled() {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);
         // The entry file's ambient set. The entry walks in the GLOBAL scope, so
@@ -43355,21 +43419,46 @@ fn analyze_over_world<'src>(
     analyzer.set_current_source(SourceId(0));
     let phase_load_walk = phase_marks.started.elapsed();
     let phase_build_start = crate::PhaseClock::now();
-    analyzer.build();
+    // M26's BUILD boundary: `build()` is the constraint fixpoint, and a cancel
+    // that landed during the walk stops before it rather than after.
+    if !crate::cancel::cancelled() {
+        analyzer.build();
+    }
     let phase_build = phase_build_start.elapsed();
     let phase_checks_start = crate::PhaseClock::now();
+    // M26's CHECKS boundary (`editor-latency.md` §4.2, `crate::cancel`).
+    // From here to `build_drop_glue` the phase is a straight sequence of
+    // whole-program checks and the tables they read, and `unless_cancelled!`
+    // puts one checkpoint before each — a relaxed atomic load between calls,
+    // nanoseconds against the ~770 ms this phase costs on kolt. The flag is
+    // one-way, so once it is set every remaining call is skipped and the phase
+    // degrades to a PREFIX of itself: which is what a truncated analysis is,
+    // and why skipping a table-builder here (`plan_resource_drops`,
+    // `build_drop_glue`) is safe — nothing after the skip runs either, and the
+    // function ends in `None` without a `Program` for anyone to read.
+    // Granularity INSIDE one check is the long loops' own business:
+    // `check_generic_bound_satisfaction` checks per call site and
+    // `scan_bodies_for_moves` per function, which is what bounds the cancel
+    // latency at one of those rather than one whole-program sweep.
+    macro_rules! unless_cancelled {
+        ($($call:expr;)+) => {
+            $( if !crate::cancel::cancelled() { $call; } )+
+        };
+    }
     // The S2 pin's switch: a second build over the drained queues must
     // change nothing observable.
     if build_twice_forced() {
         analyzer.build();
     }
-    // Every source range is recorded by now; project the frozen (std) sources
-    // onto entity-id space so the definition-site checks below can skip their
-    // entities with a binary search (S1, analysis-reuse.md §6).
-    analyzer.seal_frozen_ranges();
-    // Infer the `borrows` effect before any check reads it (readonly-mutation
-    // and the scalar-view lowering both consult `Function.borrows`).
-    analyzer.infer_borrows();
+    unless_cancelled! {
+        // Every source range is recorded by now; project the frozen (std) sources
+        // onto entity-id space so the definition-site checks below can skip their
+        // entities with a binary search (S1, analysis-reuse.md §6).
+        analyzer.seal_frozen_ranges();
+        // Infer the `borrows` effect before any check reads it (readonly-mutation
+        // and the scalar-view lowering both consult `Function.borrows`).
+        analyzer.infer_borrows();
+    }
     // The `bumps` table + fixpoint run HERE — before every consumer
     // (check_invalidation's E2 keys off the verdicts; S2 originally parked this
     // at the end of analyze(), which S3's consumption exposed).
@@ -43457,90 +43546,109 @@ fn analyze_over_world<'src>(
             external.bumps = verdict;
         }
     }
-    // Infer `bumps` over user bodies now that the native table is seeded (the
-    // call-graph fixpoint reads tabled callees' verdicts). S3's E2 keys off the
-    // verdicts, so this whole block runs before check_invalidation below.
-    analyzer.infer_bumps();
-    // Record `Some(let v)` captures over wrapped-scalar-view calls before the
-    // checks + view classification consult them.
-    analyzer.wrapped_view_captures = analyzer.compute_wrapped_view_captures();
-    // B178: the entry takes no parameters — a whole-program shape check, so it
-    // rides here with the rest rather than at the declaration's walk (where
-    // "which `main` is the entry" is not yet a question the walk can answer).
-    analyzer.check_entry_main_parameters(global_scope_id);
-    analyzer.check_readonly_mutation();
-    analyzer.check_mutable_arguments();
-    analyzer.check_mutable_references();
-    analyzer.check_view_bindings();
-    analyzer.check_view_arguments();
-    analyzer.check_view_value_reads();
-    analyzer.check_must_use();
-    analyzer.check_deprecated();
-    analyzer.check_element_attribute_shadowing();
-    analyzer.check_view_escape();
-    analyzer.check_invalidation();
-    analyzer.check_reseat_escape();
-    analyzer.check_wire_boundary();
-    analyzer.check_json_boundary();
-    analyzer.check_hashable_boundary();
-    analyzer.check_partialeq_boundary();
-    analyzer.check_rpc_signatures();
-    analyzer.check_expose_fields();
-    analyzer.check_generic_bound_satisfaction();
-    // B161's binding-position twin of the bound check above, in the same place
-    // and for the same reason: every binding's type has settled by here.
-    analyzer.check_binding_trait_constraints();
-    analyzer.check_tuple_spreads();
-    // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
-    // inert unless `std::dev` is loaded. Runs inside `analyze()` (like the S2a
-    // classification) so both the CLI and the LSP/test pipelines get it.
-    analyzer.check_hmr_transfer_bounds();
-    // The observable half of C4 resource classification (destruction.md §4):
-    // R10 (container/external-generic resource arguments) and R12 (no coercion
-    // to `any`). R1–R9 (moves, loans, conditional/loop moves, captures) follow;
-    // then R11 (per-instantiation move-clean generics). Destructors come later.
-    analyzer.check_container_resource_arguments();
-    analyzer.check_resource_any_coercion();
-    analyzer.check_resource_moves();
-    // B68 (affine-moves.md §9.4): type every `drop(x)` argument that carries no
-    // type on its own expr id — a value argument such as a call result — before
-    // anything asks what a sink call destroys. R11's forwarding check below and
-    // the drop planning / glue seeding further down all read the same answer.
-    analyzer.record_drop_sink_argument_types();
-    analyzer.check_resource_generic_instantiations();
-    // Drop planning (destruction.md §5/§7): which resource locals are owned at
-    // their scope's end (dropped there, reverse order) and which assignments
-    // overwrite a still-owned resource (R2). Static by R7; the transformer emits
-    // the per-scope `try`/`finally` teardown from it. After the move checker so
-    // it shares the resource classification.
-    analyzer.plan_resource_drops();
-    // The `Drop` restrictions (destruction.md §5): implementable only for a
-    // resource, and synchronous. Runs after classification so subject
-    // resource-ness is settled.
-    analyzer.check_drop_impls();
-    // Full per-member signature conformance (B29): every trait member an impl
-    // provides by name must agree with the trait's declaration on receiver
-    // convention, arity, parameter conventions/types, and return type. Runs
-    // post-build so declared types are resolved.
-    analyzer.check_trait_conformance();
-    // Two impls declaring one name for one subject (B57): a coherence rule, so
-    // it runs at the definition site rather than waiting for a call to pick
-    // between them. After conformance, so an impl's `with`-clause traits are
-    // resolved onto it and a trait's member is not mistaken for the type's own.
-    analyzer.check_duplicate_inherent_members();
-    // One block declaring one name twice (B84) — a different rule with a
-    // different scope, so a trait-provided name collides here even though it
-    // is exempt above. Runs after the inherent check so a program with both
-    // reports them in that order.
-    analyzer.check_duplicate_block_members();
-    // One trait implemented twice for one subject (B98) — the third member of
-    // the family, and the one that owns the exemption the other two make: they
-    // let a trait-provided NAME repeat so that two impls of one trait stay
-    // legal, and this decides when two such impls are one impl written twice.
-    analyzer.check_duplicate_trait_impls();
-    // With `drop_methods` recorded, build the per-type destruction glue the
-    // transformer emits as `__drop_<type>` helpers (destruction.md §5/§7).
-    analyzer.build_drop_glue();
+    unless_cancelled! {
+        // Infer `bumps` over user bodies now that the native table is seeded (the
+        // call-graph fixpoint reads tabled callees' verdicts). S3's E2 keys off the
+        // verdicts, so this whole block runs before check_invalidation below.
+        analyzer.infer_bumps();
+        // Record `Some(let v)` captures over wrapped-scalar-view calls before the
+        // checks + view classification consult them.
+        analyzer.wrapped_view_captures = analyzer.compute_wrapped_view_captures();
+        // B178: the entry takes no parameters — a whole-program shape check, so it
+        // rides here with the rest rather than at the declaration's walk (where
+        // "which `main` is the entry" is not yet a question the walk can answer).
+        analyzer.check_entry_main_parameters(global_scope_id);
+        analyzer.check_readonly_mutation();
+        analyzer.check_mutable_arguments();
+        analyzer.check_mutable_references();
+        analyzer.check_view_bindings();
+        analyzer.check_view_arguments();
+        analyzer.check_view_value_reads();
+        analyzer.check_must_use();
+        analyzer.check_deprecated();
+        analyzer.check_element_attribute_shadowing();
+        analyzer.check_view_escape();
+        analyzer.check_invalidation();
+        analyzer.check_reseat_escape();
+        analyzer.check_wire_boundary();
+        analyzer.check_json_boundary();
+        analyzer.check_hashable_boundary();
+        analyzer.check_partialeq_boundary();
+        analyzer.check_rpc_signatures();
+        analyzer.check_expose_fields();
+        analyzer.check_generic_bound_satisfaction();
+        // B161's binding-position twin of the bound check above, in the same place
+        // and for the same reason: every binding's type has settled by here.
+        analyzer.check_binding_trait_constraints();
+        analyzer.check_tuple_spreads();
+        // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
+        // inert unless `std::dev` is loaded. Runs inside `analyze()` (like the S2a
+        // classification) so both the CLI and the LSP/test pipelines get it.
+        analyzer.check_hmr_transfer_bounds();
+        // The observable half of C4 resource classification (destruction.md §4):
+        // R10 (container/external-generic resource arguments) and R12 (no coercion
+        // to `any`). R1–R9 (moves, loans, conditional/loop moves, captures) follow;
+        // then R11 (per-instantiation move-clean generics). Destructors come later.
+        analyzer.check_container_resource_arguments();
+        analyzer.check_resource_any_coercion();
+        analyzer.check_resource_moves();
+        // B68 (affine-moves.md §9.4): type every `drop(x)` argument that carries no
+        // type on its own expr id — a value argument such as a call result — before
+        // anything asks what a sink call destroys. R11's forwarding check below and
+        // the drop planning / glue seeding further down all read the same answer.
+        analyzer.record_drop_sink_argument_types();
+        analyzer.check_resource_generic_instantiations();
+        // Drop planning (destruction.md §5/§7): which resource locals are owned at
+        // their scope's end (dropped there, reverse order) and which assignments
+        // overwrite a still-owned resource (R2). Static by R7; the transformer emits
+        // the per-scope `try`/`finally` teardown from it. After the move checker so
+        // it shares the resource classification.
+        analyzer.plan_resource_drops();
+        // The `Drop` restrictions (destruction.md §5): implementable only for a
+        // resource, and synchronous. Runs after classification so subject
+        // resource-ness is settled.
+        analyzer.check_drop_impls();
+        // Full per-member signature conformance (B29): every trait member an impl
+        // provides by name must agree with the trait's declaration on receiver
+        // convention, arity, parameter conventions/types, and return type. Runs
+        // post-build so declared types are resolved.
+        analyzer.check_trait_conformance();
+        // Two impls declaring one name for one subject (B57): a coherence rule, so
+        // it runs at the definition site rather than waiting for a call to pick
+        // between them. After conformance, so an impl's `with`-clause traits are
+        // resolved onto it and a trait's member is not mistaken for the type's own.
+        analyzer.check_duplicate_inherent_members();
+        // One block declaring one name twice (B84) — a different rule with a
+        // different scope, so a trait-provided name collides here even though it
+        // is exempt above. Runs after the inherent check so a program with both
+        // reports them in that order.
+        analyzer.check_duplicate_block_members();
+        // One trait implemented twice for one subject (B98) — the third member of
+        // the family, and the one that owns the exemption the other two make: they
+        // let a trait-provided NAME repeat so that two impls of one trait stay
+        // legal, and this decides when two such impls are one impl written twice.
+        analyzer.check_duplicate_trait_impls();
+        // With `drop_methods` recorded, build the per-type destruction glue the
+        // transformer emits as `__drop_<type>` helpers (destruction.md §5/§7).
+        analyzer.build_drop_glue();
+    }
+
+    // M26: the cancelled analysis ends HERE, with no program.
+    //
+    // Everything below is the extraction tail — the intrinsic table, the
+    // liveness and clone plans, the per-expression type maps the transformer
+    // and the IDE read off the finished `Program`. It is expensive (it is most
+    // of what the phase line's `checks` bucket measures after the checks
+    // themselves) and, on a truncated analyzer, it is not merely wasted but
+    // ILL-DEFINED: a checkpoint that fired before `build()` leaves type slots
+    // the constraint fixpoint would have filled, and the tail reads them
+    // directly (`borrow_type_by_type_id` is a hard index, deliberately —
+    // B77/B95). So a cancelled analysis answers `None` rather than falling
+    // through with a program nobody can use. The caller drops the entry text
+    // and tree it leaked, exactly as it does for the panic path.
+    if crate::cancel::cancelled() {
+        return None;
+    }
 
     // Find `Context`'s `new`/`run`/`get` intrinsics (the context threading pass
     // keys off them) now that impl subjects have resolved.
@@ -44048,7 +44156,7 @@ fn analyze_over_world<'src>(
         );
     }
 
-    Program {
+    Some(Program {
         platform,
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,
@@ -44174,7 +44282,7 @@ fn analyze_over_world<'src>(
         scalar_view_calls,
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
-    }
+    })
 }
 
 /// E3's implicit half (B119, view-invalidation.md §7): decide the view sites

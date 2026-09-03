@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
+use vilan_core::cancel::CancelToken;
 use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
@@ -990,7 +991,42 @@ fn find_linked_tags(
 }
 
 impl Document {
+    /// [`analyze_cancellable`](Document::analyze_cancellable) under a token
+    /// nobody holds the other end of: no checkpoint can fire, so the analysis
+    /// always produces a document.
+    ///
+    /// Test-only since M26. The shipped server analyzes through the scheduler,
+    /// which always has a token to hand, so there is no production caller left
+    /// — and saying so with `cfg(test)` is what keeps `-D warnings` able to
+    /// notice if this door is ever the one a new path takes by accident.
+    #[cfg(test)]
     pub fn analyze(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
+        Self::analyze_cancellable(text, std_dir, entry_path, &CancelToken::new())
+            .expect("an analysis under an uncancelled token always produces a document")
+    }
+
+    /// [`analyze`](Document::analyze), cancellable (M26,
+    /// `proposal/editor-latency.md` §4.2).
+    ///
+    /// `cancel` is installed on the analysis thread, where the analyzer's phase
+    /// boundaries and its long per-function loops read it
+    /// ([`vilan_core::cancel`]). Answering `None` means the token was set while
+    /// the analysis ran: what it had computed is a TRUNCATED view of the
+    /// program, so it is destroyed here, on the analysis thread, and never
+    /// reaches the caller — there is no truncated `Document` for anyone to
+    /// land, publish or answer a request from.
+    ///
+    /// Cancellation is an optimisation over E117's revision stamps, not a
+    /// replacement for them: a superseded analysis that finishes before its
+    /// token is read still returns `Some`, and `land` still drops it. Nothing
+    /// here is load-bearing for correctness — remove every checkpoint and the
+    /// editor shows the same thing, more slowly.
+    pub fn analyze_cancellable(
+        text: &str,
+        std_dir: &Path,
+        entry_path: &Path,
+        cancel: &CancelToken,
+    ) -> Option<Self> {
         // The pipeline recurses deeply (chumsky), and macro-world compiles NEST
         // a full analysis inside the analysis — run the whole thing on a
         // dedicated big-stack thread, like the CLI's compiler thread (128 MiB,
@@ -1008,19 +1044,29 @@ impl Document {
         let outer_text = text.clone();
         let std_dir = std_dir.to_path_buf();
         let entry_path = entry_path.to_path_buf();
+        let cancel = cancel.clone();
         std::thread::Builder::new()
             .stack_size(128 * 1024 * 1024)
             .spawn(move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Installed for the life of the analysis and torn down before
+                // the thread ends, so the token is exactly the analysis's.
+                let _scope = cancel.install();
+                let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
                 }))
-                .unwrap_or_else(|_| Self::internal_error(&text))
+                .unwrap_or_else(|_| Self::internal_error(&text));
+                // Read AFTER the analysis, on the thread that ran it: a
+                // cancelled analysis's document is dropped here — which is what
+                // gives its entry text, tree and owned modules back
+                // (`AnalyzedProgram`'s `Drop`, `leak-soak.md` §7) — rather than
+                // travelling back to a caller who would only drop it anyway.
+                (!cancel.is_cancelled()).then_some(document)
             })
             .expect("spawn analysis thread")
             .join()
             // Unreachable while the thread body catches unwinds (an abort
             // never returns here); kept graceful all the same.
-            .unwrap_or_else(|_| Self::internal_error(&outer_text))
+            .unwrap_or_else(|_| Some(Self::internal_error(&outer_text)))
     }
 
     /// A document holding `text` and NOTHING an analysis produces: no program,
@@ -1169,6 +1215,25 @@ impl Document {
             &context.workspace,
         );
         let phase_analyze = phase_analyze_start.elapsed();
+        // M26: the analysis was superseded while it ran. Everything below is
+        // work for a result that cannot land — the editor tables the queries
+        // index, and the shared-platform legs, which are a FULL analysis each
+        // (E113) — so stop, and give back what this analysis leaked on the way
+        // in. Wrapping the (possibly `None`) program in an `AnalyzedProgram`
+        // and dropping it is what performs the reclaim: the wrap owns the entry
+        // text, the entry tree and the overlay-served modules, and its `Drop`
+        // is the only thing that hands them back (`leak-soak.md` §7). The
+        // degraded document returned here is never seen by a caller —
+        // `analyze_cancellable` reads the token and answers `None` — so it
+        // carries nothing but the text.
+        if vilan_core::cancel::cancelled() {
+            // SAFETY: the same contract the wrap below is built under — this is
+            // the program `analyze_source_owning_overlay_modules` built over
+            // `leaked` with exactly these handles, and nothing has been derived
+            // from any of them on this path.
+            drop(unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) });
+            return Self::unanalyzed(text);
+        }
         let phase_index_start = std::time::Instant::now();
 
         // The entity table the navigation queries index, computed by the one
@@ -11914,6 +11979,96 @@ mod entry_reclaim {
             leak_tally::outstanding(LeakSite::LspEntryText),
             -(FIRST.len() as isize)
         );
+    }
+
+    /// M26: a CANCELLED analysis gives back everything it leaked, on the thread
+    /// that ran it.
+    ///
+    /// The token is set before the analysis starts, so the first checkpoint —
+    /// the parse boundary in `analyze_source_unfenced` — is the one that fires:
+    /// the entry text and the entry tree are both leaked by then, and nothing
+    /// downstream has been built. That is the earliest a cancel can land and
+    /// therefore the shape most likely to leave a handle behind, which is why
+    /// it is the one pinned exactly. The reclaim seam itself is shared by every
+    /// checkpoint: they all fall through to the same wrap-and-drop in
+    /// `analyze_on_this_thread`.
+    #[test]
+    fn a_cancelled_analysis_gives_back_its_entry_text_and_tree() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let token = vilan_core::cancel::CancelToken::new();
+            token.cancel();
+            let _scope = token.install();
+            let document =
+                Document::analyze_on_this_thread(FIRST, &std_root(), Path::new("reclaim.vl"));
+            assert!(
+                !document.program.is_some(),
+                "a cancelled analysis carries no program — it stopped before there was one",
+            );
+            assert_eq!(
+                leak_tally::bytes(LeakSite::LspEntryText),
+                FIRST.len(),
+                "the entry text is leaked on the way IN, before any checkpoint can fire",
+            );
+            let tree = leak_tally::bytes(LeakSite::EntryAst);
+            assert!(tree > 0, "and so is the parsed tree");
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                FIRST.len(),
+                "…and given back before the cancelled analysis returned",
+            );
+            assert_eq!(leak_tally::released(LeakSite::EntryAst), tree);
+            assert_eq!(leak_tally::outstanding(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                0,
+                "the degraded document owns nothing, so dropping it cannot double-free",
+            );
+        });
+    }
+
+    /// M26, the other half: a cancel that lands DURING the analysis rather than
+    /// before it.
+    ///
+    /// Where it lands is the machine's business — the watcher fires after a
+    /// millisecond, which on a fast box is inside the checks and on a slow one
+    /// may be after the analysis finished altogether — and the pin is written
+    /// so that it does not matter. What is asserted is the tally after the
+    /// document drops, which must be zero in every case: a cancelled analysis
+    /// reclaims on its own thread, an uncancelled one reclaims when its
+    /// document is dropped, and there is no third outcome that leaves bytes
+    /// outstanding.
+    #[test]
+    fn a_cancel_landing_mid_analysis_leaves_nothing_outstanding() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let token = vilan_core::cancel::CancelToken::new();
+            let watcher = {
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    token.cancel();
+                })
+            };
+            let _scope = token.install();
+            let document =
+                Document::analyze_on_this_thread(SECOND, &std_root(), Path::new("reclaim.vl"));
+            watcher.join().expect("the watcher thread");
+            let stopped_early = !document.program.is_some();
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                0,
+                "the entry text is given back whether the analysis was cancelled                  (stopped_early={stopped_early}) or outran the cancel",
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::EntryAst),
+                0,
+                "and so is the tree (stopped_early={stopped_early})",
+            );
+        });
     }
 
     /// The degraded document (a panicked analysis) owns nothing: dropping it
