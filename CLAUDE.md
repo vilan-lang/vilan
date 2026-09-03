@@ -36,6 +36,13 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 - **Add unit tests for critical code.** Any change to a critical subsystem — the type solver / analyzer (`crates/vilan-core/src/analyzer.rs`), the transformer / codegen (`src/transformer.rs`), the language server (`crates/vilan-lsp/`), and the lexer/parser — must come with unit tests that pin its behavior, including the **edge cases** (the multi-parameter, nested, mixed, and ordering-sensitive forms — not just the happy path). The compiler-behavior harness lives in `crates/vilan-core/tests/inference/support.rs` (`assert_compiles`, `assert_compiles_and_runs`, `assert_fails`) and the pins beside it in the subject modules of that directory — one test binary, `cargo test -p vilan-core --test inference`, so a new pin goes in the subject module that owns its area (B145 split the old single 69k-line `tests/inference.rs`). A known-but-unfixed bug is pinned as an `#[ignore]`d test and un-ignored when fixed.
 - **Docs are gated and part of done.** Every fenced example in `vilan/docs/` is compiled by `cargo test --test docs`; a change to std, a framework, or the language updates the affected docs page **in the same commit** (see `proposals/projects/vilan/proposal/documentation.md`).
 - **"Fixed" and "closed" require a pinned test — per case, not per example.** Do not claim a bug fixed, or a class of bugs closed, on the strength of a green suite plus one representative program. Each distinct case needs its own passing (or, if still open, `#[ignore]`d) test. Edge cases without a test are how a "closed" item silently regresses or turns out never to have been covered.
+- **A `#[cfg(windows)]`-only pin is compiled here and verified only by CI** — the
+  cross-check (`cargo check --target x86_64-pc-windows-msvc -p vilan-cli -p vilan-core --tests`)
+  proves it builds, nothing on this machine can run it, and a report that lands
+  one must say so by name.
+- **A pin that waits on a process** — a watcher, a hook, a server — **is a race
+  until its ordering is proven by the harness's own sequencing**, never by a
+  sleep.
 
 ## Running the suite
 
