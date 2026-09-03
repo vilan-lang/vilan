@@ -166,8 +166,10 @@ CHANGELOG_AWK='
 function rank_of(family) {
     if (family == "breaking") return 1
     if (family == "miscompile") return 2
-    if (family == "feature") return 3
-    if (family == "tooling" || family == "diagnostics") return 4
+    if (family == "fix") return 3
+    if (family == "feature") return 4
+    if (family == "performance") return 5
+    if (family == "tooling" || family == "diagnostics") return 6
     return 0
 }
 function problem(message) {
@@ -224,7 +226,7 @@ function emit_section(   wanted, i, printed) {
             }
             return
         }
-        for (wanted = 1; wanted <= 4; wanted++)
+        for (wanted = 1; wanted <= 6; wanted++)
             for (i = 1; i <= count; i++)
                 if (rank_of(family[i]) == wanted) {
                     printf "E\t%d\t%s\t%s\t%s\n", wanted, family[i], dash(commit[i]), head[i]
@@ -234,7 +236,7 @@ function emit_section(   wanted, i, printed) {
     }
     if (refusals > 0) return
     printed = 0
-    for (wanted = 1; wanted <= 4; wanted++) {
+    for (wanted = 1; wanted <= 6; wanted++) {
         for (i = 1; i <= count; i++) {
             if (rank_of(family[i]) != wanted) continue
             printed++
