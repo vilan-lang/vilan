@@ -103,6 +103,16 @@ if slot is Some(let task) && task.ready { start(task); }   // both fine
 if slot is Some(let task) { … } else { start(task); }      // error: unbound
 ```
 
+The condition has to *say* the test passed, and it says that through
+`!`, `&&`, `||` and the `is` itself. Bury the test in a call argument
+and the condition's answer no longer reports it — `ready(slot is
+Some(let task))` is whatever `ready` returns — so the capture is out of
+scope in both branches:
+
+```vilan,fragment
+if ready(slot is Some(let task)) { start(task); }          // error: unbound
+```
+
 Negating the test swaps the two branches: `!(slot is Some(let task))` is
 true where the pattern *didn't* match, so the capture is unbound in that
 branch and in scope in the `else` — the branch reached only by a match.
@@ -111,6 +121,21 @@ branch and in scope in the `else` — the branch reached only by a match.
 if !(slot is Some(let task)) { start(task); }              // error: unbound
 if !(slot is Some(let task)) { … } else { start(task); }   // fine: it matched
 ```
+
+That swap is what makes the **guard clause** work. Negate the test, leave
+the `if` through a `ret` or a `jump`, and the code after it is reachable
+only on the path where the pattern matched — so the capture is in scope
+there, for the rest of the block:
+
+```vilan,fragment
+if !(slot is Some(let task)) { ret; }
+start(task);                                               // fine: it matched
+```
+
+It needs all three parts. The then-branch has to actually leave (a branch
+that can fall through reaches the continuation on a miss), the `if` has to
+have no `else`, and the test has to be negated — `if slot is Some(let
+task) { ret; }` continues exactly where the pattern *didn't* match.
 
 One edge to know: a `match` can't sit directly inside a larger operator
 expression. Bind it to a local first.

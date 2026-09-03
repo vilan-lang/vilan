@@ -2509,16 +2509,17 @@ impl CallSubjectConstraint {
 /// The START is `proposal/local-shadowing.md` §2 — the end of the declaring
 /// construct, so an initializer never reads the binding it declares. The END is
 /// B171: almost every binding runs to the end of its scope
-/// ([`LocalDeclaration::FOREVER`]), and the one exception is a pattern capture
-/// bound inside an operand of `||`, whose test is not known to have passed
-/// anywhere outside that operand.
+/// ([`LocalDeclaration::FOREVER`]), and the exceptions are pattern captures
+/// whose test is not known to have passed past some point — inside an operand of
+/// `||` (B171), under a negation (B195), or off the condition's boolean spine
+/// (B199).
 #[derive(Debug, Clone, Copy)]
 pub struct LocalDeclaration {
     /// Where the name starts resolving to this entity.
     pub visible_from: usize,
     /// Where it stops — EXCLUSIVE, so a use at exactly this offset already
-    /// misses. [`LocalDeclaration::FOREVER`] for everything but a `||`-arm
-    /// capture.
+    /// misses. [`LocalDeclaration::FOREVER`] for everything but a pattern
+    /// capture the condition does not carry that far.
     pub visible_until: usize,
     pub id: Id,
 }
@@ -2618,6 +2619,24 @@ impl ConditionPolarity {
             ..self
         }
     }
+
+    /// OFF the spine, into a subtree ending at `subtree_end` (B199): the
+    /// condition's truth says nothing about a test down here — `always(x is P)`
+    /// is true whatever `P` answered — so the capture reaches NEITHER branch.
+    ///
+    /// It is capped rather than erased because one rule survives the step off:
+    /// `&&` short-circuits wherever it is written, so `f(x is P(let n) && n > 0)`
+    /// still binds its own right operand. Both ends take the minimum, so a
+    /// nested drop can only tighten — a recovered tree with a widened span never
+    /// hands the capture back its reach.
+    fn off_spine(self, subtree_end: usize) -> Self {
+        Self {
+            same_until: self.same_until.min(subtree_end),
+            flip_until: self.flip_until.min(subtree_end),
+            same_in_else: false,
+            flip_in_else: false,
+        }
+    }
 }
 
 /// Whether a node is part of an `if` condition's BOOLEAN SPINE — the operators
@@ -2625,8 +2644,9 @@ impl ConditionPolarity {
 ///
 /// [`ConditionPolarity`] follows the spine and no further: a capture reached
 /// through anything else (a call argument, a nested `if`) is bound by an
-/// evaluation the condition's truth says nothing about, so the frame is dropped
-/// for that subtree and the capture keeps the plain B171 treatment.
+/// evaluation the condition's truth says nothing about, so the frame narrows to
+/// that subtree ([`ConditionPolarity::off_spine`]) and the capture reaches
+/// neither branch (B199).
 fn is_condition_spine(node: &Node<'_>) -> bool {
     matches!(
         node,
@@ -14845,8 +14865,9 @@ impl<'src> Analyzer<'src> {
     }
 
     /// [`Analyzer::declare_scope_value`] with an explicit end to the name's
-    /// visibility (B171). Only a pattern capture inside a `||` operand passes
-    /// anything but [`LocalDeclaration::FOREVER`].
+    /// visibility (B171). Only a pattern capture whose test the condition stops
+    /// carrying — a `||` operand's (B171), a negation's (B195), an off-spine
+    /// subtree's (B199) — passes anything but [`LocalDeclaration::FOREVER`].
     fn declare_scope_value_until(
         &mut self,
         scope_id: Id,
@@ -20861,14 +20882,17 @@ impl<'src> Analyzer<'src> {
             return id;
         }
         // B195: the branch bookkeeping travels the condition's boolean spine
-        // only. Stepping off it (into a call argument, a nested `if`) drops the
-        // frame for the subtree and restores it on the way out, so a capture
+        // only. Stepping off it (into a call argument, a nested `if`) narrows
+        // the frame to the subtree and restores it on the way out, so a capture
         // down there is never credited to a branch its evaluation is not tied
-        // to.
+        // to. B199: "narrowed" is the capture's WHOLE answer — it reaches
+        // neither branch, only the rest of the off-spine subtree.
         let dropped_polarity = if is_condition_spine(&node.0) {
             None
         } else {
-            Some(self.condition_polarity.take())
+            let outer = self.condition_polarity;
+            self.condition_polarity = outer.map(|polarity| polarity.off_spine(node.1.end));
+            Some(outer)
         };
         let id = self.walk_expr_node_inner(node, scope_id);
         if let Some(polarity) = dropped_polarity {
@@ -21516,12 +21540,16 @@ impl<'src> Analyzer<'src> {
                     }
                 }
 
+                /// Returns the walked branch plus the captures THIS branch's
+                /// own condition proves by being false — what B195 hands the
+                /// `else` and what B187 publishes past a diverging guard. Empty
+                /// for a bare `else`, which has no condition of its own.
                 fn walk_branch<'src>(
                     s: &mut Analyzer<'src>,
                     branch: &'src NodeIfBranch,
                     scope_id: Id,
                     inherited: &InheritedCaptures<'src>,
-                ) -> ExprIfBranch {
+                ) -> (ExprIfBranch, InheritedCaptures<'src>) {
                     match branch {
                         NodeIfBranch::If(if_) => {
                             let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
@@ -21548,17 +21576,21 @@ impl<'src> Analyzer<'src> {
                             }
                             let then_ids = s.walk_expr_nodes(&if_.then.0.0, body_scope_id);
                             let then_expr_id = s.walk_expr_node(&if_.then.0.1, body_scope_id);
-                            ExprIfBranch::If(
-                                condition_id,
-                                (then_ids, then_expr_id),
-                                if_.else_.as_ref().map(|x| {
-                                    // Everything the enclosing chain proved on
-                                    // the way here, plus what this condition
-                                    // proves by being false.
-                                    let mut passed_on = inherited.clone();
-                                    passed_on.extend(negated_captures);
-                                    Box::new(walk_branch(s, &x.0, scope_id, &passed_on))
-                                }),
+                            let walked_else = if_.else_.as_ref().map(|x| {
+                                // Everything the enclosing chain proved on
+                                // the way here, plus what this condition
+                                // proves by being false.
+                                let mut passed_on = inherited.clone();
+                                passed_on.extend(negated_captures.iter().copied());
+                                Box::new(walk_branch(s, &x.0, scope_id, &passed_on).0)
+                            });
+                            (
+                                ExprIfBranch::If(
+                                    condition_id,
+                                    (then_ids, then_expr_id),
+                                    walked_else,
+                                ),
+                                negated_captures,
                             )
                         }
                         NodeIfBranch::Else(body) => {
@@ -21566,11 +21598,44 @@ impl<'src> Analyzer<'src> {
                             declare_inherited(s, body_scope_id, inherited);
                             let else_ids = s.walk_expr_nodes(&body.0.0, body_scope_id);
                             let else_expr_id = s.walk_expr_node(&body.0.1, body_scope_id);
-                            ExprIfBranch::Else((else_ids, else_expr_id))
+                            (ExprIfBranch::Else((else_ids, else_expr_id)), Vec::new())
                         }
                     }
                 }
-                let branch = walk_branch(self, if_, scope_id, &Vec::new());
+                let (branch, false_path_captures) = walk_branch(self, if_, scope_id, &Vec::new());
+                // B187, the guard clause — negate, diverge, continue. With no
+                // `else` and a then-branch that provably diverges, the ONLY way
+                // past this `if` is the condition's false path, which is the
+                // very path B195 hands the `else` its captures on. So those
+                // captures are published into the ENCLOSING scope, visible from
+                // the end of the `if` onward — an ordinary declaration there, so
+                // a later `let` of the name shadows it like any other.
+                //
+                // Divergence is `Divergence::checker`'s answer, the one the type
+                // checker itself acts on, so the guard and the editor's
+                // unreachable-code paint cannot disagree about what "dead" is.
+                // (`panic(…)` is a leaf for the paint and not for the checker;
+                // when the checker gains it, the guard gains it with no change
+                // here.)
+                let continuation_captures = match &branch {
+                    ExprIfBranch::If(_, (then_ids, then_tail), None)
+                        if !false_path_captures.is_empty()
+                            && Divergence::checker(&self.expr_id_to_expr_map)
+                                .block(then_ids, *then_tail) =>
+                    {
+                        false_path_captures
+                    }
+                    _ => Vec::new(),
+                };
+                for (name, capture_id, visible_until) in continuation_captures {
+                    self.declare_scope_value_until(
+                        scope_id,
+                        name,
+                        capture_id,
+                        node.1.end,
+                        visible_until,
+                    );
+                }
                 // A value `if` — one with a final `else` — has its arms unified
                 // by the same rule a `match`'s legs go through (B163). Queued
                 // here rather than folded into the inference so the check runs
@@ -23165,7 +23230,9 @@ impl<'src> Analyzer<'src> {
                     let or_cap = self.or_operand_end.unwrap_or(LocalDeclaration::FOREVER);
                     // B195: and a capture under a negation stops where the
                     // negation stops carrying the match — before the
-                    // then-branch, which runs when the test FAILED.
+                    // then-branch, which runs when the test FAILED. B199: a
+                    // capture off the condition's spine stops at that subtree's
+                    // end, reaching neither branch.
                     let polarity = self.condition_polarity;
                     let visible_until =
                         polarity.map_or(or_cap, |polarity| or_cap.min(polarity.same_until));
@@ -25824,10 +25891,38 @@ impl<'src> Analyzer<'src> {
             Expr::Variable(variable_id) => {
                 let variable = self.variables.get(variable_id).unwrap();
                 let variable_type = variable.type_id.get_type(self);
-                if let Type::Unknown = variable_type {
-                    Type::Unresolved
-                } else {
-                    variable_type
+                // B191: a binding with no type YET is read through what it was
+                // bound to, rather than answering "not yet". Deferring is right
+                // when someone else will land the type, and wrong when this ask
+                // is what that someone is waiting for: an unannotated recursive
+                // body's return inference reads its tail, the tail reads `x`,
+                // and `x`'s own constraint is waiting on the self-call whose
+                // type IS the answer under construction. Following the
+                // initializer breaks the deadlock the way the direct-tail form
+                // (`g(n - 1) + 1`) never had it — the re-entrant ask answers
+                // `never`, which constrains nothing, and the other return
+                // evidence decides. It is the hop B185 gave
+                // `unfilled_closure_parameter`, and it takes the same two
+                // guards: an ANNOTATED binding is not followed (the annotation
+                // is the binding's own answer, and outranks the initializer),
+                // and `exprs_seen` ends a binding CYCLE (`let p = q; let q =
+                // p;`, writable because module bindings resolve in any order).
+                //
+                // Read UNDIRECTED, which is how `resolve_variable` grounds the
+                // same initializer: the hop must answer what the binding is
+                // going to BE, not what this particular consumer was hoping
+                // for, or a reader could ground on a type the binding never
+                // takes.
+                let initializer_id = variable.initial.filter(|_| !variable.annotated);
+                match (&variable_type, initializer_id) {
+                    (Type::Unknown, Some(initializer_id)) => self.infer_type_inner(
+                        initializer_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    ),
+                    (Type::Unknown, None) => Type::Unresolved,
+                    _ => variable_type,
                 }
             }
             Expr::Parameter(parameter_id) => {

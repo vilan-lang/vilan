@@ -32,7 +32,9 @@ error. Move the read inside the branch, or use `match`. A NEGATED test
 swaps which branch that is: `if !(x is Some(let n))` runs its then-branch
 when the pattern *didn't* match, so `n` is this error there and is in
 scope in the `else` — read it there, or drop the `!` and swap the two
-branches.
+branches. A negated test whose branch **leaves** (`{ ret; }`, no `else`)
+is the guard clause, and there the capture *is* in scope after the `if`;
+this error after one usually means the branch can fall through.
 → [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
