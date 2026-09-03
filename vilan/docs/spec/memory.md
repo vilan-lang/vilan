@@ -529,7 +529,8 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   use-after-move and `o` owes no teardown at all. A bare `self`
   receiver stays a loan (`db.exec(..)` never consumes `db`).
 - **R4: returns move out**, including through `if` / `match` tails (a
-  diverging leg is exempt). A tail move-out is still a move on *that* path
+  diverging leg — one that `ret`s, `jump`s, `panic`s or loops forever,
+  types §5.1 — is exempt). A tail move-out is still a move on *that* path
   only — R7 reads the arms against each other, so producing a different
   binding from each arm is a conditional move, not two independent returns.
 - **R5: fields.** A struct literal moves resources in. A resource field is

@@ -151,7 +151,9 @@ fun main() {
 ```
 
 There is also a bare `for { … }` for an infinite loop. Loop control is
-spelled `jump break` and `jump continue`. Iterating with `for _ in …`
+spelled `jump break` and `jump continue`. A bare `for` that nothing
+breaks out of never finishes, so the code after it is unreachable and a
+function that ends in one owes no return value. Iterating with `for _ in …`
 skips the binding.
 
 One more form matters once you care about performance:
@@ -319,3 +321,18 @@ instead.
 that should be impossible, not for expected failures; those are
 `Result`s. `assert(condition, message)` panics when the condition is
 false, and it's how `vilan test` decides a test failed.
+
+A `panic` never returns, so it fits wherever a value is expected and owes
+nothing back: a function whose body ends in one needs no return value,
+and neither does one that ends in a `for { … }` nothing breaks out of.
+
+```vilan,fragment
+fun parse_id(text: str): i32 {
+	match text.parse_i32() {
+		Some(let id) => id,
+		None => {
+			panic("not a number: " + text);   // no `0` after it
+		},
+	}
+}
+```

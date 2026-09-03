@@ -24,11 +24,21 @@ The type forms (grammar §3.9) denote:
 - **`void`**: the unit; one value, also written `void`.
 - **`any`**: the dynamic top type, produced at host boundaries; it
   unifies with every type (absorbing).
-- **`Never`**: the type of diverging expressions (`panic(..)`, `ret ..`,
-  `jump break`/`continue`). Never unifies by *yielding*: a diverging
-  match leg or if branch doesn't constrain the construct's type, and a
-  `Never` value satisfies any expected type. Internal; not written in
-  source.
+- **`Never`**: the type of expressions that never produce a value —
+  `panic(..)`, `ret ..`, `jump break`/`continue`, a `for { … }` nothing
+  breaks out of, and any block, `if` or `match` whose every path is one
+  of those. `Never` unifies by **erasure**: it *yields* to whatever it
+  meets, so a diverging expression drops out of every join it takes part
+  in — `if`/`else` arms, `match` arms, a block's tail against the type
+  expected of it, an operator's operands (`never + i32` is `i32`), a
+  `?`-chain, a call's argument against its parameter — and a `Never`
+  value satisfies any expected type, a declared return type included
+  (`fun f(): i32 { panic("x"); }` checks). Erasure removes the diverging
+  expression from the join and nothing else: whatever remains must still
+  agree, so `let v: str = if c { 1 } else { panic("no") }` is a mismatch
+  at the `1`, not at the `panic`. No `Never` value exists at run time —
+  the expression that had the type leaves before anything can read it.
+  Internal; not written in source.
 - **Generics**: a bound type parameter in scope (`T`) is a type; it is
   abstract within its binder's body.
 
@@ -645,24 +655,28 @@ static. A program that would require an unbounded set of specializations
 **Return-type inference.** A function with no declared return type takes
 its type from its body's return positions — the tail, when the body can
 reach it, and every `ret` — and they must agree. A tail the body cannot
-reach (every path before it leaves by `ret`) is not a return position, so
-`fun f(x: bool) { ret 1; }` is `i32`; a tail it can reach is one, so a
-`ret 1` beside an `if` with no `else` disagrees with the void that path
-produces. A bare `ret` is a void return; it agrees only with a void body.
-A disagreeing `ret` is an error at that `ret`, naming both types and
-where the inferred one came from — the function then has no type, so
-the error is not repeated at its calls. A call the function makes to
-itself contributes nothing (its type is the one being inferred); a
-function whose only return positions are such calls is `Never`. Declaring
-the return type replaces inference with checking (every position against
-the declaration). A closure (and an `async` block) infers the same way:
-its return type is the unification of its reachable tail and every
-`ret`, so `|x| { ret x * 2; }` is `|i32| i32`, and a `ret` that
-disagrees — with the tail, an earlier `ret`, or a body path that ends
-without a value — is an error at that `ret`. When the closure's return
-type is known ahead of the body (its own annotation, or the call site's
-expectation), the `ret`s check against that type instead, exactly as a
-declared function's do.
+reach is not a return position: the paths before it all leave, by `ret`,
+by `jump`, by a `panic(..)`, or into a `for { … }` nothing breaks out of
+(§5.1). So `fun f(x: bool) { ret 1; }` is `i32`; a tail it *can* reach
+is a return position, so a `ret 1` beside an `if` with no `else`
+disagrees with the void that path produces. A bare `ret` is a void
+return; it agrees only with a void body. A disagreeing `ret` is an error
+at that `ret`, naming both types and where the inferred one came from —
+the function then has no type, so the error is not repeated at its
+calls. A call the function makes to itself contributes nothing (its type
+is the one being inferred); a function whose only return positions are
+such calls is `Never`. Declaring the return type replaces inference with
+checking (every position against the declaration) — and an unreachable
+tail owes no value there either, so `fun f(): i32 { panic("x"); }` and
+`fun serve(): i32 { for { tick(); } }` both check without one. A closure
+(and an `async` block) infers the same way: its return type is the
+unification of its reachable tail and every `ret`, so
+`|x| { ret x * 2; }` is `|i32| i32`, and a `ret` that disagrees — with
+the tail, an earlier `ret`, or a body path that ends without a value —
+is an error at that `ret`. When the closure's return type is known ahead
+of the body (its own annotation, or the call site's expectation), the
+`ret`s check against that type instead, exactly as a declared function's
+do.
 
 ```vilan
 fun sign(x: i32) {

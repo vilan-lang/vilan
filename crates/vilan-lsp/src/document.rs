@@ -3338,14 +3338,14 @@ impl Document {
     ///
     /// It is the CHECKER's divergence analysis, not a second one
     /// ([`vilan_core::analyzer::Divergence`], which the analyzer's own
-    /// `block_diverges` now calls too). `ret`, `jump` (the loop tails), an `if`
-    /// whose every arm diverges *and* has an `else`, and a `match` whose every
-    /// arm diverges are the checker's own leaves and arrive unchanged. Paint
-    /// asks for two the checker does not have, documented on `Divergence`
-    /// itself: a `panic(…)` call, which lowers to a `throw`, and an endless
-    /// `for { … }` nothing breaks out of — `for` with no condition being the
-    /// language's only endless-loop form, since `for cond { … }` is the `while`
-    /// and `for … in` finishes with its iterable.
+    /// `block_diverges` calls too) — and since B204 it is the checker's answer
+    /// exactly, not a widening of it: `ret`, `jump` (the loop tails), a
+    /// `panic(…)` call (which lowers to a `throw`), an endless `for { … }`
+    /// nothing breaks out of — `for` with no condition being the language's
+    /// only endless-loop form, since `for cond { … }` is the `while` and
+    /// `for … in` finishes with its iterable — an `if` whose every arm diverges
+    /// *and* has an `else`, and a `match` whose every arm diverges. What fades
+    /// here is exactly what the checker treats as dead.
     ///
     /// Conservative in the imports third's two ways — nothing fades while the
     /// buffer is ahead of the analysis, nothing fades in a file carrying a
@@ -3363,7 +3363,7 @@ impl Document {
             return Vec::new();
         };
         let entry_ids = program.id_ranges_of(SourceId(0));
-        let divergence = vilan_core::analyzer::Divergence::paint(program);
+        let divergence = vilan_core::analyzer::Divergence::of_program(program);
         let mut spans: Vec<Span> = Vec::new();
         for (statements, tail) in block_regions(program, &entry_ids) {
             let Some(diverging) = statements
@@ -10405,10 +10405,10 @@ pub(crate) mod tests {
 
     // ── E114: unreachable code, as paint ─────────────────────────────────────
     //
-    // The divergence analysis is the CHECKER's (`analyzer::Divergence`), with
-    // the one widening paint is allowed and the checker is not: a `panic(…)`
-    // call is a leaf here, because it lowers to a `throw`. Each pin below is one
-    // way control leaves.
+    // The divergence analysis is the CHECKER's (`analyzer::Divergence`) — since
+    // B204, with no widening at all: a `panic(…)` call and an endless
+    // `for { … }` are leaves for both askers, so what fades here is what the
+    // checker already treats as dead. Each pin below is one way control leaves.
 
     #[test]
     fn a_statement_after_ret_is_faded() {
