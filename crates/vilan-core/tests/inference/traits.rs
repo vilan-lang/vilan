@@ -1464,3 +1464,321 @@ fn b175_the_trait_path_still_types_as_the_trait() {
         "trait default\n",
     );
 }
+
+// --- B202: a refused exposure generates NOTHING -------------------------------
+//
+// B189's residual, and the last voice in the `[expose]` pile. The `service`
+// macro reads an exposed field's element off the field's SOLE type argument —
+// it runs before any type resolves, so the `Source` impl the compiler checks
+// against is not there to read — and when it could not read one it pushed the
+// literal `"_"` and carried it into all three places the element is named: the
+// contract surface, the client's `RemoteSource<_>` mirror, and `connect`'s
+// channel binding. `_` is not a type. So a field exposing something that is no
+// source at all was told so once, correctly, at the field — and then twice more
+// as `cannot find type '_'`, in code the author never wrote.
+//
+// A field whose element cannot be read now generates nothing at all: no surface
+// entry, no mirror, no `session.expose` call. That leaves one sentence per
+// mistake, and it leaves the compiler owing a sentence for every field it
+// skips — including the one shape the two rules used to disagree about, a
+// `Source` whose element is not written as an argument, which the check now
+// refuses rather than letting the exposure quietly not happen.
+
+/// A `[service]` whose one exposed field is no `Source` at all.
+const NOT_A_SOURCE: &str = r#"
+    import std::io::print;
+    [service(KoltClient)]
+    struct KoltStore {
+        [expose] tasks: i32,
+    }
+    impl KoltStore {
+        [rpc]
+        fun bump(self, id: i32): i32 { id }
+    }
+    fun main() { print("kolt"); }
+    main();
+"#;
+
+#[test]
+fn a_refused_exposure_is_exactly_one_diagnostic_at_the_field() {
+    assert_fails_once_with(NOT_A_SOURCE, "does not implement `std::Source`");
+    assert_fails_without(NOT_A_SOURCE, "cannot find type '_'");
+    assert_fails_without(NOT_A_SOURCE, "cannot infer");
+    let diagnostics = failure_diagnostics(NOT_A_SOURCE);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused exposure is one diagnostic: {diagnostics:#?}"
+    );
+    // At the FIELD's annotation — the one place editing it means anything.
+    assert_fails_spanning(NOT_A_SOURCE, "i32", "does not implement `std::Source`");
+}
+
+#[test]
+fn a_good_field_beside_a_refused_one_is_untouched() {
+    // The skip is per field. `names` is a perfectly good exposure and the
+    // expansion still writes its surface entry, its mirror and its `expose`
+    // call; only `tasks` generates nothing.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+        [service(KoltClient)]
+        struct KoltStore {
+            [expose] tasks: i32,
+            [expose] names: SignalCell<str>,
+        }
+        impl KoltStore {
+            [rpc]
+            fun bump(self, id: i32): i32 { id }
+        }
+        fun main() { print("kolt"); }
+        main();
+        "#;
+    assert_fails_once_with(source, "does not implement `std::Source`");
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the good field beside it draws nothing: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_service_whose_exposures_are_all_good_still_mirrors_them() {
+    // The positive control the skip could break: with a refused field gone from
+    // `exposed_names`, a good one must still reach all three places the element
+    // is named. `peek` is the observable — it names the client's mirror field
+    // AND its element type, so a skip that widened to every field would fail
+    // here rather than passing quietly on a program that compiles because the
+    // mirror it does not use is missing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+        import std::rpc::{ Transport, RemoteSource };
+        [service(KoltClient)]
+        struct KoltStore {
+            [expose] names: SignalCell<str>,
+        }
+        impl KoltStore {
+            [rpc]
+            fun bump(self, id: i32): i32 { id }
+        }
+        fun peek<T: Transport>(client: KoltClient<T>): RemoteSource<str> {
+            client.names
+        }
+        fun main() { print("kolt"); }
+        main();
+        "#,
+        "kolt\n",
+    );
+}
+
+#[test]
+fn an_exposed_source_whose_element_is_not_a_written_argument_is_refused() {
+    // The shape the two rules used to disagree about. `Feed` implements
+    // `Source<Note>`, so the analyzer's reconciliation is happy; the expansion
+    // reads the annotation, sees no type argument, and has nothing to build the
+    // mirror from. It used to render `_` and fail with `cannot find type '_'`.
+    // Now that it generates nothing, silence would be the alternative — the
+    // exposure simply not happening, with the program compiling — so the check
+    // says so at the field instead.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Source, SignalCell, Subscription };
+        [derive(Wire)]
+        struct Note { id: i32 }
+        struct Feed {
+            inner: SignalCell<Note>,
+        }
+        impl Feed with Source<Note> {
+            fun get(self): Note { self.inner.get() }
+            fun sub(self, observer: |Note| void): Subscription { self.inner.sub(observer) }
+        }
+        [service(FeedClient)]
+        struct Store {
+            [expose] feed: Feed,
+        }
+        impl Store {
+            [rpc]
+            fun ping(self): i32 { 1 }
+        }
+        fun main() { print("ok"); }
+        main();
+        "#;
+    assert_fails_once_with(source, "its element is not written as a type argument");
+    assert_fails_without(source, "cannot find type '_'");
+}
+
+#[test]
+fn a_user_source_written_with_its_element_still_exposes() {
+    // The control for the refusal above, and A32's own case: a source of one's
+    // own is exposable exactly when its element is where the expansion reads
+    // it. `Feed<Note>` is; `Feed` is not.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source, SignalCell, Subscription };
+        [derive(Wire)]
+        struct Note { id: i32 }
+        struct Feed<T> {
+            inner: SignalCell<T>,
+        }
+        impl Feed<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+        [service(FeedClient)]
+        struct Store {
+            [expose] feed: Feed<Note>,
+        }
+        impl Store {
+            [rpc]
+            fun ping(self): i32 { 1 }
+        }
+        fun main() { print("ok"); }
+        main();
+        "#,
+        "ok\n",
+    );
+}
+
+// --- B205: a supertrait member's `Self` inside a sub-trait's default body -----
+//
+// `trait Doubler with Add { fun twice(self): Self { self.add(self) } }` was two
+// errors on a program with no mistake in it: `Expected Doubler, but got Add
+// instead.` at the call and `Expected Add, but got Doubler instead.` at the
+// argument. Inside a default body `self` is the trait's own abstract type
+// (`Type::Trait(Doubler, [])`), and `add` is declared in `Add`'s terms — its
+// `Self` return and its `= Self`-defaulted `b` both resolve to
+// `Type::Trait(Add, [])`, which is a different type. So the argument was
+// refused, and the call's type was refused by the enclosing default's own
+// declared `Self`.
+//
+// The OPERATOR spelling has dispatched since B193, on exactly this shape. The
+// explicit method spelling now reaches the same place: a member found in a
+// SUPERTRAIT records the pair at the lookup, and both halves — the argument
+// check, which reads a parameter type straight off the declaration, and the
+// `Self`-return specialization, which already substitutes structurally for a
+// concrete receiver — rebind it to the sub-trait.
+
+/// Two `Add` impls under one `Doubler`, so a passing run proves the default
+/// DISPATCHED rather than resolving to one answer for everybody. Both spellings
+/// stand side by side in the same trait.
+const DOUBLER: &str = r#"
+    import std::io::print;
+    import std::operators::Add;
+
+    trait Doubler with Add {
+        fun twice(self): Self {
+            self.add(self)
+        }
+        fun twice_with_the_operator(self): Self {
+            self + self
+        }
+    }
+
+    struct Money { cents: i32 }
+    impl Money with Add {
+        fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+    }
+    impl Money with Doubler {}
+
+    struct Tag { text: str }
+    impl Tag with Add {
+        fun add(self, b: Tag): Tag { Tag { text = self.text + b.text } }
+    }
+    impl Tag with Doubler {}
+"#;
+
+#[test]
+fn b205_both_spellings_of_a_supertrait_call_resolve_in_a_default_body() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{DOUBLER}
+            fun main() {{
+                print(Money {{ cents = 3 }}.twice().cents);
+                print(Money {{ cents = 3 }}.twice_with_the_operator().cents);
+            }}
+            main();
+            "#
+        ),
+        "6\n6\n",
+    );
+}
+
+#[test]
+fn b205_a_supertrait_call_in_a_default_body_dispatches_per_specialization() {
+    // The claim the compile alone cannot make: `twice` is ONE body, and each
+    // impl's own `add` is what runs in it.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{DOUBLER}
+            fun main() {{
+                print(Money {{ cents = 3 }}.twice().cents);
+                print(Tag {{ text = "ab" }}.twice().text);
+            }}
+            main();
+            "#
+        ),
+        "6\nabab\n",
+    );
+}
+
+#[test]
+fn b205_the_supertrait_chain_is_walked_the_whole_way() {
+    // The rebinding keys on the trait that DECLARES the member, whatever depth
+    // it sits at — and a user trait, so the rule is not `Add`'s. Two calls
+    // chained also prove the CALL's own type came back as the sub-trait: the
+    // second `.join` is made on the first one's result.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base {
+            fun join(self, other: Self): Self;
+        }
+        trait Middle with Base {}
+        trait Top with Middle {
+            fun tripled(self): Self {
+                self.join(self).join(self)
+            }
+        }
+
+        struct Tag { text: str }
+        impl Tag with Base {
+            fun join(self, other: Tag): Tag { Tag { text = self.text + other.text } }
+        }
+        impl Tag with Middle {}
+        impl Tag with Top {}
+
+        fun main() { print(Tag { text = "x" }.tripled().text); }
+        main();
+        "#,
+        "xxx\n",
+    );
+}
+
+#[test]
+fn b205_an_unrelated_traits_method_is_still_refused_in_a_default_body() {
+    // The control. The rebinding fires only for a member the sub-trait's own
+    // supertrait walk found; a method no supertrait promises is still nothing
+    // `Self` can do here, and widening the walk is exactly the failure this pin
+    // exists to catch.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::operators::{ Add, Mul };
+
+        trait Doubler with Add {
+            fun twice(self): Self {
+                self.mul(self)
+            }
+        }
+
+        fun main() { print("x"); }
+        main();
+        "#,
+        "Doubler has no method 'mul'",
+    );
+}

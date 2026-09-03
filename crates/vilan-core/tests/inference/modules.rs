@@ -6008,6 +6008,8 @@ fn a_qualified_path_refusal_is_attributed_to_the_module_that_wrote_it() {
 
 /// A module with a nested module, an enum and a struct — enough to write a
 /// literal head of one segment, of two, and one that is not a struct at all.
+/// The enum's `PartialEq` was a hand-written `impl` standing in for the derive
+/// until B201 let a `[derive(..)]` inside a `mod` generate into that `mod`.
 const QUALIFIED: &str = r#"
         mod shapes {
             import std::compare::PartialEq;
@@ -6018,19 +6020,10 @@ const QUALIFIED: &str = r#"
                 }
             }
 
+            [derive(PartialEq)]
             enum Kind {
                 Round(i32),
                 Flat,
-            }
-
-            impl Kind with PartialEq {
-                fun eq(self, other: Kind): bool {
-                    if self is Kind::Flat {
-                        other is Kind::Flat
-                    } else {
-                        false
-                    }
-                }
             }
 
             struct Dot {
@@ -6120,5 +6113,199 @@ fn a_parenthesised_qualified_literal_is_admitted_in_a_condition() {
             "fun main() { if (shapes::Dot { x = 1 }).x == 1 { print(\"one\"); } }\nmain();",
         ),
         "one\n",
+    );
+}
+
+// --- B201: a derive inside an inline `mod` generates into THAT scope ----------
+//
+// Expansion is unified — a `[derive(..)]` runs the same channel a macro
+// attribute does — and every generated list used to walk into the FILE's
+// module scope, whatever scope the deriving item was written in. The impl a
+// derive writes names its subject by the bare name the author wrote, and that
+// name resolves in exactly one scope: the `mod`'s. So `mod shapes {
+// [derive(PartialEq)] enum Kind { .. } }` reported `cannot find type 'Kind'`
+// twice over, plus a follow-on per variant from inside the generated body —
+// four diagnostics for a program with no mistake in it. Each generated list
+// now records the inline-`mod` path it was written in and walks into that
+// module's scope. Both channels are covered, because both had the bug: the
+// macro-generated lists (the real std's derives) and the Rust generators'
+// fallback text (a backed enum's `value()`/`parse()`, which is not a derive at
+// all and reaches every enum however it is wrapped).
+
+#[test]
+fn a_derived_enum_inside_a_mod_gets_its_impl_in_that_mod() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod shapes {
+            import std::compare::PartialEq;
+
+            [derive(PartialEq)]
+            enum Kind {
+                Flat,
+                Round,
+            }
+        }
+
+        fun main() {
+            let a = shapes::Kind::Flat;
+            print(a == shapes::Kind::Flat);
+            print(a == shapes::Kind::Round);
+        }
+
+        main();
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn a_derived_struct_inside_a_mod_gets_its_impl_in_that_mod() {
+    // The struct twin, on a different derive, so the placement is pinned as a
+    // property of the expansion rather than of `PartialEq`'s template.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod shapes {
+            import std::debug::Debug;
+
+            [derive(Debug)]
+            struct Dot {
+                x: i32,
+            }
+        }
+
+        fun main() {
+            print(shapes::Dot { x = 1 }.debug());
+        }
+
+        main();
+        "#,
+        "Dot { x = 1 }\n",
+    );
+}
+
+#[test]
+fn a_derive_in_a_nested_mod_walks_the_whole_path() {
+    // The path is a repetition, not a one-`mod` special case: the list walks
+    // down every segment it was written under.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod outer {
+            mod inner {
+                import std::compare::PartialEq;
+
+                [derive(PartialEq)]
+                enum Kind {
+                    Flat,
+                    Round,
+                }
+            }
+        }
+
+        fun main() {
+            print(outer::inner::Kind::Flat == outer::inner::Kind::Flat);
+        }
+
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn two_mods_deriving_the_same_trait_each_keep_their_own_impl() {
+    // The buckets are per declaring scope, and a derive in one `mod` must not
+    // be visible from — or collide with — the same derive in another. Both
+    // types are named `Kind`, which is only legal *because* they live in
+    // different scopes; one shared bucket would put two `impl Kind` blocks in
+    // one scope.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod left {
+            import std::compare::PartialEq;
+
+            [derive(PartialEq)]
+            enum Kind {
+                Flat,
+            }
+        }
+
+        mod right {
+            import std::compare::PartialEq;
+
+            [derive(PartialEq)]
+            enum Kind {
+                Round,
+            }
+        }
+
+        fun main() {
+            print(left::Kind::Flat == left::Kind::Flat);
+            print(right::Kind::Round == right::Kind::Round);
+        }
+
+        main();
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+#[test]
+fn a_backed_enum_inside_a_mod_gets_its_conversions_in_that_mod() {
+    // The other channel. A backing value is not a `[derive]` — the synthesized
+    // `value()`/`parse()` come from the Rust generators, accumulated per file
+    // and flushed as one list — so a `mod`-nested backed enum reported
+    // `'value' is already defined for 'unknown'` on top of the missing type.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod shapes {
+            enum Kind {
+                Flat = "flat",
+                Round = "round",
+            }
+        }
+
+        fun main() {
+            print(shapes::Kind::Flat.value());
+            print(shapes::Kind::Round.value());
+        }
+
+        main();
+        "#,
+        "flat\nround\n",
+    );
+}
+
+#[test]
+fn a_derive_at_a_files_top_level_is_unchanged() {
+    // The control: an empty path is the file's own scope, which is where it
+    // always landed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        [derive(PartialEq)]
+        enum Kind {
+            Flat,
+            Round,
+        }
+
+        fun main() {
+            print(Kind::Flat == Kind::Flat);
+        }
+
+        main();
+        "#,
+        "true\n",
     );
 }

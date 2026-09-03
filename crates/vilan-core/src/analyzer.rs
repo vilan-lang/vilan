@@ -1940,6 +1940,16 @@ pub struct Trait<'src> {
     pub supertraits: Vec<TypeId>,
 }
 
+/// The impl a trait member's signature is being rendered FOR (B206): the trait
+/// that DECLARES the member, the impl's subject type, and the arguments the
+/// `with` clause supplied. Without it a `Self` position renders as the trait's
+/// own name, which is a signature nobody can write.
+struct SignatureSubject<'a> {
+    declaring_trait_id: Id,
+    subject: TypeId,
+    trait_arguments: &'a [TypeId],
+}
+
 /// B161: a TRAIT written as a `let` binding's annotation. The annotation is
 /// not the binding's type and not a widening — the binding keeps the concrete
 /// type its initializer infers — it is a CONSTRAINT that type is checked
@@ -3275,6 +3285,20 @@ pub struct Analyzer<'src> {
     // impl's `T` to `i32`): the resulting substitution, so codegen emits a
     // monomorphized instance of the method body (e.g. `T::default()` -> `0`).
     method_call_substitution: HashMap<Id, SubstitutionContext>,
+    /// A method call inside a trait DEFAULT body that reached a SUPERTRAIT's
+    /// member: the supertrait that DECLARES it, and the SUB-trait's own abstract
+    /// type — which is what that member's `Self` means at this call (B205).
+    ///
+    /// `trait Doubler with Add { fun twice(self): Self { self.add(self) } }`
+    /// reaches `Add::add`, declared `fun add(self, b: B): Self` in `Add`'s own
+    /// terms with `B = Self`; both `Self`s resolve to `Type::Trait(Add, [])`.
+    /// Inside `Doubler`'s body they mean `Doubler`, and without the rebinding
+    /// the argument was refused (`Expected Add, but got Doubler`) and the call's
+    /// type refused by the enclosing default's declared `Self` return
+    /// (`Expected Doubler, but got Add`). Recorded at the lookup, the one place
+    /// both traits are in hand; consumed by the argument check, which reads a
+    /// member's declared parameter types straight off the declaration.
+    supertrait_self_at_call: HashMap<Id, (Id, TypeId)>,
     // The expected type imposed on an expression by its syntactic context — a
     // function's declared return type for its body tail, propagated into tail
     // positions (each `match` leg body) by their resolvers. Lets a
@@ -4158,6 +4182,7 @@ impl<'src> Analyzer<'src> {
             async_returning: HashSet::default(),
             return_sites: Vec::new(),
             method_call_substitution: HashMap::default(),
+            supertrait_self_at_call: HashMap::default(),
             expected_types: HashMap::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
@@ -6871,6 +6896,25 @@ impl<'src> Analyzer<'src> {
     /// recursion — it exists separately because `substitute_type` does not know
     /// `Self`, and leaving a nested `Self` unsubstituted would compare as a
     /// spurious mismatch (`List<Self>` vs `List<subject>`).
+    /// [`substitute_member_type`] for B205's recorded pair: a supertrait
+    /// member's `Self`, rebound to the sub-trait the call reached it through.
+    /// `None` (the ordinary call) returns the type unchanged.
+    fn rebind_supertrait_self(
+        &mut self,
+        supertrait_self: Option<(Id, TypeId)>,
+        type_: &Type,
+    ) -> Type {
+        match supertrait_self {
+            Some((declaring_trait_id, sub_trait)) => self.substitute_member_type(
+                type_,
+                declaring_trait_id,
+                sub_trait,
+                &SubstitutionContext::default(),
+            ),
+            None => type_.clone(),
+        }
+    }
+
     fn substitute_member_type(
         &mut self,
         type_: &Type,
@@ -12937,8 +12981,7 @@ impl<'src> Analyzer<'src> {
                 .map(render_type)
                 .unwrap_or_else(|| self.pretty_print_type(&field_type, &HashMap::default()));
             match element {
-                Some(element) if self.resolved_type_is_wire(element) => {}
-                Some(element) => {
+                Some(element) if !self.resolved_type_is_wire(element) => {
                     let element_type = element.get_type(self);
                     let rendered = self.pretty_print_type(&element_type, &HashMap::default());
                     // B189: this field's exposure is now reported, so the
@@ -12964,6 +13007,45 @@ impl<'src> Analyzer<'src> {
                         declaration_id,
                     );
                 }
+                // The element is Wire, and one thing is still needed: the
+                // `[service]` expansion has to be able to NAME it. That
+                // expansion runs before any type resolves, so it cannot read
+                // the `Source` impl this check just read — it reads the
+                // annotation's sole type argument, and a source whose element
+                // is not written there leaves it nothing to build the client's
+                // mirror from. It used to render the placeholder `_` and hand
+                // the author `cannot find type '_'`; B202 stopped it generating
+                // for such a field at all, which is why the refusal has to be
+                // said HERE, in the vocabulary of the field, or the exposure
+                // would simply not happen and nothing would say so.
+                Some(_)
+                    if !matches!(
+                        type_node,
+                        Some(Node::AccessorWithGenerics(_, arguments))
+                            if arguments.0.len() == 1
+                    ) =>
+                {
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "{label} is `[expose]`d, and its type `{rendered_field}` does \
+                             implement `std::Source`, but its element is not written as a \
+                             type argument: the `[service]` expansion builds the client's \
+                             mirror before any type resolves, so it reads the element off \
+                             the annotation's sole type argument and has nothing to name \
+                             here. Spell the source with its element as that argument \
+                             (`SignalCell<Note>`), or expose a field whose type is written \
+                             that way"
+                            ),
+                        },
+                        declaration_id,
+                    );
+                }
+                Some(_) => {}
                 None => {
                     // Same covering, same reason: the field cannot be exposed
                     // at all, so the generated subscription's own complaint
@@ -14001,6 +14083,69 @@ impl<'src> Analyzer<'src> {
         self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
+    /// [`declaration_type_label`] rendered FOR an impl (B206): an ambiguous
+    /// `Self` / `= Self`-defaulted position resolves to what it means there.
+    fn declaration_type_label_for(
+        &self,
+        type_id: TypeId,
+        subject: Option<&SignatureSubject<'_>>,
+    ) -> String {
+        match subject.and_then(|subject| self.signature_position_type(type_id, subject)) {
+            Some(resolved) => self.declaration_type_label(resolved),
+            None => self.declaration_type_label(type_id),
+        }
+    }
+
+    /// What an ambiguous `Self` / `= Self`-defaulted position of a trait member
+    /// means in a given impl — `None` for every other position, which renders as
+    /// written.
+    ///
+    /// The rule is `ambiguous_position_expectation`'s, the B29 residue, applied
+    /// to a rendered LABEL instead of to a check. A `= Self`-defaulted trait
+    /// generic (`trait Add<B = Self>`, `trait PartialEq<B = Self>`) resolves to
+    /// the very same type as `Self` — both are `Type::Trait(trait, [])` — so the
+    /// resolved type cannot tell a declared `b: B` from a declared `Self`, and
+    /// rendering it printed the TRAIT's name: `declare `fun eq(self, b:
+    /// PartialEq): bool``, which is not a signature anyone can write (B206). The
+    /// WRITTEN name separates them: `Self` is the impl's subject, and the
+    /// parameter's own name is the matching `with`-clause argument, falling back
+    /// to the subject when the clause supplied none — which is precisely what
+    /// the `= Self` default means.
+    fn signature_position_type(
+        &self,
+        type_id: TypeId,
+        subject: &SignatureSubject<'_>,
+    ) -> Option<TypeId> {
+        // Only a position that resolves to the declaring trait's OWN abstract
+        // type is ambiguous. A `b: i32` renders as written, and so does a
+        // mention of some other trait.
+        match type_id.get_type(self) {
+            Type::Trait(trait_id, ref arguments)
+                if trait_id == subject.declaring_trait_id && arguments.is_empty() => {}
+            _ => return None,
+        }
+        let written = self
+            .written_type_spellings
+            .iter()
+            .find(|(written_id, _)| *written_id == type_id)
+            .map(|(_, name)| *name)?;
+        if written == "Self" {
+            return Some(subject.subject);
+        }
+        let trait_ = self.traits.get(&subject.declaring_trait_id)?;
+        let index = trait_
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written)?;
+        Some(
+            subject
+                .trait_arguments
+                .get(index)
+                .copied()
+                .unwrap_or(subject.subject),
+        )
+    }
+
     /// The generic-parameter list of a declaration (`<T: Greeter, U>`), empty
     /// string when there are none.
     ///
@@ -14041,6 +14186,19 @@ impl<'src> Analyzer<'src> {
     /// Declared `async` renders here; INFERRED async is prepended by the
     /// language server (inference runs after this label is built).
     fn function_signature_label(&self, function: &Function) -> String {
+        self.function_signature_label_for(function, None)
+    }
+
+    /// [`function_signature_label`] rendered FOR an impl: a `Self` position, and
+    /// a `= Self`-defaulted parameter, take what they mean there rather than the
+    /// trait's own name (B206). `None` renders the declaration as written, which
+    /// is what hover wants — there is no impl in hand, and `Self` is exactly
+    /// what the author typed.
+    fn function_signature_label_for(
+        &self,
+        function: &Function,
+        subject: Option<&SignatureSubject<'_>>,
+    ) -> String {
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &function.parameters {
             let Some(parameter) = self.parameters.get(parameter_id) else {
@@ -14057,7 +14215,7 @@ impl<'src> Analyzer<'src> {
                     "{}{}: {}",
                     if parameter.spread { "..." } else { "" },
                     parameter.name,
-                    self.declaration_type_label(parameter.type_id)
+                    self.declaration_type_label_for(parameter.type_id, subject)
                 );
                 // A `context` clause is part of the signature's contract —
                 // render it (E9: hover shows clauses).
@@ -14080,7 +14238,12 @@ impl<'src> Analyzer<'src> {
         let generics = self.generic_list_label(&function.generic_parameter_constraint_ids);
         let return_label = function
             .return_type_id
-            .map(|return_type_id| format!(": {}", self.declaration_type_label(return_type_id)))
+            .map(|return_type_id| {
+                format!(
+                    ": {}",
+                    self.declaration_type_label_for(return_type_id, subject)
+                )
+            })
             .unwrap_or_default();
         // The inferred (or declared) `borrows` root-set is part of the signature's
         // contract — render it like the source clause (E9: hover shows clauses),
@@ -14960,6 +15123,29 @@ impl<'src> Analyzer<'src> {
         for item in generated {
             self.hoist_generated_declarations(&item.0, expansion_scope_id, module_scope_id);
         }
+    }
+
+    /// The scope an inline-`mod` path names inside `scope_id` — where a
+    /// generated list belongs when the item that produced it was written inside
+    /// one (B201). A `[derive(..)]` writes an `impl` naming its subject by the
+    /// bare name the author wrote, and that name resolves in exactly one scope:
+    /// the `mod`'s. Falls back to the enclosing scope for a segment that does
+    /// not resolve to a module — the pre-B201 placement, and the right answer
+    /// for a path no walk created (generated code declaring its own `mod`).
+    fn declaring_module_scope(&self, scope_id: Id, module_path: &[String]) -> Id {
+        let mut scope_id = scope_id;
+        for name in module_path {
+            let Some(module) = self
+                .scopes
+                .get(&scope_id)
+                .and_then(|scope| scope.name_to_id_map.get(name.as_str()).copied())
+                .and_then(|module_id| self.modules.get(&module_id))
+            else {
+                return scope_id;
+            };
+            scope_id = module.body.1;
+        }
+        scope_id
     }
 
     /// One expansion, walked into `scope_id` with the whole attribution its
@@ -25844,10 +26030,32 @@ impl<'src> Analyzer<'src> {
                             // `Wrap<T>` — abstract here, concrete at every
                             // monomorphization. Leaving it `Wrap<Marker>` made a
                             // bare trait type the payload, which has no members.
-                            if matches!(
-                                receiver_type,
-                                Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
-                            ) {
+                            //
+                            // And so does a SUB-TRAIT receiver (B205). Inside a
+                            // trait default body `self` is the trait's own
+                            // abstract type, and a member reached from a
+                            // SUPERTRAIT declares its `Self` in the supertrait's
+                            // terms — `Add::add` returns `Add`'s `Self`, which
+                            // inside `trait Doubler with Add` is `Doubler`. The
+                            // substitution is the same one, with the sub-trait as
+                            // the subject; without it `self.add(self)` typed as
+                            // `Add` and the enclosing default's own `Self` return
+                            // refused it. (The operator spelling `self + self`
+                            // has dispatched since B193; this is the explicit
+                            // method spelling reaching the same place.) A
+                            // receiver whose trait IS the declaring one is left
+                            // alone: the substitution would be the identity.
+                            let receiver_is_sub_trait = matches!(receiver_type, Type::Trait(_, _))
+                                && self
+                                    .supertrait_self_at_call
+                                    .get(&id)
+                                    .is_some_and(|(declaring, _)| *declaring == self_trait);
+                            if receiver_is_sub_trait
+                                || matches!(
+                                    receiver_type,
+                                    Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
+                                )
+                            {
                                 let subject = receiver_type.get_type_id(self);
                                 return self.substitute_member_type(
                                     &return_type,
@@ -29751,6 +29959,32 @@ impl<'src> Analyzer<'src> {
                     if let Some((_, declaring_trait_id, declaring_arguments)) = &declared {
                         self.generic_dispatch
                             .insert(id, GenericDispatch::OnType(None, member_name));
+                        // B205: a member reached from a SUPERTRAIT is written in
+                        // that trait's terms, `Self` included — and inside this
+                        // default body `Self` is the SUB-trait. Record the pair
+                        // so the argument check can rebind it; the return type
+                        // takes the same rebinding through the `Self`-return
+                        // specialization below.
+                        //
+                        // Only for an ARGUMENT-LESS `with` clause, and that is
+                        // the whole of the rule rather than a convenience. A
+                        // `= Self`-defaulted parameter resolves to the very same
+                        // type as `Self` (`trait Add<B = Self>` -> both are
+                        // `Type::Trait(Add, [])`), so with no argument written
+                        // every such occurrence means the sub-trait and a blanket
+                        // rewrite is exactly right. Write `with Add<i32>` and the
+                        // two positions part company — `b: B` is `i32`, the `Self`
+                        // return is still the sub-trait — and nothing in the
+                        // RESOLVED types tells them apart; only the written name
+                        // does (`ambiguous_position_expectation`, the same B29
+                        // residue). That shape is left exactly as it was.
+                        if *declaring_trait_id != trait_id && declaring_arguments.is_empty() {
+                            let declaring_trait_id = *declaring_trait_id;
+                            let sub_trait =
+                                Type::Trait(trait_id, trait_arguments.clone()).get_type_id(self);
+                            self.supertrait_self_at_call
+                                .insert(id, (declaring_trait_id, sub_trait));
+                        }
                         // A parameterized trait substitutes its generic parameters
                         // with the concrete arguments, so the method's signature
                         // (`got(): T`) types against them (`Get<i32>::got` -> `i32`).
@@ -30250,6 +30484,14 @@ impl<'src> Analyzer<'src> {
             .get(&call_id)
             .cloned()
             .unwrap_or_default();
+        // B205: a supertrait member's declared parameter types are read straight
+        // off its declaration, in the SUPERTRAIT's terms — `Add::add`'s `b: B`
+        // is `Type::Trait(Add, [])` under `B = Self`. Reached through a
+        // sub-trait's default body it means the sub-trait, and the rewrite is
+        // structural rather than a substitution entry because types are not
+        // interned: the parameter, the return and the trait's own `Self` binding
+        // are three ids for the one type.
+        let supertrait_self = self.supertrait_self_at_call.get(&call_id).copied();
         let expected = parameter_ids.len().saturating_sub(1);
         if argument_ids.len() != expected {
             // `self` is parameter 0 — the arguments a caller writes line up
@@ -30276,6 +30518,7 @@ impl<'src> Analyzer<'src> {
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
                 .map(|parameter| parameter.type_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
+                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
                 .unwrap_or(Type::Unknown);
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
@@ -30290,6 +30533,7 @@ impl<'src> Analyzer<'src> {
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
                 .map(|parameter| parameter.type_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
+                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
             else {
                 continue;
             };
@@ -34830,20 +35074,26 @@ impl<'src> Analyzer<'src> {
                 }
                 // Render the signature to write, and point at the trait's own
                 // declaration of it — cross-file when the trait is std's
-                // (standard B4 + C3's cross-source note).
-                let (expected_signature, note) = self
+                // (standard B4 + C3's cross-source note). Rendered FOR this
+                // impl (B206): `Self`, and a `= Self`-defaulted parameter,
+                // resolve to the subject and to the `with`-clause argument
+                // rather than to the trait's own name.
+                let signature_subject = SignatureSubject {
+                    declaring_trait_id,
+                    subject: check.subject_type_id,
+                    trait_arguments: &check.trait_arguments,
+                };
+                let (signature, note) = self
                     .traits
                     .get(&declaring_trait_id)
                     .and_then(|trait_| trait_.declarations.get(member_name).copied())
                     .and_then(|member_id| {
-                        let function_id = match self.expr_id_to_expr_map.get(&member_id) {
-                            Some(Expr::Function(function_id)) => *function_id,
-                            _ => member_id,
-                        };
+                        let function_id = self.resolve_member_function_id(member_id);
                         let function = self.functions.get(&function_id)?;
-                        let signature = self.function_signature_label(function);
+                        let signature =
+                            self.function_signature_label_for(function, Some(&signature_subject));
                         Some((
-                            format!("; declare `{signature}`"),
+                            Some(signature),
                             Some(crate::error::Note {
                                 span: function.name_span,
                                 msg: "the trait declares it here".to_string(),
@@ -34851,7 +35101,11 @@ impl<'src> Analyzer<'src> {
                             }),
                         ))
                     })
-                    .unwrap_or((String::new(), None));
+                    .unwrap_or((None, None));
+                let expected_signature = signature
+                    .as_deref()
+                    .map(|signature| format!("; declare `{signature}`"))
+                    .unwrap_or_default();
                 // B197: the operator family gets its own sentence, because its
                 // REASON is not the ordinary one. The trait does declare a body
                 // here, so "missing" would read as wrong to anyone who has read
@@ -34867,21 +35121,19 @@ impl<'src> Analyzer<'src> {
                 let operator = operator_trait_required_method(declaring_trait_name)
                     .filter(|(method, _)| *method == member_name);
                 let msg = if let Some((_, symbol)) = operator {
-                    // The signature to write, rendered HERE rather than read
-                    // off the trait's declaration: every one of the ten reads
-                    // `fun m(self, b: B): Self`, and `function_signature_label`
-                    // renders a `B = Self` parameter as the trait's own name
-                    // (`fun add(self, b: Add): Add`) — which is not a signature
-                    // anyone can write. `Self` is this impl's subject, and `B`
-                    // is whatever the `with` clause supplied, defaulting to it.
-                    let operand = check
-                        .trait_arguments
-                        .first()
-                        .map(|argument| {
-                            let argument = argument.get_type(self);
-                            self.pretty_print_type(&argument, &HashMap::default())
-                        })
-                        .unwrap_or_else(|| subject_name.clone());
+                    // The signature to write comes off the trait's own
+                    // declaration like every other arm's. B197 rendered it here
+                    // instead, because `function_signature_label` printed a
+                    // `B = Self` parameter as the trait's name (`fun add(self,
+                    // b: Add): Add`) — a signature nobody can write. B206 fixed
+                    // that at the label, so the duplicate is gone: one rendering
+                    // serves both arms, and an operator trait whose shape is not
+                    // `fun m(self, b: B): Self` can no longer be described
+                    // wrongly by a template that assumed it was.
+                    let declare = signature
+                        .as_deref()
+                        .map(|signature| format!(" Declare `{signature}`"))
+                        .unwrap_or_default();
                     // The head names the impl the AUTHOR wrote. Reached
                     // through a supertrait (`trait Doubler with Add`, then
                     // `impl Money with Doubler {}`) the requirement comes from
@@ -34910,8 +35162,7 @@ impl<'src> Analyzer<'src> {
                          `panic(\"not implemented yet\")` — it exists so `{symbol}=` can derive \
                          from `{symbol}`, not so `{member_name}` can go unwritten — so this impl \
                          compiles clean and the first `{symbol}` on a `{subject_name}` throws at \
-                         runtime, naming neither the type nor the method. Declare `fun \
-                         {member_name}(self, b: {operand}): {subject_name}`{steer}",
+                         runtime, naming neither the type nor the method.{declare}{steer}",
                         check.trait_name
                     )
                 } else {
@@ -39709,21 +39960,25 @@ pub(crate) fn service_impl_source(
     // resolves, so the element is read off the field's SOLE type argument —
     // `SignalCell<Note>`, `StorageSignal<str>`, any single-parameter source.
     // Whether the field is exposable at all is the analyzer's
-    // `check_expose_fields`, which reconciles it against `std::Source`; a source
-    // whose element is not its one type argument renders `_` here and surfaces a
-    // clear error at the generated use site.
+    // `check_expose_fields`, which reconciles it against `std::Source`; a field
+    // whose element cannot be read HERE generates nothing at all — no surface
+    // entry, no mirror, no `expose` call (B202, and the `service` macro in
+    // `std/src/rpc.vl` reads the same rule). It used to render the literal `_`,
+    // which is not a type, so a field exposing something that is no source at
+    // all drew `cannot find type '_'` twice over on top of the compiler's own
+    // curated refusal.
     let exposed: Vec<(&str, String)> = fields
         .0
         .iter()
         .filter(|field| field.0.2)
-        .map(|field| {
+        .filter_map(|field| {
             let element = match field.0.1.as_ref().map(|type_node| &type_node.0) {
                 Some(Node::AccessorWithGenerics(_, arguments)) if arguments.0.len() == 1 => {
                     render_type(&arguments.0[0].0)
                 }
-                _ => "_".to_string(),
+                _ => return None,
             };
-            (field.0.0.0, element)
+            Some((field.0.0.0, element))
         })
         .collect();
     // The `[rpc]` methods: (name, [(parameter, type)], return type), from this
@@ -41847,7 +42102,8 @@ fn expand_entry_over_world<'src>(
             .analyzer
             .attribute_new_diagnostics(before, defining_source);
     }
-    for (_, list) in &output.items {
+    for generated in &output.items {
+        let list = generated.nodes;
         for (module, _) in collect_module_refs(list, "std") {
             if !world.module_scopes.contains_key(module) {
                 return true;
@@ -41909,7 +42165,7 @@ struct World<'src> {
     /// the same way it answers it for `std::` (M21), instead of rebuilding the
     /// world for every derive that reaches a sibling.
     pkg_module_names: HashSet<&'src str>,
-    generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>>,
+    generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>>,
     // The std intrinsics the tail keys passes off (resolved from the loaded
     // world's scopes; `None` when the module never loaded).
     list_struct_id: Option<Id>,
@@ -42736,7 +42992,7 @@ fn analyze_inner<'src>(
     }
     // Splice sites are stamped with a per-analysis counter (gensym hygiene, §7).
     let mut macro_site_counter: u32 = 0;
-    let mut generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>> =
+    let mut generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>> =
         HashMap::default();
     loop {
         // Canonical drain (WO-1b): load the smallest-key module still pending
@@ -43097,10 +43353,10 @@ fn analyze_inner<'src>(
             // dependencies). Runs even with an empty registry: an unknown
             // `[attribute]` must error, not silently skip.
             let seed_generated_refs =
-                |generated: &[(Span, &'static NodeList<'static>)],
+                |generated: &[crate::macros::GeneratedItems],
                  origin: Origin,
                  to_load: &mut Vec<(Origin, &str)>| {
-                    for (_, list) in generated {
+                    for list in generated.iter().map(|items| items.nodes) {
                         to_load.extend(
                             collect_module_refs(list, "std")
                                 .into_iter()
@@ -43284,10 +43540,18 @@ fn analyze_inner<'src>(
             source: *source_id,
         });
         // Macro-generated items (derives included — expansion is unified) walk
-        // into the module's own scope right after its body, so they see its
-        // types.
-        for (origin, generated) in generated_by_source.get(source_id).into_iter().flatten() {
-            analyzer.walk_generated_expansion(generated, *module_scope_id, *origin, *source_id);
+        // into the DECLARING scope right after its body, so they see its types:
+        // the module's own scope, or the inline `mod` the deriving item was
+        // written inside (B201).
+        for generated in generated_by_source.get(source_id).into_iter().flatten() {
+            let scope_id =
+                analyzer.declaring_module_scope(*module_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                *source_id,
+            );
         }
     }
     if let Some(lib_ast) = lib_ast {
@@ -43314,9 +43578,17 @@ fn analyze_inner<'src>(
             end: analyzer.entity_id,
             source: *source_id,
         });
-        // Macro-generated items (derives included) walk into the lib's namespace.
-        for (origin, generated) in generated_by_source.get(source_id).into_iter().flatten() {
-            analyzer.walk_generated_expansion(generated, *namespace_scope_id, *origin, *source_id);
+        // Macro-generated items (derives included) walk into the lib's namespace
+        // — or into the inline `mod` that declared the deriving item (B201).
+        for generated in generated_by_source.get(source_id).into_iter().flatten() {
+            let scope_id =
+                analyzer.declaring_module_scope(*namespace_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                *source_id,
+            );
         }
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
@@ -43751,9 +44023,16 @@ fn analyze_over_world<'src>(
             source: SourceId(0),
         });
         // Synthesized `[derive(..)]` impls are walked into the same (entry) scope,
-        // right after the user's items, so they see the derived types.
-        for (origin, generated) in generated_by_source.get(&SourceId(0)).into_iter().flatten() {
-            analyzer.walk_generated_expansion(generated, global_scope_id, *origin, SourceId(0));
+        // right after the user's items, so they see the derived types — or into
+        // the inline `mod` that declared the deriving item (B201).
+        for generated in generated_by_source.get(&SourceId(0)).into_iter().flatten() {
+            let scope_id = analyzer.declaring_module_scope(global_scope_id, &generated.module_path);
+            analyzer.walk_generated_expansion(
+                generated.nodes,
+                scope_id,
+                generated.origin,
+                SourceId(0),
+            );
         }
     }
     // Constraint resolution and the post-passes attribute their diagnostics per

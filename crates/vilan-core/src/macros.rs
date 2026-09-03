@@ -964,14 +964,26 @@ fn compile_world(
 
 // --- Expansion ---
 
+/// One generated item list, walked after the originating file's items.
+#[derive(Clone)]
+pub(crate) struct GeneratedItems {
+    /// The ORIGIN — the span of the attribute/invocation in the user's file
+    /// that produced this list. It is what a diagnostic raised INSIDE the
+    /// generated code re-anchors to (standard A2).
+    pub(crate) origin: Span,
+    /// The inline-`mod` path, outermost segment first, of the item that
+    /// produced this list — empty at a file's top level. The list walks into
+    /// THAT module's scope, because that is the only scope its subject is
+    /// declared in: a `[derive(..)]` inside a `mod` used to generate its impl
+    /// at the file's top level, where the type it names is out of scope (B201).
+    pub(crate) module_path: Vec<String>,
+    pub(crate) nodes: &'static NodeList<'static>,
+}
+
 /// One file's expansion results, ready for `analyze` to fold in.
 #[derive(Default)]
 pub(crate) struct ExpansionOutput {
-    /// Generated ITEM lists, each with its ORIGIN — the span of the
-    /// attribute/invocation in the user's file that produced it — walked
-    /// after the originating file's items. The origin is what a diagnostic
-    /// raised INSIDE the generated code re-anchors to (standard A2).
-    pub(crate) items: Vec<(Span, &'static NodeList<'static>)>,
+    pub(crate) items: Vec<GeneratedItems>,
     /// Expression splices: invocation node address → the replacement
     /// expression the walk substitutes.
     pub(crate) expressions: Vec<(usize, &'static Spanned<Node<'static>>)>,
@@ -985,22 +997,19 @@ pub(crate) struct ExpansionOutput {
     pub(crate) world_errors: Vec<(SourceId, Error)>,
 }
 
-struct Expander<'r, 'd> {
-    scope: &'r MacroScope<'r>,
-    std: &'r PackageSpec,
-    limits: MacroLimits,
-    /// Rust-generated fallback text (derive/service names with no macro in
-    /// scope — fixture stds without the std macros). Flushed as ONE list,
-    /// prelude-first, ahead of the macro-generated lists — the shape the
-    /// pre-unification channel produced.
-    rust_source: String,
-    rust_traits: std::collections::HashSet<&'static str>,
-    rust_any_service: bool,
-    /// Whether this module declared a backed enum whose `value()`/`parse()` were
+/// One declaring scope's Rust-generated fallback: the generated text plus the
+/// prelude imports that text needs in scope. Bucketed per scope so a
+/// `mod`-nested derive's impl and its imports land where its subject is (B201).
+#[derive(Default)]
+struct RustFallback {
+    source: String,
+    traits: std::collections::HashSet<&'static str>,
+    any_service: bool,
+    /// Whether this scope declared a backed enum whose `value()`/`parse()` were
     /// generated, so the generated block gets `Option` in scope for its `parse`
     /// (backed-enums.md §3.8).
     backed_enums: bool,
-    /// Whether this module declared a bare-lowered enum, so the generated block
+    /// Whether this scope declared a bare-lowered enum, so the generated block
     /// gets `Hashable`/`Hash`/`canonical_hash` in scope for its synthesized
     /// `impl .. with Hashable` (backed-enums.md §7.1). Tracked apart from
     /// `backed_enums` because the two are not the same set: `enum Level { Low =
@@ -1008,6 +1017,24 @@ struct Expander<'r, 'd> {
     /// declaration — but has no written literal for `Mid`/`High` to reprint, so
     /// it gets the Hashable impl and no conversions.
     bare_lowered_enums: bool,
+}
+
+struct Expander<'r, 'd> {
+    scope: &'r MacroScope<'r>,
+    std: &'r PackageSpec,
+    limits: MacroLimits,
+    /// Rust-generated fallback text (derive/service names with no macro in
+    /// scope — fixture stds without the std macros), bucketed by the DECLARING
+    /// scope's inline-`mod` path. Each bucket is flushed as ONE list,
+    /// prelude-first, ahead of that scope's macro-generated lists — the shape
+    /// the pre-unification channel produced, per scope rather than per file
+    /// (B201: a backed enum inside a `mod` generated its `value()`/`parse()`
+    /// at the file's top level, where the enum is out of scope).
+    rust_fallback: Vec<(Vec<String>, RustFallback)>,
+    /// The inline-`mod` path currently being expanded, outermost first — empty
+    /// at a file's top level. Every generated list records it, so the walk can
+    /// place the list in the scope that declares its subject (B201).
+    module_path: Vec<String>,
     diagnostics: &'d mut Vec<Error>,
     /// The per-splice-site counter that stamps `__m<N>` gensym placeholders
     /// unique (§7): deterministic — sites are visited in file/node order.
@@ -1034,11 +1061,8 @@ pub(crate) fn expand_source(
         scope,
         std,
         limits,
-        rust_source: String::new(),
-        rust_traits: std::collections::HashSet::default(),
-        rust_any_service: false,
-        backed_enums: false,
-        bare_lowered_enums: false,
+        rust_fallback: Vec::new(),
+        module_path: Vec::new(),
         diagnostics,
         site_counter,
         output: ExpansionOutput::default(),
@@ -1050,6 +1074,28 @@ pub(crate) fn expand_source(
 }
 
 impl Expander<'_, '_> {
+    /// The Rust-fallback bucket for the scope being expanded — the file's top
+    /// level, or the inline `mod` the walk is inside (B201). Buckets are kept
+    /// in first-seen order so the flush is deterministic.
+    fn fallback(&mut self) -> &mut RustFallback {
+        match self
+            .rust_fallback
+            .iter()
+            .position(|(path, _)| *path == self.module_path)
+        {
+            Some(index) => &mut self.rust_fallback[index].1,
+            None => {
+                self.rust_fallback
+                    .push((self.module_path.clone(), RustFallback::default()));
+                &mut self
+                    .rust_fallback
+                    .last_mut()
+                    .expect("the bucket just pushed")
+                    .1
+            }
+        }
+    }
+
     /// The synthesized members of every backed enum this module declares —
     /// `value()` / `parse()` (backed-enums.md §3.8) and `impl .. with Hashable`
     /// (§7.1) — collected in ONE pass over the item tree rather than inside the
@@ -1087,19 +1133,27 @@ impl Expander<'_, '_> {
                     derived_hashable || names.iter().any(|(name, _)| *name == "Hashable");
                 self.collect_backed_enum_impls_in(inner, derived_hashable)
             }
-            Node::Module(_, body) => self.collect_backed_enum_impls(&body.0),
+            Node::Module(name, body) => {
+                // The synthesized members belong to the `mod` that declares the
+                // enum, not to the file (B201).
+                self.module_path.push((*name).to_string());
+                self.collect_backed_enum_impls(&body.0);
+                self.module_path.pop();
+            }
             Node::Enum(..) => {
                 if !derived_hashable {
                     let hashable = crate::analyzer::backed_enum_hashable_source(node);
                     if !hashable.is_empty() {
-                        self.bare_lowered_enums = true;
-                        self.rust_source.push_str(&hashable);
+                        let fallback = self.fallback();
+                        fallback.bare_lowered_enums = true;
+                        fallback.source.push_str(&hashable);
                     }
                 }
                 let source = crate::analyzer::backed_enum_impl_source(node);
                 if !source.is_empty() {
-                    self.backed_enums = true;
-                    self.rust_source.push_str(&source);
+                    let fallback = self.fallback();
+                    fallback.backed_enums = true;
+                    fallback.source.push_str(&source);
                 }
             }
             _ => {}
@@ -1124,11 +1178,15 @@ impl Expander<'_, '_> {
         match &node.0 {
             Node::Export(inner) => self.expand_item_position(inner, siblings, text, depth),
             // `mod` bodies are item position too (a service there gathers its
-            // rpc surface from the mod's own items).
-            Node::Module(_, body) => {
+            // rpc surface from the mod's own items). What a derive there
+            // generates belongs to the `mod`'s scope, so the path is tracked
+            // across the recursion (B201).
+            Node::Module(name, body) => {
+                self.module_path.push((*name).to_string());
                 for child in &body.0 {
                     self.expand_item_position(child, &body.0, text, depth);
                 }
+                self.module_path.pop();
             }
             // A macro definition: its body is the macro world's, never
             // expanded (splice syntax is program-code-only).
@@ -1168,9 +1226,10 @@ impl Expander<'_, '_> {
                     } else if let Some(known) =
                         RUST_DERIVES.iter().find(|known| **known == *name).copied()
                     {
-                        self.rust_traits.insert(known);
-                        self.rust_source
-                            .push_str(&crate::analyzer::derive_impl_source(&[name], item));
+                        let source = crate::analyzer::derive_impl_source(&[name], item);
+                        let fallback = self.fallback();
+                        fallback.traits.insert(known);
+                        fallback.source.push_str(&source);
                     }
                 }
                 self.sweep_expressions(item, text, depth);
@@ -1203,13 +1262,11 @@ impl Expander<'_, '_> {
                                     .to_string(),
                             });
                         } else {
-                            self.rust_any_service = true;
-                            self.rust_source
-                                .push_str(&crate::analyzer::service_impl_source(
-                                    *client_name,
-                                    item,
-                                    siblings,
-                                ));
+                            let source =
+                                crate::analyzer::service_impl_source(*client_name, item, siblings);
+                            let fallback = self.fallback();
+                            fallback.any_service = true;
+                            fallback.source.push_str(&source);
                         }
                     }
                 }
@@ -1331,21 +1388,38 @@ impl Expander<'_, '_> {
         );
     }
 
-    /// Flushes the Rust-generated fallback text (if any) as the FIRST items
-    /// list, prefixed with the trait-import prelude the Rust generators
-    /// assume — exactly the pre-unification channel's shape.
+    /// Flushes each declaring scope's Rust-generated fallback text (if any) as
+    /// the FIRST items list for that scope, prefixed with the trait-import
+    /// prelude the Rust generators assume — exactly the pre-unification
+    /// channel's shape, per scope rather than per file (B201).
     fn flush_rust_fallback(&mut self) {
-        if self.rust_source.trim().is_empty() {
-            return;
+        let buckets = std::mem::take(&mut self.rust_fallback);
+        let mut flushed = Vec::new();
+        for (module_path, fallback) in buckets {
+            if let Some(items) = self.rust_fallback_items(&module_path, &fallback) {
+                flushed.push(items);
+            }
+        }
+        self.output.items.splice(0..0, flushed);
+    }
+
+    /// One bucket's parsed items — `None` when it generated nothing.
+    fn rust_fallback_items(
+        &mut self,
+        module_path: &[String],
+        fallback: &RustFallback,
+    ) -> Option<GeneratedItems> {
+        if fallback.source.trim().is_empty() {
+            return None;
         }
         let mut prelude = String::new();
-        if self.rust_traits.contains("PartialEq") {
+        if fallback.traits.contains("PartialEq") {
             prelude.push_str("import std::compare::PartialEq;\n");
         }
-        if self.rust_traits.contains("Default") {
+        if fallback.traits.contains("Default") {
             prelude.push_str("import std::default::Default;\n");
         }
-        if self.rust_traits.contains("Json") || self.rust_traits.contains("Wire") {
+        if fallback.traits.contains("Json") || fallback.traits.contains("Wire") {
             // Mirrors the `Json`/`Wire` macro entry points: the validating
             // `from_json` yields a `Result` (I3), so the output needs `Result`
             // in scope; it reads JSON through methods (`try_parse_json`,
@@ -1357,24 +1431,24 @@ impl Expander<'_, '_> {
             prelude.push_str("import std::json::{ coerce_i32, coerce_i53, coerce_str };\n");
             prelude.push_str("import std::result::Result;\n");
         }
-        if self.rust_traits.contains("Wire") {
+        if fallback.traits.contains("Wire") {
             prelude.push_str(
                 "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n",
             );
         }
-        if self.rust_traits.contains("Debug") {
+        if fallback.traits.contains("Debug") {
             prelude.push_str("import std::debug::Debug;\n");
         }
         // One import line serves both producers of an `impl .. with Hashable`:
         // the `[derive(Hashable)]` fallback generator and a bare-lowered enum's
         // synthesized impl. A module with both must not import it twice.
-        if self.rust_traits.contains("Hashable") || self.bare_lowered_enums {
+        if fallback.traits.contains("Hashable") || fallback.bare_lowered_enums {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
         }
-        if self.backed_enums {
+        if fallback.backed_enums {
             prelude.push_str("import std::option::Option;\n");
         }
-        if self.rust_any_service {
+        if fallback.any_service {
             prelude.push_str(
                 "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, call, arg, reply, decode_failed, session_of, connect_socket, SocketTransport, bridge, ReactiveClient };\n",
             );
@@ -1382,19 +1456,28 @@ impl Expander<'_, '_> {
             prelude.push_str("import std::result::Result;\n");
             prelude.push_str("import std::option::Option;\n");
         }
-        let combined = format!("{prelude}{}", self.rust_source);
+        let combined = format!("{prelude}{}", fallback.source);
         // Deterministic per input (fixed prelude order, file-order source
         // accumulation, no gensyms), so it caches like any other generated
         // text: an unchanged program's re-analysis reuses the tree instead of
         // re-leaking one per analysis (the E23 sweep's uncached straggler).
         match parse_cached(&combined) {
-            Ok((parsed, _)) => self.output.items.insert(0, ((0..0).into(), parsed)),
-            Err(message) => self.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span: (0..0).into(),
-                msg: format!("the built-in derive generators produced invalid Vilan ({message})"),
+            Ok((parsed, _)) => Some(GeneratedItems {
+                origin: (0..0).into(),
+                module_path: module_path.to_vec(),
+                nodes: parsed,
             }),
+            Err(message) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: (0..0).into(),
+                    msg: format!(
+                        "the built-in derive generators produced invalid Vilan ({message})"
+                    ),
+                });
+                None
+            }
         }
     }
 
@@ -1721,7 +1804,11 @@ impl Expander<'_, '_> {
                 });
                 return;
             }
-            self.output.items.push((site, parsed));
+            self.output.items.push(GeneratedItems {
+                origin: site,
+                module_path: self.module_path.clone(),
+                nodes: parsed,
+            });
             // The generated code may carry derives, services, and further
             // macro uses — the unified item scan handles them all.
             self.expand_list(parsed, parsed_text, depth + 1);
