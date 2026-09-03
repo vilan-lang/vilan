@@ -2979,6 +2979,20 @@ pub struct Analyzer<'src> {
     // (captured at the one `infer_type` chokepoint). `Some` only during
     // `resolve_constraints`; taken to become a deferred constraint's wait set.
     current_waiting_on: Option<Vec<Id>>,
+    /// The scope the constraint being resolved is anchored in — the site whose
+    /// enclosing binders are RIGID (B211). `reconcile_type` reads it to tell a
+    /// generic parameter the enclosing declaration OWNS (which the body may not
+    /// re-bind) from a callee's / a literal's / an annotation's, which a site
+    /// infers. `None` outside constraint resolution, where nothing is rigid.
+    rigid_binder_scope: Option<Id>,
+    /// The generic parameters the INFERENCE step currently running is allowed to
+    /// bind, overriding `rigid_binder_scope` for exactly those ids (B211). A call
+    /// to a sibling member of the enclosing impl (`List::new()` inside
+    /// `List::map<U>`) names the same binder ids the body holds rigid, and that
+    /// call is a fresh instantiation of them: the binding pass says so here. The
+    /// CHECK pass leaves it empty, so a value whose type is a rigid parameter is
+    /// still refused against a parameter it does not match.
+    inferable_generics: Vec<TypeId>,
     function_calls: IndexMap<Id, FunctionCall>,
     functions: IndexMap<Id, Function<'src>>,
     generic_constraint_names: HashMap<TypeId, &'src str>,
@@ -4073,6 +4087,8 @@ impl<'src> Analyzer<'src> {
             constraints: Vec::new(),
             deferred: Vec::new(),
             current_waiting_on: None,
+            rigid_binder_scope: None,
+            inferable_generics: Vec::new(),
             function_calls: IndexMap::new(),
             functions: IndexMap::new(),
             generic_constraint_names: HashMap::default(),
@@ -4367,7 +4383,7 @@ impl<'src> Analyzer<'src> {
             // Reconcile subject-first so the bindings key on the impl's
             // binders (`impl Box2<type X>` against `Box2<Cat>` binds X = Cat).
             let Some((_unified, bindings)) =
-                self.reconcile_type(&subject_type, value_type, &SubstitutionContext::default())
+                self.reconcile_declaration(&subject_type, value_type, &subject_type)
             else {
                 continue;
             };
@@ -13250,7 +13266,7 @@ impl<'src> Analyzer<'src> {
     fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
         let impl_subject_type = impl_subject.get_type(self);
         let Some((_, bindings)) =
-            self.reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            self.reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
         else {
             return true;
         };
@@ -13290,7 +13306,7 @@ impl<'src> Analyzer<'src> {
         }
         let impl_subject_type = impl_subject.get_type(self);
         let bindings: SubstitutionContext = self
-            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
         effective
@@ -13744,7 +13760,7 @@ impl<'src> Analyzer<'src> {
         };
         let impl_subject_type = impl_subject.get_type(self);
         let bindings: SubstitutionContext = self
-            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
         let declared = return_type_id.get_type(self);
@@ -14717,7 +14733,7 @@ impl<'src> Analyzer<'src> {
     ) -> SubstitutionContext {
         let impl_subject = impl_subject_id.get_type(self);
         let mut bindings: SubstitutionContext = self
-            .reconcile_type(&impl_subject, subject_type, &HashMap::default())
+            .reconcile_declaration(&impl_subject, subject_type, &impl_subject)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
         let trait_parameter_ids = self
@@ -20241,6 +20257,26 @@ impl<'src> Analyzer<'src> {
         false
     }
 
+    /// Whether `constraint_id` is RIGID at the site currently being checked —
+    /// a generic parameter the ENCLOSING declaration owns (the function's own
+    /// `<T>`, an implicit `(a: X)` parameter, an impl's binder, a trait's
+    /// parameter inside a default body). B211: such a parameter is a fixed,
+    /// unknown type inside its own body. It is bound once per instantiation, by
+    /// the CALLER, and the body may not re-bind it — not from an assignment, not
+    /// from an argument position. Only the parameters a site is inferring — a
+    /// callee's at a call, a struct's at a literal, a nominal's at an annotation
+    /// — are open, and those belong to a declaration this site is not inside.
+    ///
+    /// Answers `false` outside constraint resolution (`rigid_binder_scope` is
+    /// `None`), where the reconciler is matching declarations against each other
+    /// rather than checking a body — impl-subject matching, conformance.
+    fn generic_is_rigid_here(&self, constraint_id: TypeId) -> bool {
+        !self.inferable_generics.contains(&constraint_id)
+            && self.rigid_binder_scope.is_some_and(|scope_id| {
+                self.generic_declared_by_enclosing_scope(constraint_id, scope_id)
+            })
+    }
+
     /// Walks the optional generic parameters of a declaration into `scope_id`,
     /// registering each as a `Generic` type bound by its constraint, and
     /// returns the constraint type ids in declaration order.
@@ -20682,6 +20718,20 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .map(|(trait_id, _)| trait_id)
             .collect()
+    }
+
+    /// Whether a generic parameter's DECLARED bound carries `required_trait_id`
+    /// — directly or through a supertrait. The abstract half of
+    /// [`satisfies_trait_bound`], without its `&mut self` (a `reconcile_type`
+    /// match guard needs it): an abstract parameter's bounds are the only
+    /// answer, never an impl (B173).
+    fn generic_bound_carries_trait(&self, constraint_id: TypeId, required_trait_id: Id) -> bool {
+        self.generic_bound_trait_ids(constraint_id)
+            .iter()
+            .any(|declared| {
+                self.trait_with_supertraits(*declared)
+                    .contains(&required_trait_id)
+            })
     }
 
     /// The bound traits of a generic parameter as `(trait id, trait arguments)` — like
@@ -24449,9 +24499,14 @@ impl<'src> Analyzer<'src> {
                 unresolved_closure_argument |= is_closure;
                 continue;
             }
-            if let Some((_, bindings)) =
-                self.reconcile_type(&parameter_type, &argument_type, substitution)
-            {
+            // This is the INFERENCE step, and `bindable` is exactly the set it
+            // is entitled to bind — including ids the body also holds rigid,
+            // when the callee is a sibling member of the enclosing impl (B211).
+            let previously_inferable =
+                std::mem::replace(&mut self.inferable_generics, bindable.clone());
+            let reconciled = self.reconcile_type(&parameter_type, &argument_type, substitution);
+            self.inferable_generics = previously_inferable;
+            if let Some((_, bindings)) = reconciled {
                 for (constraint_id, type_id) in bindings {
                     if bindable.contains(&constraint_id) {
                         substitution.insert(constraint_id, type_id);
@@ -24668,8 +24723,10 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let substituted_return = self.substitute_type(&declared_return, substitution);
-        let Some((_, bindings)) = self.reconcile_type(&substituted_return, &expected, substitution)
-        else {
+        let previously_inferable = std::mem::replace(&mut self.inferable_generics, open.clone());
+        let reconciled = self.reconcile_type(&substituted_return, &expected, substitution);
+        self.inferable_generics = previously_inferable;
+        let Some((_, bindings)) = reconciled else {
             return;
         };
         for (constraint_id, type_id) in bindings {
@@ -24963,9 +25020,13 @@ impl<'src> Analyzer<'src> {
             if matches!(argument_type, Type::Unresolved) {
                 return None;
             }
-            if let Some((_, new_bindings)) =
-                self.reconcile_type(&data_type, &argument_type, &bindings)
-            {
+            // The enum's OWN parameters are what this step infers, even where an
+            // enclosing `impl Option<type T>` holds the same ids rigid (B211).
+            let previously_inferable =
+                std::mem::replace(&mut self.inferable_generics, generic_parameters.clone());
+            let reconciled = self.reconcile_type(&data_type, &argument_type, &bindings);
+            self.inferable_generics = previously_inferable;
+            if let Some((_, new_bindings)) = reconciled {
                 bindings.extend(new_bindings);
             }
         }
@@ -26362,9 +26423,7 @@ impl<'src> Analyzer<'src> {
             .collect();
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
-            if let Some((_, bindings)) =
-                self.reconcile_type(concrete, &subject, &SubstitutionContext::default())
-            {
+            if let Some((_, bindings)) = self.reconcile_declaration(concrete, &subject, &subject) {
                 let mut binders = Vec::new();
                 self.collect_subject_binders(subject_id, &mut binders);
                 let context = self.bindings_for_binders(&binders, bindings);
@@ -26927,6 +26986,45 @@ impl<'src> Analyzer<'src> {
         Some(Type::Closure(parameter_type_ids, return_type_id))
     }
 
+    /// `(U in T: U)` — a mapped type whose template IS its own binder — sends
+    /// every element of its source to itself, so it IS the source. Reducing it
+    /// is what lets `combine`'s `(source in sources => source.get())` meet the
+    /// declared `SignalCell<T>` by AGREEING with `T` rather than by binding it,
+    /// which is no longer on offer inside `combine`'s own body (B211).
+    fn reduce_identity_mapped(&self, type_: &Type) -> Option<Type> {
+        let Type::Mapped(binder_id, source_id, template_id) = type_ else {
+            return None;
+        };
+        (template_id.get_type(self) == Type::Generic(*binder_id)).then(|| source_id.get_type(self))
+    }
+
+    /// [`reconcile_type`] for a DECLARATION-against-value match: an impl's
+    /// declared subject against a receiver, an argument, an iterable, a `Try`
+    /// value. Matching a declaration is what BINDS that declaration's own
+    /// binders, so every generic `declaration` carries is open here whatever the
+    /// enclosing body holds rigid (B211) — and it must be, because an impl's
+    /// binder deliberately INHERITS the subject declaration's constraint id
+    /// (`register_subject_binders`, B77's relation): inside
+    /// `impl Cell<Cell<type U>>`, resolving `self.get()` matches
+    /// `impl Cell<type T>`'s subject, and `T` and `U` are the same id.
+    ///
+    /// `a`/`b` keep the caller's argument order (which decides which side the
+    /// unified result comes from); `declaration` names which of them is the
+    /// declared subject.
+    fn reconcile_declaration(
+        &mut self,
+        a: &Type,
+        b: &Type,
+        declaration: &Type,
+    ) -> Option<(Type, Vec<(TypeId, TypeId)>)> {
+        let mut binders = Vec::new();
+        self.collect_generics(declaration, 0, &mut binders);
+        let previously_inferable = std::mem::replace(&mut self.inferable_generics, binders);
+        let reconciled = self.reconcile_type(a, b, &SubstitutionContext::default());
+        self.inferable_generics = previously_inferable;
+        reconciled
+    }
+
     fn reconcile_type(
         &mut self,
         a: &Type,
@@ -26934,17 +27032,24 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
     ) -> Option<(Type, Vec<(TypeId, TypeId)>)> {
         let _guard = crate::util::RecursionGuard::enter()?;
-        // A concrete-source mapped type expands to its tuple and reconciles
-        // structurally; an abstract-source one stays mapped for the inversion arms.
+        // An IDENTITY mapping reduces to its source; otherwise a concrete-source
+        // mapped type expands to its tuple and reconciles structurally, and an
+        // abstract-source one stays mapped for the inversion arms.
         let a_owned;
-        let a = if matches!(a, Type::Mapped(..)) {
+        let a = if let Some(reduced) = self.reduce_identity_mapped(a) {
+            a_owned = reduced;
+            &a_owned
+        } else if matches!(a, Type::Mapped(..)) {
             a_owned = self.expand_mapped(a.clone());
             &a_owned
         } else {
             a
         };
         let b_owned;
-        let b = if matches!(b, Type::Mapped(..)) {
+        let b = if let Some(reduced) = self.reduce_identity_mapped(b) {
+            b_owned = reduced;
+            &b_owned
+        } else if matches!(b, Type::Mapped(..)) {
             b_owned = self.expand_mapped(b.clone());
             &b_owned
         } else {
@@ -26966,7 +27071,22 @@ impl<'src> Analyzer<'src> {
             // parameter against itself records), or a longer / structurally recursive
             // binding (`T = (.., T)`, an occurs-check violation), would loop forever.
             // The cycle guard bails to the plain bind in that case.
-            (Type::Generic(constraint_id), _) => {
+            //
+            // B211: both arms are guarded by `generic_is_rigid_here`, which is
+            // the whole of "a generic parameter is rigid inside its own body".
+            // A parameter the ENCLOSING declaration owns is a fixed unknown at
+            // this site — the caller chose it — so nothing here may bind it. It
+            // is not a symmetric refusal: the OTHER side still binds to it (the
+            // second arm runs when only the first side is rigid, which is how
+            // `helper(x)` inside `fun f<T>(x: T)` still binds `helper`'s own
+            // `U := T`), and two occurrences of the same parameter agree through
+            // the equality arm below. What falls off the end is the leak: a
+            // rigid `T` against a concrete type, or against a DIFFERENT rigid
+            // parameter — `need_a(x)` binding `T := A` with no check that the
+            // argument is an `A`, and `c = b` re-binding `c`'s parameter from
+            // `b`'s. Both compiled, and both ran an impl against a value of
+            // another type.
+            (Type::Generic(constraint_id), _) if !self.generic_is_rigid_here(*constraint_id) => {
                 if let Some(resolved_id) = substitution_context.get(constraint_id).copied()
                     && !self.is_self_generic(resolved_id, *constraint_id)
                     && let Some(_cycle) = TypeCycleGuard::enter(CYCLE_RECONCILE, *constraint_id)
@@ -26980,7 +27100,7 @@ impl<'src> Analyzer<'src> {
                 let bindings = vec![(*constraint_id, b.clone().get_type_id(self))];
                 (a.clone(), bindings)
             }
-            (_, Type::Generic(constraint_id)) => {
+            (_, Type::Generic(constraint_id)) if !self.generic_is_rigid_here(*constraint_id) => {
                 if let Some(resolved_id) = substitution_context.get(constraint_id).copied()
                     && !self.is_self_generic(resolved_id, *constraint_id)
                     && let Some(_cycle) = TypeCycleGuard::enter(CYCLE_RECONCILE, *constraint_id)
@@ -26993,6 +27113,31 @@ impl<'src> Analyzer<'src> {
                 }
                 let bindings = vec![(*constraint_id, a.clone().get_type_id(self))];
                 (b.clone(), bindings)
+            }
+            // The same parameter on both sides, at least one of them rigid: it
+            // agrees with itself (`f(x)` recursing, a sibling method on `self`
+            // inside the impl that declares the binder). The self-map binding is
+            // what the arms above recorded here before the guards, and
+            // `is_self_generic` reads it — keep recording it.
+            (Type::Generic(left_id), Type::Generic(right_id)) if left_id == right_id => {
+                (a.clone(), vec![(*left_id, b.clone().get_type_id(self))])
+            }
+            // A rigid parameter meets a TRAIT-typed position through its own
+            // declared bound: `T: Ord` where `Ord::compare(self, b: Self)` wants
+            // the trait's abstract `Self`, which interns as the bare trait. The
+            // parameter is not bound — it is already fixed, and the trait is the
+            // requirement it satisfies. Before B211 this rode the binding arm
+            // above as `T := Ord`, which is trait-objects.md §1.4's leak: "a
+            // trait may satisfy a bound; it may not BE the binding."
+            (Type::Generic(constraint_id), Type::Trait(trait_id, _))
+                if self.generic_bound_carries_trait(*constraint_id, *trait_id) =>
+            {
+                (a.clone(), Vec::new())
+            }
+            (Type::Trait(trait_id, _), Type::Generic(constraint_id))
+                if self.generic_bound_carries_trait(*constraint_id, *trait_id) =>
+            {
+                (b.clone(), Vec::new())
             }
             // A mapped tuple parameter `(U in T: F<U>)` reconciled against a
             // concrete argument tuple: invert the template per element to infer the
@@ -28006,8 +28151,18 @@ impl<'src> Analyzer<'src> {
         queue.sort_by_key(|constraint| constraint.priority());
         for constraint in queue {
             self.current_waiting_on = Some(Vec::new());
+            // The anchor's scope decides which generic parameters are RIGID
+            // while this constraint resolves (B211): the ones an enclosing
+            // declaration owns. Set here, in the one place every constraint
+            // passes through, rather than threaded through `reconcile_type`'s
+            // sixty call sites.
+            self.rigid_binder_scope = self
+                .expr_id_to_scope_id_map
+                .get(&constraint.anchor())
+                .copied();
             let diagnostics_before = self.diagnostics.len();
             let resolution = self.try_resolve(&constraint);
+            self.rigid_binder_scope = None;
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
             self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
@@ -28652,9 +28807,11 @@ impl<'src> Analyzer<'src> {
                 // Bind the impl's generics from the receiver, exactly as the
                 // method-call path does, so the body monomorphizes.
                 let impl_subject_type = impl_subject.get_type(self);
-                if let Some((_, bindings)) =
-                    self.reconcile_type(&impl_subject_type, &receiver_type, &HashMap::default())
-                    && !bindings.is_empty()
+                if let Some((_, bindings)) = self.reconcile_declaration(
+                    &impl_subject_type,
+                    &receiver_type,
+                    &impl_subject_type,
+                ) && !bindings.is_empty()
                 {
                     self.static_subject_bindings
                         .insert(subject_id, bindings.into_iter().collect());
@@ -28864,6 +29021,14 @@ impl<'src> Analyzer<'src> {
                         return Resolution::Failed;
                     }
                     let substitution_context = HashMap::default();
+                    // A constructor call INSTANTIATES the enum's parameters, so
+                    // they are open here even inside an `impl Option<type T>`
+                    // that holds the same ids rigid (B211).
+                    let enum_generics = self
+                        .enums
+                        .get(&enum_id)
+                        .map(|enum_| enum_.generic_parameter_constraint_ids.clone())
+                        .unwrap_or_default();
                     for (index, data_type_id) in data_type_ids.iter().enumerate() {
                         let data_type = data_type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
@@ -28872,10 +29037,12 @@ impl<'src> Analyzer<'src> {
                         if matches!(argument_type, Type::Unresolved) {
                             return Resolution::Deferred;
                         }
-                        if self
-                            .reconcile_type(&argument_type, &data_type, &substitution_context)
-                            .is_none()
-                        {
+                        let previously_inferable =
+                            std::mem::replace(&mut self.inferable_generics, enum_generics.clone());
+                        let reconciled =
+                            self.reconcile_type(&argument_type, &data_type, &substitution_context);
+                        self.inferable_generics = previously_inferable;
+                        if reconciled.is_none() {
                             let expected =
                                 self.pretty_print_type(&data_type, &substitution_context);
                             let got = self.pretty_print_type(&argument_type, &substitution_context);
@@ -29513,7 +29680,7 @@ impl<'src> Analyzer<'src> {
                         // so the method body monomorphizes.
                         let impl_subject = impl_subject_id.get_type(self);
                         if let Some((_, bindings)) =
-                            self.reconcile_type(&impl_subject, &subject_type, &HashMap::default())
+                            self.reconcile_declaration(&impl_subject, &subject_type, &impl_subject)
                             && !bindings.is_empty()
                         {
                             self.method_call_substitution
@@ -31417,7 +31584,7 @@ impl<'src> Analyzer<'src> {
         for subject in lift_subjects {
             let candidate = subject.get_type(self);
             if self
-                .reconcile_type(subject_type, &candidate, &HashMap::default())
+                .reconcile_declaration(subject_type, &candidate, &candidate)
                 .is_some()
             {
                 return true;
@@ -31913,7 +32080,7 @@ impl<'src> Analyzer<'src> {
         for (index, subject) in candidates {
             let subject_type = subject.get_type(self);
             if self
-                .reconcile_type(&receiver_type, &subject_type, &HashMap::default())
+                .reconcile_declaration(&receiver_type, &subject_type, &subject_type)
                 .is_some()
             {
                 try_impl = Some(index);
@@ -31955,12 +32122,9 @@ impl<'src> Analyzer<'src> {
         };
         // Bind the impl's generics from the receiver, then substitute into the
         // trait's `[T, B]` to get the concrete good half.
+        let impl_subject_type = impl_subject.get_type(self);
         let bindings = self
-            .reconcile_type(
-                &receiver_type,
-                &impl_subject.get_type(self),
-                &HashMap::default(),
-            )
+            .reconcile_declaration(&receiver_type, &impl_subject_type, &impl_subject_type)
             .map(|(_, bindings)| bindings)
             .unwrap_or_default();
         let substitution: SubstitutionContext = bindings.into_iter().collect();
@@ -32893,12 +33057,22 @@ impl<'src> Analyzer<'src> {
             // THE field-value rule — shared with the assignment door
             // (`resolve_field_assignment`), so `S { field = value }` and
             // `s.field = value` cannot disagree about what fits (B166).
-            match self.check_field_value(
+            // A LITERAL instantiates the struct's parameters, so they are open
+            // here even inside an `impl Boxy<type T>` whose body holds the same
+            // ids rigid (B211) — `Boxy { value = fn(self.value) }` in
+            // `map<U>` binds `T := U`. The assignment door (`s.field = value`),
+            // which shares `check_field_value`, sets nothing: there the
+            // parameters are already fixed by the place being written.
+            let previously_inferable =
+                std::mem::replace(&mut self.inferable_generics, generic_param_ids.clone());
+            let verdict = self.check_field_value(
                 *field_value,
                 &struct_field_type,
                 &substitution_context,
                 *field_value_span,
-            ) {
+            );
+            self.inferable_generics = previously_inferable;
+            match verdict {
                 FieldValueVerdict::Deferred => {
                     deferred = true;
                     break;
@@ -32963,9 +33137,12 @@ impl<'src> Analyzer<'src> {
                 if matches!(value_type, Type::Unresolved | Type::Unknown) {
                     continue;
                 }
-                let Some((_unified, bindings)) =
-                    self.reconcile_type(&field_type, &value_type, &substitution_context)
-                else {
+                let previously_inferable =
+                    std::mem::replace(&mut self.inferable_generics, generic_param_ids.clone());
+                let reconciled =
+                    self.reconcile_type(&field_type, &value_type, &substitution_context);
+                self.inferable_generics = previously_inferable;
+                let Some((_unified, bindings)) = reconciled else {
                     continue;
                 };
                 for (constraint_id, type_id) in bindings {
@@ -35022,7 +35199,7 @@ impl<'src> Analyzer<'src> {
                         // trait's empty abstract member (B55).
                         let impl_subject = impl_subject_id.get_type(self);
                         if let Some((_, bindings)) =
-                            self.reconcile_type(&impl_subject, &iterable_type, &HashMap::default())
+                            self.reconcile_declaration(&impl_subject, &iterable_type, &impl_subject)
                             && !bindings.is_empty()
                         {
                             self.method_call_substitution
@@ -36336,7 +36513,7 @@ impl<'src> Analyzer<'src> {
                 // the emitter's never-silent check.
                 let impl_subject = impl_subject_id.get_type(self);
                 let bindings: SubstitutionContext = self
-                    .reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
+                    .reconcile_declaration(&impl_subject, &lhs_type, &impl_subject)
                     .map(|(_, bindings)| bindings.into_iter().collect())
                     .unwrap_or_default();
                 // B180: and the RIGHT operand has to belong to what that impl

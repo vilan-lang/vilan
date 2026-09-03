@@ -365,9 +365,39 @@ fn reactive_combine_variadic() {
 fn tuple_comprehension_over_mapped_source() {
     // A tuple comprehension `(x in xs => e)` maps each element of a mapped-tuple
     // source through the body, typing as `(U in T: <body>)`. Here `source.len()`
-    // collapses `(List<i32>, List<str>)` to `(i32, str) = T`. Lowers to a runtime
-    // `.map`, so it's arity-independent.
+    // sends every element to an `i32`, so the result is `(U in T: i32)` — the
+    // arity of `T` with `i32` in every slot. Lowers to a runtime `.map`, so it's
+    // arity-independent.
+    //
+    // B211 changed the RETURN this is declared with. It used to read `: T`, and
+    // that was never true: with `T = (i32, str)` the body produces `(i32, i32)`.
+    // It compiled because `reconcile_type`'s generic arm bound the body's OWN
+    // `T` to the mapped type — the leak B211 closed — and the run only looked
+    // right because `to_string` on a number reads the same either way. The
+    // declared return is now the type the body has, and the old spelling is
+    // refused (pinned below).
     assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        fun lengths<T: (2..)>(sources: (U in T: List<U>)): (U in T: i32) {
+            (source in sources => source.len())
+        }
+        fun main() {
+            let (a, b) = lengths(([1, 2, 3], ["a", "b"]));
+            print(i"{a.to_string()} {b.to_string()}");
+        }
+        "#,
+        "3 2\n",
+    );
+}
+
+#[test]
+fn b211_a_comprehension_may_not_re_bind_its_own_source_parameter() {
+    // The verdict change above, held as its own pin: declaring the return `T`
+    // when the body maps every element to an `i32` is a mismatch, not a binding.
+    // Before B211 this compiled and ran.
+    assert_fails_with(
         r#"
         import std::io::print;
         import std::display::Display;
@@ -379,7 +409,7 @@ fn tuple_comprehension_over_mapped_source() {
             print(i"{a.to_string()} {b.to_string()}");
         }
         "#,
-        "3 2\n",
+        "Expected T, but got (U in T: i32) instead.",
     );
 }
 
