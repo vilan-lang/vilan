@@ -12753,6 +12753,97 @@ mod m23_scripted_session {
     }
 }
 
+/// M24, where it meets M23: a world evicted by the BYTE BUDGET lets go of the
+/// overlay claims it held, exactly as a displaced or stale one does — and the
+/// live analysis that was served from that world goes on reading, because its
+/// own claim is what keeps the allocation alive.
+#[cfg(test)]
+mod m24_budget_eviction {
+    use super::*;
+    use crate::document::tests::{on_big_stack, std_root};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    const SIBLING: &str = "export fun app_shell(): i32 {\n\t7\n}\n";
+    const IMPORTER: &str =
+        "import pkg::views::app_shell;\n\nfun main() {\n\tlet shell = app_shell();\n}\n";
+
+    #[test]
+    fn an_evicted_world_releases_its_overlay_claims_and_the_live_analysis_survives() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_m24_claims_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let sibling_path = dir.join("views.vl");
+        let importer_path = dir.join("client.vl");
+        std::fs::write(&sibling_path, SIBLING).expect("write views.vl");
+        std::fs::write(&importer_path, IMPORTER).expect("write client.vl");
+
+        on_big_stack(move || {
+            let std_dir = std_root();
+            vilan_core::analyzer::set_base_cache_budget(
+                vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            );
+            vilan_core::analyzer::base_cache_clear();
+            // The sibling is OPEN, so the importer's world claims its copy.
+            vilan_core::analyzer::set_document_overlay(&sibling_path, Some(SIBLING.to_string()));
+            leak_tally::reset();
+            let document = Document::analyze_on_this_thread(IMPORTER, &std_dir, &importer_path);
+            assert!(
+                document.diagnostics.is_empty(),
+                "the fixture must compile clean, got {:?}",
+                document.diagnostics
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, SIBLING.len()),
+                "the stored world must claim the open sibling's copy (M23) — \
+                 without that this pin has nothing to evict"
+            );
+
+            // Evict it by budget rather than by staleness or displacement.
+            vilan_core::analyzer::set_base_cache_budget(1);
+            assert_eq!(
+                vilan_core::analyzer::base_cache_retained(),
+                0,
+                "the budget must evict the world"
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (0, 0),
+                "an evicted world must give its overlay claims back — every \
+                 eviction path releases through the same routine"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                SIBLING.len() as isize,
+                "the LIVE analysis's own claim keeps the allocation alive: \
+                 evicting a world must not free what a program is reading"
+            );
+            assert!(
+                !document.semantic_tokens().is_empty(),
+                "the analysis served from the evicted world must go on \
+                 answering from memory its own claim holds"
+            );
+
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                0,
+                "the last claim released is what frees the copy"
+            );
+
+            vilan_core::analyzer::set_base_cache_budget(
+                vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            );
+            vilan_core::analyzer::set_document_overlay(&sibling_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+}
+
 // Linux-only, and specifically Linux rather than unix: the harness reads
 // resident-set size from `/proc/self/statm`, which Windows does not have (the
 // CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1

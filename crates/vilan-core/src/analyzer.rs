@@ -41196,6 +41196,16 @@ struct BaseCacheKey {
 struct StoredWorld {
     world: World<'static>,
     overlay_claims: Vec<crate::owned_modules::ModuleClaim>,
+    /// What this world is recorded as retaining (M11's figure, computed once
+    /// at the store) — the currency the M24 budget is spent in. Kept beside
+    /// the world rather than recomputed at eviction so the release can never
+    /// give back a different number from the one the store recorded.
+    bytes: usize,
+    /// The tick of the last store or HIT of this world (M24) — the LRU key.
+    /// A hit refreshes it, which is what makes the eviction order "least
+    /// recently USED" rather than "oldest stored": the world a session keeps
+    /// coming back to is the one it keeps.
+    last_hit: u64,
 }
 
 /// The base cache (S3c, analysis-reuse.md §6.10): resolved pre-entry worlds
@@ -41208,10 +41218,110 @@ struct StoredWorld {
 /// [`StoredWorld::overlay_claims`] (M23), and the entry-derived strings that
 /// reach the world's maps (seeded module names, dependency display names) are
 /// interned above.
-static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, StoredWorld>>> =
+static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<BaseCacheState>> =
     std::sync::OnceLock::new();
 static BASE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BASE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The default retained-world byte budget (M24): generous, because the point
+/// is a BOUND, not a diet — a session that meets a handful of key shapes must
+/// never notice it, and one that walks a large workspace must not grow
+/// without end. Overridable at server start; see [`set_base_cache_budget`].
+pub const BASE_CACHE_DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+
+static BASE_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(BASE_CACHE_DEFAULT_BUDGET);
+
+/// The cache's whole mutable state, under one lock (M24): the worlds, the
+/// bytes they are recorded as retaining, and the monotonic tick that orders
+/// them by recency.
+///
+/// The byte total is kept here rather than recomputed, because eviction reads
+/// it on every store; it is the same figure [`base_cache_world_bytes`]
+/// records at the M11 tally site, so the two can never disagree about what a
+/// world is worth.
+#[derive(Default)]
+struct BaseCacheState {
+    worlds: HashMap<BaseCacheKey, StoredWorld>,
+    retained_bytes: usize,
+    tick: u64,
+}
+
+impl BaseCacheState {
+    fn next_tick(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    /// Evicts least-recently-hit worlds until the retained bytes fit the
+    /// budget (M24). `keep` — the world just stored — is never evicted: a
+    /// single world larger than the budget would otherwise be thrown away the
+    /// instant it was stored, turning the cache off rather than bounding it.
+    /// The bound is therefore "the budget, or one world, whichever is more",
+    /// and that is what the pins assert.
+    fn evict_to_budget(&mut self, keep: Option<&BaseCacheKey>) {
+        let budget = BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        while self.retained_bytes > budget {
+            let victim = self
+                .worlds
+                .iter()
+                .filter(|(key, _)| Some(*key) != keep)
+                .min_by_key(|(_, stored)| stored.last_hit)
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else { return };
+            if let Some(evicted) = self.worlds.remove(&victim) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(evicted.bytes);
+                // SAFETY (M23): the world is out of the map and dropped here;
+                // every analysis it was served to holds claims of its own.
+                unsafe { release_stored_world(evicted) };
+            }
+        }
+    }
+}
+
+/// Sets the retained-world byte budget (M24) and enforces it at once. The
+/// language server calls this at start from `VILAN_BASE_CACHE_BUDGET_MIB`;
+/// the tests call it directly, which is the whole test surface for the
+/// bound.
+///
+/// Enforcing immediately rather than at the next store is deliberate: a
+/// budget that only takes effect the next time something is cached is not a
+/// budget a session can be held to. With nothing stored yet — the server's
+/// case — the enforcement pass does nothing.
+#[doc(hidden)]
+pub fn set_base_cache_budget(bytes: usize) {
+    BASE_CACHE_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // No world is exempt here: this is not a store, so there is nothing to
+    // keep.
+    state.evict_to_budget(None);
+}
+
+/// The budget in force (M24) — the test surface, and what a `[vilan phase]`
+/// reader would want beside `base_cache_retained`.
+#[doc(hidden)]
+pub fn base_cache_budget() -> usize {
+    BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The bytes the retained worlds are recorded as holding right now (M24) —
+/// the number the budget is compared against, and the same figure the M11
+/// tally site records at `BaseCacheWorld`.
+#[doc(hidden)]
+pub fn base_cache_retained_bytes() -> usize {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retained_bytes
+        })
+        .unwrap_or(0)
+}
 
 /// (hits, misses) — the test surface.
 #[doc(hidden)]
@@ -41236,6 +41346,7 @@ pub fn base_cache_retained() -> usize {
             cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .worlds
                 .len()
         })
         .unwrap_or(0)
@@ -41255,17 +41366,20 @@ pub fn base_cache_overlay_claims() -> (usize, usize) {
             let cache = cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.values().fold((0, 0), |(count, bytes), stored| {
-                (
-                    count + stored.overlay_claims.len(),
-                    bytes
-                        + stored
-                            .overlay_claims
-                            .iter()
-                            .map(crate::owned_modules::ModuleClaim::text_bytes)
-                            .sum::<usize>(),
-                )
-            })
+            cache
+                .worlds
+                .values()
+                .fold((0, 0), |(count, bytes), stored| {
+                    (
+                        count + stored.overlay_claims.len(),
+                        bytes
+                            + stored
+                                .overlay_claims
+                                .iter()
+                                .map(crate::owned_modules::ModuleClaim::text_bytes)
+                                .sum::<usize>(),
+                    )
+                })
         })
         .unwrap_or((0, 0))
 }
@@ -41298,13 +41412,14 @@ pub fn base_cache_clear() {
         // record — a test clears from the runner's thread, a world was stored
         // on an analysis thread — which is the cross-thread shape
         // `leak_tally::outstanding` is signed for.
-        for (_, stored) in cache.drain() {
+        for (_, stored) in cache.worlds.drain() {
             // SAFETY (M23): the world is removed from the map and dropped
             // right here, so nothing borrows through its claims any more.
             // Other holders' claims — a live analysis's — keep their own
             // allocations alive.
             unsafe { release_stored_world(stored) };
         }
+        cache.retained_bytes = 0;
     }
 }
 
@@ -41361,11 +41476,11 @@ fn workspace_fingerprint(
 /// `None` (a miss, counted). Validation re-reads every recorded source and
 /// compares content hashes; a stale world is evicted, not repaired.
 fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'static>> {
-    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
-    let mut cache = cache
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+    let mut state = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let stale = if let Some(stored) = cache.get(key) {
+    let stale = if let Some(stored) = state.worlds.get(key) {
         let world = &stored.world;
         let entry_canonical = crate::util::canonical_path(entry_path);
         let entry_is_a_loaded_module = world
@@ -41404,7 +41519,14 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
                     ));
             if claimable {
                 BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                return Some(world.clone());
+                let clone = world.clone();
+                // M24: a hit refreshes the world's recency, so the LRU keeps
+                // what a session keeps coming back to.
+                let tick = state.next_tick();
+                if let Some(stored) = state.worlds.get_mut(key) {
+                    stored.last_hit = tick;
+                }
+                return Some(clone);
             }
             // Not stale — just not servable to THIS caller. Leave it stored
             // for the analyses that can claim it.
@@ -41418,7 +41540,8 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
     if stale {
         // A removed world stops being retained, so its bytes go back (M11)
         // and its overlay claims with them (M23).
-        if let Some(evicted) = cache.remove(key) {
+        if let Some(evicted) = state.worlds.remove(key) {
+            state.retained_bytes = state.retained_bytes.saturating_sub(evicted.bytes);
             // SAFETY (M23): the world is removed and dropped here, so no
             // reference taken through its claims survives; every analysis
             // that was ever served a clone of it holds claims of its own.
@@ -41498,23 +41621,35 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // only eviction this path has, so a session that never repeats a key
     // never releases, and THAT is what the site now makes countable.
     let stored_bytes = base_cache_world_bytes(&static_world);
-    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
-    let displaced = cache
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+    let mut state = cache
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            key,
-            StoredWorld {
-                world: static_world,
-                overlay_claims,
-            },
-        );
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tick = state.next_tick();
+    let displaced = state.worlds.insert(
+        key.clone(),
+        StoredWorld {
+            world: static_world,
+            overlay_claims,
+            bytes: stored_bytes,
+            last_hit: tick,
+        },
+    );
+    state.retained_bytes += stored_bytes;
     if let Some(displaced) = displaced {
+        state.retained_bytes = state.retained_bytes.saturating_sub(displaced.bytes);
         // SAFETY (M23): the displaced world is out of the map and dropped
         // here; any analysis it was ever served to took claims of its own.
         unsafe { release_stored_world(displaced) };
     }
     crate::leak_tally::record(crate::leak_tally::LeakSite::BaseCacheWorld, stored_bytes);
+    // M24: per-key overwrite was the only eviction this cache had, so a
+    // session that met N distinct key shapes retained N worlds for good —
+    // and M21 multiplied the key set by the sibling sets of a package. The
+    // budget is what bounds it; the world just stored is exempt, so a single
+    // oversized world turns the budget into "one world" rather than turning
+    // the cache off.
+    state.evict_to_budget(Some(&key));
 }
 
 /// Expands the ENTRY over a constructed [`World`] — the derive/macro hoist

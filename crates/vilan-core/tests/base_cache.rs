@@ -1205,3 +1205,195 @@ fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
     vilan_core::analyzer::base_cache_clear();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// The byte budget (backlog M24)
+// ---------------------------------------------------------------------------
+
+/// M24: the base cache had no eviction but per-key overwrite, so a session
+/// that met N distinct key shapes retained N worlds until something cleared
+/// the map — and M21 multiplied the key set by a package's sibling sets, so
+/// an N-file package can now mint N keys from one editing session. M11 made
+/// the growth VISIBLE (`base_cache_retained`, the `BaseCacheWorld` tally);
+/// this makes it BOUNDED.
+///
+/// The three claims, each asserted below: the retained bytes stay inside the
+/// budget; a HIT refreshes recency, so eviction is least-recently-USED rather
+/// than oldest-stored; and an evicted world gives its bytes back to the tally
+/// (and, after M23, its overlay claims with them).
+#[test]
+fn the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // A synthetic package of many entries, GENERATED here rather than checked
+    // in: `entry_<i>.vl` imports `pkg::mod_<i>`, so each entry mints its own
+    // base-cache key (the sibling set is part of it since M21) while every
+    // world is the same size — the sibling texts are fixed-width, so the
+    // budget arithmetic below is exact rather than approximate.
+    const ENTRIES: usize = 6;
+    let root = std::env::temp_dir().join(format!("vilan_m24_budget_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch dir");
+    let mut entry_paths = Vec::new();
+    let mut entry_sources: Vec<&'static str> = Vec::new();
+    for index in 0..ENTRIES {
+        std::fs::write(
+            root.join(format!("mod_{index}.vl")),
+            format!("fun value_{index}(): i32 {{\n\t{:04}\n}}\n", 1000 + index),
+        )
+        .expect("write module");
+        let entry_path = root.join(format!("entry_{index}.vl"));
+        let source = format!(
+            "import pkg::mod_{index}::value_{index};\n\nfun main() {{\n\tlet _v = value_{index}();\n}}\n"
+        );
+        std::fs::write(&entry_path, &source).expect("write entry");
+        entry_sources.push(Box::leak(source.into_boxed_str()));
+        entry_paths.push(entry_path);
+    }
+
+    let analyze = |index: usize| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_paths[index].clone();
+        let source = entry_sources[index];
+        let diagnostics = on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            drop(program);
+            diagnostics
+        });
+        assert_eq!(diagnostics, "[]", "entry {index} must analyze clean");
+    };
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(vilan_core::analyzer::base_cache_retained_bytes(), 0);
+
+    // Under the generous default, the growth M24 exists to bound is real:
+    // three distinct keys retain three worlds. (The vacuity guard — with no
+    // growth here the budget below would have nothing to bound.)
+    analyze(0);
+    let one_world = vilan_core::analyzer::base_cache_retained_bytes();
+    assert!(
+        one_world > 0,
+        "a stored world must be recorded as retaining something"
+    );
+    analyze(1);
+    analyze(2);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        3,
+        "three distinct sibling sets retain three worlds under the default \
+         budget — this is M24's finding, and the pin's vacuity guard"
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained_bytes(),
+        3 * one_world,
+        "the worlds are the same size by construction, so the budget \
+         arithmetic below is exact"
+    );
+
+    // The budget takes effect the moment it is set, not at the next store:
+    // two worlds' worth of budget keeps the two most recently used.
+    leak_tally::reset();
+    let budget = 2 * one_world;
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    assert_eq!(vilan_core::analyzer::base_cache_budget(), budget);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        2,
+        "the budget must evict down to what fits"
+    );
+    assert!(
+        vilan_core::analyzer::base_cache_retained_bytes() <= budget,
+        "retained {} B over a {budget} B budget",
+        vilan_core::analyzer::base_cache_retained_bytes(),
+    );
+    assert_eq!(
+        leak_tally::released(LeakSite::BaseCacheWorld),
+        one_world,
+        "an evicted world gives its recorded bytes back to the tally — the \
+         M11 site is what makes the bound checkable at all"
+    );
+
+    // Entry 0 was the least recently used, so it is the one that went.
+    let (hits_before, misses_before) = stats();
+    analyze(0);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before, misses_before + 1),
+        "the least-recently-used world must be the evicted one"
+    );
+
+    // A HIT refreshes recency. The cache now holds {1, 2, 0} trimmed to the
+    // budget — re-analyze entry 2 to hit it, then store a fresh key, and the
+    // world that goes must be the one nothing has touched.
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    analyze(3);
+    analyze(4);
+    let (hits_pre_touch, _) = stats();
+    analyze(3); // the HIT that refreshes entry 3's recency
+    let (hits_post_touch, _) = stats();
+    assert_eq!(
+        hits_post_touch,
+        hits_pre_touch + 1,
+        "the refreshing analysis must actually hit"
+    );
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    analyze(5); // a third key: the budget evicts one, and it must be entry 4
+    assert_eq!(vilan_core::analyzer::base_cache_retained(), 2);
+    let (hits_pre_3, misses_pre_3) = stats();
+    analyze(3);
+    let (hits_post_3, misses_post_3) = stats();
+    assert_eq!(
+        (hits_post_3, misses_post_3),
+        (hits_pre_3 + 1, misses_pre_3),
+        "the world a hit refreshed must survive the eviction — otherwise the \
+         policy is oldest-stored, not least-recently-used"
+    );
+    let (hits_pre_4, misses_pre_4) = stats();
+    analyze(4);
+    let (hits_post_4, misses_post_4) = stats();
+    assert_eq!(
+        (hits_post_4, misses_post_4),
+        (hits_pre_4, misses_pre_4 + 1),
+        "the untouched world must be the one that was evicted"
+    );
+
+    // A budget smaller than a single world does not turn the cache off: the
+    // world just stored is exempt, so the bound is "the budget, or one
+    // world, whichever is more".
+    vilan_core::analyzer::set_base_cache_budget(1);
+    assert!(
+        vilan_core::analyzer::base_cache_retained() <= 1,
+        "a one-byte budget must evict everything it is allowed to"
+    );
+    let (hits_tiny, misses_tiny) = stats();
+    analyze(0);
+    analyze(0);
+    let (hits_tiny_after, misses_tiny_after) = stats();
+    assert_eq!(
+        (hits_tiny_after, misses_tiny_after),
+        (hits_tiny + 1, misses_tiny + 1),
+        "even at a one-byte budget the world just stored survives to serve \
+         the next analysis of the same key"
+    );
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
