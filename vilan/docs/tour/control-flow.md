@@ -122,6 +122,21 @@ if !(slot is Some(let task)) { start(task); }              // error: unbound
 if !(slot is Some(let task)) { … } else { start(task); }   // fine: it matched
 ```
 
+That swap is what makes the **guard clause** work. Negate the test, leave
+the `if` through a `ret` or a `jump`, and the code after it is reachable
+only on the path where the pattern matched — so the capture is in scope
+there, for the rest of the block:
+
+```vilan,fragment
+if !(slot is Some(let task)) { ret; }
+start(task);                                               // fine: it matched
+```
+
+It needs all three parts. The then-branch has to actually leave (a branch
+that can fall through reaches the continuation on a miss), the `if` has to
+have no `else`, and the test has to be negated — `if slot is Some(let
+task) { ret; }` continues exactly where the pattern *didn't* match.
+
 One edge to know: a `match` can't sit directly inside a larger operator
 expression. Bind it to a local first.
 

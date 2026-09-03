@@ -839,11 +839,11 @@ fun bump<T: Add>(bag: Bag<T>, value: T): Bag<T> { bag + value }
 everywhere the test is known to have passed, and nowhere else: the
 **then-branch**, and the rest of the condition **to the right of an
 `&&`**. Not the `else` branch, where the test failed; not after the `if`,
-where nothing is known; and not the other arm of a `||`, which runs
-exactly when the test failed — nor, for a capture under a `||`, the
-then-branch, since reaching it proves only that *some* arm was true.
-Outside its scope the name is simply unbound, and reading it is the
-ordinary "cannot find" error.
+where nothing is known (except the guard clause below); and not the other
+arm of a `||`, which runs exactly when the test failed — nor, for a
+capture under a `||`, the then-branch, since reaching it proves only that
+*some* arm was true. Outside its scope the name is simply unbound, and
+reading it is the ordinary "cannot find" error.
 
 The rule follows the condition's **boolean spine** — `!`, `&&`, `||` and
 the `is` test itself — and stops there. A capture reached through
@@ -861,9 +861,28 @@ negations cancel. The `&&` rule is unchanged *inside* the negation —
 `!(x is P && …)` still binds the right operand, which the short-circuit
 reached by matching — but a negated capture does not cross an `&&` it
 sits to the left of, because `&&` carries only its left operand's true
-side. A capture under a `||` stays unbound in both branches. Binding the
-continuation after a diverging then-branch (`if !(x is P) { ret; }`) is
-not part of this rule; the name is unbound after the `if` as usual.
+side. A capture under a `||` stays unbound in both branches.
+
+The **guard clause** is the one place a capture outlives its `if`. When a
+condition binds captures on its FALSE path — the negated shapes above —
+the `if` has **no `else`**, and its then-branch **diverges** (every path
+out of it leaves — the `Never` rule of §5.1), then the only way past the
+`if` is that false path, where the pattern matched. Those captures are
+therefore in scope for **the rest of the enclosing block**, as ordinary
+declarations
+there: a later `let` of the name shadows them, and the block they belong
+to is the one the `if` was written in, not the function.
+
+All three conditions are load-bearing. An unnegated `if x is P(let n)
+{ ret; }` reaches its continuation exactly when the pattern *didn't*
+match. A then-branch that can fall through reaches it on a miss. And an
+`if` with an `else` reaches it through whichever arm did not diverge,
+which is a different question and is not part of this rule.
+
+*Implementation note (tracked gap): the divergence the guard clause reads
+counts `ret` and `jump` and not yet `panic(..)`, so a guard ending in a
+panic does not publish its captures. Tracked as B204/B187; pinned as an
+`#[ignore]`d test.*
 
 ```vilan,fragment
 if slot is Some(let n) { use(n); }                // yes: the test passed
@@ -879,7 +898,11 @@ if !(slot is Some(let n)) { … } else { use(n); }  // yes: it matched
 if !(!(slot is Some(let n))) { use(n); }          // yes: the negations cancel
 if !(slot is Some(let n) && n > 0) { … }          // yes for `n > 0`, no for the branch
 if !(slot is Some(let n)) && n > 0 { … }          // error: unbound here
-if !(slot is Some(let n)) { ret; } use(n);        // error: the `if` ended
+
+if !(slot is Some(let n)) { ret; } use(n);        // yes: the guard clause
+if !(slot is Some(let n)) { … } use(n);           // error: it can fall through
+if slot is Some(let n) { ret; } use(n);           // error: the test failed here
+if !(slot is Some(let n)) { ret; } else { … } use(n);  // error: it has an `else`
 ```
 
 A pattern is checked against the type of the value it matches, so an

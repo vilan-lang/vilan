@@ -21540,12 +21540,16 @@ impl<'src> Analyzer<'src> {
                     }
                 }
 
+                /// Returns the walked branch plus the captures THIS branch's
+                /// own condition proves by being false — what B195 hands the
+                /// `else` and what B187 publishes past a diverging guard. Empty
+                /// for a bare `else`, which has no condition of its own.
                 fn walk_branch<'src>(
                     s: &mut Analyzer<'src>,
                     branch: &'src NodeIfBranch,
                     scope_id: Id,
                     inherited: &InheritedCaptures<'src>,
-                ) -> ExprIfBranch {
+                ) -> (ExprIfBranch, InheritedCaptures<'src>) {
                     match branch {
                         NodeIfBranch::If(if_) => {
                             let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
@@ -21572,17 +21576,21 @@ impl<'src> Analyzer<'src> {
                             }
                             let then_ids = s.walk_expr_nodes(&if_.then.0.0, body_scope_id);
                             let then_expr_id = s.walk_expr_node(&if_.then.0.1, body_scope_id);
-                            ExprIfBranch::If(
-                                condition_id,
-                                (then_ids, then_expr_id),
-                                if_.else_.as_ref().map(|x| {
-                                    // Everything the enclosing chain proved on
-                                    // the way here, plus what this condition
-                                    // proves by being false.
-                                    let mut passed_on = inherited.clone();
-                                    passed_on.extend(negated_captures);
-                                    Box::new(walk_branch(s, &x.0, scope_id, &passed_on))
-                                }),
+                            let walked_else = if_.else_.as_ref().map(|x| {
+                                // Everything the enclosing chain proved on
+                                // the way here, plus what this condition
+                                // proves by being false.
+                                let mut passed_on = inherited.clone();
+                                passed_on.extend(negated_captures.iter().copied());
+                                Box::new(walk_branch(s, &x.0, scope_id, &passed_on).0)
+                            });
+                            (
+                                ExprIfBranch::If(
+                                    condition_id,
+                                    (then_ids, then_expr_id),
+                                    walked_else,
+                                ),
+                                negated_captures,
                             )
                         }
                         NodeIfBranch::Else(body) => {
@@ -21590,11 +21598,44 @@ impl<'src> Analyzer<'src> {
                             declare_inherited(s, body_scope_id, inherited);
                             let else_ids = s.walk_expr_nodes(&body.0.0, body_scope_id);
                             let else_expr_id = s.walk_expr_node(&body.0.1, body_scope_id);
-                            ExprIfBranch::Else((else_ids, else_expr_id))
+                            (ExprIfBranch::Else((else_ids, else_expr_id)), Vec::new())
                         }
                     }
                 }
-                let branch = walk_branch(self, if_, scope_id, &Vec::new());
+                let (branch, false_path_captures) = walk_branch(self, if_, scope_id, &Vec::new());
+                // B187, the guard clause — negate, diverge, continue. With no
+                // `else` and a then-branch that provably diverges, the ONLY way
+                // past this `if` is the condition's false path, which is the
+                // very path B195 hands the `else` its captures on. So those
+                // captures are published into the ENCLOSING scope, visible from
+                // the end of the `if` onward — an ordinary declaration there, so
+                // a later `let` of the name shadows it like any other.
+                //
+                // Divergence is `Divergence::checker`'s answer, the one the type
+                // checker itself acts on, so the guard and the editor's
+                // unreachable-code paint cannot disagree about what "dead" is.
+                // (`panic(…)` is a leaf for the paint and not for the checker;
+                // when the checker gains it, the guard gains it with no change
+                // here.)
+                let continuation_captures = match &branch {
+                    ExprIfBranch::If(_, (then_ids, then_tail), None)
+                        if !false_path_captures.is_empty()
+                            && Divergence::checker(&self.expr_id_to_expr_map)
+                                .block(then_ids, *then_tail) =>
+                    {
+                        false_path_captures
+                    }
+                    _ => Vec::new(),
+                };
+                for (name, capture_id, visible_until) in continuation_captures {
+                    self.declare_scope_value_until(
+                        scope_id,
+                        name,
+                        capture_id,
+                        node.1.end,
+                        visible_until,
+                    );
+                }
                 // A value `if` — one with a final `else` — has its arms unified
                 // by the same rule a `match`'s legs go through (B163). Queued
                 // here rather than folded into the inference so the check runs

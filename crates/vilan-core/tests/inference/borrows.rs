@@ -7451,11 +7451,11 @@ fn b195_a_negated_capture_under_an_or_does_not_reach_the_else_branch() {
 }
 
 #[test]
-fn b195_the_guard_clause_shape_is_refused_in_both_places() {
-    // `if !(x is P) { ret; }` — the then-branch is refused by the rule above,
-    // and the CONTINUATION after the `if` stays refused too: making the binding
-    // live on past a diverging then-branch is B187's design to rule, not this
-    // fix's to smuggle in.
+fn b195_the_guard_clauses_then_branch_stays_refused() {
+    // `if !(x is P) { print(n); ret; }` — the then-branch runs when the test
+    // FAILED, so the payload is not there whatever the branch goes on to do.
+    // B187 opened the CONTINUATION after this `if`; the branch itself is still
+    // the bug B195 fixed.
     assert_fails_once_with(
         r#"
         import std::io::print;
@@ -7467,17 +7467,322 @@ fn b195_the_guard_clause_shape_is_refused_in_both_places() {
         "#,
         "cannot find 'n' in this scope",
     );
+}
+
+// --- B187: the guard clause — negate, diverge, continue -----------------------
+//
+// The owner's ruling (Order 24, off B171's scope ruling): "`if !(x is
+// Some(let y)) { return }` — would the binding be accessible after?" Yes.
+//
+// The reasoning is B195's else rule read one step further. `!(x is P)` is true
+// exactly where `P` failed, so the capture is bound on the condition's FALSE
+// path; B195 gives that path a home when the `if` has an `else`. With no
+// `else` and a then-branch that provably DIVERGES, the false path has a
+// different home — the rest of the enclosing block — and it is the only way to
+// get there. So the captures the condition binds on its false path are declared
+// into the ENCLOSING scope, visible from the end of the `if` onward.
+//
+// The three conditions, each pinned below:
+//   * NEGATED (or otherwise bound on the false path) — an unnegated `is` whose
+//     then-branch diverges proves the test FAILED on the continuation;
+//   * DIVERGING then-branch, decided by the checker's own divergence analysis
+//     (`Divergence::checker`: `ret` and `jump` are its leaves), so the editor
+//     and the checker cannot disagree about what "dead" means;
+//   * NO `else` — the guard clause is the one-armed shape. A two-armed `if`
+//     reaches its continuation through the arm that did NOT diverge, which is a
+//     wider rule (it would have to cover `if x is P(let n) { … } else { ret; }`
+//     too) and nobody has ruled it.
+// A `||`-composed condition does not qualify: B171 caps its captures at the
+// operand, so there is nothing on the false path to publish.
+
+#[test]
+fn b187_a_diverging_guard_binds_the_continuation() {
+    // The exhibit. `ret` is the shape the owner asked about.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_the_guard_really_returns_when_the_pattern_missed() {
+    // The other half of the exhibit: the continuation is not merely typeable,
+    // it is unreachable on a miss.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { print("missed"); ret; }
+            print(n);
+        }
+        fun main() { guard(None); }
+        "#,
+        "missed\n",
+    );
+}
+
+#[test]
+fn b187_a_jump_break_diverges_for_the_guard() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            for {
+                if !(maybe is Some(let n)) { jump break; }
+                print(n);
+                jump break;
+            }
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_a_jump_continue_diverges_for_the_guard() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            mut seen = false;
+            for !seen {
+                seen = true;
+                if !(maybe is Some(let n)) { jump continue; }
+                print(n);
+            }
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_a_nested_block_that_diverges_counts() {
+    // Divergence is the checker's recursive answer, not a syntactic look at the
+    // last statement: a block whose every path leaves is a diverging block.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>, flag: bool) {
+            if !(maybe is Some(let n)) {
+                if flag { ret; } else { ret; }
+            }
+            print(n);
+        }
+        fun main() { guard(Some(2), true); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_a_non_diverging_then_branch_binds_nothing() {
+    // The control that makes the whole rule sound: if the then-branch can fall
+    // through, the continuation is reachable on a MISS, and the payload is not
+    // there.
     assert_fails_once_with(
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        fun main() {
-            let maybe = Some(2);
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { print("missed"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_an_else_branch_keeps_the_continuation_unbound() {
+    // A two-armed `if` is not the guard clause. Its continuation is reached
+    // through whichever arm did not diverge — here the `else`, where B195
+    // already declares the capture — and extending the binding past the `if`
+    // from there is a wider rule than the one that was ruled: it would have to
+    // answer for `if x is P(let n) { … } else { ret; }` in the same breath.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { ret; } else { print(n); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_an_unnegated_guard_binds_nothing_after_the_if() {
+    // The polarity matters, and it is the reason the rule reads off B195's
+    // false-path set rather than off "there was an `is` in the condition":
+    // reaching the continuation of THIS `if` proves the pattern did not match.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if maybe is Some(let n) { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_an_or_composed_guard_binds_nothing() {
+    // `!(x is P) || flag` being false proves only that BOTH operands were
+    // false, and the `||` cap (B171) already keeps the capture inside its
+    // operand, so there is nothing on the false path to publish.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>, flag: bool) {
+            if !(maybe is Some(let n)) || flag { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2), false); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_a_negated_and_publishes_both_of_its_captures() {
+    // `!(A && B)` is false exactly when both matched, so both captures are on
+    // the false path — the two-capture case, one per operand.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(left: Option<i32>, right: Option<i32>) {
+            if !(left is Some(let a) && right is Some(let b)) { ret; }
+            print(a + b);
+        }
+        fun main() { guard(Some(2), Some(3)); }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b187_one_pattern_can_publish_two_captures() {
+    // The two captures of one variant payload, both published together.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        enum Pair { Both(i32, i32), Neither }
+        fun guard(pair: Pair) {
+            if !(pair is Pair::Both(let a, let b)) { ret; }
+            print(a + b);
+        }
+        fun main() { guard(Pair::Both(2, 3)); }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b187_the_continuation_binding_can_be_shadowed() {
+    // The capture is an ordinary declaration in the enclosing scope from the
+    // end of the `if` onward, so a later `let` of the same name shadows it the
+    // way it shadows any other (local-shadowing.md §2).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { ret; }
+            print(n);
+            let n = 9;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n9\n",
+    );
+}
+
+#[test]
+fn b187_the_continuation_binding_shadows_an_earlier_local() {
+    // And it shadows in the other direction: from the end of the `if`, the
+    // name is the capture, not the `let` that came before it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            let n = 9;
+            print(n);
             if !(maybe is Some(let n)) { ret; }
             print(n);
         }
+        fun main() { guard(Some(2)); }
+        "#,
+        "9\n2\n",
+    );
+}
+
+#[test]
+fn b187_the_continuation_binding_stops_at_the_enclosing_block() {
+    // The scope is the rest of the ENCLOSING block, which is where the guard
+    // was written — not the function, and not the block's parent.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>, flag: bool) {
+            if flag {
+                if !(maybe is Some(let n)) { ret; }
+                print(n);
+            }
+            print(n);
+        }
+        fun main() { guard(Some(2), true); }
         "#,
         "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+#[ignore = "B204: `Divergence::checker` does not count `panic` as a leaf yet"]
+fn b187_a_panicking_guard_binds_the_continuation() {
+    // The guard clause's other idiomatic ending. `Divergence::paint` already
+    // treats a `panic(…)` call as a leaf; the CHECKER deliberately does not
+    // (widening it changes what satisfies a declared return type), and lane
+    // b204 is the one moving that line this order. Un-ignore when it lands.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
     );
 }
 
