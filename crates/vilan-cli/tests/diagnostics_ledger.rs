@@ -330,10 +330,37 @@ fn source_blob() -> String {
 // --- The index -------------------------------------------------------------
 
 struct Row {
-    number: u32,
+    /// The ledger row number — or `None` for a row still written `NEW`.
+    ///
+    /// A lane that ships a message owes it a row in the same change, but it
+    /// cannot know its NUMBER: every other lane of the same order is adding
+    /// rows to the same tail of this file, so a minted number is a collision
+    /// waiting for the merge and a renumbering afterwards. `NEW` is what a
+    /// lane writes instead; integration assigns the numbers when the branches
+    /// land, in the order they land. Every other check treats a `NEW` row
+    /// exactly as a numbered one — it must have a key, that key must still be
+    /// in the tree, and it holds enumerated sites the same way — so a message
+    /// gains its coverage the moment it ships rather than at the merge.
+    number: Option<u32>,
     flagship: bool,
     key: String,
 }
+
+impl Row {
+    /// How the row names itself in a failure message, and the string the
+    /// exemption lists are keyed on: the number, or `NEW`. A `NEW` row matches
+    /// no exemption, which is the right default — an exemption is an argument
+    /// about a specific row, and there is no specific row yet.
+    fn label(&self) -> String {
+        match self.number {
+            Some(number) => number.to_string(),
+            None => NEW.to_string(),
+        }
+    }
+}
+
+/// The row id a lane writes for a message whose number integration assigns.
+const NEW: &str = "NEW";
 
 fn index() -> Vec<Row> {
     let text = read(INDEX);
@@ -347,9 +374,14 @@ fn index() -> Vec<Row> {
         let flagship = fields.next().expect("a flagship column");
         let key = fields.next().expect("a key");
         rows.push(Row {
-            number: number
-                .parse()
-                .unwrap_or_else(|_| panic!("row number: {number:?}")),
+            number: match number {
+                NEW => None,
+                _ => Some(
+                    number
+                        .parse()
+                        .unwrap_or_else(|_| panic!("row number: {number:?}")),
+                ),
+            },
             flagship: match flagship {
                 "flagship" => true,
                 "-" => false,
@@ -660,33 +692,46 @@ fn the_index_is_well_formed() {
     let rows = index();
     assert!(rows.len() > 300, "the index lost rows: {}", rows.len());
     let mut previous = 0u32;
+    let mut unnumbered = false;
     for row in &rows {
-        assert!(
-            row.number > previous,
-            "row {} is out of order (after {previous})",
-            row.number
-        );
-        previous = row.number;
+        match row.number {
+            Some(number) => {
+                // A numbered row after a `NEW` one would be renumbered into the
+                // middle of the file at integration, which is how the ledger's
+                // order and this file's order come apart.
+                assert!(
+                    !unnumbered,
+                    "row {number} is numbered but follows a `{NEW}` row; the rows \
+                     awaiting a number belong at the END of the index"
+                );
+                assert!(
+                    number > previous,
+                    "row {number} is out of order (after {previous})"
+                );
+                previous = number;
+            }
+            None => unnumbered = true,
+        }
         assert!(
             !row.key.trim().is_empty(),
             "row {} has an empty key",
-            row.number
+            row.label()
         );
         let exempt = KEYS_WITHOUT_A_FRAGMENT
             .iter()
-            .any(|(number, _)| *number == row.number.to_string());
+            .any(|(number, _)| *number == row.label());
         assert!(
             exempt || longest_fragment(&row.key).is_some(),
             "row {}'s key has no literal run of {MIN_FRAGMENT} characters to search for: {:?}.\n\
              Either the key is wrong, or the head is COMPOSED — record it in \
              KEYS_WITHOUT_A_FRAGMENT with the reason.",
-            row.number,
+            row.label(),
             row.key
         );
     }
     for (number, _) in ROWS_WITHOUT_A_KEY {
         assert!(
-            !rows.iter().any(|row| row.number.to_string() == *number),
+            !rows.iter().any(|row| row.label() == *number),
             "row {number} is recorded as keyless but appears in the index"
         );
     }
@@ -703,7 +748,8 @@ fn every_indexed_row_still_lives_in_the_tree() {
         if !blob.contains(&fragment) {
             stale.push(format!(
                 "  row {}: {:?}\n      not in the tree: {fragment:?}",
-                row.number, row.key
+                row.label(),
+                row.key
             ));
         }
     }
@@ -732,7 +778,7 @@ fn every_diagnostic_the_compiler_builds_is_indexed() {
         .map(|row| {
             let composed = KEYS_WITHOUT_A_FRAGMENT
                 .iter()
-                .any(|(number, _)| *number == row.number.to_string());
+                .any(|(number, _)| *number == row.label());
             (row, composed)
         })
         .collect();
@@ -830,7 +876,7 @@ fn every_flagship_row_is_quoted_by_the_errors_appendix() {
             })
         });
         if !quoted {
-            undocumented.push(format!("  row {}: {:?}", row.number, row.key));
+            undocumented.push(format!("  row {}: {:?}", row.label(), row.key));
         }
     }
     assert!(
@@ -886,7 +932,7 @@ fn every_hand_rowed_row_is_in_the_index() {
     let missing: Vec<&str> = ROWS_THE_ENUMERATION_CANNOT_REACH
         .iter()
         .map(|(number, _)| *number)
-        .filter(|number| !rows.iter().any(|row| row.number.to_string() == *number))
+        .filter(|number| !rows.iter().any(|row| row.label() == *number))
         .collect();
     assert!(
         missing.is_empty(),
@@ -914,7 +960,7 @@ fn every_hand_rowed_row_is_still_out_of_the_enumerations_reach() {
     let reached: Vec<String> = ROWS_THE_ENUMERATION_CANNOT_REACH
         .iter()
         .filter_map(|(number, _)| {
-            let row = rows.iter().find(|row| row.number.to_string() == *number)?;
+            let row = rows.iter().find(|row| row.label() == *number)?;
             sites
                 .iter()
                 .filter(|site| !site.is_note)
@@ -949,11 +995,12 @@ fn every_fragmentless_key_still_has_no_fragment() {
         .filter(|row| {
             KEYS_WITHOUT_A_FRAGMENT
                 .iter()
-                .any(|(number, _)| *number == row.number.to_string())
+                .any(|(number, _)| *number == row.label())
         })
         .filter_map(|row| {
+            let label = row.label();
             longest_fragment(&row.key)
-                .map(|fragment| format!("  row {}: searchable as {fragment:?}", row.number))
+                .map(|fragment| format!("  row {label}: searchable as {fragment:?}"))
         })
         .collect();
     assert!(

@@ -995,6 +995,9 @@ type-level spread `(..T, U)` are recorded future work.*
 element and, through a `mut` binding, assigns it. Tuples store flat: a
 tuple-typed element occupies its elements' slots, so accessing one
 yields its region as a value (destructuring reads the same layout).
+Positional access and destructuring are the element-wise spellings a
+tuple has: a tuple is **not iterable**, and `for x in t` is refused
+because the binder would have no single type to take (§3.5).
 
 ## 5.10 `!` and `?.`
 
