@@ -6681,7 +6681,7 @@ mod cancellation_tests {
     /// anything: the analysis really was cancelled (it answered `None`), and it
     /// stopped in less time than it had left to run.
     #[test]
-    #[ignore = "M26: the cancel-latency instrument — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
+    #[ignore = "E121: the cancel-latency instrument (M26) — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
     fn cancel_latency_on_the_exhibit() {
         use crate::keystroke::gate::loadavg_1m;
         use vilan_core::cancel::CancelToken;
@@ -6761,7 +6761,7 @@ mod cancellation_tests {
     /// Minutes of analysis — run deliberately, like the latency gate it shares
     /// its subject with.
     #[tokio::test]
-    #[ignore = "M26: the cancellation instrument — a generated 1,791-function exhibit and a ten-keystroke burst, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
+    #[ignore = "E121: the cancellation instrument (M26) — a generated 1,791-function exhibit and a ten-keystroke burst, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
     async fn cancellation_measurement_on_the_exhibit() {
         let (directory, entry) = exhibit(crate::keystroke::gate::GATE_FUNCTIONS);
         burst_measurement("syn1791", &entry, crate::keystroke::gate::EXHIBIT_ENTRY, 10).await;
@@ -6777,7 +6777,7 @@ mod cancellation_tests {
     /// reading the rows. With the variable unset there is nothing to measure
     /// and the test says so rather than pretending.
     #[tokio::test]
-    #[ignore = "M26: the cancellation instrument over an external subject; set VILAN_M26_SUBJECT to a .vl file in its own package and run deliberately"]
+    #[ignore = "E121: the cancellation instrument (M26) over an external subject; set VILAN_M26_SUBJECT to a .vl file in its own package and run deliberately"]
     async fn cancellation_measurement_on_an_external_subject() {
         let Ok(path) = std::env::var("VILAN_M26_SUBJECT") else {
             panic!(
