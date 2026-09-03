@@ -43,7 +43,9 @@ use vilan_core::{
     BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Program, Workspace,
     analyze_source, transform,
 };
-use vilan_ide::{Analysis, Completion, CompletionKind, ImportRoots, LineIndex, Position};
+use vilan_ide::{
+    Analysis, Completion, CompletionIndex, CompletionKind, ImportRoots, LineIndex, Position,
+};
 
 /// The synthetic root the embedded toolchain is registered under. It never
 /// exists on any disk; `util::canonical_path` normalizes a non-existent path
@@ -231,23 +233,32 @@ struct Retained {
     entity_spans: Vec<(usize, usize, Id)>,
     platform_requirements: HashMap<Id, String>,
     import_roots: ImportRoots,
+    /// What completion may read that is a function of the analysis alone
+    /// (M25): the auto-import candidate table and the origins' module
+    /// listings. Derived here, where the program is retained, so a keystroke
+    /// reads it instead of re-deriving it — the same place in the playground's
+    /// life that `Document::capture_landed` is in the server's.
+    completion_index: CompletionIndex,
 }
 
 impl Retained {
     fn new(text: &'static str, program: Program<'static>) -> Retained {
         let entity_spans = vilan_ide::entity_spans(&program);
         let platform_requirements = vilan_core::platform_color::requirements(&program);
+        let import_roots = ImportRoots {
+            std: embedded_std_spec(),
+            pkg_root: PathBuf::from(PROJECT_ROOT),
+            dependencies: Vec::new(),
+        };
+        let completion_index = CompletionIndex::build(&program, Some(&import_roots));
         Retained {
             text,
             program,
             analyzed: LineIndex::new(text),
             entity_spans,
             platform_requirements,
-            import_roots: ImportRoots {
-                std: embedded_std_spec(),
-                pkg_root: PathBuf::from(PROJECT_ROOT),
-                dependencies: Vec::new(),
-            },
+            import_roots,
+            completion_index,
         }
     }
 }
@@ -724,6 +735,7 @@ pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<Completi
             entity_spans: &retained.entity_spans,
             platform_requirements: &retained.platform_requirements,
             import_roots: Some(&retained.import_roots),
+            index: &retained.completion_index,
             source_texts: Default::default(),
         };
         let offset = live.offset(Position { line, character });

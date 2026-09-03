@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use vilan_core::analyzer::{Expr, Implementation, SourceId};
+use vilan_core::analyzer::{Expr, Implementation, Program, SourceId};
 use vilan_core::formatter::{STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS};
 use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
@@ -1620,14 +1620,25 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let Some((origin, rest)) = segments.split_first() else {
             return origin_completions(roots);
         };
-        let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
+        let Some((module_roots, _surface)) = roots.origin_roots(origin, program.platform) else {
             // Not an origin — a same-file `mod`, or a namespace already in the
             // program under some other name. The last segment is the namespace
             // being descended into, which is all the by-name lookup reads.
             return self.namespace_completions_by_name(rest.last().unwrap_or(origin));
         };
         match rest.split_first() {
-            None => origin_member_completions(&module_roots, surface.as_deref()),
+            // `origin::` — the origin's whole module list. Served from the
+            // index's captured listing (M25): this arm used to call
+            // `modules_in_root`, a `read_dir` per source root, per request,
+            // and §2.1 is explicit that the keystroke path may not read the
+            // filesystem. An origin the analysis did not record enumerates
+            // nothing, which is the same empty answer an unresolvable origin
+            // has always given.
+            None => self
+                .index
+                .origin(origin)
+                .map(|listing| listing.completions())
+                .unwrap_or_default(),
             Some((module, past_module)) => {
                 module_member_completions(&module_roots, module, past_module)
             }
@@ -1776,54 +1787,18 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// cap's last-to-survive candidates are always `std`'s, never `pkg`'s —
     /// a std-heavy file's loaded surface still cannot flood the popup, and
     /// now `std` only spends slots `pkg` didn't need.
+    ///
+    /// **The candidates themselves are not derived here** (M25). Which names
+    /// exist, what kind each is, which module declares it and how they rank
+    /// are all functions of the analyzed `Program` alone, so they are computed
+    /// once per analysis into [`AutoImportOrder`] and this function reads the
+    /// table. What is left is the part that genuinely depends on the cursor
+    /// and the live buffer: skipping the names already in scope, stopping at
+    /// the cap, and rendering each survivor's import edit.
     fn auto_import_completions(&self, in_scope: &HashSet<&str>) -> Vec<Completion> {
-        let program = self.program;
-        let mut candidates: Vec<(u8, String, CompletionKind, Vec<String>)> = Vec::new();
-        for root in ["std", "pkg"] {
-            let Some(&root_module_id) = program.module_id_by_name.get(root) else {
-                continue;
-            };
-            let Some(root_module) = program.modules.get(&root_module_id) else {
-                continue;
-            };
-            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
-                continue;
-            };
-            let tier = import_origin_tier(root);
-            for &child_id in root_scope.name_to_id_map.values() {
-                let Some(child_module) = program.modules.get(&child_id) else {
-                    continue;
-                };
-                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
-                    continue;
-                };
-                let child_source = program.source_of(child_id);
-                for (&name, &entity_id) in &child_scope.name_to_id_map {
-                    if in_scope.contains(name) {
-                        continue;
-                    }
-                    if program.source_of(entity_id) != child_source {
-                        continue;
-                    }
-                    let kind = self.kind_of(entity_id);
-                    if matches!(
-                        kind,
-                        CompletionKind::Module | CompletionKind::Keyword | CompletionKind::Snippet
-                    ) {
-                        continue;
-                    }
-                    candidates.push((
-                        tier,
-                        name.to_string(),
-                        kind,
-                        vec![root.to_string(), child_module.name.to_string()],
-                    ));
-                }
-            }
-        }
-        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        candidates.truncate(AUTO_IMPORT_COMPLETION_CAP);
-        if candidates.is_empty() {
+        let order = &self.index.auto_import;
+        let chosen = order.take(in_scope, AUTO_IMPORT_COMPLETION_CAP);
+        if chosen.is_empty() {
             return Vec::new();
         }
         // ONE parse of the live buffer, shared by every candidate's edit
@@ -1837,23 +1812,24 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let Some(parsed) = vilan_core::formatter::ParsedSource::parse(source) else {
             return Vec::new();
         };
-        candidates
+        chosen
             .into_iter()
-            .filter_map(|(tier, name, kind, module_path)| {
-                let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
-                let edit = parsed.insert_import(&path_refs, &name)?;
+            .filter_map(|candidate| {
+                let module = &order.modules[candidate.module as usize];
+                let path_refs: Vec<&str> = module.path.iter().map(String::as_str).collect();
+                let edit = parsed.insert_import(&path_refs, &candidate.name)?;
                 Some(Completion {
-                    label: name,
-                    kind,
+                    label: candidate.name.clone(),
+                    kind: candidate.kind,
                     detail: None,
                     documentation: None,
                     call_parameters: None,
                     snippet: None,
                     needs_import: Some(AutoImport {
-                        module_path,
+                        module_path: module.path.clone(),
                         edit_span: edit.span,
                         edit_replacement: edit.replacement,
-                        origin_tier: tier,
+                        origin_tier: candidate.tier,
                     }),
                 })
             })
@@ -2108,20 +2084,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
 
     /// The completion category for a name bound in a scope.
     fn kind_of(&self, id: Id) -> CompletionKind {
-        let program = self.program;
-        if program.functions.contains_key(&id) || program.external_functions.contains_key(&id) {
-            CompletionKind::Function
-        } else if program.structs.contains_key(&id) {
-            CompletionKind::Struct
-        } else if program.enums.contains_key(&id) {
-            CompletionKind::Enum
-        } else if program.traits.contains_key(&id) {
-            CompletionKind::Trait
-        } else if program.modules.contains_key(&id) {
-            CompletionKind::Module
-        } else {
-            CompletionKind::Variable
-        }
+        kind_of(self.program, id)
     }
 
     /// Builds a completion for a named entity, enriched for the popup and for
@@ -2211,35 +2174,6 @@ fn origin_completions(roots: &ImportRoots) -> Vec<Completion> {
             .iter()
             .map(|(name, _)| Completion::bare(name.clone(), CompletionKind::Module)),
     );
-    items
-}
-
-/// What `origin::` offers: every module under the origin's source roots, in the
-/// loader's own root order (an earlier root shadows a later one, so a matching
-/// platform layer wins over the base), followed by the names its `lib.vl`
-/// surface publishes.
-fn origin_member_completions(module_roots: &[&Path], surface: Option<&Path>) -> Vec<Completion> {
-    let mut items = Vec::new();
-    let mut seen: HashSet<String> = HashSet::default();
-    for root in module_roots {
-        for (name, _path) in vilan_core::analyzer::modules_in_root(root) {
-            // `lib.vl` is the package's SURFACE, integrated into the package
-            // name itself — its members are offered right here, one loop down,
-            // and `import std::lib` is not how anyone reaches them.
-            if name == "lib" || !seen.insert(name.clone()) {
-                continue;
-            }
-            items.push(Completion::bare(name, CompletionKind::Module));
-        }
-    }
-    for importable in surface
-        .map(vilan_core::analyzer::module_importables)
-        .unwrap_or_default()
-    {
-        if seen.insert(importable.name.to_string()) {
-            items.push(importable_completion(&importable));
-        }
-    }
     items
 }
 
@@ -2405,4 +2339,271 @@ pub fn call_insertion(
         text,
         is_snippet: true,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The completion index (E121 §2.1.4, M25)
+// ---------------------------------------------------------------------------
+
+/// Everything completion needs that is a function of the ANALYSIS ALONE —
+/// built once when an analysis lands, read by every request until the next one.
+///
+/// M25's find, and the reason this type exists. Two of `completion`'s
+/// gatherers cost the CODEBASE on every keystroke, inside a request that the
+/// mandate says must cost the FILE:
+///
+/// - [`AutoImportOrder`] — `auto_import_completions` swept every `std`/`pkg`
+///   child module's `name_to_id_map`, classified each name and sorted the
+///   result, per request. On kolt's `views.vl` that sweep found 2,239
+///   candidates and cost 1.05 ms of the 2.19 ms a scope completion took; on
+///   E121's generated 1,791-function exhibit it was most of 0.63 ms.
+/// - [`OriginListing`] — an import path's origin arm called
+///   [`vilan_core::analyzer::modules_in_root`], a `read_dir` per source root,
+///   per request. §2.1 is explicit that the keystroke path may not read the
+///   filesystem at all.
+///
+/// Neither depends on the cursor, on the live buffer, or on the file's own
+/// scope, so neither belongs in a request. Both are derived here from the
+/// analyzed `Program` and the package tree it resolved, on the thread that
+/// produced them — the language server's analysis thread
+/// (`Document::capture_landed`) and the playground's `Retained::new`. A
+/// request reads the table and pays for the answer, not for the derivation.
+///
+/// The freshness rule is the one §2.1.4 asks for, stated exactly: an entry is
+/// as old as the analysis it was built from, and it is replaced wholesale when
+/// the next analysis lands. Every event that could move it — an edit to any
+/// module, a manifest change, a file appearing or disappearing under a source
+/// root — is already an event that re-analyzes, so there is no second
+/// invalidation protocol to keep truthful and no way for the two to disagree.
+#[derive(Clone, Debug, Default)]
+pub struct CompletionIndex {
+    auto_import: AutoImportOrder,
+    origins: Vec<OriginListing>,
+}
+
+impl CompletionIndex {
+    /// Derive the index from a landed analysis. `import_roots` is the package
+    /// tree that analysis resolved under — `None` for the degraded
+    /// internal-error document, which can enumerate no origin.
+    pub fn build(program: &Program, import_roots: Option<&ImportRoots>) -> CompletionIndex {
+        CompletionIndex {
+            auto_import: AutoImportOrder::build(program),
+            origins: import_roots
+                .map(|roots| OriginListing::build(roots, program.platform))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The modules and surface `origin::` offers, as the package tree stood
+    /// when the analysis ran. `None` for a name that is not an origin.
+    fn origin(&self, origin: &str) -> Option<&OriginListing> {
+        self.origins.iter().find(|listing| listing.origin == origin)
+    }
+}
+
+/// One origin's module listing — `std`, `pkg`, or a dependency package under
+/// the name this file addresses it by.
+///
+/// The names are [`vilan_core::analyzer::modules_in_root`]'s, over the origin's
+/// source roots in the loader's own order with an earlier root shadowing a
+/// later one, and with the package SURFACE (`lib.vl`) dropped: it is integrated
+/// into the package name and `import std::lib` is not how anyone reaches its
+/// members. That is the same reduction `origin_member_completions` used to
+/// perform per request, moved to the analysis that already read the tree.
+#[derive(Clone, Debug)]
+struct OriginListing {
+    origin: String,
+    /// `(module name, source file)`, first root wins, `lib` excluded.
+    modules: Vec<(String, PathBuf)>,
+    /// The `lib.vl` this origin publishes, where it has one.
+    surface: Option<PathBuf>,
+}
+
+impl OriginListing {
+    /// What `origin::` offers: every module under the origin's source roots, in
+    /// the loader's own root order (an earlier root shadows a later one, so a
+    /// matching platform layer wins over the base), followed by the names its
+    /// `lib.vl` surface publishes.
+    ///
+    /// The surface's importables are read here rather than captured because
+    /// they come from [`vilan_core::analyzer::module_importables`], which
+    /// answers through the shared parse cache — warm after the analysis that
+    /// built this listing already loaded the file.
+    fn completions(&self) -> Vec<Completion> {
+        let mut items: Vec<Completion> = self
+            .modules
+            .iter()
+            .map(|(name, _path)| Completion::bare(name.clone(), CompletionKind::Module))
+            .collect();
+        let mut seen: HashSet<String> = self.modules.iter().map(|(name, _)| name.clone()).collect();
+        for importable in self
+            .surface
+            .as_deref()
+            .map(vilan_core::analyzer::module_importables)
+            .unwrap_or_default()
+        {
+            if seen.insert(importable.name.to_string()) {
+                items.push(importable_completion(&importable));
+            }
+        }
+        items
+    }
+
+    fn build(roots: &ImportRoots, platform: BuildPlatform) -> Vec<OriginListing> {
+        let mut origins: Vec<String> = vec!["std".to_string(), "pkg".to_string()];
+        origins.extend(roots.dependencies.iter().map(|(name, _)| name.clone()));
+        origins
+            .into_iter()
+            .filter_map(|origin| {
+                let (module_roots, surface) = roots.origin_roots(&origin, platform)?;
+                let mut modules: Vec<(String, PathBuf)> = Vec::new();
+                for root in &module_roots {
+                    for (name, path) in vilan_core::analyzer::modules_in_root(root) {
+                        if name == "lib" || modules.iter().any(|(known, _)| *known == name) {
+                            continue;
+                        }
+                        modules.push((name, path));
+                    }
+                }
+                Some(OriginListing {
+                    origin,
+                    modules,
+                    surface,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The auto-import candidate table (E54c/E59): every name under `std` or `pkg`
+/// that this program could add an import for, in the order a completion answer
+/// takes them.
+///
+/// The derivation is `auto_import_completions`' own, unchanged — the same two
+/// roots, the same "declared HERE, not re-exported here" rule
+/// ([`Program::source_of`]), the same excluded kinds, the same
+/// [`import_origin_tier`] ranking and the same alphabetical tiebreak. Only its
+/// TIME moved: it runs once per analysis instead of once per keystroke.
+///
+/// **Why filtering later is the same answer.** The per-request form dropped
+/// the names already in scope *before* sorting and truncating; this one sorts
+/// everything once and skips them while taking. `sort_by` is stable, and a
+/// stable sort of a subsequence is the same subsequence of the stable sort — so
+/// the first `cap` survivors are the same candidates in the same order, which
+/// is what [`AUTO_IMPORT_COMPLETION_CAP`]'s "which 20" argument depends on.
+#[derive(Clone, Debug, Default)]
+pub struct AutoImportOrder {
+    /// The modules that contribute, in discovery order; a candidate names one
+    /// by index. Grouping the path here rather than on every candidate is what
+    /// makes the table proportional to the names, not to the names times their
+    /// module path.
+    modules: Vec<AutoImportModule>,
+    /// Every candidate, sorted by `(tier, name)`.
+    candidates: Vec<AutoImportCandidate>,
+}
+
+#[derive(Clone, Debug)]
+struct AutoImportModule {
+    /// The segments an `import` needs before a name — `["std", "json"]`.
+    path: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AutoImportCandidate {
+    tier: u8,
+    name: String,
+    kind: CompletionKind,
+    module: u32,
+}
+
+impl AutoImportOrder {
+    fn build(program: &Program) -> AutoImportOrder {
+        let mut modules: Vec<AutoImportModule> = Vec::new();
+        let mut candidates: Vec<AutoImportCandidate> = Vec::new();
+        for root in ["std", "pkg"] {
+            let Some(&root_module_id) = program.module_id_by_name.get(root) else {
+                continue;
+            };
+            let Some(root_module) = program.modules.get(&root_module_id) else {
+                continue;
+            };
+            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
+                continue;
+            };
+            let tier = import_origin_tier(root);
+            for &child_id in root_scope.name_to_id_map.values() {
+                let Some(child_module) = program.modules.get(&child_id) else {
+                    continue;
+                };
+                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
+                    continue;
+                };
+                let child_source = program.source_of(child_id);
+                let module = modules.len() as u32;
+                modules.push(AutoImportModule {
+                    path: vec![root.to_string(), child_module.name.to_string()],
+                });
+                for (&name, &entity_id) in &child_scope.name_to_id_map {
+                    // Only a name this module DECLARES is an add-import target;
+                    // a re-export names an item that lives somewhere else.
+                    if program.source_of(entity_id) != child_source {
+                        continue;
+                    }
+                    let kind = kind_of(program, entity_id);
+                    if matches!(
+                        kind,
+                        CompletionKind::Module | CompletionKind::Keyword | CompletionKind::Snippet
+                    ) {
+                        continue;
+                    }
+                    candidates.push(AutoImportCandidate {
+                        tier,
+                        name: name.to_string(),
+                        kind,
+                        module,
+                    });
+                }
+            }
+        }
+        candidates.sort_by(|left, right| {
+            left.tier
+                .cmp(&right.tier)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        AutoImportOrder {
+            modules,
+            candidates,
+        }
+    }
+
+    /// The first `cap` candidates whose name is not already offered.
+    ///
+    /// This is the whole per-request cost of the arm: a walk that stops at the
+    /// cap, so it reads about `cap` entries of a table that may hold thousands.
+    fn take(&self, in_scope: &HashSet<&str>, cap: usize) -> Vec<&AutoImportCandidate> {
+        self.candidates
+            .iter()
+            .filter(|candidate| !in_scope.contains(candidate.name.as_str()))
+            .take(cap)
+            .collect()
+    }
+}
+
+/// A name's completion category, from the analyzed program alone — the one
+/// classification [`AutoImportOrder::build`] and [`Analysis::kind_of`] share,
+/// so a candidate's icon cannot depend on which of the two produced it.
+fn kind_of(program: &Program, id: Id) -> CompletionKind {
+    if program.functions.contains_key(&id) || program.external_functions.contains_key(&id) {
+        CompletionKind::Function
+    } else if program.structs.contains_key(&id) {
+        CompletionKind::Struct
+    } else if program.enums.contains_key(&id) {
+        CompletionKind::Enum
+    } else if program.traits.contains_key(&id) {
+        CompletionKind::Trait
+    } else if program.modules.contains_key(&id) {
+        CompletionKind::Module
+    } else {
+        CompletionKind::Variable
+    }
 }
