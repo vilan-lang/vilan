@@ -518,6 +518,9 @@ fn rewrite_sibling_node(
             rewrite_sibling_node(condition, siblings, bound, count);
             rewrite_sibling_block(body, siblings, bound, count);
         }
+        // A LABEL is not a binding and `break <label>` is not a reference: JS
+        // resolves both in their own namespace, so only the body is walked.
+        js::Node::Labeled(_, body) => rewrite_sibling_block(body, siblings, bound, count),
         js::Node::If(branch) => rewrite_sibling_if(branch, siblings, bound, count),
         js::Node::Try(body, finally) => {
             rewrite_sibling_block(body, siblings, bound, count);
@@ -554,6 +557,7 @@ fn rewrite_sibling_node(
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }
@@ -573,6 +577,133 @@ fn rewrite_sibling_if(
             }
         }
         js::IfBranch::Else(body) => rewrite_sibling_block(body, siblings, bound, count),
+    }
+}
+
+/// The label B214 wraps `main`'s inlined body in. A JS label lives in its own
+/// namespace — it can neither collide with a binding nor be reached by one — so
+/// it is spelled for the reader rather than generated, and `rename_for_scopes`
+/// leaves it alone.
+const MAIN_LABEL: &str = "main";
+
+/// Wraps `main`'s inlined body in [`MAIN_LABEL`] and lowers every `return` it
+/// would have emitted at MODULE scope to a break out of that block (B214).
+///
+/// `main` is inlined at module scope, where `return` is a `SyntaxError` that
+/// refuses the whole module at parse time — so `fun main() { if flag { ret; } }`
+/// compiled clean and then failed to load. A labeled block is the lowering that
+/// costs nothing: a `main` with no such `return` is wrapped in nothing and emits
+/// exactly as it did before, and one that has them pays a `main: { … }` and a
+/// `break main` per `ret` rather than a function call around every program.
+///
+/// `exit_temp` is where a RETURNED value goes — `main`'s exit code, read by the
+/// `process.exit` the caller emits after the block. Without one (a `void` main,
+/// or a host with no exit code) a returned value is emitted for its side effects
+/// and dropped, which is what the tail already does on those hosts.
+///
+/// An ASYNC `main` is never wrapped: `execution.md` §7.1 already runs it inside
+/// an invoked `async () => { … }`, which is a real function, so its `return` was
+/// legal all along. Only the bare inlining needs this.
+fn wrap_main_returns(nodes: &mut Vec<js::Node<'_>>, exit_temp: Option<&str>) {
+    if !returns_at_module_scope(nodes) {
+        return;
+    }
+    let mut body = std::mem::take(nodes);
+    lower_returns_to_break(&mut body, exit_temp);
+    nodes.push(js::Node::Labeled(MAIN_LABEL.to_string(), body));
+}
+
+/// Whether `nodes` contains a `return` that would land at module scope — one
+/// outside every nested function and closure, which are real JS functions where
+/// `return` is legal and must be left alone.
+///
+/// Statement lists only, which is the whole set: a divergent node is emitted AS
+/// a statement everywhere ([`js::Node::is_divergent`], B152), never wrapped into
+/// an expression, so there is nowhere else for one to be.
+fn returns_at_module_scope(nodes: &[js::Node<'_>]) -> bool {
+    nodes.iter().any(|node| match node {
+        js::Node::Return(_) => true,
+        js::Node::Function(_) | js::Node::Closure(_) => false,
+        js::Node::While(_, body) | js::Node::ForOf(_, _, body) | js::Node::Labeled(_, body) => {
+            returns_at_module_scope(body)
+        }
+        js::Node::Try(body, finally) => {
+            returns_at_module_scope(body) || returns_at_module_scope(finally)
+        }
+        js::Node::If(branch) => returns_at_module_scope_in_if(branch),
+        _ => false,
+    })
+}
+
+fn returns_at_module_scope_in_if(branch: &js::IfBranch<'_>) -> bool {
+    match branch {
+        js::IfBranch::If(_, body, else_branch) => {
+            returns_at_module_scope(body)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|else_branch| returns_at_module_scope_in_if(else_branch))
+        }
+        js::IfBranch::Else(body) => returns_at_module_scope(body),
+    }
+}
+
+/// [`returns_at_module_scope`]'s traversal, rewriting instead of asking: each
+/// module-scope `return` becomes `break <label>`, preceded by the assignment
+/// that hands its value to `exit_temp` (or, with no temp to hand it to, by the
+/// value as a statement, so its side effects still run).
+fn lower_returns_to_break<'src>(nodes: &mut Vec<js::Node<'src>>, exit_temp: Option<&str>) {
+    let mut lowered: Vec<js::Node<'src>> = Vec::with_capacity(nodes.len());
+    for node in std::mem::take(nodes) {
+        match node {
+            js::Node::Return(value) => {
+                match (*value, exit_temp) {
+                    (js::Node::Void, _) => {}
+                    (value, Some(temp)) => lowered.push(js::Node::Assignment(
+                        Box::new(js::Node::Local(temp.to_string())),
+                        Box::new(value),
+                    )),
+                    (value, None) => lowered.push(value),
+                }
+                lowered.push(js::Node::BreakLabel(MAIN_LABEL.to_string()));
+            }
+            // A real JS function: its `return` is legal and stays.
+            node @ (js::Node::Function(_) | js::Node::Closure(_)) => lowered.push(node),
+            js::Node::While(condition, mut body) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lowered.push(js::Node::While(condition, body));
+            }
+            js::Node::ForOf(binding, iterable, mut body) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lowered.push(js::Node::ForOf(binding, iterable, body));
+            }
+            js::Node::Labeled(label, mut body) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lowered.push(js::Node::Labeled(label, body));
+            }
+            js::Node::Try(mut body, mut finally) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lower_returns_to_break(&mut finally, exit_temp);
+                lowered.push(js::Node::Try(body, finally));
+            }
+            js::Node::If(mut branch) => {
+                lower_returns_to_break_in_if(&mut branch, exit_temp);
+                lowered.push(js::Node::If(branch));
+            }
+            node => lowered.push(node),
+        }
+    }
+    *nodes = lowered;
+}
+
+fn lower_returns_to_break_in_if(branch: &mut js::IfBranch<'_>, exit_temp: Option<&str>) {
+    match branch {
+        js::IfBranch::If(_, body, else_branch) => {
+            lower_returns_to_break(body, exit_temp);
+            if let Some(else_branch) = else_branch {
+                lower_returns_to_break_in_if(else_branch, exit_temp);
+            }
+        }
+        js::IfBranch::Else(body) => lower_returns_to_break(body, exit_temp),
     }
 }
 
@@ -647,6 +778,9 @@ fn descend_for_preload<'src>(
         }
         js::Node::While(condition, block) => {
             descend_for_preload(condition, gates, total);
+            plant_boot_preloads(block, gates, total);
+        }
+        js::Node::Labeled(_, block) => {
             plant_boot_preloads(block, gates, total);
         }
         js::Node::If(branch) => descend_if_for_preload(branch, gates, total),
@@ -807,6 +941,8 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
             collect_reference(condition, out);
             collect_references(body, out);
         }
+        // The label is not an identifier the body can reference.
+        js::Node::Labeled(_, body) => collect_references(body, out),
         js::Node::If(branch) => collect_reference_if(branch, out),
         js::Node::Try(body, finally) => {
             collect_references(body, out);
@@ -835,6 +971,7 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }
@@ -2434,24 +2571,35 @@ impl<'src> Transformer<'src> {
                 Some(Expr::Void) | None
             );
             if tail_is_void || !self.program.platform.has_process_exit() {
-                self.walk_scope_body(
+                let mut body = self.walk_scope_body(
                     &main_fn.body.0,
                     0,
                     main_fn.body.0.len(),
                     Some((main_fn.body.1, TailDisposition::Discard)),
-                )
+                );
+                // B214: no exit code to carry — a `ret` here just leaves.
+                if !main_is_async {
+                    wrap_main_returns(&mut body, None);
+                }
+                body
             } else {
                 let exit_temp = self.ng.next_name();
                 let mut body = vec![js::Node::LetVariable(js::Variable {
                     name: exit_temp.clone(),
                     value: Box::new(js::Node::Void),
                 })];
-                let wrapped = self.walk_scope_body(
+                let mut wrapped = self.walk_scope_body(
                     &main_fn.body.0,
                     0,
                     main_fn.body.0.len(),
                     Some((main_fn.body.1, TailDisposition::AssignTo(exit_temp.clone()))),
                 );
+                // B214: the label wraps the BODY only — the temp is declared
+                // before it and the `process.exit` runs after it, so an early
+                // `ret` that breaks out still exits with the code it set.
+                if !main_is_async {
+                    wrap_main_returns(&mut wrapped, Some(&exit_temp));
+                }
                 body.extend(wrapped);
                 body.push(js::Node::Call(
                     Box::new(js::Node::Property(
@@ -2470,24 +2618,76 @@ impl<'src> Transformer<'src> {
             // void tail (e.g. a block ending in a loop) exits normally. The browser has
             // no exit code, so the tail is emitted as a plain statement — its side
             // effects still run (a `main` that ends in `render()`), the value discarded.
-            if let Some(value) = self.walk_entity(main_fn.body.1, &mut t_main_fn_body)
-                && !matches!(value, js::Node::Void)
-            {
+            let tail = self
+                .walk_entity(main_fn.body.1, &mut t_main_fn_body)
+                .filter(|value| !matches!(value, js::Node::Void));
+            // B152: a tail that already LEAVES the scope (`ret` / `jump` written
+            // as `main`'s final expression) is the statement it is under every
+            // disposition — exiting or assigning one emits `process.exit(return)`.
+            let tail = match tail {
+                Some(value) if value.is_divergent() => {
+                    t_main_fn_body.push(value);
+                    None
+                }
+                other => other,
+            };
+            // B214: a `ret` in this `main` needs the labeled-block wrapper, and
+            // the wrapper has to sit between the exit-code temp and the
+            // `process.exit` that reads it — so the exit is decided here rather
+            // than by pushing the tail straight into the body. A `main` with no
+            // such `ret` takes the `None` arm, which is the emission that shipped.
+            let exit_code_temp = (!main_is_async
+                && returns_at_module_scope(&t_main_fn_body)
+                && tail.is_some()
+                && self.program.platform.has_process_exit())
+            .then(|| self.ng.next_name());
+            match (tail, &exit_code_temp) {
+                // An exit code AND an early `ret`: the tail lands in the temp
+                // inside the block, every `ret` assigns the same temp on its way
+                // out, and one `process.exit` after the block reads it.
+                (Some(value), Some(temp)) => {
+                    t_main_fn_body.push(js::Node::Assignment(
+                        Box::new(js::Node::Local(temp.clone())),
+                        Box::new(value),
+                    ));
+                }
                 // A host with `process.exit` (Node) forwards `main`'s result as the
                 // exit code; the browser (and the host-less `none`, which the CLI
                 // refuses to *build*) has none, so the tail is a plain statement.
-                let statement = if self.program.platform.has_process_exit() {
-                    js::Node::Call(
-                        Box::new(js::Node::Property(
-                            Box::new(js::Node::Local("process".to_string())),
-                            "exit".to_string(),
-                        )),
-                        vec![value],
-                    )
-                } else {
-                    value
-                };
-                t_main_fn_body.push(statement);
+                (Some(value), None) => {
+                    let statement = if self.program.platform.has_process_exit() {
+                        js::Node::Call(
+                            Box::new(js::Node::Property(
+                                Box::new(js::Node::Local("process".to_string())),
+                                "exit".to_string(),
+                            )),
+                            vec![value],
+                        )
+                    } else {
+                        value
+                    };
+                    t_main_fn_body.push(statement);
+                }
+                (None, _) => {}
+            }
+            if !main_is_async {
+                wrap_main_returns(&mut t_main_fn_body, exit_code_temp.as_deref());
+            }
+            if let Some(temp) = exit_code_temp {
+                t_main_fn_body.insert(
+                    0,
+                    js::Node::LetVariable(js::Variable {
+                        name: temp.clone(),
+                        value: Box::new(js::Node::Void),
+                    }),
+                );
+                t_main_fn_body.push(js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(js::Node::Local("process".to_string())),
+                        "exit".to_string(),
+                    )),
+                    vec![js::Node::Local(temp)],
+                ));
             }
             t_main_fn_body
         };
@@ -9294,6 +9494,22 @@ impl Formatter {
                 )
             }
             js::Node::Break => format!("break{}", terminator),
+            // `<label>: { <body> }` / `break <label>;` (B214). The label is
+            // emitted verbatim — `rename_for_scopes` leaves it alone, since a JS
+            // label lives in its own namespace and cannot collide with a local.
+            js::Node::Labeled(label, body) => {
+                let s_body = self.sequence(body, ";", level + 1);
+                format!(
+                    "{}:{}{{{}{}{}{}}}",
+                    label,
+                    self.space,
+                    self.line_break,
+                    s_body,
+                    self.line_break,
+                    self.indentation.repeat(level),
+                )
+            }
+            js::Node::BreakLabel(label) => format!("break {}{}", label, terminator),
             js::Node::Continue => format!("continue{}", terminator),
             js::Node::Closure(closure) => {
                 let s_parameters = closure
@@ -9755,6 +9971,9 @@ pub mod js {
         Unary(char, Box<Self>),
         Bool(bool),
         Break,
+        // `break <label>;` — leaves the enclosing [`Node::Labeled`] block. Only
+        // B214's `main` wrapper emits one, and only into the block it wrapped.
+        BreakLabel(String),
         Call(Box<Self>, Vec<Self>),
         Closure(Closure<'src>),
         ConstVariable(Variable<'src>),
@@ -9765,6 +9984,13 @@ pub mod js {
         // `for (const <binding> of <iterable>) { <body> }`. The binding name is
         // `_` for a discarded element.
         ForOf(String, Box<Self>, Vec<Self>),
+        // `<label>: { <body> }` — a labeled block (B214). `main` is INLINED at
+        // module scope, where `return` is a `SyntaxError` that refuses the whole
+        // module at parse time, so a `main` containing an early `ret` has its
+        // body wrapped in one of these and each of those `ret`s lowered to
+        // `break <label>`. A `main` without one is wrapped in nothing, which is
+        // what keeps every other program's emission byte-identical.
+        Labeled(String, Vec<Self>),
         LetVariable(Variable<'src>),
         Local(String),
         Null,
@@ -9796,11 +10022,18 @@ pub mod js {
         /// The set is every variant the emitter renders as a bare statement:
         /// `Throw` is in it for the same reason, though no walk hands one back
         /// today (the only `Throw` is built directly into a generated closure
-        /// body) — a future one must not be wrapped either.
+        /// body) — a future one must not be wrapped either. `BreakLabel` joins
+        /// them as what B214 rewrites a divergent `Return` INTO: the rewrite
+        /// runs after the walk, so a `ret` that reached a tail seam as a
+        /// divergent node must still be one afterwards.
         pub fn is_divergent(&self) -> bool {
             matches!(
                 self,
-                Self::Return(_) | Self::Break | Self::Continue | Self::Throw(_)
+                Self::Return(_)
+                    | Self::Break
+                    | Self::BreakLabel(_)
+                    | Self::Continue
+                    | Self::Throw(_)
             )
         }
     }
@@ -10372,6 +10605,11 @@ fn collect_node(
             collect_node(condition, renameable, declarations, children);
             collect_declarations(body, renameable, declarations, children);
         }
+        // A labeled block declares nothing of its own — a JS label lives in its
+        // own namespace and is never renamed with the locals.
+        js::Node::Labeled(_, body) => {
+            collect_declarations(body, renameable, declarations, children)
+        }
         js::Node::If(branch) => collect_if(branch, renameable, declarations, children),
         js::Node::Try(body, finally) => {
             collect_declarations(body, renameable, declarations, children);
@@ -10401,6 +10639,7 @@ fn collect_node(
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }
@@ -10528,6 +10767,9 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
             rename_node(condition, rename);
             rename_nodes(body, rename);
         }
+        // The LABEL is deliberately not renamed: a JS label resolves in its own
+        // namespace, so it neither collides with a local nor needs to follow one.
+        js::Node::Labeled(_, body) => rename_nodes(body, rename),
         js::Node::If(branch) => rename_if(branch, rename),
         js::Node::Try(body, finally) => {
             rename_nodes(body, rename);
@@ -10557,6 +10799,7 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }

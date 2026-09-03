@@ -70,6 +70,7 @@ loops	0
 macro-block	0
 macro-derive	0
 macro-invoke	0
+main-ret	0
 map	14
 match-ergonomics	0
 match-patterns	0

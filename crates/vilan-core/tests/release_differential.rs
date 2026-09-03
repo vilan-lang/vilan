@@ -385,6 +385,7 @@ corpus_programs! {
     macro_block => "macro-block.vl",
     macro_derive => "macro-derive.vl",
     macro_invoke => "macro-invoke.vl",
+    main_ret => "main-ret.vl",
     map => "map.vl",
     match_ergonomics => "match-ergonomics.vl",
     match_patterns => "match-patterns.vl",
