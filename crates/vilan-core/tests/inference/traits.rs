@@ -1642,3 +1642,143 @@ fn a_user_source_written_with_its_element_still_exposes() {
         "ok\n",
     );
 }
+
+// --- B205: a supertrait member's `Self` inside a sub-trait's default body -----
+//
+// `trait Doubler with Add { fun twice(self): Self { self.add(self) } }` was two
+// errors on a program with no mistake in it: `Expected Doubler, but got Add
+// instead.` at the call and `Expected Add, but got Doubler instead.` at the
+// argument. Inside a default body `self` is the trait's own abstract type
+// (`Type::Trait(Doubler, [])`), and `add` is declared in `Add`'s terms — its
+// `Self` return and its `= Self`-defaulted `b` both resolve to
+// `Type::Trait(Add, [])`, which is a different type. So the argument was
+// refused, and the call's type was refused by the enclosing default's own
+// declared `Self`.
+//
+// The OPERATOR spelling has dispatched since B193, on exactly this shape. The
+// explicit method spelling now reaches the same place: a member found in a
+// SUPERTRAIT records the pair at the lookup, and both halves — the argument
+// check, which reads a parameter type straight off the declaration, and the
+// `Self`-return specialization, which already substitutes structurally for a
+// concrete receiver — rebind it to the sub-trait.
+
+/// Two `Add` impls under one `Doubler`, so a passing run proves the default
+/// DISPATCHED rather than resolving to one answer for everybody. Both spellings
+/// stand side by side in the same trait.
+const DOUBLER: &str = r#"
+    import std::io::print;
+    import std::operators::Add;
+
+    trait Doubler with Add {
+        fun twice(self): Self {
+            self.add(self)
+        }
+        fun twice_with_the_operator(self): Self {
+            self + self
+        }
+    }
+
+    struct Money { cents: i32 }
+    impl Money with Add {
+        fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+    }
+    impl Money with Doubler {}
+
+    struct Tag { text: str }
+    impl Tag with Add {
+        fun add(self, b: Tag): Tag { Tag { text = self.text + b.text } }
+    }
+    impl Tag with Doubler {}
+"#;
+
+#[test]
+fn b205_both_spellings_of_a_supertrait_call_resolve_in_a_default_body() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{DOUBLER}
+            fun main() {{
+                print(Money {{ cents = 3 }}.twice().cents);
+                print(Money {{ cents = 3 }}.twice_with_the_operator().cents);
+            }}
+            main();
+            "#
+        ),
+        "6\n6\n",
+    );
+}
+
+#[test]
+fn b205_a_supertrait_call_in_a_default_body_dispatches_per_specialization() {
+    // The claim the compile alone cannot make: `twice` is ONE body, and each
+    // impl's own `add` is what runs in it.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{DOUBLER}
+            fun main() {{
+                print(Money {{ cents = 3 }}.twice().cents);
+                print(Tag {{ text = "ab" }}.twice().text);
+            }}
+            main();
+            "#
+        ),
+        "6\nabab\n",
+    );
+}
+
+#[test]
+fn b205_the_supertrait_chain_is_walked_the_whole_way() {
+    // The rebinding keys on the trait that DECLARES the member, whatever depth
+    // it sits at — and a user trait, so the rule is not `Add`'s. Two calls
+    // chained also prove the CALL's own type came back as the sub-trait: the
+    // second `.join` is made on the first one's result.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base {
+            fun join(self, other: Self): Self;
+        }
+        trait Middle with Base {}
+        trait Top with Middle {
+            fun tripled(self): Self {
+                self.join(self).join(self)
+            }
+        }
+
+        struct Tag { text: str }
+        impl Tag with Base {
+            fun join(self, other: Tag): Tag { Tag { text = self.text + other.text } }
+        }
+        impl Tag with Middle {}
+        impl Tag with Top {}
+
+        fun main() { print(Tag { text = "x" }.tripled().text); }
+        main();
+        "#,
+        "xxx\n",
+    );
+}
+
+#[test]
+fn b205_an_unrelated_traits_method_is_still_refused_in_a_default_body() {
+    // The control. The rebinding fires only for a member the sub-trait's own
+    // supertrait walk found; a method no supertrait promises is still nothing
+    // `Self` can do here, and widening the walk is exactly the failure this pin
+    // exists to catch.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::operators::{ Add, Mul };
+
+        trait Doubler with Add {
+            fun twice(self): Self {
+                self.mul(self)
+            }
+        }
+
+        fun main() { print("x"); }
+        main();
+        "#,
+        "Doubler has no method 'mul'",
+    );
+}

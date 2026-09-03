@@ -3255,6 +3255,20 @@ pub struct Analyzer<'src> {
     // impl's `T` to `i32`): the resulting substitution, so codegen emits a
     // monomorphized instance of the method body (e.g. `T::default()` -> `0`).
     method_call_substitution: HashMap<Id, SubstitutionContext>,
+    /// A method call inside a trait DEFAULT body that reached a SUPERTRAIT's
+    /// member: the supertrait that DECLARES it, and the SUB-trait's own abstract
+    /// type — which is what that member's `Self` means at this call (B205).
+    ///
+    /// `trait Doubler with Add { fun twice(self): Self { self.add(self) } }`
+    /// reaches `Add::add`, declared `fun add(self, b: B): Self` in `Add`'s own
+    /// terms with `B = Self`; both `Self`s resolve to `Type::Trait(Add, [])`.
+    /// Inside `Doubler`'s body they mean `Doubler`, and without the rebinding
+    /// the argument was refused (`Expected Add, but got Doubler`) and the call's
+    /// type refused by the enclosing default's declared `Self` return
+    /// (`Expected Doubler, but got Add`). Recorded at the lookup, the one place
+    /// both traits are in hand; consumed by the argument check, which reads a
+    /// member's declared parameter types straight off the declaration.
+    supertrait_self_at_call: HashMap<Id, (Id, TypeId)>,
     // The expected type imposed on an expression by its syntactic context — a
     // function's declared return type for its body tail, propagated into tail
     // positions (each `match` leg body) by their resolvers. Lets a
@@ -4138,6 +4152,7 @@ impl<'src> Analyzer<'src> {
             async_returning: HashSet::default(),
             return_sites: Vec::new(),
             method_call_substitution: HashMap::default(),
+            supertrait_self_at_call: HashMap::default(),
             expected_types: HashMap::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
@@ -6838,6 +6853,25 @@ impl<'src> Analyzer<'src> {
     /// recursion — it exists separately because `substitute_type` does not know
     /// `Self`, and leaving a nested `Self` unsubstituted would compare as a
     /// spurious mismatch (`List<Self>` vs `List<subject>`).
+    /// [`substitute_member_type`] for B205's recorded pair: a supertrait
+    /// member's `Self`, rebound to the sub-trait the call reached it through.
+    /// `None` (the ordinary call) returns the type unchanged.
+    fn rebind_supertrait_self(
+        &mut self,
+        supertrait_self: Option<(Id, TypeId)>,
+        type_: &Type,
+    ) -> Type {
+        match supertrait_self {
+            Some((declaring_trait_id, sub_trait)) => self.substitute_member_type(
+                type_,
+                declaring_trait_id,
+                sub_trait,
+                &SubstitutionContext::default(),
+            ),
+            None => type_.clone(),
+        }
+    }
+
     fn substitute_member_type(
         &mut self,
         type_: &Type,
@@ -25819,10 +25853,32 @@ impl<'src> Analyzer<'src> {
                             // `Wrap<T>` — abstract here, concrete at every
                             // monomorphization. Leaving it `Wrap<Marker>` made a
                             // bare trait type the payload, which has no members.
-                            if matches!(
-                                receiver_type,
-                                Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
-                            ) {
+                            //
+                            // And so does a SUB-TRAIT receiver (B205). Inside a
+                            // trait default body `self` is the trait's own
+                            // abstract type, and a member reached from a
+                            // SUPERTRAIT declares its `Self` in the supertrait's
+                            // terms — `Add::add` returns `Add`'s `Self`, which
+                            // inside `trait Doubler with Add` is `Doubler`. The
+                            // substitution is the same one, with the sub-trait as
+                            // the subject; without it `self.add(self)` typed as
+                            // `Add` and the enclosing default's own `Self` return
+                            // refused it. (The operator spelling `self + self`
+                            // has dispatched since B193; this is the explicit
+                            // method spelling reaching the same place.) A
+                            // receiver whose trait IS the declaring one is left
+                            // alone: the substitution would be the identity.
+                            let receiver_is_sub_trait = matches!(receiver_type, Type::Trait(_, _))
+                                && self
+                                    .supertrait_self_at_call
+                                    .get(&id)
+                                    .is_some_and(|(declaring, _)| *declaring == self_trait);
+                            if receiver_is_sub_trait
+                                || matches!(
+                                    receiver_type,
+                                    Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
+                                )
+                            {
                                 let subject = receiver_type.get_type_id(self);
                                 return self.substitute_member_type(
                                     &return_type,
@@ -29698,6 +29754,32 @@ impl<'src> Analyzer<'src> {
                     if let Some((_, declaring_trait_id, declaring_arguments)) = &declared {
                         self.generic_dispatch
                             .insert(id, GenericDispatch::OnType(None, member_name));
+                        // B205: a member reached from a SUPERTRAIT is written in
+                        // that trait's terms, `Self` included — and inside this
+                        // default body `Self` is the SUB-trait. Record the pair
+                        // so the argument check can rebind it; the return type
+                        // takes the same rebinding through the `Self`-return
+                        // specialization below.
+                        //
+                        // Only for an ARGUMENT-LESS `with` clause, and that is
+                        // the whole of the rule rather than a convenience. A
+                        // `= Self`-defaulted parameter resolves to the very same
+                        // type as `Self` (`trait Add<B = Self>` -> both are
+                        // `Type::Trait(Add, [])`), so with no argument written
+                        // every such occurrence means the sub-trait and a blanket
+                        // rewrite is exactly right. Write `with Add<i32>` and the
+                        // two positions part company — `b: B` is `i32`, the `Self`
+                        // return is still the sub-trait — and nothing in the
+                        // RESOLVED types tells them apart; only the written name
+                        // does (`ambiguous_position_expectation`, the same B29
+                        // residue). That shape is left exactly as it was.
+                        if *declaring_trait_id != trait_id && declaring_arguments.is_empty() {
+                            let declaring_trait_id = *declaring_trait_id;
+                            let sub_trait =
+                                Type::Trait(trait_id, trait_arguments.clone()).get_type_id(self);
+                            self.supertrait_self_at_call
+                                .insert(id, (declaring_trait_id, sub_trait));
+                        }
                         // A parameterized trait substitutes its generic parameters
                         // with the concrete arguments, so the method's signature
                         // (`got(): T`) types against them (`Get<i32>::got` -> `i32`).
@@ -30197,6 +30279,14 @@ impl<'src> Analyzer<'src> {
             .get(&call_id)
             .cloned()
             .unwrap_or_default();
+        // B205: a supertrait member's declared parameter types are read straight
+        // off its declaration, in the SUPERTRAIT's terms — `Add::add`'s `b: B`
+        // is `Type::Trait(Add, [])` under `B = Self`. Reached through a
+        // sub-trait's default body it means the sub-trait, and the rewrite is
+        // structural rather than a substitution entry because types are not
+        // interned: the parameter, the return and the trait's own `Self` binding
+        // are three ids for the one type.
+        let supertrait_self = self.supertrait_self_at_call.get(&call_id).copied();
         let expected = parameter_ids.len().saturating_sub(1);
         if argument_ids.len() != expected {
             // `self` is parameter 0 — the arguments a caller writes line up
@@ -30223,6 +30313,7 @@ impl<'src> Analyzer<'src> {
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
                 .map(|parameter| parameter.type_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
+                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
                 .unwrap_or(Type::Unknown);
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
@@ -30237,6 +30328,7 @@ impl<'src> Analyzer<'src> {
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
                 .map(|parameter| parameter.type_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
+                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
             else {
                 continue;
             };
