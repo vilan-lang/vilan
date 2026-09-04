@@ -520,6 +520,11 @@ const DECLINER_FIXTURES: &[&str] = &[
     "<div></span>",      // a mismatched closing tag
     "<h2>Todos</h2>",    // bare text children are quoted strings
     "<div name(a, b)/>", // an attribute takes one value
+    // The PAIRED spelling of the same mistake (E136). The self-closing one above
+    // declined into `parse_atom`'s element recovery and came out with its curated
+    // message; with a `</div>` the enclosing statement stopped parsing too, and
+    // `attempt` truncated the message away with the branch that made it.
+    "<div name(a, b)></div>",
     "<div>< /div>",      // a non-adjacent `</` is not a close marker
     // --- `css` blocks (css-block S2) ---------------------------------------
     "css",                            // the keyword alone is no expression

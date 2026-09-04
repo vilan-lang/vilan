@@ -3429,11 +3429,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         if !self.peek_is_ctrl('(') {
             return Some(Some(ElementHeadItem::Attribute(name, None)));
         }
+        let open = self.position;
         self.bump();
         let value = self.parse_expression()?;
         if self.peek_is_ctrl(',') {
+            // A second value in an attribute — `<div raw("inert", scrim)>`. The
+            // message this raises is already the right one; what E136 fixed is
+            // that it used to be a HARD decline, and a hard decline threw the
+            // message away in the shape the mistake is usually written in.
+            //
+            // Declining fails the element, `parse_atom` falls back to
+            // `recover_delimited("element", '<', '>')`, and that re-emits this
+            // failure — but only if the enclosing STATEMENT then parses. With a
+            // paired `</div>` it does not: the two angle brackets read as
+            // comparisons, `attempt`'s `errors.truncate` drops the curated
+            // message with the branch that produced it, and what surfaces is
+            // `expected ';'` on the tag. The self-closing `/>` spelling escaped
+            // only because nothing else could read it.
+            //
+            // So the comma is recovered exactly as the `.`-chain arm above
+            // recovers a nameless link (E49): report HERE, where the mistake is,
+            // skip the attribute's own parentheses, and answer `Some(None)` —
+            // the head item is dropped, the element survives, and the statement
+            // around it parses, so nothing truncates.
             self.note_expected("`)` (an attribute takes one value; a chain link starts with `.`)");
-            return None;
+            let context = self.context_stack.clone();
+            self.emit_failure(
+                self.position,
+                vec![
+                    "`)` (an attribute takes one value; a chain link starts with `.`)".to_string(),
+                ],
+                context,
+            );
+            // Unbalanced parentheses have no matching `)` to skip to; the region
+            // is genuinely garbled and the element recovery is the better
+            // reader, so that case still declines.
+            let end = self.scan_balanced(open, '(', ')', &[('[', ']'), ('{', '}')])?;
+            self.position = end;
+            return Some(None);
         }
         self.expect_ctrl(')')?;
         Some(Some(ElementHeadItem::Attribute(name, Some(value))))

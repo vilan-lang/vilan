@@ -356,6 +356,29 @@ fn an_unfinished_path_reports_once_when_the_statement_is_terminated() {
     );
 }
 
+/// E136. A multi-value attribute is one mistake with one message, and the
+/// message belongs on the COMMA — in either element spelling.
+///
+/// The self-closing form always had it. The paired form did not: the comma arm
+/// declined the whole element, `parse_atom` fell back to element recovery, the
+/// enclosing statement then failed to parse around the `<`/`>` pair, and
+/// `attempt`'s `errors.truncate` threw the curated message away with the branch
+/// that produced it — leaving `expected ';'` on the tag.
+#[test]
+fn a_multi_value_attribute_reports_at_the_comma_in_both_element_spellings() {
+    let expected = "found ',' expected `)` (an attribute takes one value; \
+                    a chain link starts with `.`)"
+        .to_string();
+    assert_eq!(
+        diagnostics_at("let __probe = <div name(a, b)/>;"),
+        vec![(expected.clone(), ",".to_string())],
+    );
+    assert_eq!(
+        diagnostics_at("let __probe = <div name(a, b)></div>;"),
+        vec![(expected, ",".to_string())],
+    );
+}
+
 // The fixture arrays live in a SUBDIRECTORY, not beside this file: cargo makes a
 // test target out of every `tests/*.rs`, so a fixtures file at the top level was
 // also compiled as a target of its own — a binary with no tests in it, whose only
