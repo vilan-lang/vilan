@@ -1436,10 +1436,14 @@ async fn analyze_and_publish(
         return AnalysisOutcome::Cancelled;
     };
     analysis.stamp_analysis(started_at);
+    // M27: read before `land` takes the analysis — the editor tables it built
+    // are a per-keystroke cost the session trace had no column for.
+    let index_time = analysis.index_time;
     if !land(&context.documents, &uri, analysis) {
         return AnalysisOutcome::Dropped;
     }
     context.analyses.record_landed();
+    context.analyses.record_index(index_time);
     // The landed snapshot was built over the edited dependency, so this
     // document's keystroke-path answers are current again (§2.1.2's case 4).
     context.schedule.clear_dependency_moved(&uri);

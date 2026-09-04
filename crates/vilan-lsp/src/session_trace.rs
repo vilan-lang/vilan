@@ -76,6 +76,19 @@ pub struct AnalysisCounts {
     pub started: u64,
     pub landed: u64,
     pub cancelled: u64,
+    /// **M27**: the EDITOR TABLES each landed analysis built — `lsp-index`
+    /// (references, symbols) plus `lsp-landed` (E121's captured walk), summed
+    /// and maxed over the session in whole milliseconds.
+    ///
+    /// A fifth per-keystroke cost, and until this line the only place it was
+    /// visible was a `VILAN_PHASE_TIMING` run nobody does in a real session.
+    /// It ran 110–292 ms of wall per keystroke on a real browser application
+    /// (E126, 2026-09-04) — against `analyze` itself at ~1,100 ms, so it is a
+    /// tenth to a quarter of what a keystroke costs and it is proportional to
+    /// the PROGRAM rather than to the edited buffer. `max` is the number to
+    /// read first: a mean hides the analysis that made the editor wait.
+    pub index_total_ms: u128,
+    pub index_max_ms: u128,
 }
 
 /// The live counters behind [`AnalysisCounts`], incremented from the analysis
@@ -90,6 +103,9 @@ pub struct AnalysisTally {
     started: AtomicU64,
     landed: AtomicU64,
     cancelled: AtomicU64,
+    /// M27, in whole milliseconds — see [`AnalysisCounts::index_total_ms`].
+    index_total_ms: AtomicU64,
+    index_max_ms: AtomicU64,
 }
 
 impl AnalysisTally {
@@ -105,11 +121,28 @@ impl AnalysisTally {
         self.cancelled.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// M27: one landed analysis's editor-table cost. Called beside
+    /// [`record_landed`](AnalysisTally::record_landed) — a cancelled or
+    /// dropped analysis built no tables the editor ever read, and counting one
+    /// would report a cost the user never waited for.
+    ///
+    /// `fetch_max` rather than a compare-exchange loop: the two counters are a
+    /// diagnostic, and the ordering between them is not a fact anything
+    /// asserts on.
+    pub fn record_index(&self, elapsed: std::time::Duration) {
+        let milliseconds = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.index_total_ms
+            .fetch_add(milliseconds, Ordering::Relaxed);
+        self.index_max_ms.fetch_max(milliseconds, Ordering::Relaxed);
+    }
+
     pub fn counts(&self) -> AnalysisCounts {
         AnalysisCounts {
             started: self.started.load(Ordering::Relaxed),
             landed: self.landed.load(Ordering::Relaxed),
             cancelled: self.cancelled.load(Ordering::Relaxed),
+            index_total_ms: u128::from(self.index_total_ms.load(Ordering::Relaxed)),
+            index_max_ms: u128::from(self.index_max_ms.load(Ordering::Relaxed)),
         }
     }
 }
@@ -206,6 +239,7 @@ impl RequestTally {
              retained state: documents={} semantic_token_cache={} manifests={} \
              pending={} line_indices={}\n  \
              analyses: started={} landed={} cancelled={}\n  \
+             lsp-index (M27, editor tables per landed analysis): total={}ms max={}ms\n  \
              requests (count / mean ms / max ms), slowest total first:",
             self.total_requests,
             state.documents,
@@ -216,6 +250,8 @@ impl RequestTally {
             analyses.started,
             analyses.landed,
             analyses.cancelled,
+            analyses.index_total_ms,
+            analyses.index_max_ms,
         );
         if ordered.is_empty() {
             out.push_str("\n    (none yet)");
@@ -366,6 +402,8 @@ mod tests {
                 started: 9,
                 landed: 3,
                 cancelled: 5,
+                index_total_ms: 0,
+                index_max_ms: 0,
             },
         );
         let tokens_at = summary
@@ -415,5 +453,41 @@ mod tests {
         let tally = RequestTally::new();
         let summary = tally.summary(StateSizes::default(), AnalysisCounts::default());
         assert!(summary.contains("(none yet)"), "{summary}");
+    }
+
+    /// **M27**: the editor tables are on the session trace.
+    ///
+    /// `lsp-index` — the reference/entity index plus E121's landed walk — is a
+    /// fifth per-keystroke cost, 110–292 ms of wall on a real browser
+    /// application against `analyze`'s ~1,100 ms (E126, 2026-09-04). It was
+    /// visible only under `VILAN_PHASE_TIMING`, which nobody sets in a live
+    /// session, so a session that felt slow could not be told apart from one
+    /// that was slow for a reason the trace already named.
+    ///
+    /// `max` is asserted alongside `total` because they answer different
+    /// questions: total is what the session spent, max is the single analysis
+    /// the user waited on.
+    #[test]
+    fn the_summary_reports_what_the_editor_tables_cost() {
+        let tally = AnalysisTally::default();
+        tally.record_landed();
+        tally.record_index(std::time::Duration::from_millis(110));
+        tally.record_landed();
+        tally.record_index(std::time::Duration::from_millis(292));
+        let counts = tally.counts();
+        assert_eq!(counts.index_total_ms, 402);
+        assert_eq!(
+            counts.index_max_ms, 292,
+            "the peak is kept, not averaged away — it is the keystroke the editor stalled on",
+        );
+
+        let summary = RequestTally::new().summary(StateSizes::default(), counts);
+        assert!(
+            summary.contains(
+                "lsp-index (M27, editor tables per landed analysis): \
+                              total=402ms max=292ms"
+            ),
+            "the trace must name the cost and its number, or it is not evidence: {summary}",
+        );
     }
 }

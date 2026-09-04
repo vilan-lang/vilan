@@ -597,6 +597,22 @@ pub struct Document {
     /// allocations are replaced (and reclaimed) together. See
     /// [`AnalyzedProgram`].
     pub program: AnalyzedProgram,
+    /// **M27**: what this analysis's EDITOR TABLES cost — the `lsp-index`
+    /// phase (`entity_spans` + the [`ReferenceIndex`]) plus the `lsp-landed`
+    /// one ([`capture_landed`](Document::capture_landed)'s single walk), which
+    /// together are every table the server builds over a finished analysis.
+    ///
+    /// Carried on the document because the cost is paid on the analysis thread
+    /// and read by the SERVER, one join later: `analyze_and_publish` records it
+    /// on the session trace beside the analysis counts. Measured on a real
+    /// browser application (E126, 2026-09-04, release): `lsp-index` alone runs
+    /// 110–292 ms of wall per keystroke at loadavg 31–33 against `lsp-analyze`
+    /// at 1,146–1,436 ms, and under load the two halves stay in proportion
+    /// (494–1,058 ms of index against 232–350 ms of landed walk at loadavg
+    /// 150–166). A fifth per-keystroke cost, outside every tranche, and half
+    /// of it sat outside the instrument too until this phase line grew the
+    /// `lsp-landed` label. `ZERO` on a document that never analyzed.
+    pub index_time: std::time::Duration,
     pub diagnostics: Vec<Error>,
     /// The source file each diagnostic belongs to, parallel to `diagnostics`
     /// (`SourceId(0)` = this document; imported modules publish to their own
@@ -1168,6 +1184,7 @@ impl Document {
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: AnalyzedProgram::none(),
+            index_time: std::time::Duration::ZERO,
             diagnostics: Vec::new(),
             diagnostic_sources: Vec::new(),
             warnings: Vec::new(),
@@ -1380,33 +1397,15 @@ impl Document {
                 )
             })
             .collect();
-        // The server's half of the `VILAN_PHASE_TIMING` split (E106): one line
-        // per LSP analysis, naming the four costs the core pipeline's own line
-        // cannot see — project resolution (the E113 reachability walk and the
-        // dependency closure), the analysis proper, the editor tables built
-        // over it, and the extra full analysis each FURTHER leg of a shared
-        // module costs. Stderr, like the core line, and behind the same switch,
-        // so one variable turns the whole picture on. `legs` is the count, not
-        // a duration: a file two legs reach pays TWO analyses per keystroke,
-        // and that is the fact to read first.
-        if vilan_core::phase_timing_enabled() {
-            let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
-            eprintln!(
-                "[vilan phase] lsp-context {:.1}ms lsp-analyze {:.1}ms lsp-index {:.1}ms \
-                 lsp-legs {:.1}ms legs {}",
-                milliseconds(phase_context),
-                milliseconds(phase_analyze),
-                milliseconds(phase_index),
-                milliseconds(phase_legs_start.elapsed()),
-                context.shared_platforms.len(),
-            );
-        }
+        let phase_legs = phase_legs_start.elapsed();
         let mut document = Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program,
+            // Filled below, once the landed walk it also counts has run.
+            index_time: std::time::Duration::ZERO,
             diagnostics,
             diagnostic_sources,
             warnings,
@@ -1428,7 +1427,43 @@ impl Document {
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
         // the keystroke thread. See [`LandedSnapshot`].
+        let phase_landed_start = std::time::Instant::now();
         document.landed = document.capture_landed(entry_path);
+        let phase_landed = phase_landed_start.elapsed();
+        // M27: the editor tables, as ONE number the server can carry — the
+        // reference/entity index and the landed walk are the same family of
+        // cost (a table built over a finished analysis, thrown away by the
+        // next keystroke) and no budget separates them.
+        document.index_time = phase_index + phase_landed;
+        // The server's half of the `VILAN_PHASE_TIMING` split (E106): one line
+        // per LSP analysis, naming the costs the core pipeline's own line
+        // cannot see — project resolution (the E113 reachability walk and the
+        // dependency closure), the analysis proper, the editor tables built
+        // over it, the keystroke path's landed walk, and the extra full
+        // analysis each FURTHER leg of a shared module costs. Stderr, like the
+        // core line, and behind the same switch, so one variable turns the
+        // whole picture on. `legs` is the count, not a duration: a file two
+        // legs reach pays TWO analyses per keystroke, and that is the fact to
+        // read first.
+        //
+        // **M27 moved this print.** It used to run before `capture_landed`,
+        // which put E121's whole-program walk — the fifth per-keystroke cost —
+        // outside the only line that could see it. `lsp-landed` is that walk,
+        // and it is on the line now for the same reason `lsp-index` is: a cost
+        // nobody prints is a cost nobody budgets (N43's rule).
+        if vilan_core::phase_timing_enabled() {
+            let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[vilan phase] lsp-context {:.1}ms lsp-analyze {:.1}ms lsp-index {:.1}ms \
+                 lsp-landed {:.1}ms lsp-legs {:.1}ms legs {}",
+                milliseconds(phase_context),
+                milliseconds(phase_analyze),
+                milliseconds(phase_index),
+                milliseconds(phase_landed),
+                milliseconds(phase_legs),
+                context.shared_platforms.len(),
+            );
+        }
         document
     }
 
@@ -2086,6 +2121,7 @@ impl Document {
             retained_tail_start: _,
             analyzed_index,
             program,
+            index_time,
             diagnostics,
             diagnostic_sources,
             warnings,
@@ -2110,6 +2146,7 @@ impl Document {
         // session leak M7 measured (leak-soak.md §4.1) stops at.
         self.analyzed_index = analyzed_index;
         self.program = program;
+        self.index_time = index_time;
         self.diagnostics = diagnostics;
         self.diagnostic_sources = diagnostic_sources;
         self.warnings = warnings;

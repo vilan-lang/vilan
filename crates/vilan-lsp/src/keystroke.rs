@@ -1870,6 +1870,344 @@ pub(crate) mod gate {
         EXHIBIT_ENTRY.replace("\tlet total = panel();", "\tlet totals = panel();")
     }
 
+    // ── E126: the VIEW-SHAPED exhibit ──────────────────────────────────────
+    //
+    // The arithmetic exhibit above meets the keystroke budget honestly, and
+    // E121 built it for exactly that. It is the WRONG subject for the
+    // diagnostics budget: its bodies are `let base = frame(seed); base + k`
+    // over `i32`, so the analysis they drive records **104** method-call
+    // substitutions and costs 50 ms of warm CPU — against an application's
+    // 18,745 and 965 ms (per-module-analysis-reuse.md §1.6). A gate asserted
+    // on it goes green on a program that never had the problem.
+    //
+    // So this second generator emits the shape that produces the cost: every
+    // function returns a `View` built through a CHAINED builder, over a
+    // generic-heavy std surface (`SignalCell` / `Source` / `combine` / `map`
+    // / the `Slot`-bounded `.child`), with one imported module the size of an
+    // icon set and a band of components written in element syntax. Nothing is
+    // copied from any application — the bodies are mechanical, the icon
+    // geometry is arithmetic on the index, and the only thing taken from a
+    // real program is the four RECORDED COUNTS below.
+
+    /// **The application shape this exhibit is built to track**, recorded once.
+    ///
+    /// Measured on the dev machine (16 cores, WSL2) on **2026-09-04**, release
+    /// profile, 1-minute load average **31–33**, by a throwaway P3/P5-shaped
+    /// probe — five in-process `Document::analyze` calls on one browser entry
+    /// of a real vilan application, a distinct trailing comment each time,
+    /// `CLOCK_PROCESS_CPUTIME_ID` around each — reading `Program`'s own tables
+    /// afterwards. The application is READ-ONLY EVIDENCE and never enters this
+    /// tree: these four integers are the whole of what crossed over, and the
+    /// numbers agree with per-module-analysis-reuse.md §1.5/§1.6 (which
+    /// recorded 97,070 entities, 18,540 substitutions and 965 ms of warm CPU
+    /// against `next` at 635e3728, one order earlier).
+    ///
+    /// They are a TARGET, not a budget: [`the_view_exhibit_tracks_the_recorded_application_shape`]
+    /// asserts the generated exhibit stays within 2× of them in both
+    /// directions, which is the property that makes [`diagnostics_budget`]'s
+    /// verdict mean something. A generator change that drifts outside the band
+    /// reds that pin before it can quietly re-open §1.6's hole.
+    pub(crate) const RECORDED_ENTITIES: usize = 99_522;
+    /// See [`RECORDED_ENTITIES`] — `Program::method_call_substitution.len()`.
+    pub(crate) const RECORDED_SUBSTITUTIONS: usize = 18_745;
+    /// See [`RECORDED_ENTITIES`] — `Program::implementations.len()`.
+    pub(crate) const RECORDED_IMPLEMENTATIONS: usize = 433;
+    /// See [`RECORDED_ENTITIES`] — warm process CPU per keystroke, the minimum
+    /// of five (median 1,057 ms). This is the number [`diagnostics_budget`] is
+    /// asserted against a 500 ms mandate for.
+    pub(crate) const RECORDED_WARM_CPU_MS: f64 = 903.0;
+    /// The band the exhibit must track the recording within, each way.
+    pub(crate) const TRACKING_FACTOR: f64 = 2.0;
+
+    /// Children chained onto each generated icon — an icon set's own median.
+    const ICON_CHILDREN: usize = 4;
+    /// Components written in element syntax, each one a builder chain over the
+    /// icon module and the reactive surface.
+    const VIEW_COMPONENTS: usize = 40;
+
+    /// What an analysis of the exhibit is SHAPED like — the counts the
+    /// tracking pin compares, read off the landed program's own tables.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Census {
+        /// Entity ids minted across every source — the `source_ranges` spans
+        /// summed, which is the census §1.6's "entities" column is.
+        pub(crate) entities: usize,
+        /// `method_call_substitution.len()` — §1.6's 178× miss, and the one
+        /// count that says whether the bodies are chained builder calls or
+        /// arithmetic.
+        pub(crate) substitutions: usize,
+        pub(crate) implementations: usize,
+    }
+
+    pub(crate) fn census(document: &Document) -> Census {
+        document
+            .program
+            .as_ref()
+            .map(|program| Census {
+                entities: program
+                    .source_ranges
+                    .iter()
+                    .map(|range| (range.end - range.start) as usize)
+                    .sum(),
+                substitutions: program.method_call_substitution.len(),
+                implementations: program.implementations.len(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// One child element of a generated icon: an svg primitive whose geometry
+    /// is arithmetic on `(index, child)`, so the module is deterministic and
+    /// nothing about it came from anyone's checkout.
+    fn icon_child(index: usize, child: usize) -> String {
+        let a = (index + child) % 20 + 2;
+        let b = (index + 2 * child) % 18 + 2;
+        let c = (index + 3 * child) % 16 + 1;
+        let d = (index + 5 * child) % 14 + 1;
+        let e = (index + 7 * child) % 12 + 1;
+        match (index + child) % 6 {
+            0 => format!("path d(\"M{a} {b}h{c}l{d} {e}\")"),
+            1 => format!("path d(\"M{b} {a}v{c}\")"),
+            2 => format!("circle cx(\"{a}\") cy(\"{b}\") r(\"{c}\")"),
+            3 => format!("rect x(\"{a}\") y(\"{b}\") width(\"{c}\") height(\"{d}\") rx(\"{e}\")"),
+            4 => format!("path d(\"m{a} {b} {c}.{d} {e}\")"),
+            _ => format!("line x1(\"{a}\") y1(\"{b}\") x2(\"{c}\") y2(\"{d}\")"),
+        }
+    }
+
+    /// The icon module — `icons` functions, each returning a `View` through a
+    /// chain of `ICON_CHILDREN` `.child(..)` calls over one shared frame. This
+    /// is the module that carries the exhibit's substitution count: `.child`
+    /// is `fun child<C: Slot>(self, content: C)`, so every link in every chain
+    /// is a generic method call the analysis has to substitute.
+    pub(crate) fn view_icons_module(icons: usize) -> String {
+        let mut text = String::from(
+            "// GENERATED by E126's diagnostics gate: a synthetic icon module of one\n\
+             // repeated VIEW shape, sized like an application's icon set. Nothing here\n\
+             // is copied from any application; the geometry is arithmetic on the index.\n\n\
+             import std::ui::{ View, view };\n\n\
+             fun icon_frame(): View {\n\
+             \t<svg\n\
+             \t\twidth(\"24\")\n\
+             \t\theight(\"24\")\n\
+             \t\tviewBox(\"0 0 24 24\")\n\
+             \t\tfill(\"none\")\n\
+             \t\tstroke(\"currentColor\")\n\
+             \t\tstroke-width(\"2\")\n\
+             \t\tstroke-linecap(\"round\")\n\
+             \t\tstroke-linejoin(\"round\")\n\
+             \t/>\n\
+             }\n\n",
+        );
+        for index in 0..icons {
+            text.push_str(&format!(
+                "/// generated icon {index}\nfun icon_{index:04}(): View {{\n\ticon_frame()\n"
+            ));
+            for child in 0..ICON_CHILDREN {
+                text.push_str(&format!("\t\t.child(<{} />)\n", icon_child(index, child)));
+            }
+            text.push_str("}\n\n");
+        }
+        text
+    }
+
+    /// The generic-heavy state surface: a `SignalCell`-holding struct with a
+    /// type parameter, `combine(..).map(..)` through the reactive std, and two
+    /// functions bounded on `Source<T>`. Fixed — it is the same file at every
+    /// exhibit size, which is what isolates codebase size from file size.
+    pub(crate) const VIEW_STATE_MODULE: &str = "\
+// GENERATED by E126's diagnostics gate.
+import std::reactive::{ Source, combine };
+
+/// A row of app state, held the way an application holds it.
+struct Panel<T> {
+\ttitle: SignalCell<str>,
+\tcount: SignalCell<i32>,
+\tpayload: SignalCell<T>,
+}
+
+impl Panel<type T> {
+\tfun new(title: str, payload: T): Panel<T> {
+\t\tPanel {
+\t\t\ttitle = Signal::new(title),
+\t\t\tcount = Signal::new(0),
+\t\t\tpayload = Signal::new(payload),
+\t\t}
+\t}
+
+\tfun label(self): SignalCell<str> {
+\t\tcombine((self.title, self.count)).map(|pair| i\"{pair.0} ({pair.1})\")
+\t}
+
+\tfun bump(self) {
+\t\tself.count.set(self.count.get() + 1);
+\t}
+}
+
+fun render_label<S: Source<str>>(source: S): View {
+\t<span .child(source.get()) />
+}
+
+fun tally<T: Source<i32>>(source: T, offset: i32): i32 {
+\tsource.get() + offset
+}
+";
+
+    /// The component band: `components` functions in element syntax, each one
+    /// a styled builder chain that reaches the icon module, the reactive
+    /// surface and an inherent `impl` on a std type — an application's own
+    /// view file, mechanically.
+    pub(crate) fn view_components_module(components: usize, icons: usize) -> String {
+        let mut text = String::from(
+            "// GENERATED by E126's diagnostics gate.\n\
+             import std::reactive::{ Source, combine };\n\
+             import pkg::icons;\n\
+             import pkg::state::{ Panel, render_label, tally };\n\n\
+             impl style::Style {\n\
+             \tfun when(self, enabled: bool, modifier: style::Style) {\n\
+             \t\tif enabled {\n\t\t\tself + modifier\n\t\t} else {\n\t\t\tself\n\t\t}\n\t}\n\n\
+             \tfun flex_row(self) {\n\
+             \t\tself.display(style::Display::Flex).flex_direction(style::FlexDirection::Row)\n\
+             \t}\n}\n\n\
+             let row_style = const style::style()\n\
+             \t.padding(style::Length::rem(1))\n\
+             \t.radius(style::Length::rem(1))\n\
+             \t.flex_row();\n\n\
+             fun chip(label: str, selected: bool): View {\n\
+             \t<span .styled(row_style.when(selected, const style::style().opacity(0.5)))>\n\
+             \t\t{label}\n\
+             \t</span>\n}\n\n",
+        );
+        for index in 0..components {
+            let selected = if index % 2 == 0 { "true" } else { "false" };
+            let chipped = if index % 3 == 0 { "false" } else { "true" };
+            text.push_str(&format!(
+                "fun toolbar_{index:03}(panel: Panel<i32>): View {{\n\
+                 \t<div .styled(row_style.when({selected}, const style::style().opacity(0.{})))>\n\
+                 \t\t<button on:click(|_| {{ panel.bump(); }})>\n\
+                 \t\t\t{{icons::icon_{:04}()}}\n\
+                 \t\t</button>\n\
+                 \t\t{{render_label(panel.label())}}\n\
+                 \t\t{{chip(\"row {index}\", {chipped})}}\n\
+                 \t\t<span .child(i\"{{tally(panel.count, {})}}\") />\n\
+                 \t</div>\n}}\n\n",
+                index % 9 + 1,
+                index % icons.max(1),
+                index % 7,
+            ));
+        }
+        text
+    }
+
+    /// The app-shaped entry, held FIXED across every exhibit size for the
+    /// reason [`EXHIBIT_ENTRY`] is: growing the program around an unchanged
+    /// file is what separates codebase size from file size.
+    pub(crate) const VIEW_ENTRY: &str = "\
+// GENERATED by E126's diagnostics gate.
+import pkg::components;
+import pkg::icons;
+import pkg::state::{ Panel, tally };
+
+fun main() {
+\tlet panel = Panel::new(\"panel\", 0);
+\tlet slot_0 = components::toolbar_000(panel);
+\tlet slot_1 = components::toolbar_001(panel);
+\tlet slot_2 = components::toolbar_002(panel);
+\tlet slot_3 = components::toolbar_003(panel);
+\tlet badge = icons::icon_0000();
+\tlet total = tally(panel.count, 1);
+\tui::mount_root(\"app\", || <div .child(slot_0) .child(badge) />);
+}
+";
+
+    /// One keystroke on the view entry: a character typed inside `main`'s
+    /// BODY, so the shape stamp does not move and the verdict stays `Exact`.
+    pub(crate) fn view_keystroke() -> String {
+        VIEW_ENTRY.replace("\tlet total = tally(", "\tlet totals = tally(")
+    }
+
+    /// Write the view exhibit to a fresh package on disk and land one analysis
+    /// on its entry.
+    ///
+    /// Unlike the arithmetic exhibit this one carries a `vilan.toml`: the
+    /// shape under measurement is a BROWSER program written against the web
+    /// prelude, and both facts live in the manifest. Without it there is no
+    /// `View`, no `style`, no `ui` — and no diagnostics path worth gating.
+    fn land_view(icons: usize) -> (std::path::PathBuf, Document, Duration) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e126_gate_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let source = directory.join("src");
+        std::fs::create_dir_all(&source).expect("create the exhibit directory");
+        std::fs::write(
+            directory.join("vilan.toml"),
+            "# GENERATED by E126's diagnostics gate.\n\
+             [package]\nname = \"exhibit\"\ndefault-entry = \"main\"\nprelude = \"std::web\"\n\n\
+             [entry.main]\ntarget = \"browser\"\n",
+        )
+        .expect("write the exhibit manifest");
+        std::fs::write(source.join("icons.vl"), view_icons_module(icons))
+            .expect("write the icon module");
+        std::fs::write(source.join("state.vl"), VIEW_STATE_MODULE).expect("write the state module");
+        std::fs::write(
+            source.join("components.vl"),
+            view_components_module(VIEW_COMPONENTS, icons),
+        )
+        .expect("write the component module");
+        let entry = source.join("main.vl");
+        std::fs::write(&entry, VIEW_ENTRY).expect("write the exhibit entry");
+        let started = Instant::now();
+        let document = Document::analyze(VIEW_ENTRY, &std_root(), &entry);
+        (directory, document, started.elapsed())
+    }
+
+    /// Which exhibit a gate body is running on.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Subject {
+        /// E121's original: `functions` functions of `i32` arithmetic. The
+        /// keystroke path's subject, and honest for it.
+        Arithmetic,
+        /// E126's: `functions` `View`-returning functions through a chained
+        /// builder, plus the component band and the reactive surface. The
+        /// diagnostics path's subject.
+        View,
+    }
+
+    impl Subject {
+        /// The tag the machine-readable rows carry.
+        fn tag(self) -> &'static str {
+            match self {
+                Subject::Arithmetic => "syn",
+                Subject::View => "view",
+            }
+        }
+
+        fn land(self, functions: usize) -> (std::path::PathBuf, Document, Duration) {
+            match self {
+                Subject::Arithmetic => land(functions),
+                Subject::View => land_view(functions),
+            }
+        }
+
+        fn keystroke(self) -> String {
+            match self {
+                Subject::Arithmetic => one_keystroke(),
+                Subject::View => view_keystroke(),
+            }
+        }
+
+        /// A bare scope position inside the edited body — where a completion
+        /// request lands mid-word, and the arm that carries auto-import.
+        fn cursor_needle(self) -> &'static str {
+            match self {
+                Subject::Arithmetic => "panel();",
+                Subject::View => "tally(panel.count",
+            }
+        }
+    }
+
     /// Run `work` `REPETITIONS` times and return the per-call thread CPU and
     /// wall time.
     fn per_call(mut work: impl FnMut()) -> (Option<f64>, f64) {
@@ -1902,8 +2240,9 @@ pub(crate) mod gate {
     /// `assert_budget` is false for the smoke subject: a 24-function exhibit
     /// says nothing about a 1,791-function budget, and pretending otherwise
     /// would be the vacuous green M12 taught this tree to refuse.
-    fn keystroke_path_budget_at(functions: usize, assert_budget: bool) {
-        let (directory, mut document, analysis) = land(functions);
+    fn keystroke_path_budget_at(subject: Subject, functions: usize, assert_budget: bool) {
+        let tag = subject.tag();
+        let (directory, mut document, analysis) = subject.land(functions);
         let landed_tokens = document.keystroke_tokens(false).len();
         assert!(
             landed_tokens > 0,
@@ -1917,7 +2256,7 @@ pub(crate) mod gate {
                 .collect::<Vec<_>>(),
         );
         println!(
-            "E121 {{\"section\":\"keystroke_path\",\"subject\":\"syn{functions}\",\
+            "E121 {{\"section\":\"keystroke_path\",\"subject\":\"{tag}{functions}\",\
              \"request\":\"land\",\"profile\":\"{}\",\"load\":\"{}\",\"reps\":1,\
              \"cpu_ms\":null,\"wall_ms\":{:.1},\"count\":{landed_tokens}}}",
             profile(),
@@ -1930,23 +2269,26 @@ pub(crate) mod gate {
         let (baseline_cpu, baseline_wall) = per_call(|| {
             std::hint::black_box(document.semantic_tokens());
         });
-        row("syn", "landed_walk", baseline_cpu, baseline_wall, functions);
+        row(tag, "landed_walk", baseline_cpu, baseline_wall, functions);
 
         // One keystroke, then the burst an editor fires.
-        document.set_text(&one_keystroke());
-        let offset = one_keystroke().find("panel();").expect("a scope position");
+        let edited = subject.keystroke();
+        document.set_text(&edited);
+        let offset = edited
+            .find(subject.cursor_needle())
+            .expect("a scope position");
 
         let (tokens_cpu, tokens_wall) = per_call(|| {
             std::hint::black_box(document.keystroke_tokens(false));
         });
         let count = document.keystroke_tokens(false).len();
-        row("syn", "semanticTokens", tokens_cpu, tokens_wall, count);
+        row(tag, "semanticTokens", tokens_cpu, tokens_wall, count);
 
         let (hints_cpu, hints_wall) = per_call(|| {
             std::hint::black_box(document.keystroke_hints(false));
         });
         row(
-            "syn",
+            tag,
             "inlayHint",
             hints_cpu,
             hints_wall,
@@ -1957,7 +2299,7 @@ pub(crate) mod gate {
             std::hint::black_box(document.keystroke_completion(offset, false));
         });
         row(
-            "syn",
+            tag,
             "completion",
             completion_cpu,
             completion_wall,
@@ -1971,7 +2313,7 @@ pub(crate) mod gate {
             std::hint::black_box(document.keystroke_hints(false));
             std::hint::black_box(document.keystroke_completion(offset, false));
         });
-        row("syn", "burst", burst_cpu, burst_wall, 3);
+        row(tag, "burst", burst_cpu, burst_wall, 3);
         let _ = std::fs::remove_dir_all(&directory);
 
         if !assert_budget {
@@ -1992,17 +2334,17 @@ pub(crate) mod gate {
             let cpu = cpu.expect("the clock answered for the burst, so it answered here");
             assert!(
                 cpu < budget,
-                "{request} cost {cpu:.3} ms of thread CPU per request on the {functions}-function \
-                 exhibit, over the {budget} ms budget (loadavg {}, the whole-program walk it \
-                 replaces cost {} ms)",
+                "{request} cost {cpu:.3} ms of thread CPU per request on the {tag} exhibit at \
+                 {functions} functions, over the {budget} ms budget (loadavg {}, the \
+                 whole-program walk it replaces cost {} ms)",
                 loadavg_1m(),
                 baseline_cpu.map_or_else(|| "?".to_string(), |value| format!("{value:.3}")),
             );
         }
         assert!(
             burst_cpu < BUDGET_MS,
-            "the five-provider burst cost {burst_cpu:.3} ms of thread CPU on the \
-             {functions}-function exhibit, over the {BUDGET_MS} ms budget — and the burst is what \
+            "the five-provider burst cost {burst_cpu:.3} ms of thread CPU on the {tag} exhibit \
+             at {functions} functions, over the {BUDGET_MS} ms budget — and the burst is what \
              the editor experiences, because §1.2 measured that the server answers one serially \
              (loadavg {})",
             loadavg_1m(),
@@ -2154,7 +2496,7 @@ pub(crate) mod gate {
     #[test]
     #[ignore = "E121: the keystroke-path gate — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
     fn keystroke_path_budget() {
-        keystroke_path_budget_at(GATE_FUNCTIONS, true);
+        keystroke_path_budget_at(Subject::Arithmetic, GATE_FUNCTIONS, true);
     }
 
     /// The seconds-long smoke pin the PR gate DOES pay: the harness builds its
@@ -2162,34 +2504,42 @@ pub(crate) mod gate {
     /// path and produces rows. It asserts the mechanism, not the budget.
     #[test]
     fn keystroke_path_gate_smoke() {
-        keystroke_path_budget_at(SMOKE_FUNCTIONS, false);
+        keystroke_path_budget_at(Subject::Arithmetic, SMOKE_FUNCTIONS, false);
     }
 
-    /// §6.2's `diagnostics_budget`. CPU-clocked, which makes it
-    /// **debounce-exclusive by construction** (Q3): the debounce is a
-    /// `tokio::time::sleep` and accrues no CPU, so a CPU assertion cannot
-    /// include it.
+    /// §6.2's `diagnostics_budget`, **re-anchored on E126's view-shaped
+    /// exhibit**. CPU-clocked, which makes it **debounce-exclusive by
+    /// construction** (Q3): the debounce is a `tokio::time::sleep` and accrues
+    /// no CPU, so a CPU assertion cannot include it.
     ///
-    /// **It now holds.** The paper measured 925 ms of CPU per keystroke at
-    /// 1,791 reachable functions against a 500 ms budget; perf-25 (M21 + M19's
-    /// first tranche) took the analysis off the curve that produced it. The
-    /// budget is asserted on PROCESS CPU rather than the calling thread's,
-    /// which is the fix for the note this pin used to carry — the analysis runs
-    /// on its own spawned big-stack thread and accrues nothing to the caller's
-    /// clock, so wall was the only number available and wall is not load-proof.
-    /// It is recorded beside it.
+    /// **It is RED, and that is the honest verdict.** One warm keystroke costs
+    /// **1,053 ms** of process CPU on the view exhibit at [`GATE_FUNCTIONS`]
+    /// icons — measured 2026-09-04, release, loadavg 121, with the exhibit's
+    /// own census on the same run (104,430 entities, 26,000 substitutions) —
+    /// against the mandate's 500 ms. That is the same order as the
+    /// [`RECORDED_WARM_CPU_MS`] an application pays, which is the whole point
+    /// of the subject swap. On the arithmetic exhibit this pin used to run on,
+    /// the same measurement is ~50 ms and the gate went GREEN on a program
+    /// that never had the problem (per-module-analysis-reuse.md §1.6: 104
+    /// substitutions against an application's 18,745).
     ///
-    /// Still `#[ignore]`d, and for its SUBJECT rather than its verdict: this
-    /// builds and analyzes the same 1,791-function exhibit
-    /// [`keystroke_path_budget`] does, which is minutes of work in a debug
-    /// suite. Both gates are run deliberately, together, by the command in this
-    /// module's doc.
+    /// The path to green is **M19 tranche 1** — the per-module analysis reuse
+    /// this exhibit exists to gate. §1.5 measured that 83% of a warm
+    /// keystroke's analyzer CPU re-analyzes ONE module whose content did not
+    /// change; not doing that work is what gets under 500 ms, and no tuning of
+    /// the work does. Until it lands the pin stays `#[ignore]`d with its
+    /// measured number in the reason, which is the tree's rule for a gate that
+    /// is right and red.
+    ///
+    /// It is also expensive: building and analyzing a 1,791-icon package is
+    /// minutes of work in a debug suite. Both gates are run deliberately,
+    /// together, by the command in this module's doc.
     #[test]
-    #[ignore = "E121: the diagnostics gate — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    #[ignore = "E121/E126: the diagnostics gate — RED and honest. One warm keystroke costs 1,053 ms of process CPU on the view-shaped exhibit against a 500 ms mandate (E126, 2026-09-04, release, loadavg 121); M19 tranche 1's per-module reuse is the path to green. Minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
     fn diagnostics_budget() {
-        let (directory, _document, _) = land(GATE_FUNCTIONS);
-        let entry = directory.join("main.vl");
-        let edited = one_keystroke();
+        let (directory, _document, _) = land_view(GATE_FUNCTIONS);
+        let entry = directory.join("src").join("main.vl");
+        let edited = view_keystroke();
         let cpu_started = process_cpu_now();
         let wall_started = Instant::now();
         let analyzed = Document::analyze(&edited, &std_root(), &entry);
@@ -2198,7 +2548,29 @@ pub(crate) mod gate {
             .zip(process_cpu_now())
             .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
         let count = analyzed.diagnostics.len();
-        row("syn", "publishDiagnostics", cpu, wall, count);
+        let shape = census(&analyzed);
+        row("view", "publishDiagnostics", cpu, wall, count);
+        // The subject's shape, on the same run that produced the number above:
+        // a budget verdict is only worth reading beside the census that says
+        // WHICH program it was taken on (§1.6's whole finding).
+        println!(
+            "E126 {{\"section\":\"diagnostics\",\"subject\":\"view{GATE_FUNCTIONS}\",\
+             \"entities\":{},\"substitutions\":{},\"implementations\":{},\
+             \"recorded_entities\":{RECORDED_ENTITIES},\
+             \"recorded_substitutions\":{RECORDED_SUBSTITUTIONS}}}",
+            shape.entities, shape.substitutions, shape.implementations,
+        );
+        assert!(
+            analyzed.program.is_some(),
+            "the view exhibit did not analyze, so the CPU below measures a failed \
+             parse rather than the diagnostics path (diagnostics: {:?})",
+            analyzed
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .take(3)
+                .collect::<Vec<_>>(),
+        );
         let _ = std::fs::remove_dir_all(&directory);
         let Some(cpu) = cpu else {
             panic!(
@@ -2209,10 +2581,150 @@ pub(crate) mod gate {
         };
         assert!(
             cpu < 500.0,
-            "one keystroke took {cpu:.0} ms of CPU to diagnostics on the {GATE_FUNCTIONS}-function \
-             exhibit, over the 500 ms budget (loadavg {}, {wall:.0} ms of wall); the debounce is \
-             excluded by construction — it is not in this span at all",
+            "one keystroke took {cpu:.0} ms of CPU to diagnostics on the view-shaped \
+             {GATE_FUNCTIONS}-icon exhibit ({} entities, {} method-call substitutions), over the \
+             500 ms budget (loadavg {}, {wall:.0} ms of wall). The subject is honest: a real \
+             application of this shape pays {RECORDED_WARM_CPU_MS:.0} ms for the same keystroke, \
+             and E121's arithmetic exhibit paid 50. The debounce is excluded by construction — it \
+             is not in this span at all. M19 tranche 1 is the path: §1.5 measured 83% of this \
+             going to ONE module whose content did not change",
+            shape.entities,
+            shape.substitutions,
             loadavg_1m(),
         );
+    }
+
+    /// **E126's own pin: the exhibit is the right SUBJECT.**
+    ///
+    /// [`diagnostics_budget`]'s verdict is only worth what its subject is
+    /// worth, and §1.6 is the record of a gate that went green because its
+    /// subject was 178× too easy. So the subject is asserted, against the four
+    /// [`RECORDED_ENTITIES`] counts, in BOTH directions: an exhibit that
+    /// drifts easier re-opens §1.6's hole, and one that drifts harder turns
+    /// the budget into a number about the generator rather than about an
+    /// application.
+    ///
+    /// `#[ignore]`d for its cost, not its verdict — it lands a full-size
+    /// analysis, which is the same minutes the two budget gates pay.
+    #[test]
+    #[ignore = "E126: the exhibit-shape gate — a full-size view exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    fn the_view_exhibit_tracks_the_recorded_application_shape() {
+        let (directory, document, analysis) = land_view(GATE_FUNCTIONS);
+        let shape = census(&document);
+        println!(
+            "E126 {{\"section\":\"exhibit_shape\",\"subject\":\"view{GATE_FUNCTIONS}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"entities\":{},\"substitutions\":{},\
+             \"implementations\":{},\"land_ms\":{:.0}}}",
+            profile(),
+            loadavg_1m(),
+            shape.entities,
+            shape.substitutions,
+            shape.implementations,
+            analysis.as_secs_f64() * 1000.0,
+        );
+        let diagnostics = document
+            .diagnostics
+            .iter()
+            .map(|error| &error.msg)
+            .take(3)
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            diagnostics.is_empty(),
+            "the view exhibit must analyze CLEAN — a program that does not type-check \
+             stops walking bodies partway and its census means nothing: {diagnostics:?}",
+        );
+        for (label, measured, recorded) in [
+            ("entities", shape.entities, RECORDED_ENTITIES),
+            (
+                "method-call substitutions",
+                shape.substitutions,
+                RECORDED_SUBSTITUTIONS,
+            ),
+            (
+                "implementations",
+                shape.implementations,
+                RECORDED_IMPLEMENTATIONS,
+            ),
+        ] {
+            let ratio = measured as f64 / recorded as f64;
+            assert!(
+                (1.0 / TRACKING_FACTOR..=TRACKING_FACTOR).contains(&ratio),
+                "the exhibit's {label} came to {measured} against the recorded {recorded} \
+                 ({ratio:.2}×), outside the {TRACKING_FACTOR}× band — the generated subject no \
+                 longer tracks the application shape `diagnostics_budget` is asserted for \
+                 (per-module-analysis-reuse.md §1.6)",
+            );
+        }
+    }
+
+    /// The generator is a GENERATOR: same input, same bytes, every time, and
+    /// the shape it claims to emit is in the bytes.
+    ///
+    /// Cheap — no analysis — so the PR gate pays it. It is what catches a
+    /// generator edit that quietly stops emitting chains (the §1.6 failure)
+    /// without waiting for the minutes-long shape pin above.
+    #[test]
+    fn the_view_exhibit_generator_is_deterministic_and_view_shaped() {
+        let icons = 64;
+        assert_eq!(
+            view_icons_module(icons),
+            view_icons_module(icons),
+            "the icon module is not deterministic, so no two runs of the gate share a subject",
+        );
+        assert_eq!(
+            view_components_module(VIEW_COMPONENTS, icons),
+            view_components_module(VIEW_COMPONENTS, icons),
+            "the component module is not deterministic",
+        );
+        let module = view_icons_module(icons);
+        assert_eq!(
+            module.matches("(): View {").count(),
+            icons + 1,
+            "the icon module must declare one `View`-returning function per icon plus the \
+             shared frame",
+        );
+        assert_eq!(
+            module.matches(".child(<").count(),
+            icons * ICON_CHILDREN,
+            "every icon must chain {ICON_CHILDREN} `.child(..)` calls — the chain IS the \
+             substitution count §1.6's finding is about, and an icon module of bare returns \
+             is the exhibit that let the diagnostics gate go green",
+        );
+        let components = view_components_module(VIEW_COMPONENTS, icons);
+        assert!(
+            components.matches("icons::icon_").count() >= VIEW_COMPONENTS,
+            "every component must reach the icon module, or the icons are dead weight the \
+             entry never colours",
+        );
+        assert!(
+            VIEW_STATE_MODULE.contains("combine((self.title, self.count)).map(")
+                && VIEW_STATE_MODULE.contains("fun render_label<S: Source<str>>"),
+            "the state module carries the generic std surface — `combine`, `map` and a \
+             `Source`-bounded parameter — and without it the exhibit's generic instantiation \
+             is the icon chain alone",
+        );
+    }
+
+    /// The view exhibit's keystroke half: the mandate's per-request budgets, on
+    /// the diagnostics subject.
+    ///
+    /// E121's gate asserts them on the arithmetic exhibit, and they hold there.
+    /// They have to hold HERE too, or the keystroke path's claim is a claim
+    /// about `i32` programs: the path serves a landed snapshot, and the
+    /// snapshot of a 1,791-icon view program is the one an application has.
+    #[test]
+    #[ignore = "E121/E126: the keystroke-path gate on the view exhibit — a generated 1,791-icon package, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    fn keystroke_path_budget_view() {
+        keystroke_path_budget_at(Subject::View, GATE_FUNCTIONS, true);
+    }
+
+    /// The seconds-long smoke the PR gate DOES pay on the view subject: the
+    /// generator writes a real package, it analyzes, every provider answers
+    /// through the keystroke path. Mechanism, not budget — a 24-icon exhibit
+    /// says nothing about a 1,791-icon one.
+    #[test]
+    fn keystroke_path_gate_smoke_view() {
+        keystroke_path_budget_at(Subject::View, SMOKE_FUNCTIONS, false);
     }
 }
