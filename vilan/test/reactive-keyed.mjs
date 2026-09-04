@@ -29,7 +29,7 @@ function show(plan) {
 	}
 	console.log(out);
 }
-function $a(old_keys, old_items, items, key_of) {
+function $a(old_keys, old_items, items, key_of, same) {
 	let claimed = [  ];
 	for (const _ of old_keys) {
 		claimed.push(false);
@@ -43,7 +43,7 @@ function $a(old_keys, old_items, items, key_of) {
 			if (!(__at(claimed, index)) && __at(old_keys, index) === item_key) {
 				__at_put(claimed, index, true);
 				let $b = null;
-				if (__at(old_items, index) === item) {
+				if (same(__at(old_items, index), item)) {
 					$b = [ 0, index ];
 				} else {
 					$b = [ 1, index ];
@@ -67,19 +67,36 @@ function $a(old_keys, old_items, items, key_of) {
 }
 show($a([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30, 10, 20 ], (item) => {
 	return Math.trunc(item / 10);
+}, (a, b) => {
+	return a === b;
 }));
 show($a([ 1, 2 ], [ 10, 20 ], [ 10, 21, 35 ], (item) => {
 	return Math.trunc(item / 10);
+}, (a, b) => {
+	return a === b;
 }));
 show($a([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30 ], (item) => {
 	return Math.trunc(item / 10);
+}, (a, b) => {
+	return a === b;
 }));
 show($a([ 1 ], [ 10 ], [ 10, 10 ], (item) => {
 	return Math.trunc(item / 10);
+}, (a, b) => {
+	return a === b;
 }));
 show($a([  ], [  ], [ 10 ], (item) => {
 	return Math.trunc(item / 10);
+}, (a, b) => {
+	return a === b;
 }));
 show($a([ 1 ], [ 10 ], [  ], (item) => {
 	return Math.trunc(item / 10);
+}, (a, b) => {
+	return a === b;
+}));
+show($a([ 1, 2 ], [ 10, 20 ], [ 10, 21, 35 ], (item) => {
+	return Math.trunc(item / 10);
+}, (_a, _b) => {
+	return true;
 }));

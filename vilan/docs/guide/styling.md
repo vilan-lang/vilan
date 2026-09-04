@@ -487,6 +487,43 @@ The rule is compiled once. Only the variable's value changes at runtime.
 This one channel covers most "dynamic styling" needs — a value that
 changes inside a rule.
 
+## Conditional merges: `when`
+
+When the style depends on a handful of independent flags, `+` and `if`
+turn into a small pile of rebinding. `when(condition, delta)` is that
+pile as a chain — `self + delta` when the condition holds, `self`
+untouched when it doesn't:
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+import std::style::{ style, space, Style, Color };
+
+let base = const style().padding(space(2)).color(Color::gray(900));
+let chosen = const style().background(Color::blue(100)).color(Color::blue(900));
+let muted = const style().color(Color::gray(400));
+
+fun row(is_chosen: bool, is_muted: bool): View {
+	view("li").styled(base.when(is_chosen, chosen).when(is_muted, muted))
+}
+
+fun main() {
+	let _root = mount_root("app", || view("ul").child(row(true, false)));
+}
+```
+
+`when` selects; it never builds. Both sides were constructed in `const`,
+so the construct-in-const rule holds with a runtime flag in the middle,
+exactly as it does for `bind_styled` below.
+
+Chain order is **precedence**: when two `when`s both fire, the later
+delta wins whatever properties they share — the same rule `+` follows.
+
+The chain reads best when each condition mentions its **own** flag. If
+one condition has to mention another link's flag (`!selected &&
+!disabled`), the states aren't independent, and a `match` says that
+structurally where a chain only implies it. The compound condition is
+the tell.
+
 ## Swapping whole styles
 
 When what changes is *which* style applies, not a value inside one, put

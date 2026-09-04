@@ -248,6 +248,41 @@ impl View {
 		self
 	}
 
+	/// A reactive list keyed by the ITEM ITSELF, server side — the read-once
+	/// twin of the browser's `bind_each_values` (A42). KEEP IN STEP.
+	fun bind_each_values<T: PartialEq, S: Source<List<T>>>(
+		self,
+		source: S,
+		build: (sync |T| View) context owner_scope,
+	): View {
+		self.bind_each(source, |item| item, build)
+	}
+
+	/// A reactive list whose rows update through a cell, server side: one child
+	/// per element of the CURRENT list, each built against a fresh
+	/// `SignalCell<T>` holding that element. No reconciliation and no later
+	/// change to follow, so the cell is written once and never again — but it
+	/// must exist, because `build` is the same closure the client runs.
+	/// No bound on `T`, matching the browser twin. KEEP IN STEP.
+	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>>(
+		self,
+		source: S,
+		key: sync |T| K,
+		build: (sync |SignalCell<T>| View) context owner_scope,
+	): View {
+		let items: List<T> = source.get();
+		// The key is client business — it decides which row survives a change,
+		// and no row here outlives the request. Accepted and dropped, like the
+		// event binders' handlers.
+		let _keyed = key;
+		for item in items {
+			let cell: SignalCell<T> = SignalCell::new(item);
+			let owner = Owner::new();
+			self.children.write().push(Child::Element(run_with_owner(owner, || build(cell))));
+		}
+		self
+	}
+
 	/// Conditional content: renders the body when `condition` is currently true,
 	/// nothing when false. Read once — no toggling survives the request. The body
 	/// runs under a throwaway owner, like `bind_each`'s rows.
@@ -272,6 +307,23 @@ impl View {
 		let value = source.get();
 		let owner = Owner::new();
 		self.children.write().push(Child::Element(run_with_owner(owner, || build(value))));
+		self
+	}
+
+	/// The element mount hook, server side: ACCEPTED AND DROPPED. There is no
+	/// document to be in and no element to hand over — the server render
+	/// creates, serializes and discards — so this returns `self` unchanged,
+	/// exactly as the event binders do with their handlers. The parameter is
+	/// generic for the same reason `on_event`'s is: a server layer cannot name
+	/// the browser-only `std::dom::Element`. KEEP IN STEP with the browser
+	/// twin (browser/ui.vl).
+	fun on_mount<E>(self, action: sync |E| void): View {
+		self
+	}
+
+	/// Focus, server side: nothing to focus. Dropped like `on_mount`, whose
+	/// one-word form it is on the browser twin. KEEP IN STEP.
+	fun autofocus(self): View {
 		self
 	}
 

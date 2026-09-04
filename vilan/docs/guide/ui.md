@@ -304,6 +304,85 @@ fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
 ): View
 ```
 
+### Three forms, one engine
+
+`bind_each` asks two things of your items — a key **and** an equality —
+and most lists only have one of them to give. The other two forms each
+drop one bound:
+
+| | Signature | Key | Unchanged row | Asks of `T` |
+|---|---|---|---|---|
+| `.bind_each(source, key, render)` | `render: \|T\| View` | `key(item)` | reused; changed → rebuilt | `PartialEq` |
+| `.bind_each_values(source, render)` | `render: \|T\| View` | the item itself | reused; changed → rebuilt | `PartialEq` |
+| `.bind_each_by(source, key, render)` | `render: \|SignalCell<T>\| View` | `key(item)` | **always** reused; the row's cell is rewritten | nothing |
+
+- **`bind_each_values`** is `bind_each(source, |x| x, render)` written
+  once. Reach for it whenever the item *is* the identity — every
+  `|x| x` key in the wild is this.
+- **`bind_each_by`** is Solid's `<Index>` beside `bind_each`'s `<For>`.
+  A row whose key survives keeps its element, its owner and its
+  bindings, and std writes the new item into that row's own
+  `SignalCell<T>`, so the row updates *through* the bindings `render`
+  already made. That's what lets it take a `T` with no equality at all —
+  a struct carrying a closure, a handle, anything you can't derive
+  `PartialEq` for.
+
+  The trade: `set` never compares, so **every** kept row's cell is
+  written on every change of the list, and every binding in every row
+  re-runs. Reach for `bind_each` when `T` compares cheaply and rows are
+  expensive to rebuild; reach for `bind_each_by` when `T` can't compare,
+  or when the row's own bindings are the natural update path.
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+import std::reactive::{ Signal, SignalCell };
+
+struct Task {
+	id: i32,
+	title: str,
+}
+
+fun main() {
+	let tasks: SignalCell<List<Task>> = Signal::new([
+		Task { id = 1, title = "write docs" },
+	]);
+	let names: SignalCell<List<str>> = Signal::new(["ada", "grace"]);
+	let _root = mount_root("app", || {
+		view("div")
+			// the item is the key
+			.child(view("ul").bind_each_values(names, |name| view("li").text(name)))
+			// `Task` needs no PartialEq: the row updates through its cell
+			.child(view("ol").bind_each_by(tasks, |task| task.id, |task| {
+				view("li").bind_text(task.map(|current| current.title))
+			}))
+	});
+}
+```
+
+## After the element lands: `on_mount`, `autofocus`
+
+`view(..)` builds an element; it is not in the document until whatever
+appends it does. `.on_mount(action)` runs `action` with the element once
+it *is* — at every attachment site, including a `when` body or a
+`bind_each` row that appears in a later change.
+
+```vilan,fragment
+view("input").attr("type", "text").on_mount(|element| element.focus())
+view("input").attr("type", "text").autofocus()          // the same thing
+```
+
+`autofocus` is the reason the hook exists. HTML's `autofocus` attribute
+fires only on a document's initial parse, so it does nothing for a modal
+mounted later — and the workaround it forces (mint a uuid, set it as the
+id, start a 1 ms timer, look the element back up) is three lines of
+ceremony around a value you already had. There is nothing to look up:
+the callback is handed the element.
+
+The hook is a **microtask**, which is enough because the whole
+synchronous build — and the `mount` that finishes it — runs to
+completion before any microtask does. On the SSR twin both methods
+accept and drop, like the event binders: there is no document to be in.
+
 ## Conditionals: `show`, `when`, `swap`
 
 Three primitives. Pick by what should happen to the content while it's

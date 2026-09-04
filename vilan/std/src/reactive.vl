@@ -1,5 +1,7 @@
 import pkg::compare::PartialEq;
 import pkg::context::Context;
+import pkg::hash::Hashable;
+import pkg::native_map::NativeMap;
 import pkg::option::Option::{ None, Some, self };
 import pkg::result::Result::{ Err, Ok, self };
 import pkg::shared::Shared;
@@ -58,6 +60,10 @@ external fun queue_microtask(callback: || void);
 
 struct Turn {
 	pending: Shared<List<Subscriber>>,
+	// The ids in `pending`, as a keyed set — `enqueue`'s dedup (A44). Kept in
+	// exact step with `pending`: cleared when a wave is taken out, scrubbed
+	// when a `Subscription` removes itself.
+	queued: Shared<NativeMap<bool>>,
 	draining: Shared<bool>,
 	// True once the extent's own settle ran; a LATE enqueue (an async
 	// continuation's write) then schedules its own segment-coalesced drain.
@@ -69,6 +75,7 @@ impl Turn {
 	fun new(): Turn {
 		Turn {
 			pending = Shared::new([]),
+			queued = Shared::new(NativeMap::new()),
 			draining = Shared::new(false),
 			settled = Shared::new(false),
 			scheduled = Shared::new(false),
@@ -94,17 +101,19 @@ let draining_turns: Shared<List<Turn>> = Shared::new([]);
 
 /// Enqueue subscribers into `turn`'s queue, deduped by id so a subscriber fed
 /// by several inputs in one turn fires once — the dedup *is* the
-/// glitch-freeness. (A keyed set can replace this linear scan later without
-/// changing semantics.)
+/// glitch-freeness.
+///
+/// The membership test is a KEYED SET (A44), not a scan of the pending list.
+/// The scan it replaces was linear in the queue's own length and it ran inside
+/// `Signal::notify`'s loop, so one write that reached n queued observers cost
+/// O(n²) — which is exactly the regime `selector` exists to serve, a thousand
+/// rows deep. `queued` holds the ids in `pending` and nothing else, so the
+/// semantics are unchanged, one entry per subscriber per wave.
 fun enqueue(turn: Turn, subscribers: List<Subscriber>) {
 	for subscriber in subscribers {
-		mut seen = false;
-		for queued in turn.pending.read() {
-			if queued.id == subscriber.id {
-				seen = true;
-			}
-		}
-		if !seen {
+		let key = subscriber.id.hash();
+		if !turn.queued.read().contains_key(key) {
+			turn.queued.write().insert(key, true);
 			turn.pending.write().push(subscriber);
 		}
 	}
@@ -134,6 +143,10 @@ fun drain(turn: Turn) {
 		for !turn.pending.read().is_empty() && budget > 0 {
 			let wave = turn.pending.read();
 			turn.pending.write() = [];
+			// The wave is out of the queue, so its ids are free to re-enter it
+			// — a cascade re-enqueuing an observer this wave already ran is
+			// the propagation `drain`'s loop exists for.
+			turn.queued.write() = NativeMap::new();
 			for subscriber in wave {
 				(subscriber.notify)();
 				budget -= 1;
@@ -306,6 +319,7 @@ impl Subscription with Disposable {
 					}
 				}
 				turn.pending.write() = kept_pending;
+				turn.queued.write().remove(self.id.hash());
 			},
 			None => {},
 		}
@@ -462,6 +476,60 @@ trait Source<T> {
 	fun effect(self, observer: |T| void) {
 		get_owner().take(self.sub(observer));
 	}
+
+	/// Subscribe WITHOUT the immediate first call (backlog A43): `observer`
+	/// runs on every CHANGE from here on, and never for the value the source
+	/// already holds. `sub` is exactly this plus that call, so the pair is the
+	/// eager/lazy opt-out Solid spells `on(deps, fn, { defer: true })` — vilan
+	/// has neither overloading nor optional parameters, so the opt-out is a
+	/// NAME.
+	///
+	/// Reach for it when the first value is already accounted for: a
+	/// derivation that seeded its own initial value (`map`, `combine`), a
+	/// side effect that must not fire on the state the program starts in — a
+	/// "you have unsaved changes" prompt, an analytics ping. Every UI binding
+	/// wants the opposite (the immediate call IS the initial paint), which is
+	/// why `sub`/`effect` keep it.
+	///
+	/// The DEFAULT body wraps `sub` and swallows that first call, which is
+	/// honest against `sub`'s documented contract — one immediate call with
+	/// the current value, then one per change. An impl whose `sub` does not
+	/// fire immediately is already outside that contract and must override
+	/// this. `SignalCell` does override it, with a direct attach that never
+	/// makes the call at all (`observe`).
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription {
+		let seeded: Shared<bool> = Shared::new(false);
+		self.sub(|value| {
+			if seeded.read() {
+				observer(value);
+			} else {
+				seeded.write() = true;
+			}
+		})
+	}
+
+	/// A derived signal: `transform` of this one's value, recomputed on every
+	/// change. DETACHABLE (A28): the subscription into this signal is handed to
+	/// the ambient owner, so a derivation made inside a boundary — a mounted
+	/// view, a `bind_each` row — dies when that boundary is disposed instead of
+	/// notifying a dead derived signal for the rest of the session. Made
+	/// outside every boundary (module level, the top of `main`) it lives as long
+	/// as its source, which is what a module-level `current_path().map(parse)`
+	/// wants.
+	fun map<U>(self, transform: sync |T| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
+		let _owned = register_with_owner(self.on_change(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+
+	/// `on_change` registered with the ambient owner — `effect`'s lazy twin,
+	/// and the same static requirement: an enclosing `owner_scope.run`.
+	fun effect_on_change(self, observer: |T| void) {
+		get_owner().take(self.on_change(observer));
+	}
 }
 
 /// The WRITABLE half of the pair: `Source` reads, `Signal` writes. A component
@@ -524,6 +592,14 @@ impl SignalCell<type T> with Source<T> {
 		let subscription = observe(self, observer);
 		observer(self.get());
 		subscription
+	}
+
+	/// The direct attach — `observe` itself (A43). The trait's default body
+	/// would reach this through `sub` and drop the immediate call on the
+	/// floor; the cell can simply not make it.
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription {
+		observe(self, observer)
 	}
 }
 
@@ -620,22 +696,6 @@ impl SignalCell<type T> {
 		mutate(self.value.write());
 		self.notify();
 	}
-
-	/// A derived signal: `transform` of this one's value, recomputed on every
-	/// change. DETACHABLE (A28): the subscription into this signal is handed to
-	/// the ambient owner, so a derivation made inside a boundary — a mounted
-	/// view, a `bind_each` row — dies when that boundary is disposed instead of
-	/// notifying a dead derived signal for the rest of the session. Made
-	/// outside every boundary (module level, the top of `main`) it lives as long
-	/// as its source, which is what a module-level `current_path().map(parse)`
-	/// wants.
-	fun map<U>(self, transform: sync |T| U): SignalCell<U> {
-		let derived = SignalCell::new(transform(self.get()));
-		let _owned = register_with_owner(observe(self, |value| {
-			derived.set(transform(value));
-		}));
-		derived
-	}
 }
 
 /// A component value that may be STATIC or REACTIVE, with no ceremony at the
@@ -699,13 +759,101 @@ impl type S: Source<type T> with MaybeSignal<T> {
 fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
 	let snapshot = || (source in sources => source.get());
 	let derived = SignalCell::new(snapshot());
-	// Subscribe each input (the comprehension's `.map` runs `sub` per element).
-	// The handles are the AMBIENT OWNER's from here on — the tuple itself is
-	// what is dropped, not the subscriptions.
-	let _owned = (source in sources => register_with_owner(source.sub(|_| {
+	// Subscribe each input LAZILY (A43): `derived` was just seeded with the
+	// snapshot, so an eager `sub` would re-set it to that same value once per
+	// input — n redundant writes, and n redundant snapshots, at construction.
+	// `on_change` attaches without the call. The handles are the AMBIENT
+	// OWNER's from here on — the tuple itself is what is dropped, not the
+	// subscriptions.
+	let _owned = (source in sources => register_with_owner(source.on_change(|_| {
 		derived.set(snapshot());
 	})));
 	derived
+}
+
+// === Per-key selection (backlog A44; Solid's `createSelector`) ===============
+//
+// "Is THIS row the selected one?" — asked once per row, answered live. The
+// obvious spelling derives a boolean per row off the selection signal, and
+// every one of them recomputes on every change: n notifications to move a
+// highlight one row. `selector` takes ONE subscription on the source and keeps
+// a cell per key, so a change writes exactly TWO of them — the key that left
+// and the key that arrived — whatever n is.
+
+/// The per-key selection handle `selector` hands back. `of(key)` is the live
+/// answer for one key, as a `SignalCell<bool>` that drops straight into
+/// `show` / `when` / `bind_class` / `bind_styled`.
+///
+/// A HANDLE with a method rather than the closure Solid returns, and that is
+/// forced rather than chosen: a closure captures its context AT CREATION
+/// (spec §8.4), so a closure built inside `selector` would defer every key's
+/// cleanup to whatever owner was ambient where `selector` was CALLED — the
+/// component, never the row. A method call threads the caller's ambient owner
+/// the ordinary way, which is what lets a row's entry die with the row.
+struct Selector<T> {
+	// One cell per key, keyed by `key.hash()` (the canonical key `Map`/`Set`
+	// use). Every `of` for the same key hands back the same cell.
+	cells: Shared<NativeMap<SignalCell<bool>>>,
+	// The source's current value, mirrored here so `of` can seed a fresh cell
+	// and the change observer can find the key that is LEAVING.
+	current: Shared<T>,
+}
+
+/// Build a per-key selection over `source` — one subscription, O(2)
+/// notifications per change (`Selector`).
+///
+/// ```
+/// let selected = selector(current_id);
+/// // … inside a row, under the row's own owner:
+/// view("li").bind_styled(selected.of(todo.id).map(|on| if on { active } else { plain }))
+/// ```
+///
+/// The subscription is the AMBIENT OWNER's, like every derivation combinator's
+/// (A28), and it is a LAZY one (A43): the cells are seeded by `of` from
+/// `current`, so there is nothing for a first call to do.
+fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
+	let cells: Shared<NativeMap<SignalCell<bool>>> = Shared::new(NativeMap::new());
+	let current: Shared<T> = Shared::new(source.get());
+	let _owned = register_with_owner(source.on_change(|value| {
+		let previous = current.read();
+		current.write() = value;
+		// Two writes, whatever the row count: the key that left goes false,
+		// the key that arrived goes true. A key nobody asked about has no
+		// cell, and needs none.
+		match cells.read().get(previous.hash()) {
+			Some(let leaving) => leaving.set(false),
+			None => {},
+		}
+		match cells.read().get(value.hash()) {
+			Some(let arriving) => arriving.set(true),
+			None => {},
+		}
+	}));
+	Selector { cells = cells, current = current }
+}
+
+impl Selector<type T: Hashable + PartialEq> {
+	/// The live answer for one key: `true` exactly while the source holds it.
+	///
+	/// Creates the key's cell on first ask (seeded against the current value)
+	/// and hands back that same cell every time after. The entry's REMOVAL is
+	/// deferred to the ambient owner, so asking from inside a `bind_each` row
+	/// frees the entry when the row is disposed and the map stays the size of
+	/// the live list rather than of every list the session ever showed.
+	fun of(self, key: T): SignalCell<bool> {
+		let hash = key.hash();
+		match self.cells.read().get(hash) {
+			Some(let existing) => existing,
+			None => {
+				let cell: SignalCell<bool> = SignalCell::new(key == self.current.read());
+				self.cells.write().insert(hash, cell);
+				defer_to_owner(|| {
+					self.cells.write().remove(hash);
+				});
+				cell
+			},
+		}
+	}
 }
 
 // The monadic join (backlog A4): follow whichever inner signal the outer
@@ -747,6 +895,14 @@ impl SignalCell<SignalCell<type U>> {
 // A duplicate key claims its old row once — later duplicates render fresh.
 // Pure logic (no DOM), so its edge cases pin in ordinary node tests; the
 // browser's `bind_each` applies the plan to elements.
+//
+// "Unchanged" is the CALLER's predicate (`same`), not `T: PartialEq` (A42).
+// The key decides identity and the element MOVES; `same` decides, for a
+// surviving key, reuse against dispose-and-rebuild — two different questions
+// that the old bound conflated into one. `bind_each` passes `==` and behaves
+// exactly as it always has; `bind_each_by` passes "always the same", which is
+// what lets it take a `T` with no equality at all and update a kept row
+// through its own cell instead of rebuilding it.
 
 /// One new-position row's fate. `Keep`/`Refresh` carry the OLD row's index.
 enum RowStep {
@@ -762,11 +918,12 @@ struct ReconcilePlan {
 	removed: List<i32>,
 }
 
-fun reconcile<T: PartialEq, K: PartialEq>(
+fun reconcile<T, K: PartialEq>(
 	old_keys: List<K>,
 	old_items: List<T>,
 	items: List<T>,
 	key_of: sync |T| K,
+	same: sync |T, T| bool,
 ): ReconcilePlan {
 	mut claimed: List<bool> = [];
 	for _ in old_keys {
@@ -780,7 +937,7 @@ fun reconcile<T: PartialEq, K: PartialEq>(
 		for index < old_keys.len() {
 			if !claimed[index] && old_keys[index] == item_key {
 				claimed[index] = true;
-				step = if old_items[index] == item {
+				step = if same(old_items[index], item) {
 					RowStep::Keep(index)
 				} else {
 					RowStep::Refresh(index)

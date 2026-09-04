@@ -2157,7 +2157,7 @@ fn reconcile_plans_keep_refresh_fresh_and_removals() {
         import std::reactive::{ reconcile, RowStep };
 
         fun main() {
-            let plan = reconcile([1, 2], [10, 20], [20, 11, 35, 20], |item| item / 10);
+            let plan = reconcile([1, 2], [10, 20], [20, 11, 35, 20], |item| item / 10, |a, b| a == b);
             for step in plan.steps {
                 let rendered = match step {
                     RowStep::Keep(let index) => i"keep {index}",
@@ -2174,6 +2174,37 @@ fn reconcile_plans_keep_refresh_fresh_and_removals() {
         main();
         "#,
         "keep 1\nrefresh 0\nfresh\nfresh\n",
+    );
+}
+
+// `reconcile`'s `same` predicate is the CALLER's (A42), not `T: PartialEq`:
+// `bind_each_by` passes "always the same", so a surviving key is kept and no
+// `Refresh` is ever produced — over the exact input that refreshes above.
+#[test]
+fn reconcile_never_refreshes_when_every_surviving_key_counts_as_unchanged() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ reconcile, RowStep };
+
+        fun main() {
+            let plan = reconcile([1, 2], [10, 20], [20, 11, 35, 20], |item| item / 10, |_a, _b| true);
+            for step in plan.steps {
+                let rendered = match step {
+                    RowStep::Keep(let index) => i"keep {index}",
+                    RowStep::Refresh(let index) => i"refresh {index}",
+                    RowStep::Fresh => "fresh",
+                };
+                print(rendered);
+            }
+            for index in plan.removed {
+                print(i"removed {index}");
+            }
+        }
+
+        main();
+        "#,
+        "keep 1\nkeep 0\nfresh\nfresh\n",
     );
 }
 

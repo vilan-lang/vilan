@@ -4,6 +4,9 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __hash(value) {
+	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
+}
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
 }
@@ -42,50 +45,50 @@ class __Task {
 function __task(run, origin, nursery) {
 	return new __Task(run, origin, nursery);
 }
+function hash(self) {
+	return __hash(self);
+}
 function fresh_id() {
 	const id = next_subscriber_id.v;
 	next_subscriber_id.v = id + 1;
 	return id;
 }
 function new2() {
-	return [ __shared_new([  ]), __shared_new(false), __shared_new(false), __shared_new(false) ];
+	return [ __shared_new([  ]), __shared_new(new Map()), __shared_new(false), __shared_new(false), __shared_new(false) ];
 }
 function enqueue(turn, subscribers) {
 	for (const subscriber of subscribers) {
-		let seen = false;
-		for (const queued of turn[0].v) {
-			if (queued[0] === subscriber[0]) {
-				seen = true;
-			}
-		}
-		if (!(seen)) {
+		const key = hash(subscriber[0]);
+		if (!(turn[1].v.has(key))) {
+			turn[1].v.set(key, true);
 			turn[0].v.push(__clone(subscriber));
 		}
 	}
-	if (turn[2].v && !(turn[3].v) && !(turn[1].v)) {
-		turn[3].v = true;
+	if (turn[3].v && !(turn[4].v) && !(turn[2].v)) {
+		turn[4].v = true;
 		queueMicrotask(() => {
-			turn[3].v = false;
+			turn[4].v = false;
 			drain(turn);
 			return;
 		});
 	}
 }
 function drain(turn) {
-	if (!(turn[1].v)) {
-		turn[1].v = true;
+	if (!(turn[2].v)) {
+		turn[2].v = true;
 		draining_turns.v.push(__clone(turn));
 		let budget = 100000;
 		while (!($m(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
 			turn[0].v = [  ];
+			turn[1].v = new Map();
 			for (const subscriber of wave) {
 				subscriber[1]();
 				budget = budget - 1;
 			}
 		}
 		__list_pop(draining_turns.v);
-		turn[1].v = false;
+		turn[2].v = false;
 	}
 }
 function flush($r) {
@@ -162,7 +165,7 @@ function $w(policy, body) {
 	const fresh = new2();
 	const result = body(fresh);
 	drain(fresh);
-	fresh[2].v = true;
+	fresh[3].v = true;
 	return result;
 }
 function $y(body, $z) {
@@ -175,7 +178,7 @@ function $y(body, $z) {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
-		fresh[2].v = true;
+		fresh[3].v = true;
 		$B = result;
 	}
 	return $B;

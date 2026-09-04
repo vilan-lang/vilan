@@ -27,6 +27,7 @@ impl Element {
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
+	fun focus(self)                                    // move keyboard focus here
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
 	fun on(self, event: str, handler: || void)
@@ -159,10 +160,14 @@ too.
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |
+| `bind_each_values` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<List<T>>` | `bind_each` keyed by the item itself |
+| `bind_each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| View) context owner_scope): View`; `K: PartialEq, S: Source<List<T>>` — **no bound on `T`** | keyed rows that UPDATE through the row's own cell instead of rebuilding |
 | `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
 | `swap` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<T>` | dispose + rebuild per changed value |
 | `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
+| `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
+| `autofocus` | `(): View` | `on_mount(\|element\| element.focus())` — the modal-input form HTML's `autofocus` cannot serve |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
@@ -184,9 +189,9 @@ impl Stored<type T> with Source<T> {
 ```
 
 `Stored<str>` now feeds `bind_text`, `bind_class`, `bind_attr`,
-`bind_styled`, `style_var`, `bind_each`, `when`, `show`, `swap`,
-`swap_split` and `chunk_preload` — on both the browser layer and the SSR
-twin.
+`bind_styled`, `style_var`, `bind_each`, `bind_each_values`,
+`bind_each_by`, `when`, `show`, `swap`, `swap_split` and `chunk_preload`
+— on both the browser layer and the SSR twin.
 
 Two things deliberately still ask for the concrete type:
 

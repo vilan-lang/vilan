@@ -1445,6 +1445,37 @@ impl Style {
 		out
 	}
 
+	/// Conditionally merge `delta` — `self + delta` when `condition` holds,
+	/// `self` untouched when it does not (backlog A36, style-variants.md §8
+	/// Q3).
+	///
+	/// It never CONSTRUCTS a style: both sides were built, and emitted their
+	/// rules, inside their own `const` expressions, so the construct-in-const
+	/// rule is untouched with a runtime flag in the middle. `when` only
+	/// selects between two styles that already exist.
+	///
+	///     button_base
+	///         .when(selected, button_selected)
+	///         .when(disabled, button_disabled)
+	///
+	/// Chain order is PRECEDENCE, exactly as with `+`: when two `when`s both
+	/// fire, the later delta wins whatever properties they share (and clears a
+	/// longhand its own shorthand covers, per family).
+	///
+	/// The chain reads best when each condition mentions its OWN flag —
+	/// independent state axes, one link each. When one condition has to
+	/// mention another link's flag (`!selected && !disabled`), the states are
+	/// not independent, and a `match` states that exclusivity structurally
+	/// where a chain only implies it. The compound condition is the tell;
+	/// this is guidance, not a prohibition.
+	fun when(self, condition: bool, delta: Style): Style {
+		if condition {
+			self + delta
+		} else {
+			self
+		}
+	}
+
 	/// The rendered class attribute: every slot's class, space-joined.
 	/// Runtime-legal (no emission) — selection and merging stay ordinary code.
 	fun class_list(self): str {

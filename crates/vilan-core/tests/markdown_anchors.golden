@@ -78,6 +78,7 @@ guide/persistence.md h2 putting-it-together
 guide/reactive.md h1 reactive-state
 guide/reactive.md h2 signals
 guide/reactive.md h2 derived-state-map-combine-flatten
+guide/reactive.md h3 selection-over-a-list-selector
 guide/reactive.md h2 reacting-effect-and-sub
 guide/reactive.md h2 ownership-who-cleans-up
 guide/reactive.md h2 turns-when-changes-become-visible
@@ -126,6 +127,7 @@ guide/styling.md h2 states-and-breakpoints
 guide/styling.md h2 theming-and-stacking-conditions
 guide/styling.md h2 styling-children-from-the-parent
 guide/styling.md h2 dynamic-values
+guide/styling.md h2 conditional-merges-when
 guide/styling.md h2 swapping-whole-styles
 guide/styling.md h2 traps
 guide/ui.md h1 building-ui
@@ -136,6 +138,8 @@ guide/ui.md h2 components-are-just-functions
 guide/ui.md h2 events-run-in-turns
 guide/ui.md h2 inputs
 guide/ui.md h2 lists-bind_each
+guide/ui.md h3 three-forms-one-engine
+guide/ui.md h2 after-the-element-lands-on_mount-autofocus
 guide/ui.md h2 conditionals-show-when-swap
 guide/ui.md h2 the-ownership-picture
 guide/ui.md h2 server-side-rendering
@@ -359,6 +363,7 @@ std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance
 std/reactive.md h2 signal-and-signalcell
 std/reactive.md h2 source
+std/reactive.md h2 selector--per-key-selection
 std/reactive.md h2 writing-a-signal
 std/reactive.md h2 maybesignal
 std/reactive.md h2 combine

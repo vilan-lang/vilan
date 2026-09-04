@@ -8,6 +8,7 @@ Import what you use:
 ```vilan,fragment
 import std::reactive::{
 	Signal, SignalCell, Source, MaybeSignal, Subscription, Disposable, combine,
+	selector, Selector,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -20,12 +21,13 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Source<T>` | trait | anything readable + subscribable (`get`/`sub`/`effect`) |
+| `Source<T>` | trait | anything readable + subscribable (`get`/`sub`/`effect`, `on_change`/`effect_on_change`, `map`) |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
 | `Subscription` | struct | an explicit subscription; `Disposable` |
 | `combine` | fn | tuple-signal over 2+ signals |
+| `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `run_with_owner`, `comp`, `get_owner`, `owner_scope` | fns/context | establish/read the ambient owner |
 | `turn`, `batch`, `flush`, `at_settle`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
@@ -65,13 +67,15 @@ impl SignalCell<type T> with Signal<T> {
 }
 impl SignalCell<type T> {
 	fun update(self, mutate: sync |&mut T| void) // mutate in place, notify once
-	fun map<U>(self, transform: sync |T| U): SignalCell<U>
 }
 impl SignalCell<type T> with Source<T> {
 	fun get(self): T
 	fun sub(self, observer: |T| void): Subscription
-	// from the trait default:
+	fun on_change(self, observer: |T| void): Subscription   // the direct attach
+	// from the trait defaults:
 	fun effect(self, observer: |T| void)    // fires now + on change; owner-registered
+	fun effect_on_change(self, observer: |T| void)  // on change only; owner-registered
+	fun map<U>(self, transform: sync |T| U): SignalCell<U>
 }
 impl SignalCell<SignalCell<type U>> {
 	fun flatten(self): SignalCell<U>            // follow the current inner signal
@@ -129,6 +133,24 @@ fun main() {
 - `sub` fires once immediately with the current value, like `effect`, and
   then on every change; its `Subscription` is yours to dispose (or hand to
   `owner.take`).
+- **`on_change` is the same subscription without that first call**, and
+  `effect_on_change` is its owner-registered form. The eager pair is right for
+  a UI binding — the immediate call *is* the initial paint — and wrong for an
+  effect that must not fire on the state the program starts in: a "you have
+  unsaved changes" prompt, an analytics ping, a derivation that already seeded
+  its own first value. `map` and `combine` attach this way.
+
+```vilan
+import std::reactive::{ Disposable, Signal, SignalCell };
+
+fun main() {
+	let title: SignalCell<str> = Signal::new("untitled");
+	// Nothing prints here — the current value is not a change.
+	let watch = title.on_change(|value| print(i"renamed to {value}"));
+	title.set("plans");        // renamed to plans
+	watch.dispose();
+}
+```
 
 ## Source
 
@@ -138,12 +160,23 @@ trait Source<T> {
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription
 	fun effect(self, observer: |T| void)    // trait default; owner-registered
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription   // default; no first call
+	fun effect_on_change(self, observer: |T| void)          // default; owner-registered
+	fun map<U>(self, transform: sync |T| U): SignalCell<U>  // default; derived signal
 }
 ```
 
 The read-only half of a reactive value. `SignalCell<T>` implements it, and so does
 any type of yours — a storage-backed cell, a mirror over a transport, a wrapper
-that logs. Implement `get` and `sub` and `effect` comes free.
+that logs. Implement `get` and `sub`; `effect`, `on_change`, `effect_on_change`
+and `map` all come free.
+
+`on_change`'s default body wraps `sub` and swallows its one immediate call,
+which is honest against `sub`'s contract — fire once now, then once per change.
+An implementation whose `sub` does *not* fire immediately is outside that
+contract and must override `on_change`. `SignalCell` overrides it anyway, with a
+direct attach that never makes the call at all.
 
 ```vilan
 import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription };
@@ -195,6 +228,59 @@ alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
 its own `set` drives them. `Optimistic::over` takes any `Signal<T>` too — the
 cell STORES it in a field, and a field must name a real type, so the cell names
 it: `Optimistic<T, S>` carries the signal's type as a second parameter.
+
+## selector — per-key selection
+
+"Is this row the selected one?", asked once per row and answered live. The
+obvious spelling derives a boolean per row off the selection signal — and every
+one of them recomputes on every change, so moving a highlight one row costs `n`
+notifications. `selector` takes **one** subscription on the source and keeps a
+cell per key, so a change writes exactly **two**: the key that left and the key
+that arrived.
+
+```vilan,fragment
+fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T>
+
+impl Selector<type T: Hashable + PartialEq> {
+	fun of(self, key: T): SignalCell<bool>
+}
+```
+
+```vilan,browser
+import std::reactive::{ Signal, SignalCell, selector };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let rows: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+	let current: SignalCell<i32> = Signal::new(1);
+	let selected = selector(current);
+	let _root = mount_root("app", || {
+		view("ul").bind_each(rows, |id| id, |id| {
+			view("li").text(i"row {id}").bind_class(selected.of(id).map(|on| {
+				if on { "row current" } else { "row" }
+			}))
+		})
+	});
+}
+```
+
+`of(key)` creates the key's cell on first ask (seeded against the source's
+current value) and hands back that same cell every time after, so it is safe to
+call in a row's render body. The entry's **removal** is deferred to the ambient
+owner — which inside a `bind_each` row is the row's own — so the map stays the
+size of the live list rather than of every list the session ever showed.
+
+`Selector` is a handle with a method rather than the bare closure Solid's
+`createSelector` returns, and that is forced rather than chosen: a closure
+captures its context **at creation**, so a closure built inside `selector` would
+defer every key's cleanup to whatever owner was ambient where `selector` was
+*called* — the component, never the row. A method call threads the caller's
+ambient owner the ordinary way.
+
+The key type is bounded on `Hashable` (the canonical key `Map` and `Set` use)
+and on `PartialEq` (to seed a fresh cell against the current value). A key
+nobody has asked about has no cell and costs nothing: a change into it writes
+only the outgoing one.
 
 ## Writing a Signal
 
@@ -545,11 +631,18 @@ struct ReconcilePlan {
 	steps: List<RowStep>,  // one per NEW item, in the new order
 	removed: List<i32>,    // old indices gone entirely
 }
-fun reconcile<T: PartialEq, K: PartialEq>(
+fun reconcile<T, K: PartialEq>(
 	old_keys: List<K>, old_items: List<T>, items: List<T>, key_of: sync |T| K,
+	same: sync |T, T| bool,
 ): ReconcilePlan
 ```
 
 The pure engine under `ui.bind_each`; duplicate keys claim the first
 surviving row once. Reach for it directly only when building a custom
 list-rendering primitive.
+
+**"Unchanged" is the caller's predicate, not `T: PartialEq`.** The key decides
+identity and whether the row moves; `same` decides, for a surviving key, reuse
+against dispose-and-rebuild. `bind_each` passes `|a, b| a == b`;
+`bind_each_by` passes `|_a, _b| true`, which is why it never emits a `Refresh`
+and asks nothing of `T`.
