@@ -2237,8 +2237,24 @@ impl Document {
     /// the cursor touches — the linked-editing nicety, so renaming one tag
     /// renames the other. Raw-parsed per request, like `keyword_hover`'s lex:
     /// cheap, and independent of analysis succeeding.
+    ///
+    /// `offset` is a LIVE offset and the spans come back in LIVE coordinates,
+    /// because this parses `self.text` (E132). It used to parse
+    /// `analyzed_text()`, and that was the one place a RAW PARSE — an S2
+    /// citizen, owing nothing to the analysis — was handed the S1 snapshot.
+    /// Nothing here is program data: there is no reason for the tag positions
+    /// to lag the buffer, and one decisive reason for them not to. This
+    /// handler PRODUCES EDITS by proxy — the client mirrors every keystroke
+    /// from one returned range into the other — so answering in the analyzed
+    /// snapshot's coordinates during the debounce pointed the mirror at
+    /// whatever live text had moved into the tag's old offsets and typed into
+    /// it (E132: the owner's "unrelated text deleted"; E125's twin on
+    /// `semanticTokens/range`). The S3 staleness refusal every other
+    /// edit-producing handler takes is the wrong cure here and only here: it
+    /// would kill tag rename during exactly the typing it exists for, while
+    /// the live parse makes the feature CORRECT during typing instead.
     pub fn linked_tag_ranges(&self, offset: usize) -> Option<(Span, Span)> {
-        let (tree, _errors) = vilan_core::parsing::parse(self.analyzed_text());
+        let (tree, _errors) = vilan_core::parsing::parse(&self.text);
         let root = tree?;
         let mut found: Option<(Span, Span)> = None;
         for item in &root.0 {

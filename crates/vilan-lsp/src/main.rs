@@ -2669,15 +2669,23 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // Program-space lookup, like hover: the position converts through
-            // the ANALYZED index (S1).
-            let offset = document.analyzed_offset(position);
+            // LIVE coordinates, in and out (E132). `linked_tag_ranges` is a
+            // raw parse of the live buffer — no program data touches this
+            // answer — and the ranges it returns are handed straight back to
+            // the client as the pair it MIRRORS KEYSTROKES BETWEEN. Converting
+            // through the analyzed index (which is what this did, on the
+            // "program-space lookup, like hover" reading) named the tag's
+            // position in a text the user had already typed past: during the
+            // debounce the client happily mirrored into whatever live code had
+            // moved into those offsets. Hover's convention does not transfer,
+            // because hover only shows.
+            let offset = document.line_index.offset(position);
             Ok(document
                 .linked_tag_ranges(offset)
                 .map(|(open, close)| LinkedEditingRanges {
                     ranges: vec![
-                        document.analyzed_range(&open),
-                        document.analyzed_range(&close),
+                        document.line_index.range(&open),
+                        document.line_index.range(&close),
                     ],
                     word_pattern: None,
                 }))
@@ -7085,5 +7093,155 @@ mod line_index_cache_tests {
         assert!(backend.line_indices.is_empty(), "and never stored");
         vilan_core::analyzer::set_document_overlay(&path, None);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E132: `linkedEditingRange` answers in LIVE coordinates, so the pair the
+/// client mirrors keystrokes between names the tags the user is looking at.
+///
+/// This is the one handler whose answer the client turns into EDITS without
+/// asking again: VS Code accepts the pair when a returned range contains the
+/// caret and then types every keystroke into both. Answered in the analyzed
+/// snapshot's coordinates — a raw parse of `analyzed_text()`, converted through
+/// `analyzed_offset`/`analyzed_range` — the pair named where the tags SAT when
+/// the last analysis ran, and during the debounce (150 ms plus the analysis)
+/// that is a pair of live lines with no tag on them. The owner's report was
+/// "editing under element syntax deletes unrelated text"; the repro is one line
+/// typed above an element and then typing where the tag used to be.
+///
+/// The three pins are the two halves of the claim plus its non-vacuity: the
+/// answer follows the buffer during an unlanded edit, the caret that used to be
+/// armed on unrelated code is not armed any more, and the control after the
+/// analysis lands is unchanged.
+#[cfg(test)]
+mod linked_editing_range_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// An element with a real statement line available to insert above it, so
+    /// the stale answer has live CODE to land on rather than blank space.
+    const VIEW: &str = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div>\n\t\t\"hello world\"\n\t</div>\n}\n";
+
+    fn open(backend: &Backend, text: &str) -> Url {
+        let uri = Url::parse("file:///linked/page.vl").expect("a url");
+        backend.documents.insert(
+            uri.clone(),
+            Document::analyze(text, &std_root(), Path::new("page.vl")),
+        );
+        uri
+    }
+
+    async fn ranges(backend: &Backend, uri: &Url, position: Position) -> Option<Vec<Range>> {
+        backend
+            .linked_editing_range(LinkedEditingRangeParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("the handler never errors")
+            .map(|answer| answer.ranges)
+    }
+
+    /// The live text a returned range covers — what the client would actually
+    /// be typing into.
+    fn live_text(backend: &Backend, uri: &Url, range: Range) -> String {
+        let document = backend.documents.get(uri).expect("open");
+        let start = document.line_index.offset(range.start);
+        let end = document.line_index.offset(range.end);
+        document.text[start.min(document.text.len())..end.min(document.text.len())].to_string()
+    }
+
+    /// Half one: with an unlanded insert above the element, the caret ON THE
+    /// TAG (where it now is) gets the pair, and both ranges cover the live
+    /// `section` tags. Before E132 this answered `None` — the feature was dead
+    /// during exactly the typing it exists for.
+    #[tokio::test]
+    async fn the_mirrored_pair_lands_on_the_tags_in_live_text() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, VIEW);
+        // One line typed above the element; the analysis has not landed.
+        let live = VIEW.replacen("\t<div>", "\tlet counter = 1;\n\t<div>", 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        assert!(
+            backend.documents.get(&uri).expect("open").is_stale(),
+            "the pin needs the debounce window it describes",
+        );
+        // The open tag now sits on live line 4.
+        let answer = ranges(backend, &uri, Position::new(4, 3))
+            .await
+            .expect("a pair for the caret on the tag");
+        assert_eq!(answer.len(), 2);
+        assert_eq!(live_text(backend, &uri, answer[0]), "div");
+        assert_eq!(live_text(backend, &uri, answer[1]), "div");
+    }
+
+    /// Half two, the corrupting half: the caret on the line the tag OCCUPIED
+    /// when the analysis ran — live line 3, now `let counter = 1;` — gets no
+    /// pair. This is the assertion that reds on the shipped code: it answered
+    /// open=3:2–3:9 close=5:3–5:10 there, the open range contains the caret, so
+    /// the client accepted the pair and mirrored keystrokes into two lines of
+    /// unrelated live code.
+    #[tokio::test]
+    async fn a_caret_on_the_tags_old_line_is_not_armed() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, VIEW);
+        let live = VIEW.replacen("\t<div>", "\tlet counter = 1;\n\t<div>", 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let caret = Position::new(3, 4);
+        assert_eq!(
+            live_text(
+                backend,
+                &uri,
+                Range::new(Position::new(3, 1), Position::new(3, 17))
+            ),
+            "let counter = 1;",
+            "the pin needs the caret to be on the inserted line, not a tag",
+        );
+        assert_eq!(
+            ranges(backend, &uri, caret).await,
+            None,
+            "there is no tag under the caret, so nothing may be mirrored",
+        );
+    }
+
+    /// The control: once the analysis lands, the answer is the same pair it
+    /// always was. The live parse is not a licence for the feature to change
+    /// its answer on a settled buffer.
+    #[tokio::test]
+    async fn the_pair_is_unchanged_once_the_analysis_lands() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let live = VIEW.replacen("\t<div>", "\tlet counter = 1;\n\t<div>", 1);
+        let uri = open(backend, &live);
+        assert!(!backend.documents.get(&uri).expect("open").is_stale());
+        for (label, position) in [
+            ("the open tag", Position::new(4, 3)),
+            ("the close tag", Position::new(6, 4)),
+        ] {
+            let answer = ranges(backend, &uri, position)
+                .await
+                .unwrap_or_else(|| panic!("a pair from {label}"));
+            assert_eq!(live_text(backend, &uri, answer[0]), "div", "{label}");
+            assert_eq!(live_text(backend, &uri, answer[1]), "div", "{label}");
+        }
+        assert_eq!(
+            ranges(backend, &uri, Position::new(3, 4)).await,
+            None,
+            "and a caret on a plain statement is still not a tag",
+        );
     }
 }
