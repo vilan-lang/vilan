@@ -30058,7 +30058,22 @@ impl<'src> Analyzer<'src> {
                                 self.substitute_type(&parameter_type, &substitution_context);
                             let mut generics = Vec::new();
                             self.collect_generics(&declared, 0, &mut generics);
-                            if generics.is_empty()
+                            if matches!(declared, Type::Any) {
+                                // `any` is the one concrete type that must NOT
+                                // be adopted (B227). It is a one-way coercion
+                                // sink — every type flows into it and it tells
+                                // the hole nothing — so writing it into the
+                                // slot is not "the declared parameter types the
+                                // closure", it is the first `print(v)` in a
+                                // body deciding `v` forever, ahead of the call
+                                // that actually knows. Skip WITHOUT deferring:
+                                // a closure whose only use IS an `any` call has
+                                // nothing else coming, and deferring on it
+                                // deadlocks. The slot stays open, the enclosing
+                                // call fills it, and a slot nothing ever fills
+                                // is already covered by "type of variable could
+                                // not be resolved".
+                            } else if generics.is_empty()
                                 && !matches!(declared, Type::Unknown | Type::Unresolved)
                             {
                                 self.fill_unknown_closure_parameter(argument_id, &declared);
