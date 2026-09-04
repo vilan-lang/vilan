@@ -313,7 +313,17 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// re-mapping instead of a guess.
     pub(crate) fn map_analyzed_span(&self, span: Span) -> Option<Span> {
         let (prefix, suffix) = self.anchor();
-        if span.end <= prefix {
+        // `prefix > 0` is not redundant, and the arm below it is why. An import
+        // edit is a zero-width INSERTION POINT, and `0..0` satisfies
+        // `end <= prefix` vacuously when there is no common prefix at all —
+        // the shape of an edit at the top of a file whose FIRST line the user
+        // just changed. Where the suffix reaches back to offset 0 (a line
+        // inserted above the imports) the point belongs to the suffix and moves
+        // with the text it precedes; where it does not (a file with no imports
+        // at all, so the edit is "a new first line"), offset 0 is offset 0 in
+        // both texts and the identity is right. Taking the head arm first would
+        // answer the identity for both.
+        if prefix > 0 && span.end <= prefix {
             return Some(span);
         }
         let analyzed_len = self.analyzed.text().len();
@@ -329,6 +339,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 start: start as usize,
                 end: end as usize,
             });
+        }
+        // The file's very first byte: an insertion point there names the same
+        // place in both texts however the rest of them differ.
+        if span.start == 0 && span.end == 0 {
+            return Some(span);
         }
         None
     }
