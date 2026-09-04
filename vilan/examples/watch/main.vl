@@ -1,0 +1,29 @@
+import std::fs::{ Change, ChangeKind, Watcher };
+
+// A watch that runs until you stop it — the ordinary shape, and INTENTIONALLY
+// ENDLESS. `next` parks until the poller has something, the loop asks again,
+// and there is no exit condition anywhere in it: a watch is over when the
+// process is. That is exactly why this is an example and not a corpus program.
+// A corpus program terminates and its printed output is the claim being made;
+// this one's claim is the loop, and nothing about it could be read off a
+// stdout that never arrives.
+//
+// Run it, edit any file in this directory, and each change prints as it lands.
+
+fun describe(change: Change): str {
+	match change.kind {
+		ChangeKind::Created => i"created  {change.path}",
+		ChangeKind::Modified => i"modified {change.path}",
+		ChangeKind::Removed => i"removed  {change.path}",
+	}
+}
+
+fun main() {
+	// `watch_all` is the recursive form — this directory and everything under
+	// it. `Watcher::watch` would report only the immediate entries.
+	let watcher = Watcher::watch_all(".");
+	print("watching . — edit a file here, Ctrl-C to stop");
+	for {
+		print(describe(watcher.next()));
+	}
+}

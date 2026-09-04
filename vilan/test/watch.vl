@@ -1,6 +1,9 @@
 import std::drop::drop;
+import std::fs;
 import std::fs::{ Change, ChangeKind, Watcher };
 import std::io::print;
+import std::path::basename;
+import std::random;
 
 // The watch tier (kolt.local 020): the pull-shaped `next`, the three-variant
 // `ChangeKind` matched with no catch-all, and both spellings of teardown — an
@@ -8,24 +11,65 @@ import std::io::print;
 // inside a finally. This is where the poll helper's own bytes are held: it is
 // the largest runtime helper `std::fs` emits, and nothing else pins it whole.
 // Excluded from the macro interpreter gate — the filesystem is a host
-// capability, every call here awaits, and a watch never ends on its own.
+// capability, and every call here awaits.
+//
+// A corpus program's OUTPUT is its claim, so this one MAKES the change it
+// watches for and then leaves (tracker N51). It used to watch a directory that
+// was never there and block on `flat.next()` forever; nothing in the suite ever
+// ran it, and when the release differential finally tried, both builds were
+// killed at the 300 s deadline and the gate compared two identical "node did
+// not exit" strings. The endless form is `vilan/examples/watch`, where being
+// endless is what a watch is for.
+//
+// The scratch directory carries a random suffix because two runs of this
+// program overlap by construction — the two differentials each run it, in
+// processes that know nothing about each other — and a shared directory would
+// let one run's write land in the other's baseline, turning a `Created` into a
+// `Modified`. Only the BASENAME is printed, so the suffix never reaches stdout.
+//
+// Each claim below carries a `// witness:` line naming the emitted bytes it
+// rests on; `corpus.rs`'s `every_declared_witness_is_in_its_golden` checks them.
 
+// The three variants matched with no catch-all: the last arm is an `else`
+// rather than a test, which is what exhaustiveness over a three-variant enum
+// buys and what a `_` arm would take away.
+// witness: } else { $g = "removed " + basename(change[0]); }
 fun describe(change: Change): str {
 	match change.kind {
-		ChangeKind::Created => i"created {change.path}",
-		ChangeKind::Modified => i"modified {change.path}",
-		ChangeKind::Removed => i"removed {change.path}",
+		ChangeKind::Created => i"created {basename(change.path)}",
+		ChangeKind::Modified => i"modified {basename(change.path)}",
+		ChangeKind::Removed => i"removed {basename(change.path)}",
 	}
 }
 
 fun main() {
-	// A flat watch, stopped early by an explicit drop.
-	let flat = Watcher::watch("watch-corpus");
+	let root = i"watch-corpus-{random::range(100000, 999999)}";
+	fs::create_dir_all(root);
+	let probe = i"{root}/probe.txt";
+
+	// A flat watch, stopped early by an explicit drop. The file appears after
+	// the baseline is taken, so the next poll reports it as `Created` — the
+	// pull-shaped `next`, awaited once, is the whole consuming surface.
+	// witness: console.log(describe(await (next(flat, [ 1 ]))));
+	//
+	// The early `drop` runs the stop AND clears the slot, so the scope's
+	// finally — which is still emitted, because the drop is conditional on the
+	// path taken — does not stop an already-stopped watcher.
+	// witness: $h(flat); flat = null; } finally { if (flat !== null) { $h(flat); } }
+	let flat = Watcher::watch(root);
+	fs::write_file(probe, "one");
 	print(describe(flat.next()));
 	drop(flat);
 
-	// A recursive watch, stopped by the scope-end destructor.
-	let deep = Watcher::watch_all("watch-corpus");
+	// A recursive watch, stopped by the scope-end destructor: no `drop` call in
+	// the source, and the stop still runs, out of a finally. The file is already
+	// in this watcher's baseline, and the second write is a different length, so
+	// it is a `Modified` whatever the host clock's resolution is.
+	// witness: } finally { $h(deep); }
+	let deep = Watcher::watch_all(root);
+	fs::write_file(probe, "a second write, of a different length");
 	print(describe(deep.next()));
+
+	fs::remove_dir_all(root);
 }
 main();

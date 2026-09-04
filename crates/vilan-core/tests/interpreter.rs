@@ -51,7 +51,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
     (
         "watch.vl",
-        "async + host filesystem + a host timer (`std::fs::Watcher` polls, and a watch never ends on its own)",
+        "async + host filesystem + a host timer (`std::fs::Watcher` polls on `setTimeout`)",
     ),
 ];
 

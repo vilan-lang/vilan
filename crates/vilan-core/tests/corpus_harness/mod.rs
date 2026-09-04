@@ -192,6 +192,14 @@ macro_rules! corpus_manifest {
 /// COMPILED both ways by every gate, which is worth having on its own; only the
 /// node leg is skipped.
 ///
+/// It is not the place for a program that cannot FINISH. `watch.vl` sat here
+/// through N49 for blocking forever on a change that never came, which is a
+/// different thing entirely — an unrunnable program is not an unobservable one,
+/// and the exemption made a corpus entry out of a program the corpus rule does
+/// not admit. A corpus program terminates and its output is its claim
+/// (`vilan-cli/tests/corpus.rs`); one that does not is an example
+/// (`vilan/examples/watch`). Tracker N51.
+///
 pub const NOT_RUN: &[(&str, &str)] = &[
     ("time.vl", "host clock: two runs print different timestamps"),
     ("crypto.vl", "host WebCrypto: a fresh random draw per run"),
@@ -204,22 +212,6 @@ pub const NOT_RUN: &[(&str, &str)] = &[
     (
         "nursery.vl",
         "host timers 10ms apart decide the print order, which load can reorder",
-    ),
-    // The whole of tracker N49, in one row. `watch.vl` blocks on `flat.next()`
-    // for a filesystem change that never comes — "a watch never ends on its
-    // own", as the program's own comment says — so BOTH builds ran to
-    // `NODE_TIMEOUT` and were killed, twice 300 s, and the gate then compared
-    // two identical `Err("node did not exit within 300s")` strings and passed.
-    // That was 600 s of the union's 607 s critical path spent on a verdict that
-    // could not come out any other way. Shortening the wait instead would be a
-    // fixed clock around real work — E32's disease, and the one `NODE_TIMEOUT`
-    // below was written to cure — since the observation would become "what had
-    // it printed when we gave up", which load decides. Tracker N51 asks the
-    // owner what the corpus should hold instead.
-    (
-        "watch.vl",
-        "never terminates: it waits on a filesystem change that never arrives, \
-         so both builds are killed at the deadline and neither is observed",
     ),
 ];
 

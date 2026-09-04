@@ -33,10 +33,12 @@ priority = 100
 # N49). It was 607.3 s of a 698.7 s union, and priority was the only lever there
 # was while the leg was ONE test; split into one test per corpus program, 600 of
 # those seconds turned out to be `watch.vl` waiting out two 300 s node deadlines
-# for a filesystem change that never comes. With that program compiled-but-not-
-# run, the binary's longest member is 9.6 s and there is no straggler left to
-# schedule around — a priority that names it would be a claim about a shape that
-# is gone.
+# for a filesystem change that never came. That program now makes its own change
+# and exits (tracker N51), so it is run like any other, and the binary's longest
+# member is about 20 s under the suite's own parallelism — no straggler left to
+# schedule around, and a priority that named it would be a claim about a shape
+# that is gone. `infer_differential` took the same split (tracker N52) and is
+# not a member here either, for the same reason.
 [[profile.default.overrides]]
 filter = '''
     test(dependent_edit_measurement) + binary(style_chain_order)
