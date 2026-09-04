@@ -865,3 +865,224 @@ main();
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A41: a mirror minted from a runtime channel id, across a reconnect --------
+
+/// A service whose channel is minted at RUNTIME rather than by `[expose]`:
+/// `subscribe_extra` hands the caller a fresh channel over the session it is
+/// calling on (the public `session_of` + `ReactiveServer::expose` pair). This
+/// is the shape a per-row or per-thread subscription needs, and the one the
+/// positional `__attach` reply knows nothing about.
+#[cfg(unix)]
+const DYNAMIC_SERVER: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+import std::option::Option::{ self, Some, None };
+import std::process::args;
+import std::http::{ Response, Server };
+import std::rpc::session_of;
+import std::rpc_server::Service;
+
+[service(BoardClient)]
+struct Board {
+	extra: SignalCell<i32>,
+}
+
+impl Board {
+	[rpc]
+	fun subscribe_extra(self, connection: i32): i32 {
+		match session_of(connection) {
+			Some(let session) => session.expose(self.extra),
+			None => 0 - 1,
+		}
+	}
+}
+
+async fun main() {
+	let value = match args().get(0) {
+		Some(let raw) => match raw.parse_i32() {
+			Some(let parsed) => parsed,
+			None => 0,
+		},
+		None => 0,
+	};
+	let board = Board { extra = Signal::new(value) };
+	Server::builder()
+		.port(9298)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"listening {value}"))
+		.build()
+		.start();
+}
+"#;
+
+/// The hand-wired client the dynamic recipe requires today: `ReactiveClient`
+/// is not reachable from a generated client, so an app that mints channels at
+/// runtime builds the client half itself — and registers
+/// `invalidate_on_reconnect` beside it, which is the one line this pin is
+/// about.
+#[cfg(unix)]
+const DYNAMIC_CLIENT: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::result::Result::{ self, Ok, Err };
+import std::shared::Shared;
+import std::time::sleep;
+import std::wire::Serializer;
+import std::rpc::{
+	ConnectionState,
+	ReactiveClient,
+	RemoteSource,
+	RpcError,
+	Status,
+	bridge,
+	call,
+	connect_socket,
+	invalidate_on_reconnect,
+};
+
+async fun main() {
+	match connect_socket("ws://localhost:9298/") {
+		Ok(let socket) => {
+			let transport = socket.transport();
+			let reactive = ReactiveClient::new(bridge(socket), json_codec());
+			invalidate_on_reconnect(socket, reactive);
+			let first: Result<i32, RpcError> = call(transport, json_codec(), "subscribe_extra", [
+				|serializer: Serializer| socket.connection.read().describe(serializer),
+			]);
+			let channel = first.unwrap_or(0 - 1);
+			print(i"minted:{channel}");
+			let mirror: RemoteSource<i32> = reactive.source(channel);
+			let watching = mirror.sub(|value| print(i"dynamic:{value}"));
+			let remade: Shared<bool> = Shared::new(false);
+			mut ticks = 0;
+			for ticks < 300 {
+				sleep(100);
+				let status = mirror.status().get();
+				print(i"tick:{status.debug()}");
+				if status == Status::Waiting
+					&& !remade.read()
+					&& socket.state.get() == ConnectionState::Connected {
+					remade.write() = true;
+					// The documented recovery: re-run the rpc that minted the
+					// channel and mirror the id the FRESH session hands back.
+					let again: Result<i32, RpcError> = call(transport, json_codec(), "subscribe_extra", [
+						|serializer: Serializer| socket.connection.read().describe(serializer),
+					]);
+					let fresh: RemoteSource<i32> = reactive.source(again.unwrap_or(0 - 1));
+					let watching_again = fresh.sub(|value| print(i"remade:{value}"));
+					sleep(500);
+					watching_again.dispose();
+				}
+				ticks = ticks + 1;
+			}
+			watching.dispose();
+		},
+		Err(let reason) => print(i"connect failed: {reason}"),
+	}
+}
+"#;
+
+/// The two-package project for the dynamic pin, on its own ephemeral port.
+#[cfg(unix)]
+struct DynamicFixture {
+    directory: PathBuf,
+}
+
+#[cfg(unix)]
+impl DynamicFixture {
+    fn build(tag: &str) -> DynamicFixture {
+        let directory = temp_project(tag);
+        let port = free_port().to_string();
+        write(
+            &directory,
+            "vilan.toml",
+            "[project]\npackages = [\"server\", \"client\"]\n",
+        );
+        write(
+            &directory,
+            "server/vilan.toml",
+            "[package]\nname = \"server\"\ntarget = \"node\"\n",
+        );
+        write(
+            &directory,
+            "client/vilan.toml",
+            "[package]\nname = \"client\"\ntarget = \"node\"\n",
+        );
+        write(
+            &directory,
+            "server/src/main.vl",
+            &DYNAMIC_SERVER.replace("9298", &port),
+        );
+        write(
+            &directory,
+            "client/src/main.vl",
+            &DYNAMIC_CLIENT.replace("9298", &port),
+        );
+        let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["build", directory.to_str().unwrap()])
+            .output()
+            .expect("run vilan build");
+        assert!(
+            build.status.success(),
+            "build failed:\n{}{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        DynamicFixture { directory }
+    }
+
+    fn server(&self, value: &str) -> LineChild {
+        LineChild::spawn(&self.directory.join("dist/server.mjs"), &[value])
+    }
+
+    fn client(&self) -> LineChild {
+        LineChild::spawn(&self.directory.join("dist/client.mjs"), &[])
+    }
+}
+
+/// UNIX-ONLY for the same reason as its siblings above: the fixture drives
+/// real processes through `LineChild`, which is unix-only in this file.
+///
+/// A41's second hole. `reattach_mirrors` rebinds the positional list the
+/// generated `__attach` produced — and NOTHING else — so a mirror minted from
+/// a channel id an rpc returned survived the reconnect pointing at a channel
+/// the fresh session never minted: no error, no updates, and a `status` still
+/// reading `Ready` over a value from a connection that no longer exists. Worse
+/// than dead, in fact: channel ids count from zero per process, so the id it
+/// still names is one the fresh session will hand to something else.
+///
+/// It cannot be REBOUND — the fresh session has no memory of a channel an
+/// application method minted, and asking for it again means re-running that
+/// method with arguments std never saw (which is A39's protocol form, not
+/// this). So it is invalidated instead, and the app's recovery — re-run the
+/// rpc, mirror the fresh id — is pinned right here as the thing that works.
+#[cfg(unix)]
+#[test]
+fn a_dynamically_minted_mirror_is_invalidated_by_a_reconnect_and_can_be_remade() {
+    let fixture = DynamicFixture::build("dynamic");
+    let wait = Duration::from_secs(30);
+
+    let server = fixture.server("1");
+    server.await_line("listening 1", wait);
+    let client = fixture.client();
+    client.await_line("minted:", wait);
+    client.await_line("dynamic:1", wait);
+    // The mirror is live on this connection.
+    client.await_line("tick:Ready", wait);
+
+    // The connection is replaced under it.
+    drop(server);
+    let revived = fixture.server("2");
+    revived.await_line("listening 2", wait);
+
+    // What the reconnect must produce: the mirror says it knows nothing,
+    // rather than reporting the old connection's value forever.
+    client.await_line("tick:Waiting", wait);
+    // And the documented recovery works on the fresh session's own id.
+    client.await_line("remade:2", wait);
+
+    drop(client);
+    drop(revived);
+    let _ = std::fs::remove_dir_all(&fixture.directory);
+}

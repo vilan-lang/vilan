@@ -607,3 +607,14 @@ anything else about the chain.
 - An rpc handler's reply is its return value, so the handler runs to
   completion before the client hears back. Long work belongs in spawned
   tasks that write signals when done.
+- Minting channels at runtime (an rpc that calls `session_of` +
+  `ReactiveServer::expose`, rather than `[expose]`) is hand-wiring, and it
+  owns two things `[expose]` gets for free. Withdraw a channel you are
+  done with — `ReactiveServer::revoke(channel)`; an `Unsubscribe` only
+  stops the forward, because the client re-subscribes on the same id when
+  a view remounts. And register
+  `invalidate_on_reconnect(socket, client)` beside your
+  `ReactiveClient`, because a reconnect mints a fresh session that has
+  never heard of a channel your method minted: the mirror is invalidated
+  (`status` back to `Waiting`) and your app re-runs the rpc that minted
+  it.

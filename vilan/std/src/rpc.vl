@@ -1247,6 +1247,13 @@ impl ReactiveServer {
 	}
 
 	/// A client unsubscribed: dispose the forward for that channel.
+	///
+	/// The CAPABILITY stays. An `Unsubscribe` is client-local demand reaching
+	/// zero — a view unmounting, a row scrolling out — and `RemoteSource`
+	/// re-`Subscribe`s on the same channel id the moment demand returns
+	/// (`acquire`, 0→1). Dropping the `sources` entry here would make every
+	/// such remount silently dead, so revoking a channel is a separate,
+	/// deliberate act: `revoke` (A41).
 	fun stop(self, channel: i32) {
 		mut kept: List<(i32, Subscription)> = [];
 		for entry in self.live.read() {
@@ -1258,6 +1265,30 @@ impl ReactiveServer {
 			}
 		}
 		self.live.write() = kept;
+	}
+
+	/// Withdraw a channel: stop its forward AND drop the capability, so a
+	/// later `Subscribe` for that id finds nothing and the starter closure —
+	/// with the source it captured — is released.
+	///
+	/// This is what a DYNAMIC exposure needs (A41). A channel minted by
+	/// `expose` at runtime — an rpc method handing out a per-row or per-thread
+	/// channel — is capped by nothing: `dispose` clears the table, but that is
+	/// the end of the CONNECTION, so a client that scrolls a long list
+	/// accumulates one retained starter per row it ever looked at. The static
+	/// `[expose]` path mints one channel per field per connection and never
+	/// needs this; the dynamic path must revoke what it minted when the app
+	/// knows the id is finished with.
+	fun revoke(self, channel: i32) {
+		self.stop(channel);
+		mut kept: List<(i32, || Subscription)> = [];
+		for entry in self.sources.read() {
+			let (id, starter) = entry;
+			if id != channel {
+				kept.push((id, starter));
+			}
+		}
+		self.sources.write() = kept;
 	}
 
 	/// One inbound control frame: `Subscribe`/`Unsubscribe` route to
@@ -1318,11 +1349,21 @@ struct ReactiveClient {
 	// The id is a CELL shared with the channel's `RemoteSource` — a reconnect
 	// rebind moves both in one write (proposal/transport-robustness.md §2.5).
 	routes: Shared<List<(Shared<i32>, |Frame| void)>>,
+	// The mirrors minted from a RUNTIME channel id (`source`), each paired
+	// with the action that points it at nothing. A reconnect mints a fresh
+	// server session, and these are exactly the mirrors no `__attach` reply
+	// can rebind — see `invalidate_dynamic` (A41).
+	dynamic: Shared<List<|| void>>,
 }
 
 impl ReactiveClient {
 	fun new(transport: DuplexEnd, codec: Codec): ReactiveClient {
-		let client = ReactiveClient { transport, codec, routes = Shared::new([]) };
+		let client = ReactiveClient {
+			transport,
+			codec,
+			routes = Shared::new([]),
+			dynamic = Shared::new([]),
+		};
 		(client.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn (proposal/reactive-batching.md)
 			batch(|| client.receive(frame));
@@ -1330,10 +1371,42 @@ impl ReactiveClient {
 		client
 	}
 
-	/// A remote handle for a channel: a typed local mirror (`SignalCell<Option<T>>`,
-	/// `None` until the first update lands) kept in sync by inbound `Update`
-	/// frames, wrapped as a `RemoteSource<T>` whose `sub` also opens the channel.
+	/// A remote handle for a channel id the APP learned at runtime — an rpc
+	/// method that minted a channel with `ReactiveServer::expose` and returned
+	/// its id.
+	///
+	/// Identical to `attached_source` but for one thing: the mirror is
+	/// registered as DYNAMIC, so `invalidate_dynamic` (which
+	/// `invalidate_on_reconnect` runs) can point it at nothing when the
+	/// connection is replaced. A reconnect mints a fresh server session; the
+	/// generated mirrors are rebound positionally from the fresh `__attach`
+	/// reply, and this one cannot be, because the fresh session never minted
+	/// it and no protocol form exists yet to ask for it again (A39). Register
+	/// the invalidation with `invalidate_on_reconnect(socket, client)` — a
+	/// hand-wired client's one line — or the mirror survives the reconnect
+	/// holding a stale value on a channel id the fresh session may since have
+	/// minted for something else.
 	fun source<T: Wire>(self, channel: i32): RemoteSource<T> {
+		let mirror: RemoteSource<T> = self.attached_source(channel);
+		let cell = mirror.channel;
+		let cache = mirror.cache;
+		self.dynamic.write().push(|| {
+			// A channel no session ever mints (`fresh_channel` counts from 0),
+			// so the route stops matching instead of being re-matched by a
+			// fresh session's reuse of the id.
+			cell.write() = 0 - 1;
+			cache.set(None);
+		});
+		mirror
+	}
+
+	/// A remote handle for a channel this connection's `__attach` reply named:
+	/// a typed local mirror (`SignalCell<Option<T>>`, `None` until the first
+	/// update lands) kept in sync by inbound `Update` frames, wrapped as a
+	/// `RemoteSource<T>` whose `sub` also opens the channel. What the generated
+	/// `connect` mints, and what `reattach_mirrors` rebinds positionally after
+	/// a reconnect.
+	fun attached_source<T: Wire>(self, channel: i32): RemoteSource<T> {
 		let cache: SignalCell<Option<T>> = SignalCell::new(None);
 		let codec = self.codec;
 		// Deliver one routed `Update`: re-open the frame (the envelope was only
@@ -1362,6 +1435,22 @@ impl ReactiveClient {
 			transport = self.transport,
 			cache,
 		}
+	}
+
+	/// Point every dynamically-minted mirror at nothing: its cache goes back
+	/// to `None` (so `status` reads `Waiting` again — the truth, since the
+	/// fresh session holds no such channel) and its route stops matching any
+	/// id a session can mint. Run on reconnect by `invalidate_on_reconnect`.
+	///
+	/// The app's recovery is to re-run whatever rpc minted the channel and
+	/// mint a fresh mirror from the id it returns; there is no way for std to
+	/// do that for it, because the id came out of an application method whose
+	/// arguments std never saw (A39 is where that grows a protocol form).
+	fun invalidate_dynamic(self) {
+		for invalidate in self.dynamic.read() {
+			invalidate();
+		}
+		self.dynamic.write() = [];
 	}
 
 	/// One inbound frame: an `Update` fans out to its channel's deliverers
@@ -1411,6 +1500,7 @@ impl ReactiveClient with Disposable {
 	fun dispose(self) {
 		(self.transport).clear_on_frame();
 		self.routes.write() = [];
+		self.dynamic.write() = [];
 	}
 }
 
@@ -1635,6 +1725,28 @@ fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, 
 /// consume).
 fun dispose_on_close(socket: SocketDuplex, client: ReactiveClient) {
 	socket.on_terminal.write().push(|| client.dispose());
+}
+
+/// Bind a hand-wired client's DYNAMIC mirrors to its connection's fate: when
+/// `socket` reconnects, every mirror minted with `ReactiveClient::source` is
+/// pointed at nothing (`invalidate_dynamic`).
+///
+/// A reconnect mints a fresh server session, so every channel id from the
+/// previous connection is gone. `reattach_mirrors` rebinds the generated
+/// mirrors positionally from the fresh `__attach` reply; a mirror minted from
+/// a channel id an rpc returned cannot be rebound that way — the fresh session
+/// never minted it, and no protocol form exists yet to ask for it again (A39).
+/// Left alone it is silently dead at best, and at worst alive on an id the
+/// fresh session has since minted for something else. Invalidating says so:
+/// `status` returns to `Waiting`, and the app re-runs the rpc that minted the
+/// channel.
+///
+/// The generated `connect` does not register this, because a generated client
+/// has no dynamic mirrors — `ReactiveClient` is not reachable from it. This is
+/// for the hand-wired shape (`ReactiveClient::new(bridge(socket), codec)`),
+/// where it is one line beside the client's construction.
+fun invalidate_on_reconnect(socket: SocketDuplex, client: ReactiveClient) {
+	socket.on_reconnect.write().push(|| client.invalidate_dynamic());
 }
 
 /// Re-attach a generated client's mirrors after a reconnect (§2.5): re-verify
@@ -2021,7 +2133,7 @@ macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "_",
 		};
-		body.push(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.source(channels[{channel_index}]);");
+		body.push(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.attached_source(channels[{channel_index}]);");
 		ok_fields.push(i"{field_name} = mirror_{field_name}");
 		rebind_lines.push(i"|channel: i32, subscribe: Frame| mirror_{field_name}.rebind(channel, subscribe)");
 		channel_index = channel_index + 1;
