@@ -1050,3 +1050,41 @@ pub fn r11_rejections(
         })
         .collect()
 }
+
+/// The drop planner's enrolment for `source` (M28): the scan roots
+/// `plan_resource_drops` walked, and the roots it was offered — every bodied
+/// function and closure in the loaded world, std's included.
+///
+/// Read INSIDE the worker, because the instrument is thread-local (an analysis
+/// is single-threaded, and this harness runs each one on its own large-stack
+/// thread). Panics on a dirty analysis: an enrolment count taken off a program
+/// that did not compile says nothing.
+#[track_caller]
+pub fn drop_plan_enrolment(source: &str) -> (usize, usize) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                program.is_some() && errors.is_empty(),
+                "expected a clean analysis, got: {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            (
+                vilan_core::drop_plan_stats::planned_roots(),
+                vilan_core::drop_plan_stats::offered_roots(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}

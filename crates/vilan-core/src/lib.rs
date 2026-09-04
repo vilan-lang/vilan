@@ -14,6 +14,7 @@ pub mod context;
 pub mod css;
 pub(crate) mod depth_stats;
 pub mod dispatch_refine;
+pub mod drop_plan_stats;
 pub mod elements;
 pub mod error;
 pub mod formatter;
