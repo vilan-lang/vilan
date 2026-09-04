@@ -1172,3 +1172,44 @@ fn the_service_exhibits_refused_fields_report_only_their_roots() {
         );
     }
 }
+
+#[test]
+fn an_entry_self_import_keeps_main_and_says_the_import_is_a_no_op() {
+    // B226, end to end: `import pkg::main::..` inside the ENTRY resolved back
+    // to the entry file, which the loader then loaded as a MODULE — and an
+    // entry that is a module skips the entry-as-program walk, so `main` itself
+    // disappeared and the build died with "Cannot execute program without a
+    // main function". The build must succeed now, and the import — a no-op,
+    // since the entry's own declarations are already in scope — must be told
+    // about in the entry, on its own line.
+    let dir = temp_files(
+        "entry_self_import",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::main::helper;\n\n\
+                 fun helper(): i32 { 41 }\n\nfun main() {\n\tprint(helper());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "the entry keeps its `main` under a self-import: {stderr}"
+    );
+    assert!(
+        !stderr.contains("without a main function"),
+        "and never loses the item table: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "import pkg::main::helper;"),
+        "the telling renders at the import, in the entry: {stderr}"
+    );
+    assert!(
+        stderr.contains("is this program's own entry file"),
+        "and says why the import does nothing: {stderr}"
+    );
+}

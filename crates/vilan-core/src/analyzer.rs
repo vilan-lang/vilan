@@ -43716,6 +43716,11 @@ fn analyze_inner<'src>(
     // buffer rather than loaded a second time from disk, which would create
     // duplicate, non-unifiable types. The separate entry walk is skipped below.
     let mut entry_is_module = false;
+    // The `pkg::` module name the ENTRY file answers to, set when something
+    // references it (B226). The entry is the program, not a module, so the name
+    // is only ever an alias onto the entry's own (global) scope — reachable
+    // from the entry itself, and reportable from anywhere else.
+    let mut entry_alias_module: Option<&str> = None;
     // Dedup is per-package, not by bare name: two packages may each define a
     // module of the same name, and both must load into their own namespace.
     let mut loaded_keys: HashSet<(Origin, &str)> = HashSet::default();
@@ -43850,8 +43855,78 @@ fn analyze_inner<'src>(
                     msg,
                 });
             }
-            let is_entry_module = crate::util::canonical_path(&module_path)
+            // This module file IS the entry buffer. Two unrelated situations
+            // reach that equality and only the ORIGIN tells them apart (B226):
+            // a library file opened directly in an editor (`Std`/`Dep`), and a
+            // `pkg::<entry>` reference that walks back into the program's own
+            // entry.
+            let is_entry_file = crate::util::canonical_path(&module_path)
                 == crate::util::canonical_path(entry_path);
+            // The `pkg::` re-entry: the entry file imports its own module name,
+            // or a cycle of `pkg::` imports comes back to it. The entry is not
+            // a module of its package — it walks as the PROGRAM, in the global
+            // scope, at the end of this function. Loading it here as a module
+            // took that walk away (and with it `main`, and the entry's own
+            // macro/derive expansion, so every `[derive]` on an entry type
+            // vanished). Alias the name to the already-seeded entry scope
+            // instead: `pkg::<entry>::Name` then resolves to the entry's own
+            // declaration, which is exactly what the import asked for, and
+            // nothing is loaded, walked, or typed twice.
+            if is_entry_file && origin == Origin::Pkg {
+                let module_id = analyzer.new_entity_id();
+                analyzer.modules.insert(
+                    module_id,
+                    Module {
+                        id: module_id,
+                        name,
+                        body: (Vec::new(), global_scope_id),
+                    },
+                );
+                analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+                analyzer.source_ranges.push(SourceRange {
+                    start: module_id.0,
+                    end: module_id.0 + 1,
+                    source: SourceId(0),
+                });
+                analyzer
+                    .expr_id_to_expr_map
+                    .insert(module_id, Expr::Module(module_id));
+                analyzer
+                    .mut_scope_for_scope_id(pkg_scope_id)
+                    .name_to_id_map
+                    .insert(name, module_id);
+                // The name is resolvable in `pkg` now, so the entry-expansion
+                // hoist must not rebuild the world for a generated reference
+                // to it (M21's "a module this world never loaded" rule).
+                pkg_module_names.insert(name);
+                entry_alias_module = Some(name);
+                // A DIRECT self-import is a no-op the author did not mean to
+                // write: the entry's own declarations are already in scope. Say
+                // so, at the import. A cycle that merely comes back through the
+                // entry has no such import to point at and passes silently.
+                if let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
+                    .into_iter()
+                    .find(|(module, _)| *module == name)
+                {
+                    analyzer.warnings.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`pkg::{name}` is this program's own entry file, so this import \
+                             brings the file into itself: everything it declares is already \
+                             in scope here. Delete the import"
+                        ),
+                    });
+                    analyzer.warning_sources.push(SourceId(0));
+                }
+                continue;
+            }
+            // What is left is the editor case: a std or dependency file opened
+            // directly, analyzed *as* its module from the buffer rather than
+            // loaded a second time from disk. Stated as the origin gate it is,
+            // not as "the paths matched" — that was B226's whole mistake.
+            let is_entry_module = is_entry_file && matches!(origin, Origin::Std | Origin::Dep(_));
             // Use the entry's (buffer) AST for its own module; load the rest from
             // disk. The entry module keeps SourceId 0 so editor features resolve to
             // the open document.
@@ -44245,6 +44320,40 @@ fn analyze_inner<'src>(
         }
         if to_load.is_empty() {
             break;
+        }
+    }
+
+    // An import CYCLE back into the entry (`client` -> `views` -> `client`).
+    // The alias above answers `pkg::<entry>` with the entry's own scope, which
+    // the entry itself reads fine — but a sibling module resolves its imports
+    // before the entry walks, so that scope is still empty when it looks, and
+    // the honest answer is that the entry cannot be imported at all: it is the
+    // program. Say that at the import rather than letting the name lookup fail
+    // with "cannot find `X` in the imported path" over a name the user can see
+    // declared (B226).
+    if let Some(entry_module) = entry_alias_module {
+        for (_name, ast, _text, _scope_id, source_id, origin) in &loaded {
+            if *origin != Origin::Pkg {
+                continue;
+            }
+            for (module, span) in collect_module_refs(&ast.0, "pkg") {
+                if module != entry_module {
+                    continue;
+                }
+                let diagnostics_before = analyzer.diagnostics.len();
+                analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`pkg::{entry_module}` is this program's entry file, which is the \
+                         program itself and not a module: it cannot be imported. Move the \
+                         declarations both files need into their own module and import that \
+                         from each"
+                    ),
+                });
+                analyzer.attribute_new_diagnostics(diagnostics_before, *source_id);
+            }
         }
     }
 

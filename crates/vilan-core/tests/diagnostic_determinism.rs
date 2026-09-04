@@ -527,13 +527,24 @@ fn the_const_only_reports_are_one_per_site_on_every_cold_analysis() {
 /// them, which is the point.
 #[test]
 fn a_multi_file_programs_diagnostics_group_by_file_every_time() {
-    let entry = "import std::io::print;\nimport std::drop::Drop;\nimport pkg::store::keep;\n\
+    // `Guard` is declared in a third module both files import. It used to live
+    // in the ENTRY, with `store.vl` reaching it through `pkg::main::Guard` —
+    // which only resolved because the loader then loaded the entry as a module
+    // and dropped the entry walk with it (B226). Nothing this pin claims turns
+    // on where the resource is declared: the two `List<Guard>` spellings, one
+    // per user file, are what it sorts.
+    let guard = "import std::io::print;\nimport std::drop::Drop;\n\
                  resource struct Guard { label: str }\n\
-                 impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
+                 impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n";
+    let entry = "import pkg::guard::Guard;\nimport pkg::store::keep;\n\
                  fun main() {\n\tkeep();\n\tmut mine: List<Guard> = [];\n}\n";
-    let module = "import pkg::main::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n";
+    let module = "import pkg::guard::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n";
     let rendering = assert_cold_package_rendering_is_stable(
-        &[("main.vl", entry), ("store.vl", module)],
+        &[
+            ("main.vl", entry),
+            ("store.vl", module),
+            ("guard.vl", guard),
+        ],
         "main.vl",
         Platform::default(),
     );
