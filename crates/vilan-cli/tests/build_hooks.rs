@@ -2238,6 +2238,93 @@ fn fmt_counts_a_file_reached_under_two_names_once() {
 }
 
 #[test]
+fn fmt_counts_a_file_named_by_two_overlapping_roots_once() {
+    // B213 — G22's sibling by symptom, a different mechanism. G22 gave one
+    // WALK one identity set; `fmt` then built a fresh walk per command-line
+    // root, so the set did not span roots and `vilan fmt --check src src/pkg`
+    // printed `src/pkg/helper.vl` twice. No symlink is involved: `src/pkg` is
+    // simply named twice, once on its own and once inside `src`.
+    //
+    // Two files need formatting, so — like G22's pin — this is "each FILE
+    // once", not "one line": a fix that collapsed the two real files into one
+    // would fail it exactly as the missing guard did. Both root ORDERS are
+    // asserted, because the parent-first and child-first walks reach the shared
+    // subtree at different moments.
+    let dir = temp_project("overlapping_roots");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/top.vl", "fun  top( ) { }\n");
+    write(&dir, "src/pkg/helper.vl", "fun  helper( ) { }\n");
+    let src = dir.join("src");
+    let pkg = dir.join("src/pkg");
+
+    for roots in [
+        [src.to_str().unwrap(), pkg.to_str().unwrap()],
+        [pkg.to_str().unwrap(), src.to_str().unwrap()],
+    ] {
+        let output = vilan(&["fmt", "--check", roots[0], roots[1]]);
+        let text = combined(&output);
+        assert_eq!(
+            text.matches("would reformat").count(),
+            2,
+            "two files need formatting, and naming their directory twice on the \
+             command line does not make three: {roots:?}\n{text}"
+        );
+        assert_eq!(
+            text.matches("helper.vl").count(),
+            1,
+            "the file both roots reach is reported once: {roots:?}\n{text}"
+        );
+        assert!(
+            !output.status.success(),
+            "`--check` still fails when something would be reformatted:\n{text}"
+        );
+    }
+
+    // And the rewrite agrees: one file, formatted once.
+    let rewrite = vilan(&["fmt", src.to_str().unwrap(), pkg.to_str().unwrap()]);
+    let rewritten = combined(&rewrite);
+    assert!(rewrite.status.success(), "{rewritten}");
+    assert_eq!(
+        rewritten.matches("formatted").count(),
+        2,
+        "the rewrite formats each file once:\n{rewritten}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/pkg/helper.vl")).unwrap(),
+        "fun helper() {}\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_walks_every_disjoint_root_it_is_given() {
+    // The control for the pin above: sharing one identity set across roots must
+    // not make a LATER root a no-op. Two roots that overlap in nothing, each
+    // holding a file that needs formatting, and both are reported.
+    let dir = temp_project("disjoint_roots");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/alpha/one.vl", "fun  one( ) { }\n");
+    write(&dir, "src/beta/two.vl", "fun  two( ) { }\n");
+
+    let output = vilan(&[
+        "fmt",
+        "--check",
+        dir.join("src/alpha").to_str().unwrap(),
+        dir.join("src/beta").to_str().unwrap(),
+    ]);
+    let text = combined(&output);
+    assert_eq!(
+        text.matches("would reformat").count(),
+        2,
+        "disjoint roots are each walked whole:\n{text}"
+    );
+    assert!(text.contains("one.vl") && text.contains("two.vl"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_generated_root_outside_the_package_fails_the_build_naming_the_key() {
     // The refusal reaches the user, not just `Manifest::validate` (whose own
     // pins cover the four cases, §12.3). Lexical: `../shared` never exists in

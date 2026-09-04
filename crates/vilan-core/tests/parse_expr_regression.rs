@@ -289,6 +289,96 @@ const SNAP_COND_SHL_GT: &str = "(Binary(Gt, (Binary(Shl, (Accessor(\"a\"), 3..4)
 const SNAP_COND_IS_OR: &str = "(Binary(Or, (Is((Accessor(\"a\"), 3..4), (Variant([\"None\"], None), 8..12)), 3..12), (Is((Accessor(\"b\"), 16..17), (Variant([\"None\"], None), 21..25)), 16..25)), 3..25)";
 const SNAP_COND_PAREN_STRUCT: &str = "(StructInitializer([], (\"Foo\", 4..7), None, ([((\"x\", Some((Number(\"1\", None, None), 14..15))), 10..15)], 8..17)), 4..17)";
 
+// ---------------------------------------------------------------------------
+// 4. Located decliner messages — the shapes whose WORDING is the contract
+// ---------------------------------------------------------------------------
+
+/// The rendered diagnostics of `source`, each paired with the source text its
+/// span covers — so a pin holds the anchor as well as the wording.
+fn diagnostics_at(source: &str) -> Vec<(String, String)> {
+    parsing::parse(source)
+        .1
+        .iter()
+        .map(|error| {
+            let range = error.span.into_range();
+            (
+                parsing::render(error),
+                source[range.start..range.end].to_string(),
+            )
+        })
+        .collect()
+}
+
+/// E135. `a::` is in the decliner corpus above, which only asserts that SOMETHING
+/// was reported; the message is the point. An unfinished path used to roll its
+/// `::` back, leaving the enclosing statement to complain about a missing `;` at
+/// the operator — a true statement about a program nobody wrote, and one that
+/// never named the thing that is actually absent.
+#[test]
+fn an_unfinished_path_names_the_missing_name() {
+    assert_eq!(
+        diagnostics_at("let __probe = a::;"),
+        vec![(
+            "found ';' expected a name after `::`".to_string(),
+            ";".to_string()
+        )],
+    );
+}
+
+/// E135, the two shapes the owner hit while migrating kolt. Each is ONE parse
+/// error, anchored on the token standing where the name should be.
+///
+/// The first is the face that used to report `expected ';' to end this
+/// statement` on the `::` — the element on the next line read as a comparison
+/// once the `::` rolled back, and the whole statement degenerated. The second is
+/// the same mistake terminated on its own line.
+#[test]
+fn an_unfinished_path_before_an_element_reports_once_at_the_element() {
+    let source = "fun panel(): View {\n\tlet x = style::\n\t<div class(\"panel\")></div>\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(
+            "found '<' expected a name after `::`".to_string(),
+            "<".to_string()
+        )],
+    );
+}
+
+#[test]
+fn an_unfinished_path_reports_once_when_the_statement_is_terminated() {
+    let source = "fun panel(): View {\n\tlet x = style::;\n\t<div></div>\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(
+            "found ';' expected a name after `::`".to_string(),
+            ";".to_string()
+        )],
+    );
+}
+
+/// E136. A multi-value attribute is one mistake with one message, and the
+/// message belongs on the COMMA — in either element spelling.
+///
+/// The self-closing form always had it. The paired form did not: the comma arm
+/// declined the whole element, `parse_atom` fell back to element recovery, the
+/// enclosing statement then failed to parse around the `<`/`>` pair, and
+/// `attempt`'s `errors.truncate` threw the curated message away with the branch
+/// that produced it — leaving `expected ';'` on the tag.
+#[test]
+fn a_multi_value_attribute_reports_at_the_comma_in_both_element_spellings() {
+    let expected = "found ',' expected `)` (an attribute takes one value; \
+                    a chain link starts with `.`)"
+        .to_string();
+    assert_eq!(
+        diagnostics_at("let __probe = <div name(a, b)/>;"),
+        vec![(expected.clone(), ",".to_string())],
+    );
+    assert_eq!(
+        diagnostics_at("let __probe = <div name(a, b)></div>;"),
+        vec![(expected, ",".to_string())],
+    );
+}
+
 // The fixture arrays live in a SUBDIRECTORY, not beside this file: cargo makes a
 // test target out of every `tests/*.rs`, so a fixtures file at the top level was
 // also compiled as a target of its own — a binary with no tests in it, whose only

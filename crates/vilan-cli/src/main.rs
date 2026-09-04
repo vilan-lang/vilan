@@ -1922,10 +1922,12 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         paths.to_vec()
     };
     let mut files = Vec::new();
-    let mut outside: BTreeSet<PathBuf> = BTreeSet::new();
-    for root in &roots {
-        outside.extend(collect_vl_files(root, &mut files));
-    }
+    // ONE walk across every root, so the identity set spans them: overlapping
+    // roots (`vilan fmt --check src src/pkg`) name the same files twice on the
+    // command line and must still format each of them once (B213).
+    let outside: BTreeSet<PathBuf> = collect_vl_files_across(&roots, &mut files)
+        .into_iter()
+        .collect();
     report_links_outside_the_project(&outside);
     exclude_generated(&mut files);
     let mut changed = 0;
@@ -2190,6 +2192,16 @@ struct TreeWalk {
 
 impl TreeWalk {
     fn rooted_at(root: &Path) -> TreeWalk {
+        TreeWalk {
+            scope: Self::scope_of(root),
+            visited: BTreeSet::new(),
+            outside: Vec::new(),
+        }
+    }
+
+    /// The tree a walk rooted at `root` may not leave: the nearest `vilan.toml`
+    /// at or above it, else the root itself.
+    fn scope_of(root: &Path) -> PathBuf {
         let resolved = vilan_core::util::canonical_path(root);
         let start = if resolved.is_dir() {
             resolved
@@ -2199,11 +2211,20 @@ impl TreeWalk {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| resolved.clone())
         };
-        TreeWalk {
-            scope: find_project_root(&start).unwrap_or(start),
-            visited: BTreeSet::new(),
-            outside: Vec::new(),
-        }
+        find_project_root(&start).unwrap_or(start)
+    }
+
+    /// Re-points the walk at another command-line root, KEEPING everything it
+    /// has already visited (B213).
+    ///
+    /// G22 gave one walk one identity set — one file, one visit, whichever name
+    /// reached it — and `fmt` then built a fresh walk per root, so the set did
+    /// not span roots and `vilan fmt --check src src/pkg` reported every file
+    /// under `src/pkg` twice. The scope is re-derived per root, because each
+    /// root answers "which project is this" for itself; only the identities
+    /// carry over, which is exactly the state that has to.
+    fn re_root(&mut self, root: &Path) {
+        self.scope = Self::scope_of(root);
     }
 
     /// Whether a link is part of this project — the one question the walk asks
@@ -2286,12 +2307,31 @@ impl TreeWalk {
 /// follow because they leave the project ([`TreeWalk`]) — which `fmt` reports
 /// and the watcher's scan ignores.
 fn collect_vl_files(path: &Path, out: &mut Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut walk = TreeWalk::rooted_at(path);
-    walk.walk(path, &mut |file| {
-        if file.extension().and_then(|extension| extension.to_str()) == Some("vl") {
-            out.push(file.to_path_buf());
-        }
-    });
+    let roots = [path.to_path_buf()];
+    collect_vl_files_across(&roots, out)
+}
+
+/// The same collection over SEVERAL command-line roots, sharing one walk — and
+/// so one identity set — across all of them (B213).
+///
+/// One root at a time is not the same thing: `vilan fmt --check src src/pkg`
+/// walks `src`, reaches `src/pkg/helper.vl`, and then walks `src/pkg` and
+/// reaches it again, because the second walk starts with an empty set. G22's
+/// rule is "one file, one visit, whichever name reached it"; a per-root walk
+/// only ever held it within one name.
+fn collect_vl_files_across(roots: &[PathBuf], out: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(first) = roots.first() else {
+        return Vec::new();
+    };
+    let mut walk = TreeWalk::rooted_at(first);
+    for root in roots {
+        walk.re_root(root);
+        walk.walk(root, &mut |file| {
+            if file.extension().and_then(|extension| extension.to_str()) == Some("vl") {
+                out.push(file.to_path_buf());
+            }
+        });
+    }
     walk.outside
 }
 

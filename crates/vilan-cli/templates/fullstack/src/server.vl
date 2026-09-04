@@ -29,7 +29,10 @@ async fun main() {
 	Server::builder()
 		.port(8080)
 		.serve_build(build)
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html")
+			.body(page)
+			.build())
 		.on_start(|server| print(greeting() + " — http://localhost:8080/"))
 		.build()
 		.start();
