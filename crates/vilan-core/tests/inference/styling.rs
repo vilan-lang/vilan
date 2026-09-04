@@ -5546,3 +5546,53 @@ fn a_hand_written_style_accessor_gets_no_css_note() {
         "a `css { … }` block lowers to",
     );
 }
+
+// --- B227: an event handler's parameter is its `Event`, not `any` ------------
+//
+// The owner's second report — "`event` in `on:keydown(|event| ..)` is `any`
+// instead of `Event`" — is the same defect seen through the element head. The
+// `on:` desugar is sound (it lowers to `.on_event`, whose handler is declared
+// `|Event| void`); what re-typed the parameter was a `print(event)` written
+// above the read, through B13's adopt rule and `any`. The `|event: Event|`
+// annotations a real application carries are the workaround, not the spelling.
+
+#[test]
+fn b227_a_printed_event_parameter_is_still_an_event() {
+    // Red before the fix with "cannot call method 'bogus' on any" — the
+    // handler's own declared type reported as `any`, so no member check on
+    // `event` said anything for the rest of the body.
+    assert_fails_browser_with(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, view, mount_root };
+
+        fun main() {
+            let _root = mount_root("app", || <div on:keydown(|event| {
+                print(event);
+                event.bogus();
+            }) />);
+        }
+        "#,
+        "Event has no method 'bogus'",
+    );
+}
+
+#[test]
+fn b227_a_printed_event_parameter_still_reads_its_key() {
+    // The positive half: `Event::key` is a method, and reading it through a
+    // handler that also prints the event must compile. This is the shape the
+    // application was written in.
+    assert_compiles_browser(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, view, mount_root };
+
+        fun main() {
+            let _root = mount_root("app", || <div on:keydown(|event| {
+                print(event);
+                print(event.key());
+            }) />);
+        }
+        "#,
+    );
+}

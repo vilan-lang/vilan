@@ -6237,3 +6237,124 @@ fn b219_both_comparators_still_accept_a_rigid_parameter_against_itself() {
         "1\n",
     );
 }
+
+#[test]
+fn b227_a_print_does_not_retype_an_inferred_closure_parameter() {
+    // The owner's report — "printing a value that infers its type causes its
+    // inferred type to become `any`". `apply` declares `|i32| void`, so `v` is
+    // `i32`; before the fix the `print` got there first and the bogus method
+    // was refused "on any", naming a type the program never wrote.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun apply(f: sync |i32| void) { f(1); }
+
+        fun main() {
+            apply(|v| { print(v); v.no_such_method(); });
+        }
+        main();
+        "#,
+        "i32 has no method 'no_such_method'",
+    );
+}
+
+#[test]
+fn b227_a_print_free_twin_reports_exactly_the_same_way() {
+    // The control half of the pair: the same closure without the `print`
+    // always reported against `i32`. The two must be indistinguishable — that
+    // equality is the whole claim, since a `print` is not a type ascription.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun apply(f: sync |i32| void) { f(1); }
+
+        fun main() {
+            apply(|v| { v.no_such_method(); });
+        }
+        main();
+        "#,
+        "i32 has no method 'no_such_method'",
+    );
+}
+
+#[test]
+fn b227_a_user_any_parameter_is_the_same_sink_as_print() {
+    // It is the `any` PARAMETER, not `print`: a hand-written `fun sink(m: any)`
+    // did it identically, which is what proves the rule is about the type and
+    // not about one std function.
+    assert_fails_with(
+        r#"
+        fun sink(m: any): void {}
+        fun apply(f: sync |i32| void) { f(1); }
+
+        fun main() {
+            apply(|v| { sink(v); v.no_such_method(); });
+        }
+        main();
+        "#,
+        "i32 has no method 'no_such_method'",
+    );
+}
+
+#[test]
+fn b227_an_any_call_never_reports_against_any() {
+    // The negative form of the same pin, so a future rule that reintroduces
+    // the write is caught even if it picks a different concrete type: the
+    // word `any` must not appear as the subject of the refusal.
+    assert_fails_without(
+        r#"
+        import std::io::print;
+
+        fun apply(f: sync |i32| void) { f(1); }
+
+        fun main() {
+            apply(|v| { print(v); v.no_such_method(); });
+        }
+        main();
+        "#,
+        "on any",
+    );
+}
+
+#[test]
+fn b227_the_enclosing_call_still_types_a_printed_parameter() {
+    // And the parameter is genuinely typed, not merely un-poisoned: `v + 1`
+    // needs a number, and the program runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply(f: sync |i32| void) { f(41); }
+
+        fun main() {
+            apply(|v| { print(v); print(v + 1); });
+        }
+        main();
+        "#,
+        "41\n42\n",
+    );
+}
+
+#[test]
+fn b227_an_any_call_as_a_closures_sole_use_leaves_the_slot_open() {
+    // The deliberate edge. Skipping without deferring means a closure whose
+    // ONLY use is an `any` call gets no type from anywhere — and that is the
+    // right answer, reported by the message that already covers it. Deferring
+    // instead would deadlock: the body waits for the parameter, and nothing
+    // else is ever going to fill it. Note this is the same verdict a GENERIC
+    // sink (`fun sink<T>(m: T)`) has always produced for the same program.
+    assert_fails_with(
+        r#"
+        fun sink(m: any): void {}
+
+        fun main() {
+            let f = |v| { sink(v); v.no_such_method() };
+            f(1);
+        }
+        main();
+        "#,
+        "could not be resolved",
+    );
+}

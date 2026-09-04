@@ -2517,16 +2517,21 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
 fn b112_the_entrys_own_violations_still_attribute_to_the_entry() {
     let attributed = analyze_package_attributed(
         &[
+            // `Guard` is declared in a third module both files import. It used
+            // to live in the entry, with `store.vl` reaching it through
+            // `pkg::main::Guard` — which only ever resolved because the loader
+            // then loaded the entry AS a module and quietly dropped the entry
+            // walk with it (B226). Nothing here turns on WHERE the resource is
+            // declared; the claim is that each file's own violation goes home.
+            ("guard.vl", &guarded("")),
             (
                 "main.vl",
-                &guarded(
-                    "import pkg::store::keep;\nfun main() {\n\tkeep();\n\
-                     \tmut mine: List<Guard> = [];\n}\n",
-                ),
+                "import pkg::guard::Guard;\nimport pkg::store::keep;\n\
+                 fun main() {\n\tkeep();\n\tmut mine: List<Guard> = [];\n}\n",
             ),
             (
                 "store.vl",
-                "import pkg::main::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n",
+                "import pkg::guard::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n",
             ),
         ],
         "main.vl",
@@ -3597,5 +3602,162 @@ fn b212_one_module_declaring_a_name_twice_is_refused_on_disk_too() {
             .iter()
             .any(|error| error.contains("'N' is already declared in this module")),
         "{errors:#?}"
+    );
+}
+
+/// As [`analyze_package_raw`], but keeps the analyzed program's WARNINGS beside
+/// its diagnostics. A self-import (B226) compiles clean and warns, and the
+/// warning lives on the program the other helpers drop.
+fn analyze_package_with_warnings(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> (Vec<String>, Vec<String>) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("vilan_selfimport_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let warnings = program
+        .map(|program| {
+            program
+                .warnings
+                .into_iter()
+                .map(|warning| warning.msg)
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        errors.into_iter().map(|error| error.msg).collect(),
+        warnings,
+    )
+}
+
+#[test]
+fn an_entry_self_import_keeps_the_entrys_derive_expansion() {
+    // B226: `import pkg::main::..` inside the ENTRY resolved back to the entry
+    // file, which the loader then loaded as a MODULE — and an entry that is a
+    // module skips both the entry-as-program walk and the entry's own macro /
+    // derive expansion. The `[derive(PartialEq)]` below was expanded nowhere,
+    // and the program failed with "does not implement the `PartialEq`
+    // operator" over a type that plainly derives it.
+    let (errors, warnings) = analyze_package_with_warnings(
+        &[(
+            "main.vl",
+            "import pkg::main::Tab;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+             fun main() {\n\tlet same = Tab::Messages == Tab::Other;\n}\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the entry's derive must survive its own self-import, got: {errors:#?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("`pkg::main` is this program's own entry file")),
+        "and the no-op import must be told about: {warnings:#?}"
+    );
+}
+
+#[test]
+fn an_entry_self_import_of_a_function_keeps_the_entry_walk() {
+    // The same defect seen through the item table rather than the derive: a
+    // self-imported FUNCTION lost the whole entry walk, so `main` itself
+    // vanished. Here the program must still analyze clean.
+    let (errors, warnings) = analyze_package_with_warnings(
+        &[(
+            "main.vl",
+            "import pkg::main::helper;\n\nfun helper(): i32 { 1 }\n\n\
+             fun main() {\n\tlet value = helper();\n}\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+    assert_eq!(warnings.len(), 1, "exactly one telling: {warnings:#?}");
+}
+
+#[test]
+fn an_import_cycle_back_into_the_entry_is_refused_at_the_import() {
+    // The cycle form of B226 (`main` -> `views` -> `main`). The entry is the
+    // PROGRAM, not a module of its package, so a sibling cannot import from
+    // it — and before the fix the loader answered by loading the entry as a
+    // module, which silently cost the entry its walk and its derives. The
+    // refusal must name the real problem, at the sibling's import, and the
+    // entry's own derive must no longer be the thing that fails.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::Tab;\n\nfun render(): bool { Tab::Messages == Tab::Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::main` is this program's entry file")),
+        "the cycle must be refused where it is written: {errors:#?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("does not implement the `PartialEq` operator")),
+        "and never as a lost derive on the entry's own type: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_non_entry_self_import_stays_clean() {
+    // The control, and the latent form a real package carries: a MODULE that
+    // imports its own name. It always worked — the module is loaded once and
+    // the import is a no-op — and it must keep working silently, with no
+    // refusal and no telling. Only the entry's self-import is a telling,
+    // because only the entry is not a module.
+    let (errors, warnings) = analyze_package_with_warnings(
+        &[
+            (
+                "main.vl",
+                "import pkg::sidebar::Tab;\n\nfun main() {\n\tlet same = Tab::Messages == Tab::Other;\n}\n",
+            ),
+            (
+                "sidebar.vl",
+                "import pkg::sidebar::Tab;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+    assert!(
+        warnings.is_empty(),
+        "a non-entry self-import says nothing: {warnings:#?}"
     );
 }
