@@ -5982,3 +5982,224 @@ fn b211_an_identity_mapped_type_is_its_source() {
         "1\ntwo\n",
     );
 }
+
+// --- B230: a generic variant constructor's payload is checked against the
+// expected instantiation -----------------------------------------------------
+
+#[test]
+fn b230_a_variant_payload_is_checked_against_the_expected_instantiation() {
+    // The expected enum type SEEDS the constructor's parameter bindings so an
+    // argument is inferred against its concrete payload type. When the argument
+    // then contradicts that seed the seed used to WIN — the constructor typed as
+    // the expectation and the payload was never checked at all, so `Ok(true)`
+    // passed as a `Result<i32, str>` and the runtime value was `[0, true]`.
+    assert_fails_with(
+        r#"
+        fun main() { let x: Result<i32, str> = Ok(true); }
+        "#,
+        "Expected Result<i32, str>, but got Result<bool, str> instead.",
+    );
+}
+
+#[test]
+fn b230_the_payload_check_reaches_every_expression_position() {
+    // An argument, a struct field, and a `ret` are all positions that supply an
+    // expected enum type; each one used to swallow the mismatch.
+    assert_fails_with(
+        r#"
+        fun take(r: Result<i32, str>) {}
+        fun main() { take(Ok(true)); }
+        "#,
+        "Expected Result<i32, str>, but got Result<bool, str> instead.",
+    );
+    assert_fails_with(
+        r#"
+        struct Slot { value: Result<i32, str> }
+        fun main() { let s = Slot { value = Ok(true) }; }
+        "#,
+        "Expected Result<i32, str>, but got Result<bool, str> instead.",
+    );
+    assert_fails_with(
+        r#"
+        fun make(): Result<i32, str> { ret Ok(true); }
+        fun main() { let _ = make(); }
+        "#,
+        "Expected Result<i32, str>, but got Result<bool, str> instead.",
+    );
+}
+
+#[test]
+fn b230_option_and_user_enums_share_the_payload_check() {
+    assert_fails_with(
+        r#"
+        fun main() { let x: Option<i32> = Some(true); }
+        "#,
+        "Expected Option<i32>, but got Option<bool> instead.",
+    );
+    assert_fails_with(
+        r#"
+        enum Slot<T> { Full(T), Empty }
+        fun main() { let x: Slot<i32> = Slot::Full(true); }
+        "#,
+        "Expected Slot<i32>, but got Slot<bool> instead.",
+    );
+}
+
+#[test]
+fn b230_a_lifted_let_initializer_is_a_container_not_its_element() {
+    // The released miscompile: `probe()?` lifts the WHOLE `let` initializer
+    // (`expression-lifting.md` §2 — a `let` initializer is a slot root), so `v`
+    // is `Result<bool, str>`, and `Ok(v)` is a `Result<Result<bool, str>, str>`.
+    // That compiled: `check()` handed back `Ok(Ok(true))`, and an `Err` from
+    // `probe` came back as `Ok(Err("boom"))` — never propagated. `!`, not `?`,
+    // is the operator that unwraps and returns early (the control below).
+    assert_fails_with(
+        r#"
+        fun probe(): Result<i32, str> { Ok(1) }
+        fun check(): Result<bool, str> {
+            let v = probe()? > 0;
+            Ok(v)
+        }
+        fun main() { let _ = check(); }
+        "#,
+        "Expected Result<bool, str>, but got Result<Result<bool, str>, str> instead.",
+    );
+}
+
+#[test]
+fn b230_bang_in_a_let_initializer_binds_the_payload_and_returns_early() {
+    // The control the miscompile was mistaken for: `!` in a NON-return position
+    // already emits the early `return` of the bad half and yields the good one.
+    // Ok path — `probe` runs, `v` is a `bool`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun probe(): Result<i32, str> { print("probe ran"); Ok(1) }
+        fun check(): Result<bool, str> {
+            let v = probe()! > 0;
+            Ok(v)
+        }
+        fun main() {
+            match check() {
+                Ok(let b) => print(b),
+                Err(let e) => print(e),
+            }
+        }
+        "#,
+        "probe ran\ntrue\n",
+    );
+    // Err path — the bad half propagates as the function's own result.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun probe(): Result<i32, str> { Err("boom") }
+        fun check(): Result<bool, str> {
+            let v = probe()! > 0;
+            Ok(v)
+        }
+        fun main() {
+            match check() {
+                Ok(let b) => print(b),
+                Err(let e) => print(e),
+            }
+        }
+        "#,
+        "boom\n",
+    );
+}
+
+#[test]
+fn b230_bang_under_a_short_circuit_keeps_its_operand_ungated() {
+    // The `&&` sibling, with B224's statement slot: `probe` must NOT run when
+    // `flag` is false, and its `Err` must still propagate when it does run.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun probe(): Result<i32, str> { print("probe ran"); Ok(1) }
+        fun check(flag: bool): Result<bool, str> {
+            let v = flag && probe()! > 0;
+            Ok(v)
+        }
+        fun main() {
+            print(check(false));
+            print(check(true));
+        }
+        "#,
+        "[ 0, false ]\nprobe ran\n[ 0, true ]\n",
+    );
+}
+
+#[test]
+fn b230_the_expected_type_still_seeds_a_payload_it_agrees_with() {
+    // The seed's real job is unchanged: an argument is inferred against its
+    // CONCRETE payload type, an unsuffixed literal takes the expected width, a
+    // partial constructor (`None`) stays erased, and a generic passthrough binds
+    // the caller's own parameter.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun decode(): Option<i32> { Some(7) }
+        fun wrap(): Result<Option<i32>, str> { Ok(decode()) }
+        fun wide(): Result<i53, str> { Ok(1) }
+        fun empty(): Option<i32> { None }
+        fun pass<T>(x: T): Result<T, str> { Ok(x) }
+        fun main() {
+            print(wrap());
+            print(wide());
+            print(empty());
+            print(pass("hi"));
+        }
+        "#,
+        "[ 0, [ 0, 7 ] ]\n[ 0, 1 ]\n[ 1 ]\n[ 0, 'hi' ]\n",
+    );
+}
+
+#[test]
+fn b230_the_lifted_let_initializer_has_an_option_twin() {
+    // `Option`'s `?` shares the shape exactly: `probe()? > 0` in a `let` is an
+    // `Option<bool>`, so `Some(v)` builds `Option<Option<bool>>`. It ran as
+    // `Some(Some(true))` and swallowed a `None` the same way.
+    assert_fails_with(
+        r#"
+        fun probe(): Option<i32> { Some(1) }
+        fun check(): Option<bool> {
+            let v = probe()? > 0;
+            Some(v)
+        }
+        fun main() { let _ = check(); }
+        "#,
+        "Expected Option<bool>, but got Option<Option<bool>> instead.",
+    );
+}
+
+#[test]
+fn b230_a_condition_never_took_a_lifted_operand() {
+    // The `&&` sibling in a real CONDITION was already refused — the lifted
+    // condition is an explicit check (`expression-lifting.md` §2). Only a `let`
+    // initializer, whose slot happily takes a container, let the shape through,
+    // which is why the miscompile needed the binding to appear.
+    assert_fails_with(
+        r#"
+        fun probe(): Result<i32, str> { Ok(1) }
+        fun check(flag: bool): Result<bool, str> {
+            if flag && probe()? > 0 { Ok(true) } else { Ok(false) }
+        }
+        fun main() { let _ = check(true); }
+        "#,
+        "the `?` lifts this condition to an `Option`/`Result`, which a condition cannot take",
+    );
+}
+
+#[test]
+fn b230_the_payload_check_holds_inside_an_async_body() {
+    // An `async` body's declared return type is the frame's, and the payload
+    // check reads it the same way (`bang_works_in_async_functions` pins the `!`
+    // half of the same seam).
+    assert_fails_with(
+        r#"
+        async fun check(): Result<i32, str> { Ok(true) }
+        fun main() {}
+        "#,
+        "Expected Result<i32, str>, but got Result<bool, str> instead.",
+    );
+}
