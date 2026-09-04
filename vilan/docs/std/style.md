@@ -420,5 +420,27 @@ and work anywhere:
 
 ```vilan,fragment
 style_a + style_b          // merge: per-property, right side wins (impl Add)
+style.when(condition: bool, delta: Style): Style   // `self + delta` when true, `self` when not
 style.class_list(): str    // the space-joined class attribute (what `styled` uses)
 ```
+
+`when` is the conditional merge, written as a chain instead of a stack of
+`if`s:
+
+```vilan,fragment
+button_base
+	.when(is_selected, button_selected)
+	.when(is_disabled, button_disabled)
+```
+
+It never *constructs* a style — both sides were built, and emitted their rules,
+in their own `const` expressions — so the construct-in-const rule is untouched
+with a runtime flag in the middle. Chain order is **precedence**, exactly as
+with `+`: when two `when`s both fire, the later delta wins whatever properties
+they share.
+
+The chain reads best when each condition mentions its **own** flag —
+independent state axes, one link each. When one condition has to mention
+another link's flag (`!selected && !disabled`), the states are not independent,
+and a `match` states that exclusivity structurally where a chain only implies
+it. The compound condition is the tell; this is guidance, not a prohibition.

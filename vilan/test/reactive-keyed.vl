@@ -8,7 +8,7 @@
 // `==`, which is every case below but the last; `bind_each_by` passes "always
 // the same", which never produces a REFRESH at all.
 import std::io::print;
-import std::reactive::{ reconcile, RowStep, ReconcilePlan };
+import std::reactive::{ ReconcilePlan, RowStep, reconcile };
 
 fun show(plan: ReconcilePlan) {
 	mut out = "";

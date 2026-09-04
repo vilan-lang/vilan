@@ -727,7 +727,10 @@ pub const STYLE_BREAKPOINT_WIDTHS: &[(&str, &str)] = &[
 ///
 /// `add` (the `+` operator's method) and `class_list` are here for the same
 /// reason a user extension is: `add` merges an arbitrary right-hand `Style`,
-/// and `class_list` ends the chain.
+/// and `class_list` ends the chain. `when` (backlog A36) joins them: it merges
+/// an arbitrary right-hand `Style` exactly as `add` does, and its chain
+/// position is PRECEDENCE — two `when` links that set the same property resolve
+/// by which one comes last — so reordering it would change what renders.
 #[doc(hidden)]
 pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "rule",
@@ -737,6 +740,7 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "with_border",
     "child_relation",
     "add",
+    "when",
     "class_list",
 ];
 

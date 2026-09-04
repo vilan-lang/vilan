@@ -1,0 +1,56 @@
+// `Style::when` (backlog A36, style-variants.md §8 Q3) — the conditional-merge
+// combinator: `self + delta` when the condition holds, `self` when it does not.
+//
+// The claim is an EQUIVALENCE, so the program states it as one: the chain
+// spelling and the `+`-built spelling produce byte-identical class lists at
+// every cell of the state space, here all four of two independent flags. The
+// second claim is precedence — when both links fire, the later delta wins the
+// property they share, exactly as with `+`, which is why cell 3's colour is the
+// muted one and not the chosen one.
+//
+// `when` never CONSTRUCTS a style: both sides were built, and emitted their
+// rules, inside their own `const` expressions, so the construct-in-const rule
+// holds with a runtime flag in the middle. The `.css` golden beside this file
+// carries exactly three atomic sets and no fourth — nothing is minted here.
+import std::io::print;
+import std::style::{ Color, Style, space, style };
+
+let base: Style = const style()
+	.padding(space(2))
+	.color(Color::gray(900))
+	.background(Color::white());
+let chosen: Style = const style().color(Color::blue(900)).background(Color::blue(100));
+let muted: Style = const style().color(Color::gray(400));
+
+/// The chain: one link per flag, each mentioning its own. `when` selects; it
+/// does not build — the emitted body is the merge or the receiver, nothing else.
+// witness: if (condition) { $k = add(self, delta); } else { $k = __clone(self); }
+fun chained(is_chosen: bool, is_muted: bool): str {
+	base.when(is_chosen, chosen).when(is_muted, muted).class_list()
+}
+
+/// The same selection written with `+` and `if` — what `when` folds up.
+fun built(is_chosen: bool, is_muted: bool): str {
+	mut out = base;
+	if is_chosen {
+		out = out + chosen;
+	}
+	if is_muted {
+		out = out + muted;
+	}
+	out.class_list()
+}
+
+fun main() {
+	mut cell = 0;
+	for cell < 4 {
+		let is_chosen = cell % 2 == 1;
+		let is_muted = cell / 2 == 1;
+		let chain = chained(is_chosen, is_muted);
+		let sum = built(is_chosen, is_muted);
+		print(i"cell {cell} same={chain == sum} classes={chain}");
+		cell += 1;
+	}
+}
+
+main();
