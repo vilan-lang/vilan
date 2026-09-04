@@ -1239,6 +1239,19 @@ impl<'a> Interpreter<'a> {
                 self.read_index(&subject, &index)
             }
             js::Node::Call(subject, arguments) => self.eval_call(subject, arguments, env),
+            // B224's comma sequence: every item is evaluated, left to right,
+            // and the LAST one is the value — which is how a short-circuit
+            // operator's right operand runs the statements it needs without
+            // leaving expression position. An empty sequence cannot be built
+            // (the operand's own value is always its final item), so the
+            // fallback is unreachable rather than meaningful.
+            js::Node::Sequence(items) => {
+                let mut value = Value::Undefined;
+                for item in items {
+                    value = self.eval(item, env)?;
+                }
+                Ok(value)
+            }
             other => Err(Failure::internal(format!(
                 "statement node in expression position: {other:?}"
             ))),

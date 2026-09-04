@@ -8253,3 +8253,343 @@ fn b215_an_or_initializer_is_refused_in_the_rules_own_terms() {
         B215_STEER,
     );
 }
+
+// --- B224: a short-circuit condition keeps its right operand's statements ----
+//
+// The emitter had no statement slot for a condition, so ANY right operand that
+// lowered to statements (an `is` subject temp and its materialized captures, an
+// if-expression, a `?` lift) was walked into the ENCLOSING block and ran
+// unconditionally — before the `if`, and regardless of what the left operand
+// decided. Every program below compiled clean and ran wrong, so each pin RUNS
+// rather than merely compiling. `match` guards were the one correct form (B59
+// gave each leg its own prelude); the last pin is that control.
+
+#[test]
+fn b224_an_and_right_operand_test_does_not_run_when_the_left_missed() {
+    // The owner's find. `x.on_drag_end` was read out of a `None`'s payload
+    // before the `if`, so the program threw `TypeError: cannot read properties
+    // of undefined` instead of taking the `else`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let initiated: Option<Handler> = None;
+            if initiated is Some(let x) && x.on_drag_end is Some(let end) {
+                print("both");
+                print(end);
+            } else {
+                print("neither");
+            }
+        }
+        "#,
+        "neither\n",
+    );
+}
+
+#[test]
+fn b224_an_and_right_operand_test_runs_when_the_left_matched() {
+    // The succeeding path of the same program: both captures are readable in
+    // the body, which is what kept the miscompile invisible to the old pins.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let initiated: Option<Handler> = Some(Handler { on_drag_end = Some(7) });
+            if initiated is Some(let x) && x.on_drag_end is Some(let end) {
+                print("both");
+                print(end);
+            } else {
+                print("neither");
+            }
+        }
+        "#,
+        "both\n7\n",
+    );
+}
+
+#[test]
+fn b224_a_false_left_operand_does_not_call_the_right_operands_probe() {
+    // The side-effect form: the right operand's subject is a CALL, so a lost
+    // short-circuit is observable as an extra line of output.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let flag = false;
+            if flag && probe() is Some(let n) { print(n); } else { print("no"); }
+        }
+        "#,
+        "no\n",
+    );
+}
+
+#[test]
+fn b224_a_true_left_operand_does_not_call_an_or_right_operands_probe() {
+    // `||`'s mirror: a true left operand settles the test, so the right
+    // operand's statements must not run either.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let flag = true;
+            if flag || probe() is Some(let n) { print("hit"); }
+        }
+        "#,
+        "hit\n",
+    );
+}
+
+#[test]
+fn b224_a_negated_left_operand_still_short_circuits() {
+    // The left operand is itself an `is` under a negation (B195's shape): it
+    // matches, so the negation is false and the right operand never runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let a: Option<i32> = Some(5);
+            if !(a is Some(let n)) && probe() is Some(let m) {
+                print("hit");
+            } else {
+                print("miss");
+            }
+        }
+        "#,
+        "miss\n",
+    );
+}
+
+#[test]
+fn b224_an_if_expression_right_operand_does_not_run() {
+    // An if-expression has no expression form, so this is the statement
+    // fallback rather than the comma sequence — the same law, the other shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun boom(): i32 {
+            print("boom ran");
+            1
+        }
+        fun main() {
+            let flag = false;
+            let c = true;
+            if flag && (if c { boom() } else { 0 }) > 0 { print("yes"); } else { print("no"); }
+        }
+        "#,
+        "no\n",
+    );
+}
+
+#[test]
+fn b224_an_and_in_expression_position_short_circuits() {
+    // B215's position: the same `&&` as a `let` initializer rather than an `if`
+    // head. It must stay ONE expression, and still not read the missed payload.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let a: Option<Handler> = None;
+            let ok = a is Some(let x) && x.on_drag_end is Some(let y) && y > 1;
+            print(ok);
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b224_a_while_shaped_for_condition_short_circuits() {
+    // B136 already re-runs a `for` condition's prelude per iteration; the
+    // right operand's statements have to sit inside the short-circuit too, or
+    // the loop throws on its first test instead of never entering.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let a: Option<Handler> = None;
+            for a is Some(let x) && x.on_drag_end is Some(let y) { print(y); }
+            print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b224_a_negated_and_still_publishes_its_captures_after_the_if() {
+    // B187's continuation, run rather than merely compiled: `y` is named AFTER
+    // the `if`, so the right operand's declaration must be hoisted to the
+    // enclosing block even though its VALUE is computed inside the condition.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun guard(a: Option<Handler>) {
+            if !(a is Some(let x) && x.on_drag_end is Some(let y)) {
+                print("bail");
+                ret;
+            }
+            print(y);
+        }
+        fun main() {
+            guard(None);
+            guard(Some(Handler { on_drag_end = Some(4) }));
+        }
+        "#,
+        "bail\n4\n",
+    );
+}
+
+#[test]
+fn b224_an_else_if_condition_does_not_run_when_an_earlier_branch_matched() {
+    // `walk_branch` hoisted EVERY `else if` condition into the outer block, so
+    // the chain's later tests ran before the chain did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let a: Option<i32> = Some(5);
+            if a is Some(let n) {
+                print(n);
+            } else if probe() is Some(let m) {
+                print(m);
+            }
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b224_an_else_if_condition_runs_when_the_earlier_branch_missed() {
+    // The other half: the hoisted-out condition still has to be REACHED, and
+    // its captures still have to be readable in its own branch.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let a: Option<i32> = None;
+            if a is Some(let n) {
+                print(n);
+            } else if probe() is Some(let m) {
+                print(m);
+            }
+        }
+        "#,
+        "probe ran\n1\n",
+    );
+}
+
+#[test]
+fn b224_a_match_guard_is_the_control() {
+    // The one form that was already right (B59): each leg has its own prelude,
+    // so the guard's `is` subject is read only once the pattern has matched.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let a: Option<Handler> = None;
+            match a {
+                Some(let h) if h.on_drag_end is Some(let y) => print(y),
+                _ => print("other"),
+            }
+        }
+        "#,
+        "other\n",
+    );
+}
+
+#[test]
+fn b224_an_else_if_condition_acquires_its_resource_only_when_reached() {
+    // The reshape has to carry destruction.md §7 with it: the `else if`'s
+    // condition lifts a resource temporary, so the `try`/`finally` moves into
+    // the `else` block WITH it — acquired only once the chain reached this leg,
+    // destroyed after the branch that reads it. The earlier branch is taken,
+    // so `probe` is never called and nothing is opened or dropped.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        impl Guard { fun ok(&self): bool { true } }
+        fun probe(label: str): Guard {
+            print(i"opened {label}");
+            Guard { label = label }
+        }
+        fun main() {
+            let taken = true;
+            if taken { print("first"); } else if probe("chain").ok() { print("second"); }
+            print("end");
+        }
+        "#,
+        "first\nend\n",
+    );
+}
+
+#[test]
+fn b224_a_root_if_condition_still_lifts_its_resource_into_the_enclosing_block() {
+    // The control for the reshape, and the shape it must NOT touch: an `if`
+    // that IS the statement already has a statement slot — the block it sits
+    // in — so its condition's temporary is closed there, exactly as before.
+    // (Reshaping this one produced a bare `else { … }` at statement level, a
+    // module that would not parse.) The `else if` leg is reached rather than
+    // skipped, and the chain's OWN temporary is destroyed inside the `else`
+    // while the root condition's outlives the whole statement (§7.1's
+    // end-of-statement extent) — which is why "no" drops last.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        impl Guard { fun ok(&self): bool { self.label == "yes" } }
+        fun probe(label: str): Guard {
+            print(i"opened {label}");
+            Guard { label = label }
+        }
+        fun main() {
+            if probe("root").ok() { print("root branch"); }
+            if probe("no").ok() { print("first"); } else if probe("chain").ok() { print("second"); }
+            print("end");
+        }
+        "#,
+        "opened root\ndropped root\nopened no\nopened chain\ndropped chain\ndropped no\nend\n",
+    );
+}
