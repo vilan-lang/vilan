@@ -29,84 +29,58 @@
 //! what lets this gate say something about inference rather than about that.
 //! The release path is pinned separately, by `vilan-cli/tests/infer_preset.rs`.
 //!
-//! The run-only-on-difference rule is what keeps this affordable, and it also
-//! makes the gate self-reporting: the count of programs the sweep changed is
-//! asserted to be substantial, so the day inference silently stops folding
-//! anything, this fails instead of passing vacuously in a fraction of the time.
+//! # One test per corpus program (tracker N52)
+//!
+//! This gate kept the whole-corpus shape after N49 split its sibling
+//! `release_differential.rs` out of it: one `#[test]`, one `thread::scope` over
+//! eight static chunks, one clock across 124 programs. What that costs is not
+//! visible until it is paid — and this gate escaped paying it only through the
+//! run-only-on-difference rule below, which is a shortcut and not a bound. The
+//! day folding reached `watch.vl`, the program that never exits, this leg would
+//! have inherited its sibling's exact vacuous failure: two builds killed at the
+//! deadline and a gate comparing two identical "node did not exit" strings.
+//!
+//! So the corpus is declared ONCE, in [`corpus_harness`], and shared with the
+//! release gate — one roster, one exclusion list, one node deadline, no way for
+//! the two to drift. nextest schedules a process per program, a regression names
+//! its program in the test id rather than in a message, and one bad program can
+//! be re-run on its own. The corpus-wide claim survives as the SUM of the parts,
+//! and [`every_corpus_program_has_a_test_of_its_own`] makes the sum whole.
+//!
+//! # The shortcut's floor, per program (tracker N52)
+//!
+//! The old loop kept itself honest with a corpus-wide count: the number of
+//! programs the sweep CHANGED was asserted at the end of the body, so the day
+//! inference stopped folding, the gate failed instead of passing vacuously in a
+//! fraction of the time. That number cannot be summed across independent
+//! processes, and rebuilding it in a test of its own costs a second whole-corpus
+//! compile pass — measured at 61 s under this suite's own parallelism, which
+//! would have made the anti-vacuity check the straggler the split existed to
+//! remove.
+//!
+//! So the floor is per program instead, and [`FOLDS`] is where it lives: the
+//! programs the sweep changes, written down, checked BOTH ways inside the test
+//! that already did the compile. Nothing is compiled twice, a program that
+//! stopped folding fails by name rather than decrementing a count nobody reads,
+//! and a program that STARTED folding is named too — that is a real change in
+//! what inference reaches, and the one-line edit is where it gets noticed.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use vilan_core::options::{BuildOptions, Preset};
 use vilan_core::{PackageSpec, Platform, Workspace, analyze_source, transform};
+
+#[macro_use]
+mod corpus_harness;
+use corpus_harness::{
+    NOT_RUN, assert_every_program_not_run_is_a_corpus_program,
+    assert_the_declaration_is_the_corpus, corpus_dir, not_run_reason, run,
+};
 
 fn std_spec() -> PackageSpec {
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
     )
-}
-
-/// How long a corpus program gets under node before the run is declared hung.
-const NODE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Corpus programs this gate does not run, with the reason. These are the
-/// programs whose OUTPUT is not a function of their source alone — a clock, a
-/// random draw, a port, a database — so "both builds printed the same thing" is
-/// not a claim either build can make. They are still COMPILED both ways below
-/// and their emissions compared byte-for-byte; only the node leg is skipped.
-const NOT_RUN: &[(&str, &str)] = &[
-    ("time.vl", "host clock: two runs print different timestamps"),
-    ("crypto.vl", "host WebCrypto: a fresh random draw per run"),
-    ("db.vl", "host database: touches the filesystem"),
-    ("process-env.vl", "reads the host environment and argv"),
-];
-
-/// Runs `node <path>` under a deadline, returning `(stdout, exit code)`. Both
-/// pipes are drained by reader threads so a chatty program cannot deadlock
-/// against a full pipe buffer (the shape `tests/interpreter.rs` established;
-/// `timeout(1)` is not available on Windows and this gate must run there).
-fn run_node(path: &Path) -> Result<(String, i32), String> {
-    let mut child = Command::new("node")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not run node: {error}"))?;
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let reading_stdout = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut bytes);
-        bytes
-    });
-    let reading_stderr = std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut sink);
-    });
-    let deadline = Instant::now() + NODE_TIMEOUT;
-    let status = loop {
-        match child.try_wait().map_err(|error| error.to_string())? {
-            Some(status) => break Some(status),
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    let stdout = String::from_utf8_lossy(&reading_stdout.join().unwrap_or_default()).into_owned();
-    let _ = reading_stderr.join();
-    match status {
-        Some(status) => Ok((stdout, status.code().unwrap_or(-1))),
-        None => Err(format!(
-            "node did not exit within {}s (killed)",
-            NODE_TIMEOUT.as_secs()
-        )),
-    }
 }
 
 /// What one corpus program's two builds came to.
@@ -165,129 +139,180 @@ fn build_both_ways(source: String, root: PathBuf) -> Result<Compared, String> {
         .unwrap_or_else(|_| Err("worker thread aborted".to_string()))
 }
 
-/// Writes `javascript` to a uniquely named scratch file and runs it.
-fn run(javascript: &str, label: &str) -> Result<(String, i32), String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "vilan_infer_diff_{}_{unique}_{label}.mjs",
-        std::process::id()
-    ));
-    std::fs::write(&path, javascript).map_err(|error| error.to_string())?;
-    let outcome = run_node(&path);
-    let _ = std::fs::remove_file(&path);
-    outcome
+/// Reads `program` out of the corpus and builds it both ways.
+fn compare(program: &str) -> Compared {
+    let corpus = corpus_dir();
+    let path = corpus.join(program);
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    build_both_ways(source, corpus).unwrap_or_else(|error| panic!("{program}: {error}"))
+}
+
+/// The corpus programs the inference sweep CHANGES — 29 of them when this gate
+/// was written (const-eval.md §9.1), 32 today.
+///
+/// This is the gate's non-vacuity floor, and it is a list rather than a count
+/// because a count cannot be summed across one process per program. Every
+/// program here must still fold and every program not here must still not, both
+/// asserted inside the per-program test that already ran the compile — so the
+/// check is free, and it names the program that moved instead of reporting a
+/// number that got smaller.
+const FOLDS: &[&str] = &[
+    "arena.vl",
+    "backed-enum-keys.vl",
+    "bool.vl",
+    "capture-clones.vl",
+    "const.vl",
+    "default.vl",
+    "derive-default.vl",
+    "derive-json.vl",
+    "element-clones.vl",
+    "expression-lift.vl",
+    "fixed-arrays.vl",
+    "generic-adapter-dispatch.vl",
+    "generic-equality.vl",
+    "interpolated-multiline-string.vl",
+    "iterator-adapters.vl",
+    "json-roundtrip.vl",
+    "list-sort.vl",
+    "macro-block.vl",
+    "map.vl",
+    "match-ergonomics.vl",
+    "math.vl",
+    "mut-parameters.vl",
+    "number-math.vl",
+    "numeric-types.vl",
+    "operator-overload.vl",
+    "remainder.vl",
+    "resource_take.vl",
+    "set.vl",
+    "time.vl",
+    "tuple-access.vl",
+    "tuple-spread.vl",
+    "unary-minus.vl",
+];
+
+/// One corpus program, both ways. The body every generated test runs.
+fn inference_is_neutral_on(program: &str) {
+    let compared = compare(program);
+    let folded = compared.with != compared.without;
+    assert_eq!(
+        folded,
+        FOLDS.contains(&program),
+        "`FOLDS` says the inference sweep {} `{program}` and it {} — what the \
+         sweep reaches has changed. If that is the intended change, {} in \
+         `FOLDS`; if it is not, the sweep has stopped doing its job here and \
+         this gate would go green on it while running nothing.",
+        if FOLDS.contains(&program) {
+            "folds"
+        } else {
+            "leaves alone"
+        },
+        if folded { "folds it" } else { "does not" },
+        if FOLDS.contains(&program) {
+            "delete the line"
+        } else {
+            "add a line"
+        },
+    );
+    if !folded {
+        // The sweep folded nothing reachable here; there is no behaviour
+        // difference to look for.
+        eprintln!("[infer differential] {program}: the sweep changed nothing");
+        return;
+    }
+    if let Some(why) = not_run_reason(program) {
+        // Compiled both ways — which is worth having on its own — and not run.
+        // Said out loud, because a skip nobody can see is a skip nobody rereads.
+        eprintln!("[infer differential] {program}: folded, not run under node — {why}");
+        return;
+    }
+
+    let folded = run(&compared.with, "infer", "with");
+    let plain = run(&compared.without, "infer", "without");
+    match (folded, plain) {
+        (Ok(folded), Ok(plain)) => assert!(
+            folded == plain,
+            "FOLDING CHANGED BEHAVIOUR\n  \
+             with the sweep:    exit {}, stdout {:?}\n  \
+             without the sweep: exit {}, stdout {:?}",
+            folded.1,
+            folded.0,
+            plain.1,
+            plain.0
+        ),
+        // A run that could not happen is only a failure if the two sides
+        // disagree about it.
+        (folded, plain) => assert!(
+            format!("{folded:?}") == format!("{plain:?}"),
+            "one build ran and the other did not\n  with: {folded:?}\n  without: {plain:?}"
+        ),
+    }
+}
+
+/// Writes one test per corpus program, and records the declaration the coverage
+/// gate below reads.
+///
+/// The module is named for the program, so the test id nextest prints is
+/// `infer_differential list_sort::is_neutral_under_inference` — the program's
+/// own name, in the place a runner shows it.
+macro_rules! corpus_programs {
+    ($($module:ident => $file:literal,)*) => {
+        /// Every corpus program with a test, as `(module name, file name)`.
+        const DECLARED: &[(&str, &str)] = &[$((stringify!($module), $file),)*];
+
+        $(
+            mod $module {
+                #[test]
+                fn is_neutral_under_inference() {
+                    super::inference_is_neutral_on($file);
+                }
+            }
+        )*
+    };
+}
+
+corpus_manifest!(corpus_programs);
+
+#[test]
+fn every_corpus_program_has_a_test_of_its_own() {
+    assert_the_declaration_is_the_corpus(DECLARED);
 }
 
 #[test]
-fn inference_is_observationally_neutral_over_the_corpus() {
-    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
-        .expect("corpus directory")
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension()? == "vl").then_some(path)
-        })
-        .collect();
-    paths.sort();
-    assert!(paths.len() > 60, "suspiciously few corpus programs");
+fn every_program_not_run_is_still_a_corpus_program() {
+    assert_every_program_not_run_is_a_corpus_program(DECLARED);
+}
 
-    let programs: Vec<(String, PathBuf)> = paths
-        .into_iter()
-        .map(|path| {
-            (
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                path,
-            )
-        })
-        .collect();
-
-    // Each program is an independent compile-and-compare (corpus.rs's shape).
-    let outcomes: Vec<(usize, usize, Vec<String>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = programs
-            .chunks(programs.len().div_ceil(8).max(1))
-            .map(|chunk| {
-                let corpus = &corpus;
-                scope.spawn(move || {
-                    let mut failures = Vec::new();
-                    let mut changed = 0usize;
-                    let mut ran = 0usize;
-                    for (name, path) in chunk {
-                        let source = std::fs::read_to_string(path).expect("read corpus file");
-                        let compared = match build_both_ways(source, corpus.clone()) {
-                            Ok(compared) => compared,
-                            Err(error) => {
-                                failures.push(format!("{name}: {error}"));
-                                continue;
-                            }
-                        };
-                        if compared.with == compared.without {
-                            // The sweep folded nothing reachable here; there is
-                            // no behaviour difference to look for.
-                            continue;
-                        }
-                        changed += 1;
-                        if NOT_RUN.iter().any(|(excluded, _)| excluded == name) {
-                            continue;
-                        }
-                        let folded = run(&compared.with, "with");
-                        let plain = run(&compared.without, "without");
-                        ran += 1;
-                        match (folded, plain) {
-                            (Ok(folded), Ok(plain)) => {
-                                if folded != plain {
-                                    failures.push(format!(
-                                        "{name}: FOLDING CHANGED BEHAVIOUR\n  \
-                                         with the sweep:    exit {}, stdout {:?}\n  \
-                                         without the sweep: exit {}, stdout {:?}",
-                                        folded.1, folded.0, plain.1, plain.0
-                                    ));
-                                }
-                            }
-                            (folded, plain) => {
-                                // A run that could not happen is only a failure
-                                // if the two sides disagree about it.
-                                if format!("{folded:?}") != format!("{plain:?}") {
-                                    failures.push(format!(
-                                        "{name}: one build ran and the other did not\n  \
-                                         with: {folded:?}\n  without: {plain:?}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    (changed, ran, failures)
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| worker.join().expect("differential worker"))
-            .collect()
-    });
-
-    let changed: usize = outcomes.iter().map(|(changed, ..)| changed).sum();
-    let ran: usize = outcomes.iter().map(|(_, ran, _)| ran).sum();
-    let failures: Vec<String> = outcomes
-        .into_iter()
-        .flat_map(|(_, _, failures)| failures)
+#[test]
+fn the_sweep_folds_a_substantial_share_of_the_corpus() {
+    // The floor the old whole-corpus loop asserted as a count, kept as a claim
+    // about the LIST — and `FOLDS`'s inverse, so an entry that has left the
+    // corpus cannot go on standing for a program nobody runs.
+    let declared: std::collections::BTreeSet<&str> =
+        DECLARED.iter().map(|(_, file)| *file).collect();
+    let gone: Vec<&&str> = FOLDS
+        .iter()
+        .filter(|file| !declared.contains(**file))
         .collect();
     assert!(
-        failures.is_empty(),
-        "{} corpus program(s) are not neutral under inference:\n{}",
-        failures.len(),
-        failures.join("\n")
+        gone.is_empty(),
+        "`FOLDS` names {gone:?}, which is not a corpus program — no test asserts \
+         it, so it is a floor propping itself up. Delete the entry."
     );
-    // Non-vacuity. If the sweep ever stops folding, this gate would pass
-    // instantly and prove nothing — so the number of programs it CHANGED is
-    // part of the contract, not a statistic.
     assert!(
-        changed >= 20,
-        "inference changed only {changed} corpus program(s) — 29 of them at the \
-         time this gate was written (const-eval.md §9.1), so at this level it is \
-         close to vacuous and would pass in a fraction of the time while proving \
-         nothing. Check the sweep still runs."
+        FOLDS.len() >= 20,
+        "the inference sweep changes only {} corpus program(s) — 29 of them at \
+         the time this gate was written (const-eval.md §9.1), so at this level \
+         every per-program test passes by folding nothing and the gate proves \
+         nothing. Check the sweep still runs.",
+        FOLDS.len()
     );
-    eprintln!("[infer differential] {changed} programs changed, {ran} run under node");
+    eprintln!(
+        "[infer differential] the sweep changes {} of {} corpus programs; {} of \
+         them are excluded from the node leg",
+        FOLDS.len(),
+        DECLARED.len(),
+        NOT_RUN.len()
+    );
 }
