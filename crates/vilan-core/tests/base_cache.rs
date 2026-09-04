@@ -1397,3 +1397,348 @@ fn the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget() {
     vilan_core::analyzer::base_cache_clear();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// M19 T1 — module reuse over a cached world
+// (`per-module-analysis-reuse.md` §4.1). The base cache decides WHICH world an
+// analysis gets; T1 decides whether that world's modules keep their checks.
+// The key is the same key — `BaseCacheKey` plus every loaded source's content
+// plus "the entry did not move this module's type slots" — so these pins
+// belong beside the ones above, and they are about the third term as much as
+// the first two.
+
+/// A package with two siblings and an entry that imports whichever the caller
+/// names. Returns the root and the entry path; the caller removes the root.
+fn write_reuse_package(name: &str) -> (PathBuf, PathBuf) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "vilan_m19_reuse_{name}_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // `loaded.vl` carries a MODULE-LOCAL Class A diagnostic — an assignment to
+    // an immutable `let`, which `check_readonly_mutation` refuses. It is the
+    // thing that has to survive being replayed.
+    std::fs::write(
+        root.join("loaded.vl"),
+        "export fun value(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n",
+    )
+    .expect("write loaded");
+    std::fs::write(root.join("other.vl"), "export fun other(): i32 {\n\t9\n}\n")
+        .expect("write other");
+    // Never imported by any entry below: the world never loads it, so it is
+    // not in the key and not in the content validation.
+    std::fs::write(
+        root.join("unloaded.vl"),
+        "export fun spare(): i32 {\n\t3\n}\n",
+    )
+    .expect("write unloaded");
+    let entry = root.join("main.vl");
+    (root, entry)
+}
+
+/// What a reuse pin reads back: the published diagnostics, and the census
+/// `(reused, entry-dirty, world sources)` of the analysis that produced them.
+fn observe_reuse(
+    spec: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    source: &'static str,
+) -> (String, (usize, usize, usize)) {
+    let spec = spec.clone();
+    let pkg_root = pkg_root.to_path_buf();
+    let entry_path = entry_path.to_path_buf();
+    on_one_thread(move || {
+        let (_program, errors) = analyze_source(
+            source,
+            &spec,
+            &pkg_root,
+            &entry_path,
+            Some(Platform::default()),
+            &Workspace::default(),
+        );
+        (format!("{errors:?}"), vilan_core::analyzer::reuse_census())
+    })
+}
+
+const REUSE_ENTRY_A: &str = "import pkg::loaded::value;\nfun main() { let a = value(); }\n";
+const REUSE_ENTRY_B: &str = "import pkg::loaded::value;\nfun main() { let a = value() + 1; }\n";
+const REUSE_ENTRY_TWO: &str = "import pkg::loaded::value;\nimport pkg::other::other;\n\
+                               fun main() { let a = value() + other(); }\n";
+const REUSE_ENTRY_NONE: &str = "fun main() { let a = 1; }\n";
+
+/// The invalidation cases §4.1's key is built to answer, in one pin because
+/// they only mean anything against each other.
+///
+/// The claim under test is that reuse is exactly as invalidating as the world
+/// is — no more (an unloaded sibling is not in the world and must not cost
+/// anything) and no less (a loaded sibling's edit must take the record with
+/// it, never serve a stale diagnostic).
+#[test]
+fn module_reuse_follows_the_world_key_through_every_edit() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (root, entry) = write_reuse_package("key");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // 1. The first analysis is a MISS: it derives the module's diagnostic and
+    //    records it. Nothing is reused.
+    let first = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_A);
+    assert!(
+        first.0.contains("total"),
+        "the fixture must produce a module diagnostic: {}",
+        first.0
+    );
+    assert_eq!(first.1.0, 0, "a miss reuses nothing: {:?}", first.1);
+
+    // 2. EDIT THE ENTRY — the keystroke this tranche exists for. The world
+    //    hits, the modules are reused, and the module's diagnostic is
+    //    published from the record rather than re-derived.
+    let edited_entry = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        edited_entry.1.0 > 0,
+        "an entry-only edit must reuse the world's modules: {:?}",
+        edited_entry.1
+    );
+    assert_eq!(
+        first.0, edited_entry.0,
+        "the replayed diagnostic must be the derived one, byte for byte"
+    );
+
+    // 3. EDIT AN UNLOADED MODULE — a sibling no entry imports is not in the
+    //    world, not in the key, and not in the content validation, so it costs
+    //    nothing. This is the half of §4.1 that makes the coarse key
+    //    affordable.
+    std::fs::write(
+        root.join("unloaded.vl"),
+        "export fun spare(): i32 {\n\t4\n}\n",
+    )
+    .expect("edit unloaded");
+    let after_unloaded = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        after_unloaded.1.0 > 0,
+        "editing a sibling the world never loaded must not cost the reuse: \
+         {:?}",
+        after_unloaded.1
+    );
+
+    // 4. EDIT THE LOADED MODULE — the world is stale by content (E12), so it
+    //    is evicted, the analysis misses, nothing is reused, and the NEW text
+    //    is what gets checked. A replayed diagnostic here would be the stale
+    //    one, which is the failure this whole seam has to be incapable of.
+    std::fs::write(
+        root.join("loaded.vl"),
+        "export fun value(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal = 3;\n\ttotal\n}\n",
+    )
+    .expect("edit loaded");
+    let after_loaded = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert_eq!(
+        after_loaded.1.0, 0,
+        "an edited loaded module must evict the world AND the record: {:?}",
+        after_loaded.1
+    );
+    assert_ne!(
+        first.0, after_loaded.0,
+        "the analysis after a module edit must publish the EDITED module's \
+         diagnostics — two refusals now, not one"
+    );
+
+    // 5. ADD A MODULE — a different sibling set is a different world (M21), so
+    //    the record for the one-sibling world cannot be served to it.
+    let added = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_TWO);
+    assert_eq!(
+        added.1.0, 0,
+        "a new sibling is a new world: nothing to reuse yet ({:?})",
+        added.1
+    );
+    let added_again = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_TWO);
+    assert!(
+        added_again.1.0 > added.1.0,
+        "the two-sibling world's own second analysis must reuse: {:?}",
+        added_again.1
+    );
+    assert!(
+        added_again.1.2 > after_loaded.1.2,
+        "the two-sibling world must hold one more source than the one-sibling \
+         world ({} vs {})",
+        added_again.1.2,
+        after_loaded.1.2
+    );
+
+    // 6. REMOVE THE MODULES — an entry that imports no sibling is a std-only
+    //    world again, and the sibling's diagnostic goes with it.
+    let removed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_NONE);
+    assert!(
+        !removed.0.contains("total"),
+        "a module nobody imports must not be checked, let alone replayed: {}",
+        removed.0
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// The M24 / M26 interplay, which is about the record OUTLIVING or being
+/// TRUNCATED by the mechanisms either side of it.
+///
+/// M24 evicts a world for bytes. The record is a separate map, so it survives
+/// — and it must be harmless that it does: the world it described is gone, the
+/// next analysis misses and re-derives, and it publishes exactly what the
+/// replay would have.
+///
+/// M26 cancels an analysis at a phase boundary, which leaves the check phase a
+/// PREFIX of itself. A prefix recorded as if it were whole would publish a
+/// truncated module on every later hit, so a cancelled analysis records
+/// nothing at all.
+#[test]
+fn the_checks_record_survives_eviction_and_refuses_a_cancelled_phase() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (root, entry) = write_reuse_package("evict");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let budget_before = vilan_core::analyzer::base_cache_budget();
+
+    let derived = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_A);
+    assert!(derived.0.contains("total"), "{}", derived.0);
+    let replayed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        replayed.1.0 > 0,
+        "the warm analysis must reuse: {:?}",
+        replayed.1
+    );
+
+    // M24: a zero budget evicts everything the moment it is set. The record
+    // outlives the world it describes, and the next analysis — a MISS, since
+    // there is no world to hit — re-derives instead of replaying.
+    vilan_core::analyzer::set_base_cache_budget(0);
+    let after_eviction = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    vilan_core::analyzer::set_base_cache_budget(budget_before);
+    assert_eq!(
+        after_eviction.1.0, 0,
+        "reuse keys on the HIT: an evicted world cannot be reused over ({:?})",
+        after_eviction.1
+    );
+    assert_eq!(
+        derived.0, after_eviction.0,
+        "eviction may not change an answer"
+    );
+
+    // M26: an analysis cancelled before it starts stops at the PARSE boundary
+    // (`lib.rs`, `editor-latency.md` §4.2) — it never reaches `analyze`, so it
+    // stores no world and records no checks. That is the property asserted
+    // here, and it is the one that keeps the record safe: the store guard
+    // inside `analyze_over_world` refuses a cancelled phase because a
+    // truncated check sequence is a PREFIX of itself and a prefix recorded as
+    // a whole would silence a real refusal on every later hit — but nothing
+    // deterministic can reach that guard today, because the boundary above it
+    // fires first. So this leg pins the boundary: if M26 ever moves a
+    // checkpoint past the world store, the analysis after a cancel will HIT a
+    // world whose record is empty, and both assertions below go red before a
+    // truncated record can be published to anyone.
+    vilan_core::analyzer::base_cache_clear();
+    let cancelled = {
+        let spec = spec.clone();
+        let root = root.clone();
+        let entry = entry.clone();
+        on_one_thread(move || {
+            let token = vilan_core::cancel::CancelToken::new();
+            token.cancel();
+            let _scope = token.install();
+            let (program, _errors) = analyze_source(
+                REUSE_ENTRY_A,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program.is_none()
+        })
+    };
+    assert!(
+        cancelled,
+        "the pre-cancelled analysis must produce no program"
+    );
+    let after_cancel = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert_eq!(
+        after_cancel.1.0, 0,
+        "a cancelled analysis must leave no world behind to reuse over: {:?}",
+        after_cancel.1
+    );
+    assert_eq!(
+        derived.0, after_cancel.0,
+        "a cancelled analysis must not record its truncated phase: the module \
+         reported nothing under it, and replaying that would silence a real \
+         refusal"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// M23's overlay, over the widened seam. A sibling served from the document
+/// overlay is analysis-owned; the world that loaded it takes a claim and is
+/// stored, which is what makes a keystroke in the entry hit at all. The record
+/// rides that same world — so an overlay EDIT to the sibling must evict both,
+/// exactly as a disk edit does, and the analysis after it must publish the
+/// overlay's text and not the record's memory of the previous one.
+#[test]
+fn an_overlay_served_sibling_edit_evicts_the_record_with_the_world() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (root, entry) = write_reuse_package("overlay");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let loaded = root.join("loaded.vl");
+
+    // The buffer the editor holds: the same module, one refusal.
+    vilan_core::analyzer::set_document_overlay(
+        &loaded,
+        Some("export fun value(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n".to_string()),
+    );
+    let derived = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_A);
+    assert!(derived.0.contains("total"), "{}", derived.0);
+    let replayed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        replayed.1.0 > 0,
+        "an overlay-served world must still be hit and reused (M23): {:?}",
+        replayed.1
+    );
+    assert_eq!(derived.0, replayed.0, "the replay changed the answer");
+
+    // The editor fixes the module. Every load and every per-hit validation
+    // reads through the overlay, so the world hash-mismatches and goes — and
+    // the record goes with the answer.
+    vilan_core::analyzer::set_document_overlay(
+        &loaded,
+        Some(
+            "export fun value(): i32 {\n\tlet mut total = 1;\n\ttotal = 2;\n\ttotal\n}\n"
+                .to_string(),
+        ),
+    );
+    let fixed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        !fixed.0.contains("total"),
+        "the overlay edit must be seen: a replayed diagnostic here is the \
+         stale one, published over a buffer that no longer says it — {}",
+        fixed.0
+    );
+
+    vilan_core::analyzer::set_document_overlay(&loaded, None);
+    let _ = std::fs::remove_dir_all(&root);
+    vilan_core::analyzer::base_cache_clear();
+}
