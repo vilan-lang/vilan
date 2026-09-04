@@ -359,6 +359,30 @@ fun main() {
 }
 ```
 
+## After the element lands: `on_mount`, `autofocus`
+
+`view(..)` builds an element; it is not in the document until whatever
+appends it does. `.on_mount(action)` runs `action` with the element once
+it *is* — at every attachment site, including a `when` body or a
+`bind_each` row that appears in a later change.
+
+```vilan,fragment
+view("input").attr("type", "text").on_mount(|element| element.focus())
+view("input").attr("type", "text").autofocus()          // the same thing
+```
+
+`autofocus` is the reason the hook exists. HTML's `autofocus` attribute
+fires only on a document's initial parse, so it does nothing for a modal
+mounted later — and the workaround it forces (mint a uuid, set it as the
+id, start a 1 ms timer, look the element back up) is three lines of
+ceremony around a value you already had. There is nothing to look up:
+the callback is handed the element.
+
+The hook is a **microtask**, which is enough because the whole
+synchronous build — and the `mount` that finishes it — runs to
+completion before any microtask does. On the SSR twin both methods
+accept and drop, like the event binders: there is no document to be in.
+
 ## Conditionals: `show`, `when`, `swap`
 
 Three primitives. Pick by what should happen to the content while it's

@@ -51,6 +51,7 @@ import pkg::reactive::{
 	comp,
 	get_owner,
 	owner_scope,
+	queue_microtask,
 	reconcile,
 	run_with_owner,
 	turn,
@@ -592,6 +593,38 @@ impl View {
 			}
 		});
 		self
+	}
+
+	/// Run `action` with this element once it is IN THE DOCUMENT (backlog
+	/// A45).
+	///
+	/// Attachment happens at six different places in this module — `mount`,
+	/// `Slot::place`, `children`, `bind_each`'s order pass, `when`, `swap` —
+	/// and none of them is a hook a view can reach. So the hook is a
+	/// MICROTASK: the whole synchronous build, and the `mount`/append that
+	/// finishes it, run to completion before any microtask does, so by the
+	/// time `action` runs the element is where the build put it.
+	///
+	/// The chained form is the point — `view("input").attr("type", "text")
+	/// .on_mount(|element| element.focus())` — and it replaces the id-plus-
+	/// timer dance an app writes otherwise: mint a uuid, set it as the id,
+	/// `set_timeout(1)`, look the element back up. There is nothing to look
+	/// up: the callback is handed the element itself.
+	fun on_mount(self, action: sync |Element| void): View {
+		// Capture the ELEMENT, not the view: the closure the host holds must
+		// reach exactly what the callback needs and nothing more
+		// (`proposal/lifetimes.md` §5, V1).
+		let element = self.element;
+		queue_microtask(|| action(element));
+		self
+	}
+
+	/// Move keyboard focus here once the element is in the document — the
+	/// one-word form of `on_mount(|element| element.focus())`, and the reason
+	/// `on_mount` exists. HTML's `autofocus` attribute fires only on a
+	/// document's initial parse, so it does nothing for a modal opened later.
+	fun autofocus(self): View {
+		self.on_mount(|element| element.focus())
 	}
 
 	/// Show or hide the element on a reactive condition — present when

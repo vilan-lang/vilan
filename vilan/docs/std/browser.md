@@ -27,6 +27,7 @@ impl Element {
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
+	fun focus(self)                                    // move keyboard focus here
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
 	fun on(self, event: str, handler: || void)
@@ -165,6 +166,8 @@ too.
 | `swap` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<T>` | dispose + rebuild per changed value |
 | `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
+| `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
+| `autofocus` | `(): View` | `on_mount(\|element\| element.focus())` — the modal-input form HTML's `autofocus` cannot serve |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).

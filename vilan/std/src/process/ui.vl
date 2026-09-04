@@ -310,6 +310,23 @@ impl View {
 		self
 	}
 
+	/// The element mount hook, server side: ACCEPTED AND DROPPED. There is no
+	/// document to be in and no element to hand over — the server render
+	/// creates, serializes and discards — so this returns `self` unchanged,
+	/// exactly as the event binders do with their handlers. The parameter is
+	/// generic for the same reason `on_event`'s is: a server layer cannot name
+	/// the browser-only `std::dom::Element`. KEEP IN STEP with the browser
+	/// twin (browser/ui.vl).
+	fun on_mount<E>(self, action: sync |E| void): View {
+		self
+	}
+
+	/// Focus, server side: nothing to focus. Dropped like `on_mount`, whose
+	/// one-word form it is on the browser twin. KEEP IN STEP.
+	fun autofocus(self): View {
+		self
+	}
+
 	/// Show or hide on a condition, read once: a hidden element renders with the
 	/// `hidden` attribute (mirrors the DOM's `element.hidden`).
 	fun show<S: Source<bool>>(self, condition: S): View {

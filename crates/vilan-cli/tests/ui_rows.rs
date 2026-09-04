@@ -331,3 +331,161 @@ fn the_index_form_keeps_the_rows_element_and_updates_through_its_cell() {
          got:\n{stdout}"
     );
 }
+
+// --- A45: the element mount hook --------------------------------------------
+
+/// `on_mount` at every attachment site the module has: a statically appended
+/// child, a `when` instantiation that appears in a LATER drain wave, and
+/// `bind_each` rows — the initial one and one appended after the fact.
+const MOUNT_HOOK: &str = r#"import std::dom::Element;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let rows: SignalCell<List<str>> = Signal::new(["a"]);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("input").on_mount(|element| print(i"static {reachable(element)}")))
+			.child(view("input").autofocus())
+			.when(open, || {
+				view("section").child(view("input").on_mount(|element| {
+					print(i"when {reachable(element)}");
+				}))
+			})
+			.child(view("ul").bind_each_values(rows, |name| {
+				view("li").text(name).on_mount(|element| print(i"row {reachable(element)}"))
+			}))
+	});
+	print("built");
+	open.set(true);
+	rows.set(["a", "b"]);
+}
+
+/// The harness's own walk from the element up to the document root.
+[extern("__reachable")]
+external fun reachable(element: Element): bool;
+
+main();
+"#;
+
+/// The claim `on_mount` makes is not "later" but "in the document", so that is
+/// what is asserted — at every attachment site, including the two that happen
+/// in a drain wave AFTER the build that scheduled the microtask.
+///
+/// A microtask is enough because the whole synchronous build, and the
+/// `mount` that finishes it, run to completion before any microtask does. A
+/// row appended by a later wave is the case that could have needed the
+/// at-settle fallback; it does not — the wave is synchronous too, and its
+/// append lands before the microtask it queued.
+#[test]
+fn on_mount_hands_over_an_element_that_is_already_in_the_document() {
+    let harness = format!("{DOM_STUB}\nglobal.__reachable = inDocument;\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("mount_hook", MOUNT_HOOK, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0], "built",
+        "the callbacks must run after the synchronous build, not during it; \
+         got:\n{stdout}"
+    );
+    let mut mounted: Vec<&str> = lines[1..].to_vec();
+    mounted.sort_unstable();
+    assert_eq!(
+        mounted,
+        vec!["row true", "row true", "static true", "when true"],
+        "every mount callback must see its element IN the document, at every \
+         attachment site; got:\n{stdout}"
+    );
+}
+
+const AUTOFOCUS: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "always"))
+			.when(open, || view("input").attr("name", "modal").autofocus())
+	});
+	print("built");
+	open.set(true);
+}
+
+main();
+"#;
+
+/// `autofocus` is `on_mount(|element| element.focus())` and nothing else, so
+/// the pin is that the host's `focus()` really ran, on the right element, once
+/// that element was in the document — the case HTML's own `autofocus`
+/// attribute cannot serve, because it fires only on a document's initial
+/// parse and a modal is mounted later.
+#[test]
+fn autofocus_focuses_the_modal_input_once_it_is_in_the_document() {
+    let harness = format!(
+        "{DOM_STUB}\nrequire(\"./app.js\");\n\
+         // After the microtask queue: the hook is a microtask, so a timer is\n\
+         // the earliest the harness can look.\n\
+         setTimeout(() => {{\n  \
+         const focused = documentRoot.children[0].children.filter(c => c.focused);\n  \
+         console.log(\"focused=\" + focused.map(c => c.attributes.name).join(\",\"));\n  \
+         console.log(\"log=\" + focusLog.join(\",\"));\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("autofocus", AUTOFOCUS, &harness);
+    assert!(
+        stdout.contains("focused=modal"),
+        "autofocus must focus the input it was chained onto and no other; \
+         got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("@doc"),
+        "the element must be in the document when focus() runs; got:\n{stdout}"
+    );
+}
+
+/// The SSR twins accept and drop, like every event binder there: the markup is
+/// exactly what it would have been without them, and no action runs.
+const SSR_TWINS: &str = r#"import std::io::print;
+import std::ui::{ View, render, view };
+
+fun main() {
+	print(render(view("input").attr("name", "modal").autofocus()));
+	print(render(view("input").on_mount(|_element| print("RAN"))));
+}
+
+main();
+"#;
+
+#[test]
+fn the_ssr_twins_of_the_mount_hook_render_the_same_markup_and_run_nothing() {
+    let dir = temp_project("ssr_twins");
+    std::fs::create_dir_all(&dir).expect("create the program directory");
+    let source = dir.join("app.vl");
+    std::fs::write(&source, SSR_TWINS).expect("write the program");
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new("node")
+        .arg("app.mjs")
+        .current_dir(&dir)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert_eq!(
+        stdout, "<input name=\"modal\">\n<input>\n",
+        "the SSR twins must render the markup unchanged and run no action"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
