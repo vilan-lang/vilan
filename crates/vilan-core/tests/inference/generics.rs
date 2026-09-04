@@ -5982,3 +5982,258 @@ fn b211_an_identity_mapped_type_is_its_source() {
         "1\ntwo\n",
     );
 }
+
+// --- B225: a struct literal INSTANTIATES the struct's parameters -----------
+//
+// B211's door opens the struct's parameters at a literal, so that
+// `Boxy { value = fn(self.value) }` inside `map<U>` can bind `T := U` even
+// though the enclosing `impl Boxy<type T>` holds `T` rigid. But an impl binder
+// INHERITS the subject declaration's constraint id (B77), so opening the id
+// reopened the impl's OWN rigid parameter. One field bound `T := str`, and the
+// field carrying the CALLER's `T` then passed against it: no diagnostic
+// anywhere, and `let p: Pair<i32> = Pair::make(1)` accepted a `Pair<str>`. The
+// owner found it migrating kolt, whose `impl Searchable<type T>` has exactly
+// this shape — two fields of the same parameter, `new` with no return
+// annotation.
+//
+// The literal now instantiates rather than aliases: a parameter the enclosing
+// declaration also owns gets a FRESH constraint id at the literal, and the
+// impl's rigid one meets it ONE WAY — the fresh id binds TO the rigid
+// parameter, and nothing binds the rigid parameter. The door stays open for
+// everything it was opened for; the controls below hold each of those open.
+
+#[test]
+fn b225_a_literal_may_not_bind_the_enclosing_impls_own_parameter() {
+    // THE find, minimized. Before this, no errors at all and `p` was a
+    // `Pair<str>` held by a `Pair<i32>` binding. `b` binds the literal's own
+    // parameter to `str`; `a` then offers the caller's rigid `T` against it,
+    // which is the refusal.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T> {
+            fun make(x: T) { Pair { b = "hello", a = x } }
+        }
+        fun main() { let p: Pair<i32> = Pair::make(1); print(p); }
+        "#,
+        "Expected str, but got T instead.",
+    );
+}
+
+#[test]
+fn b225_the_kolt_shape_two_fields_of_one_parameter_in_the_subjects_own_impl() {
+    // The owner's find as written: `impl Searchable<type T>`, `new` with no
+    // return annotation, one field derived through `map` (so `str`) and one
+    // carrying the parameter itself. Compiled silently before.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{SignalCell};
+        struct Searchable<T> { list: SignalCell<List<T>>, table: SignalCell<List<T>> }
+        impl Searchable<type T> {
+            fun new(list: SignalCell<List<T>>, key: sync |T| str) {
+                Searchable { table = list.map(|l| l.map(|x| key(x).to_lowercase())), list }
+            }
+        }
+        fun main() {
+            let s: Searchable<i32> = Searchable::new(SignalCell::new([1, 2]), |n| "x");
+            print(s);
+        }
+        "#,
+        "but got SignalCell<List<T>> instead.",
+    );
+}
+
+#[test]
+fn b225_the_other_field_order_refuses_in_the_body_too() {
+    // The same program with the fields written the other way round. It was
+    // already refused — but only at the CALL SITE, as `Pair<i32>` against the
+    // `Pair<str>` the body had quietly produced. The body is where the
+    // disagreement is, and now that is where it is reported: `b = "hello"`
+    // against the caller's `T`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T> {
+            fun make(x: T) { Pair { a = x, b = "hello" } }
+        }
+        fun main() { let p: Pair<i32> = Pair::make(1); print(p); }
+        "#,
+        "Expected T, but got str instead.",
+    );
+}
+
+#[test]
+fn b225_an_annotated_return_refuses_in_the_body_too() {
+    // The same shape with `: Pair<T>` written. Refused before as
+    // `Expected Pair<T>, but got Pair<str>` at the whole literal; now at the
+    // field that disagrees.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T> {
+            fun make(x: T): Pair<T> { Pair { a = x, b = "hello" } }
+        }
+        fun main() { let p: Pair<i32> = Pair::make(1); print(p); }
+        "#,
+        "Expected T, but got str instead.",
+    );
+}
+
+#[test]
+fn b225_a_plain_generic_fun_keeps_its_verdict() {
+    // The discriminator that located the defect: the same literal in a plain
+    // `fun` was always refused, because there the struct's parameter and the
+    // function's are different ids. Pinned to show the fix moved the impl case
+    // ONTO this verdict rather than moving this one.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Pair<T> { a: T, b: T }
+        fun make<T>(x: T) { Pair { a = x, b = "hello" } }
+        fun main() { let p: Pair<i32> = make(1); print(p); }
+        "#,
+        "Expected T, but got str instead.",
+    );
+}
+
+#[test]
+fn b225_another_structs_impl_keeps_its_verdict() {
+    // The second discriminator: the same literal inside an impl of a DIFFERENT
+    // generic struct was refused too — the ids only alias when the literal's
+    // struct IS the impl's subject.
+    assert_fails_with(
+        r#"
+        struct Pair<T> { a: T, b: T }
+        struct Holder<T> { v: T }
+        impl Holder<type T> {
+            fun make(x: T) { Pair { a = x, b = "hello" } }
+        }
+        fun main() { let p: Pair<i32> = Holder::<i32>::make(1); }
+        "#,
+        "Expected T, but got str instead.",
+    );
+}
+
+#[test]
+fn b225_a_methods_own_generic_still_binds_the_literals_parameter() {
+    // THE control the door exists for (B211's comment names it): `map<U>`
+    // rebuilding its own generic struct binds the literal's parameter to the
+    // method's `U`. Runs both with and without the return annotation, since the
+    // find's shape was the unannotated one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Boxy<T> { value: T }
+        impl Boxy<type T> {
+            fun map<U>(self, fn: sync |T| U): Boxy<U> { Boxy { value = fn(self.value) } }
+            fun map_unannotated<U>(self, fn: sync |T| U) { Boxy { value = fn(self.value) } }
+        }
+        fun main() {
+            print(Boxy { value = 1 }.map(|n| "s"));
+            let b: Boxy<str> = Boxy { value = 2 }.map_unannotated(|n| "t");
+            print(b);
+        }
+        "#,
+        "[ 's' ]\n[ 't' ]\n",
+    );
+}
+
+#[test]
+fn b225_the_impls_own_parameter_still_fills_its_own_structs_literal() {
+    // The other control: a literal of the impl's own struct built from values
+    // that genuinely have the impl's parameter. The fresh parameter binds TO
+    // the rigid one — the one-way direction — so this is unchanged.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T> {
+            fun of(x: T, y: T): Pair<T> { Pair { a = x, b = y } }
+            fun swap(self): Pair<T> { Pair { a = self.b, b = self.a } }
+        }
+        fun main() { print(Pair::of(1, 2).swap()); }
+        "#,
+        "[ 2, 1 ]\n",
+    );
+}
+
+// --- B219: one rigidity predicate, two comparators -------------------------
+//
+// `compare_type_rigid` is `reconcile_type`'s READ-ONLY twin, and
+// `trait-objects.md` §1.4's table says the two agree exactly. They did not.
+// B211 taught `reconcile_type` that a generic parameter is rigid inside its own
+// body (`rigid_binder_scope` + `inferable_generics`, via
+// `generic_is_rigid_here`); the twin was left binding by shape, where a generic
+// falls back to its constraint and an unbounded constraint matches anything.
+// Both ask the one predicate now.
+//
+// The twin decides whether a literal PATTERN can match its subject, which is
+// where the difference shows in source: a rigid parameter is a fixed unknown
+// the caller chose, so an `i32` literal cannot be known to match it — exactly
+// the verdict the binding comparator already gave the same pair.
+
+#[test]
+fn b219_a_literal_pattern_against_a_parameter_keeps_b82s_verdict() {
+    // The one site that must NOT take the rigidity answer, and the pin that
+    // says so. B82 settled it: a literal pattern lowers to a `===`, which a
+    // value of another type simply fails, so the question "can this ever match"
+    // is answered by the runtime test rather than by what the caller chose.
+    // The site opens the subject's own parameters for its comparison, and this
+    // program compiles and runs exactly as it did before B219.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun literal<T>(value: T): i32 {
+            match value {
+                1 => 10,
+                _ => 30,
+            }
+        }
+        fun main() { print(literal(1)); print(literal("x")); }
+        "#,
+        "10\n30\n",
+    );
+}
+
+#[test]
+fn b219_a_bounded_parameters_literal_pattern_is_still_checked_against_its_bound() {
+    // The half of that site which is still a real check, and the reason the
+    // opt-out opens the parameter rather than skipping the comparison: an
+    // opened parameter falls back to its own CONSTRAINT, so a literal the
+    // declared bound cannot admit is refused as it always was.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Shape { fun area(self): i32; }
+        struct Square { side: i32 }
+        impl Square with Shape { fun area(self): i32 { self.side } }
+        fun literal<T: Shape>(value: T): i32 {
+            match value {
+                1 => 10,
+                _ => 30,
+            }
+        }
+        fun main() { print(literal(Square { side = 2 })); }
+        "#,
+        "literal pattern of type i32 cannot match type T",
+    );
+}
+
+#[test]
+fn b219_both_comparators_still_accept_a_rigid_parameter_against_itself() {
+    // The other cell of §1.4's table, and the one that must not move: a rigid
+    // parameter agrees with ITSELF through both comparators — a wildcard arm
+    // returning the subject, and the return check that reads it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun echo<P>(a: P): P { match a { _ => a } }
+        fun main() { print(echo(1)); }
+        "#,
+        "1\n",
+    );
+}

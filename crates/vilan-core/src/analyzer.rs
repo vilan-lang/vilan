@@ -2986,6 +2986,14 @@ pub struct Analyzer<'src> {
     /// CHECK pass leaves it empty, so a value whose type is a rigid parameter is
     /// still refused against a parameter it does not match.
     inferable_generics: Vec<TypeId>,
+    /// A struct literal's OWN instantiation of the struct's parameters, keyed by
+    /// the literal's id: the fresh constraint ids
+    /// [`Self::instantiate_literal_parameters`] mints, with the rename that
+    /// carries the struct's declared field types into them (B225). Cached
+    /// because `type_id_for_type` mints — the constraint fixpoint re-runs a
+    /// deferred literal many times, and each re-run must reach the same ids or
+    /// the bindings the previous run recorded would name nothing.
+    struct_literal_instantiations: HashMap<Id, (Vec<TypeId>, SubstitutionContext)>,
     function_calls: IndexMap<Id, FunctionCall>,
     functions: IndexMap<Id, Function<'src>>,
     generic_constraint_names: HashMap<TypeId, &'src str>,
@@ -4119,6 +4127,7 @@ impl<'src> Analyzer<'src> {
             current_waiting_on: None,
             rigid_binder_scope: None,
             inferable_generics: Vec::new(),
+            struct_literal_instantiations: HashMap::default(),
             function_calls: IndexMap::new(),
             functions: IndexMap::new(),
             generic_constraint_names: HashMap::default(),
@@ -20730,6 +20739,80 @@ impl<'src> Analyzer<'src> {
         false
     }
 
+    /// A struct literal INSTANTIATES the struct's parameters, so they are open
+    /// at the literal even inside an `impl Boxy<type T>` whose body holds the
+    /// same ids rigid — `Boxy { value = fn(self.value) }` in `map<U>` binds
+    /// `T := U` (B211's door). But an impl binder INHERITS the subject
+    /// declaration's constraint id (B77), so opening the id itself reopened the
+    /// ENCLOSING impl's own rigid parameter: in
+    /// `impl Pair<type T> { fun make(x: T) { Pair { b = "hello", a = x } } }`
+    /// one field bound `T := str` and the field carrying the CALLER's rigid `T`
+    /// then passed against it, silently returning `Pair<str>` (B225).
+    ///
+    /// So the instantiation is spelled out rather than aliased. Each parameter
+    /// the enclosing declaration ALSO owns gets a FRESH constraint id here,
+    /// carrying the same bound, name and tuple bound; the struct's declared
+    /// field types are renamed into those ids. The literal infers the fresh
+    /// ids, the impl's own `T` stays rigid, and the two meet ONE WAY —
+    /// `reconcile_type`'s second binding arm binds the fresh id TO the rigid
+    /// parameter, and no arm binds the rigid parameter to anything. `map<U>`
+    /// keeps working (the fresh parameter binds to the method's `U`); the
+    /// leaking form is refused, at the field whose value is the rigid `T`.
+    ///
+    /// A literal outside such an impl renames nothing and pays nothing: the
+    /// returned ids are the struct's own and the rename is empty.
+    fn instantiate_literal_parameters(
+        &mut self,
+        initializer_id: Id,
+        generic_param_ids: &[TypeId],
+    ) -> (Vec<TypeId>, SubstitutionContext) {
+        if let Some(cached) = self.struct_literal_instantiations.get(&initializer_id) {
+            return cached.clone();
+        }
+        let mut literal_param_ids = Vec::with_capacity(generic_param_ids.len());
+        let mut rename = SubstitutionContext::default();
+        for constraint_id in generic_param_ids {
+            let aliased = self.rigid_binder_scope.is_some_and(|scope_id| {
+                self.generic_declared_by_enclosing_scope(*constraint_id, scope_id)
+            });
+            if !aliased {
+                literal_param_ids.push(*constraint_id);
+                continue;
+            }
+            // The constraint id IS the bound's type id (`register_binder`), so a
+            // fresh id for the same bound is a fresh parameter with the same
+            // requirements — and one no scope declares, which is exactly what
+            // makes `generic_declared_by_enclosing_scope` answer `false` for it.
+            let bound = constraint_id.get_type(self);
+            let fresh = bound.get_type_id(self);
+            if let Some(name) = self.generic_constraint_names.get(constraint_id).copied() {
+                self.generic_constraint_names.insert(fresh, name);
+            }
+            if let Some(bounds) = self.generic_bounds.get(constraint_id).cloned() {
+                self.generic_bounds.insert(fresh, bounds);
+            }
+            if let Some(tuple_bound) = self.tuple_bounds.get(constraint_id).cloned() {
+                self.tuple_bounds.insert(fresh, tuple_bound);
+            }
+            let fresh_generic_id = Type::Generic(fresh).get_type_id(self);
+            rename.insert(*constraint_id, fresh_generic_id);
+            literal_param_ids.push(fresh);
+        }
+        self.struct_literal_instantiations
+            .insert(initializer_id, (literal_param_ids.clone(), rename.clone()));
+        (literal_param_ids, rename)
+    }
+
+    /// Rewrites a struct's declared field type into the literal's own
+    /// parameters (see [`Self::instantiate_literal_parameters`]). A literal
+    /// that renamed nothing skips the walk entirely.
+    fn rename_into_literal(&mut self, field_type: Type, rename: &SubstitutionContext) -> Type {
+        if rename.is_empty() {
+            return field_type;
+        }
+        self.substitute_type(&field_type, rename)
+    }
+
     /// Whether `constraint_id` is RIGID at the site currently being checked —
     /// a generic parameter the ENCLOSING declaration owns (the function's own
     /// `<T>`, an implicit `(a: X)` parameter, an impl's binder, a trait's
@@ -20743,6 +20826,13 @@ impl<'src> Analyzer<'src> {
     /// Answers `false` outside constraint resolution (`rigid_binder_scope` is
     /// `None`), where the reconciler is matching declarations against each other
     /// rather than checking a body — impl-subject matching, conformance.
+    ///
+    /// THE predicate: `reconcile_type` and its read-only twin
+    /// `compare_type_rigid` both ask it, so there is one answer to "is this
+    /// parameter rigid here" rather than two (B219 — `trait-objects.md` §1.4
+    /// documents the two as agreeing exactly, and until this they did not:
+    /// `compare_type_rigid` still bound by shape, and B225's leaking struct
+    /// literal walked straight through the hole).
     fn generic_is_rigid_here(&self, constraint_id: TypeId) -> bool {
         !self.inferable_generics.contains(&constraint_id)
             && self.rigid_binder_scope.is_some_and(|scope_id| {
@@ -24198,8 +24288,25 @@ impl<'src> Analyzer<'src> {
                 let literal_id = *literal_id;
                 let literal_type = self.infer_type(literal_id, &Type::Unknown, &HashMap::default());
                 let subject_type = expected_type_id.get_type(self);
+                // B82: a literal pattern against a type PARAMETER is sound at
+                // runtime — the emitted test is a `===`, which a value of any
+                // other type simply fails — so `match value { 1 => .. }` inside
+                // `fun literal<T>(value: T)` compiles and takes the `_` leg.
+                // That makes the parameter a HOLE at this site, not the fixed
+                // unknown it is to the reconciler (B219): the question here is
+                // answered by the runtime test, not by what the caller chose.
+                // Opening the subject's own parameters for this one comparison
+                // says so, and keeps the part that is still a real check — an
+                // opened parameter falls back to its own CONSTRAINT, so a
+                // literal that its declared bound cannot admit is still refused.
+                let mut open = self.inferable_generics.clone();
+                self.collect_generics(&subject_type, 0, &mut open);
+                let previously_inferable = std::mem::replace(&mut self.inferable_generics, open);
+                let literal_fits =
+                    self.compare_type(&subject_type, &literal_type, &HashMap::default());
+                self.inferable_generics = previously_inferable;
                 if !matches!(subject_type, Type::Unknown | Type::Any | Type::Unresolved)
-                    && !self.compare_type(&subject_type, &literal_type, &HashMap::default())
+                    && !literal_fits
                 {
                     let expected = self.pretty_print_type(&subject_type, &HashMap::default());
                     let got = self.pretty_print_type(&literal_type, &HashMap::default());
@@ -28122,6 +28229,44 @@ impl<'src> Analyzer<'src> {
             }
             (Type::Generic(left_id), _) if rigid.contains(left_id) => false,
             (_, Type::Generic(right_id)) if rigid.contains(right_id) => false,
+            // BODY rigidity (B219). The `rigid` list above is conformance's own
+            // strictness — a declared list, empty everywhere else. This asks the
+            // shared `generic_is_rigid_here`, so that from here down this
+            // read-only comparison gives `reconcile_type`'s verdict rather than
+            // a second opinion: below these arms a generic is a hole that falls
+            // back to its constraint, and an unbounded constraint matches
+            // anything — which is right for a parameter a site is INFERRING and
+            // wrong for one the enclosing declaration owns.
+            //
+            // The arms mirror `reconcile_type`'s, asymmetry included: two rigid
+            // parameters agree only when they are the same parameter; a rigid
+            // parameter meets a trait through its own declared bound (§1.4's "a
+            // trait may satisfy a bound, never BE the binding"); one rigid side
+            // still matches a parameter the other side may bind TO it; and a
+            // rigid parameter against anything else is the leak, refused.
+            (Type::Generic(left_id), Type::Generic(right_id))
+                if self.generic_is_rigid_here(*left_id)
+                    && self.generic_is_rigid_here(*right_id) =>
+            {
+                left_id == right_id
+            }
+            (Type::Generic(constraint_id), Type::Trait(trait_id, _))
+            | (Type::Trait(trait_id, _), Type::Generic(constraint_id))
+                if self.generic_is_rigid_here(*constraint_id) =>
+            {
+                self.generic_bound_carries_trait(*constraint_id, *trait_id)
+            }
+            (Type::Generic(left_id), Type::Generic(right_id))
+                if self.generic_is_rigid_here(*left_id)
+                    || self.generic_is_rigid_here(*right_id) =>
+            {
+                true
+            }
+            (Type::Generic(constraint_id), _) | (_, Type::Generic(constraint_id))
+                if self.generic_is_rigid_here(*constraint_id) =>
+            {
+                false
+            }
             (Type::Generic(constraint_id), _) => {
                 let l = substitution_context
                     .get(constraint_id)
@@ -33859,9 +34004,18 @@ impl<'src> Analyzer<'src> {
         let initializer_id = constraint.initializer_id;
         let struct_name = constraint.struct_name;
         let mut initializer_fields = IndexMap::new();
+        // The literal's OWN parameters (B225): the struct's, except that any the
+        // enclosing declaration also owns is instantiated to a fresh id here, so
+        // the literal cannot bind the impl binder B77 aliases to it. Everything
+        // below that names "the parameters this literal is inferring" — the
+        // written type arguments, the door's `inferable_generics`, the
+        // second-chance pass, the type arguments the literal ends up with — uses
+        // these ids; `generic_param_ids` stays the struct's declaration order.
+        let (literal_param_ids, literal_rename) =
+            self.instantiate_literal_parameters(initializer_id, &generic_param_ids);
         let mut substitution_context = HashMap::default();
         for (index, generic_argument_id) in constraint.generic_argument_ids.iter().enumerate() {
-            if let Some(generic_constraint) = generic_param_ids.get(index) {
+            if let Some(generic_constraint) = literal_param_ids.get(index) {
                 substitution_context.insert(*generic_constraint, *generic_argument_id);
             }
         }
@@ -33910,17 +34064,20 @@ impl<'src> Analyzer<'src> {
                 ));
             }
             let struct_field_type = struct_field.type_id.get_type(self);
+            let struct_field_type = self.rename_into_literal(struct_field_type, &literal_rename);
             // THE field-value rule — shared with the assignment door
             // (`resolve_field_assignment`), so `S { field = value }` and
             // `s.field = value` cannot disagree about what fits (B166).
             // A LITERAL instantiates the struct's parameters, so they are open
             // here even inside an `impl Boxy<type T>` whose body holds the same
             // ids rigid (B211) — `Boxy { value = fn(self.value) }` in
-            // `map<U>` binds `T := U`. The assignment door (`s.field = value`),
-            // which shares `check_field_value`, sets nothing: there the
-            // parameters are already fixed by the place being written.
+            // `map<U>` binds `T := U`. Those are the LITERAL's ids, minted by
+            // `instantiate_literal_parameters`, never the enclosing impl's own
+            // (B225). The assignment door (`s.field = value`), which shares
+            // `check_field_value`, sets nothing: there the parameters are
+            // already fixed by the place being written.
             let previously_inferable =
-                std::mem::replace(&mut self.inferable_generics, generic_param_ids.clone());
+                std::mem::replace(&mut self.inferable_generics, literal_param_ids.clone());
             let verdict = self.check_field_value(
                 *field_value,
                 &struct_field_type,
@@ -33976,7 +34133,7 @@ impl<'src> Analyzer<'src> {
         // the declared-bound check (an unbounded `U` looked satisfied) and
         // lying to any consumer. Reconcile FIELD-first here, adopting
         // bindings only for declared parameters still unbound.
-        if generic_param_ids
+        if literal_param_ids
             .iter()
             .any(|parameter| !substitution_context.contains_key(parameter))
         {
@@ -33989,12 +34146,13 @@ impl<'src> Analyzer<'src> {
                     continue;
                 };
                 let field_type = struct_field.type_id.get_type(self);
+                let field_type = self.rename_into_literal(field_type, &literal_rename);
                 let value_type = self.infer_type(*field_value, &field_type, &substitution_context);
                 if matches!(value_type, Type::Unresolved | Type::Unknown) {
                     continue;
                 }
                 let previously_inferable =
-                    std::mem::replace(&mut self.inferable_generics, generic_param_ids.clone());
+                    std::mem::replace(&mut self.inferable_generics, literal_param_ids.clone());
                 let reconciled =
                     self.reconcile_type(&field_type, &value_type, &substitution_context);
                 self.inferable_generics = previously_inferable;
@@ -34002,7 +34160,7 @@ impl<'src> Analyzer<'src> {
                     continue;
                 };
                 for (constraint_id, type_id) in bindings {
-                    if generic_param_ids.contains(&constraint_id)
+                    if literal_param_ids.contains(&constraint_id)
                         && !substitution_context.contains_key(&constraint_id)
                     {
                         substitution_context.insert(constraint_id, type_id);
@@ -34016,11 +34174,16 @@ impl<'src> Analyzer<'src> {
         // constrains stays abstract.
         let type_arguments = generic_param_ids
             .iter()
-            .map(|constraint_id| {
+            .zip(literal_param_ids.iter())
+            .map(|(declared_id, literal_id)| {
+                // A parameter no field constrains stays abstract as the STRUCT's
+                // own parameter, not as the fresh id this literal inferred with:
+                // the fresh one is private to the literal and names nothing to
+                // any consumer of the resulting type.
                 substitution_context
-                    .get(constraint_id)
+                    .get(literal_id)
                     .copied()
-                    .unwrap_or(*constraint_id)
+                    .unwrap_or(*declared_id)
             })
             .collect();
         let type_id = Type::Struct(struct_id, type_arguments).get_type_id(self);
@@ -46153,5 +46316,112 @@ mod walk_type_node_fence_tests {
             analyzer.diagnostics
         );
         assert_eq!(analyzer.get_type_by_type_id(type_id), Type::Unresolved);
+    }
+}
+
+#[cfg(test)]
+mod rigidity_agreement_tests {
+    //! B219: `reconcile_type` and `compare_type_rigid` give ONE verdict.
+    //!
+    //! `trait-objects.md` §1.4 documents `compare_type_rigid` as
+    //! `reconcile_type`'s read-only twin, agreeing with it exactly. B211 taught
+    //! the binding one that a generic parameter is RIGID inside its own body
+    //! and left the twin binding by shape — where a generic falls back to its
+    //! own constraint, and an unbounded constraint matches anything. The
+    //! difference was invisible in source (B225's struct literal reached the
+    //! hole through the door, not through the twin), which is exactly why it
+    //! needs a pin at this level: the two predicates are asked here directly,
+    //! over the type pairs B211's garbage runs are made of, and the assertion
+    //! is that they answer the same.
+    //!
+    //! Both now ask one `generic_is_rigid_here`. The table below is §1.4's,
+    //! restricted to the rigidity rows, and it is asymmetric on purpose: a
+    //! rigid parameter may not be bound, but the other side still matches TO
+    //! it — which is how `helper(x)` inside `fun f<T>(x: T)` binds `helper`'s
+    //! own `U := T`.
+
+    use super::{Analyzer, Expr, Id};
+    use crate::type_::{SubstitutionContext, Type};
+
+    /// An analyzer holding two DIFFERENT rigid binders (`P` and `Q`, B211's
+    /// `swap<P: X, Q: X>`) and one parameter that is merely open — a callee's,
+    /// which the site is inferring. Returns `(P, Q, open)`.
+    fn two_rigid_binders_and_an_open_one(analyzer: &mut Analyzer<'static>) -> (Type, Type, Type) {
+        let scope_id = analyzer.create_owned_scope(None).id;
+        let binder = |analyzer: &mut Analyzer<'static>, name: &'static str, entity: u32| {
+            let constraint_id = analyzer.type_id_for_type(Type::Any);
+            let entity_id = Id(entity);
+            analyzer
+                .mut_scope_for_scope_id(scope_id)
+                .name_to_id_map
+                .insert(name, entity_id);
+            analyzer
+                .expr_id_to_expr_map
+                .insert(entity_id, Expr::Generic(constraint_id));
+            analyzer
+                .generic_constraint_names
+                .insert(constraint_id, name);
+            Type::Generic(constraint_id)
+        };
+        let p = binder(analyzer, "P", 9001);
+        let q = binder(analyzer, "Q", 9002);
+        // Declared in NO scope, so nothing encloses it: a parameter the site is
+        // inferring rather than one it is inside.
+        let open = Type::Generic(analyzer.type_id_for_type(Type::Any));
+        analyzer.rigid_binder_scope = Some(scope_id);
+        (p, q, open)
+    }
+
+    #[test]
+    fn both_predicates_give_one_verdict_on_b211s_garbage_shapes() {
+        let mut analyzer = Analyzer::new();
+        let (p, q, open) = two_rigid_binders_and_an_open_one(&mut analyzer);
+        let concrete = Type::Struct(Id(7001), Vec::new());
+        assert!(
+            analyzer.generic_is_rigid_here(match p {
+                Type::Generic(id) => id,
+                _ => unreachable!(),
+            }),
+            "the fixture's `P` must be rigid, or every row below is vacuous"
+        );
+
+        // (left, right, verdict, what the shape is)
+        let table: Vec<(Type, Type, bool, &str)> = vec![
+            // B211's cross-assignment `c = b`, and the rotate's other direction:
+            // two different parameters the same body owns.
+            (p.clone(), q.clone(), false, "P against Q"),
+            (q.clone(), p.clone(), false, "Q against P"),
+            // B211's `need_a(x)`: the caller's parameter narrowed to a struct.
+            (p.clone(), concrete.clone(), false, "P against a struct"),
+            (concrete.clone(), p.clone(), false, "a struct against P"),
+            // The parameter agreeing with ITSELF — a recursive call, a sibling
+            // member on `self`, and B225's honest `Pair { a = x, b = y }`.
+            (p.clone(), p.clone(), true, "P against itself"),
+            // The asymmetry: the OTHER side still binds to a rigid parameter.
+            (p.clone(), open.clone(), true, "P against an open parameter"),
+            (open.clone(), p.clone(), true, "an open parameter against P"),
+            // And an open parameter is still a hole, which is what a call site
+            // binding a callee's generic from its argument depends on.
+            (
+                open.clone(),
+                concrete.clone(),
+                true,
+                "an open parameter against a struct",
+            ),
+        ];
+
+        for (left, right, expected, shape) in table {
+            let context = SubstitutionContext::default();
+            let compared = analyzer.compare_type_rigid(&left, &right, &context, &[]);
+            let reconciled = analyzer.reconcile_type(&left, &right, &context).is_some();
+            assert_eq!(
+                compared, expected,
+                "compare_type_rigid disagrees with §1.4's table on {shape}"
+            );
+            assert_eq!(
+                reconciled, compared,
+                "the two predicates disagree on {shape} — §1.4 says they agree exactly"
+            );
+        }
     }
 }
