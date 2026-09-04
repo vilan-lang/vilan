@@ -92,7 +92,12 @@ let fileWatcher: FileSystemWatcher | undefined;
 
 function sharedFileWatcher(context: ExtensionContext): FileSystemWatcher {
     if (fileWatcher === undefined) {
-        fileWatcher = workspace.createFileSystemWatcher('**/*.vl');
+        // Sources AND manifests: the server acts on both
+        // (`did_change_watched_files`, E127) — a `vilan.toml` arriving with a
+        // checkout re-colors every package file under it, and the server can
+        // only know if the event reaches it. One watcher, one glob, so the
+        // one-per-session accounting below still reads `1`.
+        fileWatcher = workspace.createFileSystemWatcher('**/{*.vl,vilan.toml}');
         context.subscriptions.push(fileWatcher);
     }
     return fileWatcher;

@@ -430,6 +430,23 @@ pub enum RenameRefusal {
     /// The index knows it is missing references to this definition: use sites
     /// whose recorded span could not be proven to cover an identifier.
     Incomplete { what: String, missing: usize },
+    /// One of the definition's references is a struct-init field SHORTHAND
+    /// (`A { x }`), whose single identifier names two things at once: the
+    /// field `A::x` and the local `x` it reads (E134). There is no span to
+    /// rewrite that serves both — renaming from either side would silently
+    /// break the other, which is the "half-applied rename" this enum exists to
+    /// forbid, and today renaming the field does exactly that. A correct
+    /// rename has to EXPAND the site to `A { x = value }` first, which is a
+    /// text rewrite rather than a span rewrite: every other edit this module
+    /// emits replaces an identifier with `new_name`, so an expansion cannot be
+    /// expressed in the edit set at all. The refusal names the expansion and
+    /// the user does it once, after which both names have spans of their own
+    /// and the rename goes through.
+    SharedSpan {
+        what: String,
+        with: String,
+        name: String,
+    },
     /// An open file that imports the definition's file has un-analyzed edits,
     /// so its analyzed spans cannot be trusted against its live buffer —
     /// applying them could corrupt it, and skipping it would emit the partial
@@ -455,6 +472,10 @@ impl RenameRefusal {
             ),
             RenameRefusal::Incomplete { what, missing } => format!(
                 "cannot rename {what}: {missing} of its references could not be located, so the edit would be incomplete"
+            ),
+            RenameRefusal::SharedSpan { what, with, name } => format!(
+                "cannot rename {what}: it is written as a field shorthand, where the one `{name}` names both it and {with}. \
+                 Expand that site to `{name} = {name}` first, so each name has a span of its own"
             ),
             RenameRefusal::StillAnalyzing { what } => format!(
                 "cannot rename {what} yet: an open file that references it is still being analyzed; retry in a moment"
@@ -2255,11 +2276,20 @@ impl Document {
     /// lookups (`entity_at`) are only meaningful for offsets that touch
     /// actual code; a comment inside a function body is *contained* by the
     /// function's span but is not the function.
+    ///
+    /// A caret at a token's END counts as touching it, the same convention
+    /// [`crate::references::ReferenceIndex::at`] answers rename and
+    /// find-references by (E133). The two gates decide the SAME question — is
+    /// the cursor on this word — for two features the user reads as one, so
+    /// hover going blank at `name|` while rename works there is the two of them
+    /// disagreeing rather than a separate rule. Trivia is unaffected: the end
+    /// of a token is code either way, and an offset inside whitespace still
+    /// touches nothing.
     fn offset_touches_a_token(&self, offset: usize) -> bool {
         let (tokens, _errors) = tokenize(self.analyzed_text());
         tokens.iter().any(|(_, span)| {
             let range = span.into_range();
-            range.start <= offset && offset < range.end
+            range.start <= offset && offset <= range.end
         })
     }
 
@@ -2274,8 +2304,24 @@ impl Document {
     /// the cursor touches — the linked-editing nicety, so renaming one tag
     /// renames the other. Raw-parsed per request, like `keyword_hover`'s lex:
     /// cheap, and independent of analysis succeeding.
+    ///
+    /// `offset` is a LIVE offset and the spans come back in LIVE coordinates,
+    /// because this parses `self.text` (E132). It used to parse
+    /// `analyzed_text()`, and that was the one place a RAW PARSE — an S2
+    /// citizen, owing nothing to the analysis — was handed the S1 snapshot.
+    /// Nothing here is program data: there is no reason for the tag positions
+    /// to lag the buffer, and one decisive reason for them not to. This
+    /// handler PRODUCES EDITS by proxy — the client mirrors every keystroke
+    /// from one returned range into the other — so answering in the analyzed
+    /// snapshot's coordinates during the debounce pointed the mirror at
+    /// whatever live text had moved into the tag's old offsets and typed into
+    /// it (E132: the owner's "unrelated text deleted"; E125's twin on
+    /// `semanticTokens/range`). The S3 staleness refusal every other
+    /// edit-producing handler takes is the wrong cure here and only here: it
+    /// would kill tag rename during exactly the typing it exists for, while
+    /// the live parse makes the feature CORRECT during typing instead.
     pub fn linked_tag_ranges(&self, offset: usize) -> Option<(Span, Span)> {
-        let (tree, _errors) = vilan_core::parsing::parse(self.analyzed_text());
+        let (tree, _errors) = vilan_core::parsing::parse(&self.text);
         let root = tree?;
         let mut found: Option<(Span, Span)> = None;
         for item in &root.0 {
@@ -3452,11 +3498,41 @@ impl Document {
             });
         }
 
-        let spans: Vec<(SourceId, Span)> = self
+        // E134: a struct-init field shorthand `A { x }` is ONE identifier
+        // naming two definitions — the field key and the local it reads — so
+        // there is no rewrite of that span that serves both. Refuse from
+        // either side rather than emit the edit that silently breaks the other
+        // name (which is what renaming the field used to do). The refusal
+        // names the expansion that gives each name a span of its own.
+        if let Some(other) = self
+            .reference_index()
+            .occurrences_of(definition)
+            .find_map(|occurrence| occurrence.shared_with(definition))
+        {
+            let name = crate::references::name_of(program, definition).unwrap_or("this symbol");
+            let with = match crate::references::kind_of(program, other) {
+                Some(kind) => format!("the {} `{name}`", kind.noun()),
+                None => format!("`{name}`"),
+            };
+            return Err(RenameRefusal::SharedSpan {
+                what: what.to_string(),
+                with,
+                name: name.to_string(),
+            });
+        }
+
+        // The index guarantees one row per `(source, span)`, so this cannot
+        // hold a duplicate — but a duplicate span is what the CLIENT rejects
+        // ("Rename failed to apply edits"), so the guarantee is re-stated
+        // where the edit set is actually produced rather than relied on from
+        // two layers away.
+        let mut spans: Vec<(SourceId, Span)> = self
             .reference_index()
             .occurrences_of(definition)
             .map(|occurrence| (occurrence.source, occurrence.span))
             .collect();
+        spans.sort_by_key(|(source, span)| (source.0, span.start, span.end));
+        spans.dedup();
         if spans.is_empty() {
             return Err(RenameRefusal::NotAnIdentifier);
         }
@@ -3642,7 +3718,7 @@ impl Document {
                     && self
                         .reference_index
                         .occurrences_of(definition)
-                        .all(|occurrence| occurrence.is_declaration)
+                        .all(|occurrence| occurrence.is_declaration_of(definition))
             })
             .map(|(_, variable)| variable.name_span)
             .collect()
@@ -7512,6 +7588,39 @@ pub(crate) mod tests {
         let hover = hover_at_cursor("fun main() {\n\tlet cou|nt = 5;\n\tlet _ = count;\n}\n")
             .expect("hover on the let binding");
         assert!(hover.contains("```vilan\nlet count: i32\n```"), "{hover}");
+    }
+
+    // E133: a caret at the very END of a name hovers, the same convention
+    // rename and find-references answer by. Hover going blank at `count|`
+    // while rename works there is the two gates disagreeing about one question
+    // the user reads as one feature — is the cursor on this word — so
+    // `offset_touches_a_token` counts a token's end as touching it. Trivia is
+    // untouched: the pin's last case is a caret inside whitespace, which still
+    // hovers nothing.
+    #[test]
+    fn hover_at_the_end_of_a_name_answers_the_same_as_inside_it() {
+        let inside = hover_at_cursor("fun main() {\n\tlet cou|nt = 5;\n\tlet _ = count;\n}\n")
+            .expect("hover inside the name");
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count| = 5;\n\tlet _ = count;\n}\n"),
+            Some(inside),
+            "the caret at `count|` is on `count`",
+        );
+        // A module binding and a function name, the other two shapes a rename
+        // is started from at `name|`.
+        assert_eq!(
+            hover_at_cursor("let capacity| = 100;\n\nfun main() {\n\tlet _ = capacity;\n}\n"),
+            hover_at_cursor("let cap|acity = 100;\n\nfun main() {\n\tlet _ = capacity;\n}\n"),
+        );
+        assert_eq!(
+            hover_at_cursor("fun helper|(value: i32): i32 {\n\tvalue + 1\n}\n"),
+            hover_at_cursor("fun hel|per(value: i32): i32 {\n\tvalue + 1\n}\n"),
+        );
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\t | \n\tlet _ = count;\n}\n"),
+            None,
+            "a caret in whitespace still touches no token",
+        );
     }
 
     // A `mut` binding hovers with the `mut` keyword — it can be reassigned.
