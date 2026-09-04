@@ -1936,6 +1936,7 @@ impl Document {
             import_roots: self.import_roots.as_ref(),
             index,
             source_texts: Default::default(),
+            anchor: Default::default(),
         }
     }
 
@@ -15247,5 +15248,177 @@ mod builder_chain_member_completion {
             found.contains(&"len".to_string()) && found.contains(&"push".to_string()),
             "`SignalCell<List<str>>::get()` answers List's members: {found:?}",
         );
+    }
+}
+
+/// E131: a member request answered while the buffer is AHEAD of the analysis
+/// resolves its receiver from the LIVE text, not from analyzed coordinates.
+///
+/// The owner's report: base text `<div .styled(base_style)>`, one un-landed
+/// change to `<div .styled(const style::style().)>`, a request inside the
+/// 150 ms debounce — and the popup offered `element, text, class, styled,
+/// style_var, attr, on, child, bind_text, …`, which is `View`'s method set.
+/// Settled, the same position offers Style's 89.
+///
+/// The cause was a coordinate one, and E125 fixed its twin for
+/// `semanticTokens/range`. `receiver_nominal_id`'s complex arm did
+/// `to_analyzed_offset(receiver_end - 1)` and then `entity_at`, and
+/// `to_analyzed_offset` is a line/character round-trip that CLAMPS: it repairs
+/// other lines (E52), but the cursor's own line is ALWAYS an edited line, so
+/// the live column clamped back onto the analyzed line's last character and
+/// `entity_at` answered with the enclosing `.styled(..)`/element — typed
+/// `View`. The keystroke layer could not catch it either: `keystroke_verdict`
+/// is `Exact` because `shape_stamp` skips `fun` bodies, and `Exact` is the
+/// anchor's claim about TOKEN positions, while the anchor is line-aligned and
+/// the cursor's line is inside its window by construction.
+///
+/// Both halves are here. The receiver's IDENTITY now comes from the live token
+/// stream — a bare name, a call, a method call, a field — with only NAMES
+/// resolved against the landed program; and what that walk cannot type falls
+/// back to the analyzed arm only where the analyzed text still describes the
+/// receiver's own bytes. Inside the edit window it declines, because a wrong
+/// list is worse than no list and the next settled request is right (Q4).
+#[cfg(test)]
+mod stale_receiver_member_completion {
+    use super::tests::analyze_workspace;
+    use super::*;
+
+    /// kolt's own manifest shape: the web prelude puts `style`, `View` and the
+    /// element vocabulary in scope with no import, which is what makes the
+    /// reported buffer the buffer it is.
+    const MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n\
+         [entry.main]\ntarget = \"browser\"\n";
+
+    /// The LANDED text: the attribute holds a plain binding.
+    const BASE: &str = "fun app(): View {\n\t<div .styled(base_style)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    fn labels(document: &Document, offset: usize) -> Vec<String> {
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    /// The labels at the `~` cursor in `live`, with `BASE` analyzed and `live`
+    /// applied as an UN-LANDED edit — a request inside the debounce.
+    fn stale(live: &str) -> Vec<String> {
+        let text = live.replace('~', "");
+        let offset = live.find('~').expect("the pin source needs a `~` cursor");
+        let (directory, mut document) =
+            analyze_workspace(&[("main.vl", BASE), ("vilan.toml", MANIFEST)]);
+        document.set_text(&text);
+        assert_eq!(
+            document.keystroke_verdict(false),
+            crate::keystroke::Verdict::Exact,
+            "the reported request is one the keystroke layer calls Exact — that is \
+             the half of the report the gate exists for",
+        );
+        let found = labels(&document, offset);
+        let _ = std::fs::remove_dir_all(&directory);
+        found
+    }
+
+    /// The same position with the analysis LANDED on the same text — what the
+    /// request answers a moment later, and the answer the stale one must not
+    /// contradict.
+    fn settled(live: &str) -> Vec<String> {
+        let text = live.replace('~', "");
+        let offset = live.find('~').expect("the pin source needs a `~` cursor");
+        let (directory, document) =
+            analyze_workspace(&[("main.vl", &text), ("vilan.toml", MANIFEST)]);
+        let found = labels(&document, offset);
+        let _ = std::fs::remove_dir_all(&directory);
+        found
+    }
+
+    /// Style members that are not View members, and vice versa — the two lists
+    /// the report is about, named so a failure says WHICH one came back.
+    fn assert_style_and_not_view(found: &[String], what: &str) {
+        for member in ["flex_direction", "padding", "gap"] {
+            assert!(
+                found.contains(&member.to_string()),
+                "{what} must offer Style's `{member}`: {found:?}",
+            );
+        }
+        for member in ["child", "bind_text", "style_var"] {
+            assert!(
+                !found.contains(&member.to_string()),
+                "{what} must not offer View's `{member}`: {found:?}",
+            );
+        }
+    }
+
+    const CALL_RECEIVER: &str = "fun app(): View {\n\t<div .styled(const style::style().~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    /// The report, verbatim.
+    #[test]
+    fn a_stale_call_receiver_answers_the_live_expressions_type() {
+        assert_style_and_not_view(&stale(CALL_RECEIVER), "a stale call receiver");
+    }
+
+    /// …and it is the SAME answer the settled request gives, which is the
+    /// property the whole item is about.
+    #[test]
+    fn the_settled_call_receiver_answers_what_the_stale_one_does() {
+        let settled = settled(CALL_RECEIVER);
+        assert_style_and_not_view(&settled, "the settled call receiver");
+        assert_eq!(
+            settled,
+            stale(CALL_RECEIVER),
+            "the stale request and the settled one answer one list",
+        );
+    }
+
+    /// The item's own isolation: a BARE-NAME receiver was always right, because
+    /// that arm reads the name off the live text. It stays right.
+    #[test]
+    fn a_stale_bare_name_receiver_still_answers() {
+        assert_style_and_not_view(
+            &stale(
+                "fun app(): View {\n\t<div .styled(base_style.~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+                 let base_style = const style::style();\nlet styles = [const style::style()];\n",
+            ),
+            "a stale bare-name receiver",
+        );
+    }
+
+    /// A METHOD call typed since the landing — the `x.m(…)` shape of the live
+    /// walk, where the sub-receiver is itself resolved live.
+    #[test]
+    fn a_stale_method_call_receiver_answers_the_methods_return() {
+        assert_style_and_not_view(
+            &stale(
+                "fun app(): View {\n\t<div .styled(base_style.padding(space(4)).~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+                 let base_style = const style::style();\nlet styles = [const style::style()];\n",
+            ),
+            "a stale method-call receiver",
+        );
+    }
+
+    const INDEX_RECEIVER: &str = "fun app(): View {\n\t<div .styled(styles[0].~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    /// The GATE. An index is a shape the live walk does not type, and the
+    /// analyzed arm behind it would answer about whatever used to be written on
+    /// this line — `View`'s members, the report's own wrong list. Inside the
+    /// edit window it declines instead.
+    #[test]
+    fn a_stale_receiver_the_live_walk_cannot_type_declines_rather_than_guessing() {
+        let found = stale(INDEX_RECEIVER);
+        assert!(
+            found.is_empty(),
+            "an unresolvable stale receiver offers nothing rather than the old \
+             expression's members: {found:?}",
+        );
+    }
+
+    /// …and the gate is not a permanent refusal: the same position, settled,
+    /// answers through the analyzed arm exactly as it always did.
+    #[test]
+    fn the_gate_lifts_the_moment_the_analysis_lands() {
+        assert_style_and_not_view(&settled(INDEX_RECEIVER), "the settled index receiver");
     }
 }

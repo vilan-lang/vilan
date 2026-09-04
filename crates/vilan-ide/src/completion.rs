@@ -1120,11 +1120,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
             CursorContext::Member {
                 receiver_end,
                 lifted: true,
-            } => self.lifted_member_completions(receiver_end),
+            } => self.lifted_member_completions(&tokens, receiver_end),
             CursorContext::Member {
                 receiver_end,
                 lifted: false,
-            } => self.member_completions(receiver_end),
+            } => self.member_completions(&tokens, receiver_end),
             CursorContext::Path { path_start } => self.code_path_completions(text, path_start),
             _ => {
                 // An ordinary expression position: the cursor's own scope,
@@ -1338,8 +1338,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// one past its last byte, LIVE space, as [`CursorContext::Member`] found
     /// it. Not "one before the `.`": the two coincide only where no trivia
     /// separates the receiver from the dot (kolt.local 001).
-    fn member_completions(&self, receiver_end: usize) -> Vec<Completion> {
-        let Some(type_id) = self.receiver_nominal_id(receiver_end) else {
+    fn member_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Vec<Completion> {
+        let Some(type_id) = self.receiver_nominal_id(tokens, receiver_end) else {
             return Vec::new();
         };
         self.nominal_member_completions(type_id)
@@ -1365,8 +1369,27 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// `Option<Profile>` offers Profile's members): the receiver ends at
     /// `receiver_end` (LIVE space, as [`CursorContext::Member`] found it) and
     /// its container's first type argument is the element.
-    fn lifted_member_completions(&self, receiver_end: usize) -> Vec<Completion> {
+    fn lifted_member_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Vec<Completion> {
         let program = self.program;
+        // The receiver read from the LIVE tokens (E131), which is where its
+        // identity lives while the buffer is ahead of the analysis.
+        if let Some(element) = self
+            .live_receiver_index(tokens, receiver_end)
+            .and_then(|index| self.live_receiver_type_id(tokens, index, 0))
+            .and_then(|type_id| match program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Struct(_, arguments)) | Some(Type::Enum(_, arguments)) => {
+                    arguments.first().copied()
+                }
+                _ => None,
+            })
+            .and_then(|element| nominal_type_id(program, element))
+        {
+            return self.nominal_member_completions(element);
+        }
         // A bare name (`p?.`): the binding's declared container type. The NAME
         // comes off the live text, but resolving it is a `program` lookup, so
         // it converts to ANALYZED space first (E52).
@@ -1409,6 +1432,15 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // `entity_at` also takes the ANALYZED offset (E52). A CALL receiver is
         // resolved structurally (E66); the rendered label is the fallback for
         // whatever that cannot type.
+        //
+        // Gated on the analyzed text still describing the receiver's own bytes
+        // (E131): inside the edit window the converted offset lands on a
+        // clamped position and this answers about an expression that is no
+        // longer written there. A wrong list is worse than no list, and the
+        // next settled request is right.
+        if !self.analyzed_agrees_at(receiver_end) {
+            return Vec::new();
+        }
         receiver_end
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
@@ -1427,30 +1459,37 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// The nominal struct/enum id of the receiver value ending at
     /// `receiver_end` — one past its last byte, LIVE space (see
     /// [`CursorContext::Member`]).
-    fn receiver_nominal_id(&self, receiver_end: usize) -> Option<Id> {
-        // A bare name (`p.`): resolve through scope, or — when the cursor's own
-        // statement failed to parse and dropped its local scope — the nearest
-        // same-file binding of that name, then read its declared type. Robust while
-        // the buffer is mid-edit, which is exactly when completion fires. The
-        // NAME comes off the live text (`receiver_end` is where it ends), but
-        // resolving that name against a scope is a `program` lookup, so it
-        // converts to ANALYZED space first (E52).
-        if let Some(name) = identifier_ending_at(self.live.text(), receiver_end) {
-            let analyzed_offset = self.to_analyzed_offset(receiver_end);
-            let binding = self
-                .binding_in_scope(name, analyzed_offset)
-                .or_else(|| self.same_file_variable(name, analyzed_offset));
-            if let Some(nominal) = binding.and_then(|id| self.binding_nominal_id(id)) {
-                return Some(nominal);
-            }
+    fn receiver_nominal_id(&self, tokens: &[(Token<'_>, Span)], receiver_end: usize) -> Option<Id> {
+        // The receiver typed from the LIVE tokens (E131) — a bare name through
+        // scope, a call through its callee's declaration, a method call
+        // through the receiver's own nominal, a field through its declared
+        // type. Every one of those is a question about bytes the user is
+        // looking at answered against declarations the landing still owns, and
+        // none of them asks the analyzed tree what sits at an offset.
+        if let Some(nominal) = self
+            .live_receiver_index(tokens, receiver_end)
+            .and_then(|index| self.live_receiver_type_id(tokens, index, 0))
+            .and_then(|type_id| nominal_type_id(self.program, type_id))
+        {
+            return Some(nominal);
         }
-        // A complex receiver (`foo().`, `a.b.`): the parsed entity's own value
-        // type — another `program` lookup, so `entity_at` also takes the
-        // ANALYZED offset (E52). The rendered label is the FALLBACK, not the
-        // answer: it is hover's phrasing, and hover answers a constructor call
-        // with the thing being constructed (`Some(1)` -> `enum Option`), which
-        // is right here, but a plain call with the CALLEE's signature
-        // (`make()` -> `fn make(): Point`), which never names a type at all.
+        // What the live walk cannot type — a literal, an `if`, a `match`, an
+        // index — falls back to the parsed entity's own value type, another
+        // `program` lookup, so `entity_at` takes the ANALYZED offset (E52).
+        // The rendered label is the FALLBACK, not the answer: it is hover's
+        // phrasing, and hover answers a constructor call with the thing being
+        // constructed (`Some(1)` -> `enum Option`), which is right here, but a
+        // plain call with the CALLEE's signature (`make()` -> `fn make():
+        // Point`), which never names a type at all.
+        //
+        // And it is GATED on the analyzed text still describing the receiver's
+        // own bytes: `to_analyzed_offset` clamps, the cursor's line is by
+        // construction inside the edit window, and inside it this answers about
+        // whatever expression used to be written there. Silence is the honest
+        // answer, and the next settled request is right (Q4).
+        if !self.analyzed_agrees_at(receiver_end) {
+            return None;
+        }
         receiver_end
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
@@ -1461,6 +1500,187 @@ impl<'a, 'src> Analysis<'a, 'src> {
                         .and_then(|label| self.nominal_id_by_name(base_type_name(&label)))
                 })
             })
+    }
+
+    /// The index of the token the receiver ENDS on — `receiver_end` is one past
+    /// its last byte, as [`member_context`] read it off the same token stream.
+    fn live_receiver_index(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Option<usize> {
+        tokens
+            .iter()
+            .rposition(|(_, span)| span.into_range().end == receiver_end)
+    }
+
+    /// The type of the receiver expression whose LAST TOKEN is `tokens[index]`,
+    /// read from the live buffer's own tokens (E131).
+    ///
+    /// This is the half of member resolution that must not be asked in analyzed
+    /// coordinates. The receiver's IDENTITY — which expression it is — is a
+    /// fact about the bytes the user is looking at, and the cursor's own line
+    /// is, by construction, a line the analysis has not seen: the edit window
+    /// is line-aligned and the line being typed on is the line that differs.
+    /// Resolving it through `to_analyzed_offset` and `entity_at` asked the
+    /// LANDED tree what sits at a clamped offset on that line, which is
+    /// whatever used to be written there — `<div .styled(const style::style().`
+    /// answered `View`'s method set, because the clamp landed back on the
+    /// element.
+    ///
+    /// So the SHAPE is walked in token space (the same space
+    /// [`member_context`] finds the receiver in, so trivia and comments are
+    /// already the lexer's problem and a `(` inside a string literal cannot be
+    /// mistaken for a bracket), and only NAMES are resolved against the landed
+    /// `Program` — which is what a landed analysis is still authoritative
+    /// about, since a declaration is not on the line being typed.
+    ///
+    /// Four shapes, the ones a receiver is actually written as:
+    /// `p` (a binding), `f(…)` / `a::b::f(…)` (a call), `x.m(…)` (a method
+    /// call) and `x.f` (a field). Anything else — a literal, an `if`, a
+    /// `match`, an index — answers `None` and falls back to the caller's
+    /// analyzed-coordinate arm, which the gate then decides on.
+    fn live_receiver_type_id(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        index: usize,
+        depth: usize,
+    ) -> Option<TypeId> {
+        if depth > EXPRESSION_TYPE_DEPTH_LIMIT {
+            return None;
+        }
+        let program = self.program;
+        // A call: `…(…)`. The matching `(` is found by depth in token space,
+        // and the token before it is the callee's name.
+        if matches!(tokens[index].0, Token::Ctrl(')')) {
+            let open = matching_open_bracket(tokens, index)?;
+            let callee = open.checked_sub(1)?;
+            let Token::Ident(name) = tokens[callee].0 else {
+                return None;
+            };
+            let target = match callee.checked_sub(1).map(|before| &tokens[before].0) {
+                // `x.m(…)` — the member `m` of whatever `x` resolves to.
+                Some(Token::Ctrl('.')) => {
+                    let receiver = self.live_receiver_type_id(tokens, callee - 2, depth + 1)?;
+                    self.member_id(nominal_type_id(program, receiver)?, name)?
+                }
+                // `a::b::f(…)` — a module member or a type's static.
+                Some(Token::Op("::")) => {
+                    let namespace = self.live_namespace_id(tokens, callee - 2, depth)?;
+                    self.namespace_entry_id(namespace, name)?
+                }
+                // `f(…)` — a name in scope.
+                _ => self.binding_in_scope(
+                    name,
+                    self.to_analyzed_offset(tokens[callee].1.into_range().start),
+                )?,
+            };
+            return self.declared_result_type_id(target);
+        }
+        let Token::Ident(name) = tokens[index].0 else {
+            return None;
+        };
+        match index.checked_sub(1).map(|before| &tokens[before].0) {
+            // `x.f` — a field read.
+            Some(Token::Ctrl('.')) => {
+                let receiver = self.live_receiver_type_id(tokens, index - 2, depth + 1)?;
+                let structure = program.structs.get(&nominal_type_id(program, receiver)?)?;
+                structure
+                    .fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| field.type_id)
+            }
+            // `a::B` names a namespace, not a value.
+            Some(Token::Op("::")) => None,
+            // A bare name: the binding it denotes, in the scope the cursor is
+            // in. The name is live, the scope is a `program` lookup, and that
+            // split is E52's own rule — this is the arm that was already right,
+            // and the item's own isolation (a bare-name receiver answers
+            // correctly even while the request is stale).
+            _ => {
+                let range = tokens[index].1.into_range();
+                let analyzed_offset = self.to_analyzed_offset(range.end);
+                let binding = self
+                    .binding_in_scope(name, analyzed_offset)
+                    .or_else(|| self.same_file_variable(name, analyzed_offset))?;
+                binding_type_id(program, binding)
+            }
+        }
+    }
+
+    /// The namespace a `::` path whose LAST segment is `tokens[index]` denotes
+    /// — the token-space twin of [`Self::code_path_completions`]' walk, for the
+    /// head of a live `a::b::f(…)` receiver.
+    fn live_namespace_id(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        index: usize,
+        depth: usize,
+    ) -> Option<Id> {
+        if depth > EXPRESSION_TYPE_DEPTH_LIMIT {
+            return None;
+        }
+        let Token::Ident(name) = tokens[index].0 else {
+            return None;
+        };
+        // A further `::` to the left means this segment is a descent step, not
+        // the head; the head is the one resolved through scope (E53).
+        if index >= 2 && matches!(tokens[index - 1].0, Token::Op("::")) {
+            let outer = self.live_namespace_id(tokens, index - 2, depth + 1)?;
+            return self.namespace_member(outer, name);
+        }
+        self.namespace_in_scope(
+            name,
+            self.to_analyzed_offset(tokens[index].1.into_range().start),
+        )
+    }
+
+    /// The id `namespace::name` denotes for a VALUE position — a module member
+    /// or a type's static — where [`Self::namespace_member`] answers only for
+    /// the namespaces a path descends through.
+    fn namespace_entry_id(&self, namespace: Id, name: &str) -> Option<Id> {
+        let program = self.program;
+        if let Some(module) = program.modules.get(&namespace)
+            && let Some(scope) = program.scopes.get(&module.body.1)
+        {
+            return scope.name_to_id_map.get(name).copied();
+        }
+        self.member_id(namespace, name)
+    }
+
+    /// The member `name` some impl of the nominal type `type_id` declares.
+    fn member_id(&self, type_id: Id, name: &str) -> Option<Id> {
+        self.program
+            .implementations
+            .iter()
+            .filter(|implementation| self.impl_subject_id(implementation) == Some(type_id))
+            .find_map(|implementation| implementation.declarations.get(name).copied())
+    }
+
+    /// The result type of calling `target`, from its DECLARATION alone: the
+    /// declared return, E107's inferred one, or an external's.
+    ///
+    /// A declared return that is a bare type PARAMETER answers `None` rather
+    /// than `T` itself: E130 substitutes such a return through what the
+    /// analyzer recorded for a call it can NAME, and a receiver typed since the
+    /// landing has no analyzed call id at all. `None` here falls back to the
+    /// analyzed arm, which the gate then decides on — silence, not a wrong
+    /// list.
+    fn declared_result_type_id(&self, target: Id) -> Option<TypeId> {
+        let program = self.program;
+        let type_id = if let Some(function) = program.functions.get(&target) {
+            function
+                .return_type_id
+                .or_else(|| program.inferred_return_types.get(&target).copied())?
+        } else {
+            program.external_functions.get(&target)?.return_type_id
+        };
+        (!matches!(
+            program.type_id_to_type_map.get(&type_id),
+            Some(Type::Generic(_))
+        ))
+        .then_some(type_id)
     }
 
     /// The nominal struct/enum id of the VALUE an expression produces — the
@@ -1611,12 +1831,6 @@ impl<'a, 'src> Analysis<'a, 'src> {
             return *bound;
         }
         return_type_id
-    }
-
-    /// The nominal struct/enum id a `let`/parameter binding's declared type names.
-    fn binding_nominal_id(&self, binding: Id) -> Option<Id> {
-        let program = self.program;
-        nominal_type_id(program, binding_type_id(program, binding)?)
     }
 
     /// The nearest same-file `let`/`mut` binding named `name` declared before
@@ -2361,6 +2575,29 @@ fn base_type_name(label: &str) -> &str {
 }
 
 /// The identifier ending at byte `end` in `text`, if any.
+/// The index of the bracket token that OPENS the one at `close`, by depth over
+/// the token stream — `None` when the buffer is mid-edit and there is no match.
+///
+/// Token space, not bytes: a `(` inside a string literal is part of one token
+/// and cannot be counted, which is the whole reason a live receiver's shape is
+/// walked here rather than over the text (E131).
+fn matching_open_bracket(tokens: &[(Token<'_>, Span)], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for index in (0..=close).rev() {
+        match tokens[index].0 {
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => depth += 1,
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The `::`-separated identifier path ending at `end` — `["style",
 /// "FlexDirection"]` for `let d = style::FlexDirection::|`, in source order.
 ///
