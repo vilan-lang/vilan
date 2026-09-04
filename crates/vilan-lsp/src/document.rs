@@ -15161,4 +15161,91 @@ mod builder_chain_member_completion {
             "nothing from the OTHER call site's specialization: {found:?}",
         );
     }
+
+    // --- E130: the declared return IS a type parameter (E107's other half) ---
+    //
+    // E107 covered the callee with NO declared return. This is the callee whose
+    // declared return is a bare `T`: the declaration is there, so the
+    // `inferred_return_types` fallback is never reached, and `T`'s own TypeId
+    // is a `Type::Generic` that names no nominal at all. The receiver's own
+    // type argument is what says which type `T` is at THIS call, and the
+    // analyzer recorded it.
+
+    /// The item's user-code reduction, with no std type involved: a generic
+    /// `Box<T>` whose `get` returns the bare parameter and whose `wrap` returns
+    /// a nominal head over it.
+    const GENERIC_BOX: &str = "import std::option::Option::{ self, Some, None };\n\
+         struct Box<T> {\n\tv: T,\n}\n\
+         impl Box<type T> {\n\
+         \tfun get(self): T { self.v }\n\
+         \tfun wrap(self): Option<T> { Some(self.v) }\n\
+         }\n\
+         struct Point { x: i32, y: i32 }\n\
+         impl Point { fun twin(self): Point { self } }\n";
+
+    #[test]
+    fn a_call_returning_a_bare_type_parameter_offers_the_bound_types_members() {
+        let found = labels(
+            GENERIC_BOX,
+            "\tlet b: Box<Point> = Box { v = Point { x = 1, y = 2 } };\n\tb.get().~;\n",
+        );
+        assert!(
+            found.contains(&"x".to_string()) && found.contains(&"twin".to_string()),
+            "`get(): T` on a `Box<Point>` answers Point's members: {found:?}",
+        );
+        assert!(
+            !found.contains(&"get".to_string()) && !found.contains(&"v".to_string()),
+            "the RESULT's members, not the box's: {found:?}",
+        );
+    }
+
+    /// A FREE generic function whose return is its own parameter — the other
+    /// channel the bindings arrive through, with no impl subject in sight.
+    #[test]
+    fn a_free_generic_call_returning_its_own_parameter_substitutes_too() {
+        let prelude = "struct Point { x: i32, y: i32 }\n\
+             impl Point { fun twin(self): Point { self } }\n\
+             fun echo<T>(value: T): T { value }\n";
+        for body in [
+            "\techo(Point { x = 1, y = 2 }).~;\n",
+            "\techo<Point>(Point { x = 1, y = 2 }).~;\n",
+        ] {
+            let found = labels(prelude, body);
+            assert!(
+                found.contains(&"x".to_string()) && found.contains(&"twin".to_string()),
+                "`echo<T>(value: T): T` at a Point call answers Point's members \
+                 ({body:?}): {found:?}",
+            );
+        }
+    }
+
+    /// The control the item names: the SAME impl's `wrap(): Option<T>` has a
+    /// nominal head written in the declaration and has always answered, so a
+    /// red here says the fix broke the path it was built beside.
+    #[test]
+    fn a_call_returning_a_nominal_over_a_parameter_still_answers() {
+        let found = labels(
+            GENERIC_BOX,
+            "\tlet b: Box<Point> = Box { v = Point { x = 1, y = 2 } };\n\tb.wrap().~;\n",
+        );
+        assert!(
+            found.contains(&"unwrap_or".to_string()),
+            "`wrap(): Option<T>` answers Option's members: {found:?}",
+        );
+    }
+
+    /// The reported shape, on std's own reactive cell: `SignalCell<T>::get`
+    /// declares `T`, and the owner's buffer is `c.get().` on a
+    /// `SignalCell<List<str>>`.
+    #[test]
+    fn a_signal_cells_get_offers_the_held_types_members() {
+        let found = labels(
+            "import std::reactive::SignalCell;\n",
+            "\tlet c: SignalCell<List<str>> = SignalCell::new(List::new());\n\tc.get().~;\n",
+        );
+        assert!(
+            found.contains(&"len".to_string()) && found.contains(&"push".to_string()),
+            "`SignalCell<List<str>>::get()` answers List's members: {found:?}",
+        );
+    }
 }

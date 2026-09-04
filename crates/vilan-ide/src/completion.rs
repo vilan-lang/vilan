@@ -1517,7 +1517,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
     ///
     /// The type ARGUMENTS of a generic return (`Result<Note, RpcError>`) do not
     /// have to be solved for this to be useful — member completion resolves
-    /// members on the nominal head, and that head is written in the declaration.
+    /// members on the nominal head, and that head is written in the
+    /// declaration. Except where it is NOT: a return declared as a bare type
+    /// PARAMETER (`fun get(self): T`) has no head at all, and the declaration
+    /// alone can never name one. That case goes through
+    /// [`Self::substituted_return_type_id`] (E130).
     fn call_result_type_id(&self, call_id: Id, depth: usize) -> Option<TypeId> {
         let program = self.program;
         let subject_id = program.function_calls.get(&call_id)?.subject_id;
@@ -1530,7 +1534,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         };
         if let Some(function) = program.functions.get(&callee_id) {
             if let Some(return_type_id) = function.return_type_id {
-                return Some(return_type_id);
+                return Some(self.substituted_return_type_id(call_id, return_type_id));
             }
             // An UNANNOTATED return is not an unknown one (E107): vilan infers it,
             // and the analyzer memoizes the answer per function. Reading only the
@@ -1553,6 +1557,60 @@ impl<'a, 'src> Analysis<'a, 'src> {
             Type::Closure(_, return_type_id) => Some(*return_type_id),
             _ => None,
         }
+    }
+
+    /// A declared return type resolved AT THIS CALL SITE: `return_type_id`
+    /// unchanged for every return that names something, and the type the
+    /// analyzer bound the parameter to for a return that is a bare type
+    /// parameter (E130).
+    ///
+    /// `fun get(self): T` on a `SignalCell<List<str>>` returns `List<str>`,
+    /// and only the call site knows that. Reading the declaration verbatim
+    /// gave completion `T`'s own TypeId — a `Type::Generic`, which
+    /// [`nominal_type_id`] matches nothing for and `hover_label` renders as
+    /// the literal `T` — so the whole popup went silent on a shape std's
+    /// reactive cell puts one `.` away from every read of a signal. E107 fixed
+    /// the sibling where the callee declares NO return; this is the one where
+    /// it declares a return that names no type.
+    ///
+    /// The bindings are the analyzer's own, recorded per call and already
+    /// carried out on `Program`: `method_call_substitution` is the single
+    /// channel every instantiation shape writes into — an impl's subject
+    /// generics, a method's own generics, and a free call's bindings whether
+    /// the source spelled them (`echo<Point>(…)`) or the solver inferred them
+    /// — which its own declaration site says in as many words, and which the
+    /// free-generic pin holds. The positional records beside it
+    /// (`own_generic_call_bindings`, `FunctionCall::generic_argument_ids`)
+    /// exist for the emission's re-dispatch and add no reach here; nothing is
+    /// read from them. A miss leaves the declared id alone, which is exactly
+    /// what this answered before.
+    ///
+    /// The map is populated MID-EDIT, which is the property this rests on: the
+    /// pins' buffers carry `expected a field or method name after '.'` and the
+    /// call before the dot is still recorded with its substitution, because a
+    /// parse error in one expression does not un-analyze the receiver that
+    /// parsed.
+    fn substituted_return_type_id(&self, call_id: Id, return_type_id: TypeId) -> TypeId {
+        let program = self.program;
+        // A `Type::Generic` wraps the CONSTRAINT id the declaration's type
+        // parameter was minted as, and that inner id is what every binding
+        // record below is keyed by — the return type's own id is the
+        // occurrence, not the parameter.
+        let Some(Type::Generic(parameter)) = program.type_id_to_type_map.get(&return_type_id)
+        else {
+            return return_type_id;
+        };
+        // The substitution map keyed by the constraint id the declaration
+        // wrote — the one channel that covers an impl's subject generics, which
+        // is where `SignalCell<T>::get`'s `T` comes from.
+        if let Some(bound) = program
+            .method_call_substitution
+            .get(&call_id)
+            .and_then(|substitution| substitution.get(parameter))
+        {
+            return *bound;
+        }
+        return_type_id
     }
 
     /// The nominal struct/enum id a `let`/parameter binding's declared type names.
