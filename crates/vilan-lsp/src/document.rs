@@ -430,6 +430,23 @@ pub enum RenameRefusal {
     /// The index knows it is missing references to this definition: use sites
     /// whose recorded span could not be proven to cover an identifier.
     Incomplete { what: String, missing: usize },
+    /// One of the definition's references is a struct-init field SHORTHAND
+    /// (`A { x }`), whose single identifier names two things at once: the
+    /// field `A::x` and the local `x` it reads (E134). There is no span to
+    /// rewrite that serves both — renaming from either side would silently
+    /// break the other, which is the "half-applied rename" this enum exists to
+    /// forbid, and today renaming the field does exactly that. A correct
+    /// rename has to EXPAND the site to `A { x = value }` first, which is a
+    /// text rewrite rather than a span rewrite: every other edit this module
+    /// emits replaces an identifier with `new_name`, so an expansion cannot be
+    /// expressed in the edit set at all. The refusal names the expansion and
+    /// the user does it once, after which both names have spans of their own
+    /// and the rename goes through.
+    SharedSpan {
+        what: String,
+        with: String,
+        name: String,
+    },
     /// An open file that imports the definition's file has un-analyzed edits,
     /// so its analyzed spans cannot be trusted against its live buffer —
     /// applying them could corrupt it, and skipping it would emit the partial
@@ -455,6 +472,10 @@ impl RenameRefusal {
             ),
             RenameRefusal::Incomplete { what, missing } => format!(
                 "cannot rename {what}: {missing} of its references could not be located, so the edit would be incomplete"
+            ),
+            RenameRefusal::SharedSpan { what, with, name } => format!(
+                "cannot rename {what}: it is written as a field shorthand, where the one `{name}` names both it and {with}. \
+                 Expand that site to `{name} = {name}` first, so each name has a span of its own"
             ),
             RenameRefusal::StillAnalyzing { what } => format!(
                 "cannot rename {what} yet: an open file that references it is still being analyzed; retry in a moment"
@@ -3440,11 +3461,41 @@ impl Document {
             });
         }
 
-        let spans: Vec<(SourceId, Span)> = self
+        // E134: a struct-init field shorthand `A { x }` is ONE identifier
+        // naming two definitions — the field key and the local it reads — so
+        // there is no rewrite of that span that serves both. Refuse from
+        // either side rather than emit the edit that silently breaks the other
+        // name (which is what renaming the field used to do). The refusal
+        // names the expansion that gives each name a span of its own.
+        if let Some(other) = self
+            .reference_index()
+            .occurrences_of(definition)
+            .find_map(|occurrence| occurrence.shared_with(definition))
+        {
+            let name = crate::references::name_of(program, definition).unwrap_or("this symbol");
+            let with = match crate::references::kind_of(program, other) {
+                Some(kind) => format!("the {} `{name}`", kind.noun()),
+                None => format!("`{name}`"),
+            };
+            return Err(RenameRefusal::SharedSpan {
+                what: what.to_string(),
+                with,
+                name: name.to_string(),
+            });
+        }
+
+        // The index guarantees one row per `(source, span)`, so this cannot
+        // hold a duplicate — but a duplicate span is what the CLIENT rejects
+        // ("Rename failed to apply edits"), so the guarantee is re-stated
+        // where the edit set is actually produced rather than relied on from
+        // two layers away.
+        let mut spans: Vec<(SourceId, Span)> = self
             .reference_index()
             .occurrences_of(definition)
             .map(|occurrence| (occurrence.source, occurrence.span))
             .collect();
+        spans.sort_by_key(|(source, span)| (source.0, span.start, span.end));
+        spans.dedup();
         if spans.is_empty() {
             return Err(RenameRefusal::NotAnIdentifier);
         }
@@ -3630,7 +3681,7 @@ impl Document {
                     && self
                         .reference_index
                         .occurrences_of(definition)
-                        .all(|occurrence| occurrence.is_declaration)
+                        .all(|occurrence| occurrence.is_declaration_of(definition))
             })
             .map(|(_, variable)| variable.name_span)
             .collect()

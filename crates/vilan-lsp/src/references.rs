@@ -40,6 +40,18 @@
 //!    every type-check pass), so the table is deduplicated at build time. This
 //!    is what makes a rename's edit set applicable.
 //!
+//!    One shape genuinely writes two DIFFERENT definitions at one span, and it
+//!    is not a duplicate to discard: the struct-init field shorthand
+//!    `A { x }`, whose single identifier is both the field key and a read of
+//!    the local `x` (E134). Dropping either half is a real loss — the local's
+//!    only surviving row became its declaration, so find-references missed the
+//!    use and the unused-local third faded a binding that is read. Such a row
+//!    carries the second definition as a CO-REFERENCE
+//!    ([`Occurrence::co_definition`]) instead: `occurrences_of` answers for
+//!    both names, [`ReferenceIndex::at`] still returns one row, and rename
+//!    REFUSES at the span, because a shorthand has no room to spell two names
+//!    and rewriting it would serve one of them.
+//!
 //! One table per PROGRAM, though — and a program reaches only its own import
 //! closure, the files below its entry. So a symbol queried in the file that
 //! DEFINES it could not see the files that import it (kolt.local 034, 003
@@ -57,7 +69,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use vilan_core::Span;
-use vilan_core::analyzer::{Expr, Program, SourceId};
+use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Program, SourceId};
 use vilan_core::id::Id;
 
 /// A definition that identifiers can name.
@@ -152,7 +164,44 @@ pub struct Occurrence {
     pub span: Span,
     pub definition: Definition,
     /// Whether this occurrence is the definition's own declaration name.
+    ///
+    /// Always about [`Occurrence::definition`], never about
+    /// [`Occurrence::co_definition`] — a co-referenced definition's own
+    /// declaration is a row elsewhere. Ask [`Occurrence::is_declaration_of`]
+    /// when the definition in hand may be either.
     pub is_declaration: bool,
+    /// A SECOND definition this same identifier names (E134).
+    ///
+    /// `Some` for exactly one shape: the struct-init field shorthand
+    /// `A { x }`, whose one identifier is both the field key of `A::x` and a
+    /// read of the local `x`. The analyzer records the field key at the name
+    /// span and synthesizes a local read whose span is the whole entry — for a
+    /// shorthand, the same bytes. Neither is a duplicate of the other, so the
+    /// dedup cannot just drop one, and the two cannot be two rows without
+    /// breaking invariant 2 (and with it every rename's edit set). So one row
+    /// carries both names, and every definition-keyed query sees it.
+    pub co_definition: Option<Definition>,
+}
+
+impl Occurrence {
+    /// Whether this row is `definition`'s own declaration name — the
+    /// [`Occurrence::is_declaration`] question asked safely of a definition
+    /// that may be reaching this row as a co-reference, where the flag belongs
+    /// to the OTHER name.
+    pub fn is_declaration_of(&self, definition: Definition) -> bool {
+        self.is_declaration && self.definition == definition
+    }
+
+    /// The other name this row carries, seen from `definition` — `None` when
+    /// this row names only `definition`.
+    pub fn shared_with(&self, definition: Definition) -> Option<Definition> {
+        let other = self.co_definition?;
+        if other == definition {
+            Some(self.definition)
+        } else {
+            Some(other)
+        }
+    }
 }
 
 /// Where in a recorded span the identifier sits.
@@ -204,6 +253,30 @@ fn narrow(span: Span, name: &str, anchor: Anchor) -> Option<Span> {
     })
 }
 
+/// Whether two definitions claiming one span are the two halves of a
+/// struct-init field shorthand `A { x }` (E134) — a field, and a binding that
+/// the shorthand reads under the same name.
+///
+/// It is a SHAPE test, not a guess: nothing else in the language puts a field
+/// key and a value read at identical bytes. `A { x = 1 }` records the key at
+/// `x` and the value elsewhere; `a.x` records only the field. Invariant 1 has
+/// already proved both spans spell their definition's name, so the two names
+/// being equal is the last thing left to check, and derive-generated code —
+/// where unrelated definitions collide on shared template offsets — is
+/// excluded outright, since a template's bytes are nobody's identifier.
+fn is_field_shorthand(program: &Program, left: Definition, right: Definition) -> bool {
+    let (field, entity) = match (left, right) {
+        (Definition::Field(..), Definition::Entity(id)) => (left, id),
+        (Definition::Entity(id), Definition::Field(..)) => (right, id),
+        _ => return false,
+    };
+    matches!(
+        kind_of(program, Definition::Entity(entity)),
+        Some(DefinitionKind::Binding)
+    ) && name_of(program, field).is_some()
+        && name_of(program, field) == name_of(program, Definition::Entity(entity))
+}
+
 /// The reference index for one analyzed program.
 #[derive(Default)]
 pub struct ReferenceIndex {
@@ -246,6 +319,7 @@ impl ReferenceIndex {
                     span,
                     definition,
                     is_declaration,
+                    co_definition: None,
                 }),
                 None => *dropped.entry(definition).or_default() += 1,
             }
@@ -528,25 +602,76 @@ impl ReferenceIndex {
             );
         }
 
-        // --- Deduplicate ---------------------------------------------------
+        // --- Collapse each span to one row ---------------------------------
         // Sort so declarations win the tie for a span recorded by both passes,
-        // then drop every repeat of a `(source, span)`. Without this a struct
-        // rename emits each constructor site twice and the client rejects the
-        // whole edit as overlapping.
+        // then reduce every `(source, span)` group to a single row. Invariant 2
+        // is what makes a rename's edit set applicable: a duplicate span
+        // reaches the client as an overlapping `TextEdit` and it rejects the
+        // whole edit ("Rename failed to apply edits").
+        //
+        // A group has one of three shapes.
+        //
+        //  - The SAME definition recorded twice — a struct's constructor name
+        //    landing in both `type_references` and `struct_initializer_to_def`,
+        //    a match pattern's segments re-recorded per type-check pass, a
+        //    declaration name that is also a `type_references` row. A true
+        //    duplicate: keep one, drop the rest.
+        //  - A FIELD KEY and a LOCAL READ, the struct-init shorthand `A { x }`
+        //    (E134). Two different definitions, one identifier, and both are
+        //    real: dropping either is the defect this arm exists to end. Keep
+        //    one row and give it the other name as a co-reference.
+        //  - Anything else at one span, which today means only derive-generated
+        //    code: two expansions of one `[derive(..)]` template index the same
+        //    template offsets, so `Ordering` and `JsonKind` both claim
+        //    `DERIVED_SOURCE` 304..312. Those are unrelated definitions that
+        //    merely share an address in a text no file holds and no rename may
+        //    touch; linking them would make `occurrences_of` answer with the
+        //    other program's rows. Kept as it always was: one row, the rest
+        //    discarded.
         rows.sort_by(|left, right| {
             (left.source.0, left.span.start, left.span.end)
                 .cmp(&(right.source.0, right.span.start, right.span.end))
                 .then(right.is_declaration.cmp(&left.is_declaration))
                 .then(left.definition.sort_key().cmp(&right.definition.sort_key()))
         });
-        rows.dedup_by(|left, right| left.source == right.source && left.span == right.span);
+        let mut collapsed: Vec<Occurrence> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(kept) = collapsed.last_mut() else {
+                collapsed.push(row);
+                continue;
+            };
+            if kept.source != row.source || kept.span != row.span {
+                collapsed.push(row);
+                continue;
+            }
+            if kept.definition != row.definition
+                && kept.co_definition.is_none()
+                && !kept.is_declaration
+                && !row.is_declaration
+                && row.source != DERIVED_SOURCE
+                && is_field_shorthand(program, kept.definition, row.definition)
+            {
+                kept.co_definition = Some(row.definition);
+            }
+        }
+        let rows = collapsed;
 
+        // A co-reference is indexed under BOTH names, which is what makes
+        // `occurrences_of(local)` see the shorthand use — the half the old
+        // dedup destroyed, and the reason the unused-local third faded a
+        // binding the program reads.
         let mut by_definition: HashMap<Definition, Vec<u32>> = HashMap::new();
         for (index, row) in rows.iter().enumerate() {
             by_definition
                 .entry(row.definition)
                 .or_default()
                 .push(index as u32);
+            if let Some(co_definition) = row.co_definition {
+                by_definition
+                    .entry(co_definition)
+                    .or_default()
+                    .push(index as u32);
+            }
         }
 
         ReferenceIndex {
@@ -621,7 +746,7 @@ impl ReferenceIndex {
     pub fn key_of(&self, program: &Program, definition: Definition) -> Option<DefinitionKey> {
         let declaration = self
             .occurrences_of(definition)
-            .find(|occurrence| occurrence.is_declaration)?;
+            .find(|occurrence| occurrence.is_declaration_of(definition))?;
         let path = program
             .canonical_sources
             .get(declaration.source.0 as usize)?
@@ -979,6 +1104,172 @@ fun main(): i32 {
             Some("sum"),
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E134: the struct-init field shorthand ---------------------------
+    //
+    // `A { x }` is ONE identifier naming TWO definitions: the field key of
+    // `A::x`, and a read of the local `x` (the AST has no value node for a
+    // shorthand, so the analyzer synthesizes the read at the entry's span —
+    // for a shorthand, the same bytes as the name). The old dedup dropped
+    // whichever lost `Definition::sort_key()`, which is declaration order, so
+    // ONE of the two names was always destroyed: with the struct declared
+    // first the local kept only its declaration — find-references answered
+    // with just that, and the unused-local third faded a binding the program
+    // reads — and with the struct declared after, the field lost its rename
+    // site instead. The owner reported both halves as separate bugs.
+
+    const SHORTHAND_STRUCT_FIRST: &str =
+        "struct A { x: i32 }\n\nfun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n";
+    const SHORTHAND_STRUCT_LAST: &str =
+        "fun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n\nstruct A { x: i32 }\n";
+
+    /// The reference spans the cursor at `offset` answers with, as the text
+    /// they cover, in source order.
+    fn shorthand_references(document: &Document, source: &str, offset: usize) -> Vec<String> {
+        let mut found: Vec<(usize, String)> = document
+            .references(offset)
+            .into_iter()
+            .map(|(_, span)| {
+                (
+                    span.start,
+                    source.get(span.into_range()).unwrap_or("?").to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, text)| text).collect()
+    }
+
+    // Both declaration orders, both halves. Nothing fades, and each name's
+    // reference set is COMPLETE from its own declaration: the local is the
+    // declaration plus the shorthand, the field is the declaration plus the
+    // shorthand plus `a.x`. Before the fix one of these two was short by the
+    // shorthand in each order, and `SHORTHAND_STRUCT_FIRST` faded `x`.
+    #[test]
+    fn a_field_shorthand_is_a_reference_to_both_names_in_either_order() {
+        for (label, source) in [
+            ("the struct declared first", SHORTHAND_STRUCT_FIRST),
+            ("the struct declared after", SHORTHAND_STRUCT_LAST),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            assert!(
+                document.diagnostics.is_empty(),
+                "{label}: the fixture must analyze clean, got {:?}",
+                document
+                    .diagnostics
+                    .iter()
+                    .map(|e| &e.msg)
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                document
+                    .unused_local_spans()
+                    .into_iter()
+                    .map(|span| source.get(span.into_range()).unwrap_or("?"))
+                    .collect::<Vec<_>>(),
+                Vec::<&str>::new(),
+                "{label}: `x` is read by the shorthand initializer",
+            );
+            let local = source.find("let x = 1").expect("fixture") + 4;
+            let field = source.find("x: i32").expect("fixture");
+            assert_eq!(
+                shorthand_references(&document, source, local),
+                ["x", "x"],
+                "{label}: the local's declaration and the shorthand that reads it",
+            );
+            assert_eq!(
+                shorthand_references(&document, source, field),
+                ["x", "x", "x"],
+                "{label}: the field's declaration, the shorthand key, and `a.x`",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Invariant 2 is untouched by the fix: the shorthand is ONE row carrying a
+    // co-reference, not two rows at one span. The pin says so directly, since
+    // "no two rows share a span" would also be satisfied by going back to
+    // throwing one of the two names away.
+    #[test]
+    fn a_field_shorthand_is_one_row_carrying_both_names() {
+        let (dir, document) = analyze_workspace(&[("main.vl", SHORTHAND_STRUCT_FIRST)]);
+        let offset = SHORTHAND_STRUCT_FIRST.find("A { x }").expect("fixture") + 4;
+        let index = document.reference_index();
+        let row = index
+            .at(SourceId(0), offset)
+            .expect("a row at the shorthand");
+        assert_eq!(SHORTHAND_STRUCT_FIRST.get(row.span.into_range()), Some("x"),);
+        let other = row
+            .co_definition
+            .expect("the second name this span carries");
+        assert_ne!(other, row.definition);
+        assert_eq!(
+            index
+                .rows()
+                .iter()
+                .filter(|other| other.source == row.source && other.span == row.span)
+                .count(),
+            1,
+            "one span, one row — invariant 2",
+        );
+        // And the row is reachable from BOTH names.
+        assert!(
+            index
+                .occurrences_of(other)
+                .any(|found| found.span == row.span),
+        );
+        assert!(
+            index
+                .occurrences_of(row.definition)
+                .any(|found| found.span == row.span),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Rename REFUSES at a shorthand from either side, with the expansion in
+    // the message. One identifier cannot spell two names, so rewriting it
+    // serves one and silently breaks the other — which is what renaming the
+    // FIELD did before this, since the shorthand key was already in its edit
+    // set. The refusal is the rule kolt.local 002 set: a rename that cannot
+    // produce a complete edit set says why rather than emitting a partial one.
+    #[test]
+    fn rename_refuses_at_a_field_shorthand_from_either_side() {
+        for (label, source) in [
+            ("the struct declared first", SHORTHAND_STRUCT_FIRST),
+            ("the struct declared after", SHORTHAND_STRUCT_LAST),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            for (side, offset) in [
+                (
+                    "from the local",
+                    source.find("let x = 1").expect("fixture") + 4,
+                ),
+                ("from the field", source.find("x: i32").expect("fixture")),
+                (
+                    "at the shorthand",
+                    source.find("A { x }").expect("fixture") + 4,
+                ),
+            ] {
+                let refusal = document
+                    .rename_edits(offset, "renamed")
+                    .expect_err(&format!("{label}, {side}: a shorthand cannot be renamed"));
+                let message = refusal.message();
+                assert!(
+                    message.contains("field shorthand") && message.contains("`x = x`"),
+                    "{label}, {side}: {message}",
+                );
+            }
+            // A name with no shorthand in it renames as it always did — the
+            // refusal is about the shape, not about fields or locals.
+            assert!(
+                document
+                    .rename_edits(source.find("let a = A").expect("fixture") + 4, "renamed")
+                    .is_ok(),
+                "{label}: `a` has no shorthand site",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // --- The per-symbol-kind matrix -------------------------------------
