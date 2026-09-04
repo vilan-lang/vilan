@@ -3209,6 +3209,19 @@ pub struct Analyzer<'src> {
     // real source — so a diagnostic anchored in generated code re-anchors at
     // its attribute (standard A2).
     derived_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
+    /// The same per-walk record keyed by the TYPE ids the walk minted (B217).
+    ///
+    /// A written type annotation is not resolved during the walk at all: it is
+    /// PREPPED (`prepped_type_locals`, `prepped_type_static_accessors`) and
+    /// drained in `build()`, long after the generated walk closed. Those drains
+    /// carry the walk's `SourceId` and no entity id, so `push_in_source` had
+    /// nothing to look an origin up BY and kept the entry fallback — a
+    /// generated type miss then landed at the declaring `mod`, or at the type,
+    /// or wherever the deriving file happened to hold those offsets. Type ids
+    /// are minted from their own monotonic counter, so a walk's are contiguous
+    /// exactly as its entity ids are, and the range is known when the
+    /// references are prepped.
+    derived_type_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
     // Where an unannotated closure parameter's shared type slot was filled
     // from (the FIRST call's argument, B13) — a later conflicting call
     // diagnoses naming that origin instead of a bare mismatch.
@@ -4183,6 +4196,7 @@ impl<'src> Analyzer<'src> {
             prelude_repair: PreludeRepair::default(),
             std_trait_method_index: None,
             derived_origins: Vec::new(),
+            derived_type_origins: Vec::new(),
             closure_parameter_fill_sites: HashMap::default(),
             prepped_binder_inheritance: Vec::new(),
             binary_op_dispatch: HashMap::default(),
@@ -15477,6 +15491,7 @@ impl<'src> Analyzer<'src> {
     ) {
         let walking = self.current_source_id;
         let generated_start = self.entity_id;
+        let generated_type_start = self.type_id;
         let diagnostics_before = self.diagnostics.len();
         self.set_current_source(DERIVED_SOURCE);
         self.walk_generated_items(generated, scope_id);
@@ -15487,6 +15502,10 @@ impl<'src> Analyzer<'src> {
         });
         self.derived_origins
             .push((generated_start..self.entity_id, origin, origin_source));
+        // The type ids the walk minted, so the annotations it PREPPED can find
+        // this origin when they drain in `build()` (B217).
+        self.derived_type_origins
+            .push((generated_type_start..self.type_id, origin, origin_source));
         // Runs BEFORE the restore: it closes the attribution run it opens with
         // whatever `current_source_id` then is, so the walk's own source has to
         // still be current for the marks to bracket the generated diagnostics.
@@ -28888,15 +28907,56 @@ impl<'src> Analyzer<'src> {
     /// the walk that saw them.
     ///
     /// A generated span ([`DERIVED_SOURCE`]) keeps the entry fallback here:
-    /// re-anchoring at the attribute needs an entity id to find the origin
-    /// range by, and a bare source cannot supply one. Every site that HAS an
-    /// id uses [`Self::push_anchored`], which does re-anchor.
+    /// re-anchoring at the attribute needs an id to find the origin range by,
+    /// and a bare source cannot supply one. A site that HAS one uses
+    /// [`Self::push_anchored`] (an entity) or
+    /// [`Self::push_at_written_type`] (a written annotation's type id), and
+    /// both re-anchor.
     fn push_in_source(&mut self, error: Error, source: SourceId) {
         let from = self.diagnostics.len();
         self.diagnostics.push(error);
         if source != DERIVED_SOURCE {
             self.attribute_new_diagnostics(from, source);
         }
+    }
+
+    /// [`Self::push_in_source`] for the `prepped_*` type-reference drains: the
+    /// diagnostic is about a WRITTEN ANNOTATION, and the annotation's type id
+    /// is the anchor a generated one re-anchors by (B217).
+    ///
+    /// These drains run in `build()`, after every walk has closed, so they are
+    /// the one family that carries its own `(span, source)` instead of
+    /// inheriting an attribution mark. Generated code reaches them exactly as
+    /// hand-written code does — the type miss in a derive template is prepped
+    /// by the generated walk and resolved here — and before this the redirect
+    /// simply did not cover the route: the message said nothing about its
+    /// provenance and the span indexed a template no file holds.
+    fn push_at_written_type(&mut self, error: Error, source: SourceId, type_id: TypeId) {
+        let origin = match source {
+            DERIVED_SOURCE => self.derived_type_origin(type_id),
+            _ => None,
+        };
+        let from = self.diagnostics.len();
+        self.diagnostics.push(error);
+        match origin {
+            Some((origin_span, origin_source)) => {
+                self.redirect_derived_range(from, origin_span, origin_source)
+            }
+            None => {
+                if source != DERIVED_SOURCE {
+                    self.attribute_new_diagnostics(from, source);
+                }
+            }
+        }
+    }
+
+    /// [`Self::derived_origins`]' lookup by the TYPE id a generated walk minted
+    /// — which attribute wrote the annotation this id came from (B217).
+    fn derived_type_origin(&self, type_id: TypeId) -> Option<(Span, SourceId)> {
+        self.derived_type_origins
+            .iter()
+            .find(|(range, _, _)| range.contains(&type_id.0))
+            .map(|(_, span, source)| (*span, *source))
     }
 
     /// The file a whole-program check's SECONDARY note points into, in the
@@ -34862,7 +34922,7 @@ impl<'src> Analyzer<'src> {
                     {
                         let (message, note) =
                             self.non_trait_in_bound_position(name, sort, subject_id, scope_id);
-                        self.push_in_source(
+                        self.push_at_written_type(
                             Error {
                                 trace: Vec::new(),
                                 note,
@@ -34870,6 +34930,7 @@ impl<'src> Analyzer<'src> {
                                 msg: message,
                             },
                             source_id,
+                            type_id,
                         );
                     }
                     let refused_arity = arity_error.is_some();
@@ -34877,7 +34938,7 @@ impl<'src> Analyzer<'src> {
                         // Attributed to the walk that wrote the annotation, for
                         // the reason the unresolved arm below is (E108) — this
                         // is the same drain, and it had the same defect.
-                        self.push_in_source(
+                        self.push_at_written_type(
                             Error {
                                 trace: Vec::new(),
                                 note: None,
@@ -34885,6 +34946,7 @@ impl<'src> Analyzer<'src> {
                                 msg: message,
                             },
                             source_id,
+                            type_id,
                         );
                     }
                     // Attach the written generic arguments to the nominal type
@@ -35020,7 +35082,7 @@ impl<'src> Analyzer<'src> {
                             // annotation, for the reason the unresolved arm
                             // below is (E108) — this is the same drain, and
                             // it had the same defect.
-                            self.push_in_source(
+                            self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
                                     note,
@@ -35028,6 +35090,7 @@ impl<'src> Analyzer<'src> {
                                     msg: message,
                                 },
                                 source_id,
+                                type_id,
                             );
                             // B182: the slot this report accounts for.
                             // Everything downstream reads `Unknown` here —
@@ -35091,7 +35154,7 @@ impl<'src> Analyzer<'src> {
                     // indexes a file the author never opened. `source_id` is
                     // the walk's own record, captured when the annotation was
                     // prepped.
-                    self.push_in_source(
+                    self.push_at_written_type(
                         Error {
                             trace: Vec::new(),
                             note: None,
@@ -35099,6 +35162,7 @@ impl<'src> Analyzer<'src> {
                             msg: message,
                         },
                         source_id,
+                        type_id,
                     );
                     // B189's first sibling: a name that does not resolve is a
                     // REFUSED ANNOTATION like any other. B182 instrumented the
@@ -35141,7 +35205,7 @@ impl<'src> Analyzer<'src> {
                         // slot and the mistake surfaced, if at all, as a
                         // mismatch wherever the annotated thing was next used.
                         Some(member_id) if !self.entity_denotes_a_type(member_id) => {
-                            self.push_in_source(
+                            self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
                                     note: None,
@@ -35151,6 +35215,7 @@ impl<'src> Analyzer<'src> {
                                     ),
                                 },
                                 source_id,
+                                type_id,
                             );
                             self.write_type_slot(type_id, Type::Unknown);
                         }
@@ -35171,7 +35236,7 @@ impl<'src> Analyzer<'src> {
                             self.write_type_slot(type_id, member_type);
                         }
                         None => {
-                            self.push_in_source(
+                            self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
                                     note: None,
@@ -35182,6 +35247,7 @@ impl<'src> Analyzer<'src> {
                                     ),
                                 },
                                 source_id,
+                                type_id,
                             );
                             self.write_type_slot(type_id, Type::Unknown);
                         }
@@ -35197,7 +35263,7 @@ impl<'src> Analyzer<'src> {
                     if !matches!(subject_type, Type::Unknown | Type::Unresolved) {
                         let subject_str =
                             self.pretty_print_type(&subject_type, &HashMap::default());
-                        self.push_in_source(
+                        self.push_at_written_type(
                             Error {
                                 trace: Vec::new(),
                                 note: None,
@@ -35207,6 +35273,7 @@ impl<'src> Analyzer<'src> {
                                 ),
                             },
                             source_id,
+                            type_id,
                         );
                     }
                     self.write_type_slot(type_id, Type::Unknown);
