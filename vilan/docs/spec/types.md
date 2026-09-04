@@ -921,11 +921,10 @@ match. A then-branch that can fall through reaches it on a miss. And an
 `if` with an `else` reaches it through whichever arm did not diverge,
 which is a different question and is not part of this rule.
 
-*Implementation note (tracked gap): the guard clause's continuation
-binding is decided while the body is walked, and the divergence leaves
-that make `panic(..)` count (§5.1) are settled after the walk — so a
-guard ending in a panic does not yet publish its captures. Tracked as
-B222; pinned as an `#[ignore]`d test.*
+"Diverges" is the whole of §5.1's rule, every leaf included: a guard
+ending in `ret`, in a `jump`, in a `panic(..)` or in a `for { .. }`
+nothing breaks out of publishes its captures the same way, because the
+language has one answer to "does this leave?" and this is it.
 
 **Everything above is about a CONDITION** — an `if`'s, a `while`-shaped
 `for`'s, a `match` guard's — because a condition is the only thing that

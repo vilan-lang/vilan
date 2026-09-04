@@ -2595,6 +2595,32 @@ impl ConditionPolarity {
     }
 }
 
+/// A guard clause whose verdict is not yet in (B222): an else-less `if` whose
+/// condition binds captures on its FALSE path, written down while the body is
+/// walked and decided once [`DivergenceLeaves`] have settled.
+///
+/// B187 asked `Divergence` during the walk, which can only see the leaves an
+/// expression's SHAPE carries — `ret` and `jump`. The other two (a `panic(…)`
+/// call, an endless `for { … }`) are resolved facts about the whole world, so
+/// `if !(maybe is Some(let n)) { panic("missing"); } print(n)` refused `n`: at
+/// the moment the guard was walked, the panic was not yet an ending. The
+/// question moves whole to the one place that can answer it for every leaf —
+/// the walk now only records what it would have asked.
+#[derive(Clone, Debug)]
+struct GuardContinuation<'src> {
+    /// The scope the captures are published into: the one the guard is written
+    /// in, which is where its continuation runs.
+    scope_id: Id,
+    /// The end of the `if` — a continuation binding is visible from there on.
+    visible_from: usize,
+    /// The then-block, the thing that has to diverge for any of this to hold.
+    then_statements: Vec<Id>,
+    then_tail: Id,
+    /// What the condition binds by being FALSE (`name`, entity, `visible_until`)
+    /// — B195's else set, which with no `else` has the continuation for a home.
+    captures: Vec<(&'src str, Id, usize)>,
+}
+
 /// Whether a node is part of an `if` condition's BOOLEAN SPINE — the operators
 /// whose truth the branches are selected by, and the `is` test itself (B195).
 ///
@@ -3533,6 +3559,10 @@ pub struct Analyzer<'src> {
     // constraint fixpoint) rather than per query, since each is a scan and
     // `expr_diverges` is asked once per statement.
     divergence_leaves: DivergenceLeaves,
+    // The guard clauses whose continuation binding is still undecided (B222):
+    // recorded by the walk, settled in `resolve_world` once the leaves above
+    // exist and before any name resolves against the scope they publish into.
+    guard_continuations: Vec<GuardContinuation<'src>>,
     // The `std::reactive` `Source` TRAIT, if loaded. `[expose]` reconciles an
     // exposed field's type against it (A32's ruling): a field is exposable when
     // its type IMPLEMENTS the nominal std trait, not when its spelling happens
@@ -4232,6 +4262,7 @@ impl<'src> Analyzer<'src> {
             panic_fn_id: None,
             call_subjects: Vec::new(),
             divergence_leaves: DivergenceLeaves::default(),
+            guard_continuations: Vec::new(),
             source_trait_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
@@ -15281,17 +15312,32 @@ impl<'src> Analyzer<'src> {
         let positional = !self.module_scope_ids.contains(&scope_id)
             || visible_until != LocalDeclaration::FOREVER;
         let scope = self.mut_scope_for_scope_id(scope_id);
-        scope.name_to_id_map.insert(name, id);
-        if positional {
-            scope
-                .local_value_declarations
-                .entry(name)
-                .or_default()
-                .push(LocalDeclaration {
-                    visible_from,
-                    visible_until,
-                    id,
-                });
+        if !positional {
+            scope.name_to_id_map.insert(name, id);
+            return;
+        }
+        // Kept ordered by `visible_from`, because the resolver reads the LAST
+        // covering entry as the innermost one. The walk declares in source
+        // order, so this appends and nothing changes; B222's guard-continuation
+        // pass is the one caller that declares out of order — it publishes a
+        // capture from the END of an `if` after the whole enclosing block has
+        // been walked, and appending it would have made it shadow the `let` of
+        // the same name written BELOW the guard. `name_to_id_map` follows the
+        // same rule it always had — the last declaration wins — which is now
+        // the last one by position rather than by arrival.
+        let entries = scope.local_value_declarations.entry(name).or_default();
+        let at = entries.partition_point(|entry| entry.visible_from <= visible_from);
+        let last = at == entries.len();
+        entries.insert(
+            at,
+            LocalDeclaration {
+                visible_from,
+                visible_until,
+                id,
+            },
+        );
+        if last {
+            scope.name_to_id_map.insert(name, id);
         }
     }
 
@@ -22143,30 +22189,24 @@ impl<'src> Analyzer<'src> {
                 // Divergence is `Divergence::new`'s answer — one walk, B204 — the one the type
                 // checker itself acts on, so the guard and the editor's
                 // unreachable-code paint cannot disagree about what "dead" is.
-                // (`panic(…)` is a leaf for the paint and not for the checker;
-                // when the checker gains it, the guard gains it with no change
-                // here.)
-                let continuation_captures = match &branch {
-                    ExprIfBranch::If(_, (then_ids, then_tail), None)
-                        if !false_path_captures.is_empty()
-                            && Divergence::new(
-                                &self.expr_id_to_expr_map,
-                                &self.divergence_leaves,
-                            )
-                            .block(then_ids, *then_tail) =>
-                    {
-                        false_path_captures
-                    }
-                    _ => Vec::new(),
-                };
-                for (name, capture_id, visible_until) in continuation_captures {
-                    self.declare_scope_value_until(
+                //
+                // B222: which is why the verdict is not taken HERE. Two of that
+                // walk's four leaves — a `panic(…)` call, an endless `for { … }`
+                // — are facts about the resolved world, not about an
+                // expression's shape, and they settle after this walk has run.
+                // Asking now would answer for `ret` and `jump` and quietly say
+                // "no" to the other ending. So the candidate is written down and
+                // `resolve_world` decides it, once, for all four leaves.
+                if let ExprIfBranch::If(_, (then_ids, then_tail), None) = &branch
+                    && !false_path_captures.is_empty()
+                {
+                    self.guard_continuations.push(GuardContinuation {
                         scope_id,
-                        name,
-                        capture_id,
-                        node.1.end,
-                        visible_until,
-                    );
+                        visible_from: node.1.end,
+                        then_statements: then_ids.clone(),
+                        then_tail: *then_tail,
+                        captures: false_path_captures,
+                    });
                 }
                 // A value `if` — one with a final `else` — has its arms unified
                 // by the same rule a `match`'s legs go through (B163). Queued
@@ -34352,6 +34392,153 @@ impl<'src> Analyzer<'src> {
         self.finalize_build();
     }
 
+    /// Whether a queued bare-name use is one a guard clause's continuation
+    /// might bind (B222) — a capture of that name, published by a guard written
+    /// in a scope this use is inside. Those uses wait for the verdict; every
+    /// other name resolves in the drain's first part.
+    ///
+    /// Deliberately asked by NAME and SCOPE only, not by byte offset: a use
+    /// ahead of the guard reads the same declaration record to say "'n' is
+    /// declared here, later in the scope", so it has to see the record too.
+    fn guard_may_publish(&mut self, id: Id, name: &'src str) -> bool {
+        if self.guard_continuations.is_empty() {
+            return false;
+        }
+        let scope_id = self.get_scope_id_for_entity(id);
+        self.guard_continuations.iter().any(|guard| {
+            guard
+                .captures
+                .iter()
+                .any(|(capture, _, _)| *capture == name)
+                && self.scope_encloses(guard.scope_id, scope_id)
+        })
+    }
+
+    /// One queued bare-name use, resolved against its scope at its own byte
+    /// offset. Lifted out of `resolve_world`'s drain (B222) because that drain
+    /// now runs in TWO parts around the guard-continuation pass: a name a guard
+    /// clause might publish cannot resolve until the pass that publishes it has
+    /// run, and every other name — the call subjects the divergence leaves are
+    /// read from among them — must resolve before it.
+    fn resolve_prepped_local(&mut self, id: Id, name: &'src str) {
+        let scope_id = self.get_scope_id_for_entity(id);
+        // A use resolves at its own byte offset (positional visibility,
+        // proposal/local-shadowing.md); a spanless synthesized use sees
+        // the whole scope, as every use did before shadowing.
+        let use_offset = match self.span_map.get(&id) {
+            Some(span) if span.end > span.start => span.start,
+            _ => usize::MAX,
+        };
+        match self.resolve_value_name_at(name, scope_id, use_offset) {
+            Some(subject_id) => {
+                if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
+                    let diagnostics_before = self.diagnostics.len();
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                        msg: message,
+                    });
+                    if let Some(source) = self.source_of_id(id) {
+                        self.attribute_new_diagnostics(diagnostics_before, source);
+                    }
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                } else {
+                    let rc = self.reference_count.entry(subject_id).or_insert(0);
+                    *rc += 1;
+                    self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
+                }
+            }
+            None => {
+                let diagnostics_before = self.diagnostics.len();
+                // B215: the name is not missing — it was captured by an `is`
+                // written in EXPRESSION position, whose answer is an ordinary
+                // `bool`. Nothing past that expression proves the test
+                // passed, so the capture stops there; refusing this read as a
+                // name typo would send its author looking for a spelling
+                // mistake instead of at the shape of the test.
+                if let Some(test) = self.expression_position_capture(name, scope_id, use_offset) {
+                    let spelling = self
+                        .source_of_id(id)
+                        .and_then(|source| self.spelling_at(source, test));
+                    let steer = match spelling {
+                        Some(test) => format!(
+                            ". Put the test where a branch depends on it — \
+                             `if {test} {{ … }}` — and read '{name}' inside"
+                        ),
+                        None => format!(
+                            ". Put the test where a branch depends on it — an `if`, a \
+                             `while`-shaped `for`, a `match` guard — and read '{name}' inside"
+                        ),
+                    };
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "'{name}' is bound only inside the `is` test that captured it: \
+                             outside a condition that test is an ordinary `bool`, and nothing \
+                             after it proves the payload is there{steer}"
+                        ),
+                    });
+                    if let Some(source) = self.source_of_id(id) {
+                        self.attribute_new_diagnostics(diagnostics_before, source);
+                    }
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return;
+                }
+                let steer = self.import_steer(name).unwrap_or_default();
+                // A use before the name's only declaration gets pointed at
+                // it: the visibility rule is new information.
+                let note = self.later_local_declaration(name, scope_id, use_offset).map(
+                    |later_id| {
+                        // The use sitting inside the declaring statement is
+                        // the self-referential initializer (`let x = x;`);
+                        // anywhere else it is a plain use-before-declaration.
+                        let own_initializer = self
+                            .span_map
+                            .get(&later_id)
+                            .is_some_and(|span| span.into_range().contains(&use_offset));
+                        Note {
+                            span: self
+                                .variables
+                                .get(&later_id)
+                                .map(|variable| variable.name_span)
+                                .unwrap_or_else(|| {
+                                    **self.span_map.get(&later_id).unwrap_or(&&EMPTY_SPAN)
+                                }),
+                            msg: if own_initializer {
+                                format!(
+                                    "'{}' is the binding being declared: an initializer cannot read its own binding",
+                                    name
+                                )
+                            } else {
+                                format!(
+                                    "'{}' is declared here, later in the scope: a local binding is visible only after its declaration",
+                                    name
+                                )
+                            },
+                            source: self.source_of_id(later_id),
+                        }
+                    },
+                );
+                let note = note
+                    .or_else(|| self.element_view_import_note(id, name))
+                    .or_else(|| self.css_style_import_note(id, name));
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note,
+                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!("cannot find '{}' in this scope{}", name, steer),
+                });
+                if let Some(source) = self.source_of_id(id) {
+                    self.attribute_new_diagnostics(diagnostics_before, source);
+                }
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+            }
+        }
+    }
+
     /// The resolution preamble and the constraint fixpoint — everything
     /// `build()` does BEFORE the commit tail. The S3 two-phase shape runs
     /// this alone over the pre-entry world (analysis-reuse.md §6.7): the
@@ -34500,124 +34687,23 @@ impl<'src> Analyzer<'src> {
             self.generic_bounds.insert(binder_constraint_id, bounds);
         }
 
+        // B222: the drain runs in two parts. A guard clause publishes its
+        // condition's false-path captures into the enclosing scope only once
+        // the divergence leaves have settled — `panic(…)` is an ending the walk
+        // cannot recognise, and a call's subject is not a resolved name until
+        // the pass below has run — so a use those captures could bind is held
+        // back and resolved with the guard verdict, at the bottom of this
+        // function. Everything else resolves here. The held-back set is a name
+        // a guard in an ENCLOSING scope publishes, nothing wider: a file with
+        // no guard clause defers nothing, and an unrelated local that happens
+        // to share a capture's name is not a use the pass can change.
+        let mut guarded_locals = Vec::new();
         for (id, name) in std::mem::take(&mut self.prepped_locals) {
-            let scope_id = self.get_scope_id_for_entity(id);
-            // A use resolves at its own byte offset (positional visibility,
-            // proposal/local-shadowing.md); a spanless synthesized use sees
-            // the whole scope, as every use did before shadowing.
-            let use_offset = match self.span_map.get(&id) {
-                Some(span) if span.end > span.start => span.start,
-                _ => usize::MAX,
-            };
-            match self.resolve_value_name_at(name, scope_id, use_offset) {
-                Some(subject_id) => {
-                    if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
-                        let diagnostics_before = self.diagnostics.len();
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: message,
-                        });
-                        if let Some(source) = self.source_of_id(id) {
-                            self.attribute_new_diagnostics(diagnostics_before, source);
-                        }
-                        self.expr_id_to_expr_map.insert(id, Expr::Error);
-                    } else {
-                        let rc = self.reference_count.entry(subject_id).or_insert(0);
-                        *rc += 1;
-                        self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
-                    }
-                }
-                None => {
-                    let diagnostics_before = self.diagnostics.len();
-                    // B215: the name is not missing — it was captured by an `is`
-                    // written in EXPRESSION position, whose answer is an ordinary
-                    // `bool`. Nothing past that expression proves the test
-                    // passed, so the capture stops there; refusing this read as a
-                    // name typo would send its author looking for a spelling
-                    // mistake instead of at the shape of the test.
-                    if let Some(test) = self.expression_position_capture(name, scope_id, use_offset)
-                    {
-                        let spelling = self
-                            .source_of_id(id)
-                            .and_then(|source| self.spelling_at(source, test));
-                        let steer = match spelling {
-                            Some(test) => format!(
-                                ". Put the test where a branch depends on it — \
-                                 `if {test} {{ … }}` — and read '{name}' inside"
-                            ),
-                            None => format!(
-                                ". Put the test where a branch depends on it — an `if`, a \
-                                 `while`-shaped `for`, a `match` guard — and read '{name}' inside"
-                            ),
-                        };
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "'{name}' is bound only inside the `is` test that captured it: \
-                                 outside a condition that test is an ordinary `bool`, and nothing \
-                                 after it proves the payload is there{steer}"
-                            ),
-                        });
-                        if let Some(source) = self.source_of_id(id) {
-                            self.attribute_new_diagnostics(diagnostics_before, source);
-                        }
-                        self.expr_id_to_expr_map.insert(id, Expr::Error);
-                        continue;
-                    }
-                    let steer = self.import_steer(name).unwrap_or_default();
-                    // A use before the name's only declaration gets pointed at
-                    // it: the visibility rule is new information.
-                    let note = self.later_local_declaration(name, scope_id, use_offset).map(
-                        |later_id| {
-                            // The use sitting inside the declaring statement is
-                            // the self-referential initializer (`let x = x;`);
-                            // anywhere else it is a plain use-before-declaration.
-                            let own_initializer = self
-                                .span_map
-                                .get(&later_id)
-                                .is_some_and(|span| span.into_range().contains(&use_offset));
-                            Note {
-                                span: self
-                                    .variables
-                                    .get(&later_id)
-                                    .map(|variable| variable.name_span)
-                                    .unwrap_or_else(|| {
-                                        **self.span_map.get(&later_id).unwrap_or(&&EMPTY_SPAN)
-                                    }),
-                                msg: if own_initializer {
-                                    format!(
-                                        "'{}' is the binding being declared: an initializer cannot read its own binding",
-                                        name
-                                    )
-                                } else {
-                                    format!(
-                                        "'{}' is declared here, later in the scope: a local binding is visible only after its declaration",
-                                        name
-                                    )
-                                },
-                                source: self.source_of_id(later_id),
-                            }
-                        },
-                    );
-                    let note = note
-                        .or_else(|| self.element_view_import_note(id, name))
-                        .or_else(|| self.css_style_import_note(id, name));
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note,
-                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!("cannot find '{}' in this scope{}", name, steer),
-                    });
-                    if let Some(source) = self.source_of_id(id) {
-                        self.attribute_new_diagnostics(diagnostics_before, source);
-                    }
-                    self.expr_id_to_expr_map.insert(id, Expr::Error);
-                }
+            if self.guard_may_publish(id, name) {
+                guarded_locals.push((id, name));
+                continue;
             }
+            self.resolve_prepped_local(id, name);
         }
 
         // --- Wire assignments to their variables ---
@@ -35916,15 +36002,49 @@ impl<'src> Analyzer<'src> {
         }
 
         // B204's two resolved divergence leaves, settled HERE: after the
-        // preamble above (whose `prepped_locals` pass is what turns a call's
-        // subject into the `Expr::Local` naming its callee) and before the
-        // fixpoint below, so no constraint can observe a half-filled answer and
-        // none can change it. Every walk that mints a `for` or a call has run
-        // by now — the two-phase pipeline settles this once over the loaded
+        // preamble above (whose bare-name and member-path passes are what turn
+        // a call's subject into the `Expr::Local` naming its callee) and before
+        // the fixpoint below, so no constraint can observe a half-filled answer
+        // and none can change it. Every walk that mints a `for` or a call has
+        // run by now — the two-phase pipeline settles this once over the loaded
         // world and again after the entry walks — so the answer a constraint
         // acts on is the answer the finished program carries, which is the
         // answer the editor's paint reads back.
         self.divergence_leaves = self.compute_divergence_leaves();
+
+        // B222: and the guard clauses, decided with those leaves in hand — the
+        // first read of the divergence analysis in this build, and the reason
+        // the walk records a candidate instead of taking the verdict itself.
+        // The then-block has to diverge on EVERY path, and all four leaves
+        // count (`ret`, `jump`, a `panic(…)`, an endless `for { … }`) because
+        // the checker has one divergence analysis and this is it; then the
+        // captures the condition binds by being FALSE become ordinary
+        // declarations in the enclosing scope, visible from the end of the `if`
+        // onward (B187).
+        for guard in std::mem::take(&mut self.guard_continuations) {
+            let diverges = Divergence::new(&self.expr_id_to_expr_map, &self.divergence_leaves)
+                .block(&guard.then_statements, guard.then_tail);
+            if !diverges {
+                continue;
+            }
+            for (name, capture_id, visible_until) in guard.captures {
+                self.declare_scope_value_until(
+                    guard.scope_id,
+                    name,
+                    capture_id,
+                    guard.visible_from,
+                    visible_until,
+                );
+            }
+        }
+
+        // The uses held back at the drain above, now that the scope they read
+        // is complete. They are the last names to resolve and still resolve
+        // before the fixpoint, which is the only ordering the constraints care
+        // about.
+        for (id, name) in guarded_locals {
+            self.resolve_prepped_local(id, name);
+        }
 
         // --- Constraint solving loop ---
         // A true fixpoint: each pass resolves the constraints whose dependencies

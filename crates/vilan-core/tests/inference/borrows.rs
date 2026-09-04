@@ -7796,13 +7796,12 @@ fn b187_the_continuation_binding_stops_at_the_enclosing_block() {
 }
 
 #[test]
-#[ignore = "B222: the guard's continuation binding is decided during the walk, before B204's divergence leaves settle"]
 fn b187_a_panicking_guard_binds_the_continuation() {
     // The guard clause's other idiomatic ending. B204 made a `panic(…)` call a
-    // leaf of the ONE `Divergence` walk — but the continuation binding is
-    // decided while the body is walked, and the leaves are settled after the
-    // walk (`resolve_world`), so at that moment the panic is not yet a leaf.
-    // Un-ignore when B222 moves the decision after the leaves settle.
+    // leaf of the ONE `Divergence` walk, and B222 moved the verdict to where
+    // that leaf exists: the walk records the candidate, `resolve_world` decides
+    // it once the leaves have settled and before any name resolves against the
+    // scope it publishes into.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -7815,6 +7814,100 @@ fn b187_a_panicking_guard_binds_the_continuation() {
         fun main() { guard(Some(2)); }
         "#,
         "2\n",
+    );
+}
+
+// --- B222: the verdict is taken where the divergence leaves are --------------
+//
+// B187 asked `Divergence` during the walk. Two of that analysis's four leaves
+// are facts about the RESOLVED world — a `panic(…)` call (which call names the
+// intrinsic?) and an endless `for { … }` (does any `jump break` bind to it?) —
+// and they settle after the walk, in `resolve_world`. So a guard that ended in
+// either of the two endings the walk cannot read bound nothing, while the same
+// guard ending in `ret` bound its continuation: one rule, answered twice.
+//
+// The walk now records the candidate and `resolve_world` decides it, once the
+// leaves exist and before any name resolves against the scope it publishes
+// into. The pins below are the two leaves that used to be missed, plus their
+// controls.
+
+#[test]
+fn b222_an_endless_loop_guard_binds_the_continuation() {
+    // The other leaf the walk cannot read: `for { … }` with nothing that breaks
+    // out of it never falls through, so the only way past the `if` is the
+    // condition's false path — the guard clause exactly.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { for { print("stuck"); } }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b222_a_loop_with_a_break_is_not_an_ending() {
+    // The control for that leaf, and the reason the leaf is a resolved fact
+    // rather than a shape: the same `for`, with a `jump break` bound to it,
+    // falls through — so the continuation is reached with the pattern still
+    // unproven and binds nothing.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { for { jump break; } }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b222_a_module_qualified_panic_is_still_an_ending() {
+    // The `panic` leaf is the callee's IDENTITY, not the spelling at the call:
+    // `io::panic(…)` is a member path whose subject resolves later than a bare
+    // name, and the verdict waits for it too.
+    assert_compiles_and_runs(
+        r#"
+        import std::io;
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { io::panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b222_the_continuation_binding_is_still_immutable() {
+    // The continuation binding is a capture, not a `let`: it is published into
+    // the enclosing scope as an ordinary immutable declaration, and the
+    // deferred resolution above does not cost it that.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot mutate immutable 'n'",
     );
 }
 
