@@ -26511,6 +26511,31 @@ impl<'src> Analyzer<'src> {
             let previously_inferable =
                 std::mem::replace(&mut self.inferable_generics, generic_parameters.clone());
             let reconciled = self.reconcile_type(&data_type, &argument_type, &bindings);
+            // B230: the seed is a HINT for typing the argument, never an
+            // override of what the argument turned out to be. A payload that
+            // CONTRADICTS the seed re-binds from its own type instead, so the
+            // constructor types as the value it actually builds and the
+            // enclosing check (a `let` annotation, a parameter, a field, the
+            // declared return type) reports the mismatch. Keeping the seed here
+            // let the contradiction pass silently: the failed reconcile was
+            // dropped, the parameter stayed bound to the expectation, and
+            // `Ok(true)` typed as `Result<i32, str>` — the only check on a
+            // generic variant's payload is this one, since the call-subject
+            // check reconciles against the enum's still-OPEN parameter. That
+            // wrote `[0, true]` behind a `Result<i32, str>`, and it is what made
+            // `let v = probe()? > 0; Ok(v)` compile: `?` lifts the whole `let`
+            // initializer (`expression-lifting.md` §2), so `Ok(v)` builds a
+            // `Result<Result<bool, str>, str>` and the double wrap went
+            // unreported.
+            let reconciled = match reconciled {
+                Some(reconciled) => Some(reconciled),
+                // A payload with nothing to say — an unknown, or a diverging
+                // `panic(..)` — is not a contradiction; leave the seed.
+                None if matches!(argument_type, Type::Unknown | Type::Never) => None,
+                None => {
+                    self.reconcile_type(&data_type, &argument_type, &SubstitutionContext::default())
+                }
+            };
             self.inferable_generics = previously_inferable;
             if let Some((_, new_bindings)) = reconciled {
                 bindings.extend(new_bindings);

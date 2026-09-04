@@ -1130,6 +1130,17 @@ Both dispatch through lang-item traits and desugar per expression:
   result re-wraps in the container, unless the continuation itself
   yields the container type, in which case it is returned as-is
   (flattening). If `v` is bad, the container passes through unchanged.
+- `e?` with no `.` after it: **expression lift**. The lifted expression
+  is the whole enclosing **slot** — a `let`/`mut` initializer, a call
+  argument, a field value in a struct literal, a list or tuple element,
+  an index, a `ret` value, a condition, a match subject, or a block tail
+  — with every bare `?` under that slot joining one region. **The slot
+  therefore receives the CONTAINER, not the element**: `let v =
+  probe()? > 0` binds a `Result<bool, E>`, not a `bool`, and the
+  position of the `?` inside the slot changes nothing about where the
+  lift lands. Parentheses delimit a slot of their own. `!`, not `?`, is
+  the operator that yields the element and returns the bad half from the
+  enclosing function; a `?` region does not early-return past its slot.
 
 ```vilan
 import std::option::Option::{ self, Some, None };
@@ -1166,6 +1177,14 @@ Normative rejection cases (each is a compile error):
   be omitted.
 - An enum-variant pattern matched against a generic parameter of an
   enclosing declaration (§5.7).
+- A generic enum variant constructed with a payload that does not match
+  the instantiation the position expects (`let x: Result<i32, str> =
+  Ok(true)`, and the same call as an argument, a field value, or a
+  return). The expected type may *guide* how the payload is typed —
+  `Ok(decode())` types `decode()` against the expected element — but it
+  never overrides what the payload turned out to be, so the constructor
+  is the enum at the arguments its payload binds and the mismatch is
+  reported where the value lands.
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the
   bound …`).
 - A `match` whose VALUE legs' types don't unify, and — by the same rule
