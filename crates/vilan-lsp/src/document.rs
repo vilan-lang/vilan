@@ -1627,6 +1627,7 @@ impl Document {
             completion: Arc::new(vilan_ide::CompletionIndex::build(
                 program,
                 self.import_roots.as_ref(),
+                self.analyzed_text(),
             )),
         };
         index.refresh_entry_from_syntax(self.analyzed_text());
@@ -1992,6 +1993,7 @@ impl Document {
             import_roots: self.import_roots.as_ref(),
             index,
             source_texts: Default::default(),
+            anchor: Default::default(),
         }
     }
 
@@ -3104,10 +3106,27 @@ impl Document {
             // which the landed engine below already does with the ranking tiers
             // and the `additionalTextEdits` that insert the import.
             CursorContext::Scope { prefix } => entry_names(prefix),
-            CursorContext::Path { module, prefix } => index
-                .module(module)
-                .map(|module| candidates(&module.entries, prefix))
-                .unwrap_or_default(),
+            // A one-segment path is the arm the index straightforwardly
+            // replaces. A NESTED one is not: the index is keyed by module
+            // name, `module` here is only the path's last segment, and
+            // answering `style::FlexDirection::` with whatever module happens
+            // to be called `FlexDirection` would be a lie. The descent is a
+            // resolution question — the landed engine's
+            // `code_path_completions` walks it (E129), and this defers.
+            CursorContext::Path {
+                module,
+                prefix,
+                nested,
+            } => {
+                if *nested {
+                    Vec::new()
+                } else {
+                    index
+                        .module(module)
+                        .map(|module| candidates(&module.entries, prefix))
+                        .unwrap_or_default()
+                }
+            }
             // A member position in the exact state: the landed analysis owns
             // the member list, and it arrives below. Otherwise the receiver's
             // binding may have moved, and the module's own names are the
@@ -3147,7 +3166,11 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let index = vilan_ide::CompletionIndex::build(program, self.import_roots.as_ref());
+        let index = vilan_ide::CompletionIndex::build(
+            program,
+            self.import_roots.as_ref(),
+            self.analyzed_text(),
+        );
         self.keystroke_completion_over(offset, dependency_moved, &index)
     }
 
@@ -5780,15 +5803,20 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // E83: ONE whole-buffer parse per completion request, however many
-    // auto-import candidates the request shapes. `insert_import`'s
-    // string-input form re-parses the buffer per call, and calling it once
-    // per surviving candidate (up to `AUTO_IMPORT_COMPLETION_CAP`) is what
-    // made a bare scope position cost ~20 member completions
-    // (playground-completion.md §9) — in the language server and the
-    // playground alike, since both drive this engine. The shared
-    // `formatter::ParsedSource` pays the parse once; this pin holds the
-    // count, not the time.
+    // E83, then M29: NO whole-buffer parse in a completion request at all,
+    // however many auto-import candidates the request shapes.
+    //
+    // `insert_import`'s string-input form re-parses the buffer per call, and
+    // calling it once per surviving candidate (up to
+    // `AUTO_IMPORT_COMPLETION_CAP`) is what made a bare scope position cost
+    // ~20 member completions (playground-completion.md §9); E83's shared
+    // `formatter::ParsedSource` brought that to ONE parse per request. M29
+    // moved that one onto the analysis: the edits are computed against the
+    // ANALYZED text when the completion index is built and re-mapped through
+    // the edit anchor when a request serves them, so the request parses
+    // nothing. `BUFFER_PARSES` is thread-local and the index is built on the
+    // analysis thread, so what this counts is exactly the request's own
+    // parses. The pin holds the count, not the time.
     #[test]
     fn a_scope_completion_with_many_auto_import_candidates_parses_the_buffer_once() {
         let many_functions: String = (0..30)
@@ -5816,8 +5844,10 @@ pub(crate) mod tests {
             "the scenario must shape a full cap of candidates for the parse count to mean anything"
         );
         assert_eq!(
-            parses, 1,
-            "a completion request parses the buffer once, not once per auto-import candidate"
+            parses, 0,
+            "a completion request parses the buffer not at all: the import edits come \
+             off the analysis (M29), and before it they cost one parse per request \
+             (E83) and one per candidate before that"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10337,6 +10367,78 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"Red".to_string()),
             "a locally-declared enum completes mid-edit: {labels:?}"
+        );
+    }
+
+    // --- E129: a NESTED `::` path descends, like an import path already does ---
+    //
+    // `code_path_completions` used to read only the identifier ending at the
+    // `::`, so `style::FlexDirection::` saw `FlexDirection` — a MEMBER of
+    // `style`, never a binding — and answered nothing. The import arm has
+    // always descended (`import std::style::FlexDirection::` → four variants);
+    // these hold the code arm to the same reach, with E53's in-scope rooting
+    // still deciding the HEAD.
+
+    // The owner's own case, spelled the way kolt spells it: a `prelude`
+    // manifest puts `std::web`'s names in scope, so `style` is a module
+    // reachable with no import — and the path descends into the enum from
+    // there.
+    #[test]
+    fn nested_code_path_completion_descends_a_std_module_into_an_enum() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "fun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+            ),
+            (
+                "vilan.toml",
+                "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n",
+            ),
+        ]);
+        assert!(
+            labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
+            "`style::FlexDirection::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    // The same descent through an explicit import, which is the spelling a
+    // file without a prelude uses.
+    #[test]
+    fn nested_code_path_completion_descends_an_imported_std_module() {
+        let labels = completions_at_cursor(
+            "import std::style;\n\nfun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
+            "`style::FlexDirection::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn nested_code_path_completion_descends_a_same_file_module_into_an_enum() {
+        let labels = completions_at_cursor(
+            "mod geo {\n\tenum Shape { Circle, Square }\n}\n\nfun main() {\n\tlet s = geo::Shape::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Circle".to_string()) && labels.contains(&"Square".to_string()),
+            "`geo::Shape::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    // The one-segment control: the head still answers as it did, so the
+    // descent above is an addition and not a replacement.
+    #[test]
+    fn one_segment_code_path_completion_still_answers_the_module() {
+        let labels = completions_at_cursor(
+            "mod geo {\n\tenum Shape { Circle, Square }\n}\n\nfun main() {\n\tlet s = geo::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Shape".to_string()),
+            "`geo::` offers the module's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Circle".to_string()),
+            "and not the enum's variants, which are one level deeper: {labels:?}"
         );
     }
 
@@ -15318,5 +15420,264 @@ mod builder_chain_member_completion {
             !found.contains(&"twin".to_string()) && !found.contains(&"x".to_string()),
             "nothing from the OTHER call site's specialization: {found:?}",
         );
+    }
+
+    // --- E130: the declared return IS a type parameter (E107's other half) ---
+    //
+    // E107 covered the callee with NO declared return. This is the callee whose
+    // declared return is a bare `T`: the declaration is there, so the
+    // `inferred_return_types` fallback is never reached, and `T`'s own TypeId
+    // is a `Type::Generic` that names no nominal at all. The receiver's own
+    // type argument is what says which type `T` is at THIS call, and the
+    // analyzer recorded it.
+
+    /// The item's user-code reduction, with no std type involved: a generic
+    /// `Box<T>` whose `get` returns the bare parameter and whose `wrap` returns
+    /// a nominal head over it.
+    const GENERIC_BOX: &str = "import std::option::Option::{ self, Some, None };\n\
+         struct Box<T> {\n\tv: T,\n}\n\
+         impl Box<type T> {\n\
+         \tfun get(self): T { self.v }\n\
+         \tfun wrap(self): Option<T> { Some(self.v) }\n\
+         }\n\
+         struct Point { x: i32, y: i32 }\n\
+         impl Point { fun twin(self): Point { self } }\n";
+
+    #[test]
+    fn a_call_returning_a_bare_type_parameter_offers_the_bound_types_members() {
+        let found = labels(
+            GENERIC_BOX,
+            "\tlet b: Box<Point> = Box { v = Point { x = 1, y = 2 } };\n\tb.get().~;\n",
+        );
+        assert!(
+            found.contains(&"x".to_string()) && found.contains(&"twin".to_string()),
+            "`get(): T` on a `Box<Point>` answers Point's members: {found:?}",
+        );
+        assert!(
+            !found.contains(&"get".to_string()) && !found.contains(&"v".to_string()),
+            "the RESULT's members, not the box's: {found:?}",
+        );
+    }
+
+    /// A FREE generic function whose return is its own parameter — the other
+    /// channel the bindings arrive through, with no impl subject in sight.
+    #[test]
+    fn a_free_generic_call_returning_its_own_parameter_substitutes_too() {
+        let prelude = "struct Point { x: i32, y: i32 }\n\
+             impl Point { fun twin(self): Point { self } }\n\
+             fun echo<T>(value: T): T { value }\n";
+        for body in [
+            "\techo(Point { x = 1, y = 2 }).~;\n",
+            "\techo<Point>(Point { x = 1, y = 2 }).~;\n",
+        ] {
+            let found = labels(prelude, body);
+            assert!(
+                found.contains(&"x".to_string()) && found.contains(&"twin".to_string()),
+                "`echo<T>(value: T): T` at a Point call answers Point's members \
+                 ({body:?}): {found:?}",
+            );
+        }
+    }
+
+    /// The control the item names: the SAME impl's `wrap(): Option<T>` has a
+    /// nominal head written in the declaration and has always answered, so a
+    /// red here says the fix broke the path it was built beside.
+    #[test]
+    fn a_call_returning_a_nominal_over_a_parameter_still_answers() {
+        let found = labels(
+            GENERIC_BOX,
+            "\tlet b: Box<Point> = Box { v = Point { x = 1, y = 2 } };\n\tb.wrap().~;\n",
+        );
+        assert!(
+            found.contains(&"unwrap_or".to_string()),
+            "`wrap(): Option<T>` answers Option's members: {found:?}",
+        );
+    }
+
+    /// The reported shape, on std's own reactive cell: `SignalCell<T>::get`
+    /// declares `T`, and the owner's buffer is `c.get().` on a
+    /// `SignalCell<List<str>>`.
+    #[test]
+    fn a_signal_cells_get_offers_the_held_types_members() {
+        let found = labels(
+            "import std::reactive::SignalCell;\n",
+            "\tlet c: SignalCell<List<str>> = SignalCell::new(List::new());\n\tc.get().~;\n",
+        );
+        assert!(
+            found.contains(&"len".to_string()) && found.contains(&"push".to_string()),
+            "`SignalCell<List<str>>::get()` answers List's members: {found:?}",
+        );
+    }
+}
+
+/// E131: a member request answered while the buffer is AHEAD of the analysis
+/// resolves its receiver from the LIVE text, not from analyzed coordinates.
+///
+/// The owner's report: base text `<div .styled(base_style)>`, one un-landed
+/// change to `<div .styled(const style::style().)>`, a request inside the
+/// 150 ms debounce — and the popup offered `element, text, class, styled,
+/// style_var, attr, on, child, bind_text, …`, which is `View`'s method set.
+/// Settled, the same position offers Style's 89.
+///
+/// The cause was a coordinate one, and E125 fixed its twin for
+/// `semanticTokens/range`. `receiver_nominal_id`'s complex arm did
+/// `to_analyzed_offset(receiver_end - 1)` and then `entity_at`, and
+/// `to_analyzed_offset` is a line/character round-trip that CLAMPS: it repairs
+/// other lines (E52), but the cursor's own line is ALWAYS an edited line, so
+/// the live column clamped back onto the analyzed line's last character and
+/// `entity_at` answered with the enclosing `.styled(..)`/element — typed
+/// `View`. The keystroke layer could not catch it either: `keystroke_verdict`
+/// is `Exact` because `shape_stamp` skips `fun` bodies, and `Exact` is the
+/// anchor's claim about TOKEN positions, while the anchor is line-aligned and
+/// the cursor's line is inside its window by construction.
+///
+/// Both halves are here. The receiver's IDENTITY now comes from the live token
+/// stream — a bare name, a call, a method call, a field — with only NAMES
+/// resolved against the landed program; and what that walk cannot type falls
+/// back to the analyzed arm only where the analyzed text still describes the
+/// receiver's own bytes. Inside the edit window it declines, because a wrong
+/// list is worse than no list and the next settled request is right (Q4).
+#[cfg(test)]
+mod stale_receiver_member_completion {
+    use super::tests::analyze_workspace;
+    use super::*;
+
+    /// kolt's own manifest shape: the web prelude puts `style`, `View` and the
+    /// element vocabulary in scope with no import, which is what makes the
+    /// reported buffer the buffer it is.
+    const MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n\
+         [entry.main]\ntarget = \"browser\"\n";
+
+    /// The LANDED text: the attribute holds a plain binding.
+    const BASE: &str = "fun app(): View {\n\t<div .styled(base_style)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    fn labels(document: &Document, offset: usize) -> Vec<String> {
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    /// The labels at the `~` cursor in `live`, with `BASE` analyzed and `live`
+    /// applied as an UN-LANDED edit — a request inside the debounce.
+    fn stale(live: &str) -> Vec<String> {
+        let text = live.replace('~', "");
+        let offset = live.find('~').expect("the pin source needs a `~` cursor");
+        let (directory, mut document) =
+            analyze_workspace(&[("main.vl", BASE), ("vilan.toml", MANIFEST)]);
+        document.set_text(&text);
+        assert_eq!(
+            document.keystroke_verdict(false),
+            crate::keystroke::Verdict::Exact,
+            "the reported request is one the keystroke layer calls Exact — that is \
+             the half of the report the gate exists for",
+        );
+        let found = labels(&document, offset);
+        let _ = std::fs::remove_dir_all(&directory);
+        found
+    }
+
+    /// The same position with the analysis LANDED on the same text — what the
+    /// request answers a moment later, and the answer the stale one must not
+    /// contradict.
+    fn settled(live: &str) -> Vec<String> {
+        let text = live.replace('~', "");
+        let offset = live.find('~').expect("the pin source needs a `~` cursor");
+        let (directory, document) =
+            analyze_workspace(&[("main.vl", &text), ("vilan.toml", MANIFEST)]);
+        let found = labels(&document, offset);
+        let _ = std::fs::remove_dir_all(&directory);
+        found
+    }
+
+    /// Style members that are not View members, and vice versa — the two lists
+    /// the report is about, named so a failure says WHICH one came back.
+    fn assert_style_and_not_view(found: &[String], what: &str) {
+        for member in ["flex_direction", "padding", "gap"] {
+            assert!(
+                found.contains(&member.to_string()),
+                "{what} must offer Style's `{member}`: {found:?}",
+            );
+        }
+        for member in ["child", "bind_text", "style_var"] {
+            assert!(
+                !found.contains(&member.to_string()),
+                "{what} must not offer View's `{member}`: {found:?}",
+            );
+        }
+    }
+
+    const CALL_RECEIVER: &str = "fun app(): View {\n\t<div .styled(const style::style().~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    /// The report, verbatim.
+    #[test]
+    fn a_stale_call_receiver_answers_the_live_expressions_type() {
+        assert_style_and_not_view(&stale(CALL_RECEIVER), "a stale call receiver");
+    }
+
+    /// …and it is the SAME answer the settled request gives, which is the
+    /// property the whole item is about.
+    #[test]
+    fn the_settled_call_receiver_answers_what_the_stale_one_does() {
+        let settled = settled(CALL_RECEIVER);
+        assert_style_and_not_view(&settled, "the settled call receiver");
+        assert_eq!(
+            settled,
+            stale(CALL_RECEIVER),
+            "the stale request and the settled one answer one list",
+        );
+    }
+
+    /// The item's own isolation: a BARE-NAME receiver was always right, because
+    /// that arm reads the name off the live text. It stays right.
+    #[test]
+    fn a_stale_bare_name_receiver_still_answers() {
+        assert_style_and_not_view(
+            &stale(
+                "fun app(): View {\n\t<div .styled(base_style.~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+                 let base_style = const style::style();\nlet styles = [const style::style()];\n",
+            ),
+            "a stale bare-name receiver",
+        );
+    }
+
+    /// A METHOD call typed since the landing — the `x.m(…)` shape of the live
+    /// walk, where the sub-receiver is itself resolved live.
+    #[test]
+    fn a_stale_method_call_receiver_answers_the_methods_return() {
+        assert_style_and_not_view(
+            &stale(
+                "fun app(): View {\n\t<div .styled(base_style.padding(space(4)).~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+                 let base_style = const style::style();\nlet styles = [const style::style()];\n",
+            ),
+            "a stale method-call receiver",
+        );
+    }
+
+    const INDEX_RECEIVER: &str = "fun app(): View {\n\t<div .styled(styles[0].~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    /// The GATE. An index is a shape the live walk does not type, and the
+    /// analyzed arm behind it would answer about whatever used to be written on
+    /// this line — `View`'s members, the report's own wrong list. Inside the
+    /// edit window it declines instead.
+    #[test]
+    fn a_stale_receiver_the_live_walk_cannot_type_declines_rather_than_guessing() {
+        let found = stale(INDEX_RECEIVER);
+        assert!(
+            found.is_empty(),
+            "an unresolvable stale receiver offers nothing rather than the old \
+             expression's members: {found:?}",
+        );
+    }
+
+    /// …and the gate is not a permanent refusal: the same position, settled,
+    /// answers through the analyzed arm exactly as it always did.
+    #[test]
+    fn the_gate_lifts_the_moment_the_analysis_lands() {
+        assert_style_and_not_view(&settled(INDEX_RECEIVER), "the settled index receiver");
     }
 }

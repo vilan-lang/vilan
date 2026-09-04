@@ -12,7 +12,7 @@
 //! measured as the whole overlap (nine functions) when completion was lifted
 //! out of the server. Everything hover-shaped above them stays in the server.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{OnceCell, Ref, RefCell};
 
 use vilan_core::analyzer::{Expr, SourceId};
 use vilan_core::fx::FxHashMap as HashMap;
@@ -69,6 +69,18 @@ pub struct Analysis<'a, 'src> {
     /// query's reads. A failed read is recorded (`None`) so it is not
     /// retried. Construct with `Default::default()`.
     pub source_texts: RefCell<HashMap<SourceId, Option<String>>>,
+    /// The two-sided, line-aligned edit anchor between `analyzed` and `live`,
+    /// as `(prefix, suffix)` byte counts — computed at most once per query, by
+    /// [`Analysis::anchor`], and only where something asks. Construct with
+    /// `Default::default()`.
+    ///
+    /// The server's keystroke path computes the same two numbers per request
+    /// (`keystroke::Anchor`) and cannot hand them here: the engine is below it,
+    /// and the playground has no keystroke path at all. What reads it is E131's
+    /// gate — whether the ANALYZED text still describes the bytes at a given
+    /// live offset — which is a question only the engine's own two texts can
+    /// answer.
+    pub anchor: OnceCell<(usize, usize)>,
 }
 
 /// `(start, end, id)` for every entry-file entity with a real span, for
@@ -168,6 +180,33 @@ pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>
     )
 }
 
+/// The start of the line containing `at` — `0`, or one past the nearest
+/// preceding `\n`.
+fn line_start(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    while at > 0 && bytes[at - 1] != b'\n' {
+        at -= 1;
+    }
+    at
+}
+
+/// The start of the line AFTER the one containing `at` — the length when `at`
+/// is on the last line.
+fn next_line_start(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    if at > 0 && bytes[at - 1] == b'\n' {
+        return at;
+    }
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if byte == b'\n' {
+            return at;
+        }
+    }
+    bytes.len()
+}
+
 /// The nominal struct/enum id a resolved type names, ignoring its type
 /// arguments — the id member resolution is keyed by.
 pub(crate) fn nominal_type_id(program: &Program, type_id: TypeId) -> Option<Id> {
@@ -206,6 +245,107 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// produces — including one past the end of a shorter analyzed text.
     pub(crate) fn to_analyzed_offset(&self, live_offset: usize) -> usize {
         self.analyzed.offset(self.live.position(live_offset))
+    }
+
+    /// The line-aligned common prefix and suffix of the analyzed text and the
+    /// live buffer, in bytes — the same two-sided anchor E121's keystroke path
+    /// computes, memoized per query.
+    ///
+    /// Both edges are trimmed to a line boundary, for the reason the server's
+    /// anchor states: a `\n` cannot occur inside a UTF-8 sequence, so a line
+    /// boundary is a char boundary in both texts and never cuts a token in
+    /// half.
+    fn anchor(&self) -> (usize, usize) {
+        *self.anchor.get_or_init(|| {
+            let analyzed = self.analyzed.text().as_bytes();
+            let live = self.live.text().as_bytes();
+            if analyzed == live {
+                return (analyzed.len(), 0);
+            }
+            let common_prefix = analyzed
+                .iter()
+                .zip(live)
+                .take_while(|(old, new)| old == new)
+                .count();
+            let prefix = line_start(analyzed, common_prefix);
+            let common_suffix = analyzed
+                .iter()
+                .rev()
+                .zip(live.iter().rev())
+                .take_while(|(old, new)| old == new)
+                .count();
+            // Clamp before trimming so the two edges cannot overlap in EITHER
+            // text — `"aa"` -> `"a"` shares a one-byte prefix and a one-byte
+            // suffix that are the same byte.
+            let room = analyzed.len().min(live.len()).saturating_sub(prefix);
+            let common_suffix = common_suffix.min(room);
+            let live_suffix_start = next_line_start(live, live.len() - common_suffix);
+            (prefix, live.len() - live_suffix_start)
+        })
+    }
+
+    /// Whether the ANALYZED text still describes the live bytes at
+    /// `live_offset` — outside the edit window, where the two texts are
+    /// byte-identical, so a `program` lookup keyed on a converted offset is
+    /// answering about the same characters the user is looking at.
+    ///
+    /// False inside the window, and the cursor's OWN line is inside it by
+    /// construction: the anchor is line-aligned, and the line being typed on is
+    /// the line that differs. That is why a converted offset cannot be trusted
+    /// there — [`Analysis::to_analyzed_offset`] is a line/character round-trip
+    /// that CLAMPS, so a live column past the end of the shorter analyzed line
+    /// lands on that line's last character and `entity_at` answers about
+    /// whatever expression used to be written there (E131).
+    pub(crate) fn analyzed_agrees_at(&self, live_offset: usize) -> bool {
+        let (prefix, suffix) = self.anchor();
+        let live_len = self.live.text().len();
+        live_offset < prefix || live_offset >= live_len.saturating_sub(suffix)
+    }
+
+    /// An ANALYZED span in LIVE coordinates, or `None` when it has no image —
+    /// the engine's own form of `keystroke::Anchor::map_span`, for the answers
+    /// that are computed against the analyzed text and delivered as edits to
+    /// the live buffer (M29's captured import edits).
+    ///
+    /// A span maps only when it lies ENTIRELY inside one anchor: one that
+    /// straddles the edit window is dropped rather than clamped, because half
+    /// of it describes bytes that are gone. That is what keeps this a
+    /// re-mapping instead of a guess.
+    pub(crate) fn map_analyzed_span(&self, span: Span) -> Option<Span> {
+        let (prefix, suffix) = self.anchor();
+        // `prefix > 0` is not redundant, and the arm below it is why. An import
+        // edit is a zero-width INSERTION POINT, and `0..0` satisfies
+        // `end <= prefix` vacuously when there is no common prefix at all —
+        // the shape of an edit at the top of a file whose FIRST line the user
+        // just changed. Where the suffix reaches back to offset 0 (a line
+        // inserted above the imports) the point belongs to the suffix and moves
+        // with the text it precedes; where it does not (a file with no imports
+        // at all, so the edit is "a new first line"), offset 0 is offset 0 in
+        // both texts and the identity is right. Taking the head arm first would
+        // answer the identity for both.
+        if prefix > 0 && span.end <= prefix {
+            return Some(span);
+        }
+        let analyzed_len = self.analyzed.text().len();
+        let live_len = self.live.text().len();
+        if span.start >= analyzed_len.saturating_sub(suffix) {
+            let shift = live_len as i64 - analyzed_len as i64;
+            let start = span.start as i64 + shift;
+            let end = span.end as i64 + shift;
+            if start < 0 || end < start || end as usize > live_len {
+                return None;
+            }
+            return Some(Span {
+                start: start as usize,
+                end: end as usize,
+            });
+        }
+        // The file's very first byte: an insertion point there names the same
+        // place in both texts however the rest of them differ.
+        if span.start == 0 && span.end == 0 {
+            return Some(span);
+        }
+        None
     }
 
     /// The innermost entry-file entity whose span contains `offset`.
@@ -280,14 +420,39 @@ impl<'a, 'src> Analysis<'a, 'src> {
         };
         let start = name_span.into_range().start.min(text.len());
         let head = &text[..start];
-        let mut lines: Vec<&str> = head.lines().collect();
+        // The lines above the declaration, read BACKWARDS from it — never
+        // collected (M29). `head.lines().collect()` was O(the whole prefix),
+        // and a candidate declared deep in a large module made a completion
+        // that offers it cost the module's length: on E121's 1,791-function
+        // exhibit that is seven thousand line slices built to look at three.
+        // Only the last few lines are ever read, and the loops below already
+        // stop at the first line that is not one of them.
+        //
+        // `str::lines()` treats a final newline as a TERMINATOR rather than a
+        // separator, so the one trailing `\n` is stripped before the walk and
+        // the sequence this yields is that iterator's, reversed, line for line.
+        let mut remaining = head.strip_suffix('\n').unwrap_or(head);
+        let mut previous_line = move || {
+            if remaining.is_empty() {
+                return None;
+            }
+            Some(match remaining.rfind('\n') {
+                Some(at) => {
+                    let line = &remaining[at + 1..];
+                    remaining = &remaining[..at];
+                    line
+                }
+                None => std::mem::take(&mut remaining),
+            })
+        };
         // Drop the (partial) declaration line itself.
-        lines.pop();
+        previous_line();
+        let mut line = previous_line();
         // Skip attribute and modifier-only lines between docs and the name.
-        while let Some(last) = lines.last() {
-            let trimmed = last.trim();
+        while let Some(current) = line {
+            let trimmed = current.trim();
             if trimmed.starts_with('[') || trimmed == "async" || trimmed == "external" {
-                lines.pop();
+                line = previous_line();
             } else {
                 break;
             }
@@ -295,13 +460,13 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // `///` is the doc-comment syntax (user decision, 2026-07-16); a
         // plain `//` block is an implementation note and never surfaces.
         let mut docs: Vec<String> = Vec::new();
-        while let Some(last) = lines.last() {
-            let trimmed = last.trim();
+        while let Some(current) = line {
+            let trimmed = current.trim();
             let Some(comment) = trimmed.strip_prefix("///") else {
                 break;
             };
             docs.push(comment.strip_prefix(' ').unwrap_or(comment).to_string());
-            lines.pop();
+            line = previous_line();
         }
         if docs.is_empty() {
             return None;

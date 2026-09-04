@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use vilan_core::analyzer::{Expr, Implementation, Program, SourceId};
 use vilan_core::formatter::{STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS};
+use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
 use vilan_core::token::Token;
@@ -1120,11 +1121,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
             CursorContext::Member {
                 receiver_end,
                 lifted: true,
-            } => self.lifted_member_completions(receiver_end),
+            } => self.lifted_member_completions(&tokens, receiver_end),
             CursorContext::Member {
                 receiver_end,
                 lifted: false,
-            } => self.member_completions(receiver_end),
+            } => self.member_completions(&tokens, receiver_end),
             CursorContext::Path { path_start } => self.code_path_completions(text, path_start),
             _ => {
                 // An ordinary expression position: the cursor's own scope,
@@ -1213,7 +1214,23 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // and the `css` block are each desugared before analysis, so neither
         // survives into `program` and each is only ever seen through a raw
         // parse — and both are in the same tree, so it is parsed once.
-        let raw = vilan_core::parsing::parse(text).0;
+        //
+        // …and only where either world can possibly contain the cursor (M29).
+        // The parse is a whole-buffer one and it was paid on EVERY completion,
+        // in a file with no element and no `css` in it at all — 0.14 ms of the
+        // 0.55 ms an ordinary scope completion cost. The test below is exact,
+        // not a guess: both consumers look for an item that ENCLOSES the
+        // cursor, an element item begins with a `<` and a `css` block with the
+        // `css` keyword, so with neither token anywhere before the cursor there
+        // is no such item for the parse to find. `css_position`'s own
+        // token-only fallback for a block still being typed (E105) is reached
+        // through the same `css` token, so it is not lost either.
+        let sub_language = tokens.iter().any(|(token, span)| {
+            span.into_range().start < offset && matches!(token, Token::Ctrl('<') | Token::Css)
+        });
+        let raw = sub_language
+            .then(|| vilan_core::parsing::parse(text).0)
+            .flatten();
         // An element's opening tag is its own world (E67): between `<div` and
         // `>` the desugar takes an attribute, an `on:event(…)` or a `.method(…)`
         // chain link — and nothing that is merely in scope. The check runs from
@@ -1338,8 +1355,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// one past its last byte, LIVE space, as [`CursorContext::Member`] found
     /// it. Not "one before the `.`": the two coincide only where no trivia
     /// separates the receiver from the dot (kolt.local 001).
-    fn member_completions(&self, receiver_end: usize) -> Vec<Completion> {
-        let Some(type_id) = self.receiver_nominal_id(receiver_end) else {
+    fn member_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Vec<Completion> {
+        let Some(type_id) = self.receiver_nominal_id(tokens, receiver_end) else {
             return Vec::new();
         };
         self.nominal_member_completions(type_id)
@@ -1365,8 +1386,27 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// `Option<Profile>` offers Profile's members): the receiver ends at
     /// `receiver_end` (LIVE space, as [`CursorContext::Member`] found it) and
     /// its container's first type argument is the element.
-    fn lifted_member_completions(&self, receiver_end: usize) -> Vec<Completion> {
+    fn lifted_member_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Vec<Completion> {
         let program = self.program;
+        // The receiver read from the LIVE tokens (E131), which is where its
+        // identity lives while the buffer is ahead of the analysis.
+        if let Some(element) = self
+            .live_receiver_index(tokens, receiver_end)
+            .and_then(|index| self.live_receiver_type_id(tokens, index, 0))
+            .and_then(|type_id| match program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Struct(_, arguments)) | Some(Type::Enum(_, arguments)) => {
+                    arguments.first().copied()
+                }
+                _ => None,
+            })
+            .and_then(|element| nominal_type_id(program, element))
+        {
+            return self.nominal_member_completions(element);
+        }
         // A bare name (`p?.`): the binding's declared container type. The NAME
         // comes off the live text, but resolving it is a `program` lookup, so
         // it converts to ANALYZED space first (E52).
@@ -1409,6 +1449,15 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // `entity_at` also takes the ANALYZED offset (E52). A CALL receiver is
         // resolved structurally (E66); the rendered label is the fallback for
         // whatever that cannot type.
+        //
+        // Gated on the analyzed text still describing the receiver's own bytes
+        // (E131): inside the edit window the converted offset lands on a
+        // clamped position and this answers about an expression that is no
+        // longer written there. A wrong list is worse than no list, and the
+        // next settled request is right.
+        if !self.analyzed_agrees_at(receiver_end) {
+            return Vec::new();
+        }
         receiver_end
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
@@ -1427,30 +1476,37 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// The nominal struct/enum id of the receiver value ending at
     /// `receiver_end` — one past its last byte, LIVE space (see
     /// [`CursorContext::Member`]).
-    fn receiver_nominal_id(&self, receiver_end: usize) -> Option<Id> {
-        // A bare name (`p.`): resolve through scope, or — when the cursor's own
-        // statement failed to parse and dropped its local scope — the nearest
-        // same-file binding of that name, then read its declared type. Robust while
-        // the buffer is mid-edit, which is exactly when completion fires. The
-        // NAME comes off the live text (`receiver_end` is where it ends), but
-        // resolving that name against a scope is a `program` lookup, so it
-        // converts to ANALYZED space first (E52).
-        if let Some(name) = identifier_ending_at(self.live.text(), receiver_end) {
-            let analyzed_offset = self.to_analyzed_offset(receiver_end);
-            let binding = self
-                .binding_in_scope(name, analyzed_offset)
-                .or_else(|| self.same_file_variable(name, analyzed_offset));
-            if let Some(nominal) = binding.and_then(|id| self.binding_nominal_id(id)) {
-                return Some(nominal);
-            }
+    fn receiver_nominal_id(&self, tokens: &[(Token<'_>, Span)], receiver_end: usize) -> Option<Id> {
+        // The receiver typed from the LIVE tokens (E131) — a bare name through
+        // scope, a call through its callee's declaration, a method call
+        // through the receiver's own nominal, a field through its declared
+        // type. Every one of those is a question about bytes the user is
+        // looking at answered against declarations the landing still owns, and
+        // none of them asks the analyzed tree what sits at an offset.
+        if let Some(nominal) = self
+            .live_receiver_index(tokens, receiver_end)
+            .and_then(|index| self.live_receiver_type_id(tokens, index, 0))
+            .and_then(|type_id| nominal_type_id(self.program, type_id))
+        {
+            return Some(nominal);
         }
-        // A complex receiver (`foo().`, `a.b.`): the parsed entity's own value
-        // type — another `program` lookup, so `entity_at` also takes the
-        // ANALYZED offset (E52). The rendered label is the FALLBACK, not the
-        // answer: it is hover's phrasing, and hover answers a constructor call
-        // with the thing being constructed (`Some(1)` -> `enum Option`), which
-        // is right here, but a plain call with the CALLEE's signature
-        // (`make()` -> `fn make(): Point`), which never names a type at all.
+        // What the live walk cannot type — a literal, an `if`, a `match`, an
+        // index — falls back to the parsed entity's own value type, another
+        // `program` lookup, so `entity_at` takes the ANALYZED offset (E52).
+        // The rendered label is the FALLBACK, not the answer: it is hover's
+        // phrasing, and hover answers a constructor call with the thing being
+        // constructed (`Some(1)` -> `enum Option`), which is right here, but a
+        // plain call with the CALLEE's signature (`make()` -> `fn make():
+        // Point`), which never names a type at all.
+        //
+        // And it is GATED on the analyzed text still describing the receiver's
+        // own bytes: `to_analyzed_offset` clamps, the cursor's line is by
+        // construction inside the edit window, and inside it this answers about
+        // whatever expression used to be written there. Silence is the honest
+        // answer, and the next settled request is right (Q4).
+        if !self.analyzed_agrees_at(receiver_end) {
+            return None;
+        }
         receiver_end
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
@@ -1461,6 +1517,199 @@ impl<'a, 'src> Analysis<'a, 'src> {
                         .and_then(|label| self.nominal_id_by_name(base_type_name(&label)))
                 })
             })
+    }
+
+    /// The index of the token the receiver ENDS on — `receiver_end` is one past
+    /// its last byte, as [`member_context`] read it off the same token stream.
+    fn live_receiver_index(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Option<usize> {
+        tokens
+            .iter()
+            .rposition(|(_, span)| span.into_range().end == receiver_end)
+    }
+
+    /// The type of the receiver expression whose LAST TOKEN is `tokens[index]`,
+    /// read from the live buffer's own tokens (E131).
+    ///
+    /// This is the half of member resolution that must not be asked in analyzed
+    /// coordinates. The receiver's IDENTITY — which expression it is — is a
+    /// fact about the bytes the user is looking at, and the cursor's own line
+    /// is, by construction, a line the analysis has not seen: the edit window
+    /// is line-aligned and the line being typed on is the line that differs.
+    /// Resolving it through `to_analyzed_offset` and `entity_at` asked the
+    /// LANDED tree what sits at a clamped offset on that line, which is
+    /// whatever used to be written there — `<div .styled(const style::style().`
+    /// answered `View`'s method set, because the clamp landed back on the
+    /// element.
+    ///
+    /// So the SHAPE is walked in token space (the same space
+    /// [`member_context`] finds the receiver in, so trivia and comments are
+    /// already the lexer's problem and a `(` inside a string literal cannot be
+    /// mistaken for a bracket), and only NAMES are resolved against the landed
+    /// `Program` — which is what a landed analysis is still authoritative
+    /// about, since a declaration is not on the line being typed.
+    ///
+    /// Four shapes, the ones a receiver is actually written as:
+    /// `p` (a binding), `f(…)` / `a::b::f(…)` (a call), `x.m(…)` (a method
+    /// call) and `x.f` (a field). Anything else — a literal, an `if`, a
+    /// `match`, an index — answers `None` and falls back to the caller's
+    /// analyzed-coordinate arm, which the gate then decides on.
+    fn live_receiver_type_id(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        index: usize,
+        depth: usize,
+    ) -> Option<TypeId> {
+        if depth > EXPRESSION_TYPE_DEPTH_LIMIT {
+            return None;
+        }
+        let program = self.program;
+        // A call: `…(…)`. The matching `(` is found by depth in token space,
+        // and the token before it is the callee's name.
+        if matches!(tokens[index].0, Token::Ctrl(')')) {
+            let open = matching_open_bracket(tokens, index)?;
+            let callee = open.checked_sub(1)?;
+            let Token::Ident(name) = tokens[callee].0 else {
+                return None;
+            };
+            let target = match callee.checked_sub(1).map(|before| &tokens[before].0) {
+                // `x.m(…)` — the member `m` of whatever `x` resolves to.
+                Some(Token::Ctrl('.')) => {
+                    let receiver = self.live_receiver_type_id(tokens, callee - 2, depth + 1)?;
+                    self.member_id(nominal_type_id(program, receiver)?, name)?
+                }
+                // `a::b::f(…)` — a module member or a type's static.
+                Some(Token::Op("::")) => {
+                    let namespace = self.live_namespace_id(tokens, callee - 2, depth)?;
+                    self.namespace_entry_id(namespace, name)?
+                }
+                // `f(…)` — a name in scope.
+                _ => self.binding_in_scope(
+                    name,
+                    self.to_analyzed_offset(tokens[callee].1.into_range().start),
+                )?,
+            };
+            return self.declared_result_type_id(target);
+        }
+        let Token::Ident(name) = tokens[index].0 else {
+            return None;
+        };
+        match index.checked_sub(1).map(|before| &tokens[before].0) {
+            // `x.f` — a field read.
+            Some(Token::Ctrl('.')) => {
+                let receiver = self.live_receiver_type_id(tokens, index - 2, depth + 1)?;
+                let structure = program.structs.get(&nominal_type_id(program, receiver)?)?;
+                structure
+                    .fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| field.type_id)
+            }
+            // `a::B` names a namespace, not a value.
+            Some(Token::Op("::")) => None,
+            // A bare name: the binding it denotes, in the scope the cursor is
+            // in. The name is live, the scope is a `program` lookup, and that
+            // split is E52's own rule — this is the arm that was already right,
+            // and the item's own isolation (a bare-name receiver answers
+            // correctly even while the request is stale).
+            _ => {
+                let range = tokens[index].1.into_range();
+                let analyzed_offset = self.to_analyzed_offset(range.end);
+                let binding = self
+                    .binding_in_scope(name, analyzed_offset)
+                    .or_else(|| self.same_file_variable(name, analyzed_offset))?;
+                binding_type_id(program, binding)
+            }
+        }
+    }
+
+    /// The namespace a `::` path whose LAST segment is `tokens[index]` denotes
+    /// — the token-space twin of [`Self::code_path_completions`]' walk, for the
+    /// head of a live `a::b::f(…)` receiver.
+    fn live_namespace_id(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        index: usize,
+        depth: usize,
+    ) -> Option<Id> {
+        if depth > EXPRESSION_TYPE_DEPTH_LIMIT {
+            return None;
+        }
+        let Token::Ident(name) = tokens[index].0 else {
+            return None;
+        };
+        // A further `::` to the left means this segment is a descent step, not
+        // the head; the head is the one resolved through scope (E53).
+        if index >= 2 && matches!(tokens[index - 1].0, Token::Op("::")) {
+            let outer = self.live_namespace_id(tokens, index - 2, depth + 1)?;
+            return self.namespace_member(outer, name);
+        }
+        self.namespace_in_scope(
+            name,
+            self.to_analyzed_offset(tokens[index].1.into_range().start),
+        )
+    }
+
+    /// The id `namespace::name` denotes for a VALUE position — a module member
+    /// or a type's STATIC (`Panel::new()`) — where [`Self::namespace_member`]
+    /// answers only for the namespaces a path descends through.
+    fn namespace_entry_id(&self, namespace: Id, name: &str) -> Option<Id> {
+        let program = self.program;
+        if let Some(module) = program.modules.get(&namespace)
+            && let Some(scope) = program.scopes.get(&module.body.1)
+        {
+            return scope.name_to_id_map.get(name).copied();
+        }
+        self.index
+            .members
+            .methods(namespace, false)
+            .iter()
+            .find(|(member, _)| member == name)
+            .map(|(_, id)| *id)
+    }
+
+    /// The instance member `name` the nominal type `type_id` provides — read
+    /// from the captured table, so typing a live method-call receiver costs a
+    /// lookup rather than a walk over every impl in the program (M29).
+    fn member_id(&self, type_id: Id, name: &str) -> Option<Id> {
+        self.index
+            .members
+            .methods(type_id, true)
+            .iter()
+            .find(|(member, _)| member == name)
+            .map(|(_, id)| *id)
+    }
+
+    /// The result type of calling `target`, from its DECLARATION alone: the
+    /// declared return, E107's inferred one, or an external's.
+    ///
+    /// A declared return that is a bare type PARAMETER answers `None` rather
+    /// than `T` itself: E130 substitutes such a return through what the
+    /// analyzer recorded for a call it can NAME, and a receiver typed since the
+    /// landing has no analyzed call id at all. `None` here falls back to the
+    /// analyzed arm, which the gate then decides on — silence, not a wrong
+    /// list.
+    fn declared_result_type_id(&self, target: Id) -> Option<TypeId> {
+        let program = self.program;
+        // An impl's `declarations` entry is a MEMBER id, and a name in scope is
+        // a binding: both reach their declaration through the same chain walk
+        // hover and go-to-definition use.
+        let target = self.function_target(target).unwrap_or(target);
+        let type_id = if let Some(function) = program.functions.get(&target) {
+            function
+                .return_type_id
+                .or_else(|| program.inferred_return_types.get(&target).copied())?
+        } else {
+            program.external_functions.get(&target)?.return_type_id
+        };
+        (!matches!(
+            program.type_id_to_type_map.get(&type_id),
+            Some(Type::Generic(_))
+        ))
+        .then_some(type_id)
     }
 
     /// The nominal struct/enum id of the VALUE an expression produces — the
@@ -1517,7 +1766,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
     ///
     /// The type ARGUMENTS of a generic return (`Result<Note, RpcError>`) do not
     /// have to be solved for this to be useful — member completion resolves
-    /// members on the nominal head, and that head is written in the declaration.
+    /// members on the nominal head, and that head is written in the
+    /// declaration. Except where it is NOT: a return declared as a bare type
+    /// PARAMETER (`fun get(self): T`) has no head at all, and the declaration
+    /// alone can never name one. That case goes through
+    /// [`Self::substituted_return_type_id`] (E130).
     fn call_result_type_id(&self, call_id: Id, depth: usize) -> Option<TypeId> {
         let program = self.program;
         let subject_id = program.function_calls.get(&call_id)?.subject_id;
@@ -1530,7 +1783,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         };
         if let Some(function) = program.functions.get(&callee_id) {
             if let Some(return_type_id) = function.return_type_id {
-                return Some(return_type_id);
+                return Some(self.substituted_return_type_id(call_id, return_type_id));
             }
             // An UNANNOTATED return is not an unknown one (E107): vilan infers it,
             // and the analyzer memoizes the answer per function. Reading only the
@@ -1555,10 +1808,58 @@ impl<'a, 'src> Analysis<'a, 'src> {
         }
     }
 
-    /// The nominal struct/enum id a `let`/parameter binding's declared type names.
-    fn binding_nominal_id(&self, binding: Id) -> Option<Id> {
+    /// A declared return type resolved AT THIS CALL SITE: `return_type_id`
+    /// unchanged for every return that names something, and the type the
+    /// analyzer bound the parameter to for a return that is a bare type
+    /// parameter (E130).
+    ///
+    /// `fun get(self): T` on a `SignalCell<List<str>>` returns `List<str>`,
+    /// and only the call site knows that. Reading the declaration verbatim
+    /// gave completion `T`'s own TypeId — a `Type::Generic`, which
+    /// [`nominal_type_id`] matches nothing for and `hover_label` renders as
+    /// the literal `T` — so the whole popup went silent on a shape std's
+    /// reactive cell puts one `.` away from every read of a signal. E107 fixed
+    /// the sibling where the callee declares NO return; this is the one where
+    /// it declares a return that names no type.
+    ///
+    /// The bindings are the analyzer's own, recorded per call and already
+    /// carried out on `Program`: `method_call_substitution` is the single
+    /// channel every instantiation shape writes into — an impl's subject
+    /// generics, a method's own generics, and a free call's bindings whether
+    /// the source spelled them (`echo<Point>(…)`) or the solver inferred them
+    /// — which its own declaration site says in as many words, and which the
+    /// free-generic pin holds. The positional records beside it
+    /// (`own_generic_call_bindings`, `FunctionCall::generic_argument_ids`)
+    /// exist for the emission's re-dispatch and add no reach here; nothing is
+    /// read from them. A miss leaves the declared id alone, which is exactly
+    /// what this answered before.
+    ///
+    /// The map is populated MID-EDIT, which is the property this rests on: the
+    /// pins' buffers carry `expected a field or method name after '.'` and the
+    /// call before the dot is still recorded with its substitution, because a
+    /// parse error in one expression does not un-analyze the receiver that
+    /// parsed.
+    fn substituted_return_type_id(&self, call_id: Id, return_type_id: TypeId) -> TypeId {
         let program = self.program;
-        nominal_type_id(program, binding_type_id(program, binding)?)
+        // A `Type::Generic` wraps the CONSTRAINT id the declaration's type
+        // parameter was minted as, and that inner id is what every binding
+        // record below is keyed by — the return type's own id is the
+        // occurrence, not the parameter.
+        let Some(Type::Generic(parameter)) = program.type_id_to_type_map.get(&return_type_id)
+        else {
+            return return_type_id;
+        };
+        // The substitution map keyed by the constraint id the declaration
+        // wrote — the one channel that covers an impl's subject generics, which
+        // is where `SignalCell<T>::get`'s `T` comes from.
+        if let Some(bound) = program
+            .method_call_substitution
+            .get(&call_id)
+            .and_then(|substitution| substitution.get(parameter))
+        {
+            return *bound;
+        }
+        return_type_id
     }
 
     /// The nearest same-file `let`/`mut` binding named `name` declared before
@@ -1645,27 +1946,66 @@ impl<'a, 'src> Analysis<'a, 'src> {
         }
     }
 
-    /// Items reachable through `left::` in CODE — an enum's variants and
-    /// statics, a struct's statics, or a module's members — where `left` is the
-    /// identifier ending just before the `::` at `colon_offset`.
+    /// Items reachable through a `::` path in CODE — an enum's variants and
+    /// statics, a struct's statics, or a module's members — where the path is
+    /// the whole `a::b::c` chain ending just before the `::` at `colon_offset`.
     ///
-    /// `left` is resolved THROUGH SCOPE (E53). Matching it against every loaded
-    /// module's declarations by name, which is what this did, offered whatever
-    /// any module in the process happened to declare — and nine std modules are
-    /// ALWAYS loaded for the derive prelude, so `Json::` completed `parse`,
-    /// `stringify`, and friends in a file that never imported `std::json`. An
-    /// import path is the opposite case, where reaching what is not in scope is
-    /// the entire point; it is served by [`Self::import_completions`], which
-    /// keeps the by-name lookup ([`Self::namespace_completions_by_name`]).
+    /// The HEAD is resolved THROUGH SCOPE (E53). Matching it against every
+    /// loaded module's declarations by name, which is what this did, offered
+    /// whatever any module in the process happened to declare — and nine std
+    /// modules are ALWAYS loaded for the derive prelude, so `Json::` completed
+    /// `parse`, `stringify`, and friends in a file that never imported
+    /// `std::json`. An import path is the opposite case, where reaching what is
+    /// not in scope is the entire point; it is served by
+    /// [`Self::import_completions`], which keeps the by-name lookup
+    /// ([`Self::namespace_completions_by_name`]).
+    ///
+    /// Everything PAST the head is a descent, not a second scope lookup (E129).
+    /// This used to read one identifier, so `style::FlexDirection::` looked up
+    /// `FlexDirection` in scope — where it is not, and never was: it is a
+    /// MEMBER of `style` — and answered nothing, while the import spelling of
+    /// the same path (`import std::style::FlexDirection::`) descended fine.
+    /// Each further segment is one step through
+    /// [`Self::namespace_member`], the same single-step descent
+    /// [`Self::namespace_completions`] offers the last one's items from; a
+    /// segment that names nothing a path descends into (an enum variant, a
+    /// function, a typo) stops the walk and answers empty, which is what an
+    /// unresolvable path has always answered.
     fn code_path_completions(&self, text: &str, colon_offset: usize) -> Vec<Completion> {
-        let Some(left) = identifier_ending_at(text, colon_offset) else {
+        let Some(segments) = code_path_segments(text, colon_offset) else {
+            return Vec::new();
+        };
+        let Some((head, rest)) = segments.split_first() else {
             return Vec::new();
         };
         let analyzed_offset = self.to_analyzed_offset(colon_offset);
-        let Some(namespace) = self.namespace_in_scope(left, analyzed_offset) else {
+        let Some(mut namespace) = self.namespace_in_scope(head, analyzed_offset) else {
             return Vec::new();
         };
+        for segment in rest {
+            let Some(next) = self.namespace_member(namespace, segment) else {
+                return Vec::new();
+            };
+            namespace = next;
+        }
         self.namespace_completions(namespace)
+    }
+
+    /// One step of a `::` descent: the namespace `namespace::name` denotes.
+    ///
+    /// A module's own scope is the only thing a code path descends THROUGH — a
+    /// module holds enums, structs and nested modules, and each of those is a
+    /// namespace in turn. An enum is where a path STOPS: its variants and
+    /// statics are values, not namespaces, and `import_completions` stops in
+    /// the same place for the same reason (`resolve_import` descends no
+    /// further either). `None` for anything else, which answers empty rather
+    /// than guessing.
+    fn namespace_member(&self, namespace: Id, name: &str) -> Option<Id> {
+        let program = self.program;
+        let module = program.modules.get(&namespace)?;
+        let scope = program.scopes.get(&module.body.1)?;
+        let member = *scope.name_to_id_map.get(name)?;
+        self.is_namespace(member).then_some(member)
     }
 
     /// The struct / enum / module `name` denotes at `analyzed_offset` — the
@@ -1801,23 +2141,25 @@ impl<'a, 'src> Analysis<'a, 'src> {
         if chosen.is_empty() {
             return Vec::new();
         }
-        // ONE parse of the live buffer, shared by every candidate's edit
-        // (E83): the string-input `insert_import` re-parses per call, which
-        // made a bare scope position cost ~20 member completions — the parse
-        // was the whole bill (playground-completion.md §9). When the buffer
-        // does not parse cleanly there is no candidate to offer at all: no
-        // import edit would be safe, which is exactly the `None` each
-        // per-candidate call used to answer.
-        let source = self.live.text();
-        let Some(parsed) = vilan_core::formatter::ParsedSource::parse(source) else {
-            return Vec::new();
-        };
+        // The edits themselves came off the analysis (M29): the parse they are
+        // computed against is the analyzed text's, done once when the index was
+        // built, not once per request. E83 had already reduced this arm to ONE
+        // parse per request from one per candidate; this takes the last one out
+        // of the request entirely.
+        //
+        // What the REQUEST still owes is the coordinates. An edit is a span in
+        // the analyzed text, and the buffer may have moved since; the anchor
+        // maps it, and a span with no image — the user is typing ON the import
+        // run the edit would touch — drops the candidate rather than offering
+        // an edit at a stale offset. That is the same rule E121's token
+        // re-mapping follows, and it is why the analyzed parse is safe here:
+        // where the answer could be wrong, there is no answer.
         chosen
             .into_iter()
             .filter_map(|candidate| {
                 let module = &order.modules[candidate.module as usize];
-                let path_refs: Vec<&str> = module.path.iter().map(String::as_str).collect();
-                let edit = parsed.insert_import(&path_refs, &candidate.name)?;
+                let edit = candidate.edit.as_ref()?;
+                let span = self.map_analyzed_span(edit.span)?;
                 Some(Completion {
                     label: candidate.name.clone(),
                     kind: candidate.kind,
@@ -1827,8 +2169,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     snippet: None,
                     needs_import: Some(AutoImport {
                         module_path: module.path.clone(),
-                        edit_span: edit.span,
-                        edit_replacement: edit.replacement,
+                        edit_span: span,
+                        edit_replacement: edit.replacement.clone(),
                         origin_tier: candidate.tier,
                     }),
                 })
@@ -1911,158 +2253,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// `value.default()` (a static method with no `self`) would not type-check, so
     /// member completion must not offer it.
     ///
-    /// Two sources, in precedence order: the members the type's impl blocks
-    /// DECLARE, then the default-bodied trait methods those impls INHERIT
-    /// (kolt.local 033). Reading only the first left every default invisible on
-    /// every implementing type — `list.iter().` offered `next` and nothing
-    /// else, because `impl ListIterator<type T> with Iterator<T>` declares
-    /// exactly that one member and `trait Iterator<T>`'s other fourteen are
-    /// defaults. One name is offered ONCE: a declaration wins its name outright,
-    /// which is what makes an impl that overrides a default offer the override
-    /// rather than both.
+    /// The two sources and their precedence — the members the type's impl
+    /// blocks DECLARE, then the default-bodied trait methods those impls
+    /// INHERIT (kolt.local 033) — are resolved once per analysis into
+    /// [`MemberTable`], whose doc carries them; this reads the answer and
+    /// renders it. Deriving them here was a walk over every impl in the program
+    /// on every request (M29).
     fn push_methods(&self, type_id: Id, want_self: bool, items: &mut Vec<Completion>) {
-        let program = self.program;
-        let mut offered: HashSet<&str> = HashSet::new();
-        for implementation in &program.implementations {
-            if self.impl_subject_id(implementation) != Some(type_id) {
-                continue;
-            }
-            for (name, member_id) in &implementation.declarations {
-                if self.is_self_method(*member_id) == want_self && offered.insert(name) {
-                    items.push(self.entity_completion(
-                        name.to_string(),
-                        *member_id,
-                        CompletionKind::Method,
-                    ));
-                }
-            }
+        for (name, member_id) in self.index.members.methods(type_id, want_self) {
+            items.push(self.entity_completion(name.clone(), *member_id, CompletionKind::Method));
         }
-        if want_self {
-            self.push_inherited_defaults(type_id, &mut offered, items);
-        }
-    }
-
-    /// Appends the trait defaults `type_id` inherits: for every impl of the
-    /// type, every default-bodied INSTANCE method its traits (and their
-    /// supertraits) declare and the impls themselves do not — `offered`
-    /// carrying the names already spoken for.
-    ///
-    /// The admission rule is the analyzer's own
-    /// (`Analyzer::inherited_default_candidates`), so the popup and the call
-    /// site agree on what the concrete type provides: a member with no default
-    /// body is never inherited (conformance forces the impl to declare it, and
-    /// the pass above already found it there), a `[trait_only]` default stays
-    /// off the concrete surface (`proposal/transport-rpc.md` §3.2), and a
-    /// static has no inherited path onto a value at all.
-    fn push_inherited_defaults(
-        &self,
-        type_id: Id,
-        offered: &mut HashSet<&'src str>,
-        items: &mut Vec<Completion>,
-    ) {
-        let program = self.program;
-        for implementation in &program.implementations {
-            if self.impl_subject_id(implementation) != Some(type_id) {
-                continue;
-            }
-            for trait_id in &implementation.trait_ids {
-                for home_id in self.trait_with_supertraits(*trait_id) {
-                    let Some(home) = program.traits.get(&home_id) else {
-                        continue;
-                    };
-                    for (name, member_id) in &home.declarations {
-                        if self.member_has_default_body(*member_id)
-                            && !self.declaration_is_trait_only(*member_id)
-                            && self.is_self_method(*member_id)
-                            && offered.insert(name)
-                        {
-                            items.push(self.entity_completion(
-                                name.to_string(),
-                                *member_id,
-                                CompletionKind::Method,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// `trait_id` plus its transitive supertraits — a trait's full interface
-    /// includes everything its supertraits declare (`trait Ord with Eq +
-    /// PartialOrd` reaches `PartialOrd`'s `lt`/`le`/`gt`/`ge`).
-    fn trait_with_supertraits(&self, trait_id: Id) -> Vec<Id> {
-        let program = self.program;
-        let mut result = Vec::new();
-        let mut pending = vec![trait_id];
-        while let Some(id) = pending.pop() {
-            if result.contains(&id) {
-                continue;
-            }
-            result.push(id);
-            let Some(trait_) = program.traits.get(&id) else {
-                continue;
-            };
-            for supertrait in &trait_.supertraits {
-                if let Some(Type::Trait(super_id, _)) = program.type_id_to_type_map.get(supertrait)
-                {
-                    pending.push(*super_id);
-                }
-            }
-        }
-        result
-    }
-
-    /// Whether a trait member has a source-provided body — a DEFAULT method,
-    /// which an impl of the trait may inherit rather than supply itself.
-    fn member_has_default_body(&self, member_id: Id) -> bool {
-        let program = self.program;
-        match program.entity_map.get(&member_id) {
-            Some(Expr::Function(function_id)) => program
-                .functions
-                .get(function_id)
-                .is_some_and(|function| function.has_body),
-            _ => false,
-        }
-    }
-
-    /// Whether a trait member is marked `[trait_only]` — reachable through a
-    /// bound, never on the concrete type's own member surface.
-    fn declaration_is_trait_only(&self, member_id: Id) -> bool {
-        let program = self.program;
-        match program.entity_map.get(&member_id) {
-            Some(Expr::Function(function_id)) => program
-                .functions
-                .get(function_id)
-                .is_some_and(|function| function.trait_only),
-            _ => false,
-        }
-    }
-
-    /// Whether a method's first parameter is `self` — i.e. it is called on a value
-    /// (`v.method()`) rather than on the type (`Type::method()`).
-    fn is_self_method(&self, member_id: Id) -> bool {
-        let program = self.program;
-        let first_parameter = match program.entity_map.get(&member_id) {
-            Some(Expr::Function(function_id)) => program
-                .functions
-                .get(function_id)
-                .and_then(|function| function.parameters.first()),
-            Some(Expr::ExternalFunction(external_id)) => program
-                .external_functions
-                .get(external_id)
-                .and_then(|external| external.parameters.first()),
-            _ => None,
-        };
-        first_parameter
-            .and_then(|parameter_id| program.parameters.get(parameter_id))
-            .is_some_and(|parameter| parameter.name == "self")
-    }
-
-    /// The nominal struct/enum id an impl's subject names, ignoring type arguments.
-    fn impl_subject_id(&self, implementation: &Implementation) -> Option<Id> {
-        let program = self.program;
-        nominal_type_id(program, implementation.subject)
     }
 
     /// The struct or enum named `name` (type arguments already stripped).
@@ -2264,6 +2464,54 @@ fn base_type_name(label: &str) -> &str {
 }
 
 /// The identifier ending at byte `end` in `text`, if any.
+/// The index of the bracket token that OPENS the one at `close`, by depth over
+/// the token stream — `None` when the buffer is mid-edit and there is no match.
+///
+/// Token space, not bytes: a `(` inside a string literal is part of one token
+/// and cannot be counted, which is the whole reason a live receiver's shape is
+/// walked here rather than over the text (E131).
+fn matching_open_bracket(tokens: &[(Token<'_>, Span)], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for index in (0..=close).rev() {
+        match tokens[index].0 {
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => depth += 1,
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `::`-separated identifier path ending at `end` — `["style",
+/// "FlexDirection"]` for `let d = style::FlexDirection::|`, in source order.
+///
+/// [`identifier_ending_at`] walks back over identifier bytes only, so it stops
+/// at a `::` and sees one segment; this repeats it across each `::` it lands
+/// on, which is what lets a code path descend as far as the user has written
+/// it (E129). `None` when there is no identifier at all just before `end`.
+fn code_path_segments(text: &str, end: usize) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut segments = Vec::new();
+    let mut end = end.min(bytes.len());
+    loop {
+        let segment = identifier_ending_at(text, end)?;
+        segments.push(segment);
+        let start = end - segment.len();
+        if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
+            end = start - 2;
+        } else {
+            break;
+        }
+    }
+    segments.reverse();
+    Some(segments)
+}
+
 fn identifier_ending_at(text: &str, end: usize) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut start = end.min(bytes.len());
@@ -2379,18 +2627,26 @@ pub fn call_insertion(
 pub struct CompletionIndex {
     auto_import: AutoImportOrder,
     origins: Vec<OriginListing>,
+    members: MemberTable,
 }
 
 impl CompletionIndex {
     /// Derive the index from a landed analysis. `import_roots` is the package
     /// tree that analysis resolved under — `None` for the degraded
-    /// internal-error document, which can enumerate no origin.
-    pub fn build(program: &Program, import_roots: Option<&ImportRoots>) -> CompletionIndex {
+    /// internal-error document, which can enumerate no origin; `analyzed` is
+    /// the ENTRY TEXT that analysis ran on, which every candidate's import edit
+    /// is computed against (M29).
+    pub fn build(
+        program: &Program,
+        import_roots: Option<&ImportRoots>,
+        analyzed: &str,
+    ) -> CompletionIndex {
         CompletionIndex {
-            auto_import: AutoImportOrder::build(program),
+            auto_import: AutoImportOrder::build(program, analyzed),
             origins: import_roots
                 .map(|roots| OriginListing::build(roots, program.platform))
                 .unwrap_or_default(),
+            members: MemberTable::build(program),
         }
     }
 
@@ -2398,6 +2654,191 @@ impl CompletionIndex {
     /// when the analysis ran. `None` for a name that is not an origin.
     fn origin(&self, origin: &str) -> Option<&OriginListing> {
         self.origins.iter().find(|listing| listing.origin == origin)
+    }
+}
+
+/// Every nominal type's member surface, derived ONCE per analysis (M29).
+///
+/// Deriving it per request is what member completion used to do, and it is a
+/// walk over the whole program: `push_methods` scanned every `Implementation`
+/// the analysis holds to find the ones whose subject is this type, and
+/// `push_inherited_defaults` scanned them again and then every trait and
+/// supertrait each one provides. On kolt that made a member request the single
+/// most expensive thing the keystroke path answered (2.63 ms), and the cost
+/// followed the CODEBASE rather than the file — the same shape M25 took off
+/// the auto-import arm, in the one gatherer M25 did not touch.
+///
+/// Nothing in that derivation depends on the cursor or on the live buffer: it
+/// is a function of the analyzed program alone, so it is built where the
+/// program is (the server's analysis thread, the playground's `Retained::new`)
+/// and a request reads a lookup. The capture can never be staler than the
+/// analysis the request is already being answered from, which is M25's own
+/// argument for the tables beside it — and E131 is what makes that safe at a
+/// member position specifically: the receiver's IDENTITY comes from the live
+/// text, and only the TYPE's surface is read from the landing.
+///
+/// One pass fills every type, and the pass is a regrouping rather than extra
+/// work: the impls are visited once in total instead of once per request per
+/// type.
+#[derive(Clone, Debug, Default)]
+struct MemberTable {
+    by_type: HashMap<Id, TypeMembers>,
+}
+
+/// One nominal type's methods, split by how they are called.
+#[derive(Clone, Debug, Default)]
+struct TypeMembers {
+    /// `value.method()` — the impls' own `self` methods, then the
+    /// default-bodied instance methods their traits inherit.
+    instance: Vec<(String, Id)>,
+    /// `Type::method()` — statics and associated functions.
+    statics: Vec<(String, Id)>,
+}
+
+impl MemberTable {
+    /// Group every impl in the program by the nominal its subject names, then
+    /// resolve each group's member surface with the precedence the per-request
+    /// walk used: a DECLARATION wins its name outright, so an impl that
+    /// overrides a trait default offers the override and not both.
+    fn build(program: &Program) -> MemberTable {
+        let mut by_type: HashMap<Id, TypeMembers> = HashMap::default();
+        let mut grouped: HashMap<Id, Vec<&Implementation>> = HashMap::default();
+        for implementation in &program.implementations {
+            if let Some(type_id) = nominal_type_id(program, implementation.subject) {
+                grouped.entry(type_id).or_default().push(implementation);
+            }
+        }
+        for (type_id, implementations) in grouped {
+            let mut members = TypeMembers::default();
+            let mut instance_names: HashSet<&str> = HashSet::new();
+            let mut static_names: HashSet<&str> = HashSet::new();
+            for implementation in &implementations {
+                for (name, member_id) in &implementation.declarations {
+                    if is_self_method(program, *member_id) {
+                        if instance_names.insert(name) {
+                            members.instance.push((name.to_string(), *member_id));
+                        }
+                    } else if static_names.insert(name) {
+                        members.statics.push((name.to_string(), *member_id));
+                    }
+                }
+            }
+            // The default-bodied INSTANCE methods the impls' traits (and their
+            // supertraits) declare and the impls themselves do not
+            // (kolt.local 033: reading only the declarations left every trait
+            // default invisible on every implementing type — `list.iter().`
+            // offered `next` and nothing else).
+            //
+            // The admission rule is the analyzer's own
+            // (`Analyzer::inherited_default_candidates`), so the popup and the
+            // call site agree on what the concrete type provides: a member with
+            // no default body is never inherited (conformance forces the impl to
+            // declare it, and the pass above already found it there), a
+            // `[trait_only]` default stays off the concrete surface
+            // (`proposal/transport-rpc.md` §3.2), and a static has no inherited
+            // path onto a value at all.
+            for implementation in &implementations {
+                for trait_id in &implementation.trait_ids {
+                    for home_id in trait_with_supertraits(program, *trait_id) {
+                        let Some(home) = program.traits.get(&home_id) else {
+                            continue;
+                        };
+                        for (name, member_id) in &home.declarations {
+                            if member_has_default_body(program, *member_id)
+                                && !declaration_is_trait_only(program, *member_id)
+                                && is_self_method(program, *member_id)
+                                && instance_names.insert(name)
+                            {
+                                members.instance.push((name.to_string(), *member_id));
+                            }
+                        }
+                    }
+                }
+            }
+            by_type.insert(type_id, members);
+        }
+        MemberTable { by_type }
+    }
+
+    /// `type_id`'s instance methods (`want_self`) or its statics, in the order
+    /// the impls declare them. Empty for a type with no impl at all.
+    fn methods(&self, type_id: Id, want_self: bool) -> &[(String, Id)] {
+        self.by_type
+            .get(&type_id)
+            .map(|members| {
+                if want_self {
+                    &members.instance
+                } else {
+                    &members.statics
+                }
+            })
+            .map_or(&[][..], Vec::as_slice)
+    }
+}
+
+/// Whether a method's first parameter is `self` — i.e. it is called on a value
+/// (`v.method()`) rather than on the type (`Type::method()`).
+fn is_self_method(program: &Program, member_id: Id) -> bool {
+    let first_parameter = match program.entity_map.get(&member_id) {
+        Some(Expr::Function(function_id)) => program
+            .functions
+            .get(function_id)
+            .and_then(|function| function.parameters.first()),
+        Some(Expr::ExternalFunction(external_id)) => program
+            .external_functions
+            .get(external_id)
+            .and_then(|external| external.parameters.first()),
+        _ => None,
+    };
+    first_parameter
+        .and_then(|parameter_id| program.parameters.get(parameter_id))
+        .is_some_and(|parameter| parameter.name == "self")
+}
+
+/// `trait_id` plus its transitive supertraits — a trait's full interface
+/// includes everything its supertraits declare (`trait Ord with Eq +
+/// PartialOrd` reaches `PartialOrd`'s `lt`/`le`/`gt`/`ge`).
+fn trait_with_supertraits(program: &Program, trait_id: Id) -> Vec<Id> {
+    let mut result = Vec::new();
+    let mut pending = vec![trait_id];
+    while let Some(id) = pending.pop() {
+        if result.contains(&id) {
+            continue;
+        }
+        result.push(id);
+        let Some(trait_) = program.traits.get(&id) else {
+            continue;
+        };
+        for supertrait in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, _)) = program.type_id_to_type_map.get(supertrait) {
+                pending.push(*super_id);
+            }
+        }
+    }
+    result
+}
+
+/// Whether a trait member has a source-provided body — a DEFAULT method,
+/// which an implementing type inherits.
+fn member_has_default_body(program: &Program, member_id: Id) -> bool {
+    match program.entity_map.get(&member_id) {
+        Some(Expr::Function(function_id)) => program
+            .functions
+            .get(function_id)
+            .is_some_and(|function| function.has_body),
+        _ => false,
+    }
+}
+
+/// Whether a trait member is marked `[trait_only]` — reachable through a
+/// bound, never on the concrete type's own member surface.
+fn declaration_is_trait_only(program: &Program, member_id: Id) -> bool {
+    match program.entity_map.get(&member_id) {
+        Some(Expr::Function(function_id)) => program
+            .functions
+            .get(function_id)
+            .is_some_and(|function| function.trait_only),
+        _ => false,
     }
 }
 
@@ -2514,10 +2955,22 @@ struct AutoImportCandidate {
     name: String,
     kind: CompletionKind,
     module: u32,
+    /// The import edit this candidate carries, computed at BUILD time against
+    /// the analyzed text and in that text's coordinates (M29) — `None` for a
+    /// name already imported, or in a buffer that did not parse cleanly, which
+    /// is the same `None` the per-request probe answered.
+    edit: Option<CapturedImportEdit>,
+}
+
+/// One candidate's ready-made `import` edit, in ANALYZED coordinates.
+#[derive(Clone, Debug)]
+struct CapturedImportEdit {
+    span: Span,
+    replacement: String,
 }
 
 impl AutoImportOrder {
-    fn build(program: &Program) -> AutoImportOrder {
+    fn build(program: &Program, analyzed: &str) -> AutoImportOrder {
         let mut modules: Vec<AutoImportModule> = Vec::new();
         let mut candidates: Vec<AutoImportCandidate> = Vec::new();
         for root in ["std", "pkg"] {
@@ -2561,6 +3014,7 @@ impl AutoImportOrder {
                         name: name.to_string(),
                         kind,
                         module,
+                        edit: None,
                     });
                 }
             }
@@ -2570,6 +3024,30 @@ impl AutoImportOrder {
                 .cmp(&right.tier)
                 .then_with(|| left.name.cmp(&right.name))
         });
+        // Each candidate's IMPORT EDIT, computed here against the analyzed text
+        // rather than in the request (M29). A request used to parse the whole
+        // live buffer for this — 0.14 ms of a 0.55 ms scope completion on
+        // E121's exhibit, and the largest single item left in it after M25 —
+        // and then probe the parse once per surviving candidate. The probes are
+        // cheap; the parse was the bill, and it is a function of the text the
+        // analysis ran on, so it belongs to the analysis.
+        //
+        // ONE parse fills every candidate. A buffer that does not parse cleanly
+        // has no safe import edit at all, which is exactly the `None` the
+        // per-request probe answered, and the whole table then carries `None`.
+        if let Some(parsed) = vilan_core::formatter::ParsedSource::parse(analyzed) {
+            for candidate in &mut candidates {
+                let module = &modules[candidate.module as usize];
+                let path: Vec<&str> = module.path.iter().map(String::as_str).collect();
+                candidate.edit =
+                    parsed
+                        .insert_import(&path, &candidate.name)
+                        .map(|edit| CapturedImportEdit {
+                            span: edit.span,
+                            replacement: edit.replacement,
+                        });
+            }
+        }
         AutoImportOrder {
             modules,
             candidates,
