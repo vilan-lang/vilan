@@ -1858,14 +1858,28 @@ pub struct Trait<'src> {
     pub supertraits: Vec<TypeId>,
 }
 
-/// The impl a trait member's signature is being rendered FOR (B206): the trait
-/// that DECLARES the member, the impl's subject type, and the arguments the
-/// `with` clause supplied. Without it a `Self` position renders as the trait's
-/// own name, which is a signature nobody can write.
+/// What a trait member's signature is being rendered FOR: the trait that
+/// DECLARES the member, and which side of the trait/impl pair is asking.
+/// Without it a `Self` position renders as the trait's own name, which is a
+/// signature nobody can write.
 struct SignatureSubject<'a> {
     declaring_trait_id: Id,
-    subject: TypeId,
-    trait_arguments: &'a [TypeId],
+    rendered_for: SignatureSide<'a>,
+}
+
+/// The two sides a trait member's signature is read from — and what an
+/// ambiguous `Self` / `= Self`-defaulted position means on each.
+enum SignatureSide<'a> {
+    /// The trait's OWN declaration (E128): the literal `Self`. It is what the
+    /// author wrote, it is the only spelling a reader can write back, and a
+    /// `= Self`-defaulted parameter shows its default — which is the whole of
+    /// what the shorthand says. Hover reads this side.
+    Declaration,
+    /// An IMPL of the trait (B206): the impl's subject type, and the arguments
+    /// its `with` clause supplied. `Self` is the subject; a `= Self`-defaulted
+    /// parameter is the matching clause argument, falling back to the subject
+    /// when the clause supplied none. The conformance steer reads this side.
+    Impl(TypeId, &'a [TypeId]),
 }
 
 /// A supertrait member reached from a sub-trait's default body (B205/B216):
@@ -14390,39 +14404,47 @@ impl<'src> Analyzer<'src> {
         self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
-    /// [`declaration_type_label`] rendered FOR an impl (B206): an ambiguous
-    /// `Self` / `= Self`-defaulted position resolves to what it means there.
+    /// [`declaration_type_label`] rendered FOR one side of a trait/impl pair
+    /// (B206, E128): an ambiguous `Self` / `= Self`-defaulted position renders
+    /// as what it means THERE.
     fn declaration_type_label_for(
         &self,
         type_id: TypeId,
         subject: Option<&SignatureSubject<'_>>,
     ) -> String {
-        match subject.and_then(|subject| self.signature_position_type(type_id, subject)) {
-            Some(resolved) => self.declaration_type_label(resolved),
+        match subject.and_then(|subject| self.signature_position_label(type_id, subject)) {
+            Some(label) => label,
             None => self.declaration_type_label(type_id),
         }
     }
 
-    /// What an ambiguous `Self` / `= Self`-defaulted position of a trait member
-    /// means in a given impl — `None` for every other position, which renders as
-    /// written.
+    /// How an ambiguous `Self` / `= Self`-defaulted position of a trait member
+    /// RENDERS on a given side — `None` for every other position, which renders
+    /// as written.
     ///
-    /// The rule is `ambiguous_position_expectation`'s, the B29 residue, applied
-    /// to a rendered LABEL instead of to a check. A `= Self`-defaulted trait
-    /// generic (`trait Add<B = Self>`, `trait PartialEq<B = Self>`) resolves to
-    /// the very same type as `Self` — both are `Type::Trait(trait, [])` — so the
-    /// resolved type cannot tell a declared `b: B` from a declared `Self`, and
-    /// rendering it printed the TRAIT's name: `declare `fun eq(self, b:
-    /// PartialEq): bool``, which is not a signature anyone can write (B206). The
-    /// WRITTEN name separates them: `Self` is the impl's subject, and the
-    /// parameter's own name is the matching `with`-clause argument, falling back
-    /// to the subject when the clause supplied none — which is precisely what
-    /// the `= Self` default means.
-    fn signature_position_type(
+    /// A `= Self`-defaulted trait generic (`trait Add<B = Self>`,
+    /// `trait PartialEq<B = Self>`) resolves to the very same type as `Self` —
+    /// both are `Type::Trait(trait, [])` — so the resolved type cannot tell a
+    /// declared `b: B` from a declared `Self`, and rendering it printed the
+    /// TRAIT's name: `fun eq(self, b: PartialEq): bool`, which is not a
+    /// signature anyone can write.
+    ///
+    /// On the IMPL side (B206) the rule is `ambiguous_position_expectation`'s,
+    /// the B29 residue, applied to a rendered LABEL instead of to a check: the
+    /// WRITTEN name separates the two, `Self` being the impl's subject and the
+    /// parameter's own name the matching `with`-clause argument, falling back to
+    /// the subject when the clause supplied none.
+    ///
+    /// On the DECLARATION side (E128) there is nothing to separate: `Self` and a
+    /// `= Self` default are the same promise, spelled two ways, and the trait's
+    /// own text is what hover is showing. Both render `Self` — the parameter's
+    /// default shown as the default it is — so no spelling lookup is needed,
+    /// and a position whose spelling was never recorded renders right too.
+    fn signature_position_label(
         &self,
         type_id: TypeId,
         subject: &SignatureSubject<'_>,
-    ) -> Option<TypeId> {
+    ) -> Option<String> {
         // Only a position that resolves to the declaring trait's OWN abstract
         // type is ambiguous. A `b: i32` renders as written, and so does a
         // mention of some other trait.
@@ -14431,13 +14453,17 @@ impl<'src> Analyzer<'src> {
                 if trait_id == subject.declaring_trait_id && arguments.is_empty() => {}
             _ => return None,
         }
+        let (impl_subject, trait_arguments) = match subject.rendered_for {
+            SignatureSide::Declaration => return Some("Self".to_string()),
+            SignatureSide::Impl(impl_subject, trait_arguments) => (impl_subject, trait_arguments),
+        };
         let written = self
             .written_type_spellings
             .iter()
             .find(|(written_id, _)| *written_id == type_id)
             .map(|(_, name)| *name)?;
         if written == "Self" {
-            return Some(subject.subject);
+            return Some(self.declaration_type_label(impl_subject));
         }
         let trait_ = self.traits.get(&subject.declaring_trait_id)?;
         let index = trait_
@@ -14445,11 +14471,9 @@ impl<'src> Analyzer<'src> {
             .iter()
             .position(|name| *name == written)?;
         Some(
-            subject
-                .trait_arguments
-                .get(index)
-                .copied()
-                .unwrap_or(subject.subject),
+            self.declaration_type_label(
+                trait_arguments.get(index).copied().unwrap_or(impl_subject),
+            ),
         )
     }
 
@@ -14496,11 +14520,11 @@ impl<'src> Analyzer<'src> {
         self.function_signature_label_for(function, None)
     }
 
-    /// [`function_signature_label`] rendered FOR an impl: a `Self` position, and
-    /// a `= Self`-defaulted parameter, take what they mean there rather than the
-    /// trait's own name (B206). `None` renders the declaration as written, which
-    /// is what hover wants — there is no impl in hand, and `Self` is exactly
-    /// what the author typed.
+    /// [`function_signature_label`] rendered FOR one side of a trait/impl pair:
+    /// a `Self` position, and a `= Self`-defaulted parameter, take what they
+    /// mean there rather than the trait's own name (B206, E128). `None` renders
+    /// the resolved types, which is right for everything that is not a trait
+    /// member.
     fn function_signature_label_for(
         &self,
         function: &Function,
@@ -35997,8 +36021,10 @@ impl<'src> Analyzer<'src> {
                 // rather than to the trait's own name.
                 let signature_subject = SignatureSubject {
                     declaring_trait_id,
-                    subject: check.subject_type_id,
-                    trait_arguments: &check.trait_arguments,
+                    rendered_for: SignatureSide::Impl(
+                        check.subject_type_id,
+                        &check.trait_arguments,
+                    ),
                 };
                 let (signature, note) = self
                     .traits
@@ -45572,8 +45598,34 @@ fn analyze_over_world<'src>(
     // signature, a struct/enum's fields and variants — the language server
     // fences these as code and appends docs and platform lines.
     let mut declaration_labels: HashMap<Id, String> = HashMap::default();
+    // E128: a TRAIT member's signature renders for the trait's own declaration,
+    // so a `Self` position — and a `= Self`-defaulted parameter, which resolves
+    // to the very same type — renders as the literal `Self` rather than as the
+    // trait's name. `fun add(self, b: Add): Add` was not a signature anyone
+    // could write; `fun add(self, b: Self): Self` is what the author wrote.
+    let declaring_trait_of_member: HashMap<Id, Id> = analyzer
+        .traits
+        .iter()
+        .flat_map(|(trait_id, trait_)| {
+            trait_
+                .declarations
+                .values()
+                .map(move |member_id| (*member_id, *trait_id))
+        })
+        .map(|(member_id, trait_id)| (analyzer.resolve_member_function_id(member_id), trait_id))
+        .collect();
     for (function_id, function) in &analyzer.functions {
-        declaration_labels.insert(*function_id, analyzer.function_signature_label(function));
+        let label = match declaring_trait_of_member.get(function_id) {
+            Some(declaring_trait_id) => analyzer.function_signature_label_for(
+                function,
+                Some(&SignatureSubject {
+                    declaring_trait_id: *declaring_trait_id,
+                    rendered_for: SignatureSide::Declaration,
+                }),
+            ),
+            None => analyzer.function_signature_label(function),
+        };
+        declaration_labels.insert(*function_id, label);
     }
     for (function_id, external) in &analyzer.external_functions {
         let mut parameters: Vec<String> = Vec::new();
