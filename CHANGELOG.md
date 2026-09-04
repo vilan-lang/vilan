@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**An unfinished `a::` path now names the name it is missing, instead of asking for a `;` on the `::`.** `let x = style::` followed by an element reported `expected ';' to end this statement` anchored on the `::` — a true statement about a program nobody wrote, which never mentioned the thing that is actually absent — and the element on the next line, read as a comparison once the `::` rolled back, dragged the whole statement into operator soup. The `::` arm now RECORDS what it wanted (``a name after `::` ``) before it rolls back, and declines rather than handing back a value: the note survives every backtrack above it (the farthest-failure record deliberately outlives `attempt`), so statement recovery surfaces it once, located on the token standing where the name should be — ``found '<' expected a name after `::` ``. Three pins in `parse_expr_regression`; one ledger row. One face of the report is NOT fixed and is deliberately left alone: `let x = style::` followed by `print(…)` on the next line still parses as `style::print(…)`, because `print` is a perfectly good path member and only a line rule — which this parser has none of anywhere — could say otherwise. (tracker E135)
+
 <!-- family: fix -->
 **Two spellings of one unsaved file agree again in the editor's containment tests.** `canonical_path_of_unwritten` gave up at a `.` or `..` in the unwritten tail (a component with no file name) and answered the whole path lexically, while the plain spelling of the same file resolved through its deepest existing ancestor — so under a root whose canonical form differs from its spelling (Windows's 8.3 temp directory; a symlink anywhere) `same_file` said two spellings of one buffer were different files. The tail is folded lexically first and re-attached to the resolved ancestor; the pin runs on Linux through a symlinked ancestor.
 

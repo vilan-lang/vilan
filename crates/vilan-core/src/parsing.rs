@@ -163,6 +163,12 @@ enum TerminatorRecovery<'src> {
 /// so a set that mixes it with others still renders.
 const TERMINATOR_EXPECTED: &str = "';'";
 
+/// The expectation an unfinished `::` path records (E135). Spelled as an
+/// expectation rather than as a curated rule because that is exactly what it is
+/// — the path wanted one more name — and the "found X expected …" frame is what
+/// puts the token standing in the name's place into the message.
+const A_NAME_AFTER_PATH_SEPARATOR: &str = "a name after `::`";
+
 /// The rule a program written before the `css` promotion breaks. Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spelling): `css` became a hard keyword with the `css { … }` block
@@ -2535,8 +2541,32 @@ impl<'a, 'src> Parser<'a, 'src> {
                         current = (Node::Error, self.span_from(start));
                         continue;
                     }
+                    // `style::` with nothing after it — the shape a path is in
+                    // while it is being TYPED. The roll-back alone told the
+                    // reader nothing: `style` became the whole value, the `::`
+                    // was left for whatever came next, and the only diagnostic
+                    // was the enclosing statement's missing `;` anchored on the
+                    // operator — the name that is actually absent never named
+                    // (E135).
+                    //
+                    // NOTING the expectation is what fixes that, and it is all
+                    // that is needed: `farthest_failure` is deliberately not
+                    // rolled back by `attempt`, so the note survives every
+                    // backtrack above this one and the statement recovery
+                    // surfaces it as the located `found '<' expected a name
+                    // after `::``. The arm still DECLINES — it does not hand
+                    // back a `Node::Error` stand-in — because a stand-in leaves
+                    // the cursor on the token after the `::`, where a `<` opening
+                    // the next line reads as a comparison and drags the element
+                    // into an operator soup whose failure lands on the `let`.
+                    // Declining hands the statement to `recover_statement`,
+                    // which reports this note once and resynchronizes.
+                    //
+                    // The cursor rolls back exactly as before, so a caller that
+                    // does not backtrack sees the same position it always did.
+                    self.note_expected(A_NAME_AFTER_PATH_SEPARATOR);
                     self.position = save;
-                    break;
+                    return None;
                 }
             }
         }
