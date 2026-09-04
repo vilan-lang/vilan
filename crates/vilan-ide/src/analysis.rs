@@ -302,6 +302,37 @@ impl<'a, 'src> Analysis<'a, 'src> {
         live_offset < prefix || live_offset >= live_len.saturating_sub(suffix)
     }
 
+    /// An ANALYZED span in LIVE coordinates, or `None` when it has no image —
+    /// the engine's own form of `keystroke::Anchor::map_span`, for the answers
+    /// that are computed against the analyzed text and delivered as edits to
+    /// the live buffer (M29's captured import edits).
+    ///
+    /// A span maps only when it lies ENTIRELY inside one anchor: one that
+    /// straddles the edit window is dropped rather than clamped, because half
+    /// of it describes bytes that are gone. That is what keeps this a
+    /// re-mapping instead of a guess.
+    pub(crate) fn map_analyzed_span(&self, span: Span) -> Option<Span> {
+        let (prefix, suffix) = self.anchor();
+        if span.end <= prefix {
+            return Some(span);
+        }
+        let analyzed_len = self.analyzed.text().len();
+        let live_len = self.live.text().len();
+        if span.start >= analyzed_len.saturating_sub(suffix) {
+            let shift = live_len as i64 - analyzed_len as i64;
+            let start = span.start as i64 + shift;
+            let end = span.end as i64 + shift;
+            if start < 0 || end < start || end as usize > live_len {
+                return None;
+            }
+            return Some(Span {
+                start: start as usize,
+                end: end as usize,
+            });
+        }
+        None
+    }
+
     /// The innermost entry-file entity whose span contains `offset`.
     pub fn entity_at(&self, offset: usize) -> Option<Id> {
         entity_at(self.entity_spans, offset)
@@ -374,14 +405,39 @@ impl<'a, 'src> Analysis<'a, 'src> {
         };
         let start = name_span.into_range().start.min(text.len());
         let head = &text[..start];
-        let mut lines: Vec<&str> = head.lines().collect();
+        // The lines above the declaration, read BACKWARDS from it — never
+        // collected (M29). `head.lines().collect()` was O(the whole prefix),
+        // and a candidate declared deep in a large module made a completion
+        // that offers it cost the module's length: on E121's 1,791-function
+        // exhibit that is seven thousand line slices built to look at three.
+        // Only the last few lines are ever read, and the loops below already
+        // stop at the first line that is not one of them.
+        //
+        // `str::lines()` treats a final newline as a TERMINATOR rather than a
+        // separator, so the one trailing `\n` is stripped before the walk and
+        // the sequence this yields is that iterator's, reversed, line for line.
+        let mut remaining = head.strip_suffix('\n').unwrap_or(head);
+        let mut previous_line = move || {
+            if remaining.is_empty() {
+                return None;
+            }
+            Some(match remaining.rfind('\n') {
+                Some(at) => {
+                    let line = &remaining[at + 1..];
+                    remaining = &remaining[..at];
+                    line
+                }
+                None => std::mem::take(&mut remaining),
+            })
+        };
         // Drop the (partial) declaration line itself.
-        lines.pop();
+        previous_line();
+        let mut line = previous_line();
         // Skip attribute and modifier-only lines between docs and the name.
-        while let Some(last) = lines.last() {
-            let trimmed = last.trim();
+        while let Some(current) = line {
+            let trimmed = current.trim();
             if trimmed.starts_with('[') || trimmed == "async" || trimmed == "external" {
-                lines.pop();
+                line = previous_line();
             } else {
                 break;
             }
@@ -389,13 +445,13 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // `///` is the doc-comment syntax (user decision, 2026-07-16); a
         // plain `//` block is an implementation note and never surfaces.
         let mut docs: Vec<String> = Vec::new();
-        while let Some(last) = lines.last() {
-            let trimmed = last.trim();
+        while let Some(current) = line {
+            let trimmed = current.trim();
             let Some(comment) = trimmed.strip_prefix("///") else {
                 break;
             };
             docs.push(comment.strip_prefix(' ').unwrap_or(comment).to_string());
-            lines.pop();
+            line = previous_line();
         }
         if docs.is_empty() {
             return None;

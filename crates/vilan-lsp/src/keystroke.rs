@@ -2153,6 +2153,133 @@ pub(crate) mod gate {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// M29: the same identity property at MEMBER positions, over the shapes the
+    /// per-type member table now serves — and with the import edits the
+    /// captured table carries asserted equal to the live parse's.
+    ///
+    /// Two things moved onto the analysis in M29 and both can only break the
+    /// ANSWER, never the speed. Member completion used to derive a type's
+    /// surface per request by walking every `Implementation` the program holds
+    /// (and then every trait and supertrait each provides); it now reads a
+    /// table built once. Every auto-import candidate's edit used to be computed
+    /// against a fresh parse of the LIVE buffer; it is now computed against the
+    /// analyzed text when the index is built and re-mapped through the edit
+    /// anchor. So the reference is the old mechanism itself, exactly as M25's
+    /// pin above uses it: derive the index at request time and require one
+    /// answer — and, for the edits, require the captured one to equal what
+    /// parsing the buffer in the request would have produced, which is a
+    /// question the anchor makes meaningful only because the two texts agree
+    /// here.
+    ///
+    /// Its subject is its OWN small exhibit rather than M25's: the member arm
+    /// needs a nominal receiver with fields, methods and an inherited trait
+    /// default, and `EXHIBIT_ENTRY` is deliberately a file of `i32`s.
+    #[test]
+    fn the_captured_tables_serve_member_positions_and_import_edits_identically() {
+        const ENTRY: &str = "import pkg::table::{ icon_0000 };\n\n\
+             struct Panel { width: i32 }\n\
+             impl Panel {\n\
+             \tfun new(): Panel { Panel { width = icon_0000() } }\n\
+             \tfun grow(self): Panel { Panel { width = self.width + 1 } }\n\
+             }\n\n\
+             fun main() {\n\tlet p = Panel::new();\n\tlet total = p.width;\n}\n";
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan_m29_pin_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(4))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, ENTRY).expect("write the entry");
+        let mut document = Document::analyze(ENTRY, &std_root(), &entry);
+        assert!(
+            document.program.is_some(),
+            "the fixture must analyze, or every comparison below is empty",
+        );
+
+        // A member position on each shape the live receiver walk types: a bare
+        // binding, a static call, a method call on a call. Written into a
+        // function BODY so the declaration shape does not move and the verdict
+        // stays Exact.
+        let mut answered = 0usize;
+        for (label, receiver) in [
+            ("binding receiver", "p"),
+            ("static-call receiver", "Panel::new()"),
+            ("method-call receiver", "p.grow()"),
+        ] {
+            // ONE dangling `.` at a time, which is what a buffer mid-keystroke
+            // actually holds: three of them in one file would make each line's
+            // receiver read as a member of the line above it, since a chain
+            // written down the page is exactly that shape.
+            let live = ENTRY.replace(
+                "\tlet total = p.width;\n",
+                &format!("\t{receiver}.\n\tlet total = p.width;\n"),
+            );
+            document.set_text(&live);
+            assert_eq!(
+                document.keystroke_verdict(false),
+                crate::keystroke::Verdict::Exact,
+                "the {label} corpus row is about the captured tables, not about degrading",
+            );
+            let offset = live
+                .find(&format!("\t{receiver}.\n"))
+                .expect("the inserted member position")
+                + receiver.len()
+                + 2;
+            let served = document.keystroke_completion(offset, false);
+            answered += usize::from(
+                served.iter().any(|item| item.label == "grow")
+                    && served.iter().any(|item| item.label == "width"),
+            );
+            assert_eq!(
+                render_candidates(&served),
+                render_candidates(&document.keystroke_completion_rebuilding_index(offset, false)),
+                "at the {label} the captured member table answered differently from \
+                 deriving it per request",
+            );
+        }
+        assert_eq!(
+            answered, 3,
+            "every member position in the corpus must offer the receiver's own \
+             `width` and `grow`, or the equalities above compare lists that say \
+             nothing about the member table",
+        );
+
+        // The import edits: the buffer the request serves IS the analyzed text
+        // here, so the captured edit and a live re-parse must agree byte for
+        // byte, span included.
+        document.set_text(ENTRY);
+        let scope =
+            ENTRY.find("\tlet total = ").expect("a scope position") + "\tlet total = ".len();
+        let served = document.keystroke_completion(scope, false);
+        let mut checked = 0usize;
+        for candidate in &served {
+            let Some(import) = candidate.needs_import.as_ref() else {
+                continue;
+            };
+            let path: Vec<&str> = import.module_path.iter().map(String::as_str).collect();
+            let live_edit = vilan_core::formatter::insert_import(ENTRY, &path, &candidate.label)
+                .unwrap_or_else(|| panic!("no live edit for {}", candidate.label));
+            assert_eq!(
+                (import.edit_span, import.edit_replacement.as_str()),
+                (live_edit.span, live_edit.replacement.as_str()),
+                "the captured import edit for `{}` differs from parsing the buffer \
+                 in the request",
+                candidate.label,
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no auto-import candidate carried an edit, so the equality above \
+             compared nothing",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// Every field of a candidate a client can see, as one comparable line —
     /// the label, its icon, its detail, its call shape, and the whole
     /// auto-import edit it carries.

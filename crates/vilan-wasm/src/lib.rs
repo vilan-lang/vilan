@@ -250,7 +250,7 @@ impl Retained {
             pkg_root: PathBuf::from(PROJECT_ROOT),
             dependencies: Vec::new(),
         };
-        let completion_index = CompletionIndex::build(&program, Some(&import_roots));
+        let completion_index = CompletionIndex::build(&program, Some(&import_roots), text);
         Retained {
             text,
             program,

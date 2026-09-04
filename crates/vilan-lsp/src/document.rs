@@ -1571,6 +1571,7 @@ impl Document {
             completion: Arc::new(vilan_ide::CompletionIndex::build(
                 program,
                 self.import_roots.as_ref(),
+                self.analyzed_text(),
             )),
         };
         index.refresh_entry_from_syntax(self.analyzed_text());
@@ -3082,7 +3083,11 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let index = vilan_ide::CompletionIndex::build(program, self.import_roots.as_ref());
+        let index = vilan_ide::CompletionIndex::build(
+            program,
+            self.import_roots.as_ref(),
+            self.analyzed_text(),
+        );
         self.keystroke_completion_over(offset, dependency_moved, &index)
     }
 
@@ -5685,15 +5690,20 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // E83: ONE whole-buffer parse per completion request, however many
-    // auto-import candidates the request shapes. `insert_import`'s
-    // string-input form re-parses the buffer per call, and calling it once
-    // per surviving candidate (up to `AUTO_IMPORT_COMPLETION_CAP`) is what
-    // made a bare scope position cost ~20 member completions
-    // (playground-completion.md §9) — in the language server and the
-    // playground alike, since both drive this engine. The shared
-    // `formatter::ParsedSource` pays the parse once; this pin holds the
-    // count, not the time.
+    // E83, then M29: NO whole-buffer parse in a completion request at all,
+    // however many auto-import candidates the request shapes.
+    //
+    // `insert_import`'s string-input form re-parses the buffer per call, and
+    // calling it once per surviving candidate (up to
+    // `AUTO_IMPORT_COMPLETION_CAP`) is what made a bare scope position cost
+    // ~20 member completions (playground-completion.md §9); E83's shared
+    // `formatter::ParsedSource` brought that to ONE parse per request. M29
+    // moved that one onto the analysis: the edits are computed against the
+    // ANALYZED text when the completion index is built and re-mapped through
+    // the edit anchor when a request serves them, so the request parses
+    // nothing. `BUFFER_PARSES` is thread-local and the index is built on the
+    // analysis thread, so what this counts is exactly the request's own
+    // parses. The pin holds the count, not the time.
     #[test]
     fn a_scope_completion_with_many_auto_import_candidates_parses_the_buffer_once() {
         let many_functions: String = (0..30)
@@ -5721,8 +5731,10 @@ pub(crate) mod tests {
             "the scenario must shape a full cap of candidates for the parse count to mean anything"
         );
         assert_eq!(
-            parses, 1,
-            "a completion request parses the buffer once, not once per auto-import candidate"
+            parses, 0,
+            "a completion request parses the buffer not at all: the import edits come \
+             off the analysis (M29), and before it they cost one parse per request \
+             (E83) and one per candidate before that"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
