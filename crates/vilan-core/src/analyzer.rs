@@ -629,11 +629,6 @@ pub struct Function<'src> {
     /// the body's type, which matters for generic returns like `(): T`.
     pub return_type_id: Option<TypeId>,
     pub body: (Vec<Id>, Id, Id),
-    /// The block's own last statement (`body.0` also carries the parameter
-    /// destructures, which run first). An undeclared return asks whether it
-    /// LEAVES to know if the synthesized tail after it is reachable
-    /// (proposal/ret-checking.md rule 3).
-    pub last_statement_id: Option<Id>,
     /// The body's `ret` sites (span + optional value), collected for a function
     /// with no declared return type: its return type is inferred from these
     /// together with its reachable tail (`inferred_return_type`). Empty for a
@@ -2246,13 +2241,15 @@ enum Constraint<'src> {
     ReturnType {
         body_id: Id,
         return_type_id: TypeId,
-        /// The block's last STATEMENT, when `body_id` is a function/closure
-        /// TAIL (not a `ret`) and the block has one — S3's regime-1/1'
-        /// distinction (editing-dx.md §3.7): a body-ends-without-a-value
-        /// mismatch is worded differently depending on whether that
-        /// statement, had it been the tail instead of discarded by a
-        /// trailing `;`, would itself have produced the expected value.
-        last_statement_id: Option<Id>,
+        /// The block's own STATEMENTS, when `body_id` is a function/closure
+        /// TAIL (not a `ret`). Two questions read them. B221: does the body
+        /// LEAVE before it ever reaches the tail — the first diverging
+        /// statement makes everything after it unreachable, so the tail owes
+        /// nothing. And S3's regime-1/1' distinction (editing-dx.md §3.7),
+        /// which asks of the LAST one whether it, had it been the tail instead
+        /// of discarded by a trailing `;`, would itself have produced the
+        /// expected value.
+        statement_ids: Vec<Id>,
     },
     /// `expr!` — resolves the receiver's `Try` dispatch (std `Option`/`Result`
     /// fast path or a user `Try` impl), types the expression as the good half,
@@ -2630,6 +2627,32 @@ impl ConditionPolarity {
     }
 }
 
+/// A guard clause whose verdict is not yet in (B222): an else-less `if` whose
+/// condition binds captures on its FALSE path, written down while the body is
+/// walked and decided once [`DivergenceLeaves`] have settled.
+///
+/// B187 asked `Divergence` during the walk, which can only see the leaves an
+/// expression's SHAPE carries — `ret` and `jump`. The other two (a `panic(…)`
+/// call, an endless `for { … }`) are resolved facts about the whole world, so
+/// `if !(maybe is Some(let n)) { panic("missing"); } print(n)` refused `n`: at
+/// the moment the guard was walked, the panic was not yet an ending. The
+/// question moves whole to the one place that can answer it for every leaf —
+/// the walk now only records what it would have asked.
+#[derive(Clone, Debug)]
+struct GuardContinuation<'src> {
+    /// The scope the captures are published into: the one the guard is written
+    /// in, which is where its continuation runs.
+    scope_id: Id,
+    /// The end of the `if` — a continuation binding is visible from there on.
+    visible_from: usize,
+    /// The then-block, the thing that has to diverge for any of this to hold.
+    then_statements: Vec<Id>,
+    then_tail: Id,
+    /// What the condition binds by being FALSE (`name`, entity, `visible_until`)
+    /// — B195's else set, which with no `else` has the continuation for a home.
+    captures: Vec<(&'src str, Id, usize)>,
+}
+
 /// Whether a node is part of an `if` condition's BOOLEAN SPINE — the operators
 /// whose truth the branches are selected by, and the `is` test itself (B195).
 ///
@@ -2909,27 +2932,18 @@ pub struct Analyzer<'src> {
     /// arm's test. `None` outside a `||`. Set to the INNERMOST operand's end
     /// (operand spans nest), and restored on the way out.
     or_operand_end: Option<usize>,
-    /// B195: while walking an `if` condition along its boolean spine, how a
-    /// capture bound HERE relates to the two branches. `None` everywhere else —
-    /// off the spine, and outside a condition entirely.
+    /// B195: while walking a CONDITION along its boolean spine — an `if`'s, a
+    /// `while`-shaped `for`'s, or a `match` guard's, all three of them since
+    /// B223 — how a capture bound HERE relates to the branches the condition
+    /// selects. Off the spine it is the narrowed frame (B199); at the root of a
+    /// spine written outside every condition it is B215's expression frame; and
+    /// `None` is what a walk that is inside neither reads.
     condition_polarity: Option<ConditionPolarity>,
-    /// Whether the walk is inside a CONDITION — an `if`'s, a `while`-shaped
-    /// `for`'s, or a `match` guard's — as opposed to an ordinary expression.
-    ///
-    /// B215: [`Analyzer::condition_polarity`] alone could not tell those apart.
-    /// `None` meant both "outside every condition" and "in a condition that has
-    /// not installed a frame" — the `for` and the guard, which never did — so an
-    /// `is` capture in either fell back to B171's plain answer, visible to the
-    /// end of its scope. That is right for the two conditions (reaching the loop
-    /// body or the leg body IS the test having passed) and wrong for an
-    /// expression (`let b = x is Some(let n);` proves nothing afterwards). This
-    /// flag is the half that separates them.
-    in_condition: bool,
     /// The `is` tests whose captures were bound in expression position (B215),
-    /// as capture id → the byte range of the whole test. A read past the test's
-    /// own expression misses, and this is what turns that miss into B215's
-    /// curated refusal instead of a bare "cannot find".
-    expression_position_captures: HashMap<Id, std::ops::Range<usize>>,
+    /// as capture id → the capture's name and the byte range of the whole test.
+    /// A read past the test's own expression misses, and this is what turns
+    /// that miss into B215's curated refusal instead of a bare "cannot find".
+    expression_position_captures: HashMap<Id, (&'src str, std::ops::Range<usize>)>,
     /// B195: the captures the condition being walked binds in the `if`'s ELSE
     /// branch — the ones under a negation — as `(name, entity, visible_until)`.
     /// Drained by the `if` walk, which declares them into the else branch's own
@@ -3591,8 +3605,12 @@ pub struct Analyzer<'src> {
     // [`Divergence`]'s two resolved leaves (B204), recomputed once per
     // resolution phase (in `resolve_world`, after names resolve and before the
     // constraint fixpoint) rather than per query, since each is a scan and
-    // `expr_diverges` is asked once per statement.
+    // the question is asked once per block.
     divergence_leaves: DivergenceLeaves,
+    // The guard clauses whose continuation binding is still undecided (B222):
+    // recorded by the walk, settled in `resolve_world` once the leaves above
+    // exist and before any name resolves against the scope they publish into.
+    guard_continuations: Vec<GuardContinuation<'src>>,
     // The `std::reactive` `Source` TRAIT, if loaded. `[expose]` reconciles an
     // exposed field's type against it (A32's ruling): a field is exposable when
     // its type IMPLEMENTS the nominal std trait, not when its spelling happens
@@ -4160,7 +4178,6 @@ impl<'src> Analyzer<'src> {
             current_source_id: SourceId(0),
             or_operand_end: None,
             condition_polarity: None,
-            in_condition: false,
             expression_position_captures: HashMap::default(),
             else_visible_captures: Vec::new(),
             diagnostic_source_marks: Vec::new(),
@@ -4295,6 +4312,7 @@ impl<'src> Analyzer<'src> {
             panic_fn_id: None,
             call_subjects: Vec::new(),
             divergence_leaves: DivergenceLeaves::default(),
+            guard_continuations: Vec::new(),
             source_trait_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
@@ -11350,15 +11368,16 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a block definitely diverges (every path returns / jumps out /
     /// throws / loops forever), so it never reaches an enclosing merge — the
-    /// R4/R7 diverging-leg exemption.
+    /// R4/R7 diverging-leg exemption, and B221's reachable-tail question: a
+    /// block leaves when ANY statement of it does, the tail included.
+    ///
+    /// The whole-block spelling is the only one the analyzer needs. Asking it
+    /// of a single expression is `block_diverges(&[], expr)`, which no caller
+    /// wants any more: every position that used to ask about one expression —
+    /// a function's tail, a closure's, the last statement — was asking a
+    /// question about the block it sits in.
     fn block_diverges(&self, statements: &[Id], tail: Id) -> bool {
         self.divergence().block(statements, tail)
-    }
-
-    /// Whether an expression definitely diverges — [`Divergence::expr`] over the
-    /// analyzer's own expression map.
-    fn expr_diverges(&self, expr_id: Id) -> bool {
-        self.divergence().expr(expr_id)
     }
 
     /// [`DivergenceLeaves`] for the world walked so far (B204) — the two leaves
@@ -15419,17 +15438,32 @@ impl<'src> Analyzer<'src> {
         let positional = !self.module_scope_ids.contains(&scope_id)
             || visible_until != LocalDeclaration::FOREVER;
         let scope = self.mut_scope_for_scope_id(scope_id);
-        scope.name_to_id_map.insert(name, id);
-        if positional {
-            scope
-                .local_value_declarations
-                .entry(name)
-                .or_default()
-                .push(LocalDeclaration {
-                    visible_from,
-                    visible_until,
-                    id,
-                });
+        if !positional {
+            scope.name_to_id_map.insert(name, id);
+            return;
+        }
+        // Kept ordered by `visible_from`, because the resolver reads the LAST
+        // covering entry as the innermost one. The walk declares in source
+        // order, so this appends and nothing changes; B222's guard-continuation
+        // pass is the one caller that declares out of order — it publishes a
+        // capture from the END of an `if` after the whole enclosing block has
+        // been walked, and appending it would have made it shadow the `let` of
+        // the same name written BELOW the guard. `name_to_id_map` follows the
+        // same rule it always had — the last declaration wins — which is now
+        // the last one by position rather than by arrival.
+        let entries = scope.local_value_declarations.entry(name).or_default();
+        let at = entries.partition_point(|entry| entry.visible_from <= visible_from);
+        let last = at == entries.len();
+        entries.insert(
+            at,
+            LocalDeclaration {
+                visible_from,
+                visible_until,
+                id,
+            },
+        );
+        if last {
+            scope.name_to_id_map.insert(name, id);
         }
     }
 
@@ -20725,12 +20759,30 @@ impl<'src> Analyzer<'src> {
                     })
                 })
                 .and_then(|entry| self.expression_position_captures.get(&entry.id));
-            if let Some(range) = found {
+            if let Some((_, range)) = found {
                 return Some(range.clone());
             }
             current = scope.parent_id;
         }
-        None
+        // B223: and the test written INSIDE a scope of this one — a closure, in
+        // practice, whose body is not part of any condition it is written in
+        // and whose `is` is therefore in expression position. Its capture was
+        // never declared out here, so the chain above cannot reach it, and the
+        // read that misses gets the same rule stated in the same terms it would
+        // anywhere else. The nearest such test before the use wins, so two of
+        // them in one expression give one answer whatever order the map is in.
+        self.expression_position_captures
+            .iter()
+            .filter(|(capture_id, (capture_name, range))| {
+                *capture_name == name
+                    && range.end <= use_offset
+                    && self
+                        .expr_id_to_scope_id_map
+                        .get(capture_id)
+                        .is_some_and(|capture_scope| self.scope_encloses(scope_id, *capture_scope))
+            })
+            .max_by_key(|(capture_id, (_, range))| (range.start, range.end, capture_id.0))
+            .map(|(_, (_, range))| range.clone())
     }
 
     /// The source text over `range`, so a steer can quote the author's own
@@ -21623,12 +21675,13 @@ impl<'src> Analyzer<'src> {
         // neither branch, only the rest of the off-spine subtree.
         // B215: and the ROOT of a boolean spine written OUTSIDE every condition
         // installs the expression-position frame — the one answer B199's fix
-        // left conflated with "no frame yet", because a `for` condition and a
-        // `match` guard reach here with `None` too (`in_condition` is what tells
-        // those apart). Only the root: a spine node under one already has a
-        // frame, and narrowing is the operators' own job below.
+        // left conflated with "no frame yet". B223 retired the marker that used
+        // to be needed here: every condition installs a frame now, so `None`
+        // means what it says, and a spine root that finds it is in expression
+        // position. Only the root: a spine node under one already has a frame,
+        // and narrowing is the operators' own job below.
         let dropped_polarity = if is_condition_spine(&node.0) {
-            if self.condition_polarity.is_none() && !self.in_condition {
+            if self.condition_polarity.is_none() {
                 self.condition_polarity = Some(ConditionPolarity::expression(node.1.into_range()));
                 Some(None)
             } else {
@@ -21949,15 +22002,24 @@ impl<'src> Analyzer<'src> {
                 if let Some(condition) = condition.as_ref() {
                     self.reject_lift_region_condition(condition);
                 }
-                // B215: a `while`-shaped `for`'s condition installs no polarity
-                // frame — reaching the body IS the test having passed, so a
-                // capture keeps B171's plain answer — but it IS a condition, and
-                // must not be mistaken for expression position.
-                let outer_condition = std::mem::replace(&mut self.in_condition, true);
-                let condition_id = condition
-                    .as_ref()
-                    .map(|condition| self.walk_expr_node(condition, body_scope_id));
-                self.in_condition = outer_condition;
+                // B223: a `while`-shaped `for`'s condition is a condition, and
+                // gets the condition frame — rooted at its own end, exactly as
+                // an `if`'s is. Reaching the body IS the test having passed, so
+                // an ordinary capture runs on into the body untouched; what the
+                // frame adds is the negated case, where the body runs on the
+                // path the pattern MISSED and the capture must not reach it
+                // (B195's rule, which the `for` was outside of until now).
+                // The else collector is swapped out with it: a `for` has no
+                // else, so what its condition binds on the false path belongs
+                // to nobody and must not leak into an enclosing `if`'s.
+                let outer_polarity = self.condition_polarity;
+                let outer_captures = std::mem::take(&mut self.else_visible_captures);
+                let condition_id = condition.as_ref().map(|condition| {
+                    self.condition_polarity = Some(ConditionPolarity::root(condition.1.end));
+                    self.walk_expr_node(condition, body_scope_id)
+                });
+                self.condition_polarity = outer_polarity;
+                self.else_visible_captures = outer_captures;
                 if let (Some(condition_id), Some(condition)) = (condition_id, condition.as_ref())
                     && !matches!(condition.0, Node::LiftRegion(..))
                 {
@@ -22315,11 +22377,9 @@ impl<'src> Analyzer<'src> {
                             let outer_polarity = s
                                 .condition_polarity
                                 .replace(ConditionPolarity::root(if_.condition.1.end));
-                            let outer_condition = std::mem::replace(&mut s.in_condition, true);
                             let outer_captures = std::mem::take(&mut s.else_visible_captures);
                             let condition_id = s.walk_expr_node(&if_.condition, body_scope_id);
                             s.condition_polarity = outer_polarity;
-                            s.in_condition = outer_condition;
                             let negated_captures =
                                 std::mem::replace(&mut s.else_visible_captures, outer_captures);
                             // A lifted condition was already rejected above
@@ -22367,30 +22427,24 @@ impl<'src> Analyzer<'src> {
                 // Divergence is `Divergence::new`'s answer — one walk, B204 — the one the type
                 // checker itself acts on, so the guard and the editor's
                 // unreachable-code paint cannot disagree about what "dead" is.
-                // (`panic(…)` is a leaf for the paint and not for the checker;
-                // when the checker gains it, the guard gains it with no change
-                // here.)
-                let continuation_captures = match &branch {
-                    ExprIfBranch::If(_, (then_ids, then_tail), None)
-                        if !false_path_captures.is_empty()
-                            && Divergence::new(
-                                &self.expr_id_to_expr_map,
-                                &self.divergence_leaves,
-                            )
-                            .block(then_ids, *then_tail) =>
-                    {
-                        false_path_captures
-                    }
-                    _ => Vec::new(),
-                };
-                for (name, capture_id, visible_until) in continuation_captures {
-                    self.declare_scope_value_until(
+                //
+                // B222: which is why the verdict is not taken HERE. Two of that
+                // walk's four leaves — a `panic(…)` call, an endless `for { … }`
+                // — are facts about the resolved world, not about an
+                // expression's shape, and they settle after this walk has run.
+                // Asking now would answer for `ret` and `jump` and quietly say
+                // "no" to the other ending. So the candidate is written down and
+                // `resolve_world` decides it, once, for all four leaves.
+                if let ExprIfBranch::If(_, (then_ids, then_tail), None) = &branch
+                    && !false_path_captures.is_empty()
+                {
+                    self.guard_continuations.push(GuardContinuation {
                         scope_id,
-                        name,
-                        capture_id,
-                        node.1.end,
-                        visible_until,
-                    );
+                        visible_from: node.1.end,
+                        then_statements: then_ids.clone(),
+                        then_tail: *then_tail,
+                        captures: false_path_captures,
+                    });
                 }
                 // A value `if` — one with a final `else` — has its arms unified
                 // by the same rule a `match`'s legs go through (B163). Queued
@@ -22496,21 +22550,22 @@ impl<'src> Analyzer<'src> {
                         Some(declared) => ReturnFrame::Function(id, declared),
                         None => ReturnFrame::Inferred { rets: Vec::new() },
                     });
-                    let (ids, expr_id, last_statement_id) = match &function.body {
+                    let (ids, expr_id, body_statement_ids) = match &function.body {
                         Some(body) => {
                             // Parameter destructures run first, before the body.
                             let mut ids = parameter_destructures;
                             let statement_ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
-                            // S3 (editing-dx.md §3.7): the block's own last
-                            // statement, captured before it's merged with the
-                            // destructure ids — `resolve_return_type` reads it
-                            // to tell "this body ends without producing a
-                            // value" from "the `;` discards this body's last
-                            // value".
-                            let last_statement_id = statement_ids.last().copied();
+                            // The block's OWN statements, captured before they
+                            // are merged with the destructure ids —
+                            // `resolve_return_type` reads them to ask whether
+                            // the body leaves before the tail (B221) and to
+                            // tell "this body ends without producing a value"
+                            // from "the `;` discards this body's last value"
+                            // (S3, editing-dx.md §3.7).
+                            let body_statement_ids = statement_ids.clone();
                             ids.extend(statement_ids);
                             let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
-                            (ids, expr_id, last_statement_id)
+                            (ids, expr_id, body_statement_ids)
                         }
                         None => {
                             // A signature without a body is only legitimate as a
@@ -22531,7 +22586,7 @@ impl<'src> Analyzer<'src> {
                             self.expr_id_to_expr_map.insert(void_id, Expr::Void);
                             self.expr_id_to_scope_id_map.insert(void_id, body_scope_id);
                             self.span_map.insert(void_id, &EMPTY_SPAN);
-                            (Vec::new(), void_id, None)
+                            (Vec::new(), void_id, Vec::new())
                         }
                     };
                     let rets = match self.return_type_stack.pop() {
@@ -22576,14 +22631,14 @@ impl<'src> Analyzer<'src> {
                         // editing-dx.md §17.2) or — for an exhaustive
                         // `if`/`match` of `ret`s — a false one (B124, §17.7).
                         // The constraint is pushed unconditionally and
-                        // `check_return_position` asks `expr_diverges` instead:
+                        // `check_return_position` asks `block_diverges` instead:
                         // at walk time a `match` is not yet in
                         // `expr_id_to_expr_map` (`resolve_match` inserts it), so
                         // only the resolve-time question can see every way out.
                         self.constraints.push(Constraint::ReturnType {
                             body_id: expr_id,
                             return_type_id,
-                            last_statement_id,
+                            statement_ids: body_statement_ids.clone(),
                         });
                     }
                     // Rule 3: an undeclared return is inferred from the body's
@@ -22605,7 +22660,6 @@ impl<'src> Analyzer<'src> {
                             parameters,
                             return_type_id,
                             body: (ids, expr_id, body_scope_id),
-                            last_statement_id,
                             rets,
                             has_body: function.body.is_some(),
                             call_count: 0,
@@ -22700,8 +22754,9 @@ impl<'src> Analyzer<'src> {
                             body_id: checked_id,
                             return_type_id,
                             // A `ret`'s checked value is never a block tail —
-                            // regime 1/1' is a tail-only distinction.
-                            last_statement_id: None,
+                            // neither regime 1/1' nor B221's reachability
+                            // question is asked of anything but a tail.
+                            statement_ids: Vec::new(),
                         });
                         self.return_sites.push((function_id, checked_id));
                     }
@@ -23297,13 +23352,18 @@ impl<'src> Analyzer<'src> {
                             self.walk_pattern(&pattern.0, &pattern.1, leg_scope_id, pattern.1.end)
                         })
                         .collect();
-                    // B215: a guard is a condition for the same reason — the leg
-                    // body runs only where the guard held.
-                    let outer_condition = std::mem::replace(&mut self.in_condition, true);
-                    let guard_id = guard
-                        .as_ref()
-                        .map(|guard| self.walk_expr_node(guard, leg_scope_id));
-                    self.in_condition = outer_condition;
+                    // B223: a guard is a condition for the same reason — the
+                    // leg body runs only where the guard held — so it gets the
+                    // same frame, rooted at the guard's own end, and the same
+                    // swap of the else collector a leg has no use for.
+                    let outer_polarity = self.condition_polarity;
+                    let outer_captures = std::mem::take(&mut self.else_visible_captures);
+                    let guard_id = guard.as_ref().map(|guard| {
+                        self.condition_polarity = Some(ConditionPolarity::root(guard.1.end));
+                        self.walk_expr_node(guard, leg_scope_id)
+                    });
+                    self.condition_polarity = outer_polarity;
+                    self.else_visible_captures = outer_captures;
                     let body_id = self.walk_expr_node(body, leg_scope_id);
                     walked_legs.push(WalkLeg {
                         patterns: walked_patterns,
@@ -23608,7 +23668,18 @@ impl<'src> Analyzer<'src> {
                 // lifted by B133).
                 self.return_type_stack
                     .push(ReturnFrame::Inferred { rets: Vec::new() });
+                // B223: a closure BODY is not part of any condition the closure
+                // is written in. The condition's truth says nothing about a
+                // test that runs inside a function value — `if holds(|| x is
+                // Some(let n))` is true or false whatever the `is` answered —
+                // so the body starts from no frame, and an `is` at the root of
+                // a spine in it installs B215's expression frame. That is what
+                // gives the read past it B215's steer instead of the bare name
+                // miss B199's per-node narrowing left behind: one rule, one
+                // voice, wherever the test is written.
+                let outer_polarity = self.condition_polarity.take();
                 let expr_id = self.walk_expr_node(&closure.return_value, body_scope_id);
+                self.condition_polarity = outer_polarity;
                 let rets = match self.return_type_stack.pop() {
                     Some(ReturnFrame::Inferred { rets }) => rets,
                     _ => Vec::new(),
@@ -24010,7 +24081,7 @@ impl<'src> Analyzer<'src> {
                         polarity.map_or(or_cap, |polarity| or_cap.min(polarity.same_until));
                     if let Some((start, end)) = polarity.and_then(|p| p.expression_root) {
                         self.expression_position_captures
-                            .insert(capture_id, start..end);
+                            .insert(capture_id, (name, start..end));
                     }
                     self.declare_scope_value_until(
                         scope_id,
@@ -27147,13 +27218,13 @@ impl<'src> Analyzer<'src> {
                     // where it used to fall through to the whole-value
                     // comparison at the argument and report the closure as
                     // `Expected |Point| str, but got |Point| i32`.
-                    let (anchor_span, checked_id, last_statement_id) =
+                    let (anchor_span, checked_id, statement_ids) =
                         match self.closure_block_tail(return_expr_id) {
                             Some(block) => block,
                             None => {
                                 let expression_span =
                                     **self.span_map.get(&return_expr_id).unwrap_or(&&EMPTY_SPAN);
-                                (expression_span, return_expr_id, None)
+                                (expression_span, return_expr_id, Vec::new())
                             }
                         };
                     // Record the target the body is held to, so
@@ -27165,7 +27236,7 @@ impl<'src> Analyzer<'src> {
                     match self.check_return_position(
                         checked_id,
                         &target_return_type,
-                        last_statement_id,
+                        &statement_ids,
                         substitution_context,
                         exprs_seen,
                     ) {
@@ -27180,9 +27251,7 @@ impl<'src> Analyzer<'src> {
                             // reach this attempt after that constraint already
                             // resolved (resolution is monotone), so the route
                             // must not rely on it alone.
-                            let tail_dead = self.expr_diverges(checked_id)
-                                || last_statement_id
-                                    .is_some_and(|statement_id| self.expr_diverges(statement_id));
+                            let tail_dead = self.block_diverges(&statement_ids, checked_id);
                             if tail_dead {
                                 self.check_closure_rets_against_target(
                                     closure_id,
@@ -27215,7 +27284,7 @@ impl<'src> Analyzer<'src> {
                             // error node never types and is not waited for
                             // (its own diagnostic is the root cause).
                             if matches!(self.expr_id_to_expr_map.get(&checked_id), Some(Expr::Void))
-                                && let Some(statement_id) = last_statement_id
+                                && let Some(statement_id) = statement_ids.last().copied()
                                 && !self.variables.contains_key(&statement_id)
                                 && !matches!(
                                     self.expr_id_to_expr_map.get(&statement_id),
@@ -27685,12 +27754,12 @@ impl<'src> Analyzer<'src> {
                 disagreements: Vec::new(),
             };
         };
-        let (tail_id, last_statement_id, rets) = (
+        let (tail_id, statement_ids, rets) = (
             function.body.1,
-            function.last_statement_id,
+            function.body.0.clone(),
             function.rets.clone(),
         );
-        let evidence = self.return_evidence(tail_id, last_statement_id, &rets);
+        let evidence = self.return_evidence(tail_id, &statement_ids, &rets);
         self.return_inference_stack.push((function_id, true));
         let inference =
             self.unify_return_evidence(&evidence, &Type::Unknown, substitution_context, exprs_seen);
@@ -27715,12 +27784,14 @@ impl<'src> Analyzer<'src> {
     fn return_evidence(
         &self,
         tail_id: Id,
-        last_statement_id: Option<Id>,
+        statement_ids: &[Id],
         rets: &[(Span, Option<Id>)],
     ) -> Vec<(ReturnOrigin, Option<Id>)> {
         let mut evidence: Vec<(ReturnOrigin, Option<Id>)> = Vec::new();
-        let tail_reachable = !(self.expr_diverges(tail_id)
-            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id)));
+        // B221: any statement that leaves makes the tail unreachable, not just
+        // the last one — `Divergence`'s own question about the block, the same
+        // one `check_return_position` asks of a declared return type.
+        let tail_reachable = !self.block_diverges(statement_ids, tail_id);
         if tail_reachable {
             let tail_span = self
                 .span_map
@@ -27882,15 +27953,13 @@ impl<'src> Analyzer<'src> {
     }
 
     /// A closure body's return positions: a BLOCK body's tail and its own
-    /// last statement (the reachability question's other half), a
-    /// bare-expression body itself. The closure twin of what the function
-    /// walk stores as `body.1` + `last_statement_id`.
-    fn closure_body_positions(&self, body_id: Id) -> (Id, Option<Id>) {
+    /// statements (the reachability question's other half), a bare-expression
+    /// body itself. The closure twin of what the function walk stores as
+    /// `body.1` + the block's statement ids.
+    fn closure_body_positions(&self, body_id: Id) -> (Id, Vec<Id>) {
         match self.expr_id_to_expr_map.get(&body_id) {
-            Some(Expr::Block((statement_ids, tail_id))) => {
-                (*tail_id, statement_ids.last().copied())
-            }
-            _ => (body_id, None),
+            Some(Expr::Block((statement_ids, tail_id))) => (*tail_id, statement_ids.clone()),
+            _ => (body_id, Vec::new()),
         }
     }
 
@@ -27914,8 +27983,8 @@ impl<'src> Analyzer<'src> {
             };
         };
         let (body_id, rets) = (closure.return_, closure.rets.clone());
-        let (tail_id, last_statement_id) = self.closure_body_positions(body_id);
-        let evidence = self.return_evidence(tail_id, last_statement_id, &rets);
+        let (tail_id, statement_ids) = self.closure_body_positions(body_id);
+        let evidence = self.return_evidence(tail_id, &statement_ids, &rets);
         self.unify_return_evidence(
             &evidence,
             initial_expectation,
@@ -29319,8 +29388,11 @@ impl<'src> Analyzer<'src> {
             Constraint::ReturnType {
                 body_id,
                 return_type_id,
-                last_statement_id,
-            } => self.resolve_return_type(*body_id, *return_type_id, *last_statement_id),
+                statement_ids,
+            } => {
+                let statement_ids = statement_ids.clone();
+                self.resolve_return_type(*body_id, *return_type_id, &statement_ids)
+            }
             Constraint::TryAssert {
                 id,
                 receiver_id,
@@ -31874,7 +31946,7 @@ impl<'src> Analyzer<'src> {
         &mut self,
         body_id: Id,
         return_type_id: TypeId,
-        last_statement_id: Option<Id>,
+        statement_ids: &[Id],
     ) -> Resolution {
         if !self.expr_id_to_expr_map.contains_key(&body_id) {
             return Resolution::Deferred;
@@ -31884,7 +31956,7 @@ impl<'src> Analyzer<'src> {
         match self.check_return_position(
             body_id,
             &return_type,
-            last_statement_id,
+            statement_ids,
             &substitution_context,
             &mut HashSet::default(),
         ) {
@@ -31947,7 +32019,7 @@ impl<'src> Analyzer<'src> {
         &mut self,
         body_id: Id,
         target_return_type: &Type,
-        last_statement_id: Option<Id>,
+        statement_ids: &[Id],
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnPositionCheck {
@@ -31977,17 +32049,22 @@ impl<'src> Analyzer<'src> {
         // the tail after it is unreachable. Two shapes reach here: the body
         // ITSELF diverges (a `{ ret ..; }` block in tail position — an
         // exhaustive `if`/`match` of `ret`s already infers as `Type::Never`
-        // and reconciled above), or the block's last STATEMENT diverges and
-        // the parser's synthesized void tail after it is dead code. The second
-        // subsumes §17.2's `ret`-only dedup at the tail-construction site: a
-        // `jump`, or an exhaustive `if`/`match` of `ret`s, leaves exactly the
-        // same way and left the same false "ends without producing a value"
-        // behind. Nothing is weakened — `expr_diverges` needs EVERY path to
-        // leave, so a body with any fall-through still reaches the diagnostics
-        // below.
-        if self.expr_diverges(body_id)
-            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id))
-        {
+        // and reconciled above), or a STATEMENT of the block diverges and
+        // everything the parser wrote after it, the synthesized void tail
+        // included, is dead code. The second subsumes §17.2's `ret`-only dedup
+        // at the tail-construction site: a `jump`, or an exhaustive
+        // `if`/`match` of `ret`s, leaves exactly the same way and left the same
+        // false "ends without producing a value" behind.
+        //
+        // B221 widened "the LAST statement" to ANY statement, which is the
+        // question `Divergence` answers about a BLOCK and the one the editor's
+        // unreachable-code paint asks: the first diverging statement makes
+        // everything after it unreachable, so `fun g(): i32 { ret 1;
+        // print("dead"); }` owes a tail value nothing can ever ask for. Nothing
+        // is weakened — divergence needs EVERY path out of a statement to
+        // leave, so a body with any fall-through (a `ret` inside an `if` with
+        // no `else`) still reaches the diagnostics below.
+        if self.block_diverges(statement_ids, body_id) {
             return ReturnPositionCheck::Matched;
         }
         // S3 (editing-dx.md §3.6-3.7): a body that ends WITHOUT PRODUCING A
@@ -32007,7 +32084,7 @@ impl<'src> Analyzer<'src> {
         // `Expr::If` not present, and correctly stays on the generic message.
         let msg = if matches!(self.expr_id_to_expr_map.get(&body_id), Some(Expr::Void)) {
             self.missing_return_value_message(
-                last_statement_id,
+                statement_ids.last().copied(),
                 target_return_type,
                 substitution_context,
             )
@@ -32074,7 +32151,7 @@ impl<'src> Analyzer<'src> {
     /// its last STATEMENT's id for the regime-1/1' distinction. `None` for
     /// the bare-expression form (`|x| x + 1`), which S3's route anchors at
     /// the expression itself instead (B132).
-    fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Option<Id>)> {
+    fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Vec<Id>)> {
         let Expr::Block((statement_ids, tail_id)) =
             self.expr_id_to_expr_map.get(&return_expr_id)?
         else {
@@ -32085,7 +32162,7 @@ impl<'src> Analyzer<'src> {
             start: block_span.end.saturating_sub(1),
             end: block_span.end,
         };
-        Some((brace_span, *tail_id, statement_ids.last().copied()))
+        Some((brace_span, *tail_id, statement_ids.clone()))
     }
 
     /// `a?.b.c` (proposal/try-and-lift.md §3): once the subject resolves, the
@@ -33016,9 +33093,8 @@ impl<'src> Analyzer<'src> {
         for disagreement in &inference.disagreements {
             self.report_closure_ret_disagreement(disagreement);
         }
-        let (tail_id, last_statement_id) = self.closure_body_positions(body_id);
-        let tail_dead = self.expr_diverges(tail_id)
-            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id));
+        let (tail_id, statement_ids) = self.closure_body_positions(body_id);
+        let tail_dead = self.block_diverges(&statement_ids, tail_id);
         if tail_dead {
             let target = own_annotation
                 .filter(|annotation| self.type_is_ground(*annotation))
@@ -34739,6 +34815,153 @@ impl<'src> Analyzer<'src> {
         self.finalize_build();
     }
 
+    /// Whether a queued bare-name use is one a guard clause's continuation
+    /// might bind (B222) — a capture of that name, published by a guard written
+    /// in a scope this use is inside. Those uses wait for the verdict; every
+    /// other name resolves in the drain's first part.
+    ///
+    /// Deliberately asked by NAME and SCOPE only, not by byte offset: a use
+    /// ahead of the guard reads the same declaration record to say "'n' is
+    /// declared here, later in the scope", so it has to see the record too.
+    fn guard_may_publish(&mut self, id: Id, name: &'src str) -> bool {
+        if self.guard_continuations.is_empty() {
+            return false;
+        }
+        let scope_id = self.get_scope_id_for_entity(id);
+        self.guard_continuations.iter().any(|guard| {
+            guard
+                .captures
+                .iter()
+                .any(|(capture, _, _)| *capture == name)
+                && self.scope_encloses(guard.scope_id, scope_id)
+        })
+    }
+
+    /// One queued bare-name use, resolved against its scope at its own byte
+    /// offset. Lifted out of `resolve_world`'s drain (B222) because that drain
+    /// now runs in TWO parts around the guard-continuation pass: a name a guard
+    /// clause might publish cannot resolve until the pass that publishes it has
+    /// run, and every other name — the call subjects the divergence leaves are
+    /// read from among them — must resolve before it.
+    fn resolve_prepped_local(&mut self, id: Id, name: &'src str) {
+        let scope_id = self.get_scope_id_for_entity(id);
+        // A use resolves at its own byte offset (positional visibility,
+        // proposal/local-shadowing.md); a spanless synthesized use sees
+        // the whole scope, as every use did before shadowing.
+        let use_offset = match self.span_map.get(&id) {
+            Some(span) if span.end > span.start => span.start,
+            _ => usize::MAX,
+        };
+        match self.resolve_value_name_at(name, scope_id, use_offset) {
+            Some(subject_id) => {
+                if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
+                    let diagnostics_before = self.diagnostics.len();
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                        msg: message,
+                    });
+                    if let Some(source) = self.source_of_id(id) {
+                        self.attribute_new_diagnostics(diagnostics_before, source);
+                    }
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                } else {
+                    let rc = self.reference_count.entry(subject_id).or_insert(0);
+                    *rc += 1;
+                    self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
+                }
+            }
+            None => {
+                let diagnostics_before = self.diagnostics.len();
+                // B215: the name is not missing — it was captured by an `is`
+                // written in EXPRESSION position, whose answer is an ordinary
+                // `bool`. Nothing past that expression proves the test
+                // passed, so the capture stops there; refusing this read as a
+                // name typo would send its author looking for a spelling
+                // mistake instead of at the shape of the test.
+                if let Some(test) = self.expression_position_capture(name, scope_id, use_offset) {
+                    let spelling = self
+                        .source_of_id(id)
+                        .and_then(|source| self.spelling_at(source, test));
+                    let steer = match spelling {
+                        Some(test) => format!(
+                            ". Put the test where a branch depends on it — \
+                             `if {test} {{ … }}` — and read '{name}' inside"
+                        ),
+                        None => format!(
+                            ". Put the test where a branch depends on it — an `if`, a \
+                             `while`-shaped `for`, a `match` guard — and read '{name}' inside"
+                        ),
+                    };
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "'{name}' is bound only inside the `is` test that captured it: \
+                             outside a condition that test is an ordinary `bool`, and nothing \
+                             after it proves the payload is there{steer}"
+                        ),
+                    });
+                    if let Some(source) = self.source_of_id(id) {
+                        self.attribute_new_diagnostics(diagnostics_before, source);
+                    }
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return;
+                }
+                let steer = self.import_steer(name).unwrap_or_default();
+                // A use before the name's only declaration gets pointed at
+                // it: the visibility rule is new information.
+                let note = self.later_local_declaration(name, scope_id, use_offset).map(
+                    |later_id| {
+                        // The use sitting inside the declaring statement is
+                        // the self-referential initializer (`let x = x;`);
+                        // anywhere else it is a plain use-before-declaration.
+                        let own_initializer = self
+                            .span_map
+                            .get(&later_id)
+                            .is_some_and(|span| span.into_range().contains(&use_offset));
+                        Note {
+                            span: self
+                                .variables
+                                .get(&later_id)
+                                .map(|variable| variable.name_span)
+                                .unwrap_or_else(|| {
+                                    **self.span_map.get(&later_id).unwrap_or(&&EMPTY_SPAN)
+                                }),
+                            msg: if own_initializer {
+                                format!(
+                                    "'{}' is the binding being declared: an initializer cannot read its own binding",
+                                    name
+                                )
+                            } else {
+                                format!(
+                                    "'{}' is declared here, later in the scope: a local binding is visible only after its declaration",
+                                    name
+                                )
+                            },
+                            source: self.source_of_id(later_id),
+                        }
+                    },
+                );
+                let note = note
+                    .or_else(|| self.element_view_import_note(id, name))
+                    .or_else(|| self.css_style_import_note(id, name));
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note,
+                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!("cannot find '{}' in this scope{}", name, steer),
+                });
+                if let Some(source) = self.source_of_id(id) {
+                    self.attribute_new_diagnostics(diagnostics_before, source);
+                }
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+            }
+        }
+    }
+
     /// The resolution preamble and the constraint fixpoint — everything
     /// `build()` does BEFORE the commit tail. The S3 two-phase shape runs
     /// this alone over the pre-entry world (analysis-reuse.md §6.7): the
@@ -34887,124 +35110,23 @@ impl<'src> Analyzer<'src> {
             self.generic_bounds.insert(binder_constraint_id, bounds);
         }
 
+        // B222: the drain runs in two parts. A guard clause publishes its
+        // condition's false-path captures into the enclosing scope only once
+        // the divergence leaves have settled — `panic(…)` is an ending the walk
+        // cannot recognise, and a call's subject is not a resolved name until
+        // the pass below has run — so a use those captures could bind is held
+        // back and resolved with the guard verdict, at the bottom of this
+        // function. Everything else resolves here. The held-back set is a name
+        // a guard in an ENCLOSING scope publishes, nothing wider: a file with
+        // no guard clause defers nothing, and an unrelated local that happens
+        // to share a capture's name is not a use the pass can change.
+        let mut guarded_locals = Vec::new();
         for (id, name) in std::mem::take(&mut self.prepped_locals) {
-            let scope_id = self.get_scope_id_for_entity(id);
-            // A use resolves at its own byte offset (positional visibility,
-            // proposal/local-shadowing.md); a spanless synthesized use sees
-            // the whole scope, as every use did before shadowing.
-            let use_offset = match self.span_map.get(&id) {
-                Some(span) if span.end > span.start => span.start,
-                _ => usize::MAX,
-            };
-            match self.resolve_value_name_at(name, scope_id, use_offset) {
-                Some(subject_id) => {
-                    if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
-                        let diagnostics_before = self.diagnostics.len();
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: message,
-                        });
-                        if let Some(source) = self.source_of_id(id) {
-                            self.attribute_new_diagnostics(diagnostics_before, source);
-                        }
-                        self.expr_id_to_expr_map.insert(id, Expr::Error);
-                    } else {
-                        let rc = self.reference_count.entry(subject_id).or_insert(0);
-                        *rc += 1;
-                        self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
-                    }
-                }
-                None => {
-                    let diagnostics_before = self.diagnostics.len();
-                    // B215: the name is not missing — it was captured by an `is`
-                    // written in EXPRESSION position, whose answer is an ordinary
-                    // `bool`. Nothing past that expression proves the test
-                    // passed, so the capture stops there; refusing this read as a
-                    // name typo would send its author looking for a spelling
-                    // mistake instead of at the shape of the test.
-                    if let Some(test) = self.expression_position_capture(name, scope_id, use_offset)
-                    {
-                        let spelling = self
-                            .source_of_id(id)
-                            .and_then(|source| self.spelling_at(source, test));
-                        let steer = match spelling {
-                            Some(test) => format!(
-                                ". Put the test where a branch depends on it — \
-                                 `if {test} {{ … }}` — and read '{name}' inside"
-                            ),
-                            None => format!(
-                                ". Put the test where a branch depends on it — an `if`, a \
-                                 `while`-shaped `for`, a `match` guard — and read '{name}' inside"
-                            ),
-                        };
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "'{name}' is bound only inside the `is` test that captured it: \
-                                 outside a condition that test is an ordinary `bool`, and nothing \
-                                 after it proves the payload is there{steer}"
-                            ),
-                        });
-                        if let Some(source) = self.source_of_id(id) {
-                            self.attribute_new_diagnostics(diagnostics_before, source);
-                        }
-                        self.expr_id_to_expr_map.insert(id, Expr::Error);
-                        continue;
-                    }
-                    let steer = self.import_steer(name).unwrap_or_default();
-                    // A use before the name's only declaration gets pointed at
-                    // it: the visibility rule is new information.
-                    let note = self.later_local_declaration(name, scope_id, use_offset).map(
-                        |later_id| {
-                            // The use sitting inside the declaring statement is
-                            // the self-referential initializer (`let x = x;`);
-                            // anywhere else it is a plain use-before-declaration.
-                            let own_initializer = self
-                                .span_map
-                                .get(&later_id)
-                                .is_some_and(|span| span.into_range().contains(&use_offset));
-                            Note {
-                                span: self
-                                    .variables
-                                    .get(&later_id)
-                                    .map(|variable| variable.name_span)
-                                    .unwrap_or_else(|| {
-                                        **self.span_map.get(&later_id).unwrap_or(&&EMPTY_SPAN)
-                                    }),
-                                msg: if own_initializer {
-                                    format!(
-                                        "'{}' is the binding being declared: an initializer cannot read its own binding",
-                                        name
-                                    )
-                                } else {
-                                    format!(
-                                        "'{}' is declared here, later in the scope: a local binding is visible only after its declaration",
-                                        name
-                                    )
-                                },
-                                source: self.source_of_id(later_id),
-                            }
-                        },
-                    );
-                    let note = note
-                        .or_else(|| self.element_view_import_note(id, name))
-                        .or_else(|| self.css_style_import_note(id, name));
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note,
-                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!("cannot find '{}' in this scope{}", name, steer),
-                    });
-                    if let Some(source) = self.source_of_id(id) {
-                        self.attribute_new_diagnostics(diagnostics_before, source);
-                    }
-                    self.expr_id_to_expr_map.insert(id, Expr::Error);
-                }
+            if self.guard_may_publish(id, name) {
+                guarded_locals.push((id, name));
+                continue;
             }
+            self.resolve_prepped_local(id, name);
         }
 
         // --- Wire assignments to their variables ---
@@ -36312,15 +36434,49 @@ impl<'src> Analyzer<'src> {
         }
 
         // B204's two resolved divergence leaves, settled HERE: after the
-        // preamble above (whose `prepped_locals` pass is what turns a call's
-        // subject into the `Expr::Local` naming its callee) and before the
-        // fixpoint below, so no constraint can observe a half-filled answer and
-        // none can change it. Every walk that mints a `for` or a call has run
-        // by now — the two-phase pipeline settles this once over the loaded
+        // preamble above (whose bare-name and member-path passes are what turn
+        // a call's subject into the `Expr::Local` naming its callee) and before
+        // the fixpoint below, so no constraint can observe a half-filled answer
+        // and none can change it. Every walk that mints a `for` or a call has
+        // run by now — the two-phase pipeline settles this once over the loaded
         // world and again after the entry walks — so the answer a constraint
         // acts on is the answer the finished program carries, which is the
         // answer the editor's paint reads back.
         self.divergence_leaves = self.compute_divergence_leaves();
+
+        // B222: and the guard clauses, decided with those leaves in hand — the
+        // first read of the divergence analysis in this build, and the reason
+        // the walk records a candidate instead of taking the verdict itself.
+        // The then-block has to diverge on EVERY path, and all four leaves
+        // count (`ret`, `jump`, a `panic(…)`, an endless `for { … }`) because
+        // the checker has one divergence analysis and this is it; then the
+        // captures the condition binds by being FALSE become ordinary
+        // declarations in the enclosing scope, visible from the end of the `if`
+        // onward (B187).
+        for guard in std::mem::take(&mut self.guard_continuations) {
+            let diverges = Divergence::new(&self.expr_id_to_expr_map, &self.divergence_leaves)
+                .block(&guard.then_statements, guard.then_tail);
+            if !diverges {
+                continue;
+            }
+            for (name, capture_id, visible_until) in guard.captures {
+                self.declare_scope_value_until(
+                    guard.scope_id,
+                    name,
+                    capture_id,
+                    guard.visible_from,
+                    visible_until,
+                );
+            }
+        }
+
+        // The uses held back at the drain above, now that the scope they read
+        // is complete. They are the last names to resolve and still resolve
+        // before the fixpoint, which is the only ordering the constraints care
+        // about.
+        for (id, name) in guarded_locals {
+            self.resolve_prepped_local(id, name);
+        }
 
         // --- Constraint solving loop ---
         // A true fixpoint: each pass resolves the constraints whose dependencies

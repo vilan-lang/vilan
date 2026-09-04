@@ -7796,13 +7796,12 @@ fn b187_the_continuation_binding_stops_at_the_enclosing_block() {
 }
 
 #[test]
-#[ignore = "B222: the guard's continuation binding is decided during the walk, before B204's divergence leaves settle"]
 fn b187_a_panicking_guard_binds_the_continuation() {
     // The guard clause's other idiomatic ending. B204 made a `panic(…)` call a
-    // leaf of the ONE `Divergence` walk — but the continuation binding is
-    // decided while the body is walked, and the leaves are settled after the
-    // walk (`resolve_world`), so at that moment the panic is not yet a leaf.
-    // Un-ignore when B222 moves the decision after the leaves settle.
+    // leaf of the ONE `Divergence` walk, and B222 moved the verdict to where
+    // that leaf exists: the walk records the candidate, `resolve_world` decides
+    // it once the leaves have settled and before any name resolves against the
+    // scope it publishes into.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -7947,6 +7946,10 @@ fn b199_a_negated_call_argument_capture_reaches_neither_branch() {
 fn b199_a_capture_inside_a_closure_argument_stays_in_the_closure() {
     // The closure body is its own scope, so the capture never escaped it even
     // before B199 — the control that says the fix did not have to reach here.
+    // B223 kept the answer and changed the VOICE: a closure body is not part of
+    // the condition it is written in, so the test in it is in expression
+    // position and the read is refused in B215's terms rather than as a name
+    // typo. One rule, one voice, wherever the test is written.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -7957,7 +7960,7 @@ fn b199_a_capture_inside_a_closure_argument_stays_in_the_closure() {
             if apply(|| maybe is Some(let n)) { print(n); }
         }
         "#,
-        "cannot find 'n' in this scope",
+        B215_STEER,
     );
 }
 
@@ -8591,5 +8594,186 @@ fn b224_a_root_if_condition_still_lifts_its_resource_into_the_enclosing_block() 
         }
         "#,
         "opened root\ndropped root\nopened no\nopened chain\ndropped chain\ndropped no\nend\n",
+    );
+}
+
+#[test]
+fn b222_an_endless_loop_guard_binds_the_continuation() {
+    // The other leaf the walk cannot read: `for { … }` with nothing that breaks
+    // out of it never falls through, so the only way past the `if` is the
+    // condition's false path — the guard clause exactly.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { for { print("stuck"); } }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b222_a_loop_with_a_break_is_not_an_ending() {
+    // The control for that leaf, and the reason the leaf is a resolved fact
+    // rather than a shape: the same `for`, with a `jump break` bound to it,
+    // falls through — so the continuation is reached with the pattern still
+    // unproven and binds nothing.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { for { jump break; } }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b222_a_module_qualified_panic_is_still_an_ending() {
+    // The `panic` leaf is the callee's IDENTITY, not the spelling at the call:
+    // `io::panic(…)` is a member path whose subject resolves later than a bare
+    // name, and the verdict waits for it too.
+    assert_compiles_and_runs(
+        r#"
+        import std::io;
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { io::panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b222_the_continuation_binding_is_still_immutable() {
+    // The continuation binding is a capture, not a `let`: it is published into
+    // the enclosing scope as an ordinary immutable declaration, and the
+    // deferred resolution above does not cost it that.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot mutate immutable 'n'",
+    );
+}
+
+#[test]
+fn b223_a_negated_for_condition_binds_nothing_in_the_body() {
+    // The exhibit. The loop body runs where the pattern did NOT match, so the
+    // payload is not there — before the frame this compiled and read it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = None;
+            for !(slot is Some(let n)) {
+                print(n);
+                slot = Some(1);
+            }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b223_a_negated_match_guard_binds_nothing_in_the_leg() {
+    // The guard's twin: the leg runs where the guard held, and the guard held
+    // where the pattern missed.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let scale = 5;
+            match scale {
+                let s if !(maybe is Some(let n)) => print(n + s),
+                _ => print(0),
+            }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b223_an_unnegated_for_condition_still_binds_its_body() {
+    // The control on the other side: reaching the body IS the test having
+    // passed, so the plain shape keeps binding exactly as it did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = Some(4);
+            for slot is Some(let n) {
+                print(n);
+                slot = None;
+            }
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b223_a_capture_in_a_closure_written_in_a_condition_speaks_b215s_rule() {
+    // A closure body is not part of the condition it is written in — the
+    // condition's truth says nothing about a test that runs inside a function
+    // value. So an `is` there is in EXPRESSION position, and the read past it
+    // is refused in B215's terms rather than as a name typo, which is what
+    // B199's per-node narrowing left it as.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun holds(check: || bool): bool { check() }
+        fun main() {
+            let maybe = Some(2);
+            if holds(|| maybe is Some(let n)) {
+                print(n);
+            }
+        }
+        "#,
+        "Put the test where a branch depends on it — `if maybe is Some(let n) { … }`",
+    );
+}
+
+#[test]
+fn b223_the_if_control_is_unchanged() {
+    // B195's own exhibit, re-pinned beside the two conditions that now share
+    // its frame: one rule, three conditions, one voice.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
     );
 }

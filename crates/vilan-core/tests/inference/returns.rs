@@ -5248,3 +5248,123 @@ fn an_async_main_keeps_its_plain_return() {
         "an async `main` keeps its `return` and gains no label:\n{javascript}"
     );
 }
+
+// --- B221: the first diverging STATEMENT exempts the tail ---------------------
+//
+// B124 exempted a body whose tail diverges, and a body whose LAST statement
+// does — the two shapes the parser's synthesized void tail arrives in. It is
+// the position that was wrong, not the rule: the first diverging statement
+// makes everything after it unreachable, so `fun g(): i32 { ret 1;
+// print("dead"); }` owed a tail value it could never be asked for, and paint
+// (which grays `print("dead")`) and the checker described one block two ways.
+// The question is now `Divergence`'s own — does this BLOCK diverge — asked of
+// every statement, which is B124's exemption list widened once.
+
+#[test]
+fn b221_a_ret_before_the_last_statement_exempts_the_tail() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        fun g(): i32 {
+        	ret 1;
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+    );
+}
+
+#[test]
+fn b221_a_panic_before_the_last_statement_exempts_the_tail() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+
+        fun g(): i32 {
+        	panic("no answer");
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+    );
+}
+
+#[test]
+fn b221_an_endless_loop_before_the_last_statement_exempts_the_tail() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        fun g(): i32 {
+        	for { print("forever"); }
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+    );
+}
+
+#[test]
+fn b221_a_diverging_statement_in_a_non_taken_branch_does_not_exempt() {
+    // The control. `expr_diverges` needs EVERY path out of the statement to
+    // leave; an `if` with no `else` falls through, so the tail is reachable
+    // and still owes its value.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+
+        fun g(flag: bool): i32 {
+        	if flag { ret 1; }
+        	print("dead");
+        }
+
+        fun main() { print(g(true)); }
+        "#,
+        "ends without producing a value",
+    );
+}
+
+#[test]
+fn b221_an_unannotated_body_infers_from_the_reachable_ret_alone() {
+    // The same question, asked by return INFERENCE (`return_evidence`): a tail
+    // the body cannot reach is no evidence, so the void after the dead
+    // `print` does not vote against the `ret` above it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g() {
+        	ret 1;
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b221_a_closure_body_that_leaves_early_owes_no_tail() {
+    // And by the closure route, which shares the check.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply(f: |i32| i32): i32 { f(2) }
+
+        fun main() {
+        	print(apply(|x| {
+        		ret x + 1;
+        		print("dead");
+        	}));
+        }
+        "#,
+        "3\n",
+    );
+}

@@ -686,7 +686,10 @@ exactly as `g(n - 1) + 1` does; a function whose only return positions are
 such calls is `Never`. Declaring the return type replaces inference with
 checking (every position against the declaration) — and an unreachable
 tail owes no value there either, so `fun f(): i32 { panic("x"); }` and
-`fun serve(): i32 { for { tick(); } }` both check without one. A closure
+`fun serve(): i32 { for { tick(); } }` both check without one. A tail is
+unreachable as soon as ANY statement before it leaves, not only the last
+one: `fun g(): i32 { ret 1; log("dead"); }` owes nothing, because
+nothing after the `ret` runs. A closure
 (and an `async` block) infers the same way: its return type is the
 unification of its reachable tail and every `ret`, so
 `|x| { ret x * 2; }` is `|i32| i32`, and a `ret` that disagrees — with
@@ -933,17 +936,18 @@ match. A then-branch that can fall through reaches it on a miss. And an
 `if` with an `else` reaches it through whichever arm did not diverge,
 which is a different question and is not part of this rule.
 
-*Implementation note (tracked gap): the guard clause's continuation
-binding is decided while the body is walked, and the divergence leaves
-that make `panic(..)` count (§5.1) are settled after the walk — so a
-guard ending in a panic does not yet publish its captures. Tracked as
-B222; pinned as an `#[ignore]`d test.*
+"Diverges" is the whole of §5.1's rule, every leaf included: a guard
+ending in `ret`, in a `jump`, in a `panic(..)` or in a `for { .. }`
+nothing breaks out of publishes its captures the same way, because the
+language has one answer to "does this leave?" and this is it.
 
 **Everything above is about a CONDITION** — an `if`'s, a `while`-shaped
 `for`'s, a `match` guard's — because a condition is the only thing that
-selects on a test's answer. An `is` written anywhere else is an ordinary
-expression yielding an ordinary `bool`, and **its captures reach the rest
-of that expression and nothing after it**: `let ok = x is Some(let n);`
+selects on a test's answer, and all three read the same way: a plain
+capture reaches the body the test selects, a negated one does not. An
+`is` written anywhere else is an ordinary expression yielding an ordinary
+`bool`, and **its captures reach the rest of that expression and nothing
+after it**: `let ok = x is Some(let n);`
 binds `n` for nowhere, and a later read of it is refused. There is no
 narrowing that could make one work — the language has no flow typing, so
 "`n` where `ok` is true" is not a thing it can say — and admitting the
@@ -975,6 +979,12 @@ if !(slot is Some(let n)) { ret; } else { … } use(n);  // error: it has an `el
 let ok = slot is Some(let n); use(n);             // error: not a condition
 let ok = slot is Some(let n) && n > 0;            // yes: `&&`, wherever written
 f(slot is Some(let n)); use(n);                   // error: not a condition
+
+for slot is Some(let n) { use(n); }               // yes: the test passed
+for !(slot is Some(let n)) { use(n); }            // error: the test failed
+match x { _ if slot is Some(let n) => use(n) }    // yes: the guard held
+match x { _ if !(slot is Some(let n)) => use(n) } // error: the test failed
+if f(|| slot is Some(let n)) { use(n); }          // error: a closure body is not the condition
 ```
 
 A pattern is checked against the type of the value it matches, so an
