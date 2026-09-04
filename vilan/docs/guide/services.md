@@ -360,9 +360,9 @@ at-least-once — see
 
 ## Authentication
 
-The straightforward shape, and the one the walkthrough app uses: a
-`login` rpc returns a token, later rpcs take the token as their first
-parameter, and the server validates it per call.
+The straightforward shape, and the one a first draft usually reaches
+for: a `login` rpc returns a token, later rpcs take the token as their
+first parameter, and the server validates it per call.
 
 ```vilan,fragment
 [rpc]
@@ -372,9 +372,83 @@ fun login(self, username: str, password: str): AuthOutcome { … }
 fun create_task(self, token: str, workspace_id: i32, name: str): i32 { … }
 ```
 
-When token-per-call gets noisy, the recorded refinement is
-connection-scoped identity via `std::context`. It isn't built into the
-generated dispatch yet.
+It works, and it has two costs: every method carries a parameter that is
+not about what the method does, and **the socket itself is open to
+anyone** — a client that never logs in still connects, still holds a
+connection, and still receives whatever the service exposes.
+
+### Authorizing the connection
+
+The refinement is to decide once, at the handshake, before a socket
+exists: `Service::authorize`.
+
+```vilan,fragment
+Service::factory(|connection: Connection| Store {
+	user = connection.session.identity,
+	notes = Signal::new([]),
+}, json_codec())
+	.authorize(|handshake: Handshake| match handshake.token() {
+		Some(let token) => match verify(token) {
+			Some(let subject) => Result::Ok(Session::of(subject)),
+			None => Result::Err(Reject::Forbidden),
+		},
+		None => Result::Err(Reject::Unauthorized),
+	})
+```
+
+`Err` answers the raw socket `401`/`403`/`429` and destroys it: no
+connection id, no reactive session, no service instance — nothing of the
+service is built for a client it refused. `Ok(session)` becomes
+`Connection.session`, which the [factory](#one-instance-per-connected-client)
+reads to build that client's instance. So identity arrives **on the
+handshake**, and the methods lose their token parameter.
+
+The mechanism is yours. Vilan verifies nothing and knows no token
+format — `authorize` may await, so signing checks (`std::jwt`, WebCrypto)
+belong right there.
+
+**How the credential gets there.** A browser cannot put a header on a
+WebSocket handshake. The one field it can fill is the subprotocol list,
+so that is the convention: `["vilan-rpc", "token." + credential]`, which
+`std::rpc::rpc_protocols(credential)` writes for you.
+
+```vilan,fragment
+let client = TodoClient::connect_with(url, json_codec(), rpc_protocols(token))!;
+```
+
+The server selects `vilan-rpc`, echoes it in the 101 (required — a
+browser closes a connection whose subprotocol offer went unanswered), and
+hands the whole offer list to `authorize` as `Handshake.protocols`;
+`handshake.token()` picks the `"token."` one out. A subprotocol is a
+token, not a header value: no commas, no spaces — every JWT already
+qualifies. The same list is re-presented on each reconnect, so an
+authorized connection re-authorizes itself automatically.
+
+`Client::connect(url, codec)` is unchanged and offers nothing, which is
+right for a service with no gate.
+
+An authorized service answers **only** the WebSocket upgrade: the
+connectionless SSE and POST legs carry no handshake to authorize, so they
+answer `401` rather than standing open as the way around the gate — the
+rpc leg with a typed `RpcError::Unauthorized` envelope.
+
+### Cheap limits, with or without a gate
+
+Three knobs on the same seam, all refusing before the upgrade, all
+working with no `authorize` at all:
+
+```vilan,fragment
+Service::new(protocol)
+	.max_connections(500)          // 429 over the ceiling
+	.handshake_rate(20, 10000.0)   // 20 handshakes per address per 10s
+	.handshake_timeout(5000)       // a socket that never greets is destroyed
+```
+
+`handshake_timeout` bounds the **greeting**, not idleness: the first
+inbound byte disarms it, so a client that connected and is only watching
+mirrors is never touched. Behind a proxy every client shares the proxy's
+address, which makes `handshake_rate` a limit for a directly-exposed
+server.
 
 ## Where the service lives
 

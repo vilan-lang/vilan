@@ -316,7 +316,27 @@ fun parse_announced(text: str): i32 {
 external struct WebSocket;
 
 [extern(new, "WebSocket")]
-external fun new_web_socket(url: str): WebSocket;
+external fun new_web_socket(url: str, protocols: List<str>): WebSocket;
+
+/// The subprotocol a vilan rpc server selects and echoes on the 101 (RFC 6455
+/// §4.2.2). Named here because both halves need the same string: the client
+/// offers it, the server picks it out of what was offered.
+fun rpc_subprotocol(): str {
+	"vilan-rpc"
+}
+
+/// The handshake offer that carries a credential (A40): the real protocol
+/// name, then `"token.<credential>"` beside it. The browser `WebSocket` API
+/// puts no headers on a handshake and the subprotocol list is the only field
+/// it lets a page fill, so this is where a token goes — and the server reads
+/// it back with `Handshake::token`.
+///
+/// A subprotocol is a token, not a header value: it may not contain a comma,
+/// a space, or a separator, which every JWT already satisfies. A credential
+/// that does not is the app's to encode (base64url) on both sides.
+fun rpc_protocols(credential: str): List<str> {
+	[rpc_subprotocol(), "token." + credential]
+}
 
 // The HMR hooks, declared here rather than imported from `std::dev` (`hmr.md`
 // §5): `std::dev` is a browser-layer module and this base module serves every
@@ -440,6 +460,10 @@ struct SocketDuplex {
 	socket: Shared<WebSocket>,
 	// The address to redial.
 	url: str,
+	// The subprotocols this connection was opened with — re-offered on every
+	// redial, because a reconnect must re-present the same credential the
+	// first handshake was authorized on (A40).
+	protocols: List<str>,
 	// The connection id the server announced — correlates this duplex with
 	// RPC calls (e.g. an `attach(connection)` method), like `SplitDuplex`.
 	// A cell: every reconnect lands a fresh id.
@@ -639,10 +663,11 @@ fun route_socket_bytes(message: Bytes, pending_settle: |i32, Frame| void, dispat
 /// socket closes or errors first (an unreachable server).
 fun dial(
 	url: str,
+	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
 ): Result<(WebSocket, i32), str> {
-	let socket = new_web_socket(url);
+	let socket = new_web_socket(url, protocols);
 	socket.set_binary_type("arraybuffer");
 	let connection: Shared<str> = Shared::new("");
 	let opened = await dial_promise(|finish: |bool| void| {
@@ -675,6 +700,7 @@ fun dial(
 /// curve. The first attempt is immediate.
 fun dial_with_backoff(
 	url: str,
+	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
 ): Result<(WebSocket, i32), str> {
@@ -690,7 +716,7 @@ fun dial_with_backoff(
 				delay * 2i53
 			};
 		}
-		outcome = dial(url, settle, dispatch);
+		outcome = dial(url, protocols, settle, dispatch);
 		if outcome is Ok(let _opened) {
 			jump break;
 		}
@@ -760,7 +786,7 @@ fun handle_drop(duplex: SocketDuplex) {
 		let early = duplex.early;
 		let settle = |request: i32, reply: Frame| settle_pending(pending, request, reply);
 		let dispatch = |payload: Frame| deliver_inbound(inbound, early, payload);
-		match dial_with_backoff(duplex.url, settle, dispatch) {
+		match dial_with_backoff(duplex.url, duplex.protocols, settle, dispatch) {
 			Ok(let opened) => {
 				let (socket, connection) = opened;
 				duplex.socket.write() = socket;
@@ -785,18 +811,27 @@ fun handle_drop(duplex: SocketDuplex) {
 /// backoff as a reconnect, so a briefly-unavailable server delays the start
 /// instead of failing it; a server that stays away returns `Err`.
 fun connect_socket(url: str): Result<SocketDuplex, str> {
+	connect_socket_with(url, [])
+}
+
+/// `connect_socket`, offering `protocols` on the handshake (A40) — the seam a
+/// credential rides on, since a browser handshake carries no headers.
+/// `std::rpc::rpc_protocols(token)` writes the documented offer. The same list
+/// is re-presented on every reconnect.
+fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str> {
 	let inbound: Shared<Option<|Frame| void>> = Shared::new(None);
 	let early: Shared<List<Frame>> = Shared::new([]);
 	let pending: Shared<List<PendingCall>> = Shared::new([]);
 	let settle = |request: i32, reply: Frame| settle_pending(pending, request, reply);
 	let dispatch = |payload: Frame| deliver_inbound(inbound, early, payload);
-	match dial_with_backoff(url, settle, dispatch) {
+	match dial_with_backoff(url, protocols, settle, dispatch) {
 		Err(let reason) => Err(reason),
 		Ok(let opened) => {
 			let (socket, connection) = opened;
 			let duplex = SocketDuplex {
 				socket = Shared::new(socket),
 				url,
+				protocols,
 				connection = Shared::new(connection),
 				state = SignalCell::new(ConnectionState::Connected),
 				inbound,
@@ -1575,7 +1610,13 @@ impl RemoteSource<type T> {
 /// unit; see backlog B21 for the load-order sensitivity that pushed it out of
 /// the template.
 fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
-	let dialed = connect_socket(url);
+	dial_for_service_with(url, [])
+}
+
+/// `dial_for_service`, offering `protocols` on the handshake — what the
+/// generated `Client::connect_with(url, codec, protocols)` opens with (A40).
+fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, RpcError> {
+	let dialed = connect_socket_with(url, protocols);
 	dialed.map_err(|reason: str| RpcError::Transport(reason))
 }
 
@@ -1955,22 +1996,21 @@ macro fun service(item: Item): Source {
 	// --- Client::connect (§4.2): contract enforcement, __attach, mirrors —
 	// --- and the reconnect hook that re-attaches them (K6).
 	let complaint = quote("the server reports a different service surface");
-	mut connect = fun_of("connect")
-		.parameter("url: str")
-		.parameter("codec: Codec")
-		.returns(i"Result<{target.client_name}<SocketTransport>, RpcError>")
-		.line("let socket = dial_for_service(url)!;")
-		.line("let transport = socket.transport();")
-		.line("let remote: Result<str, RpcError> = call(transport, codec, " + quote("__contract") + ", []);")
-		.line("if remote! != " + quote(hash) + " {\n" + indent(i"ret Result::Err(RpcError::Contract({complaint}));", 1) + "\n}")
-		.line("let connection = socket.connection.read();")
-		.line("let attached: Result<List<i32>, RpcError> = call(transport, codec, " + quote("__attach") + ", [|serializer: Serializer| connection.describe(serializer)]);")
-		.line("let channels = attached!;")
-		.line("let reactive = ReactiveClient::new(bridge(socket), codec);")
-		// Registered where the client is born, so no terminal arm has to carry
-		// it and no window exists in which the connection could close unbound
-		// (backlog A31).
-		.line("dispose_on_close(socket, reactive);");
+	// Everything AFTER the dial is the same for both spellings of connect, so
+	// it is built once and replayed into each (A40 added `connect_with`, whose
+	// only difference is the handshake offer it dials with).
+	mut body: List<str> = [];
+	body.push("let transport = socket.transport();");
+	body.push("let remote: Result<str, RpcError> = call(transport, codec, " + quote("__contract") + ", []);");
+	body.push("if remote! != " + quote(hash) + " {\n" + indent(i"ret Result::Err(RpcError::Contract({complaint}));", 1) + "\n}");
+	body.push("let connection = socket.connection.read();");
+	body.push("let attached: Result<List<i32>, RpcError> = call(transport, codec, " + quote("__attach") + ", [|serializer: Serializer| connection.describe(serializer)]);");
+	body.push("let channels = attached!;");
+	body.push("let reactive = ReactiveClient::new(bridge(socket), codec);");
+	// Registered where the client is born, so no terminal arm has to carry
+	// it and no window exists in which the connection could close unbound
+	// (backlog A31).
+	body.push("dispose_on_close(socket, reactive);");
 	mut ok_fields: List<str> = [];
 	ok_fields.push("transport = transport");
 	ok_fields.push("codec = codec");
@@ -1981,7 +2021,7 @@ macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "_",
 		};
-		connect = connect.line(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.source(channels[{channel_index}]);");
+		body.push(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.source(channels[{channel_index}]);");
 		ok_fields.push(i"{field_name} = mirror_{field_name}");
 		rebind_lines.push(i"|channel: i32, subscribe: Frame| mirror_{field_name}.rebind(channel, subscribe)");
 		channel_index = channel_index + 1;
@@ -1993,16 +2033,37 @@ macro fun service(item: Item): Source {
 	} else {
 		"[]"
 	};
-	connect = connect
-		.line(i"let rebinds: List<|i32, Frame| void> = {rebind_list};")
-		.line("socket.on_reconnect.write().push(|| {\n" + indent("reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds);", 1) + "\n});");
+	body.push(i"let rebinds: List<|i32, Frame| void> = {rebind_list};");
+	body.push("socket.on_reconnect.write().push(|| {\n" + indent("reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds);", 1) + "\n});");
 	let field_lines = join(ok_fields, ",\n");
-	connect = connect.expr(i"Result::Ok({target.client_name} \{\n" + indent(field_lines, 1) + "\n})");
+	let client_value = i"Result::Ok({target.client_name} \{\n" + indent(field_lines, 1) + "\n})";
+	let connect_type = i"Result<{target.client_name}<SocketTransport>, RpcError>";
+	mut connect = fun_of("connect")
+		.parameter("url: str")
+		.parameter("codec: Codec")
+		.returns(connect_type)
+		.line("let socket = dial_for_service(url)!;");
+	for line in body {
+		connect = connect.line(line);
+	}
+	// The credential seam (A40): the same connect, offering `protocols` on the
+	// handshake — `rpc_protocols(token)` writes the documented offer, and the
+	// same list is re-presented on every reconnect.
+	mut connect_with = fun_of("connect_with")
+		.parameter("url: str")
+		.parameter("codec: Codec")
+		.parameter("protocols: List<str>")
+		.returns(connect_type)
+		.line("let socket = dial_for_service_with(url, protocols)!;");
+	for line in body {
+		connect_with = connect_with.line(line);
+	}
 	let connect_impl = impl_of(target.client_name)
 		.generics("<SocketTransport>")
-		.method(connect)
+		.method(connect.expr(client_value))
+		.method(connect_with.expr(client_value))
 		.render();
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
+	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
 	source(imports + service_impl + service_trait_impl + client_struct.render() + client_impl.render() + connect_impl)
 }

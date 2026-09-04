@@ -81,9 +81,16 @@ impl NodeSocket {
 	[extern(method, "on", retains)]
 	external fun on_bytes(self, event: str, handler: |Bytes| void);
 
-	/// Lifecycle events with no payload (`"close"`, `"error"`).
+	/// Lifecycle events with no payload (`"close"`, `"error"`, `"timeout"`).
 	[extern(method, "on", retains)]
 	external fun on_signal(self, event: str, handler: || void);
+
+	/// Emit `"timeout"` after `millis` of inactivity; `0` clears it. Node's
+	/// own `socket.setTimeout` — it does NOT close the socket, it only tells
+	/// you, which is what lets `std::rpc_server` arm a greeting bound and
+	/// disarm it on the first byte.
+	[extern(method, "setTimeout")]
+	external fun set_timeout(self, millis: i32);
 
 	/// The peer's address as node reports it (`net.Socket.remoteAddress`) —
 	/// `undefined` on a socket that is already destroyed, which reads back as
@@ -477,6 +484,13 @@ struct Server {
 	on_stop: |Server| void,
 	/// A WebSocket-style protocol upgrade handler, when the app mounted one
 	/// (`ServerBuilder::on_upgrade`): `(request, raw socket, head bytes)`.
+	///
+	/// The handler MAY suspend, since A40: an rpc service's pre-upgrade
+	/// `authorize` hook has to be able to await (verifying a JWT is a
+	/// WebCrypto call, and WebCrypto is async everywhere). Node neither
+	/// answers the upgrade itself nor waits on this handler — the socket stays
+	/// open until something writes to it — so a handler that settles later
+	/// still owns the socket when it does.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
 	/// The live listener, once bound — what `stop()` closes. `start()`
 	/// populates it on the copy of `Server` it hands to `on_start`, so
