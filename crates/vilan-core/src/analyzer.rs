@@ -1868,6 +1868,22 @@ struct SignatureSubject<'a> {
     trait_arguments: &'a [TypeId],
 }
 
+/// A supertrait member reached from a sub-trait's default body (B205/B216):
+/// the trait that DECLARES the member, the SUB-trait's own abstract type — what
+/// that member's `Self` means at this call — and the arguments the sub-trait's
+/// `with` clause supplied the declaring trait.
+///
+/// [`SignatureSubject`]'s twin for method resolution rather than for a rendered
+/// label, and it carries the arguments for the same reason: under a
+/// PARAMETERIZED clause a `= Self`-defaulted parameter and `Self` resolve to the
+/// one type, so only the written name says which of the two a position is.
+#[derive(Clone, Debug)]
+struct SupertraitSelf {
+    declaring_trait_id: Id,
+    sub_trait: TypeId,
+    arguments: Vec<TypeId>,
+}
+
 /// B161: a TRAIT written as a `let` binding's annotation. The annotation is
 /// not the binding's type and not a widening — the binding keeps the concrete
 /// type its initializer infers — it is a CONSTRAINT that type is checked
@@ -3275,7 +3291,7 @@ pub struct Analyzer<'src> {
     /// (`Expected Doubler, but got Add`). Recorded at the lookup, the one place
     /// both traits are in hand; consumed by the argument check, which reads a
     /// member's declared parameter types straight off the declaration.
-    supertrait_self_at_call: HashMap<Id, (Id, TypeId)>,
+    supertrait_self_at_call: HashMap<Id, SupertraitSelf>,
     // The expected type imposed on an expression by its syntactic context — a
     // function's declared return type for its body tail, propagated into tail
     // positions (each `match` leg body) by their resolvers. Lets a
@@ -6993,23 +7009,88 @@ impl<'src> Analyzer<'src> {
     /// recursion — it exists separately because `substitute_type` does not know
     /// `Self`, and leaving a nested `Self` unsubstituted would compare as a
     /// spurious mismatch (`List<Self>` vs `List<subject>`).
-    /// [`substitute_member_type`] for B205's recorded pair: a supertrait
+    /// [`substitute_member_type`] for B205's recorded reach: a supertrait
     /// member's `Self`, rebound to the sub-trait the call reached it through.
     /// `None` (the ordinary call) returns the type unchanged.
+    ///
+    /// `declared_id` is the position's WRITTEN type id — the parameter's or the
+    /// return's own annotation, before any substitution — because under a
+    /// parameterized clause that id's spelling is the only thing separating
+    /// `Self` from a `= Self`-defaulted parameter (B216).
     fn rebind_supertrait_self(
         &mut self,
-        supertrait_self: Option<(Id, TypeId)>,
+        reached: Option<&SupertraitSelf>,
+        declared_id: Option<TypeId>,
         type_: &Type,
     ) -> Type {
-        match supertrait_self {
-            Some((declaring_trait_id, sub_trait)) => self.substitute_member_type(
+        let Some(reached) = reached else {
+            return type_.clone();
+        };
+        // An AMBIGUOUS position — one resolving to the declaring trait's own
+        // abstract type while the clause wrote arguments — is decided by the
+        // spelling, never by the resolved type. A position whose spelling
+        // cannot be recovered is left exactly as declared rather than guessed
+        // at: that is the shape B205 refused to touch at all.
+        let ambiguous = !reached.arguments.is_empty()
+            && matches!(
                 type_,
-                declaring_trait_id,
-                sub_trait,
-                &SubstitutionContext::default(),
-            ),
-            None => type_.clone(),
+                Type::Trait(trait_id, arguments)
+                    if *trait_id == reached.declaring_trait_id && arguments.is_empty()
+            );
+        if ambiguous {
+            return match self.supertrait_position_type(reached, declared_id) {
+                Some(type_id) => type_id.get_type(self),
+                None => type_.clone(),
+            };
         }
+        let context =
+            self.trait_parameter_substitution(reached.declaring_trait_id, &reached.arguments);
+        self.substitute_member_type(
+            type_,
+            reached.declaring_trait_id,
+            reached.sub_trait,
+            &context,
+        )
+    }
+
+    /// What an ambiguous `Self` / `= Self`-defaulted position of a SUPERTRAIT's
+    /// member means at a call reached through a sub-trait's parameterized `with`
+    /// clause (B216).
+    ///
+    /// `ambiguous_position_expectation`'s rule (the B29 residue) and
+    /// `signature_position_type`'s (B206's label rule) applied a third time, at
+    /// method resolution: `Self` is the sub-trait, and a position spelled with
+    /// one of the declaring trait's own parameter names is the matching clause
+    /// argument — falling back to the sub-trait when the clause supplied none,
+    /// which is precisely what the `= Self` default means. `None` when the
+    /// spelling cannot be recovered, and the caller then leaves the position
+    /// alone.
+    fn supertrait_position_type(
+        &self,
+        reached: &SupertraitSelf,
+        declared_id: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let declared_id = declared_id?;
+        let written = self
+            .written_type_spellings
+            .iter()
+            .find(|(written_id, _)| *written_id == declared_id)
+            .map(|(_, name)| *name)?;
+        if written == "Self" {
+            return Some(reached.sub_trait);
+        }
+        let trait_ = self.traits.get(&reached.declaring_trait_id)?;
+        let index = trait_
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written)?;
+        Some(
+            reached
+                .arguments
+                .get(index)
+                .copied()
+                .unwrap_or(reached.sub_trait),
+        )
     }
 
     fn substitute_member_type(
@@ -26494,17 +26575,34 @@ impl<'src> Analyzer<'src> {
                             // method spelling reaching the same place.) A
                             // receiver whose trait IS the declaring one is left
                             // alone: the substitution would be the identity.
-                            let receiver_is_sub_trait = matches!(receiver_type, Type::Trait(_, _))
-                                && self
-                                    .supertrait_self_at_call
-                                    .get(&id)
-                                    .is_some_and(|(declaring, _)| *declaring == self_trait);
+                            let receiver_is_sub_trait =
+                                matches!(receiver_type, Type::Trait(_, _))
+                                    && self.supertrait_self_at_call.get(&id).is_some_and(
+                                        |reached| reached.declaring_trait_id == self_trait,
+                                    );
                             if receiver_is_sub_trait
                                 || matches!(
                                     receiver_type,
                                     Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
                                 )
                             {
+                                // A sub-trait receiver goes through the reach the
+                                // lookup recorded, so a PARAMETERIZED clause
+                                // decides the return by its written name too — a
+                                // member returning `B` under `with Add<i32>`
+                                // returns `i32`, not the sub-trait (B216). With
+                                // no arguments written the two are the same
+                                // substitution, B205's.
+                                if receiver_is_sub_trait
+                                    && let Some(reached) =
+                                        self.supertrait_self_at_call.get(&id).cloned()
+                                {
+                                    return self.rebind_supertrait_self(
+                                        Some(&reached),
+                                        return_type_id,
+                                        &return_type,
+                                    );
+                                }
                                 let subject = receiver_type.get_type_id(self);
                                 return self.substitute_member_type(
                                     &return_type,
@@ -30626,29 +30724,38 @@ impl<'src> Analyzer<'src> {
                             .insert(id, GenericDispatch::OnType(None, member_name));
                         // B205: a member reached from a SUPERTRAIT is written in
                         // that trait's terms, `Self` included — and inside this
-                        // default body `Self` is the SUB-trait. Record the pair
+                        // default body `Self` is the SUB-trait. Record the reach
                         // so the argument check can rebind it; the return type
                         // takes the same rebinding through the `Self`-return
                         // specialization below.
                         //
-                        // Only for an ARGUMENT-LESS `with` clause, and that is
-                        // the whole of the rule rather than a convenience. A
-                        // `= Self`-defaulted parameter resolves to the very same
-                        // type as `Self` (`trait Add<B = Self>` -> both are
-                        // `Type::Trait(Add, [])`), so with no argument written
-                        // every such occurrence means the sub-trait and a blanket
-                        // rewrite is exactly right. Write `with Add<i32>` and the
-                        // two positions part company — `b: B` is `i32`, the `Self`
-                        // return is still the sub-trait — and nothing in the
-                        // RESOLVED types tells them apart; only the written name
-                        // does (`ambiguous_position_expectation`, the same B29
-                        // residue). That shape is left exactly as it was.
-                        if *declaring_trait_id != trait_id && declaring_arguments.is_empty() {
+                        // With an ARGUMENT-LESS `with` clause a blanket rewrite is
+                        // exactly right: a `= Self`-defaulted parameter resolves to
+                        // the very same type as `Self` (`trait Add<B = Self>` ->
+                        // both are `Type::Trait(Add, [])`), and with no argument
+                        // written every such occurrence does mean the sub-trait.
+                        // Write `with Add<i32>` and the two positions part company
+                        // — `b: B` is `i32`, the `Self` return is still the
+                        // sub-trait — and nothing in the RESOLVED types tells them
+                        // apart; only the WRITTEN name does. So the clause's
+                        // arguments are carried along too, and the rebinding
+                        // decides each ambiguous position by its spelling (B216,
+                        // `supertrait_position_type` — the same B29 residue
+                        // `ambiguous_position_expectation` and B206's label rule
+                        // run on).
+                        if *declaring_trait_id != trait_id {
                             let declaring_trait_id = *declaring_trait_id;
+                            let arguments = declaring_arguments.clone();
                             let sub_trait =
                                 Type::Trait(trait_id, trait_arguments.clone()).get_type_id(self);
-                            self.supertrait_self_at_call
-                                .insert(id, (declaring_trait_id, sub_trait));
+                            self.supertrait_self_at_call.insert(
+                                id,
+                                SupertraitSelf {
+                                    declaring_trait_id,
+                                    sub_trait,
+                                    arguments,
+                                },
+                            );
                         }
                         // A parameterized trait substitutes its generic parameters
                         // with the concrete arguments, so the method's signature
@@ -31156,7 +31263,7 @@ impl<'src> Analyzer<'src> {
         // structural rather than a substitution entry because types are not
         // interned: the parameter, the return and the trait's own `Self` binding
         // are three ids for the one type.
-        let supertrait_self = self.supertrait_self_at_call.get(&call_id).copied();
+        let supertrait_self = self.supertrait_self_at_call.get(&call_id).cloned();
         let expected = parameter_ids.len().saturating_sub(1);
         if argument_ids.len() != expected {
             // `self` is parameter 0 — the arguments a caller writes line up
@@ -31178,12 +31285,16 @@ impl<'src> Analyzer<'src> {
         let mut argument_types = Vec::with_capacity(argument_ids.len());
         for argument_id in argument_ids {
             // `+ 1` skips the method's `self` parameter.
-            let parameter_type = parameter_ids
+            let declared_id = parameter_ids
                 .get(argument_types.len() + 1)
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
-                .map(|parameter| parameter.type_id.get_type(self))
+                .map(|parameter| parameter.type_id);
+            let parameter_type = declared_id
+                .map(|declared_id| declared_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
-                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
+                .map(|parameter| {
+                    self.rebind_supertrait_self(supertrait_self.as_ref(), declared_id, &parameter)
+                })
                 .unwrap_or(Type::Unknown);
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
@@ -31193,12 +31304,16 @@ impl<'src> Analyzer<'src> {
         }
         for (index, argument_type) in argument_types.into_iter().enumerate() {
             let argument_id = argument_ids[index];
-            let Some(parameter_type) = parameter_ids
+            let declared_id = parameter_ids
                 .get(index + 1)
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
-                .map(|parameter| parameter.type_id.get_type(self))
+                .map(|parameter| parameter.type_id);
+            let Some(parameter_type) = declared_id
+                .map(|declared_id| declared_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
-                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
+                .map(|parameter| {
+                    self.rebind_supertrait_self(supertrait_self.as_ref(), declared_id, &parameter)
+                })
             else {
                 continue;
             };
