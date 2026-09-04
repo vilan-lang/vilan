@@ -2121,7 +2121,15 @@ impl Backend {
         let path = vilan_core::util::canonical_path(&path);
         self.documents
             .iter()
-            .filter_map(|entry| entry.value().package_root().map(Path::to_path_buf))
+            // Both sides canonical: on Windows a document's root can carry the
+            // short spelling of a directory (`RUNNER~1`) while the arriving
+            // path is canonical, and `starts_with` compares components.
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .package_root()
+                    .map(vilan_core::util::canonical_path)
+            })
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.as_os_str().len())
     }
