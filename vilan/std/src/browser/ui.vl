@@ -304,6 +304,11 @@ impl View {
 	/// A row whose key survives is reused (its element MOVES into the new
 	/// order, subscriptions intact); it re-renders only when its item's value
 	/// changed (`T: PartialEq`).
+	///
+	/// This is the KEYED, value-checked form — the one that both moves rows and
+	/// skips unchanged ones, and the only one that needs both bounds. Two
+	/// siblings drop one bound each (A42): `bind_each_values` keys by the item
+	/// itself, and `bind_each_by` keys by `key` and asks nothing of `T` at all.
 	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
 		self,
 		source: S,
@@ -323,7 +328,9 @@ impl View {
 			}
 		});
 		source.effect(|list: List<T>| {
-			let plan = reconcile(row_keys.read(), row_items.read(), list, key);
+			let plan = reconcile(row_keys.read(), row_items.read(), list, key, |before, after| {
+				before == after
+			});
 			let previous_views = row_views.read();
 			let previous_owners = row_owners.read();
 			for index in plan.removed {
@@ -366,6 +373,130 @@ impl View {
 			}
 			row_keys.write() = next_keys;
 			row_items.write() = list;
+			row_views.write() = next_views;
+			row_owners.write() = next_owners;
+		});
+		self
+	}
+
+	/// A reactive list keyed by the ITEM ITSELF — `bind_each` with the key
+	/// function it was going to be given anyway (A42).
+	///
+	/// Every call site in the estate that passed `|x| x` wants this: the item
+	/// decides identity AND change, so writing the identity closure was pure
+	/// ceremony, and hand-writing a `PartialEq` to serve as the key — which is
+	/// what a type carrying a closure has to do — was a second copy of the same
+	/// decision. Semantically identical to `bind_each(source, |item| item,
+	/// render)`, and the same disposal boundary per row.
+	fun bind_each_values<T: PartialEq, S: Source<List<T>>>(
+		self,
+		source: S,
+		render: (sync |T| View) context owner_scope,
+	): View {
+		self.bind_each(source, |item| item, render)
+	}
+
+	/// A reactive list keyed by `key`, whose rows UPDATE THROUGH A CELL instead
+	/// of being rebuilt — Solid's `<Index>` beside `bind_each`'s `<For>` (A42).
+	///
+	/// Nothing is asked of `T`: no `PartialEq`, no derive, no hand-written
+	/// equality. A row whose key survives keeps its element, its owner and its
+	/// bindings, and std writes the new item into that row's own
+	/// `SignalCell<T>` — so the row updates through the bindings `render`
+	/// already made rather than through a dispose-and-rebuild. No `Refresh` is
+	/// ever emitted here; a key is either kept, fresh, or gone.
+	///
+	/// The trade is stated plainly: `set` never compares, so every kept row's
+	/// cell is written on every change of the list, and every binding in every
+	/// row re-runs. That is the price of not knowing what changed. Reach for
+	/// `bind_each` when `T` compares cheaply and rows are expensive to rebuild;
+	/// reach for this when `T` cannot compare at all (a struct carrying a
+	/// closure, a handle) or when the row's own bindings are the natural
+	/// update path.
+	///
+	/// `render` receives the row's cell as a `SignalCell<T>` rather than as
+	/// some read-only view of it, because vilan has no trait objects: a closure
+	/// PARAMETER cannot be typed by a trait, only by a concrete type or a
+	/// generic. Treat it as read-only — writing it desynchronizes the row from
+	/// the list until the next reconcile.
+	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>>(
+		self,
+		source: S,
+		key: sync |T| K,
+		render: (sync |SignalCell<T>| View) context owner_scope,
+	): View {
+		let element = self.element;
+		let row_keys: Shared<List<K>> = Shared::new([]);
+		let row_items: Shared<List<T>> = Shared::new([]);
+		let row_cells: Shared<List<SignalCell<T>>> = Shared::new([]);
+		let row_views: Shared<List<View>> = Shared::new([]);
+		let row_owners: Shared<List<Owner>> = Shared::new([]);
+		// Whichever rows are live when the enclosing boundary is disposed go
+		// with it, exactly as `bind_each`'s do.
+		get_owner().defer(|| {
+			for owner in row_owners.read() {
+				owner.dispose();
+			}
+		});
+		source.effect(|list: List<T>| {
+			// A surviving key is ALWAYS kept: the row's cell carries the new
+			// item, so there is nothing for a `Refresh` to rebuild.
+			let plan = reconcile(row_keys.read(), row_items.read(), list, key, |_before, _after| {
+				true
+			});
+			let previous_cells = row_cells.read();
+			let previous_views = row_views.read();
+			let previous_owners = row_owners.read();
+			for index in plan.removed {
+				previous_owners[index].dispose();
+				previous_views[index].element.remove();
+			}
+			mut next_cells: List<SignalCell<T>> = [];
+			mut next_views: List<View> = [];
+			mut next_owners: List<Owner> = [];
+			mut position = 0;
+			for step in plan.steps {
+				let item = list[position];
+				match step {
+					RowStep::Keep(let index) => {
+						let cell = previous_cells[index];
+						cell.set(item);
+						next_cells.push(cell);
+						next_views.push(previous_views[index]);
+						next_owners.push(previous_owners[index]);
+					},
+					// Unreachable: `same` above is constantly true, so
+					// `reconcile` never refreshes here. Kept in step with
+					// `Keep` rather than left to rot differently.
+					RowStep::Refresh(let index) => {
+						let cell = previous_cells[index];
+						cell.set(item);
+						next_cells.push(cell);
+						next_views.push(previous_views[index]);
+						next_owners.push(previous_owners[index]);
+					},
+					RowStep::Fresh => {
+						let cell: SignalCell<T> = SignalCell::new(item);
+						let owner = Owner::new();
+						next_cells.push(cell);
+						next_views.push(run_with_owner(owner, || render(cell)));
+						next_owners.push(owner);
+					},
+				}
+				position += 1;
+			}
+			// The order pass: appending a kept element moves it; a fresh one
+			// inserts.
+			for row in next_views {
+				element.append(row.element);
+			}
+			mut next_keys: List<K> = [];
+			for item in list {
+				next_keys.push(key(item));
+			}
+			row_keys.write() = next_keys;
+			row_items.write() = list;
+			row_cells.write() = next_cells;
 			row_views.write() = next_views;
 			row_owners.write() = next_owners;
 		});

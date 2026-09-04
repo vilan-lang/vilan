@@ -512,10 +512,13 @@ catches the cell mid-transition.
 
 ## Keyed reconciliation
 
-`reconcile(old_keys, old_items, new_items, key)` computes a minimal
-update plan for keyed lists (keep this row, refresh that one, these are
-gone). It's the pure engine underneath `ui`'s `bind_each`. You'd only
-call it directly to build your own list-rendering primitive.
+`reconcile(old_keys, old_items, new_items, key, same)` computes a
+minimal update plan for keyed lists (keep this row, refresh that one,
+these are gone). It's the pure engine underneath `ui`'s `bind_each`.
+You'd only call it directly to build your own list-rendering primitive.
+`key` decides identity — whether a row survives and moves — and `same`
+decides, for a surviving key, whether the row is reused or rebuilt;
+they're two questions, so they're two arguments.
 
 ## Traps
 

@@ -631,11 +631,18 @@ struct ReconcilePlan {
 	steps: List<RowStep>,  // one per NEW item, in the new order
 	removed: List<i32>,    // old indices gone entirely
 }
-fun reconcile<T: PartialEq, K: PartialEq>(
+fun reconcile<T, K: PartialEq>(
 	old_keys: List<K>, old_items: List<T>, items: List<T>, key_of: sync |T| K,
+	same: sync |T, T| bool,
 ): ReconcilePlan
 ```
 
 The pure engine under `ui.bind_each`; duplicate keys claim the first
 surviving row once. Reach for it directly only when building a custom
 list-rendering primitive.
+
+**"Unchanged" is the caller's predicate, not `T: PartialEq`.** The key decides
+identity and whether the row moves; `same` decides, for a surviving key, reuse
+against dispose-and-rebuild. `bind_each` passes `|a, b| a == b`;
+`bind_each_by` passes `|_a, _b| true`, which is why it never emits a `Refresh`
+and asks nothing of `T`.

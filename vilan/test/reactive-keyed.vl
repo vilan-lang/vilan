@@ -2,6 +2,11 @@
 // node-testable: per new item KEEP an unchanged same-key row, REFRESH a
 // changed one, render FRESH for a new key; absent keys report as removed;
 // a duplicate key claims its old row once.
+//
+// "Unchanged" is the caller's own predicate (A42), not `T: PartialEq`: the key
+// decides identity, `same` decides reuse against rebuild. `bind_each` passes
+// `==`, which is every case below but the last; `bind_each_by` passes "always
+// the same", which never produces a REFRESH at all.
 import std::io::print;
 import std::reactive::{ reconcile, RowStep, ReconcilePlan };
 
@@ -24,16 +29,21 @@ fun show(plan: ReconcilePlan) {
 
 fun main() {
 	// Reorder: rows move with their keys.
-	show(reconcile([1, 2, 3], [10, 20, 30], [30, 10, 20], |item| item / 10));
+	show(reconcile([1, 2, 3], [10, 20, 30], [30, 10, 20], |item| item / 10, |a, b| a == b));
 	// Keep the unchanged, refresh the changed, fresh the new.
-	show(reconcile([1, 2], [10, 20], [10, 21, 35], |item| item / 10));
+	show(reconcile([1, 2], [10, 20], [10, 21, 35], |item| item / 10, |a, b| a == b));
 	// Keys that left the list report their old indices.
-	show(reconcile([1, 2, 3], [10, 20, 30], [30], |item| item / 10));
+	show(reconcile([1, 2, 3], [10, 20, 30], [30], |item| item / 10, |a, b| a == b));
 	// Duplicate keys: the first claims the old row, later ones are fresh.
-	show(reconcile([1], [10], [10, 10], |item| item / 10));
+	show(reconcile([1], [10], [10, 10], |item| item / 10, |a, b| a == b));
 	// From empty, and to empty.
-	show(reconcile([], [], [10], |item| item / 10));
-	show(reconcile([1], [10], [], |item| item / 10));
+	show(reconcile([], [], [10], |item| item / 10, |a, b| a == b));
+	show(reconcile([1], [10], [], |item| item / 10, |a, b| a == b));
+	// `bind_each_by`'s predicate: a surviving key is ALWAYS kept, so the same
+	// input that refreshed above keeps its row instead — the row's own cell
+	// carries the new item.
+	// witness: if (same(__at(old_items, index), item)) {
+	show(reconcile([1, 2], [10, 20], [10, 21, 35], |item| item / 10, |_a, _b| true));
 }
 
 main();

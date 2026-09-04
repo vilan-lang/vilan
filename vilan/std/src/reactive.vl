@@ -895,6 +895,14 @@ impl SignalCell<SignalCell<type U>> {
 // A duplicate key claims its old row once — later duplicates render fresh.
 // Pure logic (no DOM), so its edge cases pin in ordinary node tests; the
 // browser's `bind_each` applies the plan to elements.
+//
+// "Unchanged" is the CALLER's predicate (`same`), not `T: PartialEq` (A42).
+// The key decides identity and the element MOVES; `same` decides, for a
+// surviving key, reuse against dispose-and-rebuild — two different questions
+// that the old bound conflated into one. `bind_each` passes `==` and behaves
+// exactly as it always has; `bind_each_by` passes "always the same", which is
+// what lets it take a `T` with no equality at all and update a kept row
+// through its own cell instead of rebuilding it.
 
 /// One new-position row's fate. `Keep`/`Refresh` carry the OLD row's index.
 enum RowStep {
@@ -910,11 +918,12 @@ struct ReconcilePlan {
 	removed: List<i32>,
 }
 
-fun reconcile<T: PartialEq, K: PartialEq>(
+fun reconcile<T, K: PartialEq>(
 	old_keys: List<K>,
 	old_items: List<T>,
 	items: List<T>,
 	key_of: sync |T| K,
+	same: sync |T, T| bool,
 ): ReconcilePlan {
 	mut claimed: List<bool> = [];
 	for _ in old_keys {
@@ -928,7 +937,7 @@ fun reconcile<T: PartialEq, K: PartialEq>(
 		for index < old_keys.len() {
 			if !claimed[index] && old_keys[index] == item_key {
 				claimed[index] = true;
-				step = if old_items[index] == item {
+				step = if same(old_items[index], item) {
 					RowStep::Keep(index)
 				} else {
 					RowStep::Refresh(index)
