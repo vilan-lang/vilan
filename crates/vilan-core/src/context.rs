@@ -302,6 +302,24 @@ fn span_of(program: &Program, id: Id) -> crate::span::Span {
         .unwrap_or(crate::span::Span { start: 0, end: 0 })
 }
 
+/// Where a note ABOUT A CALL points: the callee's own name when the analyzer
+/// recorded one, the whole call expression otherwise.
+///
+/// A method call's span starts at the head of its receiver chain — `root =
+/// root.child(row` / `.render_body())` is one call, and its span is both of
+/// those lines — so a note that takes it underlines the whole chain and says
+/// "this call" about all of it; in a component-shaped body the chain IS the
+/// body (B229). `member_name_spans` holds the precise callee span for exactly
+/// the calls that have one (a method's `.render_body`); a plain `label()` has
+/// no member name and its own span is already tight.
+fn call_anchor_span(program: &Program, call: Id) -> crate::span::Span {
+    program
+        .member_name_spans
+        .get(&call)
+        .copied()
+        .unwrap_or_else(|| span_of(program, call))
+}
+
 fn context_name<'a>(program: &'a Program, context: Id) -> &'a str {
     program
         .variables
@@ -875,8 +893,44 @@ fn analyze(
         sorted
     };
 
+    // --- The `run` sites the solver never selected (B229). ---
+    // A `run` whose argument failed to type is never SELECTED, and an
+    // unselected method call is wired nowhere: the collection loop above scans
+    // `function_calls` and so cannot see it. The site is then missing from
+    // `runs`, the context it binds looks bound nowhere, and every strict read
+    // of it fences — three refusals about a missing `run` the program plainly
+    // writes, printed ahead of the one about the argument that actually
+    // failed. The shape survives in `unresolved_method_calls`, so the contexts
+    // those sites name stand their coverage verdict down: coverage is not a
+    // question that can be answered about a program whose `run` sites are not
+    // all on record, and the diagnostic explaining why is already in hand.
+    //
+    // Narrow on purpose, in both directions. Only the contexts an unresolved
+    // `run` actually names are excused — every other context in the same
+    // program keeps its verdict. And nothing is excused in a program that
+    // carries no diagnostic: a suppression that could fire on a clean program
+    // would trade a confusing refusal for a silent miscompile, which is the
+    // one thing this check exists to prevent.
+    let unresolved_run_contexts: HashSet<Id> = if program.diagnostics.is_empty() {
+        HashSet::default()
+    } else {
+        program
+            .unresolved_method_calls
+            .iter()
+            .filter(|(_, _, member_name)| *member_name == "run")
+            .filter_map(|(_, subject_id, _)| local_target(program, *subject_id))
+            .filter(|context| contexts.contains(context))
+            .collect()
+    };
+
     // --- Per-context effect inference + coverage. ---
     for &context in &plan.contexts {
+        // A `run` for this context is written but unresolved (B229): neither
+        // the verdict nor the rewrite is this pass's to record — the program
+        // has not type-checked, and its own diagnostic says so.
+        if unresolved_run_contexts.contains(&context) {
+            continue;
+        }
         // Seed with the nodes that directly read this context.
         let mut needs: HashSet<Id> = HashSet::default();
         let mut worklist: Vec<Id> = Vec::new();
@@ -1247,7 +1301,7 @@ fn analyze(
                 .take(TRACE_CAP)
                 .map(|hop| TraceHop {
                     note: Note {
-                        span: span_of(program, hop.call),
+                        span: call_anchor_span(program, hop.call),
                         msg: if hop.dispatch {
                             "the context requirement may flow through this call (dispatch may select a reader)"
                                 .to_string()
@@ -1264,7 +1318,7 @@ fn analyze(
                 let plural = if elided == 1 { "call" } else { "calls" };
                 entries.push(TraceHop {
                     note: Note {
-                        span: span_of(program, last.call),
+                        span: call_anchor_span(program, last.call),
                         msg: format!("… {elided} more uncovered {plural} on this path"),
                         source: locate(last.call),
                     },

@@ -2855,6 +2855,10 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    /// Method calls the fixpoint never selected, as `(call entity, receiver
+    /// entity, member name)` — filled once, after the fixpoint. See
+    /// [`Program::unresolved_method_calls`] for why anyone wants them.
+    unresolved_method_calls: Vec<(Id, Id, &'src str)>,
     struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     /// E119: the platform this analysis runs under, and why (the latter already
     /// rendered) — copied off the call's arguments and the `Workspace` so the
@@ -4095,6 +4099,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            unresolved_method_calls: Vec::new(),
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             or_operand_end: None,
@@ -37904,6 +37909,26 @@ impl<'src> Analyzer<'src> {
             }
         }
 
+        // The calls the fixpoint could not select, kept for the passes that
+        // read the program's SHAPE rather than its types (B229 — the context
+        // pass and its `run`). Recorded unconditionally and before the
+        // residual sweep below decides which stalls to speak about: whether a
+        // stall is worth a diagnostic is a separate question from whether the
+        // call was written.
+        self.unresolved_method_calls = self
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                Constraint::MethodCall {
+                    id,
+                    subject_id,
+                    member_name,
+                    ..
+                } => Some((*id, *subject_id, *member_name)),
+                _ => None,
+            })
+            .collect();
+
         // --- Post-solve diagnostics ---
         // Unresolved tasks still on the queue could not be typed (priority order
         // — struct initializers before field accessors — matches the original
@@ -39306,6 +39331,21 @@ pub struct Program<'src> {
     // Use-site identifier spans for field accesses / method calls (`.x`), keyed
     // by the access expr id — drives rename and go-to-definition on members.
     pub member_name_spans: HashMap<Id, Span>,
+    /// The method calls the solver never selected — the `MethodCall`
+    /// constraints still on the queue when the fixpoint ended — as `(call
+    /// entity, receiver entity, member name)`.
+    ///
+    /// A selected method call is wired into `function_calls`; an unselected one
+    /// is recorded NOWHERE, so a later pass that finds its own sites by
+    /// scanning `function_calls` cannot tell "the program never wrote that
+    /// call" from "the program wrote it and an argument failed to type". The
+    /// context pass looks for `run` that way, and answered the first question
+    /// when the program had only asked the second: one mistyped `run` argument
+    /// deleted the whole `run` site and every read of that context fenced as
+    /// uncovered, burying the real error under its own cascade (B229). This is
+    /// the shape the program stated, kept for a pass that needs to know a call
+    /// WAS written even though nothing could be resolved about it.
+    pub unresolved_method_calls: Vec<(Id, Id, &'src str)>,
     /// Use-site identifier spans for struct-initializer field KEYS: `(file, name
     /// span, owning struct id, field index)`, one per `x` in `Point { x = 1 }`.
     ///
@@ -45629,6 +45669,7 @@ fn analyze_over_world<'src>(
         layer_platforms,
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
+        unresolved_method_calls: std::mem::take(&mut analyzer.unresolved_method_calls),
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,

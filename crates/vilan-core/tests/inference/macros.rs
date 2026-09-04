@@ -2537,9 +2537,11 @@ fun main() {
                 0,
                 "the context requirement flows through this call",
             ),
+            // The callee's own name, not the receiver chain (B229): a
+            // dispatch hop takes the same anchor every method hop does.
             (
-                "subject.report()",
-                0,
+                "report",
+                1,
                 "the context requirement may flow through this call (dispatch may select a reader)",
             ),
         ],
@@ -2757,6 +2759,256 @@ main();
             (
                 "call_it(|| print(current.get()))",
                 0,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
+// --- B229: a `run` the solver never selected is still a `run` ---
+//
+// The context pass finds its sites by scanning `function_calls`, which holds
+// only SELECTED calls. One `run` argument that fails to type leaves the
+// method unselected, so the site vanishes from the scan, the context looks
+// bound nowhere, and every strict read of it fences — a wall of refusals about
+// a missing `run` the program plainly writes, with the one real error last.
+// The fix reads the unresolved sites' shape and stands the coverage verdict
+// down for exactly the contexts they name.
+
+/// The owner's shape (kolt, 2026-09-04): a field added to the context struct
+/// and not to the initializer. ONE error, at the initializer.
+#[test]
+fn b229_a_missing_initializer_field_does_not_fence_every_read() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+    density: i32,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun badge(): str {
+    app_ctx.get().theme + "-badge"
+}
+
+fun footer(): str {
+    app_ctx.get().theme + "-footer"
+}
+
+fun component(): str {
+    label() + badge() + footer()
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(component());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`density` is missing");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The arity mismatch's other half: an EXTRA field cascades the same way, and
+/// is stood down the same way.
+#[test]
+fn b229_an_extra_initializer_field_does_not_fence_every_read() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark", density = 2 }, || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`density` is not a field of `AppCtx`");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The general form: ANY unresolved value argument deletes the site, so the
+/// stand-down is keyed on the unselected call and not on the initializer.
+#[test]
+fn b229_an_unresolved_run_argument_does_not_fence_every_read() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun main() {
+    app_ctx.run(missing_fn(), || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "cannot find 'missing_fn' in this scope");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The invariant the stand-down may not weaken: an uncovered read in a program
+/// with nothing else wrong is still a compile error, not a silent miscompile.
+#[test]
+fn b229_an_uncovered_read_in_a_clean_program_still_fences() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun main() {
+    print(label());
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(label());
+    });
+}
+main();
+        "#,
+        "context `app_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// And it is per CONTEXT, not per program: the context whose `run` failed
+/// stands down; a second context's genuinely uncovered read in the same
+/// program keeps its refusal.
+#[test]
+fn b229_only_the_unresolved_run_s_own_context_stands_down() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+    density: i32,
+}
+
+struct Other {
+    tint: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+let other_ctx: Context<Other> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun tint(): str {
+    other_ctx.get().tint
+}
+
+fun main() {
+    print(tint());
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `other_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "context `app_ctx` is read here");
+}
+
+/// B229's second face: a trace label on a METHOD-call hop points at the
+/// callee's name, not at the whole receiver chain — which in a
+/// component-shaped body is the body. The plain hops in the same trace
+/// (`label()`, `panel(..)`, `main()`) are the control: they carry no member
+/// name and keep their own already-tight spans.
+#[test]
+fn b229_a_method_call_hop_spans_the_callee_name() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun label(): i32 {
+    current.get()
+}
+
+struct Row {
+    id: i32,
+}
+
+impl Row {
+    fun render_body(self): i32 {
+        label()
+    }
+}
+
+fun panel(row: Row): i32 {
+    row
+        .render_body()
+}
+
+fun main() {
+    print(panel(Row { id = 1 }));
+}
+main();
+        "#;
+    assert_traces(
+        source,
+        "context `current` is read here",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "panel(Row { id = 1 })",
+                0,
+                "the context requirement flows through this call",
+            ),
+            (
+                "render_body",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "label()",
+                1,
                 "the context requirement flows through this call",
             ),
         ],
