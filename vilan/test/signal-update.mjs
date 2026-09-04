@@ -19,6 +19,9 @@ function __shared_new(value) {
 function hash(self) {
 	return __hash(self);
 }
+function hash2(self) {
+	return __hash(self);
+}
 function new2() {
 	const table = new Map();
 	return [ table ];
@@ -29,44 +32,41 @@ function fresh_id() {
 	return id;
 }
 function new3() {
-	return [ __shared_new([  ]), __shared_new(false), __shared_new(false), __shared_new(false) ];
+	return [ __shared_new([  ]), __shared_new(new Map()), __shared_new(false), __shared_new(false), __shared_new(false) ];
 }
 function enqueue(turn, subscribers) {
 	for (const subscriber of subscribers) {
-		let seen = false;
-		for (const queued of turn[0].v) {
-			if (queued[0] === subscriber[0]) {
-				seen = true;
-			}
-		}
-		if (!(seen)) {
+		const key = hash2(subscriber[0]);
+		if (!(turn[1].v.has(key))) {
+			turn[1].v.set(key, true);
 			turn[0].v.push(__clone(subscriber));
 		}
 	}
-	if (turn[2].v && !(turn[3].v) && !(turn[1].v)) {
-		turn[3].v = true;
+	if (turn[3].v && !(turn[4].v) && !(turn[2].v)) {
+		turn[4].v = true;
 		queueMicrotask(() => {
-			turn[3].v = false;
+			turn[4].v = false;
 			drain(turn);
 			return;
 		});
 	}
 }
 function drain(turn) {
-	if (!(turn[1].v)) {
-		turn[1].v = true;
+	if (!(turn[2].v)) {
+		turn[2].v = true;
 		draining_turns.v.push(__clone(turn));
 		let budget = 100000;
 		while (!($i(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
 			turn[0].v = [  ];
+			turn[1].v = new Map();
 			for (const subscriber of wave) {
 				subscriber[1]();
 				budget = budget - 1;
 			}
 		}
 		__list_pop(draining_turns.v);
-		turn[1].v = false;
+		turn[2].v = false;
 	}
 }
 function dispose(self, $L) {
@@ -88,6 +88,7 @@ function dispose(self, $L) {
 			}
 		}
 		turn[0].v = kept_pending;
+		turn[1].v.delete(hash2(self[1]));
 		$N = undefined;
 	} else {
 		$N = undefined;
@@ -242,7 +243,7 @@ function $R(body, $S) {
 		const fresh = new3();
 		const result = body(fresh);
 		drain(fresh);
-		fresh[2].v = true;
+		fresh[3].v = true;
 		$U = result;
 	}
 	return $U;

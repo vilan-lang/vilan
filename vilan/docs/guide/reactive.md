@@ -145,6 +145,35 @@ fun main() {
 A named function can stand in for the closure (`signal.map(parse)`).
 See [functions & closures](../tour/functions-and-closures.md).
 
+### Selection over a list: `selector`
+
+`map` is the wrong tool for one particular shape — "is *this* row the
+selected one?", asked once per row. A derivation per row means every row
+recomputes on every change: `n` notifications to move a highlight one
+row. `selector(source)` keeps one subscription and a cell per key, so a
+change writes exactly two of them — the key that left and the key that
+arrived.
+
+```vilan
+import std::reactive::{ Signal, SignalCell, selector };
+
+fun main() {
+	let current: SignalCell<i32> = Signal::new(1);
+	let selected = selector(current);
+	let first = selected.of(1);
+	let second = selected.of(2);
+	print(i"{first.get()} {second.get()}");   // true false
+	current.set(2);
+	print(i"{first.get()} {second.get()}");   // false true
+}
+```
+
+`selected.of(id)` hands back a `SignalCell<bool>` that drops into
+`.show`, `.when`, `.bind_class` or `.bind_styled`. Call it inside a
+`bind_each` row and the key's entry is released when the row is — the
+map stays the size of the live list. Full reference:
+[`std::reactive`](../std/reactive.md#selector--per-key-selection).
+
 ## Reacting: `effect` and `sub`
 
 Two ways to run code on change. **Use `effect` by default.**

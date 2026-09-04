@@ -1,0 +1,63 @@
+// `selector` (backlog A44) — Solid's `createSelector`: one subscription on the
+// selection source, a cell per key, and TWO writes per change whatever the row
+// count. The obvious spelling (a derived boolean per row) costs n.
+//
+// Three claims:
+//   1. A key's cell is `true` exactly while the source holds that key, and a
+//      change writes only the key that left and the key that arrived.
+//   2. `of` hands back the SAME cell for a key it already has.
+//   3. The entry's removal is the ambient owner's, so a cell asked for inside a
+//      row's scope is gone from the map when that row is disposed.
+//
+// The fourth claim is `enqueue`'s: its dedup is a keyed set now, not a scan of
+// the pending queue, so one write reaching n queued observers is O(n) and not
+// O(n²) — the regime `selector` exists to serve. Semantics are unchanged, which
+// is what the batch below states: one observer fed twice in one turn fires once.
+import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, batch, run_with_owner, selector };
+
+fun main() {
+	let current: SignalCell<i32> = Signal::new(1);
+	let selected = selector(current);
+
+	let rows = Owner::new();
+	let one = run_with_owner(rows, || selected.of(1));
+	let two = run_with_owner(rows, || selected.of(2));
+	let three = run_with_owner(rows, || selected.of(3));
+	print(i"seeded {one.get()} {two.get()} {three.get()}");
+
+	// The two writes: 1 leaves, 2 arrives. Row three is not touched at all —
+	// the observer mirrors the outgoing key rather than walking the cells.
+	// witness: const previous = current2.v; current2.v = value;
+	current.set(2);
+	print(i"after 2: {one.get()} {two.get()} {three.get()}");
+
+	// A key with no cell costs nothing — nobody asked about 9.
+	current.set(9);
+	print(i"after 9: {one.get()} {two.get()} {three.get()}");
+
+	// The same key hands back the same cell, not a second one.
+	let again = run_with_owner(rows, || selected.of(2));
+	current.set(2);
+	print(i"same cell={again.get()} entries={selected.cells.read().len()}");
+
+	// The entries are the rows' — disposing the row scope empties the map.
+	rows.dispose();
+	print(i"after dispose={selected.cells.read().len()}");
+
+	// `enqueue`'s dedup, keyed: one observer fed twice in one turn fires once.
+	// witness: if (!(turn[1].v.has(key))) { turn[1].v.set(key, true);
+	let counted: SignalCell<i32> = Signal::new(0);
+	mut hits = 0;
+	let watch = counted.on_change(|_| {
+		hits += 1;
+	});
+	batch(|| {
+		counted.set(1);
+		counted.set(2);
+	});
+	print(i"hits={hits}");
+	watch.dispose();
+}
+
+main();

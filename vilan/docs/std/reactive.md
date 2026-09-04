@@ -8,6 +8,7 @@ Import what you use:
 ```vilan,fragment
 import std::reactive::{
 	Signal, SignalCell, Source, MaybeSignal, Subscription, Disposable, combine,
+	selector, Selector,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -26,6 +27,7 @@ import std::reactive::{
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
 | `Subscription` | struct | an explicit subscription; `Disposable` |
 | `combine` | fn | tuple-signal over 2+ signals |
+| `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `run_with_owner`, `comp`, `get_owner`, `owner_scope` | fns/context | establish/read the ambient owner |
 | `turn`, `batch`, `flush`, `at_settle`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
@@ -226,6 +228,59 @@ alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
 its own `set` drives them. `Optimistic::over` takes any `Signal<T>` too — the
 cell STORES it in a field, and a field must name a real type, so the cell names
 it: `Optimistic<T, S>` carries the signal's type as a second parameter.
+
+## selector — per-key selection
+
+"Is this row the selected one?", asked once per row and answered live. The
+obvious spelling derives a boolean per row off the selection signal — and every
+one of them recomputes on every change, so moving a highlight one row costs `n`
+notifications. `selector` takes **one** subscription on the source and keeps a
+cell per key, so a change writes exactly **two**: the key that left and the key
+that arrived.
+
+```vilan,fragment
+fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T>
+
+impl Selector<type T: Hashable + PartialEq> {
+	fun of(self, key: T): SignalCell<bool>
+}
+```
+
+```vilan,browser
+import std::reactive::{ Signal, SignalCell, selector };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let rows: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+	let current: SignalCell<i32> = Signal::new(1);
+	let selected = selector(current);
+	let _root = mount_root("app", || {
+		view("ul").bind_each(rows, |id| id, |id| {
+			view("li").text(i"row {id}").bind_class(selected.of(id).map(|on| {
+				if on { "row current" } else { "row" }
+			}))
+		})
+	});
+}
+```
+
+`of(key)` creates the key's cell on first ask (seeded against the source's
+current value) and hands back that same cell every time after, so it is safe to
+call in a row's render body. The entry's **removal** is deferred to the ambient
+owner — which inside a `bind_each` row is the row's own — so the map stays the
+size of the live list rather than of every list the session ever showed.
+
+`Selector` is a handle with a method rather than the bare closure Solid's
+`createSelector` returns, and that is forced rather than chosen: a closure
+captures its context **at creation**, so a closure built inside `selector` would
+defer every key's cleanup to whatever owner was ambient where `selector` was
+*called* — the component, never the row. A method call threads the caller's
+ambient owner the ordinary way.
+
+The key type is bounded on `Hashable` (the canonical key `Map` and `Set` use)
+and on `PartialEq` (to seed a fresh cell against the current value). A key
+nobody has asked about has no cell and costs nothing: a change into it writes
+only the outgoing one.
 
 ## Writing a Signal
 

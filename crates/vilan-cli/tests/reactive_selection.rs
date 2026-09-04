@@ -185,3 +185,133 @@ fn combine_attaches_to_its_inputs_without_the_first_call() {
          derived signal to the value it was just seeded with; its body is:\n{body}"
     );
 }
+
+// --- A44: the per-key selector ----------------------------------------------
+
+/// A thousand rows, each holding the selector's cell for its own key and
+/// counting the notifications that cell delivers.
+const THOUSAND_ROWS: &str = r#"import std::reactive::{ Disposable, Owner, Signal, SignalCell, Subscription, run_with_owner, selector };
+
+fun main() {
+	let current: SignalCell<i32> = Signal::new(0);
+	let selected = selector(current);
+	let rows = Owner::new();
+	mut watches: List<Subscription> = [];
+	mut notifications = 0;
+	mut key = 0;
+	for key < 1000 {
+		let cell = run_with_owner(rows, || selected.of(key));
+		watches.push(cell.on_change(|_| {
+			notifications += 1;
+		}));
+		key += 1;
+	}
+	print(i"wired={notifications} entries={selected.cells.read().len()}");
+	current.set(500);
+	print(i"one change={notifications}");
+	current.set(900);
+	print(i"two changes={notifications}");
+	// A key nobody holds a cell for writes nothing at all on the way in.
+	current.set(4000);
+	print(i"absent key={notifications}");
+	rows.dispose();
+	print(i"after dispose={selected.cells.read().len()}");
+	for watch in watches {
+		watch.dispose();
+	}
+}
+
+main();
+"#;
+
+/// The whole point of A44, measured: a selection change over a thousand live
+/// rows writes exactly TWO cells — the key that left and the key that arrived —
+/// so the notification count moves by 2 per change and not by 1000.
+///
+/// Red-first: spelling the row's cell `current.map(|value| value == key)`
+/// instead — the derivation this exists to replace — reports 1000 per change.
+/// The last two lines are the other half of the design: an incoming key nobody
+/// holds a cell for costs ONE write (the outgoing one) and nothing more, and
+/// the per-key entries are the ROWS' — the map empties when their scope goes.
+#[test]
+fn a_selection_change_over_a_thousand_rows_writes_two_cells() {
+    let stdout = build_and_run("thousand_rows", THOUSAND_ROWS);
+    assert_eq!(
+        stdout,
+        "wired=0 entries=1000\none change=2\ntwo changes=4\nabsent key=5\n\
+         after dispose=0\n",
+        "the selector did not notify O(2) per change over a thousand rows"
+    );
+}
+
+/// `enqueue`'s dedup at scale, as a RATIO between two measurements taken in one
+/// process — the shape `perf_baseline.rs`'s const-pass pin uses, because a
+/// number of milliseconds is a claim about the machine and a ratio is a claim
+/// about the algorithm.
+///
+/// Four times the observers on one signal is four times the work for a linear
+/// dedup and sixteen times for the scan of the pending queue this replaced.
+/// Measured on the development machine: 80 ms → 229 ms (ratio 2.9) keyed,
+/// 696 ms → 9630 ms (ratio 13.8) scanning. The threshold sits between them.
+const ENQUEUE_SCALING: &str = r#"import std::reactive::{ Signal, SignalCell, Subscription, batch };
+import std::time::now_millis;
+
+fun wave_millis(count: i32): f64 {
+	let source: SignalCell<i32> = Signal::new(0);
+	mut watches: List<Subscription> = [];
+	mut hits = 0;
+	mut index = 0;
+	for index < count {
+		watches.push(source.on_change(|_| {
+			hits += 1;
+		}));
+		index += 1;
+	}
+	let start = now_millis();
+	mut round = 0;
+	for round < 20 {
+		batch(|| {
+			source.set(round + 1);
+		});
+		round += 1;
+	}
+	now_millis() - start
+}
+
+fun main() {
+	// Warm the engine so the first measurement is not the one that pays for it.
+	let _warm = wave_millis(500);
+	let small = wave_millis(2000);
+	let large = wave_millis(8000);
+	print(i"small={small} large={large}");
+}
+
+main();
+"#;
+
+#[test]
+fn one_turns_dedup_scales_with_its_queue_and_not_with_its_square() {
+    let stdout = build_and_run("enqueue_scaling", ENQUEUE_SCALING);
+    let numbers: Vec<f64> = stdout
+        .split_whitespace()
+        .filter_map(|field| field.split_once('=').map(|(_, value)| value))
+        .map(|value| value.parse::<f64>().expect("a millisecond measurement"))
+        .collect();
+    assert_eq!(
+        numbers.len(),
+        2,
+        "expected two measurements; got:\n{stdout}"
+    );
+    let (small, large) = (numbers[0], numbers[1]);
+    // A measurement at or below the clock's resolution cannot carry a ratio.
+    assert!(
+        small >= 4.0,
+        "the small wave was too fast to measure ({small} ms); got:\n{stdout}"
+    );
+    assert!(
+        large < small * 8.0,
+        "four times the observers cost {large} ms against {small} ms — more \
+         than the 8x ceiling, so the dedup is scanning its queue again rather \
+         than keying it (linear is ~4x, quadratic ~16x)"
+    );
+}
