@@ -2218,11 +2218,20 @@ impl Document {
     /// lookups (`entity_at`) are only meaningful for offsets that touch
     /// actual code; a comment inside a function body is *contained* by the
     /// function's span but is not the function.
+    ///
+    /// A caret at a token's END counts as touching it, the same convention
+    /// [`crate::references::ReferenceIndex::at`] answers rename and
+    /// find-references by (E133). The two gates decide the SAME question — is
+    /// the cursor on this word — for two features the user reads as one, so
+    /// hover going blank at `name|` while rename works there is the two of them
+    /// disagreeing rather than a separate rule. Trivia is unaffected: the end
+    /// of a token is code either way, and an offset inside whitespace still
+    /// touches nothing.
     fn offset_touches_a_token(&self, offset: usize) -> bool {
         let (tokens, _errors) = tokenize(self.analyzed_text());
         tokens.iter().any(|(_, span)| {
             let range = span.into_range();
-            range.start <= offset && offset < range.end
+            range.start <= offset && offset <= range.end
         })
     }
 
@@ -7491,6 +7500,39 @@ pub(crate) mod tests {
         let hover = hover_at_cursor("fun main() {\n\tlet cou|nt = 5;\n\tlet _ = count;\n}\n")
             .expect("hover on the let binding");
         assert!(hover.contains("```vilan\nlet count: i32\n```"), "{hover}");
+    }
+
+    // E133: a caret at the very END of a name hovers, the same convention
+    // rename and find-references answer by. Hover going blank at `count|`
+    // while rename works there is the two gates disagreeing about one question
+    // the user reads as one feature — is the cursor on this word — so
+    // `offset_touches_a_token` counts a token's end as touching it. Trivia is
+    // untouched: the pin's last case is a caret inside whitespace, which still
+    // hovers nothing.
+    #[test]
+    fn hover_at_the_end_of_a_name_answers_the_same_as_inside_it() {
+        let inside = hover_at_cursor("fun main() {\n\tlet cou|nt = 5;\n\tlet _ = count;\n}\n")
+            .expect("hover inside the name");
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count| = 5;\n\tlet _ = count;\n}\n"),
+            Some(inside),
+            "the caret at `count|` is on `count`",
+        );
+        // A module binding and a function name, the other two shapes a rename
+        // is started from at `name|`.
+        assert_eq!(
+            hover_at_cursor("let capacity| = 100;\n\nfun main() {\n\tlet _ = capacity;\n}\n"),
+            hover_at_cursor("let cap|acity = 100;\n\nfun main() {\n\tlet _ = capacity;\n}\n"),
+        );
+        assert_eq!(
+            hover_at_cursor("fun helper|(value: i32): i32 {\n\tvalue + 1\n}\n"),
+            hover_at_cursor("fun hel|per(value: i32): i32 {\n\tvalue + 1\n}\n"),
+        );
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\t | \n\tlet _ = count;\n}\n"),
+            None,
+            "a caret in whitespace still touches no token",
+        );
     }
 
     // A `mut` binding hovers with the `mut` keyword — it can be reassigned.

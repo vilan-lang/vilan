@@ -562,14 +562,34 @@ impl ReferenceIndex {
     /// Because every row is identifier-exact, rows cannot nest, so there is at
     /// most one answer — which is precisely why this replaces the old resolution
     /// ladder rather than being another rung on it.
+    ///
+    /// A caret at the very END of an identifier — `name|`, where the user just
+    /// finished typing the word — is ON that identifier (E133). Every editor's
+    /// hover, go-to-definition and rename assume the convention, and a caret
+    /// there is where a rename is started FROM; the strict half-open
+    /// containment test alone answered `None`, `rename_edits` turned that into
+    /// `NotAnIdentifier`, and `prepare_rename` turned THAT into VS Code's "the
+    /// element can't be renamed" notice. The same `at` backs find-references,
+    /// so `name|` missed there too — only rename made it visible, because
+    /// renaming is the caret-driven one. The fallback cannot be ambiguous: rows
+    /// are identifier-exact and non-nesting, so at most one row ends at
+    /// `offset`, and it is the row immediately before the partition point.
+    /// Strict containment is still tried first, so a caret BETWEEN two adjacent
+    /// identifiers keeps naming the one it is inside.
     pub fn at(&self, source: SourceId, offset: usize) -> Option<&Occurrence> {
         let start = self
             .occurrences
             .partition_point(|row| (row.source.0, row.span.end) <= (source.0, offset));
-        self.occurrences[start..]
+        if let Some(inside) = self.occurrences[start..]
             .iter()
             .take_while(|row| row.source == source && row.span.start <= offset)
             .find(|row| row.span.start <= offset && offset < row.span.end)
+        {
+            return Some(inside);
+        }
+        let previous = self.occurrences.get(start.checked_sub(1)?)?;
+        (previous.source == source && previous.span.end == offset && previous.span.start < offset)
+            .then_some(previous)
     }
 
     /// Every occurrence of `definition`, declaration included, in source order.
@@ -876,6 +896,88 @@ fun main(): i32 {
                 row.source,
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E133. A caret at the very END of an identifier is ON it. `name|` is
+    // where a user's caret sits the moment they finish typing a word, and it
+    // is where a rename is started from; the strict half-open containment test
+    // alone answered `None` there, so find-references came back empty and
+    // rename refused with `NotAnIdentifier` — which `prepare_rename` renders
+    // as VS Code's "the element can't be renamed".
+    //
+    // Non-vacuous on both sides: the same offsets are asserted to give the
+    // same answer as a caret plainly INSIDE the word, and a caret one byte
+    // further on (past the identifier, into the punctuation that follows) is
+    // asserted to name nothing — so a fallback that swallowed the whole gap
+    // would red here rather than pass quietly.
+    #[test]
+    fn a_caret_at_the_end_of_an_identifier_names_it() {
+        let (dir, document) = matrix();
+        let index = document.reference_index();
+        for (label, needle, delta) in [
+            ("a local's declaration", "let total", 4),
+            ("a local's use", "helper(total)", 7),
+            ("a function's declaration", "fun helper", 4),
+            ("a struct's declaration", "struct Point", 7),
+            ("a field key", "Point { x = 1", 8),
+        ] {
+            let inside = at(needle, delta);
+            let name = index
+                .at(SourceId(0), inside)
+                .unwrap_or_else(|| panic!("{label}: the caret is inside the identifier"))
+                .span;
+            assert_eq!(
+                index.at(SourceId(0), name.end).map(|row| row.span),
+                Some(name),
+                "{label}: a caret at `name|` must name the same identifier",
+            );
+            assert_eq!(
+                references_at(&document, name.end),
+                references_at(&document, inside),
+                "{label}: and answer the same reference set",
+            );
+            assert!(
+                index
+                    .at(SourceId(0), name.end + 1)
+                    .is_none_or(|row| row.span != name),
+                "{label}: one byte past the end is not on the identifier",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The other side of the convention: strict containment still wins, so a
+    // caret that is INSIDE one identifier and at the END of nothing is
+    // unaffected, and the end-of-word fallback can never shadow a real hit.
+    #[test]
+    fn strict_containment_still_decides_where_it_applies() {
+        let (dir, document) = matrix();
+        let index = document.reference_index();
+        // `p.sum()`: the caret between `p` and `.` ends `p`; the caret on `s`
+        // of `sum` is inside `sum`. Two neighbouring rows, two answers.
+        let p = at("\tlet total = p.sum();", 13);
+        let sum = at("p.sum()", 2);
+        assert_eq!(
+            MATRIX.get(
+                index
+                    .at(SourceId(0), p + 1)
+                    .expect("`p|`")
+                    .span
+                    .into_range()
+            ),
+            Some("p"),
+        );
+        assert_eq!(
+            MATRIX.get(
+                index
+                    .at(SourceId(0), sum)
+                    .expect("`|sum`")
+                    .span
+                    .into_range()
+            ),
+            Some("sum"),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

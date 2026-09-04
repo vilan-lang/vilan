@@ -3358,6 +3358,58 @@ mod snapshot_consistency_tests {
         );
     }
 
+    // E133: `prepare_rename` with the caret at `name|` opens the rename box.
+    // A caret at the very end of a word is where it sits the moment the word
+    // is finished being typed, and the reference index's containment test was
+    // strictly half-open — so `at` answered `None`, `rename_edits` answered
+    // `NotAnIdentifier`, and this handler turned that into `Ok(None)`, which
+    // VS Code shows as "the element can't be renamed". The pin drives the real
+    // handler and asserts the RANGE it hands back, so an answer that merely
+    // stopped being `None` without naming the identifier still reds.
+    #[tokio::test]
+    async fn prepare_rename_answers_with_the_caret_at_the_end_of_the_name() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+        // `\tlet value = 1;` — the name spans characters 5..10 on line 1.
+        let name = Range::new(Position::new(1, 5), Position::new(1, 10));
+        for (label, character) in [("inside the name", 7), ("at `value|`", 10)] {
+            let answer = backend
+                .prepare_rename(TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(1, character),
+                })
+                .await
+                .expect("the handler never errors here")
+                .unwrap_or_else(|| panic!("{label}: `value` is renameable"));
+            assert_eq!(answer, PrepareRenameResponse::Range(name), "{label}");
+        }
+        // One byte further on is the space before `=`, and names nothing.
+        assert_eq!(
+            backend
+                .prepare_rename(TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(1, 11),
+                })
+                .await
+                .expect("the handler never errors here"),
+            None,
+        );
+        // And the rename itself agrees from the same caret — the standing rule
+        // that rename and find-references read one index, held at the offset
+        // that used to divide them.
+        let edit = backend
+            .rename(rename_params(&uri, Position::new(1, 10)))
+            .await
+            .expect("a rename from `value|`")
+            .expect("`value` is renameable");
+        assert_eq!(
+            edit.changes.expect("one file's edits")[&uri].len(),
+            2,
+            "the declaration and its use",
+        );
+    }
+
     // S3, handler 2 of 2: Organize Imports also returns text edits, and its
     // prune half reads program data. Its refusal is the SILENT spelling —
     // `ContentModified`, which `vscode-languageclient` swallows into the
