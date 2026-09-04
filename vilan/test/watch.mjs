@@ -1,3 +1,4 @@
+import { mkdir, rm, writeFile } from "node:fs/promises";
 class __Watcher {
 	constructor(fsPromises, nodePath, root, recursive, intervalMs) {
 		this.fs = fsPromises;
@@ -118,63 +119,104 @@ async function __fs_watch(root, recursive, intervalMs) {
 function __fs_watch_stop(watcher) {
 	watcher.stop();
 }
+function __random_int(low, high) {
+	return Math.floor(Math.random() * (high - low + 1)) + low;
+}
+function __substring(text, start, end) {
+	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
+	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
+}
+async function create_dir_all(path) {
+	const options = Object();
+	options.recursive = true;
+	return await (mkdir(path, options));
+}
+async function remove_dir_all(path) {
+	const options = Object();
+	options.recursive = true;
+	options.force = true;
+	return await (rm(path, options));
+}
 async function watch(path) {
 	return await (__fs_watch(path, false, 300));
 }
 async function watch_all(path) {
 	return await (__fs_watch(path, true, 300));
 }
-async function next(self, $a) {
-	const raw = await (self.next_change(ambient_signal($a)));
+async function next(self, $b) {
+	const raw = await (self.next_change(ambient_signal($b)));
 	return [ raw.path, raw.kind ];
 }
 function drop(self) {
 	__fs_watch_stop(self);
 }
-function ambient_signal($b) {
-	const $c = $b;
-	let $d = null;
-	if ($c[0] === 0) {
-		const n = $c[1];
-		$d = [ 0, n.signal_of() ];
-	} else {
-		$d = [ 1 ];
+function basename(path) {
+	let end = path.length;
+	while (end > 0 && __substring(path, end - 1, end) === "/") {
+		end = end - 1;
 	}
-	return $d;
+	let start = end;
+	while (start > 0 && __substring(path, start - 1, start) !== "/") {
+		start = start - 1;
+	}
+	return __substring(path, start, end);
+}
+function range(low, high) {
+	return __random_int(low, high);
+}
+function ambient_signal($c) {
+	const $d = $c;
+	let $e = null;
+	if ($d[0] === 0) {
+		const n = $d[1];
+		$e = [ 0, n.signal_of() ];
+	} else {
+		$e = [ 1 ];
+	}
+	return $e;
 }
 function describe(change) {
-	const $e = change[1];
-	let $f = null;
-	if ($e[0] === 0) {
-		$f = "created " + change[0];
-	} else if ($e[0] === 1) {
-		$f = "modified " + change[0];
+	const $f = change[1];
+	let $g = null;
+	if ($f[0] === 0) {
+		$g = "created " + basename(change[0]);
+	} else if ($f[0] === 1) {
+		$g = "modified " + basename(change[0]);
 	} else {
-		$f = "removed " + change[0];
+		$g = "removed " + basename(change[0]);
 	}
-	return $f;
+	return $g;
 }
-function $g($h) {
-	drop($h);
+function $a(low, high) {
+	return range(low, high);
+}
+function $h($i) {
+	drop($i);
 }
 (async () => {
-	let flat = await (watch("watch-corpus"));
+	const root = "watch-corpus-" + $a(100000, 999999);
+	await (create_dir_all(root));
+	const probe = "" + root + "/probe.txt";
+	let flat = await (watch(root));
 	try {
+		await (writeFile(probe, "one"));
 		console.log(describe(await (next(flat, [ 1 ]))));
-		$g(flat);
+		$h(flat);
 		flat = null;
 	} finally {
 		if (flat !== null) {
-			$g(flat);
+			$h(flat);
 		}
 	}
-	const deep = await (watch_all("watch-corpus"));
+	const deep = await (watch_all(root));
 	try {
+		await (writeFile(probe, "a second write, of a different length"));
 		console.log(describe(await (next(deep, [ 1 ]))));
 	} finally {
-		$g(deep);
+		$h(deep);
 	}
-})().catch(($i) => {
-	console.error(String($i));
+	await (remove_dir_all(root));
+})().catch(($j) => {
+	console.error(String($j));
 	process.exit(1);
 });

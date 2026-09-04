@@ -7,6 +7,36 @@
 //! under test is always the one Cargo just built from this tree, so a stale
 //! binary can no longer write or check goldens. A deliberate output change
 //! still regenerates goldens by hand; this gate then verifies the commit.
+//!
+//! # What belongs in the corpus (tracker N51)
+//!
+//! **A corpus program TERMINATES, and its output is the claim.** This gate reads
+//! the bytes a program compiles to, and the `// witness:` rule below makes the
+//! load-bearing ones nameable — but the differentials over the same directory
+//! (`vilan-core/tests/{release,infer}_differential.rs`) read what it PRINTS,
+//! and that is the claim the corpus rests on: two builds of one program are the
+//! same program if and only if they print the same thing. A program that never
+//! exits has no stdout for anything to compare, so it is not a weaker corpus
+//! entry, it is not one at all — and its cost is paid whether or not anyone
+//! notices, since a runner has nothing to wait for but its own deadline.
+//! `watch.vl` was exactly that for as long as it existed: it blocked on
+//! `flat.next()` for a change nothing ever made, and when the release
+//! differential first ran it, both builds were killed at 300 s and the gate
+//! compared two identical "node did not exit" strings and passed — 600 s of a
+//! 607 s critical path spent on a verdict that could not come out any other way.
+//! It now makes its own bounded change and observes it (`created probe.txt`,
+//! `modified probe.txt`, exit 0, ~1 s at loadavg 126); the endless form is
+//! `vilan/examples/watch`, where a program that runs until you stop it is the
+//! thing being shown.
+//!
+//! The rule does not ask a program to be FAST, and shortening a wait to make one
+//! terminate is the other disease (E32: the observation becomes "what had it
+//! printed when we gave up", which load decides). It asks the program to reach
+//! its own end on its own — to make the event it waits for, or to stop waiting
+//! for one. Programs whose output is not a function of their source alone — a
+//! clock, a random draw, the host environment — are still corpus programs and
+//! are compiled by every gate; they simply do not reach the node leg
+//! (`corpus_harness::NOT_RUN` names them, with the reason each).
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
