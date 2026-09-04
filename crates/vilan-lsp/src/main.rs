@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod book_sync;
+mod dead_items;
 mod document;
 mod keystroke;
 mod line_index;
@@ -31,11 +32,21 @@ use crate::document::{Document, Symbol, SymbolKind as VilanSymbolKind, hash_text
 use crate::line_index::LineIndex;
 use crate::publish::PublishState;
 use crate::schedule::Schedule;
+use vilan_core::cancel::CancelToken;
 use vilan_ide::{Completion, CompletionFunctionCall, CompletionKind as VilanCompletionKind};
 
 /// How long to wait after the last edit before re-analyzing, so a burst of
 /// keystrokes collapses to a single analysis instead of one per character.
 const DEBOUNCE_MS: u64 = 150;
+
+/// E124: how long the editor must be at rest before the package clock
+/// recomputes a union (`proposal/dead-code-paint.md` §2.4).
+///
+/// Well above `DEBOUNCE_MS` on purpose: the union costs one full analysis per
+/// declared entry, and it must never run inside the debounce window, where the
+/// document's own analysis is the thing the user is waiting for. Four windows
+/// is the settle a person's typing pause clears and a burst does not.
+const UNION_IDLE_MS: u64 = 600;
 
 /// The client's feature settings (VS Code `contributes.configuration`), received
 /// as `initializationOptions` at startup and refreshed live by
@@ -542,6 +553,23 @@ struct Backend {
     /// route. Held across the sends and nothing else — the analyses themselves
     /// stay fully concurrent.
     publish_gate: Arc<tokio::sync::Mutex<()>>,
+    /// E124's package clock, keyed by the directory of the package's
+    /// `vilan.toml`: the last completed union of the pruner's reachability
+    /// across the package's entries, the edit revision each package is at, and
+    /// the token that stops a union an edit has already invalidated.
+    ///
+    /// Per PACKAGE, which is what makes it new machinery: every other cache in
+    /// `Backend` is per-URI or per-path, and this one deliberately is not — the
+    /// question "does any entry reach this item" has no per-file answer.
+    ///
+    /// The three move together. An edit bumps `package_revision`, cancels
+    /// `union_tokens`' entry and REMOVES `package_unions`, which is the
+    /// withdrawal and needs no analysis; the clock re-inserts a union only if
+    /// the revision it started from is still current, which is the restoration
+    /// and rides an idle timer well above the debounce.
+    package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
+    package_revision: Arc<DashMap<PathBuf, u64>>,
+    union_tokens: Arc<DashMap<PathBuf, CancelToken>>,
 }
 
 /// What a cached read of a file is only valid for: the file's length and its
@@ -1374,6 +1402,13 @@ struct AnalysisContext {
     revision: Arc<AtomicU64>,
     schedule: Arc<Schedule>,
     analyses: Arc<session_trace::AnalysisTally>,
+    /// E124's package clock — the three maps `Backend` holds, carried here so
+    /// the clock can be started from a spawned task once the analysis that
+    /// resolved the file's package has landed. Read at publish time; the
+    /// debounced analysis itself neither computes a union nor waits for one.
+    package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
+    package_revision: Arc<DashMap<PathBuf, u64>>,
+    union_tokens: Arc<DashMap<PathBuf, CancelToken>>,
 }
 
 /// What one scheduled analysis did (M26).
@@ -1401,6 +1436,137 @@ impl AnalysisOutcome {
     fn landed(self) -> bool {
         matches!(self, AnalysisOutcome::Landed)
     }
+}
+
+/// The package a URI belongs to, for E124's clock: the document's own resolved
+/// manifest directory, or — for a `vilan.toml`, which is no document at all —
+/// its own directory.
+///
+/// `None` when there is no package to speak of: a `[library]` (no entries, so
+/// no union and no gray), a workspace root, a file with no project, and a file
+/// whose first analysis has not landed yet. All four get no top-level gray, so
+/// there is nothing to withdraw and nothing to restore.
+fn package_of(documents: &DashMap<Url, Document>, uri: &Url) -> Option<PathBuf> {
+    let path = uri.to_file_path().ok()?;
+    if is_manifest(uri) {
+        return path.parent().map(vilan_core::util::canonical_path);
+    }
+    documents
+        .get(uri)
+        .and_then(|document| document.manifest_dir().map(Path::to_path_buf))
+}
+
+/// E124's package clock: recompute the union after the editor has been at
+/// rest, off every request path.
+///
+/// The trigger is the settle, not the keystroke. `UNION_IDLE_MS` sits well
+/// above `DEBOUNCE_MS` so the union never runs inside the debounce window,
+/// and the revision check at the top of the task is what collapses a burst:
+/// each edit bumped the package's revision, so every task but the last
+/// one's returns having done nothing.
+///
+/// The work is one full analysis per declared entry — 0.4–1.2 s each on
+/// kolt, cold — and it happens in `spawn_blocking`, like every other
+/// analysis the server runs. M21's `BASE_CACHE` cannot amortize it: the
+/// cache revalidates by content, and the edit that invalidates an entry's
+/// world is exactly an edit to a module that entry loads
+/// (`dead-code-paint.md` §2.3). The walk over the finished programs is the
+/// cheap part — 8.2 ms for kolt's three entries.
+fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
+    let Some(manifest_dir) = package_of(&context.documents, uri) else {
+        return;
+    };
+    let started_at = context
+        .package_revision
+        .get(&manifest_dir)
+        .map(|revision| *revision.value())
+        .unwrap_or(0);
+    let documents = Arc::clone(&context.documents);
+    let package_unions = Arc::clone(&context.package_unions);
+    let package_revision = Arc::clone(&context.package_revision);
+    let union_tokens = Arc::clone(&context.union_tokens);
+    let client = context.client.clone();
+    let publish_state = Arc::clone(&context.publish_state);
+    let publish_gate = Arc::clone(&context.publish_gate);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(UNION_IDLE_MS)).await;
+        let current = |dir: &Path| {
+            package_revision
+                .get(dir)
+                .map(|revision| *revision.value())
+                .unwrap_or(0)
+        };
+        // A newer edit arrived during the idle window; its own task is
+        // behind it, and this one would compute a union for a world that
+        // is already gone.
+        if current(&manifest_dir) != started_at {
+            return;
+        }
+        if package_unions.contains_key(&manifest_dir) {
+            return;
+        }
+        let Some(entries) = dead_items::entry_paths(&manifest_dir) else {
+            return;
+        };
+        // The entries' texts as the editor has them, sampled synchronously
+        // (no map guard may cross an await): a buffered entry is what the
+        // user is looking at, and a union taken off the stale disk copy
+        // would gray on a world nobody can see.
+        let buffers: HashMap<PathBuf, String> = entries
+            .iter()
+            .filter_map(|(_, path)| {
+                let uri = Url::from_file_path(path).ok()?;
+                let document = documents.get(&uri)?;
+                Some((
+                    vilan_core::util::canonical_path(path),
+                    document.text.clone(),
+                ))
+            })
+            .collect();
+        let std_dir = discover_std_dir(&manifest_dir);
+        let token = CancelToken::new();
+        union_tokens.insert(manifest_dir.clone(), token.clone());
+        let walked = manifest_dir.clone();
+        let computed = tokio::task::spawn_blocking(move || {
+            dead_items::compute(&entries, &std_dir, started_at, &token, |path| {
+                buffers
+                    .get(&vilan_core::util::canonical_path(path))
+                    .cloned()
+                    .or_else(|| std::fs::read_to_string(path).ok())
+            })
+        })
+        .await;
+        union_tokens.remove(&walked);
+        let Ok(Some(reach)) = computed else {
+            return;
+        };
+        // The world may have moved while the entries were analyzed. A union
+        // is only ever installed for the revision it was computed against —
+        // the restoration half of determination 8, and the reason the union
+        // carries that revision rather than the caller remembering it.
+        if current(&walked) != reach.revision {
+            return;
+        }
+        package_unions.insert(walked.clone(), Arc::new(reach));
+        // Repaint every open document of this package: the union just
+        // landed, and their last publish was taken without it.
+        let owners: Vec<Url> = documents
+            .iter()
+            .filter(|document| document.manifest_dir() == Some(walked.as_path()))
+            .map(|document| document.key().clone())
+            .collect();
+        for owner in owners {
+            publish_document(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &package_unions,
+                &owner,
+            )
+            .await;
+        }
+    });
 }
 
 /// Analyze `text` as the document at `uri`, land the result on the open
@@ -1467,6 +1633,7 @@ async fn analyze_and_publish(
         &context.client,
         &context.publish_state,
         &context.publish_gate,
+        &context.package_unions,
         &uri,
     )
     .await;
@@ -1534,6 +1701,7 @@ async fn publish_document(
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
     publish_gate: &tokio::sync::Mutex<()>,
+    package_unions: &DashMap<PathBuf, Arc<dead_items::PackageReach>>,
     uri: &Url,
 ) {
     // E117: plan and send as one step. The plan is already ordered (the planner
@@ -1544,9 +1712,20 @@ async fn publish_document(
     // Plan before the first await (neither the map guard nor the planner
     // lock may be held across one).
     let actions = {
-        let Some(document) = documents.get(uri) else {
+        let Some(mut document) = documents.get_mut(uri) else {
             return;
         };
+        // E124: the union this document's top-level gray is served from, taken
+        // fresh at every publish. The map IS the state — an edit removed the
+        // entry, so this hands over `None` and the grays are withdrawn without
+        // anything having to remember to clear them; the clock re-inserts, and
+        // the next publish paints again. Nothing is stored across an analysis.
+        let reach = document.manifest_dir().and_then(|dir| {
+            package_unions
+                .get(dir)
+                .map(|entry| Arc::clone(entry.value()))
+        });
+        document.set_package_reach(reach);
         publish_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1864,6 +2043,55 @@ impl Backend {
             revision: Arc::clone(&self.revision),
             schedule: Arc::clone(&self.schedule),
             analyses: Arc::clone(&self.analyses),
+            package_unions: Arc::clone(&self.package_unions),
+            package_revision: Arc::clone(&self.package_revision),
+            union_tokens: Arc::clone(&self.union_tokens),
+        }
+    }
+
+    /// E124's withdrawal: a change anywhere in a package takes that package's
+    /// top-level grays off the screen at once, before any analysis runs.
+    ///
+    /// This is determination 8, and it is asymmetric on purpose. The two
+    /// staleness errors are not equally bad: a stale gray on an item the user
+    /// has just started calling from another file says "dead" about live code,
+    /// and the user's response to a gray is to DELETE — that is the worst
+    /// outcome paint has. A missing gray on an item that has just become unused
+    /// is merely late, and nothing follows from lateness. So a top-level gray
+    /// may be arbitrarily stale toward FEWER grays and must never be served
+    /// stale toward more.
+    ///
+    /// Withdrawal is instant and needs no analysis, which is what makes the
+    /// rule affordable: drop the union and every consumer of it goes quiet in
+    /// the same breath. Restoration is slow and rides the clock below. The
+    /// consequence, stated plainly rather than discovered later: **during an
+    /// editing burst a package's top-level gray is off**, and it returns when
+    /// the editor settles. That is correct for a paint whose value is "you may
+    /// delete this" — it is acted on at rest, not mid-keystroke — and it is the
+    /// opposite of E114's locals and unreachable paint, which are file-local,
+    /// cheap, and stay on throughout.
+    ///
+    /// The whole package, not the edited file's dependency cone. A use can only
+    /// be added from a file that imports the item's module, and inverting
+    /// `depends_on` would give exactly that set — but the union is computed and
+    /// cached per package, so the package IS the granularity the withdrawal has
+    /// to speak in, and it errs toward fewer grays, which is the safe side.
+    fn withdraw_package_grays_for(&self, uri: &Url) {
+        if let Some(manifest_dir) = package_of(&self.documents, uri) {
+            self.withdraw_package_grays(&manifest_dir);
+        }
+    }
+
+    /// [`withdraw_package_grays_for`](Backend::withdraw_package_grays_for) with
+    /// the package already resolved.
+    fn withdraw_package_grays(&self, manifest_dir: &Path) {
+        let key = manifest_dir.to_path_buf();
+        *self.package_revision.entry(key.clone()).or_insert(0) += 1;
+        self.package_unions.remove(&key);
+        // A union already walking is a union for a world that has moved. It
+        // costs a full analysis per entry, so stopping it is worth the token.
+        if let Some(token) = self.union_tokens.get(&key) {
+            token.cancel();
         }
     }
 
@@ -1948,6 +2176,10 @@ impl Backend {
             // The analyzed snapshot moved under the client's highlighting and
             // hints; ask for them again (S5). Every guard is long dropped here.
             send_refreshes(&context.client, refresh_plan(landed || dependents_landed)).await;
+            // E124: the edit withdrew this package's top-level grays before the
+            // debounce; this is the other half — the idle timer that brings
+            // them back, if the editor stays at rest long enough for it.
+            schedule_package_union(&context, &uri);
         });
     }
 
@@ -2355,9 +2587,13 @@ impl LanguageServer for Backend {
             // The shared path: `spawn_blocking`, stamped with the world it
             // read, under the scheduler's cancellation token, landed only if it
             // is still the newest view of the live text (E117), then published.
-            let landed = analyze_and_publish(&context, uri, text, generation)
+            let landed = analyze_and_publish(&context, uri.clone(), text, generation)
                 .await
                 .landed();
+            // E124: the open's analysis is what RESOLVED this file's package,
+            // so the clock can only be started after it (before it, the
+            // document carries no manifest directory to key on).
+            schedule_package_union(&context, &uri);
             // The analyzed snapshot moved under whatever the client asked for
             // in the meantime — it opened the file and immediately asked for
             // tokens and hints over a document that had none. Ask it to ask
@@ -2391,6 +2627,9 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
+                // E124: a manifest edit can change the entry set itself, so
+                // the package's union is withdrawn like any other change in it.
+                self.withdraw_package_grays_for(&uri);
                 self.manifests.insert(uri, ManifestDocument::new(text));
                 return;
             }
@@ -2419,6 +2658,10 @@ impl LanguageServer for Backend {
             // stamped with the world it actually read and this edit's own
             // analysis is stamped strictly higher.
             self.revision.fetch_add(1, Ordering::SeqCst);
+            // E124: the package's top-level grays come off NOW, before the
+            // debounce, before any analysis — the withdrawal is the half of the
+            // staleness rule that must not wait for anything.
+            self.withdraw_package_grays_for(&uri);
             self.on_change(uri, text);
         })
     }
@@ -2468,6 +2711,10 @@ impl LanguageServer for Backend {
         landed |= reanalyze_dependents(&context, &saved, recolored.as_deref()).await;
         // Same sweep rule as a typing pause (S5).
         send_refreshes(&self.client, refresh_plan(landed)).await;
+        // E124: a save is the clock's other trigger, and the cleanest one — the
+        // package's content on disk is now what the union will read, and the
+        // editor is by definition at rest.
+        schedule_package_union(&context, &saved);
     }
 
     /// E127: files that change on DISK, outside every open buffer.
@@ -3389,6 +3636,9 @@ mod snapshot_consistency_tests {
             snippet_support: Arc::new(AtomicBool::new(false)),
             revision: Arc::new(AtomicU64::new(0)),
             publish_gate: Arc::new(tokio::sync::Mutex::new(())),
+            package_unions: Arc::new(DashMap::new()),
+            package_revision: Arc::new(DashMap::new()),
+            union_tokens: Arc::new(DashMap::new()),
         })
     }
 
@@ -5005,6 +5255,9 @@ async fn main() {
         snippet_support: Arc::new(AtomicBool::new(false)),
         revision: Arc::new(AtomicU64::new(0)),
         publish_gate: Arc::new(tokio::sync::Mutex::new(())),
+        package_unions: Arc::new(DashMap::new()),
+        package_revision: Arc::new(DashMap::new()),
+        union_tokens: Arc::new(DashMap::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -7667,6 +7920,122 @@ mod watched_files_tests {
             .did_change_watched_files(created(&directory.join("notes.md")))
             .await;
         assert_eq!(backend.revision.load(Ordering::SeqCst), before);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E124's clock, driven through the real notification handlers: **the paint is
+/// withdrawn the moment a change arrives and returns only when the package
+/// union lands again** (`proposal/dead-code-paint.md` §3.2, determination 8).
+///
+/// The rule is asymmetric and the asymmetry is the whole design. A stale gray
+/// on an item the user has just started calling from ANOTHER file says "dead"
+/// about live code, and the response a gray asks for is deletion — that is the
+/// worst outcome paint has. A missing gray on an item that has just become
+/// unused is merely late. So: downgraded on edit, upgraded on land.
+///
+/// A wall-clock pin (it waits for the debounced analysis and then for the
+/// package clock's idle timer), so it joins the `wall-clock-waits` group in
+/// `.config/nextest.toml` beside `package_recolor_tests`, whose shape it is.
+#[cfg(test)]
+mod dead_item_clock_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n[entry.client]\n\n[entry.server]\n";
+    const CLIENT: &str =
+        "import pkg::shared::used_by_client;\n\nfun main() {\n\tused_by_client();\n}\n";
+    const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n";
+    const SHARED: &str = "import std::io::print;\n\n\
+         fun used_by_client() {\n\tprint(\"c\");\n}\n\n\
+         fun used_by_nobody() {\n\tprint(\"n\");\n}\n";
+
+    fn workspace() -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-e124-clock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        for (relative, contents) in [
+            ("vilan.toml", MANIFEST),
+            ("src/client.vl", CLIENT),
+            ("src/server.vl", SERVER),
+            ("src/shared.vl", SHARED),
+        ] {
+            std::fs::write(directory.join(relative), contents).expect("a source file");
+        }
+        let shared = Url::from_file_path(directory.join("src/shared.vl")).expect("a file url");
+        (directory, shared)
+    }
+
+    /// How many top-level items the server is currently fading in `uri` — read
+    /// off the open document, which is where `publish_document` leaves the
+    /// union it served the last publish from.
+    fn grays(backend: &Backend, uri: &Url) -> usize {
+        backend
+            .documents
+            .get(uri)
+            .map(|document| document.dead_item_spans().len())
+            .unwrap_or(0)
+    }
+
+    async fn wait_for_grays(backend: &Backend, uri: &Url, wanted: bool) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if (grays(backend, uri) > 0) == wanted {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn an_edit_withdraws_the_packages_grays_and_the_clock_brings_them_back() {
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union and `used_by_nobody` fades",
+        );
+        assert_eq!(
+            grays(server, &shared),
+            1,
+            "exactly the item no entry reaches — `used_by_client` is reached by \
+             the `client` entry and must not fade",
+        );
+
+        // The edit. Withdrawal is synchronous and needs no analysis: the union
+        // is gone before `did_change` returns.
+        let edited = format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n");
+        server
+            .did_change(whole_file_change(&shared, 2, &edited))
+            .await;
+        assert!(
+            server.package_unions.is_empty(),
+            "the union is dropped by the edit itself, before any analysis runs",
+        );
+        assert!(
+            wait_for_grays(server, &shared, false).await,
+            "and the first publish after the edit carries no top-level gray",
+        );
+
+        // The settle. The clock recomputes and the paint returns.
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the editor came to rest, the union recomputed, and the gray is back",
+        );
+        println!(
+            "E124 clock: load={} grays={}",
+            crate::keystroke::gate::loadavg_1m(),
+            grays(server, &shared),
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

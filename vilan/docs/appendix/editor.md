@@ -61,6 +61,46 @@ or on-type formatting.
 **Linked editing** for markup tag pairs: rename `<div>` and `</div>`
 follows.
 
+**Dead code, faded.** Code nothing uses is dimmed rather than warned
+about: it does not enter the Problems count, does not badge the file, and
+gates nothing. Five things fade — an unused import, a `let` inside a
+function body that nothing reads, the statements after one that cannot
+return, a top-level item no entry of your package reaches, and every
+top-level item of a module no entry loads at all.
+
+The last two are the whole-package ones, and they are worth knowing
+precisely, because a fade means "you may delete this."
+
+- **What can fade:** a top-level `fun` and a module-level `let`. A
+  `struct`, an `enum`, a `trait` and an `impl` block never fade, used or
+  unused — they compile to nothing either way, so "does the build keep
+  it" is not a question that has an answer for them.
+- **What "unused" means:** no entry of the package reaches it. A package
+  with several entries is a union — an item only your `probe` entry calls
+  is used. An item behind a `[platform]` fence is used if the entry for
+  that platform reaches it.
+- **A `[library]` never fades a top-level item.** A library has no
+  entries, so there is nothing to compute the answer from, and every
+  top-level item is surface a consumer may import — which is what keeps
+  you from having to fork a library that forgot to export something. This
+  holds for a library inside a workspace too, even when the only consumer
+  today is a sibling package. Use `[doc(hidden)]` to keep a name out of
+  consumers' completion without forbidding it.
+- **A declared `generated` root never fades.** `[package] generated =
+  "src/icons"` already tells `vilan fmt` to leave a machine-written
+  directory alone; it tells the fade the same thing.
+- **`_`-led names never fade**, the way an unused local does not. It is
+  the "I know" marker.
+- **Trait impl members never fade in this version.** Whether a trait
+  method is reached depends on which types your program constructs, so
+  the answer moves in blocks as you edit; inherent impl members do fade.
+- **The fade goes off while you type** and comes back a moment after you
+  stop. The fact that would prove an item used lives in another file, so
+  a fade held across an edit could say "dead" about code you have just
+  started calling — and that is the one mistake a fade must not make.
+  Being late is fine; being wrong is not. A syntax error anywhere in the
+  package holds the whole package's fades off for the same reason.
+
 ## Completion
 
 Where the cursor is decides what is offered.

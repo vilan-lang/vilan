@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 use crate::analyzer::{GenericDispatch, Program, SourceId};
-use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -262,6 +262,38 @@ pub(crate) fn reachable_bindings(
     traversal.reached_bindings
 }
 
+/// E124's paint walk: every graph node — function, closure, module-level
+/// binding — that the program's own `main` reaches, under the SAME
+/// per-instantiation refinement admission and emission use, plus the two edge
+/// kinds only the paint follows.
+///
+/// It differs from [`reachable_bindings`] in exactly two ways, and both are
+/// `dead-code-paint.md`'s findings rather than preferences:
+///
+/// - it collects **nodes**, not only bindings — the paint's question is "does
+///   any entry reach this declaration", and a `fun` is not a binding;
+/// - it follows a `const` module binding's initializer edges, which
+///   [`crate::call_graph::CallGraph`] deliberately drops for emission. A
+///   function called only from `let x = const f();` is unreached and unemitted
+///   and deleting it breaks the build (§1.6, probe P3).
+///
+/// `None` when the program has no `main` — which is most files in the editor,
+/// where the OPEN file is the entry (§2.1, probe P5). That is the whole reason
+/// the paint's per-entry sets are computed out of band rather than off the
+/// analysis in hand.
+///
+/// Over-approximation is deliberate and always the safe direction here: a
+/// missed gray is late, a false gray is a lie (§1.4, determination 2).
+pub fn paint_reachable_nodes(program: &Program) -> Option<HashSet<Id>> {
+    let entry = entry_function(program)?;
+    let graph = program.call_graph();
+    let mut traversal = Traversal::new(program, graph, None);
+    traversal.collect_nodes = true;
+    traversal.follow_const_initializers = true;
+    traversal.walk(entry, &SubstitutionContext::default(), None);
+    Some(traversal.reached_nodes)
+}
+
 /// A per-call type binding: the analyzer's constraint id → bound type id.
 type SubstitutionContext = HashMap<TypeId, TypeId>;
 
@@ -298,6 +330,20 @@ struct Traversal<'a, 'src> {
     diagnostics: Vec<Violation>,
     module_bindings: HashSet<Id>,
     reached_bindings: HashSet<Id>,
+    /// E124: every node the walk reached, collected only when
+    /// `collect_nodes` is set. Admission and emission ask "which BINDINGS
+    /// run", which `reached_bindings` answers; the paint asks "which
+    /// declarations does any entry reach", which is every node — so the set
+    /// is opt-in rather than always built, and the admission walk pays
+    /// nothing for it.
+    reached_nodes: HashSet<Id>,
+    collect_nodes: bool,
+    /// E124: whether to follow the edges out of a `const` module binding's
+    /// initializer (`CallGraph`'s paint-only maps). Off for emission and
+    /// admission, whose answer about a const initializer — data, not code —
+    /// is right; on for the paint, whose answer would otherwise gray a
+    /// function whose deletion breaks the build (`dead-code-paint.md` §1.6).
+    follow_const_initializers: bool,
     origin: Origin,
 }
 
@@ -312,6 +358,9 @@ impl<'a, 'src> Traversal<'a, 'src> {
             diagnostics: Vec::new(),
             module_bindings: program.module_level_bindings().into_iter().collect(),
             reached_bindings: HashSet::default(),
+            reached_nodes: HashSet::default(),
+            collect_nodes: false,
+            follow_const_initializers: false,
             origin: Origin::Entry,
         }
     }
@@ -329,6 +378,9 @@ impl<'a, 'src> Traversal<'a, 'src> {
 
         if self.module_bindings.contains(&node) {
             self.reached_bindings.insert(node);
+        }
+        if self.collect_nodes {
+            self.reached_nodes.insert(node);
         }
 
         if let Some(platform) = self.platform
@@ -357,11 +409,17 @@ impl<'a, 'src> Traversal<'a, 'src> {
             }
         }
 
+        let const_calls: &[Call] = if self.follow_const_initializers {
+            self.graph.const_initializer_calls_of(node)
+        } else {
+            &[]
+        };
         for call in self
             .graph
             .calls_of(node)
             .iter()
             .chain(self.graph.initializer_calls_of(node))
+            .chain(const_calls)
         {
             let arrived = self.arrival(call.call_id);
             match call.target {
@@ -395,13 +453,33 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
         // Referencing a module-level binding runs its initializer (F6);
         // initializers are never generic, so they walk context-free.
-        for (reference, global) in self.graph.global_references_of(node) {
+        let const_globals: &[(Id, Id)] = if self.follow_const_initializers {
+            self.graph.const_global_references_of(node)
+        } else {
+            &[]
+        };
+        for (reference, global) in self
+            .graph
+            .global_references_of(node)
+            .iter()
+            .chain(const_globals)
+        {
             let arrived = self.arrival(*reference);
             self.walk(*global, &SubstitutionContext::default(), arrived);
         }
         // A function passed as a value charges at the reference site; with no
         // call record there is no binding to thread.
-        for (reference, function) in self.graph.function_references_of(node) {
+        let const_functions: &[(Id, Id)] = if self.follow_const_initializers {
+            self.graph.const_function_references_of(node)
+        } else {
+            &[]
+        };
+        for (reference, function) in self
+            .graph
+            .function_references_of(node)
+            .iter()
+            .chain(const_functions)
+        {
             let arrived = self.arrival(*reference);
             self.walk(*function, &SubstitutionContext::default(), arrived);
         }
@@ -418,6 +496,11 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
         for closure in self.graph.initializer_closures_of(node).to_vec() {
             self.walk(closure, &SubstitutionContext::default(), None);
+        }
+        if self.follow_const_initializers {
+            for closure in self.graph.const_initializer_closures_of(node).to_vec() {
+                self.walk(closure, &SubstitutionContext::default(), None);
+            }
         }
         // Synthetic destruction edges (destruction.md §8): the transformer inserts
         // the teardown at each scope exit, so this walk can't see the call

@@ -12,6 +12,7 @@ pub mod closest_name;
 pub mod const_eval;
 pub mod context;
 pub mod css;
+pub mod dead_items;
 pub(crate) mod depth_stats;
 pub mod dispatch_refine;
 pub mod drop_plan_stats;

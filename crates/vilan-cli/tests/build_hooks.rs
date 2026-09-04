@@ -2895,7 +2895,7 @@ fn every_test_that_drives_a_watch_session_is_in_the_group() {
 /// windows. Named here so the config check below covers them, and so dropping
 /// either from the filterset is a red rather than a silence.
 const MEMBERS_OUTSIDE_THIS_CRATE: &[&str] =
-    &["binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests|watched_files_tests/)"];
+    &["binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests|watched_files_tests|dead_item_clock_tests/)"];
 
 #[test]
 fn the_group_is_declared_the_way_this_file_reads_it() {

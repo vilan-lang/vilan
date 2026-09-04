@@ -31,6 +31,8 @@ use tower_lsp::lsp_types::{
     Url,
 };
 
+use vilan_core::Span;
+
 use crate::document::{Document, PublishedDiagnostic};
 use crate::line_index::LineIndex;
 
@@ -514,18 +516,32 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
     // the dead lines — and all three share the severity, the tag, and the
     // conservatism (`Document::unused_import_spans` and its two siblings all
     // answer empty for a stale or broken file).
-    let faded = [
-        ("unused import", document.unused_import_spans()),
-        ("unused local", document.unused_local_spans()),
-        ("unreachable code", document.unreachable_spans()),
+    //
+    // E124 adds the fourth and fifth producers, and they are the first two that
+    // are not file-local: a top-level item is dead only if NO ENTRY of the
+    // package reaches it, which is a fact about other files. The coarse one — a
+    // module no entry loads, faded whole — rides the per-entry module walk the
+    // analysis already paid for. The fine one reads the package clock's last
+    // completed union and is EMPTY whenever there is none, which is the
+    // withdraw-on-edit rule: a gray is a claim the user acts on by deleting, so
+    // it may be arbitrarily stale toward fewer grays and never toward more.
+    let mut faded: Vec<(String, Vec<Span>)> = vec![
+        ("unused import".to_string(), document.unused_import_spans()),
+        ("unused local".to_string(), document.unused_local_spans()),
+        ("unreachable code".to_string(), document.unreachable_spans()),
+        (
+            "no entry uses this item".to_string(),
+            document.dead_item_spans(),
+        ),
     ];
+    faded.extend(document.unloaded_module_paint());
     for (message, spans) in faded {
         for span in spans {
             entry_group.push(Diagnostic {
                 range: document.analyzed_range(&span),
                 severity: Some(DiagnosticSeverity::HINT),
                 source: Some("vilan".to_string()),
-                message: message.to_string(),
+                message: message.clone(),
                 tags: Some(vec![DiagnosticTag::UNNECESSARY]),
                 ..Default::default()
             });
