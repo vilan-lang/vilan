@@ -44,6 +44,7 @@ row	flagship	key
 11	-	an async closure cannot capture the view '{name}': the captu
 12	-	cannot reseat a view to '{name}', which goes out of scope be
 13	flagship	cannot mutate immutable '{name}'; {advice} to allow mutation
+14	flagship	cannot mutate immutable '{name}'; {advice} to allow mutation
 15	-	a view can't be read as a value here; write `*` to copy the 
 16	-	cannot take a writable view of immutable '{name}'; {advice} 
 17	-	view binding '{name}' cannot be `mut`: a view cannot be rebo
@@ -76,6 +77,7 @@ row	flagship	key
 44	-	a `context`-typed closure type is not valid here (expected a
 45	-	a closure-type marker is not valid here (expected an express
 46	-	a mapped tuple type is not valid here (expected an expressio
+47	-	a `context` clause is only supported on a closure type
 48	flagship	cannot find '{}' in this scope
 49	-	'{}' is not an enum variant
 50	flagship	variant '{}' does not belong to the matched enum
@@ -88,12 +90,16 @@ row	flagship	key
 57	-	a `context` clause is only supported on a parameter's closur
 58	-	this array literal has {} element{}, but its type is `[_; {l
 59	flagship	Expected {expected} (this literal's element type), but got {
+60	flagship	Expected {expected} (this literal's element type), but got {
 61	-	`self` import has no enclosing namespace
 62	flagship	cannot find module '{}' to import
 63	-	cannot find '{}' in the imported path
 64	flagship	Expected {} {}, but got {} instead.
 65	flagship	Expected {}, but got {} instead.{}
+66	flagship	Expected {} {}, but got {} instead.
 67	flagship	Expected {}, but got {} instead.
+68	flagship	Expected {} {}, but got {} instead.
+69	flagship	Expected {}, but got {} instead.
 70	-	cannot call '{name}': it is a struct, not a function; const
 71	-	cannot call this as a function: it is {rendered}
 72	-	{} has no method '{}'
@@ -101,7 +107,13 @@ row	flagship	key
 74	-	{} has no method '{}'{}
 75	flagship	cannot call method '{}' on {}
 76	flagship	cannot call '{member_name}' on a value of bare trait type 
+77	flagship	Expected {}, but got {} instead.
+78	flagship	Expected {} {}, but got {} instead.
+79	flagship	Expected {}, but got {} instead.
 80	-	a tuple comprehension's source must be a mapped tuple, got {
+81	flagship	Expected {}, but got {} instead.
+82	flagship	Expected {}, but got {} instead.
+83	flagship	Expected {}, but got {} instead.
 84	-	`?.` flattens into the chain's own `Result`, so the error ty
 85	-	{operator} lifts an `Option`, a `Result`, or a type opting in with `impl .. with Lift`; this is {rendered}
 86	flagship	every `?` in one lifted expression must split the same 
@@ -125,21 +137,27 @@ row	flagship	key
 104	flagship	{construct} have mismatched types: expected {expected}, but got {got} instead.
 105	-	unknown struct: {}
 106	-	cannot initialize a non-struct: {}
+107	flagship	Expected {} {}, but got {} instead.
 108	flagship	struct '{}' has no field '{}'
+109	flagship	Expected {}, but got {} instead.
 110	-	a tuple's members are its positions: `{tuple}` has no membe
 111	-	subject is not a struct: {}
+112	flagship	struct '{}' has no field '{}'
 113	-	cannot access field '{}' on type {}
 114	-	cannot index this List: its element type is never determined
 115	flagship	index {literal_index} is out of range for an array of length
 116	-	cannot index {} (only a `List` or `[T; n]` array is indexabl
+117	flagship	cannot find '{}' in this scope
 118	-	`use` requires a namespace (a module or an enum)
 119	-	cannot find '{}' in the `use` path
 120	flagship	`{name}` is a type, not a value; construct it (`{name} { .`
+121	flagship	cannot find '{}' in this scope
 122	flagship	cannot assign to this expression
 123	flagship	cannot find type '{name}'{steer}
 124	-	cannot find '{}' in module '{}'
 125	-	cannot resolve `{member_name}` here: {subject_str} is not a 
 126	-	cannot find '{}' in {}{}
+127	-	cannot find '{}' in module '{}'
 128	-	cannot access '{}' on an unconstrained type parameter
 129	-	no bound of this type parameter ({}) has a member '{}'
 130	-	cannot find trait '{}'
@@ -158,6 +176,7 @@ row	flagship	key
 143	flagship	type of accessor subject could not be resolved
 144	flagship	type of variable '{}' could not be resolved
 145	flagship	type of function call arguments could not be resolved
+146	-	cannot index this List: its element type is never determined
 147	flagship	type of match expression could not be resolved (subject: {})
 148	-	the type of '{name}' is never fully determined: `{rendered}`
 149	-	parse error in `{path}`: {rendered}
@@ -177,6 +196,8 @@ row	flagship	key
 164	-	no macro named `{name}` is in scope
 165	-	`{name}` is a macro HELPER (its signature is not a macro sha
 166	-	macro `{name}` is invocation-shaped (it takes no `Item`); ca
+167	-	no macro named `{name}` is in scope
+168	-	`{name}` is a macro HELPER (its signature is not a macro sha
 169	-	macro `{name}` is attribute-shaped (it takes an `Item`); use
 170	-	macro expansion did not settle after {cap} rounds: the chai
 171	-	{label}'s definition did not compile
@@ -184,7 +205,9 @@ row	flagship	key
 173	-	{label} generated invalid Vilan ({message}); the 
 174	flagship	{label} must generate a single expression here (it is 
 175	-	{label} generated a `macro {{ .. }}` block: macros cannot 
+176	-	{label} generated invalid Vilan ({message}); the 
 177	-	{label} generated a `macro fun`: macros cannot define macros
+178	-	{label} generated a `macro {{ .. }}` block: macros cannot 
 179	-	unknown platform pattern `{pattern_text}` in `[platform(…)]`
 180	flagship	`{name}` requires {requirement} and cannot run on `{platfo`
 181	flagship	{label} of `[derive(Wire)]` type `{type_name}` is the resourc
@@ -203,6 +226,7 @@ row	flagship	key
 194	-	use of `{name}` after it was moved
 195	-	`{name}` is not move-clean when instantiated with a resource 
 196	-	`{name}` is not move-clean … pass a resource to `drop<T>`
+197	-	`{name}` is not move-clean when instantiated with a resource 
 198	-	a `sync` closure contract is only supported on parameters
 199	-	`drop` for `{subject}` is async: teardown must be synchronou
 200	-	`drop` for `{subject}` requires an ambient context: teardown
@@ -276,6 +300,7 @@ row	flagship	key
 269	flagship	`{name}` is not move-clean when instantiated with a resource: {summary}, and a generic body cannot destroy a `T`; move it out on every path, or take a concrete type
 270	flagship	`{name}` is not move-clean when instantiated with a resource: {summary}; a generic used with a resource type argument must use each resource value at most once, and never copy or capture it
 271	flagship	cannot mutate immutable '{name}'; {advice}.
+272	flagship	cannot mutate immutable '{name}'; {advice}.
 273	-	cannot take a writable view of immutable '{name}'; {advice}.
 274	flagship	unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.
 275	-	a resource never copies, so `mut {name}` cannot take one; declare it `own {name}` to transfer it in
@@ -296,6 +321,7 @@ row	flagship	key
 290	flagship	{subject} is compile-time-only; call it directly inside a `const` expression — a compile-time-only function has no runtime value form
 291	-	{headline}{subject}: {}
 292	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
+293	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
 294	-	the `macro_std` package was not found beside `std`
 295	-	the macro `{}` did not compile to a callable function
 296	-	in this macro: {}
