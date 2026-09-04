@@ -7084,6 +7084,107 @@ pub(crate) mod tests {
         document.hover(offset)
     }
 
+    // --- E128: `Self` in a TRAIT declaration renders as `Self` ---------------
+    //
+    // `declaration_labels` called `function_signature_label` with no impl, and a
+    // `= Self`-defaulted trait generic resolves to the very same type as `Self`
+    // (`trait Add<B = Self>` — both are `Type::Trait(Add, [])`), so hover on
+    // `Add::add` printed the TRAIT's name: `fun add(self, b: Add): Add`, a
+    // signature nobody can write. B206 fixed exactly this for the conformance
+    // steer, by rendering FOR the impl; hover has no impl in hand and does not
+    // want one — it is showing the DECLARATION.
+    //
+    // Ruled: render the literal `Self`. It is what the trait's author wrote, it
+    // is the only spelling a reader can write back, and a `= Self` parameter
+    // shows its default, which is the whole of what the shorthand says.
+
+    #[test]
+    fn e128_hover_on_a_trait_member_renders_self_and_not_the_traits_name() {
+        // The item's own exhibit: `Add::add`, reached from a sub-trait's default
+        // body. Both positions — the `= Self`-defaulted `b` and the `Self`
+        // return — printed `Add` before.
+        let hover = hover_at_cursor(
+            "import std::operators::Add;\n\ntrait Doubler with Add {\n\tfun twice(self): Self {\n\t\tself.a|dd(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `add` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun add(self, b: Self): Self\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_through_a_generic_bound_renders_self_too() {
+        // The other route to a trait's own declaration: a call dispatched
+        // through a bound. Same label, because it is the same declaration.
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::operators::Sub;\n\nfun gap<T: Sub>(a: T, b: T): T {\n\ta.s|ub(b)\n}\n\nfun main() {\n\tprint(gap(3, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `sub` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun sub(self, b: Self): Self\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_on_a_user_traits_defaulted_parameter_renders_self() {
+        // A user trait, so the rule is not std's — hovered on the declaration
+        // itself, where a reader is most likely to ask.
+        let hover = hover_at_cursor(
+            "trait Adder<B = Self> {\n\tfun pl|us(self, b: B): Self;\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `plus` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun plus(self, b: Self): Self\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_renders_self_in_a_partial_eq_shaped_declaration() {
+        // `PartialEq`'s shape — a `= Self` parameter under a `bool` return — so
+        // the rule is pinned on a position whose SIBLING is not ambiguous: only
+        // the parameter moves, and `bool` is still `bool`.
+        let hover = hover_at_cursor(
+            "trait Same<B = Self> {\n\tfun al|ike(self, other: B): bool;\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `alike` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun alike(self, other: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_a_trait_members_ordinary_parameter_still_renders_as_written() {
+        // The control that keeps the rule narrow: only a position resolving to
+        // the DECLARING trait's own abstract type is rewritten. A concrete
+        // parameter and a mention of another trait's name are untouched.
+        let hover = hover_at_cursor(
+            "trait Labelled<B = Self> {\n\tfun la|bel(self, times: i32, other: B): str;\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `label` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun label(self, times: i32, other: Self): str\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_on_an_impls_method_still_renders_the_impls_own_types() {
+        // The other control: an IMPL is not a declaration, and its signature was
+        // never ambiguous — it says the concrete type on both sides.
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::operators::PartialEq;\n\nstruct Tag { n: i32 }\nimpl Tag with PartialEq {\n\tfun e|q(self, other: Tag): bool { self.n == other.n }\n}\n\nfun main() {\n\tprint(Tag { n = 1 }.eq(Tag { n = 1 }));\n}\n\nmain();\n",
+        )
+        .expect("hover on the impl's `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, other: Tag): bool\n```"),
+            "{hover}"
+        );
+    }
+
     // Hovering a function name appends its inferred platform requirement — the
     // coloring fixpoint surfaced in the editor, with the same via-chain
     // vocabulary the diagnostics use.

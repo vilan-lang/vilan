@@ -1782,3 +1782,212 @@ fn b205_an_unrelated_traits_method_is_still_refused_in_a_default_body() {
         "Doubler has no method 'mul'",
     );
 }
+
+// --- B216: a PARAMETERIZED supertrait clause keeps `Self` in a default body --
+//
+// B205 rebound a supertrait member's `Self` to the sub-trait, GATED to an
+// argument-less `with` clause: write `with Add<i32>` and `b: B` (`i32`) and the
+// `Self` return part company, while both still resolve to the one type
+// `Type::Trait(Add, [])` under `B = Self`. Nothing in the RESOLVED types
+// separates them — only the WRITTEN name does — so a blanket rewrite would have
+// made `b` the sub-trait and `self.add(1)` was refused with `Expected Bumper,
+// but got Add instead.` (the argument), plus a refusal of the call's own type.
+//
+// The written-name rule B206 built for LABELS is what tells the two apart, and
+// it now runs in method resolution's substitution too: a position spelled `Self`
+// takes the sub-trait, a position spelled with one of the supertrait's own
+// parameter names takes the matching `with`-clause argument.
+
+#[test]
+fn b216_a_parameterized_supertrait_clause_binds_its_argument_and_keeps_self() {
+    // The repro. `b: B` is the clause's `i32` (so the literal `1` is accepted)
+    // and the `Self` return is `Bumper` (so `.cents` resolves on the result).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Bumper with Add<i32> {
+            fun bumped(self): Self {
+                self.add(1)
+            }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add<i32> {
+            fun add(self, b: i32): Money { Money { cents = self.cents + b } }
+        }
+        impl Money with Bumper {}
+
+        fun main() { print(Money { cents = 3 }.bumped().cents); }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b216_a_parameterized_supertrait_default_dispatches_per_specialization() {
+    // The claim the compile alone cannot make: `bumped` is ONE body and each
+    // impl's own `add` runs in it, with the clause argument bound per subject.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Bumper with Add<i32> {
+            fun bumped(self): Self {
+                self.add(1)
+            }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add<i32> {
+            fun add(self, b: i32): Money { Money { cents = self.cents + b } }
+        }
+        impl Money with Bumper {}
+
+        struct Tag { text: str }
+        impl Tag with Add<i32> {
+            fun add(self, b: i32): Tag { Tag { text = self.text + b } }
+        }
+        impl Tag with Bumper {}
+
+        fun main() {
+            print(Money { cents = 3 }.bumped().cents);
+            print(Tag { text = "x" }.bumped().text);
+        }
+        main();
+        "#,
+        "4\nx1\n",
+    );
+}
+
+#[test]
+fn b216_a_two_parameter_supertrait_clause_binds_both_arguments_and_the_self_return() {
+    // Two written arguments, so the clause's substitution and the `Self` return
+    // are exercised together: `a: A` is `str` and `b: B` is `i32` from the
+    // clause, while the return is the SUB-trait — the half that was refused.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Blender<A, B> {
+            fun blend(self, a: A, b: B): Self;
+        }
+
+        trait Blended with Blender<str, i32> {
+            fun blended(self): Self {
+                self.blend("!", 1)
+            }
+        }
+
+        struct Tag { text: str }
+        impl Tag with Blender<str, i32> {
+            fun blend(self, a: str, b: i32): Tag { Tag { text = self.text + a + b } }
+        }
+        impl Tag with Blended {}
+
+        fun main() { print(Tag { text = "x" }.blended().text); }
+        main();
+        "#,
+        "x!1\n",
+    );
+}
+
+#[test]
+fn b216_a_defaulted_parameter_the_clause_left_out_still_means_the_sub_trait() {
+    // The written name is looked up BY POSITION in the declaring trait's
+    // parameter list, and a `= Self` parameter the clause did not reach (`B` is
+    // index 1, the clause wrote one argument) falls back to the sub-trait —
+    // which is precisely what the default says. So `self` is a legal second
+    // argument here while the first is the clause's `str`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Blender<A, B = Self> {
+            fun blend(self, a: A, b: B): Self;
+        }
+
+        trait Blended with Blender<str> {
+            fun blended(self): Self {
+                self.blend("!", self)
+            }
+        }
+
+        struct Tag { text: str }
+        impl Tag with Blender<str> {
+            fun blend(self, a: str, b: Tag): Tag { Tag { text = self.text + a + b.text } }
+        }
+        impl Tag with Blended {}
+
+        fun main() { print(Tag { text = "x" }.blended().text); }
+        main();
+        "#,
+        "x!x\n",
+    );
+}
+
+#[test]
+fn b216_the_argument_less_clause_still_takes_the_sub_trait_everywhere() {
+    // B205's control, standing next to the parameterized shape in ONE program:
+    // with nothing written in the clause, `= Self` means exactly `Self` and
+    // BOTH positions are the sub-trait — the blanket rewrite B205 installed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self {
+                self.add(self)
+            }
+        }
+
+        trait Bumper with Add<i32> {
+            fun bumped(self): Self {
+                self.add(1)
+            }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add { fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } } }
+        impl Money with Doubler {}
+
+        struct Tally { hits: i32 }
+        impl Tally with Add<i32> { fun add(self, b: i32): Tally { Tally { hits = self.hits + b } } }
+        impl Tally with Bumper {}
+
+        fun main() {
+            print(Money { cents = 3 }.twice().cents);
+            print(Tally { hits = 3 }.bumped().hits);
+        }
+        main();
+        "#,
+        "6\n4\n",
+    );
+}
+
+#[test]
+fn b216_a_parameterized_supertrait_argument_of_the_wrong_type_is_still_refused() {
+    // The rebinding must not become a licence: the clause argument is a real
+    // expectation, so a `str` where the clause wrote `i32` is refused — and
+    // named as `i32`, not as `Add` and not as `Bumper`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Bumper with Add<i32> {
+            fun bumped(self): Self {
+                self.add("nope")
+            }
+        }
+
+        fun main() { print("x"); }
+        main();
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}

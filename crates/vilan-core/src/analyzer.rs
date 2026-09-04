@@ -1858,14 +1858,44 @@ pub struct Trait<'src> {
     pub supertraits: Vec<TypeId>,
 }
 
-/// The impl a trait member's signature is being rendered FOR (B206): the trait
-/// that DECLARES the member, the impl's subject type, and the arguments the
-/// `with` clause supplied. Without it a `Self` position renders as the trait's
-/// own name, which is a signature nobody can write.
+/// What a trait member's signature is being rendered FOR: the trait that
+/// DECLARES the member, and which side of the trait/impl pair is asking.
+/// Without it a `Self` position renders as the trait's own name, which is a
+/// signature nobody can write.
 struct SignatureSubject<'a> {
     declaring_trait_id: Id,
-    subject: TypeId,
-    trait_arguments: &'a [TypeId],
+    rendered_for: SignatureSide<'a>,
+}
+
+/// The two sides a trait member's signature is read from — and what an
+/// ambiguous `Self` / `= Self`-defaulted position means on each.
+enum SignatureSide<'a> {
+    /// The trait's OWN declaration (E128): the literal `Self`. It is what the
+    /// author wrote, it is the only spelling a reader can write back, and a
+    /// `= Self`-defaulted parameter shows its default — which is the whole of
+    /// what the shorthand says. Hover reads this side.
+    Declaration,
+    /// An IMPL of the trait (B206): the impl's subject type, and the arguments
+    /// its `with` clause supplied. `Self` is the subject; a `= Self`-defaulted
+    /// parameter is the matching clause argument, falling back to the subject
+    /// when the clause supplied none. The conformance steer reads this side.
+    Impl(TypeId, &'a [TypeId]),
+}
+
+/// A supertrait member reached from a sub-trait's default body (B205/B216):
+/// the trait that DECLARES the member, the SUB-trait's own abstract type — what
+/// that member's `Self` means at this call — and the arguments the sub-trait's
+/// `with` clause supplied the declaring trait.
+///
+/// [`SignatureSubject`]'s twin for method resolution rather than for a rendered
+/// label, and it carries the arguments for the same reason: under a
+/// PARAMETERIZED clause a `= Self`-defaulted parameter and `Self` resolve to the
+/// one type, so only the written name says which of the two a position is.
+#[derive(Clone, Debug)]
+struct SupertraitSelf {
+    declaring_trait_id: Id,
+    sub_trait: TypeId,
+    arguments: Vec<TypeId>,
 }
 
 /// B161: a TRAIT written as a `let` binding's annotation. The annotation is
@@ -3205,6 +3235,19 @@ pub struct Analyzer<'src> {
     // real source — so a diagnostic anchored in generated code re-anchors at
     // its attribute (standard A2).
     derived_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
+    /// The same per-walk record keyed by the TYPE ids the walk minted (B217).
+    ///
+    /// A written type annotation is not resolved during the walk at all: it is
+    /// PREPPED (`prepped_type_locals`, `prepped_type_static_accessors`) and
+    /// drained in `build()`, long after the generated walk closed. Those drains
+    /// carry the walk's `SourceId` and no entity id, so `push_in_source` had
+    /// nothing to look an origin up BY and kept the entry fallback — a
+    /// generated type miss then landed at the declaring `mod`, or at the type,
+    /// or wherever the deriving file happened to hold those offsets. Type ids
+    /// are minted from their own monotonic counter, so a walk's are contiguous
+    /// exactly as its entity ids are, and the range is known when the
+    /// references are prepped.
+    derived_type_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
     // Where an unannotated closure parameter's shared type slot was filled
     // from (the FIRST call's argument, B13) — a later conflicting call
     // diagnoses naming that origin instead of a bare mismatch.
@@ -3287,7 +3330,7 @@ pub struct Analyzer<'src> {
     /// (`Expected Doubler, but got Add`). Recorded at the lookup, the one place
     /// both traits are in hand; consumed by the argument check, which reads a
     /// member's declared parameter types straight off the declaration.
-    supertrait_self_at_call: HashMap<Id, (Id, TypeId)>,
+    supertrait_self_at_call: HashMap<Id, SupertraitSelf>,
     // The expected type imposed on an expression by its syntactic context — a
     // function's declared return type for its body tail, propagated into tail
     // positions (each `match` leg body) by their resolvers. Lets a
@@ -4181,6 +4224,7 @@ impl<'src> Analyzer<'src> {
             prelude_repair: PreludeRepair::default(),
             std_trait_method_index: None,
             derived_origins: Vec::new(),
+            derived_type_origins: Vec::new(),
             closure_parameter_fill_sites: HashMap::default(),
             prepped_binder_inheritance: Vec::new(),
             binary_op_dispatch: HashMap::default(),
@@ -7007,23 +7051,88 @@ impl<'src> Analyzer<'src> {
     /// recursion — it exists separately because `substitute_type` does not know
     /// `Self`, and leaving a nested `Self` unsubstituted would compare as a
     /// spurious mismatch (`List<Self>` vs `List<subject>`).
-    /// [`substitute_member_type`] for B205's recorded pair: a supertrait
+    /// [`substitute_member_type`] for B205's recorded reach: a supertrait
     /// member's `Self`, rebound to the sub-trait the call reached it through.
     /// `None` (the ordinary call) returns the type unchanged.
+    ///
+    /// `declared_id` is the position's WRITTEN type id — the parameter's or the
+    /// return's own annotation, before any substitution — because under a
+    /// parameterized clause that id's spelling is the only thing separating
+    /// `Self` from a `= Self`-defaulted parameter (B216).
     fn rebind_supertrait_self(
         &mut self,
-        supertrait_self: Option<(Id, TypeId)>,
+        reached: Option<&SupertraitSelf>,
+        declared_id: Option<TypeId>,
         type_: &Type,
     ) -> Type {
-        match supertrait_self {
-            Some((declaring_trait_id, sub_trait)) => self.substitute_member_type(
+        let Some(reached) = reached else {
+            return type_.clone();
+        };
+        // An AMBIGUOUS position — one resolving to the declaring trait's own
+        // abstract type while the clause wrote arguments — is decided by the
+        // spelling, never by the resolved type. A position whose spelling
+        // cannot be recovered is left exactly as declared rather than guessed
+        // at: that is the shape B205 refused to touch at all.
+        let ambiguous = !reached.arguments.is_empty()
+            && matches!(
                 type_,
-                declaring_trait_id,
-                sub_trait,
-                &SubstitutionContext::default(),
-            ),
-            None => type_.clone(),
+                Type::Trait(trait_id, arguments)
+                    if *trait_id == reached.declaring_trait_id && arguments.is_empty()
+            );
+        if ambiguous {
+            return match self.supertrait_position_type(reached, declared_id) {
+                Some(type_id) => type_id.get_type(self),
+                None => type_.clone(),
+            };
         }
+        let context =
+            self.trait_parameter_substitution(reached.declaring_trait_id, &reached.arguments);
+        self.substitute_member_type(
+            type_,
+            reached.declaring_trait_id,
+            reached.sub_trait,
+            &context,
+        )
+    }
+
+    /// What an ambiguous `Self` / `= Self`-defaulted position of a SUPERTRAIT's
+    /// member means at a call reached through a sub-trait's parameterized `with`
+    /// clause (B216).
+    ///
+    /// `ambiguous_position_expectation`'s rule (the B29 residue) and
+    /// `signature_position_type`'s (B206's label rule) applied a third time, at
+    /// method resolution: `Self` is the sub-trait, and a position spelled with
+    /// one of the declaring trait's own parameter names is the matching clause
+    /// argument — falling back to the sub-trait when the clause supplied none,
+    /// which is precisely what the `= Self` default means. `None` when the
+    /// spelling cannot be recovered, and the caller then leaves the position
+    /// alone.
+    fn supertrait_position_type(
+        &self,
+        reached: &SupertraitSelf,
+        declared_id: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let declared_id = declared_id?;
+        let written = self
+            .written_type_spellings
+            .iter()
+            .find(|(written_id, _)| *written_id == declared_id)
+            .map(|(_, name)| *name)?;
+        if written == "Self" {
+            return Some(reached.sub_trait);
+        }
+        let trait_ = self.traits.get(&reached.declaring_trait_id)?;
+        let index = trait_
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written)?;
+        Some(
+            reached
+                .arguments
+                .get(index)
+                .copied()
+                .unwrap_or(reached.sub_trait),
+        )
     }
 
     fn substitute_member_type(
@@ -14309,39 +14418,47 @@ impl<'src> Analyzer<'src> {
         self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
-    /// [`declaration_type_label`] rendered FOR an impl (B206): an ambiguous
-    /// `Self` / `= Self`-defaulted position resolves to what it means there.
+    /// [`declaration_type_label`] rendered FOR one side of a trait/impl pair
+    /// (B206, E128): an ambiguous `Self` / `= Self`-defaulted position renders
+    /// as what it means THERE.
     fn declaration_type_label_for(
         &self,
         type_id: TypeId,
         subject: Option<&SignatureSubject<'_>>,
     ) -> String {
-        match subject.and_then(|subject| self.signature_position_type(type_id, subject)) {
-            Some(resolved) => self.declaration_type_label(resolved),
+        match subject.and_then(|subject| self.signature_position_label(type_id, subject)) {
+            Some(label) => label,
             None => self.declaration_type_label(type_id),
         }
     }
 
-    /// What an ambiguous `Self` / `= Self`-defaulted position of a trait member
-    /// means in a given impl — `None` for every other position, which renders as
-    /// written.
+    /// How an ambiguous `Self` / `= Self`-defaulted position of a trait member
+    /// RENDERS on a given side — `None` for every other position, which renders
+    /// as written.
     ///
-    /// The rule is `ambiguous_position_expectation`'s, the B29 residue, applied
-    /// to a rendered LABEL instead of to a check. A `= Self`-defaulted trait
-    /// generic (`trait Add<B = Self>`, `trait PartialEq<B = Self>`) resolves to
-    /// the very same type as `Self` — both are `Type::Trait(trait, [])` — so the
-    /// resolved type cannot tell a declared `b: B` from a declared `Self`, and
-    /// rendering it printed the TRAIT's name: `declare `fun eq(self, b:
-    /// PartialEq): bool``, which is not a signature anyone can write (B206). The
-    /// WRITTEN name separates them: `Self` is the impl's subject, and the
-    /// parameter's own name is the matching `with`-clause argument, falling back
-    /// to the subject when the clause supplied none — which is precisely what
-    /// the `= Self` default means.
-    fn signature_position_type(
+    /// A `= Self`-defaulted trait generic (`trait Add<B = Self>`,
+    /// `trait PartialEq<B = Self>`) resolves to the very same type as `Self` —
+    /// both are `Type::Trait(trait, [])` — so the resolved type cannot tell a
+    /// declared `b: B` from a declared `Self`, and rendering it printed the
+    /// TRAIT's name: `fun eq(self, b: PartialEq): bool`, which is not a
+    /// signature anyone can write.
+    ///
+    /// On the IMPL side (B206) the rule is `ambiguous_position_expectation`'s,
+    /// the B29 residue, applied to a rendered LABEL instead of to a check: the
+    /// WRITTEN name separates the two, `Self` being the impl's subject and the
+    /// parameter's own name the matching `with`-clause argument, falling back to
+    /// the subject when the clause supplied none.
+    ///
+    /// On the DECLARATION side (E128) there is nothing to separate: `Self` and a
+    /// `= Self` default are the same promise, spelled two ways, and the trait's
+    /// own text is what hover is showing. Both render `Self` — the parameter's
+    /// default shown as the default it is — so no spelling lookup is needed,
+    /// and a position whose spelling was never recorded renders right too.
+    fn signature_position_label(
         &self,
         type_id: TypeId,
         subject: &SignatureSubject<'_>,
-    ) -> Option<TypeId> {
+    ) -> Option<String> {
         // Only a position that resolves to the declaring trait's OWN abstract
         // type is ambiguous. A `b: i32` renders as written, and so does a
         // mention of some other trait.
@@ -14350,13 +14467,17 @@ impl<'src> Analyzer<'src> {
                 if trait_id == subject.declaring_trait_id && arguments.is_empty() => {}
             _ => return None,
         }
+        let (impl_subject, trait_arguments) = match subject.rendered_for {
+            SignatureSide::Declaration => return Some("Self".to_string()),
+            SignatureSide::Impl(impl_subject, trait_arguments) => (impl_subject, trait_arguments),
+        };
         let written = self
             .written_type_spellings
             .iter()
             .find(|(written_id, _)| *written_id == type_id)
             .map(|(_, name)| *name)?;
         if written == "Self" {
-            return Some(subject.subject);
+            return Some(self.declaration_type_label(impl_subject));
         }
         let trait_ = self.traits.get(&subject.declaring_trait_id)?;
         let index = trait_
@@ -14364,11 +14485,9 @@ impl<'src> Analyzer<'src> {
             .iter()
             .position(|name| *name == written)?;
         Some(
-            subject
-                .trait_arguments
-                .get(index)
-                .copied()
-                .unwrap_or(subject.subject),
+            self.declaration_type_label(
+                trait_arguments.get(index).copied().unwrap_or(impl_subject),
+            ),
         )
     }
 
@@ -14415,11 +14534,11 @@ impl<'src> Analyzer<'src> {
         self.function_signature_label_for(function, None)
     }
 
-    /// [`function_signature_label`] rendered FOR an impl: a `Self` position, and
-    /// a `= Self`-defaulted parameter, take what they mean there rather than the
-    /// trait's own name (B206). `None` renders the declaration as written, which
-    /// is what hover wants — there is no impl in hand, and `Self` is exactly
-    /// what the author typed.
+    /// [`function_signature_label`] rendered FOR one side of a trait/impl pair:
+    /// a `Self` position, and a `= Self`-defaulted parameter, take what they
+    /// mean there rather than the trait's own name (B206, E128). `None` renders
+    /// the resolved types, which is right for everything that is not a trait
+    /// member.
     fn function_signature_label_for(
         &self,
         function: &Function,
@@ -15410,6 +15529,7 @@ impl<'src> Analyzer<'src> {
     ) {
         let walking = self.current_source_id;
         let generated_start = self.entity_id;
+        let generated_type_start = self.type_id;
         let diagnostics_before = self.diagnostics.len();
         self.set_current_source(DERIVED_SOURCE);
         self.walk_generated_items(generated, scope_id);
@@ -15420,6 +15540,10 @@ impl<'src> Analyzer<'src> {
         });
         self.derived_origins
             .push((generated_start..self.entity_id, origin, origin_source));
+        // The type ids the walk minted, so the annotations it PREPPED can find
+        // this origin when they drain in `build()` (B217).
+        self.derived_type_origins
+            .push((generated_type_start..self.type_id, origin, origin_source));
         // Runs BEFORE the restore: it closes the attribution run it opens with
         // whatever `current_source_id` then is, so the walk's own source has to
         // still be current for the marks to bracket the generated diagnostics.
@@ -26606,17 +26730,34 @@ impl<'src> Analyzer<'src> {
                             // method spelling reaching the same place.) A
                             // receiver whose trait IS the declaring one is left
                             // alone: the substitution would be the identity.
-                            let receiver_is_sub_trait = matches!(receiver_type, Type::Trait(_, _))
-                                && self
-                                    .supertrait_self_at_call
-                                    .get(&id)
-                                    .is_some_and(|(declaring, _)| *declaring == self_trait);
+                            let receiver_is_sub_trait =
+                                matches!(receiver_type, Type::Trait(_, _))
+                                    && self.supertrait_self_at_call.get(&id).is_some_and(
+                                        |reached| reached.declaring_trait_id == self_trait,
+                                    );
                             if receiver_is_sub_trait
                                 || matches!(
                                     receiver_type,
                                     Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
                                 )
                             {
+                                // A sub-trait receiver goes through the reach the
+                                // lookup recorded, so a PARAMETERIZED clause
+                                // decides the return by its written name too — a
+                                // member returning `B` under `with Add<i32>`
+                                // returns `i32`, not the sub-trait (B216). With
+                                // no arguments written the two are the same
+                                // substitution, B205's.
+                                if receiver_is_sub_trait
+                                    && let Some(reached) =
+                                        self.supertrait_self_at_call.get(&id).cloned()
+                                {
+                                    return self.rebind_supertrait_self(
+                                        Some(&reached),
+                                        return_type_id,
+                                        &return_type,
+                                    );
+                                }
                                 let subject = receiver_type.get_type_id(self);
                                 return self.substitute_member_type(
                                     &return_type,
@@ -28940,15 +29081,56 @@ impl<'src> Analyzer<'src> {
     /// the walk that saw them.
     ///
     /// A generated span ([`DERIVED_SOURCE`]) keeps the entry fallback here:
-    /// re-anchoring at the attribute needs an entity id to find the origin
-    /// range by, and a bare source cannot supply one. Every site that HAS an
-    /// id uses [`Self::push_anchored`], which does re-anchor.
+    /// re-anchoring at the attribute needs an id to find the origin range by,
+    /// and a bare source cannot supply one. A site that HAS one uses
+    /// [`Self::push_anchored`] (an entity) or
+    /// [`Self::push_at_written_type`] (a written annotation's type id), and
+    /// both re-anchor.
     fn push_in_source(&mut self, error: Error, source: SourceId) {
         let from = self.diagnostics.len();
         self.diagnostics.push(error);
         if source != DERIVED_SOURCE {
             self.attribute_new_diagnostics(from, source);
         }
+    }
+
+    /// [`Self::push_in_source`] for the `prepped_*` type-reference drains: the
+    /// diagnostic is about a WRITTEN ANNOTATION, and the annotation's type id
+    /// is the anchor a generated one re-anchors by (B217).
+    ///
+    /// These drains run in `build()`, after every walk has closed, so they are
+    /// the one family that carries its own `(span, source)` instead of
+    /// inheriting an attribution mark. Generated code reaches them exactly as
+    /// hand-written code does — the type miss in a derive template is prepped
+    /// by the generated walk and resolved here — and before this the redirect
+    /// simply did not cover the route: the message said nothing about its
+    /// provenance and the span indexed a template no file holds.
+    fn push_at_written_type(&mut self, error: Error, source: SourceId, type_id: TypeId) {
+        let origin = match source {
+            DERIVED_SOURCE => self.derived_type_origin(type_id),
+            _ => None,
+        };
+        let from = self.diagnostics.len();
+        self.diagnostics.push(error);
+        match origin {
+            Some((origin_span, origin_source)) => {
+                self.redirect_derived_range(from, origin_span, origin_source)
+            }
+            None => {
+                if source != DERIVED_SOURCE {
+                    self.attribute_new_diagnostics(from, source);
+                }
+            }
+        }
+    }
+
+    /// [`Self::derived_origins`]' lookup by the TYPE id a generated walk minted
+    /// — which attribute wrote the annotation this id came from (B217).
+    fn derived_type_origin(&self, type_id: TypeId) -> Option<(Span, SourceId)> {
+        self.derived_type_origins
+            .iter()
+            .find(|(range, _, _)| range.contains(&type_id.0))
+            .map(|(_, span, source)| (*span, *source))
     }
 
     /// The file a whole-program check's SECONDARY note points into, in the
@@ -30776,29 +30958,38 @@ impl<'src> Analyzer<'src> {
                             .insert(id, GenericDispatch::OnType(None, member_name));
                         // B205: a member reached from a SUPERTRAIT is written in
                         // that trait's terms, `Self` included — and inside this
-                        // default body `Self` is the SUB-trait. Record the pair
+                        // default body `Self` is the SUB-trait. Record the reach
                         // so the argument check can rebind it; the return type
                         // takes the same rebinding through the `Self`-return
                         // specialization below.
                         //
-                        // Only for an ARGUMENT-LESS `with` clause, and that is
-                        // the whole of the rule rather than a convenience. A
-                        // `= Self`-defaulted parameter resolves to the very same
-                        // type as `Self` (`trait Add<B = Self>` -> both are
-                        // `Type::Trait(Add, [])`), so with no argument written
-                        // every such occurrence means the sub-trait and a blanket
-                        // rewrite is exactly right. Write `with Add<i32>` and the
-                        // two positions part company — `b: B` is `i32`, the `Self`
-                        // return is still the sub-trait — and nothing in the
-                        // RESOLVED types tells them apart; only the written name
-                        // does (`ambiguous_position_expectation`, the same B29
-                        // residue). That shape is left exactly as it was.
-                        if *declaring_trait_id != trait_id && declaring_arguments.is_empty() {
+                        // With an ARGUMENT-LESS `with` clause a blanket rewrite is
+                        // exactly right: a `= Self`-defaulted parameter resolves to
+                        // the very same type as `Self` (`trait Add<B = Self>` ->
+                        // both are `Type::Trait(Add, [])`), and with no argument
+                        // written every such occurrence does mean the sub-trait.
+                        // Write `with Add<i32>` and the two positions part company
+                        // — `b: B` is `i32`, the `Self` return is still the
+                        // sub-trait — and nothing in the RESOLVED types tells them
+                        // apart; only the WRITTEN name does. So the clause's
+                        // arguments are carried along too, and the rebinding
+                        // decides each ambiguous position by its spelling (B216,
+                        // `supertrait_position_type` — the same B29 residue
+                        // `ambiguous_position_expectation` and B206's label rule
+                        // run on).
+                        if *declaring_trait_id != trait_id {
                             let declaring_trait_id = *declaring_trait_id;
+                            let arguments = declaring_arguments.clone();
                             let sub_trait =
                                 Type::Trait(trait_id, trait_arguments.clone()).get_type_id(self);
-                            self.supertrait_self_at_call
-                                .insert(id, (declaring_trait_id, sub_trait));
+                            self.supertrait_self_at_call.insert(
+                                id,
+                                SupertraitSelf {
+                                    declaring_trait_id,
+                                    sub_trait,
+                                    arguments,
+                                },
+                            );
                         }
                         // A parameterized trait substitutes its generic parameters
                         // with the concrete arguments, so the method's signature
@@ -31306,7 +31497,7 @@ impl<'src> Analyzer<'src> {
         // structural rather than a substitution entry because types are not
         // interned: the parameter, the return and the trait's own `Self` binding
         // are three ids for the one type.
-        let supertrait_self = self.supertrait_self_at_call.get(&call_id).copied();
+        let supertrait_self = self.supertrait_self_at_call.get(&call_id).cloned();
         let expected = parameter_ids.len().saturating_sub(1);
         if argument_ids.len() != expected {
             // `self` is parameter 0 — the arguments a caller writes line up
@@ -31328,12 +31519,16 @@ impl<'src> Analyzer<'src> {
         let mut argument_types = Vec::with_capacity(argument_ids.len());
         for argument_id in argument_ids {
             // `+ 1` skips the method's `self` parameter.
-            let parameter_type = parameter_ids
+            let declared_id = parameter_ids
                 .get(argument_types.len() + 1)
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
-                .map(|parameter| parameter.type_id.get_type(self))
+                .map(|parameter| parameter.type_id);
+            let parameter_type = declared_id
+                .map(|declared_id| declared_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
-                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
+                .map(|parameter| {
+                    self.rebind_supertrait_self(supertrait_self.as_ref(), declared_id, &parameter)
+                })
                 .unwrap_or(Type::Unknown);
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
@@ -31343,12 +31538,16 @@ impl<'src> Analyzer<'src> {
         }
         for (index, argument_type) in argument_types.into_iter().enumerate() {
             let argument_id = argument_ids[index];
-            let Some(parameter_type) = parameter_ids
+            let declared_id = parameter_ids
                 .get(index + 1)
                 .and_then(|parameter_id| self.parameters.get(parameter_id))
-                .map(|parameter| parameter.type_id.get_type(self))
+                .map(|parameter| parameter.type_id);
+            let Some(parameter_type) = declared_id
+                .map(|declared_id| declared_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
-                .map(|parameter| self.rebind_supertrait_self(supertrait_self, &parameter))
+                .map(|parameter| {
+                    self.rebind_supertrait_self(supertrait_self.as_ref(), declared_id, &parameter)
+                })
             else {
                 continue;
             };
@@ -34915,7 +35114,7 @@ impl<'src> Analyzer<'src> {
                     {
                         let (message, note) =
                             self.non_trait_in_bound_position(name, sort, subject_id, scope_id);
-                        self.push_in_source(
+                        self.push_at_written_type(
                             Error {
                                 trace: Vec::new(),
                                 note,
@@ -34923,6 +35122,7 @@ impl<'src> Analyzer<'src> {
                                 msg: message,
                             },
                             source_id,
+                            type_id,
                         );
                     }
                     let refused_arity = arity_error.is_some();
@@ -34930,7 +35130,7 @@ impl<'src> Analyzer<'src> {
                         // Attributed to the walk that wrote the annotation, for
                         // the reason the unresolved arm below is (E108) — this
                         // is the same drain, and it had the same defect.
-                        self.push_in_source(
+                        self.push_at_written_type(
                             Error {
                                 trace: Vec::new(),
                                 note: None,
@@ -34938,6 +35138,7 @@ impl<'src> Analyzer<'src> {
                                 msg: message,
                             },
                             source_id,
+                            type_id,
                         );
                     }
                     // Attach the written generic arguments to the nominal type
@@ -35073,7 +35274,7 @@ impl<'src> Analyzer<'src> {
                             // annotation, for the reason the unresolved arm
                             // below is (E108) — this is the same drain, and
                             // it had the same defect.
-                            self.push_in_source(
+                            self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
                                     note,
@@ -35081,6 +35282,7 @@ impl<'src> Analyzer<'src> {
                                     msg: message,
                                 },
                                 source_id,
+                                type_id,
                             );
                             // B182: the slot this report accounts for.
                             // Everything downstream reads `Unknown` here —
@@ -35144,7 +35346,7 @@ impl<'src> Analyzer<'src> {
                     // indexes a file the author never opened. `source_id` is
                     // the walk's own record, captured when the annotation was
                     // prepped.
-                    self.push_in_source(
+                    self.push_at_written_type(
                         Error {
                             trace: Vec::new(),
                             note: None,
@@ -35152,6 +35354,7 @@ impl<'src> Analyzer<'src> {
                             msg: message,
                         },
                         source_id,
+                        type_id,
                     );
                     // B189's first sibling: a name that does not resolve is a
                     // REFUSED ANNOTATION like any other. B182 instrumented the
@@ -35194,7 +35397,7 @@ impl<'src> Analyzer<'src> {
                         // slot and the mistake surfaced, if at all, as a
                         // mismatch wherever the annotated thing was next used.
                         Some(member_id) if !self.entity_denotes_a_type(member_id) => {
-                            self.push_in_source(
+                            self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
                                     note: None,
@@ -35204,6 +35407,7 @@ impl<'src> Analyzer<'src> {
                                     ),
                                 },
                                 source_id,
+                                type_id,
                             );
                             self.write_type_slot(type_id, Type::Unknown);
                         }
@@ -35224,7 +35428,7 @@ impl<'src> Analyzer<'src> {
                             self.write_type_slot(type_id, member_type);
                         }
                         None => {
-                            self.push_in_source(
+                            self.push_at_written_type(
                                 Error {
                                     trace: Vec::new(),
                                     note: None,
@@ -35235,6 +35439,7 @@ impl<'src> Analyzer<'src> {
                                     ),
                                 },
                                 source_id,
+                                type_id,
                             );
                             self.write_type_slot(type_id, Type::Unknown);
                         }
@@ -35250,7 +35455,7 @@ impl<'src> Analyzer<'src> {
                     if !matches!(subject_type, Type::Unknown | Type::Unresolved) {
                         let subject_str =
                             self.pretty_print_type(&subject_type, &HashMap::default());
-                        self.push_in_source(
+                        self.push_at_written_type(
                             Error {
                                 trace: Vec::new(),
                                 note: None,
@@ -35260,6 +35465,7 @@ impl<'src> Analyzer<'src> {
                                 ),
                             },
                             source_id,
+                            type_id,
                         );
                     }
                     self.write_type_slot(type_id, Type::Unknown);
@@ -35983,8 +36189,10 @@ impl<'src> Analyzer<'src> {
                 // rather than to the trait's own name.
                 let signature_subject = SignatureSubject {
                     declaring_trait_id,
-                    subject: check.subject_type_id,
-                    trait_arguments: &check.trait_arguments,
+                    rendered_for: SignatureSide::Impl(
+                        check.subject_type_id,
+                        &check.trait_arguments,
+                    ),
                 };
                 let (signature, note) = self
                     .traits
@@ -45593,8 +45801,34 @@ fn analyze_over_world<'src>(
     // signature, a struct/enum's fields and variants — the language server
     // fences these as code and appends docs and platform lines.
     let mut declaration_labels: HashMap<Id, String> = HashMap::default();
+    // E128: a TRAIT member's signature renders for the trait's own declaration,
+    // so a `Self` position — and a `= Self`-defaulted parameter, which resolves
+    // to the very same type — renders as the literal `Self` rather than as the
+    // trait's name. `fun add(self, b: Add): Add` was not a signature anyone
+    // could write; `fun add(self, b: Self): Self` is what the author wrote.
+    let declaring_trait_of_member: HashMap<Id, Id> = analyzer
+        .traits
+        .iter()
+        .flat_map(|(trait_id, trait_)| {
+            trait_
+                .declarations
+                .values()
+                .map(move |member_id| (*member_id, *trait_id))
+        })
+        .map(|(member_id, trait_id)| (analyzer.resolve_member_function_id(member_id), trait_id))
+        .collect();
     for (function_id, function) in &analyzer.functions {
-        declaration_labels.insert(*function_id, analyzer.function_signature_label(function));
+        let label = match declaring_trait_of_member.get(function_id) {
+            Some(declaring_trait_id) => analyzer.function_signature_label_for(
+                function,
+                Some(&SignatureSubject {
+                    declaring_trait_id: *declaring_trait_id,
+                    rendered_for: SignatureSide::Declaration,
+                }),
+            ),
+            None => analyzer.function_signature_label(function),
+        };
+        declaration_labels.insert(*function_id, label);
     }
     for (function_id, external) in &analyzer.external_functions {
         let mut parameters: Vec<String> = Vec::new();
