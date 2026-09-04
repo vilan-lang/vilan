@@ -1050,6 +1050,18 @@ impl Dispatcher {
 	}
 }
 
+/// What `[service]` implements for the struct it decorates: THIS INSTANCE's
+/// dispatcher. One instance, one dispatcher, one connection — the shape
+/// `Service::factory` needs (`transport-rpc.md` Q9: the struct instance is the
+/// connection's session, created on connect and owned by the dispatcher the
+/// routes close over). `dispatcher()` stays as the inherent spelling for the
+/// process-wide instance `Service::new` mounts; this trait is what lets std
+/// build a dispatcher from an instance it only learns the type of at the
+/// factory's call site.
+trait RpcService {
+	fun dispatcher_for(self): Dispatcher;
+}
+
 // === Reactive protocol ======================================================
 
 // The protocol's frames — `Subscribe(channel)` / `Unsubscribe(channel)` up,
@@ -1887,6 +1899,19 @@ macro fun service(item: Item): Source {
 	let dispatcher = fun_of("dispatcher").parameter("self").returns("Dispatcher").expr(chain);
 	let contract_hash = fun_of("contract_hash").parameter("self").returns("str").expr(quote(hash));
 	let service_impl = impl_of(target.name).method(dispatcher).method(contract_hash).render();
+	// The per-instance spelling, as a trait so `Service::factory` can build a
+	// dispatcher from an instance whose type it learns at the call site (A38).
+	// Every route in the chain captures the `self` it was built from, so a
+	// dispatcher built here answers for THAT connection's instance and no
+	// other — including its `[expose]`d fields, which are that instance's own
+	// cells and channels.
+	let service_trait_impl = impl_of(target.name)
+		.implements("RpcService")
+		.method(fun_of("dispatcher_for")
+			.parameter("self")
+			.returns("Dispatcher")
+			.expr("self.dispatcher()"))
+		.render();
 
 	// --- The client sibling: a transport + a mirror per exposed field.
 	mut client_struct = struct_of(target.client_name)
@@ -1978,6 +2003,6 @@ macro fun service(item: Item): Source {
 		.method(connect)
 		.render();
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, call, arg, reply, decode_failed, session_of, dial_for_service, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
-	source(imports + service_impl + client_struct.render() + client_impl.render() + connect_impl)
+	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
+	source(imports + service_impl + service_trait_impl + client_struct.render() + client_impl.render() + connect_impl)
 }

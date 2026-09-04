@@ -9,7 +9,7 @@
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::crypto::sha256;
-import pkg::json::{ JsonValue, coerce_str };
+import pkg::json::{ JsonKind, JsonValue, coerce_str };
 import pkg::option::Option::{ None, Some, self };
 import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
@@ -85,8 +85,25 @@ impl NodeSocket {
 	[extern(method, "on", retains)]
 	external fun on_signal(self, event: str, handler: || void);
 
+	/// The peer's address as node reports it (`net.Socket.remoteAddress`) —
+	/// `undefined` on a socket that is already destroyed, which reads back as
+	/// the empty string. Behind a proxy this is the PROXY's address; an app
+	/// that trusts a forwarding header must read it off the request instead.
+	[extern(get, "remoteAddress")]
+	external fun remote_address_raw(self): JsonValue;
+
 	[extern(method, "destroy")]
 	external fun destroy(self);
+
+	/// `remote_address_raw` as text, with the absent case flattened to `""`.
+	fun remote_address(self): str {
+		let raw = self.remote_address_raw();
+		if raw.kind() == JsonKind::String {
+			coerce_str(raw)
+		} else {
+			""
+		}
+	}
 }
 
 /// Reads a request's full body (a stream) to text. `node:stream/consumers` `text`

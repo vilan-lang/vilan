@@ -17,8 +17,10 @@ import pkg::json::{ FromJson, JsonValue, has_json_field };
 import pkg::option::Option::{ None, Some, self };
 import pkg::reactive::{ FlushPolicy, batch, turn };
 import pkg::rpc::{
+	Dispatcher,
 	DuplexEnd,
 	RpcProtocol,
+	RpcService,
 	drop_session,
 	duplex_pair,
 	register_session,
@@ -26,7 +28,7 @@ import pkg::rpc::{
 	tag_rpc_bytes,
 };
 import pkg::shared::Shared;
-import pkg::wire::Frame;
+import pkg::wire::{ Codec, Frame };
 import pkg::ws::{ WsEvent, WsParser, binary_frame, close_frame, pong_frame, text_frame };
 
 // --- WebSocket handshake (node:crypto) ------------------------------------------
@@ -59,6 +61,54 @@ fun ws_accept_key(key: str): str {
 
 // --- Service: an rpc mount installed on a `ServerBuilder` (fullstack-dx.md §4) -
 
+/// What the app proved about a connection before the socket went up — the
+/// identity half of `transport-rpc.md` Q4, carried into the factory as
+/// `Connection.session`. A service with no `authorize` hook sees
+/// `Session::anonymous()`; the app decides what more a connection's identity
+/// means by looking `identity` up in the instance the factory builds.
+struct Session {
+	/// The app's name for whoever is on the other end — a user id, a subject
+	/// claim. Empty when nothing authorized this connection.
+	identity: str,
+	/// The credential the identity was proved with, kept for apps that must
+	/// re-present it downstream. Empty when there was none.
+	credential: str,
+}
+
+impl Session {
+	/// A connection nothing authorized: no identity, no credential.
+	fun anonymous(): Session {
+		Session { identity = "", credential = "" }
+	}
+
+	/// The ordinary `authorize` result: this connection is `identity`.
+	fun of(identity: str): Session {
+		Session { identity = identity, credential = "" }
+	}
+
+	/// `of`, keeping the credential the identity was proved with.
+	fun with_credential(own self, credential: str): Session {
+		self.credential = credential;
+		self
+	}
+
+	/// Whether anything authorized this connection.
+	fun is_anonymous(self): bool {
+		self.identity == ""
+	}
+}
+
+/// One connected client, as the factory sees it: the connection id the rest of
+/// the layer keys by (the same id `on_connect`/`on_disconnect` carry and the
+/// generated `__attach` is called with), the session `authorize` proved, and
+/// the peer's address (`""` when the host does not report one — and the
+/// PROXY's address behind a proxy).
+struct Connection {
+	id: i32,
+	session: Session,
+	remote_addr: str,
+}
+
 /// One rpc service mounted on a `Server`: the protocol, where its routes
 /// live, and what happens to a connection's per-connection state. The routes
 /// (`{mount}events`, `{mount}send`, `{mount}rpc`) and the upgrade handshake
@@ -71,7 +121,16 @@ fun ws_accept_key(key: str): str {
 /// own per-connection state (dispose a `ReactiveServer` session, say) —
 /// otherwise a long-running server leaks a session per ever-connected client.
 struct Service {
-	protocol: RpcProtocol,
+	/// The protocol THIS connection is answered by. `Service::new` hands every
+	/// connection the same one; `Service::factory` builds a fresh service
+	/// instance per connection and returns its dispatcher's protocol (Q9).
+	build_protocol: |Connection| RpcProtocol,
+	/// The one protocol, for a service that HAS one without a connection —
+	/// `Service::new` only. It is what the connectionless `{mount}rpc` POST
+	/// leg answers from; `None` under `factory`, which has no instance to
+	/// answer with until a connection exists.
+	shared: Option<RpcProtocol>,
+	codec: Codec,
 	mount: str,
 	on_connect: |i32, DuplexEnd| void,
 	on_disconnect: |i32| void,
@@ -83,11 +142,53 @@ impl Service {
 	/// reactive session the generated `__attach` route can answer from,
 	/// disposed on disconnect. Mounted at `/` until `.at(prefix)` says
 	/// otherwise.
+	///
+	/// The STATELESS shorthand: one process-wide instance behind one protocol,
+	/// shared by every client. `Service::factory(|_connection| shared, codec)`
+	/// is the same service written the long way — reach for `factory` the
+	/// moment a method needs to know who called.
 	fun new(protocol: RpcProtocol): Service {
 		Service {
-			protocol = protocol,
+			build_protocol = |_connection| protocol,
+			shared = Some(protocol),
+			codec = protocol.codec,
 			mount = "/",
 			on_connect = |connection, wire| register_session(connection, wire, protocol.codec),
+			on_disconnect = |connection| drop_session(connection),
+		}
+	}
+
+	/// One service INSTANCE per connected client (`transport-rpc.md` Q9: the
+	/// struct instance IS the connection's session). `build` is called once
+	/// per connection, with that connection's `Connection` — its id, what
+	/// `authorize` proved about it, and where it came from — and the instance
+	/// it returns owns every route for that connection and nothing else:
+	///
+	/// ```text
+	/// Service::factory(|connection| Store::open(connection.session.identity, db), json_codec())
+	/// ```
+	///
+	/// Two consequences worth stating. A method can finally learn who called,
+	/// because the answer is a field of the `self` its route closed over
+	/// rather than a parameter the caller supplies. And `[expose]`d fields
+	/// become per-client for free: each instance has its own cells, so each
+	/// connection's `__attach` mints channels over that client's own sources.
+	///
+	/// The instance is dropped with the connection: `on_disconnect` releases
+	/// the reactive session, and the dispatcher (with the instance every route
+	/// captured) goes with the socket that held it.
+	///
+	/// The connectionless `{mount}rpc` POST leg has no connection to build
+	/// for, so a factory service refuses it (501) — a factory service is
+	/// reached over the WebSocket transport, which every generated
+	/// `Client::connect` uses.
+	fun factory<S: RpcService>(build: |Connection| S, codec: Codec): Service {
+		Service {
+			build_protocol = |connection| build(connection).dispatcher_for().into_protocol(codec),
+			shared = None,
+			codec = codec,
+			mount = "/",
+			on_connect = |connection, wire| register_session(connection, wire, codec),
 			on_disconnect = |connection| drop_session(connection),
 		}
 	}
@@ -219,11 +320,21 @@ fun send_response(request: Request): Response {
 /// One connected service's rpc route: the body as bytes, no sniffing — the
 /// JSON codec's reader accepts a binary frame as UTF-8 (both sides run one
 /// codec, Q6).
-fun rpc_frame_response(protocol: RpcProtocol, request: Request): Response {
-	let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Binary(request.bytes())));
-	match reply {
-		Frame::Text(let frame) => Response::builder().set_header("Content-Type", "application/json").body(frame).build(),
-		Frame::Binary(let frame) => Response::builder().set_header("Content-Type", "application/octet-stream").body_bytes(frame).build(),
+///
+/// A POST carries no connection, so a service that builds one instance per
+/// connection (`Service::factory`) has nothing to answer it with — no
+/// instance, no session, no identity. That is refused in as many words rather
+/// than silently answered by some other client's instance.
+fun rpc_frame_response(service: Service, request: Request): Response {
+	match service.shared {
+		Some(let protocol) => {
+			let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Binary(request.bytes())));
+			match reply {
+				Frame::Text(let frame) => Response::builder().set_header("Content-Type", "application/json").body(frame).build(),
+				Frame::Binary(let frame) => Response::builder().set_header("Content-Type", "application/octet-stream").body_bytes(frame).build(),
+			}
+		},
+		None => Response::builder().code(501).body("this service builds one instance per connection (Service::factory), and a POST rpc frame carries no connection to build for — connect over the WebSocket transport instead").build(),
 	}
 }
 
@@ -236,7 +347,7 @@ fun service_response(service: Service, request: Request): Option<Response> {
 	} else if path_matches_route(path, service.mount + "send") {
 		Some(send_response(request))
 	} else if path_matches_route(path, service.mount + "rpc") {
-		Some(rpc_frame_response(service.protocol, request))
+		Some(rpc_frame_response(service, request))
 	} else {
 		None
 	}
@@ -301,7 +412,7 @@ fun fold_service_upgrades(
 		let sorted = services_by_mount(services);
 		Some(|request, socket, head| {
 			match service_for_upgrade(sorted, request) {
-				Some(let service) => accept_socket(request, socket, head, service.protocol, service.on_connect, service.on_disconnect),
+				Some(let service) => accept_socket(request, socket, head, service),
 				None => match fallback {
 					Some(let handler) => handler(request, socket, head),
 					None => socket.destroy(),
@@ -317,14 +428,7 @@ fun fold_service_upgrades(
 /// with the same id, `d:<frame>` is a duplex/reactive wire turn. Pings are
 /// answered; close (or a protocol violation) tears the session down like an
 /// SSE close.
-fun accept_socket(
-	request: NodeRequest,
-	socket: NodeSocket,
-	head: Bytes,
-	protocol: RpcProtocol,
-	on_connect: |i32, DuplexEnd| void,
-	on_disconnect: |i32| void,
-) {
+fun accept_socket(request: NodeRequest, socket: NodeSocket, head: Bytes, service: Service) {
 	let headers = request.headers();
 	if !has_json_field(headers, "sec-websocket-key") {
 		socket.destroy();
@@ -335,6 +439,16 @@ fun accept_socket(
 	let key: str = str::from_json_value(headers.field("sec-websocket-key")).unwrap_or("");
 	socket.write_text("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws_accept_key(key) + "\r\n\r\n");
 	let id = fresh_connection();
+	// The connection's OWN protocol: under `Service::factory` this builds the
+	// instance that answers for this client and nothing else (A38), and every
+	// `respond` below routes through it.
+	let protocol = (service.build_protocol)(Connection {
+		id = id,
+		session = Session::anonymous(),
+		remote_addr = socket.remote_address(),
+	});
+	let on_connect = service.on_connect;
+	let on_disconnect = service.on_disconnect;
 	let (app_end, wire_end) = duplex_pair();
 	wire_end.on_frame(|frame| {
 		match frame {

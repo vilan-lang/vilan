@@ -104,6 +104,7 @@ guide/services.md h2 connection-state-and-reconnection
 guide/services.md h2 authentication
 guide/services.md h2 where-the-service-lives
 guide/services.md h2 the-server-side
+guide/services.md h3 one-instance-per-connected-client
 guide/services.md h2 growing-past-one-service
 guide/services.md h2 traps
 guide/ssr.md h1 server-side-rendering

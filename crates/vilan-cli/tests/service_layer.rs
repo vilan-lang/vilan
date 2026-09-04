@@ -698,3 +698,216 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A38: one service instance per connection (`Service::factory`) -------------
+
+/// The factory server used by the two pins below: `Notes` is built once per
+/// connection, so its counter and its `[expose]`d mirror belong to that client
+/// alone, and `whoami` can answer from the `Connection` the factory closed over
+/// — the identity a method could not learn when one instance served the whole
+/// process (`transport-rpc.md` Q9).
+const FACTORY_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(NotesClient)]
+struct Notes {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+"#;
+
+#[test]
+fn a_factory_service_builds_one_instance_per_connection() {
+    // A38: `Service::factory(build, codec)` calls `build` once per connection
+    // and every route of that connection's dispatcher captures ITS instance.
+    // Two clients therefore count separately, see their own `[expose]`d
+    // mirror, and read back their own identity — none of which is expressible
+    // when `Service::new`'s single protocol answers every connection.
+    let dir = temp_project("factory");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            "{FACTORY_SERVER}{}",
+            r#"
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = i"conn-{connection.id}",
+			count = Signal::new(0),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let a) => {
+			match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+				Ok(let b) => {
+					let watch_a = a.count.sub(|value| print(i"a-mirror:{value}"));
+					let watch_b = b.count.sub(|value| print(i"b-mirror:{value}"));
+					print(i"a-add:{a.add(2).unwrap_or(0 - 1)}");
+					print(i"a-add:{a.add(2).unwrap_or(0 - 1)}");
+					print(i"b-add:{b.add(5).unwrap_or(0 - 1)}");
+					let a_who = a.whoami().unwrap_or("?");
+					let b_who = b.whoami().unwrap_or("?");
+					print(i"a-who:{a_who}");
+					print(i"b-who:{b_who}");
+					print(i"hash:{a.contract_hash()}");
+					watch_a.dispose();
+					watch_b.dispose();
+				},
+				Err(let error) => print(i"b-err:{error.debug()}"),
+			}
+		},
+		Err(let error) => print(i"a-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#
+        ),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // Each connection counts in its own cell: A reaches 4 while B, adding
+        // 5 to a counter that has never been touched, reaches exactly 5.
+        "a-add:2",
+        "a-add:4",
+        "b-add:5",
+        // Each connection's `[expose]`d mirror is its own instance's cell.
+        "a-mirror:4",
+        "b-mirror:5",
+        // The identity a route closed over — impossible with one instance.
+        "a-who:conn-0",
+        "b-who:conn-1",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a factory service must build one instance per connection; `{expected}` is \
+             missing:\n{stdout}"
+        );
+    }
+    for forbidden in [
+        "a-mirror:5",
+        "a-mirror:7",
+        "b-mirror:2",
+        "b-mirror:4",
+        "b-add:9",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "`{forbidden}` means the two connections shared one instance's state:\n{stdout}"
+        );
+    }
+    // Contract hash unaffected by the per-connection shape: it hashes methods
+    // and exposures (`add(i32)->i32;whoami()->str;expose:count:i32;`), neither
+    // of which the factory touches. Recorded here so a future change to the
+    // generated surface has to say so out loud.
+    assert!(
+        stdout.contains("hash:d1d5fba0"),
+        "the contract hash moved — the factory shape must not change the hashed \
+         surface:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_factory_services_connectionless_rpc_post_is_refused_in_as_many_words() {
+    // A38's one refusal: the `{mount}rpc` POST leg carries no connection, so a
+    // service that builds one instance per connection has nothing to answer it
+    // with — no instance, no session, no identity. Answering it from some other
+    // client's instance would be worse than refusing, so it refuses (501) and
+    // says why. `Service::new`'s shared protocol still answers the same leg,
+    // which the sibling assertion holds down.
+    let dir = temp_project("factory_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            "{FACTORY_SERVER}{}",
+            r#"
+fun main() {
+	let shared = Notes { who = "shared", count = Signal::new(0) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = i"conn-{connection.id}",
+			count = Signal::new(0),
+		}, json_codec()))
+		.with_service(Service::new(shared.dispatcher().into_protocol(json_codec())).at("/shared/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#
+        ),
+    );
+
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    let refused = raw_http_closed(
+        port,
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 501 "),
+        "a factory service's POST rpc leg must be refused, not answered: {refused}"
+    );
+    assert!(
+        refused.contains("Service::factory") && refused.contains("WebSocket"),
+        "the refusal must name the cause and the way out: {refused}"
+    );
+
+    let answered = raw_http_closed(
+        port,
+        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: \
+         close\r\n\r\n{}",
+    );
+    assert!(
+        answered.starts_with("HTTP/1.1 200 OK\r\n") && answered.contains("application/json"),
+        "a stateless `Service::new` still answers its POST rpc leg: {answered}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}

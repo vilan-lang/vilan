@@ -428,6 +428,47 @@ and checked against the build, is in
 per-connection state, `Service::on_connect`/`on_disconnect` replace the
 default session lifecycle (see the [rpc reference](../std/rpc.md)).
 
+### One instance per connected client
+
+`Service::new` mounts **one instance for the whole process**: every client
+is answered by the same `self`, so a method cannot tell who called and an
+`[expose]`d field is one cell shared by everybody. When a method needs to
+know its caller — which is most apps the moment they have users — mount the
+service with a **factory** instead, and the struct instance becomes the
+connection's session:
+
+```vilan,fragment
+Server::builder()
+	.port(port)
+	.with_service(Service::factory(|connection: Connection| Store {
+		user = user_of(connection.session.identity),
+		notes = Signal::new([]),
+	}, json_codec()))
+	.build()
+	.start();
+```
+
+`build` runs once per connection, with that connection's `Connection`
+(`id`, the `session` an [`authorize`](#authentication) hook proved, and
+`remote_addr`), and every route of that connection's dispatcher closes over
+the instance it returned. Three things follow:
+
+- A method reads its caller off `self` — no token parameter, no per-call
+  re-resolution.
+- `[expose]`d fields are **per client**: each instance has its own cells,
+  so each connection's mirrors carry that client's own data.
+- The instance dies with the connection, alongside the reactive session
+  `on_disconnect` already releases.
+
+`Service::new(protocol)` is the stateless shorthand for
+`Service::factory(|_connection| shared, codec)`, and stays exactly as
+useful for a service with nothing per-client to hold.
+
+One limitation, stated plainly: the connectionless `POST {mount}rpc` leg has
+no connection to build an instance for, so a factory service **refuses it**
+(`501`, with the reason in the body). A factory service is reached over the
+WebSocket transport — which is what every generated `Client::connect` uses.
+
 ## Growing past one service
 
 That chain is the whole layer — `Service::new(protocol)`, installed with
@@ -476,8 +517,9 @@ routes are untouched. Two constants either way: services always answer
 before `on_request` (so an app route can't accidentally shadow a
 service route), and the connection lifecycle is the service's own knob —
 `Service::on_connect`/`on_disconnect` swap the default session registry
-for the app's per-connection state (an auth identity, an app-written
-attach) without changing anything else about the chain.
+for the app's per-connection state (an app-written attach), and
+`Service::factory` is the same knob for CONSTRUCTION — without changing
+anything else about the chain.
 
 ## Traps
 
