@@ -9,7 +9,7 @@
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::crypto::sha256;
-import pkg::json::{ JsonValue, coerce_str };
+import pkg::json::{ JsonKind, JsonValue, coerce_str };
 import pkg::option::Option::{ None, Some, self };
 import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
@@ -81,12 +81,36 @@ impl NodeSocket {
 	[extern(method, "on", retains)]
 	external fun on_bytes(self, event: str, handler: |Bytes| void);
 
-	/// Lifecycle events with no payload (`"close"`, `"error"`).
+	/// Lifecycle events with no payload (`"close"`, `"error"`, `"timeout"`).
 	[extern(method, "on", retains)]
 	external fun on_signal(self, event: str, handler: || void);
 
+	/// Emit `"timeout"` after `millis` of inactivity; `0` clears it. Node's
+	/// own `socket.setTimeout` — it does NOT close the socket, it only tells
+	/// you, which is what lets `std::rpc_server` arm a greeting bound and
+	/// disarm it on the first byte.
+	[extern(method, "setTimeout")]
+	external fun set_timeout(self, millis: i32);
+
+	/// The peer's address as node reports it (`net.Socket.remoteAddress`) —
+	/// `undefined` on a socket that is already destroyed, which reads back as
+	/// the empty string. Behind a proxy this is the PROXY's address; an app
+	/// that trusts a forwarding header must read it off the request instead.
+	[extern(get, "remoteAddress")]
+	external fun remote_address_raw(self): JsonValue;
+
 	[extern(method, "destroy")]
 	external fun destroy(self);
+
+	/// `remote_address_raw` as text, with the absent case flattened to `""`.
+	fun remote_address(self): str {
+		let raw = self.remote_address_raw();
+		if raw.kind() == JsonKind::String {
+			coerce_str(raw)
+		} else {
+			""
+		}
+	}
 }
 
 /// Reads a request's full body (a stream) to text. `node:stream/consumers` `text`
@@ -460,6 +484,13 @@ struct Server {
 	on_stop: |Server| void,
 	/// A WebSocket-style protocol upgrade handler, when the app mounted one
 	/// (`ServerBuilder::on_upgrade`): `(request, raw socket, head bytes)`.
+	///
+	/// The handler MAY suspend, since A40: an rpc service's pre-upgrade
+	/// `authorize` hook has to be able to await (verifying a JWT is a
+	/// WebCrypto call, and WebCrypto is async everywhere). Node neither
+	/// answers the upgrade itself nor waits on this handler — the socket stays
+	/// open until something writes to it — so a handler that settles later
+	/// still owns the socket when it does.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
 	/// The live listener, once bound — what `stop()` closes. `start()`
 	/// populates it on the copy of `Server` it hands to `on_start`, so

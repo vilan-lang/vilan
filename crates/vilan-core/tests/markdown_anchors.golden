@@ -102,8 +102,11 @@ guide/services.md h2 mirrors
 guide/services.md h3 reading-a-mirror
 guide/services.md h2 connection-state-and-reconnection
 guide/services.md h2 authentication
+guide/services.md h3 authorizing-the-connection
+guide/services.md h3 cheap-limits-with-or-without-a-gate
 guide/services.md h2 where-the-service-lives
 guide/services.md h2 the-server-side
+guide/services.md h3 one-instance-per-connected-client
 guide/services.md h2 growing-past-one-service
 guide/services.md h2 traps
 guide/ssr.md h1 server-side-rendering

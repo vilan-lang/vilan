@@ -698,3 +698,642 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A38: one service instance per connection (`Service::factory`) -------------
+
+/// The factory server used by the two pins below: `Notes` is built once per
+/// connection, so its counter and its `[expose]`d mirror belong to that client
+/// alone, and `whoami` can answer from the `Connection` the factory closed over
+/// — the identity a method could not learn when one instance served the whole
+/// process (`transport-rpc.md` Q9).
+const FACTORY_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(NotesClient)]
+struct Notes {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+"#;
+
+#[test]
+fn a_factory_service_builds_one_instance_per_connection() {
+    // A38: `Service::factory(build, codec)` calls `build` once per connection
+    // and every route of that connection's dispatcher captures ITS instance.
+    // Two clients therefore count separately, see their own `[expose]`d
+    // mirror, and read back their own identity — none of which is expressible
+    // when `Service::new`'s single protocol answers every connection.
+    let dir = temp_project("factory");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            "{FACTORY_SERVER}{}",
+            r#"
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = i"conn-{connection.id}",
+			count = Signal::new(0),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let a) => {
+			match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+				Ok(let b) => {
+					let watch_a = a.count.sub(|value| print(i"a-mirror:{value}"));
+					let watch_b = b.count.sub(|value| print(i"b-mirror:{value}"));
+					print(i"a-add:{a.add(2).unwrap_or(0 - 1)}");
+					print(i"a-add:{a.add(2).unwrap_or(0 - 1)}");
+					print(i"b-add:{b.add(5).unwrap_or(0 - 1)}");
+					let a_who = a.whoami().unwrap_or("?");
+					let b_who = b.whoami().unwrap_or("?");
+					print(i"a-who:{a_who}");
+					print(i"b-who:{b_who}");
+					print(i"hash:{a.contract_hash()}");
+					watch_a.dispose();
+					watch_b.dispose();
+				},
+				Err(let error) => print(i"b-err:{error.debug()}"),
+			}
+		},
+		Err(let error) => print(i"a-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#
+        ),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // Each connection counts in its own cell: A reaches 4 while B, adding
+        // 5 to a counter that has never been touched, reaches exactly 5.
+        "a-add:2",
+        "a-add:4",
+        "b-add:5",
+        // Each connection's `[expose]`d mirror is its own instance's cell.
+        "a-mirror:4",
+        "b-mirror:5",
+        // The identity a route closed over — impossible with one instance.
+        "a-who:conn-0",
+        "b-who:conn-1",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a factory service must build one instance per connection; `{expected}` is \
+             missing:\n{stdout}"
+        );
+    }
+    for forbidden in [
+        "a-mirror:5",
+        "a-mirror:7",
+        "b-mirror:2",
+        "b-mirror:4",
+        "b-add:9",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "`{forbidden}` means the two connections shared one instance's state:\n{stdout}"
+        );
+    }
+    // Contract hash unaffected by the per-connection shape: it hashes methods
+    // and exposures (`add(i32)->i32;whoami()->str;expose:count:i32;`), neither
+    // of which the factory touches. Recorded here so a future change to the
+    // generated surface has to say so out loud.
+    assert!(
+        stdout.contains("hash:d1d5fba0"),
+        "the contract hash moved — the factory shape must not change the hashed \
+         surface:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_factory_services_connectionless_rpc_post_is_refused_in_as_many_words() {
+    // A38's one refusal: the `{mount}rpc` POST leg carries no connection, so a
+    // service that builds one instance per connection has nothing to answer it
+    // with — no instance, no session, no identity. Answering it from some other
+    // client's instance would be worse than refusing, so it refuses (501) and
+    // says why. `Service::new`'s shared protocol still answers the same leg,
+    // which the sibling assertion holds down.
+    let dir = temp_project("factory_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            "{FACTORY_SERVER}{}",
+            r#"
+fun main() {
+	let shared = Notes { who = "shared", count = Signal::new(0) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = i"conn-{connection.id}",
+			count = Signal::new(0),
+		}, json_codec()))
+		.with_service(Service::new(shared.dispatcher().into_protocol(json_codec())).at("/shared/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#
+        ),
+    );
+
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    let refused = raw_http_closed(
+        port,
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 501 "),
+        "a factory service's POST rpc leg must be refused, not answered: {refused}"
+    );
+    assert!(
+        refused.contains("Service::factory") && refused.contains("WebSocket"),
+        "the refusal must name the cause and the way out: {refused}"
+    );
+
+    let answered = raw_http_closed(
+        port,
+        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: \
+         close\r\n\r\n{}",
+    );
+    assert!(
+        answered.starts_with("HTTP/1.1 200 OK\r\n") && answered.contains("application/json"),
+        "a stateless `Service::new` still answers its POST rpc leg: {answered}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A40: the pre-upgrade gate, and the subprotocol echo ----------------------
+
+/// One raw WebSocket upgrade request, with `extra` folded in before the blank
+/// line — the 101 (or the refusal) exactly as it arrived. Bounded rather than
+/// read-to-close: an accepted upgrade holds the socket open forever.
+fn raw_upgrade(port: u16, path: &str, extra: &str) -> String {
+    raw_http_bounded(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n{extra}\r\n"
+        ),
+        Duration::from_millis(1500),
+    )
+}
+
+/// A service that gates its upgrades: `"good"` is `ada`, any other token is
+/// forbidden, no token at all is unauthorized. The mechanism is the app's —
+/// std verifies nothing — so the pin uses the cheapest possible check.
+const AUTHORIZED_SERVER: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+
+[service(NotesClient)]
+struct Notes {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = connection.session.identity,
+			count = Signal::new(0),
+		}, json_codec())
+			.authorize(|handshake: Handshake| match handshake.token() {
+				Some(let token) => if token == "good" {
+					Result::Ok(Session::of("ada").with_credential(token))
+				} else {
+					Result::Err(Reject::Forbidden)
+				},
+				None => Result::Err(Reject::Unauthorized),
+			}))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// Boot `source` as a long-running server and return `(server, port)`.
+fn spawn_service_server(tag: &str, source: &str) -> (StreamingServer, u16) {
+    let dir = temp_project(tag);
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", source);
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+    (server, port)
+}
+
+#[test]
+fn the_handshake_echoes_the_subprotocol_it_selected() {
+    // RFC 6455 §4.2.2: a client that offered subprotocols must hear the
+    // server's selection back in the 101. This server never read the header
+    // and never echoed one, so a BROWSER — which enforces the rule — closed
+    // every connection a page opened with a subprotocol, silently. The echo is
+    // independent of `authorize` and pinned here on an ungated service, offer
+    // by offer; an offer of nothing must still produce the byte-identical
+    // handshake it always did.
+    let (server, port) = spawn_service_server("echo", BYTE_IDENTICAL_SERVER);
+
+    let selected = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.abc\r\n",
+    );
+    assert!(
+        selected.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "the offer must still be upgraded: {selected}"
+    );
+    assert!(
+        selected.contains("Sec-WebSocket-Protocol: vilan-rpc\r\n"),
+        "the server must echo the subprotocol it selected, or a browser closes the \
+         connection: {selected}"
+    );
+    assert!(
+        !selected.contains("token.abc"),
+        "the credential rides the offer; the server selects the PROTOCOL, never echoes the \
+         token back: {selected}"
+    );
+
+    // Not among the offers it knows: the client's first choice is selected, so
+    // the connection is not closed for want of an echo.
+    let unknown = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: chat, superchat\r\n");
+    assert!(
+        unknown.contains("Sec-WebSocket-Protocol: chat\r\n"),
+        "an offer with no vilan-rpc in it still needs an echo from the list: {unknown}"
+    );
+
+    // A credential is not a protocol: an offer of nothing else selects
+    // nothing, rather than naming `token.…` as the protocol in play and
+    // writing the credential back out in the reply.
+    let credential_only = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: token.secret\r\n");
+    assert!(
+        credential_only.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "an ungated service still upgrades it: {credential_only}"
+    );
+    assert!(
+        !credential_only.contains("Sec-WebSocket-Protocol"),
+        "a `token.` offer must never be selected or echoed: {credential_only}"
+    );
+
+    // No offer, no echo — the handshake byte-for-byte as it was before A40.
+    let silent = raw_upgrade(port, "/", "");
+    assert!(
+        silent.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a bare handshake must still upgrade: {silent}"
+    );
+    assert!(
+        !silent.contains("Sec-WebSocket-Protocol"),
+        "a client that offered nothing must be sent no selection: {silent}"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
+    // A40: `authorize` runs on the upgrade REQUEST. A refusal writes a status
+    // line on the raw socket and destroys it — no 101, no connection id, no
+    // reactive session, no service instance — which is the whole reason the
+    // gate is here and not inside a method. The three answers are distinct
+    // because the app's three answers are.
+    let (server, port) = spawn_service_server("authorize", AUTHORIZED_SERVER);
+
+    let missing = raw_upgrade(port, "/", "");
+    assert!(
+        missing.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "a handshake with no credential must be refused 401: {missing}"
+    );
+    let forbidden = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.bad\r\n",
+    );
+    assert!(
+        forbidden.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "a credential the app rejects must be refused 403: {forbidden}"
+    );
+    for refusal in [&missing, &forbidden] {
+        assert!(
+            !refusal.contains("101 Switching Protocols"),
+            "a refused handshake must never be upgraded: {refusal}"
+        );
+    }
+
+    let admitted = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    assert!(
+        admitted.starts_with("HTTP/1.1 101 Switching Protocols\r\n")
+            && admitted.contains("Sec-WebSocket-Protocol: vilan-rpc\r\n"),
+        "the credential the app accepts must be upgraded, echo included: {admitted}"
+    );
+
+    // The connectionless legs carry no handshake to gate, so an authorized
+    // service refuses them rather than leaving them as the open door around
+    // `authorize`. The rpc leg answers in the protocol's own vocabulary —
+    // where `RpcError::Unauthorized`, constructed nowhere in std until now,
+    // gets its producer.
+    let posted = raw_http_closed(
+        port,
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert!(
+        posted.starts_with("HTTP/1.1 401 Unauthorized\r\n") && posted.contains("Unauthorized"),
+        "an authorized service's POST rpc leg must answer a typed Unauthorized failure: {posted}"
+    );
+    let streamed = raw_http_bounded(
+        port,
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(1500),
+    );
+    assert!(
+        streamed.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "an authorized service's SSE leg must be refused too: {streamed}"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn the_connection_ceiling_refuses_the_handshake_over_it() {
+    // The DoS half of A40, and the part that works with `authorize` absent: a
+    // ceiling on live connections, refused at the handshake with 429 rather
+    // than after a socket, a session and an instance already exist. Two
+    // sockets are held open across the third attempt, which is what makes the
+    // count a count.
+    let source = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).max_connections(2))",
+    );
+    assert!(
+        source.contains("max_connections(2)"),
+        "the ceiling must actually be spliced into the server source"
+    );
+    let (server, port) = spawn_service_server("ceiling", &source);
+
+    let mut held = Vec::new();
+    for attempt in 0..2 {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("connect to the reported port");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .expect("set a read timeout");
+        stream
+            .write_all(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+                 Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+                 13\r\n\r\n"
+                    .as_bytes(),
+            )
+            .expect("send the upgrade");
+        let mut buffer = [0u8; 512];
+        let read = stream.read(&mut buffer).expect("read the handshake reply");
+        let reply = String::from_utf8_lossy(&buffer[..read]).into_owned();
+        assert!(
+            reply.starts_with("HTTP/1.1 101 "),
+            "connection {attempt} is under the ceiling and must be upgraded: {reply}"
+        );
+        held.push(stream);
+    }
+
+    let over = raw_upgrade(port, "/", "");
+    assert!(
+        over.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "the handshake over the ceiling must be refused 429, not upgraded: {over}"
+    );
+
+    // A slot released by a closed connection is a slot again.
+    drop(held.pop());
+    let after = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = raw_upgrade(port, "/", "");
+            if reply.starts_with("HTTP/1.1 101 ") || Instant::now() > deadline {
+                break reply;
+            }
+        }
+    };
+    assert!(
+        after.starts_with("HTTP/1.1 101 "),
+        "closing a connection must return its slot to the ceiling: {after}"
+    );
+
+    drop(held);
+    drop(server);
+}
+
+#[test]
+fn an_authorized_client_connects_with_its_credential_and_is_that_identity() {
+    // The whole A40 loop, end to end and in one process: the client offers
+    // `["vilan-rpc", "token.good"]` through `connect_with`, the server selects
+    // and echoes `vilan-rpc`, `authorize` turns the credential into a
+    // `Session`, and A38's factory builds the instance from it — so `whoami`
+    // answers with an identity that arrived on the HANDSHAKE and was never a
+    // parameter of any call.
+    let dir = temp_project("credential");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(AUTHORIZED_SERVER
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::rpc_protocols;\nimport std::result::Result::{ Ok, Err };",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect_with(i"ws://localhost:{port}/", json_codec(), rpc_protocols("good")) {
+		Ok(let client) => {
+			let who = client.whoami().unwrap_or("?");
+			print(i"who:{who}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("who:ada"),
+        "the credential offered on the handshake must reach the factory as the connection's \
+         identity:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_greeting_bound_destroys_a_silent_socket_and_spares_a_speaking_one() {
+    // The third of A40's cheap limits: a socket that completes the handshake
+    // and then says nothing is destroyed, so a slowloris costs a timer rather
+    // than a connection slot for the life of the process. It is a GREETING
+    // bound, not an idle one — disarmed by the first inbound byte — which is
+    // the half that matters, because a client that connected and is only
+    // watching mirrors sends nothing for hours and must not be touched.
+    let source = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_timeout(500))",
+    );
+    assert!(source.contains("handshake_timeout(500)"));
+    let (server, port) = spawn_service_server("greeting", &source);
+
+    // Silent: the 101 lands, then the server hangs up on its own.
+    let mut quiet = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    quiet
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set a read timeout");
+    quiet
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let mut buffer = [0u8; 512];
+    let first = quiet.read(&mut buffer).expect("read the 101");
+    assert!(
+        String::from_utf8_lossy(&buffer[..first]).starts_with("HTTP/1.1 101 "),
+        "the handshake itself is not what the bound refuses"
+    );
+    // Whatever else arrives (the `__conn:` frame), the stream must reach EOF.
+    let closed = loop {
+        match quiet.read(&mut buffer) {
+            Ok(0) => break true,
+            Ok(_more) => {}
+            Err(_timeout) => break false,
+        }
+    };
+    assert!(
+        closed,
+        "a socket that upgraded and then said nothing must be destroyed by the greeting bound"
+    );
+
+    // Speaking: one masked ping is a greeting. The pong proves it was heard,
+    // and the socket must still be there well past the bound.
+    let mut talker = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    talker
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set a read timeout");
+    talker
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let handshake = talker.read(&mut buffer).expect("read the 101");
+    assert!(String::from_utf8_lossy(&buffer[..handshake]).starts_with("HTTP/1.1 101 "));
+    // FIN + opcode 0x9 (ping), masked, empty payload.
+    talker
+        .write_all(&[0x89, 0x80, 0x01, 0x02, 0x03, 0x04])
+        .expect("send a ping");
+    let mut saw_pong = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match talker.read(&mut buffer) {
+            Ok(0) => panic!("a socket that greeted the server must not be destroyed by the bound"),
+            Ok(read) => {
+                if buffer[..read].windows(2).any(|pair| pair == [0x8a, 0x00]) {
+                    saw_pong = true;
+                    break;
+                }
+            }
+            Err(_timeout) => break,
+        }
+    }
+    assert!(
+        saw_pong,
+        "the ping must be answered, which is what disarms the bound"
+    );
+    assert!(
+        talker
+            .write_all(&[0x89, 0x80, 0x01, 0x02, 0x03, 0x04])
+            .is_ok(),
+        "the socket must still be live past the greeting bound"
+    );
+
+    drop(server);
+}

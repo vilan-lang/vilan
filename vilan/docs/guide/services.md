@@ -360,9 +360,9 @@ at-least-once — see
 
 ## Authentication
 
-The straightforward shape, and the one the walkthrough app uses: a
-`login` rpc returns a token, later rpcs take the token as their first
-parameter, and the server validates it per call.
+The straightforward shape, and the one a first draft usually reaches
+for: a `login` rpc returns a token, later rpcs take the token as their
+first parameter, and the server validates it per call.
 
 ```vilan,fragment
 [rpc]
@@ -372,9 +372,83 @@ fun login(self, username: str, password: str): AuthOutcome { … }
 fun create_task(self, token: str, workspace_id: i32, name: str): i32 { … }
 ```
 
-When token-per-call gets noisy, the recorded refinement is
-connection-scoped identity via `std::context`. It isn't built into the
-generated dispatch yet.
+It works, and it has two costs: every method carries a parameter that is
+not about what the method does, and **the socket itself is open to
+anyone** — a client that never logs in still connects, still holds a
+connection, and still receives whatever the service exposes.
+
+### Authorizing the connection
+
+The refinement is to decide once, at the handshake, before a socket
+exists: `Service::authorize`.
+
+```vilan,fragment
+Service::factory(|connection: Connection| Store {
+	user = connection.session.identity,
+	notes = Signal::new([]),
+}, json_codec())
+	.authorize(|handshake: Handshake| match handshake.token() {
+		Some(let token) => match verify(token) {
+			Some(let subject) => Result::Ok(Session::of(subject)),
+			None => Result::Err(Reject::Forbidden),
+		},
+		None => Result::Err(Reject::Unauthorized),
+	})
+```
+
+`Err` answers the raw socket `401`/`403`/`429` and destroys it: no
+connection id, no reactive session, no service instance — nothing of the
+service is built for a client it refused. `Ok(session)` becomes
+`Connection.session`, which the [factory](#one-instance-per-connected-client)
+reads to build that client's instance. So identity arrives **on the
+handshake**, and the methods lose their token parameter.
+
+The mechanism is yours. Vilan verifies nothing and knows no token
+format — `authorize` may await, so signing checks (`std::jwt`, WebCrypto)
+belong right there.
+
+**How the credential gets there.** A browser cannot put a header on a
+WebSocket handshake. The one field it can fill is the subprotocol list,
+so that is the convention: `["vilan-rpc", "token." + credential]`, which
+`std::rpc::rpc_protocols(credential)` writes for you.
+
+```vilan,fragment
+let client = TodoClient::connect_with(url, json_codec(), rpc_protocols(token))!;
+```
+
+The server selects `vilan-rpc`, echoes it in the 101 (required — a
+browser closes a connection whose subprotocol offer went unanswered), and
+hands the whole offer list to `authorize` as `Handshake.protocols`;
+`handshake.token()` picks the `"token."` one out. A subprotocol is a
+token, not a header value: no commas, no spaces — every JWT already
+qualifies. The same list is re-presented on each reconnect, so an
+authorized connection re-authorizes itself automatically.
+
+`Client::connect(url, codec)` is unchanged and offers nothing, which is
+right for a service with no gate.
+
+An authorized service answers **only** the WebSocket upgrade: the
+connectionless SSE and POST legs carry no handshake to authorize, so they
+answer `401` rather than standing open as the way around the gate — the
+rpc leg with a typed `RpcError::Unauthorized` envelope.
+
+### Cheap limits, with or without a gate
+
+Three knobs on the same seam, all refusing before the upgrade, all
+working with no `authorize` at all:
+
+```vilan,fragment
+Service::new(protocol)
+	.max_connections(500)          // 429 over the ceiling
+	.handshake_rate(20, 10000.0)   // 20 handshakes per address per 10s
+	.handshake_timeout(5000)       // a socket that never greets is destroyed
+```
+
+`handshake_timeout` bounds the **greeting**, not idleness: the first
+inbound byte disarms it, so a client that connected and is only watching
+mirrors is never touched. Behind a proxy every client shares the proxy's
+address, which makes `handshake_rate` a limit for a directly-exposed
+server.
 
 ## Where the service lives
 
@@ -428,6 +502,47 @@ and checked against the build, is in
 per-connection state, `Service::on_connect`/`on_disconnect` replace the
 default session lifecycle (see the [rpc reference](../std/rpc.md)).
 
+### One instance per connected client
+
+`Service::new` mounts **one instance for the whole process**: every client
+is answered by the same `self`, so a method cannot tell who called and an
+`[expose]`d field is one cell shared by everybody. When a method needs to
+know its caller — which is most apps the moment they have users — mount the
+service with a **factory** instead, and the struct instance becomes the
+connection's session:
+
+```vilan,fragment
+Server::builder()
+	.port(port)
+	.with_service(Service::factory(|connection: Connection| Store {
+		user = user_of(connection.session.identity),
+		notes = Signal::new([]),
+	}, json_codec()))
+	.build()
+	.start();
+```
+
+`build` runs once per connection, with that connection's `Connection`
+(`id`, the `session` an [`authorize`](#authentication) hook proved, and
+`remote_addr`), and every route of that connection's dispatcher closes over
+the instance it returned. Three things follow:
+
+- A method reads its caller off `self` — no token parameter, no per-call
+  re-resolution.
+- `[expose]`d fields are **per client**: each instance has its own cells,
+  so each connection's mirrors carry that client's own data.
+- The instance dies with the connection, alongside the reactive session
+  `on_disconnect` already releases.
+
+`Service::new(protocol)` is the stateless shorthand for
+`Service::factory(|_connection| shared, codec)`, and stays exactly as
+useful for a service with nothing per-client to hold.
+
+One limitation, stated plainly: the connectionless `POST {mount}rpc` leg has
+no connection to build an instance for, so a factory service **refuses it**
+(`501`, with the reason in the body). A factory service is reached over the
+WebSocket transport — which is what every generated `Client::connect` uses.
+
 ## Growing past one service
 
 That chain is the whole layer — `Service::new(protocol)`, installed with
@@ -476,8 +591,9 @@ routes are untouched. Two constants either way: services always answer
 before `on_request` (so an app route can't accidentally shadow a
 service route), and the connection lifecycle is the service's own knob —
 `Service::on_connect`/`on_disconnect` swap the default session registry
-for the app's per-connection state (an auth identity, an app-written
-attach) without changing anything else about the chain.
+for the app's per-connection state (an app-written attach), and
+`Service::factory` is the same knob for CONSTRUCTION — without changing
+anything else about the chain.
 
 ## Traps
 
@@ -491,3 +607,14 @@ attach) without changing anything else about the chain.
 - An rpc handler's reply is its return value, so the handler runs to
   completion before the client hears back. Long work belongs in spawned
   tasks that write signals when done.
+- Minting channels at runtime (an rpc that calls `session_of` +
+  `ReactiveServer::expose`, rather than `[expose]`) is hand-wiring, and it
+  owns two things `[expose]` gets for free. Withdraw a channel you are
+  done with — `ReactiveServer::revoke(channel)`; an `Unsubscribe` only
+  stops the forward, because the client re-subscribes on the same id when
+  a view remounts. And register
+  `invalidate_on_reconnect(socket, client)` beside your
+  `ReactiveClient`, because a reconnect mints a fresh session that has
+  never heard of a channel your method minted: the mirror is invalidated
+  (`status` back to `Waiting`) and your app re-runs the rpc that minted
+  it.
