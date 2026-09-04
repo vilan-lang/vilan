@@ -931,9 +931,11 @@ language has one answer to "does this leave?" and this is it.
 
 **Everything above is about a CONDITION** — an `if`'s, a `while`-shaped
 `for`'s, a `match` guard's — because a condition is the only thing that
-selects on a test's answer. An `is` written anywhere else is an ordinary
-expression yielding an ordinary `bool`, and **its captures reach the rest
-of that expression and nothing after it**: `let ok = x is Some(let n);`
+selects on a test's answer, and all three read the same way: a plain
+capture reaches the body the test selects, a negated one does not. An
+`is` written anywhere else is an ordinary expression yielding an ordinary
+`bool`, and **its captures reach the rest of that expression and nothing
+after it**: `let ok = x is Some(let n);`
 binds `n` for nowhere, and a later read of it is refused. There is no
 narrowing that could make one work — the language has no flow typing, so
 "`n` where `ok` is true" is not a thing it can say — and admitting the
@@ -965,6 +967,12 @@ if !(slot is Some(let n)) { ret; } else { … } use(n);  // error: it has an `el
 let ok = slot is Some(let n); use(n);             // error: not a condition
 let ok = slot is Some(let n) && n > 0;            // yes: `&&`, wherever written
 f(slot is Some(let n)); use(n);                   // error: not a condition
+
+for slot is Some(let n) { use(n); }               // yes: the test passed
+for !(slot is Some(let n)) { use(n); }            // error: the test failed
+match x { _ if slot is Some(let n) => use(n) }    // yes: the guard held
+match x { _ if !(slot is Some(let n)) => use(n) } // error: the test failed
+if f(|| slot is Some(let n)) { use(n); }          // error: a closure body is not the condition
 ```
 
 A pattern is checked against the type of the value it matches, so an

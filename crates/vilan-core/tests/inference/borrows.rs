@@ -8040,6 +8040,10 @@ fn b199_a_negated_call_argument_capture_reaches_neither_branch() {
 fn b199_a_capture_inside_a_closure_argument_stays_in_the_closure() {
     // The closure body is its own scope, so the capture never escaped it even
     // before B199 — the control that says the fix did not have to reach here.
+    // B223 kept the answer and changed the VOICE: a closure body is not part of
+    // the condition it is written in, so the test in it is in expression
+    // position and the read is refused in B215's terms rather than as a name
+    // typo. One rule, one voice, wherever the test is written.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -8050,7 +8054,7 @@ fn b199_a_capture_inside_a_closure_argument_stays_in_the_closure() {
             if apply(|| maybe is Some(let n)) { print(n); }
         }
         "#,
-        "cannot find 'n' in this scope",
+        B215_STEER,
     );
 }
 
@@ -8344,5 +8348,122 @@ fn b215_an_or_initializer_is_refused_in_the_rules_own_terms() {
         }
         "#,
         B215_STEER,
+    );
+}
+
+// --- B223: a `for` condition and a `match` guard are conditions too ----------
+//
+// Every capture rule vilan has is about a CONDITION, and there are three of
+// them: an `if`'s, a `while`-shaped `for`'s, and a `match` guard's. Only the
+// `if` installed a polarity frame. B215 gave the other two a marker that said
+// "this IS a condition" without saying anything about polarity, which kept
+// their behavior exactly as it was — and their behavior was B171's plain
+// answer, the one B195 had already refused for the `if`: a capture under a
+// NEGATION, bound on the path where the pattern did NOT match, readable in the
+// body that runs when it did not.
+//
+// The frame is now the same frame, rooted at the condition's end. The captures
+// this refuses are the ones an `if` has refused since B195, and a census of
+// std, the corpus, the examples, the docs, kolt and the website found no
+// program written in the refused shape.
+
+#[test]
+fn b223_a_negated_for_condition_binds_nothing_in_the_body() {
+    // The exhibit. The loop body runs where the pattern did NOT match, so the
+    // payload is not there — before the frame this compiled and read it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = None;
+            for !(slot is Some(let n)) {
+                print(n);
+                slot = Some(1);
+            }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b223_a_negated_match_guard_binds_nothing_in_the_leg() {
+    // The guard's twin: the leg runs where the guard held, and the guard held
+    // where the pattern missed.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let scale = 5;
+            match scale {
+                let s if !(maybe is Some(let n)) => print(n + s),
+                _ => print(0),
+            }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b223_an_unnegated_for_condition_still_binds_its_body() {
+    // The control on the other side: reaching the body IS the test having
+    // passed, so the plain shape keeps binding exactly as it did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = Some(4);
+            for slot is Some(let n) {
+                print(n);
+                slot = None;
+            }
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b223_a_capture_in_a_closure_written_in_a_condition_speaks_b215s_rule() {
+    // A closure body is not part of the condition it is written in — the
+    // condition's truth says nothing about a test that runs inside a function
+    // value. So an `is` there is in EXPRESSION position, and the read past it
+    // is refused in B215's terms rather than as a name typo, which is what
+    // B199's per-node narrowing left it as.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun holds(check: || bool): bool { check() }
+        fun main() {
+            let maybe = Some(2);
+            if holds(|| maybe is Some(let n)) {
+                print(n);
+            }
+        }
+        "#,
+        "Put the test where a branch depends on it — `if maybe is Some(let n) { … }`",
+    );
+}
+
+#[test]
+fn b223_the_if_control_is_unchanged() {
+    // B195's own exhibit, re-pinned beside the two conditions that now share
+    // its frame: one rule, three conditions, one voice.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
     );
 }
