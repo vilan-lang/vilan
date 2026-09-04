@@ -1658,8 +1658,8 @@ pub fn format(original: &str) -> String {
 
 /// The column budget for ONE rendered line. A line whose inline rendering is
 /// *wider* than this re-renders in split form when the construct on it has one
-/// (a postfix chain of at least two `.name(…)` call links breaks one link per
-/// line; a list literal breaks one element per line); at exactly the budget it
+/// (a postfix chain breaks one `.name(…)` call link per line, from one link up;
+/// a list literal breaks one element per line); at exactly the budget it
 /// stays inline. The budget applies to every line the printer emits — a
 /// statement's own line, and recursively each continuation line a split
 /// produced. Deliberately not a knob: the formatter has one canonical output,
@@ -3166,6 +3166,25 @@ impl<'src> Printer<'src> {
         display_width(&self.out[line_start..]) > LINE_BUDGET
     }
 
+    /// Whether the FIRST line of a rendering that starts at output offset
+    /// `start` overflows the budget — where `start` may be anywhere on its line,
+    /// not just past the indentation.
+    ///
+    /// [`Self::over_line_budget`] adds the current indent level back and so
+    /// needs its offset to be the first byte after the indentation;
+    /// [`Self::current_line_over_budget`] reads the indentation from the text
+    /// but measures the LAST line. A rendering probed mid-line that may span
+    /// lines needs both halves: the text's own indentation, and the first line,
+    /// which is the line the decision is about.
+    fn first_line_over_budget(&self, start: usize) -> bool {
+        let line_start = self.out[..start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let rendered = &self.out[line_start..];
+        let first_line = rendered.split('\n').next().unwrap_or(rendered);
+        display_width(first_line) > LINE_BUDGET
+    }
+
     /// Rolls the output and the comment cursor back to the start of the
     /// statement just printed inline and arms the statement-level split, so the
     /// caller can print the same statement again in split form. Returns `false`
@@ -3199,6 +3218,41 @@ impl<'src> Printer<'src> {
         }
         spine.reverse();
         (subject, spine)
+    }
+
+    /// Whether a ONE-link chain may break on width at all: its single link's
+    /// LAST argument is a closure (E137). Whether it actually DOES is measured
+    /// at the door in [`Self::print_expr`] — this only says the shape is a
+    /// candidate.
+    ///
+    /// "One link is not a chain — breaking it would buy a line and no clarity"
+    /// is still the rule everywhere else, and it is right: `subject.long_name(1)`
+    /// gains nothing from a line that holds only the subject, and
+    /// `list.push(Task { … })` / `registry.register([ … ])` already break their
+    /// argument where it stands, through the argument-tail descent.
+    ///
+    /// A CLOSURE argument is the shape the rule was blind to. Its body is an
+    /// expression that can break in turn, but a body that is itself a chain can
+    /// only break usefully once it has an indentation level to break into — and
+    /// when the link IS the whole chain, the only thing that can give it one is
+    /// the link taking a line of its own. Left inline, `combine(x).map(|…|
+    /// a.b().c())` stayed one 220-column line at any width, because the width
+    /// rule had no site to hang the layout on.
+    fn breaks_as_a_single_link(expr: &Spanned<Node<'src>>) -> bool {
+        let (_, spine) = Self::postfix_spine(expr);
+        spine
+            .iter()
+            .filter(|step| Self::is_call_link(&step.0))
+            .next_back()
+            .and_then(|step| match &step.0 {
+                Node::MemberAccessor(_, member) => Some(member),
+                _ => None,
+            })
+            .and_then(|member| match &member.0 {
+                Node::Call(_, _, arguments) => arguments.0.last(),
+                _ => None,
+            })
+            .is_some_and(|argument| matches!(argument.0, Node::Closure(_)))
     }
 
     /// Whether a spine step is a `.name(…)` call link — the unit the split form
@@ -3276,16 +3330,25 @@ impl<'src> Printer<'src> {
         Some(links)
     }
 
-    /// Whether `expr` is a postfix chain the split form breaks: two or more
-    /// `.name(…)` call links. One link is not a chain — breaking it would buy a
-    /// line and no clarity.
-    fn is_breakable_chain(expr: &Spanned<Node<'src>>) -> bool {
+    /// How many `.name(…)` call links `expr`'s postfix spine carries — the unit
+    /// the split form gives its own line, and the number the split doors are
+    /// graded on.
+    ///
+    /// The WIDTH door opens from ONE link up (E137). It used to require two —
+    /// "one link is not a chain, and breaking it would buy a line and no
+    /// clarity" — which was true of the case that rule was written for and
+    /// false of the case that motivated it: `combine(x).map(|…| <150 columns>)`
+    /// is one link, and the exemption held the whole statement inline at any
+    /// width, because the only place its layout could hang off was that link's
+    /// argument. The SEAM and COMMENT doors keep the two-link threshold: both
+    /// are about what sits BETWEEN links, so one link has nothing for them to
+    /// be about.
+    fn chain_call_links(expr: &Spanned<Node<'src>>) -> usize {
         let (_, spine) = Self::postfix_spine(expr);
         spine
             .iter()
             .filter(|node| Self::is_call_link(&node.0))
             .count()
-            >= 2
     }
 
     /// Prints a postfix chain in split form: the subject stays on the line the
@@ -3293,8 +3356,8 @@ impl<'src> Printer<'src> {
     /// indentation level in, carrying whatever non-call postfixes follow it
     /// (`a.b(x).c` keeps `.c` on `.b(x)`'s line). The statement's terminator is
     /// the caller's, so it glues to the last link. Only ever called for a chain
-    /// [`Self::is_breakable_chain`] accepted, so the spine holds at least the
-    /// two call links.
+    /// a split door accepted, so the spine holds at least ONE call link — two
+    /// through the seam and comment doors, one through the width door (E137).
     /// Prints a `style()` chain INLINE from an already-ordered link list — the
     /// rendering the recursive `MemberAccessor` arm of [`Self::print_expr`]
     /// produces, with the links taken from `links` instead of from the spine's
@@ -4238,7 +4301,8 @@ impl<'src> Printer<'src> {
         }
         // Two doors into the split form: the width rule armed a split, or the
         // chain carries a `})` seam (`proposal/chain-seam-split.md`).
-        if Self::is_breakable_chain(expr)
+        let call_links = Self::chain_call_links(expr);
+        if call_links >= 2
             && (split != Split::Off
                 || self.chain_has_comment_between_links(expr)
                 || self.chain_has_spanning_seam(expr))
@@ -4253,6 +4317,32 @@ impl<'src> Printer<'src> {
         // through untouched, so nothing else in the formatter moves.
         if let Some(links) = self.style_sorted_links(expr) {
             self.print_inline_chain(expr, &links, split);
+            return;
+        }
+        // The width door for a ONE-link chain (E137). Measured, not predicted,
+        // like every other width decision: the inline form is printed first —
+        // with the permission handed to the link, so the argument-tail descent
+        // still reaches whatever is inside it — and only if the FIRST line is
+        // still over budget does the link roll back onto a line of its own.
+        //
+        // That order is what keeps `raw.map(|entry| Entry { … })` reading the
+        // way it should. The struct literal breaks where it is, under a `raw.map(`
+        // that fits; splitting the chain first would put `raw` alone on a line
+        // and buy nothing. `combine(x).map(|…| a.b().c())` measures the other
+        // way — 105 columns with the closure broken — and takes the link's own
+        // line, which is what finally gives the closure body somewhere to indent
+        // into.
+        if split != Split::Off && call_links == 1 && Self::breaks_as_a_single_link(expr) {
+            let (_, spine) = Self::postfix_spine(expr);
+            let start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_inline_chain(expr, &spine, split);
+            if !self.first_line_over_budget(start) {
+                return;
+            }
+            self.out.truncate(start);
+            self.cursor = comment_cursor;
+            self.print_split_chain(expr);
             return;
         }
         match &expr.0 {
@@ -4670,6 +4760,13 @@ impl<'src> Printer<'src> {
                 }
                 if !self.print_closure_element_body(&closure.return_value) {
                     self.out.push(' ');
+                    // A closure body continues the line the closure opened, so
+                    // it takes the same split permission every other
+                    // line-continuing position takes (E137). Without this the
+                    // body of `.map(|t| a.b(x).c(y))` was exempt from the
+                    // budget: the split arrived at the closure and stopped
+                    // there, and the two-link chain inside it never broke.
+                    self.split = split;
                     self.print_expr(&closure.return_value);
                 }
             }
@@ -6294,6 +6391,69 @@ mod chain_splitting {
         assert_over_budget(plain_call.trim_end());
         assert_construct(single_link, single_link);
         assert_construct(plain_call, plain_call);
+    }
+
+    /// E137, the motivating line — from kolt's theme picker, 220 columns and
+    /// stable at 220 before this. ONE `.map(…)` link, so the width door was shut
+    /// and the whole statement was exempt from the budget at any width.
+    ///
+    /// The link takes a line of its own, and that is what gives the closure body
+    /// an indentation level to break its own two-link chain into. Every line of
+    /// the result is inside the budget.
+    #[test]
+    fn a_single_link_carrying_a_closure_chain_breaks_one_call_per_line() {
+        let source = "fun pick() {\n\
+                      \tlet selected_theme = combine((filtered_themes, selected_index))\
+                      .map(|(themes, selected_index)| themes.find(|theme| theme == \
+                      initial_theme).or_else(|| themes.get(selected_index.clamp(0, \
+                      themes.len()))));\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun pick() {\n\
+             \tlet selected_theme = combine((filtered_themes, selected_index))\n\
+             \t\t.map(|(themes, selected_index)| themes\n\
+             \t\t\t.find(|theme| theme == initial_theme)\n\
+             \t\t\t.or_else(|| themes.get(selected_index.clamp(0, themes.len()))));\n\
+             }\n",
+        );
+    }
+
+    /// The other side of the same door: a one-link chain that FITS is left
+    /// alone, closure argument or not. The door is a width rule, and nothing
+    /// about carrying a closure makes a line that fits worth breaking.
+    #[test]
+    fn a_short_single_link_chain_with_a_closure_stays_inline() {
+        let source = "let picked = combine((a, b)).map(|(x, y)| x.find(|t| t == y));\n";
+        assert!(columns(source.trim_end()) <= LINE_BUDGET);
+        assert_construct(source, source);
+    }
+
+    /// And the narrowing that keeps the door honest: the one-link split is
+    /// MEASURED, not assumed. `raw.map(|entry| Entry { … })` is 156 columns and
+    /// breaks — but at the struct literal, where the descent already reaches,
+    /// under a `raw.map(` that fits. Splitting the chain first would put `raw`
+    /// alone on a line and buy nothing. (`vilan/std/src/process/fs.vl`.)
+    #[test]
+    fn a_single_link_whose_argument_breaks_in_place_keeps_the_link_inline() {
+        let source = "fun scan() {\n\
+                      \traw.map(|entry| Entry { name = entry.name(), is_directory = \
+                      entry.is_directory(), is_file = entry.is_file(), is_symlink = \
+                      entry.is_symlink() })\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun scan() {\n\
+             \traw.map(|entry| Entry {\n\
+             \t\tname = entry.name(),\n\
+             \t\tis_directory = entry.is_directory(),\n\
+             \t\tis_file = entry.is_file(),\n\
+             \t\tis_symlink = entry.is_symlink(),\n\
+             \t})\n\
+             }\n",
+        );
     }
 
     /// WIDTH does not split a statement that spans lines: the budget is read from
