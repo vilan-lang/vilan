@@ -163,10 +163,37 @@ mod cost {
          fun theme_ink(): i32 {\n\tdefault_theme.ink\n}\n\n\
          fun theme_paper(): i32 {\n\tdefault_theme.paper\n}\n\n\
          fun never_called_by_anyone(): i32 {\n\t0\n}\n";
-    const CLIENT: &str = "import pkg::table::{ icon_0000, icon_0001, icon_0002, icon_0003 };\n\
-         import pkg::theme::theme_ink;\n\n\
-         fun panel(): i32 {\n\ticon_0000() + icon_0001() + icon_0002() + icon_0003() + theme_ink()\n}\n\n\
-         fun main() {\n\tlet total = panel();\n}\n";
+    /// How much of the generated module the `client` leg reaches. kolt's own
+    /// client leg reaches 624 ids, and the walk's cost is proportional to the
+    /// nodes it VISITS rather than to the program it visits them in — so an
+    /// entry that names four icons out of 1,791 would produce a walk that
+    /// measures almost nothing, and a bound set on it would hold whatever the
+    /// walk did.
+    const CLIENT_REACHES: usize = 600;
+
+    /// The `client` leg: a fixed preamble plus `CLIENT_REACHES` calls into the
+    /// generated module, so the walk visits a kolt-sized share of the graph.
+    fn client_module() -> String {
+        let names: Vec<String> = (0..CLIENT_REACHES)
+            .map(|index| format!("icon_{index:04}"))
+            .collect();
+        // Built piece by piece rather than as one continued literal: `cargo
+        // fmt` rewraps a `\`-continued format string and would inject its own
+        // indentation into the generated source.
+        let mut text = String::new();
+        text.push_str("import pkg::table::{ ");
+        text.push_str(&names.join(", "));
+        text.push_str(" };\n");
+        text.push_str("import pkg::theme::theme_ink;\n\n");
+        text.push_str("fun panel(): i32 {\n\tmut total = theme_ink();\n");
+        for name in &names {
+            text.push_str(&format!("\ttotal = total + {name}();\n"));
+        }
+        text.push_str("\ttotal\n}\n\n");
+        text.push_str("fun main() {\n\tlet total = panel();\n}\n");
+        text
+    }
+
     const SERVER: &str = "import pkg::theme::theme_paper;\n\n\
          fun serve(): i32 {\n\ttheme_paper()\n}\n\n\
          fun main() {\n\tlet answer = serve();\n}\n";
@@ -187,9 +214,9 @@ mod cost {
             exhibit_module(crate::keystroke::gate::GATE_FUNCTIONS),
         )
         .expect("the generated module");
+        std::fs::write(directory.join("src/client.vl"), client_module()).expect("the client leg");
         for (relative, contents) in [
             ("src/theme.vl", THEME),
-            ("src/client.vl", CLIENT),
             ("src/server.vl", SERVER),
             ("src/probe.vl", PROBE),
         ] {
@@ -263,8 +290,9 @@ mod cost {
         // is vacuous: the three entries together reach the four named icons,
         // the theme accessors behind the `const` initializer, and `main`.
         assert!(
-            items > 8,
-            "the union reached only {items} items — the exhibit is not exercising the walk",
+            items > CLIENT_REACHES,
+            "the union reached only {items} items — the exhibit is not exercising the \
+             walk, whose cost is proportional to the nodes it VISITS",
         );
         let _ = std::fs::remove_dir_all(&directory);
         let Some(cpu) = cpu else {
@@ -284,11 +312,24 @@ mod cost {
         );
     }
 
-    /// The debug-suite budget for the three-entry union walk. The paper's
-    /// release figure for kolt's three entries is 8.2 ms best / 13.3 ms
-    /// typical; this is set well above a debug build's own measurement of the
-    /// same shape, so it separates MECHANISMS (a per-item walk of the graph
-    /// versus anything that rescans the program per candidate) rather than
-    /// tunings.
-    const UNION_WALK_BUDGET_MS: f64 = 400.0;
+    /// The budget for the three-entry union walk, and it is a MECHANISM bound
+    /// rather than a tuning one.
+    ///
+    /// Measured on this exhibit — 613 items reached across the three legs,
+    /// against kolt's own client leg at 624 — in a **debug** build at
+    /// **loadavg 117**: **10.6 ms of thread CPU**, 70.2 ms of wall. The
+    /// paper's release figure for kolt's three entries is 8.2 ms best,
+    /// 13.3 ms typical, so the shape agrees. The bound is fourteen times the
+    /// measurement, which is room for a slower host and none at all for a
+    /// walk that has stopped being proportional to the graph: anything that
+    /// rescanned the 1,791-function program per candidate would be seconds,
+    /// not tens of milliseconds.
+    ///
+    /// Recorded beside it, and deliberately NOT asserted: the union's inputs,
+    /// one full analysis per entry — 9,187 ms / 1,572 ms / 1,282 ms for
+    /// client / server / probe in the same debug build under the same load.
+    /// Those are the real cost, they are why the union rides a package clock
+    /// instead of the diagnostics path, and a budget on them would be a
+    /// budget on the analyzer wearing E124's name.
+    const UNION_WALK_BUDGET_MS: f64 = 150.0;
 }

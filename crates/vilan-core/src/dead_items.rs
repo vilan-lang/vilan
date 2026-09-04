@@ -259,7 +259,7 @@ pub fn is_generated(manifest_dir: &Path, manifest: &Manifest, file: &Path) -> bo
     let Some(generated) = manifest.generated_root() else {
         return false;
     };
-    let root = crate::util::canonical_path(&manifest_dir.join(generated));
+    let root = crate::util::canonical_path(manifest_dir.join(generated));
     crate::util::canonical_path(file).starts_with(&root)
 }
 
@@ -289,7 +289,7 @@ pub fn unreached_module_entries(
     choices: &[PlatformChoice],
 ) -> Option<Vec<String>> {
     let package = manifest.package.as_ref()?;
-    let pkg_root = crate::util::canonical_path(&manifest_dir.join(package.root()));
+    let pkg_root = crate::util::canonical_path(manifest_dir.join(package.root()));
     let file = crate::util::canonical_path(file);
     if !file.starts_with(&pkg_root) || is_generated(manifest_dir, manifest, &file) {
         return None;
