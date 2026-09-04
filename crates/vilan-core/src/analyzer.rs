@@ -629,11 +629,6 @@ pub struct Function<'src> {
     /// the body's type, which matters for generic returns like `(): T`.
     pub return_type_id: Option<TypeId>,
     pub body: (Vec<Id>, Id, Id),
-    /// The block's own last statement (`body.0` also carries the parameter
-    /// destructures, which run first). An undeclared return asks whether it
-    /// LEAVES to know if the synthesized tail after it is reachable
-    /// (proposal/ret-checking.md rule 3).
-    pub last_statement_id: Option<Id>,
     /// The body's `ret` sites (span + optional value), collected for a function
     /// with no declared return type: its return type is inferred from these
     /// together with its reachable tail (`inferred_return_type`). Empty for a
@@ -2216,13 +2211,15 @@ enum Constraint<'src> {
     ReturnType {
         body_id: Id,
         return_type_id: TypeId,
-        /// The block's last STATEMENT, when `body_id` is a function/closure
-        /// TAIL (not a `ret`) and the block has one — S3's regime-1/1'
-        /// distinction (editing-dx.md §3.7): a body-ends-without-a-value
-        /// mismatch is worded differently depending on whether that
-        /// statement, had it been the tail instead of discarded by a
-        /// trailing `;`, would itself have produced the expected value.
-        last_statement_id: Option<Id>,
+        /// The block's own STATEMENTS, when `body_id` is a function/closure
+        /// TAIL (not a `ret`). Two questions read them. B221: does the body
+        /// LEAVE before it ever reaches the tail — the first diverging
+        /// statement makes everything after it unreachable, so the tail owes
+        /// nothing. And S3's regime-1/1' distinction (editing-dx.md §3.7),
+        /// which asks of the LAST one whether it, had it been the tail instead
+        /// of discarded by a trailing `;`, would itself have produced the
+        /// expected value.
+        statement_ids: Vec<Id>,
     },
     /// `expr!` — resolves the receiver's `Try` dispatch (std `Option`/`Result`
     /// fast path or a user `Try` impl), types the expression as the good half,
@@ -3557,7 +3554,7 @@ pub struct Analyzer<'src> {
     // [`Divergence`]'s two resolved leaves (B204), recomputed once per
     // resolution phase (in `resolve_world`, after names resolve and before the
     // constraint fixpoint) rather than per query, since each is a scan and
-    // `expr_diverges` is asked once per statement.
+    // the question is asked once per block.
     divergence_leaves: DivergenceLeaves,
     // The guard clauses whose continuation binding is still undecided (B222):
     // recorded by the walk, settled in `resolve_world` once the leaves above
@@ -11253,15 +11250,16 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a block definitely diverges (every path returns / jumps out /
     /// throws / loops forever), so it never reaches an enclosing merge — the
-    /// R4/R7 diverging-leg exemption.
+    /// R4/R7 diverging-leg exemption, and B221's reachable-tail question: a
+    /// block leaves when ANY statement of it does, the tail included.
+    ///
+    /// The whole-block spelling is the only one the analyzer needs. Asking it
+    /// of a single expression is `block_diverges(&[], expr)`, which no caller
+    /// wants any more: every position that used to ask about one expression —
+    /// a function's tail, a closure's, the last statement — was asking a
+    /// question about the block it sits in.
     fn block_diverges(&self, statements: &[Id], tail: Id) -> bool {
         self.divergence().block(statements, tail)
-    }
-
-    /// Whether an expression definitely diverges — [`Divergence::expr`] over the
-    /// analyzer's own expression map.
-    fn expr_diverges(&self, expr_id: Id) -> bool {
-        self.divergence().expr(expr_id)
     }
 
     /// [`DivergenceLeaves`] for the world walked so far (B204) — the two leaves
@@ -22312,21 +22310,22 @@ impl<'src> Analyzer<'src> {
                         Some(declared) => ReturnFrame::Function(id, declared),
                         None => ReturnFrame::Inferred { rets: Vec::new() },
                     });
-                    let (ids, expr_id, last_statement_id) = match &function.body {
+                    let (ids, expr_id, body_statement_ids) = match &function.body {
                         Some(body) => {
                             // Parameter destructures run first, before the body.
                             let mut ids = parameter_destructures;
                             let statement_ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
-                            // S3 (editing-dx.md §3.7): the block's own last
-                            // statement, captured before it's merged with the
-                            // destructure ids — `resolve_return_type` reads it
-                            // to tell "this body ends without producing a
-                            // value" from "the `;` discards this body's last
-                            // value".
-                            let last_statement_id = statement_ids.last().copied();
+                            // The block's OWN statements, captured before they
+                            // are merged with the destructure ids —
+                            // `resolve_return_type` reads them to ask whether
+                            // the body leaves before the tail (B221) and to
+                            // tell "this body ends without producing a value"
+                            // from "the `;` discards this body's last value"
+                            // (S3, editing-dx.md §3.7).
+                            let body_statement_ids = statement_ids.clone();
                             ids.extend(statement_ids);
                             let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
-                            (ids, expr_id, last_statement_id)
+                            (ids, expr_id, body_statement_ids)
                         }
                         None => {
                             // A signature without a body is only legitimate as a
@@ -22347,7 +22346,7 @@ impl<'src> Analyzer<'src> {
                             self.expr_id_to_expr_map.insert(void_id, Expr::Void);
                             self.expr_id_to_scope_id_map.insert(void_id, body_scope_id);
                             self.span_map.insert(void_id, &EMPTY_SPAN);
-                            (Vec::new(), void_id, None)
+                            (Vec::new(), void_id, Vec::new())
                         }
                     };
                     let rets = match self.return_type_stack.pop() {
@@ -22392,14 +22391,14 @@ impl<'src> Analyzer<'src> {
                         // editing-dx.md §17.2) or — for an exhaustive
                         // `if`/`match` of `ret`s — a false one (B124, §17.7).
                         // The constraint is pushed unconditionally and
-                        // `check_return_position` asks `expr_diverges` instead:
+                        // `check_return_position` asks `block_diverges` instead:
                         // at walk time a `match` is not yet in
                         // `expr_id_to_expr_map` (`resolve_match` inserts it), so
                         // only the resolve-time question can see every way out.
                         self.constraints.push(Constraint::ReturnType {
                             body_id: expr_id,
                             return_type_id,
-                            last_statement_id,
+                            statement_ids: body_statement_ids.clone(),
                         });
                     }
                     // Rule 3: an undeclared return is inferred from the body's
@@ -22421,7 +22420,6 @@ impl<'src> Analyzer<'src> {
                             parameters,
                             return_type_id,
                             body: (ids, expr_id, body_scope_id),
-                            last_statement_id,
                             rets,
                             has_body: function.body.is_some(),
                             call_count: 0,
@@ -22516,8 +22514,9 @@ impl<'src> Analyzer<'src> {
                             body_id: checked_id,
                             return_type_id,
                             // A `ret`'s checked value is never a block tail —
-                            // regime 1/1' is a tail-only distinction.
-                            last_statement_id: None,
+                            // neither regime 1/1' nor B221's reachability
+                            // question is asked of anything but a tail.
+                            statement_ids: Vec::new(),
                         });
                         self.return_sites.push((function_id, checked_id));
                     }
@@ -26929,13 +26928,13 @@ impl<'src> Analyzer<'src> {
                     // where it used to fall through to the whole-value
                     // comparison at the argument and report the closure as
                     // `Expected |Point| str, but got |Point| i32`.
-                    let (anchor_span, checked_id, last_statement_id) =
+                    let (anchor_span, checked_id, statement_ids) =
                         match self.closure_block_tail(return_expr_id) {
                             Some(block) => block,
                             None => {
                                 let expression_span =
                                     **self.span_map.get(&return_expr_id).unwrap_or(&&EMPTY_SPAN);
-                                (expression_span, return_expr_id, None)
+                                (expression_span, return_expr_id, Vec::new())
                             }
                         };
                     // Record the target the body is held to, so
@@ -26947,7 +26946,7 @@ impl<'src> Analyzer<'src> {
                     match self.check_return_position(
                         checked_id,
                         &target_return_type,
-                        last_statement_id,
+                        &statement_ids,
                         substitution_context,
                         exprs_seen,
                     ) {
@@ -26962,9 +26961,7 @@ impl<'src> Analyzer<'src> {
                             // reach this attempt after that constraint already
                             // resolved (resolution is monotone), so the route
                             // must not rely on it alone.
-                            let tail_dead = self.expr_diverges(checked_id)
-                                || last_statement_id
-                                    .is_some_and(|statement_id| self.expr_diverges(statement_id));
+                            let tail_dead = self.block_diverges(&statement_ids, checked_id);
                             if tail_dead {
                                 self.check_closure_rets_against_target(
                                     closure_id,
@@ -26997,7 +26994,7 @@ impl<'src> Analyzer<'src> {
                             // error node never types and is not waited for
                             // (its own diagnostic is the root cause).
                             if matches!(self.expr_id_to_expr_map.get(&checked_id), Some(Expr::Void))
-                                && let Some(statement_id) = last_statement_id
+                                && let Some(statement_id) = statement_ids.last().copied()
                                 && !self.variables.contains_key(&statement_id)
                                 && !matches!(
                                     self.expr_id_to_expr_map.get(&statement_id),
@@ -27467,12 +27464,12 @@ impl<'src> Analyzer<'src> {
                 disagreements: Vec::new(),
             };
         };
-        let (tail_id, last_statement_id, rets) = (
+        let (tail_id, statement_ids, rets) = (
             function.body.1,
-            function.last_statement_id,
+            function.body.0.clone(),
             function.rets.clone(),
         );
-        let evidence = self.return_evidence(tail_id, last_statement_id, &rets);
+        let evidence = self.return_evidence(tail_id, &statement_ids, &rets);
         self.return_inference_stack.push((function_id, true));
         let inference =
             self.unify_return_evidence(&evidence, &Type::Unknown, substitution_context, exprs_seen);
@@ -27497,12 +27494,14 @@ impl<'src> Analyzer<'src> {
     fn return_evidence(
         &self,
         tail_id: Id,
-        last_statement_id: Option<Id>,
+        statement_ids: &[Id],
         rets: &[(Span, Option<Id>)],
     ) -> Vec<(ReturnOrigin, Option<Id>)> {
         let mut evidence: Vec<(ReturnOrigin, Option<Id>)> = Vec::new();
-        let tail_reachable = !(self.expr_diverges(tail_id)
-            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id)));
+        // B221: any statement that leaves makes the tail unreachable, not just
+        // the last one — `Divergence`'s own question about the block, the same
+        // one `check_return_position` asks of a declared return type.
+        let tail_reachable = !self.block_diverges(statement_ids, tail_id);
         if tail_reachable {
             let tail_span = self
                 .span_map
@@ -27664,15 +27663,13 @@ impl<'src> Analyzer<'src> {
     }
 
     /// A closure body's return positions: a BLOCK body's tail and its own
-    /// last statement (the reachability question's other half), a
-    /// bare-expression body itself. The closure twin of what the function
-    /// walk stores as `body.1` + `last_statement_id`.
-    fn closure_body_positions(&self, body_id: Id) -> (Id, Option<Id>) {
+    /// statements (the reachability question's other half), a bare-expression
+    /// body itself. The closure twin of what the function walk stores as
+    /// `body.1` + the block's statement ids.
+    fn closure_body_positions(&self, body_id: Id) -> (Id, Vec<Id>) {
         match self.expr_id_to_expr_map.get(&body_id) {
-            Some(Expr::Block((statement_ids, tail_id))) => {
-                (*tail_id, statement_ids.last().copied())
-            }
-            _ => (body_id, None),
+            Some(Expr::Block((statement_ids, tail_id))) => (*tail_id, statement_ids.clone()),
+            _ => (body_id, Vec::new()),
         }
     }
 
@@ -27696,8 +27693,8 @@ impl<'src> Analyzer<'src> {
             };
         };
         let (body_id, rets) = (closure.return_, closure.rets.clone());
-        let (tail_id, last_statement_id) = self.closure_body_positions(body_id);
-        let evidence = self.return_evidence(tail_id, last_statement_id, &rets);
+        let (tail_id, statement_ids) = self.closure_body_positions(body_id);
+        let evidence = self.return_evidence(tail_id, &statement_ids, &rets);
         self.unify_return_evidence(
             &evidence,
             initial_expectation,
@@ -29022,8 +29019,11 @@ impl<'src> Analyzer<'src> {
             Constraint::ReturnType {
                 body_id,
                 return_type_id,
-                last_statement_id,
-            } => self.resolve_return_type(*body_id, *return_type_id, *last_statement_id),
+                statement_ids,
+            } => {
+                let statement_ids = statement_ids.clone();
+                self.resolve_return_type(*body_id, *return_type_id, &statement_ids)
+            }
             Constraint::TryAssert {
                 id,
                 receiver_id,
@@ -31545,7 +31545,7 @@ impl<'src> Analyzer<'src> {
         &mut self,
         body_id: Id,
         return_type_id: TypeId,
-        last_statement_id: Option<Id>,
+        statement_ids: &[Id],
     ) -> Resolution {
         if !self.expr_id_to_expr_map.contains_key(&body_id) {
             return Resolution::Deferred;
@@ -31555,7 +31555,7 @@ impl<'src> Analyzer<'src> {
         match self.check_return_position(
             body_id,
             &return_type,
-            last_statement_id,
+            statement_ids,
             &substitution_context,
             &mut HashSet::default(),
         ) {
@@ -31618,7 +31618,7 @@ impl<'src> Analyzer<'src> {
         &mut self,
         body_id: Id,
         target_return_type: &Type,
-        last_statement_id: Option<Id>,
+        statement_ids: &[Id],
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnPositionCheck {
@@ -31648,17 +31648,22 @@ impl<'src> Analyzer<'src> {
         // the tail after it is unreachable. Two shapes reach here: the body
         // ITSELF diverges (a `{ ret ..; }` block in tail position — an
         // exhaustive `if`/`match` of `ret`s already infers as `Type::Never`
-        // and reconciled above), or the block's last STATEMENT diverges and
-        // the parser's synthesized void tail after it is dead code. The second
-        // subsumes §17.2's `ret`-only dedup at the tail-construction site: a
-        // `jump`, or an exhaustive `if`/`match` of `ret`s, leaves exactly the
-        // same way and left the same false "ends without producing a value"
-        // behind. Nothing is weakened — `expr_diverges` needs EVERY path to
-        // leave, so a body with any fall-through still reaches the diagnostics
-        // below.
-        if self.expr_diverges(body_id)
-            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id))
-        {
+        // and reconciled above), or a STATEMENT of the block diverges and
+        // everything the parser wrote after it, the synthesized void tail
+        // included, is dead code. The second subsumes §17.2's `ret`-only dedup
+        // at the tail-construction site: a `jump`, or an exhaustive
+        // `if`/`match` of `ret`s, leaves exactly the same way and left the same
+        // false "ends without producing a value" behind.
+        //
+        // B221 widened "the LAST statement" to ANY statement, which is the
+        // question `Divergence` answers about a BLOCK and the one the editor's
+        // unreachable-code paint asks: the first diverging statement makes
+        // everything after it unreachable, so `fun g(): i32 { ret 1;
+        // print("dead"); }` owes a tail value nothing can ever ask for. Nothing
+        // is weakened — divergence needs EVERY path out of a statement to
+        // leave, so a body with any fall-through (a `ret` inside an `if` with
+        // no `else`) still reaches the diagnostics below.
+        if self.block_diverges(statement_ids, body_id) {
             return ReturnPositionCheck::Matched;
         }
         // S3 (editing-dx.md §3.6-3.7): a body that ends WITHOUT PRODUCING A
@@ -31678,7 +31683,7 @@ impl<'src> Analyzer<'src> {
         // `Expr::If` not present, and correctly stays on the generic message.
         let msg = if matches!(self.expr_id_to_expr_map.get(&body_id), Some(Expr::Void)) {
             self.missing_return_value_message(
-                last_statement_id,
+                statement_ids.last().copied(),
                 target_return_type,
                 substitution_context,
             )
@@ -31745,7 +31750,7 @@ impl<'src> Analyzer<'src> {
     /// its last STATEMENT's id for the regime-1/1' distinction. `None` for
     /// the bare-expression form (`|x| x + 1`), which S3's route anchors at
     /// the expression itself instead (B132).
-    fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Option<Id>)> {
+    fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Vec<Id>)> {
         let Expr::Block((statement_ids, tail_id)) =
             self.expr_id_to_expr_map.get(&return_expr_id)?
         else {
@@ -31756,7 +31761,7 @@ impl<'src> Analyzer<'src> {
             start: block_span.end.saturating_sub(1),
             end: block_span.end,
         };
-        Some((brace_span, *tail_id, statement_ids.last().copied()))
+        Some((brace_span, *tail_id, statement_ids.clone()))
     }
 
     /// `a?.b.c` (proposal/try-and-lift.md §3): once the subject resolves, the
@@ -32687,9 +32692,8 @@ impl<'src> Analyzer<'src> {
         for disagreement in &inference.disagreements {
             self.report_closure_ret_disagreement(disagreement);
         }
-        let (tail_id, last_statement_id) = self.closure_body_positions(body_id);
-        let tail_dead = self.expr_diverges(tail_id)
-            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id));
+        let (tail_id, statement_ids) = self.closure_body_positions(body_id);
+        let tail_dead = self.block_diverges(&statement_ids, tail_id);
         if tail_dead {
             let target = own_annotation
                 .filter(|annotation| self.type_is_ground(*annotation))

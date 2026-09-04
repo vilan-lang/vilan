@@ -686,7 +686,10 @@ exactly as `g(n - 1) + 1` does; a function whose only return positions are
 such calls is `Never`. Declaring the return type replaces inference with
 checking (every position against the declaration) — and an unreachable
 tail owes no value there either, so `fun f(): i32 { panic("x"); }` and
-`fun serve(): i32 { for { tick(); } }` both check without one. A closure
+`fun serve(): i32 { for { tick(); } }` both check without one. A tail is
+unreachable as soon as ANY statement before it leaves, not only the last
+one: `fun g(): i32 { ret 1; log("dead"); }` owes nothing, because
+nothing after the `ret` runs. A closure
 (and an `async` block) infers the same way: its return type is the
 unification of its reachable tail and every `ret`, so
 `|x| { ret x * 2; }` is `|i32| i32`, and a `ret` that disagrees — with
