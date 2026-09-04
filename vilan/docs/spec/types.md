@@ -895,6 +895,18 @@ whether or not `P` matched, so `n` reaches **neither** branch. Only the
 `&&` rule survives the step off the spine, and only *inside* the subtree
 it stepped into, because `&&` short-circuits wherever it is written.
 
+That short-circuit is also a promise about **evaluation**, not only about
+names. `&&` and `||` evaluate their right operand **only when the left
+operand did not already settle the test**, and that covers everything the
+operand needs to run — the subject of an `is`, the copy a capture takes,
+a call, a nested `if` — not merely the comparison it ends in. So `a is
+Some(let x) && x.on_end is Some(let y)` never reads `x.on_end` when `a`
+is `None`, and `flag || probe() is Some(let n)` never calls `probe` when
+`flag` is true. It holds wherever the operator is written — a condition,
+an initializer, an operand of another operator — and the same "only once
+it is reached" applies to an `else if`'s condition, which runs only after
+every earlier branch of its chain has missed.
+
 A **negation swaps the two branches**, and nothing else: `!(x is P)` is
 true exactly where `P` failed, so the capture is *not* in that `if`'s
 then-branch — it is in the **`else`** branch (and on down an `else if`

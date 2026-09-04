@@ -546,7 +546,9 @@ fn rewrite_sibling_node(
         // `Property`'s member is a property name, not a binding — recurse only
         // the subject, exactly as the rename walk does.
         | js::Node::Property(inner, _) => rewrite_sibling_node(inner, siblings, bound, count),
-        js::Node::Array(items) => {
+        // A `Sequence`'s items are expressions in a row, exactly like an
+        // array literal's (B224) — same walk.
+        js::Node::Array(items) | js::Node::Sequence(items) => {
             for item in items {
                 rewrite_sibling_node(item, siblings, bound, count);
             }
@@ -809,7 +811,7 @@ fn descend_for_preload<'src>(
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => descend_for_preload(inner, gates, total),
-        js::Node::Array(items) => {
+        js::Node::Array(items) | js::Node::Sequence(items) => {
             for item in items {
                 descend_for_preload(item, gates, total);
             }
@@ -870,7 +872,9 @@ fn gate_source_name(node: &js::Node, gates: &BTreeMap<String, String>) -> Option
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => gate_source_name(inner, gates),
-        js::Node::Array(items) => items.iter().find_map(|item| gate_source_name(item, gates)),
+        js::Node::Array(items) | js::Node::Sequence(items) => {
+            items.iter().find_map(|item| gate_source_name(item, gates))
+        }
         _ => None,
     }
 }
@@ -964,7 +968,7 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => collect_reference(inner, out),
-        js::Node::Array(items) => collect_references(items, out),
+        js::Node::Array(items) | js::Node::Sequence(items) => collect_references(items, out),
         js::Node::String(_)
         | js::Node::Number(_, _)
         | js::Node::Bool(_)
@@ -4709,6 +4713,38 @@ impl<'src> Transformer<'src> {
             }
             Expr::Binary(op, lhs, rhs) => {
                 let lhs = self.walk_entity(*lhs, block).unwrap_or(js::Node::Void);
+                // B224: `&&` and `||` are the only operators whose right
+                // operand may not run at all, and the emitter had no statement
+                // slot for a condition — so a right operand that lowers to
+                // STATEMENTS (an `is` subject temp and its materialized
+                // captures, an if-expression, a `?` lift) was walked into the
+                // ENCLOSING block and ran unconditionally, before the test that
+                // was supposed to gate it. `a is Some(let x) && x.f is Some(let
+                // y)` read a `None`'s payload and threw; `flag && probe() is
+                // Some(let n)` called `probe` with `flag` false. So the right
+                // operand is walked into a SCRATCH list instead and whatever it
+                // needed is put back where the operand itself runs
+                // (`emit_short_circuit`).
+                //
+                // Returning here skips none of the operator rewrites below:
+                // `&&`/`||` are not overloadable (`operator_trait_method` has
+                // no arm for them, so `binary_op_dispatch`, `generic_dispatch`
+                // and `concat_render_dispatch` never hold one), and they are
+                // neither bitwise nor division.
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let mark = self.pending_temporaries.len();
+                    let mut scratch = Vec::new();
+                    let t_rhs = self
+                        .walk_entity(*rhs, &mut scratch)
+                        .unwrap_or(js::Node::Void);
+                    // The overwhelmingly common case — a right operand that
+                    // needed no statement — emits exactly as it always did,
+                    // byte for byte.
+                    if scratch.is_empty() && self.pending_temporaries.len() == mark {
+                        return Some(binary(*op, lhs, t_rhs));
+                    }
+                    return Some(self.emit_short_circuit(*op, lhs, t_rhs, scratch, mark, block));
+                }
                 let mut rhs = self.walk_entity(*rhs, block).unwrap_or(js::Node::Void);
                 // B176: `"v=" + value` where `value: T` is bounded to a trait
                 // that provides `to_string`. The analyzer ADMITS this — the
@@ -5473,25 +5509,61 @@ impl<'src> Transformer<'src> {
                 _ => js::Node::Void,
             },
             Expr::If(branch) => {
+                /// `is_root` distinguishes the chain's OWN `if` from its `else
+                /// if`s (B224). The root's condition runs unconditionally, so
+                /// its statements belong in the enclosing block exactly as
+                /// before; an `else if`'s condition runs only once every
+                /// earlier branch has missed, so its statements walk into a
+                /// prelude of their own and the branch is re-shaped as `else {
+                /// <prelude> if (..) {..} else {..} }`. Before this they were
+                /// walked into the OUTER block with the root's, so `if a is
+                /// Some(let n) { .. } else if probe() is Some(let m) { .. }`
+                /// called `probe` before the chain ran — and even when `a`
+                /// matched.
                 fn walk_branch<'src>(
                     t: &mut Transformer<'src>,
                     branch: &ExprIfBranch,
                     block: &mut Vec<js::Node<'src>>,
+                    is_root: bool,
                     expr_variable_name: &mut Option<String>,
                 ) -> js::IfBranch<'src> {
                     match branch {
                         ExprIfBranch::If(condition, body, else_) => {
+                            let mark = t.pending_temporaries.len();
+                            let mut prelude = Vec::new();
+                            let slot = if is_root { &mut *block } else { &mut prelude };
                             let t_condition = t
-                                .walk_entity(*condition, block)
+                                .walk_entity(*condition, slot)
                                 .unwrap_or(js::Node::Bool(false));
                             let t_body = t.walk_branch_body(&body.0, body.1, expr_variable_name);
-                            js::IfBranch::If(
+                            let inner = js::IfBranch::If(
                                 Box::new(t_condition),
                                 t_body,
                                 else_.as_ref().map(|x| {
-                                    Box::new(walk_branch(t, x, block, expr_variable_name))
+                                    Box::new(walk_branch(t, x, block, false, expr_variable_name))
                                 }),
-                            )
+                            );
+                            // The ROOT's condition already emitted into `block`,
+                            // where the enclosing statement closes whatever it
+                            // lifted — and an `if` that IS the statement cannot
+                            // be re-shaped into an `else` anyway. Only an `else
+                            // if` reaches the rest of this arm.
+                            //
+                            // A statement-free `else if` condition — every one
+                            // in the estate — also stays in the chain
+                            // untouched, so its emission is byte-identical.
+                            if is_root
+                                || (prelude.is_empty() && t.pending_temporaries.len() == mark)
+                            {
+                                return inner;
+                            }
+                            // The `if` goes into the prelude BEFORE the
+                            // temporaries are closed, so a resource the
+                            // condition acquired is destroyed after the branch
+                            // that reads it rather than before it.
+                            prelude.push(js::Node::If(inner));
+                            t.close_temporaries(mark, 0, &mut prelude);
+                            js::IfBranch::Else(prelude)
                         }
                         ExprIfBranch::Else(body) => {
                             let t_body = t.walk_branch_body(&body.0, body.1, expr_variable_name);
@@ -5500,7 +5572,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
                 let mut expr_variable_name = None;
-                let branch = walk_branch(self, branch, block, &mut expr_variable_name);
+                let branch = walk_branch(self, branch, block, true, &mut expr_variable_name);
                 match expr_variable_name {
                     Some(variable_name) => {
                         let expr_variable = js::Node::LetVariable(js::Variable {
@@ -6297,6 +6369,164 @@ impl<'src> Transformer<'src> {
                     block.push(js::Node::If(js::IfBranch::If(Box::new(test), slot, None)))
                 }
             }
+        }
+    }
+
+    /// Emits `lhs && rhs` / `lhs || rhs` where the right operand needed
+    /// STATEMENTS (B224), keeping them on the short-circuit's own side of the
+    /// test. `scratch` is what walking the right operand emitted, `mark` the
+    /// resource-temporary watermark from before that walk.
+    ///
+    /// Two shapes, and the first is preferred because it leaves the operator an
+    /// EXPRESSION — so an `if` head, a `while` head, a `let` initializer and a
+    /// nested operand all keep taking one node:
+    ///
+    /// - **A comma sequence.** Every scratch statement becomes an expression: a
+    ///   `const`/`let` splits into an UNINITIALIZED declaration hoisted to the
+    ///   enclosing block and an assignment inside the sequence, and everything
+    ///   else is already one. `$a[0] === 0 && (($b = $a[1][0]), $b[0] === 0)`.
+    ///
+    ///   The hoist is not a convenience — it is what keeps B187's continuation
+    ///   nameable. `if !(a is Some(let x) && x.f is Some(let y)) { ret; }
+    ///   print(y)` reads `y` AFTER the `if`, and `y` aliases (or is declared
+    ///   from) the right operand's temp, so that declaration cannot be nested
+    ///   inside the condition. It is sound because the continuation is reached
+    ///   only when the whole `&&` was true, which is exactly when the sequence
+    ///   ran and assigned it.
+    ///
+    /// - **A statement fallback**, when some part has no expression form: an
+    ///   if-expression's `if`, a resource temporary's `try`/`finally`, or a
+    ///   divergent operand (`is_divergent`, B152 — a statement everywhere).
+    ///   `let $r = lhs; if ($r) { <scratch> $r = rhs; }` — `if (!$r)` for `||`
+    ///   — with the operator yielding `$r`. That is `&&`/`||` exactly: JS
+    ///   yields the LEFT operand when it settles the test and the right one
+    ///   otherwise, which is what the conditional overwrite of `$r` does.
+    fn emit_short_circuit(
+        &mut self,
+        op: BinaryOp,
+        lhs: js::Node<'src>,
+        t_rhs: js::Node<'src>,
+        scratch: Vec<js::Node<'src>>,
+        mark: usize,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let expressible = self.pending_temporaries.len() == mark
+            && !t_rhs.is_divergent()
+            && scratch.iter().all(Self::node_is_expressible);
+        if expressible {
+            let mut sequence = Vec::with_capacity(scratch.len() + 1);
+            for node in scratch {
+                match node {
+                    js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                        // Declared `undefined` rather than with its own value:
+                        // the value is what must not run yet. (The same split
+                        // `hoist_declaration_out_of` makes when a temporary's
+                        // `try` closes over a declaration.)
+                        let already_split = matches!(*variable.value, js::Node::Void);
+                        block.push(js::Node::LetVariable(js::Variable {
+                            name: variable.name.clone(),
+                            value: Box::new(js::Node::Void),
+                        }));
+                        // A declaration THIS split already made one level in —
+                        // a nested `&&`'s own hoist — re-declares here and has
+                        // nothing left to assign; emitting `($b = undefined)`
+                        // into the sequence would be a no-op written out.
+                        if !already_split {
+                            sequence.push(js::Node::Assignment(
+                                Box::new(js::Node::Local(variable.name)),
+                                variable.value,
+                            ));
+                        }
+                    }
+                    node => sequence.push(node),
+                }
+            }
+            // Every scratch statement was a declaration and nothing was left to
+            // run before the operand: the hoists alone did the work, and the
+            // operator emits as it always did.
+            if sequence.is_empty() {
+                return binary(op, lhs, t_rhs);
+            }
+            sequence.push(t_rhs);
+            return binary(op, lhs, js::Node::Sequence(sequence));
+        }
+        let result_name = self.ng.next_name();
+        block.push(js::Node::LetVariable(js::Variable {
+            name: result_name.clone(),
+            value: Box::new(lhs),
+        }));
+        let mut branch_body = scratch;
+        if t_rhs.is_divergent() {
+            branch_body.push(t_rhs);
+        } else {
+            branch_body.push(js::Node::Assignment(
+                Box::new(js::Node::Local(result_name.clone())),
+                Box::new(t_rhs),
+            ));
+        }
+        // A resource temporary the right operand lifted is closed HERE, inside
+        // the branch that acquired it: the `finally` then covers the operand's
+        // own use of the value (the assignment is already in `branch_body`) and
+        // nothing outside the short-circuit, and the pending entry's index —
+        // recorded against `scratch`, which `branch_body` still is — is the one
+        // `close_temporaries` reads.
+        self.close_temporaries(mark, 0, &mut branch_body);
+        let test = match op {
+            BinaryOp::And => js::Node::Local(result_name.clone()),
+            _ => js::Node::Unary('!', Box::new(js::Node::Local(result_name.clone()))),
+        };
+        block.push(js::Node::If(js::IfBranch::If(
+            Box::new(test),
+            branch_body,
+            None,
+        )));
+        js::Node::Local(result_name)
+    }
+
+    /// Whether an emitted STATEMENT also has an expression form — whether it
+    /// can be spliced into a [`js::Node::Sequence`] (B224). A declaration
+    /// counts: `emit_short_circuit` splits it into a hoisted declaration and an
+    /// assignment. Nothing with a body of its own does, and nothing divergent
+    /// does; both take the statement fallback instead.
+    ///
+    /// Exhaustive on purpose — a new JS node has to answer this question rather
+    /// than inherit a wrong default, because saying "yes" wrongly emits a
+    /// bundle that does not parse.
+    fn node_is_expressible(node: &js::Node<'src>) -> bool {
+        match node {
+            js::Node::ConstVariable(_)
+            | js::Node::LetVariable(_)
+            | js::Node::Assignment(_, _)
+            | js::Node::Call(_, _)
+            | js::Node::Await(_)
+            | js::Node::Binary(_, _, _)
+            | js::Node::Unary(_, _)
+            | js::Node::Property(_, _)
+            | js::Node::PropertyIndex(_, _)
+            | js::Node::Array(_)
+            | js::Node::Closure(_)
+            | js::Node::Sequence(_)
+            | js::Node::Local(_)
+            | js::Node::Number(_, _)
+            | js::Node::String(_)
+            | js::Node::Bool(_)
+            | js::Node::Null
+            | js::Node::Void => true,
+            // A block form (no expression spelling), a hoisted `function`
+            // declaration, a `...spread` (legal only inside a literal), or a
+            // divergent statement.
+            js::Node::If(_)
+            | js::Node::While(_, _)
+            | js::Node::ForOf(_, _, _)
+            | js::Node::Try(_, _)
+            | js::Node::Labeled(_, _)
+            | js::Node::Function(_)
+            | js::Node::Spread(_)
+            | js::Node::Return(_)
+            | js::Node::Break
+            | js::Node::BreakLabel(_)
+            | js::Node::Continue
+            | js::Node::Throw(_) => false,
         }
     }
 
@@ -9267,6 +9497,19 @@ impl Formatter {
                     self.array_surround, s_items, self.array_surround, terminator
                 )
             }
+            // `(a, b, c)` (B224). Always parenthesized: the comma binds looser
+            // than every operator, so an unwrapped sequence would be re-parsed
+            // by whatever encloses it — and looser than assignment too, so an
+            // assignment item keeps the parentheses `operand` gives it while
+            // everything else passes through bare.
+            js::Node::Sequence(items) => {
+                let s_items = items
+                    .iter()
+                    .map(|item| self.operand(item, level, |_| true))
+                    .collect::<Vec<_>>()
+                    .join(format!(",{}", self.space).as_str());
+                format!("({}){}", s_items, terminator)
+            }
             js::Node::Spread(operand) => {
                 format!("...{}{}", self.node(operand, "", level), terminator)
             }
@@ -9999,6 +10242,21 @@ pub mod js {
         Property(Box<Self>, String),
         PropertyIndex(Box<Self>, Box<Self>),
         Return(Box<Self>),
+        // `(<a>, <b>, …)` — a parenthesized comma sequence (B224). The one JS
+        // form that runs a STATEMENT in expression position, and so the one
+        // that gives a short-circuit operator's right operand a statement slot
+        // on its own side of the test: `$a[0] === 0 && (($b = $a[1][0]), $b[0]
+        // === 0)`. The parentheses are part of the rendering — the comma binds
+        // looser than every operator, so a bare sequence would be re-parsed by
+        // whatever encloses it.
+        //
+        // **Invariant: no item is divergent** ([`Node::is_divergent`]) and none
+        // is a block form. `emit_short_circuit` builds every one of these and
+        // checks both (`node_is_expressible`), falling back to a real statement
+        // slot otherwise — which is what lets the post-walk statement rewrites
+        // (`returns_at_module_scope`, `lower_returns_to_break`) keep ignoring
+        // this node: there is no `return` inside one for them to find.
+        Sequence(Vec<Self>),
         String(Cow<'src, str>),
         Throw(Box<Self>),
         // `try { <body> } finally { <finally> }` — scope-end destruction
@@ -10631,7 +10889,12 @@ fn collect_node(
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => collect_node(inner, renameable, declarations, children),
-        js::Node::Array(items) => collect_declarations(items, renameable, declarations, children),
+        // A `Sequence` declares nothing of its own: B224 hoists the right
+        // operand's declarations to the ENCLOSING block and leaves assignments
+        // here, so this only has to reach the values.
+        js::Node::Array(items) | js::Node::Sequence(items) => {
+            collect_declarations(items, renameable, declarations, children)
+        }
         js::Node::Local(_)
         | js::Node::String(_)
         | js::Node::Number(_, _)
@@ -10792,7 +11055,7 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
         | js::Node::Spread(inner)
         // `Property`'s member is a property name, not a binding — recurse only the subject.
         | js::Node::Property(inner, _) => rename_node(inner, rename),
-        js::Node::Array(items) => rename_nodes(items, rename),
+        js::Node::Array(items) | js::Node::Sequence(items) => rename_nodes(items, rename),
         js::Node::String(_)
         | js::Node::Number(_, _)
         | js::Node::Bool(_)
