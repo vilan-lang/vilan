@@ -2942,6 +2942,50 @@ pub struct Analyzer<'src> {
     // definition-site checks ask per expression inside their hottest loops,
     // where `source_of_id`'s linear scan would cost more than the skip saves.
     frozen_ranges: Vec<(u32, u32)>,
+    // M19 T1 (`per-module-analysis-reuse.md` §5): the CACHED WORLD's own
+    // sources projected onto entity-id space, sealed beside `frozen_ranges`
+    // rather than merged into it — std's guarantee is that its diagnostics are
+    // known ABSENT, the world's is only that they are REMEMBERED, and the
+    // paper's §3.1 keeps the two apart so the stricter one is not weakened by
+    // association. Empty unless this analysis was served a base-cache HIT
+    // whose recorded checks are still valid; a module the entry dirtied
+    // (`entry_dirty_sources`) drops out for that analysis.
+    world_ranges: Vec<(u32, u32)>,
+    // M19 T1: the sources whose Class A checks this analysis SKIPPED and whose
+    // diagnostics it replayed, in ascending order. Read by the phase line and
+    // by the record pass, which must never re-record a source it did not
+    // actually re-derive.
+    reused_sources: Vec<SourceId>,
+    // M19 T0 (`per-module-analysis-reuse.md` §3.3): the source each `TypeId`
+    // was minted in, indexed by the id's own dense counter. `Id`s get this
+    // through `source_ranges`; `TypeId`s are a separate counter and had
+    // nothing, which is what made "did the entry move THIS module's slots?"
+    // unanswerable.
+    type_id_sources: Vec<SourceId>,
+    // M19 T1: the sources whose record this analysis must NOT write, because
+    // something it derived for them reaches OUTSIDE the world — a note or a
+    // trace hop pointing into the entry. Such a diagnostic is about a module
+    // but half-rendered against a buffer that changes every keystroke, so
+    // remembering it would replay one entry's note onto another's text. The
+    // module simply stays un-recorded, and therefore re-derives.
+    reuse_unrecordable: HashSet<u32>,
+    // M19 T1: the Class A diagnostics and warnings THIS analysis derived,
+    // filed under the source each will publish to — the record a later
+    // analysis over the same world replays instead of re-deriving. Filled
+    // per check by `record_reusable_window`; per-analysis scratch, so it is
+    // empty in every world the base cache stores.
+    reuse_derived: HashMap<u32, ModuleDiagnostics>,
+    // M19 T0: the sources whose type slots the ENTRY moved — every
+    // world-changing `write_type_slot` made after `entry_phase` opened,
+    // resolved to the source that minted the slot. The third term of §4.1's
+    // key: a module in here is not reusable for THIS analysis, because a slot
+    // it reads was ground by the buffer being edited.
+    entry_dirty_sources: HashSet<SourceId>,
+    // M19 T0: whether the entry tail has begun — set once, after
+    // `resolve_world` on a miss and after the base-cache lookup on a hit. The
+    // world's OWN resolution writes slots constantly and dirties nothing; only
+    // writes past this point are the entry's.
+    entry_phase: bool,
     // Each analyzed file's text, keyed by its SourceId (element-syntax S4):
     // lets a diagnostic inspect the source its span points into — the
     // element-origin detectors read it. First entry wins; files this never
@@ -4111,6 +4155,13 @@ impl<'src> Analyzer<'src> {
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
+            world_ranges: Vec::new(),
+            reused_sources: Vec::new(),
+            type_id_sources: Vec::new(),
+            reuse_derived: HashMap::default(),
+            reuse_unrecordable: HashSet::default(),
+            entry_dirty_sources: HashSet::default(),
+            entry_phase: false,
             source_texts: Vec::new(),
             type_references: Vec::new(),
             external_functions: IndexMap::new(),
@@ -8312,7 +8363,7 @@ impl<'src> Analyzer<'src> {
             };
             // S1: keyed on the call site — a std callee with an `any`
             // parameter called from entry keeps its entry-anchored report.
-            if self.frozen_entity(*call_id) {
+            if self.reusable_entity(*call_id) {
                 continue;
             }
             let Some(function_call) = self.function_calls.get(call_id) else {
@@ -8347,7 +8398,7 @@ impl<'src> Analyzer<'src> {
         //    move rules police, not R12).
         for variable in self.variables.values() {
             // S1: the coercion anchors at the binding's own initializer.
-            if self.frozen_entity(variable.id) {
+            if self.reusable_entity(variable.id) {
                 continue;
             }
             if variable.annotated
@@ -8362,7 +8413,7 @@ impl<'src> Analyzer<'src> {
         for (function_id, value_id) in &self.return_sites {
             // S1: the coercion anchors at the returned value in the
             // function's own body.
-            if self.frozen_entity(*function_id) {
+            if self.reusable_entity(*function_id) {
                 continue;
             }
             if let Some(return_type_id) = self
@@ -10251,6 +10302,12 @@ impl<'src> Analyzer<'src> {
             .functions
             .values()
             .filter(|function| function.has_body)
+            // M19 T1: R1–R8 are decided inside ONE body against types the
+            // world already resolved, so a body from a reused source has the
+            // answer the record holds (`per-module-analysis-reuse.md` §3.3,
+            // Class A). std was already skipped here through the same
+            // predicate's narrow half.
+            .filter(|function| !self.reusable_entity(function.id))
             .map(|function| {
                 (
                     function.body.0.clone(),
@@ -10289,8 +10346,11 @@ impl<'src> Analyzer<'src> {
         // resets to 0). Captures of OUTER resources are R9's business, below.
         let closures: Vec<(Vec<Id>, Vec<Id>, Id)> = self
             .closures
-            .values()
-            .map(|closure| {
+            .iter()
+            // M19 T1: a closure is its own root and lives in exactly one body,
+            // so it reuses with the source that wrote it.
+            .filter(|(closure_id, _)| !self.reusable_entity(**closure_id))
+            .map(|(_, closure)| {
                 (
                     closure.parameters.clone(),
                     closure.parameter_destructures.clone(),
@@ -11363,6 +11423,14 @@ impl<'src> Analyzer<'src> {
         violations: &mut Vec<ResourceMoveViolation>,
     ) {
         for closure_id in self.closures.keys() {
+            // M19 T1: R9 asks what ONE closure captures from its enclosing
+            // body — the module's own question, and the same skip the two
+            // scans above take. R11's call into `scan_one_closure_captures` is
+            // deliberately NOT filtered: it runs over an instantiated generic
+            // body and is Class C.
+            if self.reusable_entity(*closure_id) {
+                continue;
+            }
             self.scan_one_closure_captures(
                 *closure_id,
                 resource_bindings,
@@ -15480,6 +15548,12 @@ impl<'src> Analyzer<'src> {
     fn new_type_id(&mut self) -> TypeId {
         let id = self.type_id;
         self.type_id += 1;
+        // M19 T0: stamp the minting source. The counter is dense and monotone,
+        // so the push keeps `type_id_sources` indexed by the id itself — one
+        // `u32` per slot, and the only thing that makes `write_type_slot`'s
+        // dirty bit attributable to a MODULE rather than to the program.
+        debug_assert_eq!(self.type_id_sources.len(), id as usize);
+        self.type_id_sources.push(self.current_source_id);
         TypeId(id)
     }
 
@@ -15525,6 +15599,25 @@ impl<'src> Analyzer<'src> {
             .is_some_and(|existing| *existing != type_);
         if changes_the_world {
             self.type_map_writes += 1;
+            // M19 T0's second addition: the same write, read as an
+            // ATTRIBUTION. A world-changing write made after the entry tail
+            // opened moved a slot somebody else minted, and if that somebody
+            // is a module then the module's Class A and Class C answers are no
+            // longer the ones a previous analysis cached
+            // (`per-module-analysis-reuse.md` §3.3). The mint itself and an
+            // idempotent rewrite are excluded here for exactly the reasons
+            // they are excluded above: neither moves the world.
+            // Deliberately unconditional in `current_source_id`: constraint
+            // resolution re-anchors that field per constraint, so a write made
+            // while it names the module would read as the module's own — when
+            // in truth `resolve_world` finished before this phase opened and
+            // everything past it is the entry's doing. Over-dirtying costs
+            // reuse; under-dirtying costs soundness.
+            if self.entry_phase
+                && let Some(source) = self.type_id_sources.get(type_id.0 as usize).copied()
+            {
+                self.entry_dirty_sources.insert(source);
+            }
         }
         self.type_id_to_type_map.insert(type_id, type_);
     }
@@ -17217,7 +17310,7 @@ impl<'src> Analyzer<'src> {
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             // S1: every escape this loop finds anchors inside the iterated
             // expression; the precomputes above stay whole-program.
-            if self.frozen_entity(*expr_id) {
+            if self.reusable_entity(*expr_id) {
                 continue;
             }
             match expr {
@@ -17281,7 +17374,7 @@ impl<'src> Analyzer<'src> {
         // agree about what a return position hands back. A HashSet dedupes.
         let function_seams: HashSet<(Id, Id)> = self.return_sites.iter().copied().collect();
         for (function_id, seam) in function_seams {
-            if self.frozen_entity(function_id) {
+            if self.reusable_entity(function_id) {
                 continue;
             }
             let Some(function) = self.functions.get(&function_id) else {
@@ -17311,7 +17404,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             // S1: a closure written in entry code keeps its own (entry) id
             // even when passed into std — only std-written closures skip.
-            .filter(|(closure_id, _)| !self.frozen_entity(**closure_id))
+            .filter(|(closure_id, _)| !self.reusable_entity(**closure_id))
             .map(|(_, closure)| closure.return_)
             .collect();
         for return_id in closure_returns {
@@ -18175,13 +18268,13 @@ impl<'src> Analyzer<'src> {
             .filter(|(_, function)| function.has_body)
             // S1: every violation the scan finds anchors inside the scanned
             // body; the precomputed view sets above stay whole-program.
-            .filter(|(id, _)| !self.frozen_entity(**id))
+            .filter(|(id, _)| !self.reusable_entity(**id))
             .map(|(id, function)| (*id, function.body.0.clone(), function.body.1))
             .collect();
         let closure_returns: Vec<Id> = self
             .closures
             .iter()
-            .filter(|(closure_id, _)| !self.frozen_entity(**closure_id))
+            .filter(|(closure_id, _)| !self.reusable_entity(**closure_id))
             .map(|(_, closure)| closure.return_)
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
@@ -18362,7 +18455,7 @@ impl<'src> Analyzer<'src> {
             .closures
             .keys()
             .copied()
-            .filter(|closure_id| !self.frozen_entity(*closure_id))
+            .filter(|closure_id| !self.reusable_entity(*closure_id))
             .collect();
         let mut errors: Vec<(Id, &'src str)> = Vec::new();
         let mut pending: Vec<(Id, Id, &'src str)> = Vec::new();
@@ -18810,7 +18903,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             // S1: the violation anchors at the assignment itself.
-            if self.frozen_entity(*assignment_id) {
+            if self.reusable_entity(*assignment_id) {
                 continue;
             }
             // A reseat targets the view binding itself (`view = …`), not `*view`.
@@ -19147,7 +19240,7 @@ impl<'src> Analyzer<'src> {
             })
             // S1: a frozen (std) assignment's mutability was judged when std
             // was pinned clean; the skip keys on the assignment itself.
-            .filter(|target_id| !self.frozen_entity(*target_id))
+            .filter(|target_id| !self.reusable_entity(*target_id))
             .collect();
         for target_id in assignment_targets {
             if let Some((name, fix)) = self.readonly_root(target_id) {
@@ -19181,7 +19274,7 @@ impl<'src> Analyzer<'src> {
             })
             // S1: keyed on the CALL SITE, never the callee — an entry call
             // into a `&mut`-parameter std function must keep its diagnostic.
-            .filter(|call_id| !self.frozen_entity(*call_id))
+            .filter(|call_id| !self.reusable_entity(*call_id))
             .collect();
         for call_id in call_ids {
             let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -19276,7 +19369,7 @@ impl<'src> Analyzer<'src> {
         let mut leaks: Vec<Id> = Vec::new();
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             // S1: the leak anchors inside the iterated expression.
-            if self.frozen_entity(*expr_id) {
+            if self.reusable_entity(*expr_id) {
                 continue;
             }
             match expr {
@@ -19348,7 +19441,7 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             })
             // S1: the reference expression is its own anchor.
-            .filter(|(reference_id, _)| !self.frozen_entity(*reference_id))
+            .filter(|(reference_id, _)| !self.reusable_entity(*reference_id))
             .collect();
         for (reference_id, operand_id) in references {
             if let Some((name, fix)) = self.readonly_root(operand_id) {
@@ -19396,7 +19489,7 @@ impl<'src> Analyzer<'src> {
             })
             // S1: a binding's diagnostics anchor at its own declaration.
             // Synthetic and derived bindings have no frozen range and stay.
-            .filter(|(binding_id, ..)| !self.frozen_entity(*binding_id))
+            .filter(|(binding_id, ..)| !self.reusable_entity(*binding_id))
             .collect();
         for (binding_id, mutable, initial, name, name_span) in bindings {
             let holds_view = self.binding_or_param_is_view(binding_id);
@@ -19456,7 +19549,7 @@ impl<'src> Analyzer<'src> {
             })
             // S1: keyed on the call site, never the callee (as in
             // `check_mutable_arguments` above).
-            .filter(|call_id| !self.frozen_entity(*call_id))
+            .filter(|call_id| !self.reusable_entity(*call_id))
             .collect();
         for call_id in call_ids {
             let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -19665,7 +19758,7 @@ impl<'src> Analyzer<'src> {
             })
             // S1: keyed on the call site — the `.attr` node is synthesized
             // into the writing file's range, so entry calls always survive.
-            .filter(|(call_id, _)| !self.frozen_entity(*call_id))
+            .filter(|(call_id, _)| !self.reusable_entity(*call_id))
             .collect();
         for (_, name_argument) in candidates {
             if !matches!(
@@ -19776,14 +19869,14 @@ impl<'src> Analyzer<'src> {
         // `[must_use]` function discarded in entry code still warns (the
         // statement is entry-side); std's own discards were pinned clean.
         for function in self.functions.values() {
-            if self.frozen_entity(function.id) {
+            if self.reusable_entity(function.id) {
                 continue;
             }
             statements.extend(function.body.0.iter().copied());
         }
         for (block_id, expr) in self.expr_id_to_expr_map.iter() {
             if let Expr::Block((block_statements, _tail)) = expr {
-                if self.frozen_entity(*block_id) {
+                if self.reusable_entity(*block_id) {
                     continue;
                 }
                 statements.extend(block_statements.iter().copied());
@@ -19832,13 +19925,20 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             call_subjects.insert(call.subject_id);
+            // M19 T1: was `std_sources.contains(source_of_id(..))` — a LINEAR
+            // scan of `source_ranges` per call site, at 53 sources and 116k
+            // expressions most of this check's cost. `reusable_entity` is the
+            // sealed binary search, and it answers the wider question: a
+            // deprecation warning inside a reused module is remembered, not
+            // re-derived. The `source_of_id` below now runs only for the sites
+            // that actually warn.
+            if self.reusable_entity(*call_id) {
+                continue;
+            }
             let Some((name, steer)) = self.deprecated_steer(target_id) else {
                 continue;
             };
             let source = self.source_of_id(*call_id).unwrap_or(SourceId(0));
-            if self.std_sources.contains(&source) {
-                continue;
-            }
             let span = self
                 .member_name_spans
                 .get(call_id)
@@ -19853,16 +19953,13 @@ impl<'src> Analyzer<'src> {
             let Expr::Local(target_id) = expr else {
                 continue;
             };
-            if call_subjects.contains(expr_id) {
+            if call_subjects.contains(expr_id) || self.reusable_entity(*expr_id) {
                 continue;
             }
             let Some((name, steer)) = self.deprecated_steer(target_id) else {
                 continue;
             };
             let source = self.source_of_id(*expr_id).unwrap_or(SourceId(0));
-            if self.std_sources.contains(&source) {
-                continue;
-            }
             let span = **self.span_map.get(expr_id).unwrap_or(&&EMPTY_SPAN);
             sites.push((span, source, format!("`{name}` is deprecated; {steer}")));
         }
@@ -28864,6 +28961,204 @@ impl<'src> Analyzer<'src> {
             .frozen_ranges
             .partition_point(|(start, _)| *start <= id.0);
         index > 0 && id.0 < self.frozen_ranges[index - 1].1
+    }
+
+    /// Seals [`Self::world_ranges`] from the cached world's own sources — M19
+    /// T1's widening of the seam above (`per-module-analysis-reuse.md` §5).
+    ///
+    /// `reusable` is the set the caller decided is eligible: every non-entry
+    /// source of a world this analysis was SERVED from the base cache, minus
+    /// the ones the entry dirtied. Every such range lies below the entry's own
+    /// walk (ids are minted monotonically and the entry walks last, §2.1), so
+    /// the sealed set is disjoint and sortable exactly as std's is.
+    ///
+    /// [`DERIVED_SOURCE`] can never be in `reusable` — it is `SourceId::MAX`
+    /// and the caller builds the set from the world's real source indices — so
+    /// generated entities walked from the ENTRY stay checked, which is the
+    /// same conservative default `frozen_entity` documents.
+    fn seal_world_ranges(&mut self, reusable: &HashSet<SourceId>) {
+        self.world_ranges.clear();
+        self.reused_sources.clear();
+        if reusable.is_empty() || full_scan_checks_forced() || !world_reuse_enabled() {
+            return;
+        }
+        self.world_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| reusable.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.world_ranges.sort_unstable();
+        self.reused_sources = reusable.iter().copied().collect();
+        self.reused_sources.sort_unstable();
+    }
+
+    /// Whether `id` was minted by a source this analysis is REUSING — a module
+    /// of a base-cached world whose content is unchanged and whose type slots
+    /// the entry did not move (M19 T1, `per-module-analysis-reuse.md` §4.1).
+    fn world_entity(&self, id: Id) -> bool {
+        let index = self
+            .world_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < self.world_ranges[index - 1].1
+    }
+
+    /// The predicate the **Class A** checks ask (§3.3): module-local given the
+    /// world, so a std entity's diagnostics are known absent AND a cached
+    /// module's are remembered — the second half being what
+    /// [`Self::replay_world_diagnostics`] splices back in.
+    ///
+    /// Class B (coherence, conformance, duplicates) and Class C
+    /// (instantiation-driven) must keep asking [`Self::frozen_entity`]: an
+    /// impl written in the entry can make a MODULE's impl a duplicate, and a
+    /// module-level generic can be ground by the entry, so neither answer is
+    /// the module's own.
+    fn reusable_entity(&self, id: Id) -> bool {
+        self.frozen_entity(id) || self.world_entity(id)
+    }
+
+    /// The file a diagnostic at `index` will publish under — the same
+    /// resolution `analyze`'s tail runs over `diagnostic_source_marks` when it
+    /// materializes `Program::diagnostic_sources`. Read here so a record is
+    /// filed under the file its diagnostic will actually claim, not under
+    /// whatever was current when the check pushed it.
+    fn diagnostic_source_at(&self, index: usize) -> SourceId {
+        self.diagnostic_source_marks
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= index)
+            .map(|(_, source)| *source)
+            .unwrap_or(SourceId(0))
+    }
+
+    /// Harvests what ONE Class A check just derived, filed per source (M19 T1,
+    /// `per-module-analysis-reuse.md` §3.2).
+    ///
+    /// Per check rather than per phase, and that is the load-bearing detail:
+    /// the check sequence interleaves Class B (coherence) and Class C
+    /// (instantiation-driven) calls, which keep running over every module on
+    /// every analysis. Recording a window that contained one of those would
+    /// replay a diagnostic the next analysis also re-derives, and the module
+    /// would report it twice. The window is therefore exactly the calls that
+    /// are actually routed through [`Self::reusable_entity`].
+    ///
+    /// Costs nothing on the overwhelmingly common path: a check that pushed
+    /// nothing iterates two empty ranges.
+    fn record_reusable_window(&mut self, diagnostics_from: usize, warnings_from: usize) {
+        for index in diagnostics_from..self.diagnostics.len() {
+            let source = self.diagnostic_source_at(index);
+            if source == SourceId(0) || source == DERIVED_SOURCE {
+                continue;
+            }
+            if Self::reaches_outside_the_world(&self.diagnostics[index]) {
+                self.reuse_unrecordable.insert(source.0);
+                continue;
+            }
+            self.reuse_derived
+                .entry(source.0)
+                .or_default()
+                .diagnostics
+                .push(self.diagnostics[index].clone());
+        }
+        for index in warnings_from..self.warnings.len() {
+            let source = self
+                .warning_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0));
+            if source == SourceId(0) || source == DERIVED_SOURCE {
+                continue;
+            }
+            if Self::reaches_outside_the_world(&self.warnings[index]) {
+                self.reuse_unrecordable.insert(source.0);
+                continue;
+            }
+            self.reuse_derived
+                .entry(source.0)
+                .or_default()
+                .warnings
+                .push(self.warnings[index].clone());
+        }
+    }
+
+    /// Whether a module's diagnostic points at the ENTRY — a `Note.source` or
+    /// a trace hop naming `SourceId(0)`.
+    ///
+    /// A `SourceId` is an index into the world's `sources` vector and index 0
+    /// is always the entry, but WHICH entry is not part of the base-cache key:
+    /// two files in one package share a world and a record. A remembered note
+    /// into "the entry" would therefore be replayed over a different file's
+    /// text, spans and all — the E1/B112 harm, arrived at from the other side.
+    /// So a module that produced one is not recorded at all, and re-derives on
+    /// every analysis. Class A's whole premise is that its answers stay inside
+    /// the module, so this is a guard against the premise being wrong
+    /// somewhere, not a case anything is expected to hit.
+    fn reaches_outside_the_world(error: &crate::error::Error) -> bool {
+        let entry_note = |note: &Option<crate::error::Note>| {
+            note.as_ref()
+                .is_some_and(|note| note.source == Some(SourceId(0)))
+        };
+        entry_note(&error.note)
+            || error
+                .trace
+                .iter()
+                .any(|hop| hop.note.source == Some(SourceId(0)))
+    }
+
+    /// The Class A record this analysis is entitled to write: one entry per
+    /// source it actually RE-DERIVED, including the clean ones.
+    ///
+    /// The clean ones matter as much as the dirty ones — a module with no
+    /// entry in the record is a module with nothing remembered, and reuse
+    /// refuses to activate for it. Recording "I checked this module and it
+    /// said nothing" is the whole answer for the overwhelming majority of a
+    /// program's files.
+    fn take_reuse_record(
+        &mut self,
+        source_count: usize,
+    ) -> (HashMap<u32, ModuleDiagnostics>, HashSet<u32>) {
+        let derived = std::mem::take(&mut self.reuse_derived);
+        let unrecordable = std::mem::take(&mut self.reuse_unrecordable);
+        let mut record = HashMap::default();
+        for index in 1..source_count as u32 {
+            let source = SourceId(index);
+            if self.reused_sources.binary_search(&source).is_ok()
+                || self.entry_dirty_sources.contains(&source)
+                || unrecordable.contains(&index)
+            {
+                continue;
+            }
+            record.insert(index, derived.get(&index).cloned().unwrap_or_default());
+        }
+        (record, unrecordable)
+    }
+
+    /// Splices a reused module's remembered Class A output back in (§3.2).
+    ///
+    /// A splice, not a re-derivation, and it needs no repair: the spans are
+    /// byte offsets into the module's own unchanged text, the messages are
+    /// already rendered against a world under the same key, and the published
+    /// ORDER is decided later by `normalize_diagnostic_order`'s `sort_in_step`
+    /// — so where in the phase this lands cannot be observed.
+    fn replay_world_diagnostics(&mut self, records: &HashMap<u32, ModuleDiagnostics>) {
+        let reused = self.reused_sources.clone();
+        for source in reused {
+            let Some(record) = records.get(&source.0) else {
+                continue;
+            };
+            let from = self.diagnostics.len();
+            self.diagnostics.extend(record.diagnostics.iter().cloned());
+            self.attribute_new_diagnostics(from, source);
+            // `warning_sources` is padded lazily (`sort_in_step` resizes it),
+            // so materialize the implicit tail before pushing pairs or the
+            // replayed warnings would steal an earlier one's file.
+            self.warning_sources
+                .resize(self.warnings.len(), SourceId(0));
+            for warning in &record.warnings {
+                self.warnings.push(warning.clone());
+                self.warning_sources.push(source);
+            }
+        }
     }
 
     fn resolve_constraints(&mut self) -> bool {
@@ -38704,7 +38999,7 @@ pub enum Intrinsic {
 /// Identifies a source file within a compiled `Program` — an index into
 /// `Program.sources`. `SourceId(0)` is always the entry file; the rest are
 /// `std` package modules pulled in during analysis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceId(pub u32);
 
 /// The source assigned to `[derive(..)]`-synthesized entities. Their spans are
@@ -40101,6 +40396,49 @@ pub fn set_full_scan_checks(enabled: bool) {
 
 pub(crate) fn full_scan_checks_forced() -> bool {
     FULL_SCAN_CHECKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// M19 T1's own disable switch (`per-module-analysis-reuse.md` §5, the
+/// red-first pin): turns the WIDENED half of the seam off — a cached world's
+/// modules are checked in full and nothing is replayed — while leaving std's
+/// S1 skip exactly as it was.
+///
+/// Two things need it. The differential runs the corpus with reuse forced off
+/// against the same corpus with it on, and demands byte-identical diagnostics,
+/// warnings and emitted JS. And a phase pin asserts the switch MOVES the
+/// milliseconds: a seam that costs nothing to disable is a seam that is not
+/// running.
+///
+/// Separate from `FULL_SCAN_CHECKS` on purpose. That one is S1's gate and
+/// turns off std's skip too, so it cannot tell "the widening broke it" from
+/// "the original seam broke it".
+static WORLD_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_world_reuse(enabled: bool) {
+    WORLD_REUSE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn world_reuse_enabled() -> bool {
+    WORLD_REUSE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// How many sources the last top-level analysis on this thread REUSED, how many
+// the entry dirtied, and how many the world held — M19 T0's census and T1's own
+// counter, read by the pins the way `generic_bound_checks()` is read by tranche
+// 1's.
+//
+// Thread-local because an analysis runs on its own spawned thread and two
+// analyses must never read each other's count; the LSP and the CLI both land
+// one analysis per thread.
+thread_local! {
+    static REUSE_CENSUS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[doc(hidden)]
+pub fn reuse_census() -> (usize, usize, usize) {
+    REUSE_CENSUS.with(std::cell::Cell::get)
 }
 
 /// Forces `analyze` to run `build()` twice back-to-back — the S2 pin's
@@ -42570,6 +42908,10 @@ pub fn base_cache_clear() {
         }
         cache.retained_bytes = 0;
     }
+    // M19 T1: the checks record is keyed by the same worlds and must go with
+    // them, or a cleared cache would still replay a remembered diagnostic on
+    // its next miss-then-hit round.
+    checked_cache_clear();
 }
 
 /// The workspace half of a [`BaseCacheKey`], rendered as sorted rows: the
@@ -42619,6 +42961,174 @@ fn workspace_fingerprint(
         rows.push(format!("seed {index}::{module}"));
     }
     rows
+}
+
+// ---------------------------------------------------------------------------
+// M19 T1 — the replay unit and its cache (`per-module-analysis-reuse.md` §3.2)
+
+/// One cached module's remembered Class A output. Small by construction: a
+/// clean module records two empty vectors, and the spans inside are byte
+/// offsets into that module's own unchanged text, so nothing has to be
+/// relocated on the way back in.
+#[derive(Debug, Clone, Default)]
+struct ModuleDiagnostics {
+    diagnostics: Vec<crate::error::Error>,
+    warnings: Vec<crate::error::Error>,
+}
+
+/// What one [`BaseCacheKey`]'s world remembers about its own modules' checks.
+///
+/// The validation is deliberately belt-and-braces. `source_hashes` re-states
+/// the E12 content rule at THIS seam rather than trusting that the base cache
+/// evicted in step — the two caches are separate maps and a checks record must
+/// never outlive the world's content. `sources_fingerprint` is §3.2's
+/// condition made checkable: a replayed `Note.source` is an INDEX into the
+/// world's `sources` vector, so the record is only replayable while that
+/// vector still names the same files in the same order.
+struct WorldChecks {
+    source_hashes: Vec<u64>,
+    sources_fingerprint: u64,
+    per_source: HashMap<u32, ModuleDiagnostics>,
+}
+
+/// The recorded checks, keyed exactly as the worlds are. Not stored inside
+/// [`StoredWorld`] because the record is filled AFTER the world is stored —
+/// the checks run past the entry walk — and because a world evicted for bytes
+/// (M24) can be rebuilt while its record stays valid under the same content.
+static CHECKED_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, WorldChecks>>> =
+    std::sync::OnceLock::new();
+
+/// The record map's key bound. The values are diagnostics — kilobytes at
+/// worst against the base cache's megabytes — so this is a leak stop, not a
+/// budget, and it does the crudest thing that cannot grow: past the bound the
+/// map starts over. A session that meets more than this many world shapes
+/// pays one full check phase per shape afterwards, which is what it paid
+/// before this cache existed.
+const CHECKED_CACHE_KEYS: usize = 256;
+
+/// §3.2's `sources_fingerprint`: the WORLD's source paths, in order, hashed.
+///
+/// The world's, which is to say `sources[1..]` — `sources[0]` is the entry,
+/// and the base-cache key deliberately does not carry the entry's path, so two
+/// entries in one package share a key and a record. Hashing the entry here
+/// would refuse every record the moment a second file in the same package was
+/// analyzed, which is precisely the session this tranche exists for.
+///
+/// Public because the invariant it guards is asserted, not commented (the
+/// owner's Q5 answer), and an assertion nothing can exercise is a comment
+/// with a panic in it — the pin reorders a source list and calls
+/// [`assert_replay_sources_stable`] directly.
+#[doc(hidden)]
+pub fn replay_sources_fingerprint(sources: &[PathBuf]) -> u64 {
+    let mut rendered = String::new();
+    for source in sources {
+        rendered.push_str(&source.to_string_lossy());
+        rendered.push('\u{0}');
+    }
+    crate::content_hash(&rendered)
+}
+
+/// The `Note.source` index invariant, asserted (`per-module-analysis-reuse.md`
+/// §3.2, owner's Q5).
+///
+/// A replayed note carries a `SourceId` INDEX into the world's `sources`
+/// vector, never a path. That is stable today — the base-cache clone preserves
+/// the vector — and it breaks SILENTLY the moment any later tranche reorders
+/// or prunes `sources`: the note keeps pointing at index 7 and index 7 is now
+/// a different file. The failure mode is a note drawn over the wrong file,
+/// which is the exact harm E1/B112 exist to stop, so it is a hard assertion
+/// rather than a comment. It costs one `u64` comparison per replayed module.
+#[doc(hidden)]
+pub fn assert_replay_sources_stable(recorded: u64, sources: &[PathBuf]) {
+    assert_eq!(
+        recorded,
+        replay_sources_fingerprint(sources),
+        "M19 T1 replay: the world's `sources` vector moved under a recorded \
+         diagnostic set. Replayed `Note.source` values are INDICES into it \
+         (`per-module-analysis-reuse.md` §3.2), so a reordered or pruned \
+         vector would point every remembered note at the wrong file. Whatever \
+         reordered `sources` must invalidate the checks record with it."
+    );
+}
+
+/// The recorded checks for `key`, if they still describe this world's content.
+/// Cloned out under the lock: the values are diagnostics, and a session with a
+/// clean world clones two empty vectors per module.
+fn checked_cache_lookup(
+    key: &BaseCacheKey,
+    sources: &[PathBuf],
+    source_hashes: &[u64],
+) -> Option<HashMap<u32, ModuleDiagnostics>> {
+    let cache = CHECKED_CACHE.get()?;
+    let state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recorded = state.get(key)?;
+    // `[0]` is the entry, which is the file that changed; every other source
+    // must be byte-identical to the run that recorded, or the remembered
+    // answers are about text nobody is compiling.
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+    {
+        return None;
+    }
+    assert_replay_sources_stable(recorded.sources_fingerprint, &sources[1..]);
+    Some(recorded.per_source.clone())
+}
+
+/// Records what this analysis derived for the modules it actually re-derived.
+/// Merges rather than replaces: a run that reused half the world still knows
+/// the truth about the other half, and the halves are recorded under the same
+/// content.
+fn checked_cache_store(
+    key: &BaseCacheKey,
+    sources: &[PathBuf],
+    source_hashes: &[u64],
+    derived: HashMap<u32, ModuleDiagnostics>,
+    purge: &HashSet<u32>,
+) {
+    let cache = CHECKED_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fingerprint = replay_sources_fingerprint(&sources[1..]);
+    let existing = state.get(key).filter(|recorded| {
+        recorded.source_hashes.len() == source_hashes.len()
+            && recorded.source_hashes[1..] == source_hashes[1..]
+            && recorded.sources_fingerprint == fingerprint
+    });
+    let mut per_source = existing
+        .map(|recorded| recorded.per_source.clone())
+        .unwrap_or_default();
+    // A source this analysis found unrecordable loses whatever an EARLIER one
+    // remembered about it: the merge above would otherwise keep serving a
+    // record the current derivation has just declared unfit.
+    for index in purge {
+        per_source.remove(index);
+    }
+    per_source.extend(derived);
+    if state.len() >= CHECKED_CACHE_KEYS && !state.contains_key(key) {
+        state.clear();
+    }
+    state.insert(
+        key.clone(),
+        WorldChecks {
+            source_hashes: source_hashes.to_vec(),
+            sources_fingerprint: fingerprint,
+            per_source,
+        },
+    );
+}
+
+/// Drops every recorded checks set — the companion of [`base_cache_clear`],
+/// so a test that clears the worlds is not served a record of one.
+fn checked_cache_clear() {
+    if let Some(cache) = CHECKED_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 /// A validated, entry-patched clone of the cached world for this key, or
@@ -43242,6 +43752,10 @@ fn analyze_inner<'src>(
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
         world.phase_marks = PhaseMarks::started_at(phase_analyze_start);
+        // M19 T0/T1: from here every type-slot write is the ENTRY's, so
+        // `write_type_slot` can attribute the ones that move a module's slots.
+        // Set before the entry expansion, which is already entry work.
+        world.analyzer.entry_phase = true;
         if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
             // Generated code demands a module this world never loaded:
             // rebuild fresh, with the load-region expansion restored.
@@ -43256,7 +43770,19 @@ fn analyze_inner<'src>(
                 false,
             );
         }
-        return analyze_over_world(world, nodes, std, pkg_root, platform, workspace);
+        // M19 T1: a HIT is the one shape §2.1 proves id-stable — the clone
+        // hands back a byte-identical module prefix — so it is the only shape
+        // the widened seam activates on.
+        return analyze_over_world(
+            world,
+            nodes,
+            std,
+            pkg_root,
+            platform,
+            workspace,
+            Some(base_cache_key),
+            true,
+        );
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
@@ -44701,8 +45227,11 @@ fn analyze_inner<'src>(
         },
     };
     if base_cacheable && !entry_is_module {
-        base_cache_store(base_cache_key, &world);
+        base_cache_store(base_cache_key.clone(), &world);
     }
+    // After the store, so the world the cache holds is the pre-entry one it
+    // has always been.
+    world.analyzer.entry_phase = true;
     // The suppressed entry expansion runs here, symmetric with the hit path
     // (§6.13); a generated demand for an unloaded module rebuilds fresh.
     if base_cacheable
@@ -44720,12 +45249,31 @@ fn analyze_inner<'src>(
             false,
         );
     }
-    analyze_over_world(world, nodes, std, pkg_root, platform, workspace)
+    // A MISS derives everything and RECORDS it; only a hit replays. The key
+    // rides along either way, since the record is keyed by the world it
+    // describes.
+    analyze_over_world(
+        world,
+        nodes,
+        std,
+        pkg_root,
+        platform,
+        workspace,
+        (base_cacheable && !entry_is_module).then_some(base_cache_key),
+        false,
+    )
 }
 
 /// The entry tail: walks the entry over a resolved [`World`], builds,
 /// checks, and extracts the `Program`. Byte-identical to the former tail
 /// of `analyze` — the destructure below restores its locals.
+///
+/// `checks_key` and `from_base_cache` are M19 T1's two extra inputs
+/// (`per-module-analysis-reuse.md` §4.1): the key this world's remembered
+/// module checks are filed under, and whether the world was SERVED from the
+/// base cache — which is what makes the module id prefix the stored world's,
+/// and so the only shape the widened seam may run on.
+#[allow(clippy::too_many_arguments, reason = "the entry tail's whole context")]
 fn analyze_over_world<'src>(
     world: World<'src>,
     nodes: &'src Spanned<NodeList<'src>>,
@@ -44733,6 +45281,8 @@ fn analyze_over_world<'src>(
     pkg_root: &Path,
     platform: Platform,
     workspace: &Workspace,
+    checks_key: Option<BaseCacheKey>,
+    from_base_cache: bool,
 ) -> Option<Program<'src>> {
     let World {
         mut analyzer,
@@ -44840,11 +45390,56 @@ fn analyze_over_world<'src>(
     if build_twice_forced() {
         analyzer.build();
     }
+    // ------------------------------------------------------------------
+    // M19 T1: which of this world's modules are reusable for THIS analysis
+    // (`per-module-analysis-reuse.md` §4.1). Three terms, and all three have
+    // to hold:
+    //
+    //  1. the world came from a base-cache HIT — which is what makes every
+    //     module entity occupy the byte-identical id prefix §2.1 proves, and
+    //     what has already re-validated every loaded source's CONTENT;
+    //  2. the entry did not move the module's type slots (T0's dirty bit);
+    //  3. a checks record for this key exists and still describes this
+    //     content — because a skipped check's diagnostics are REMEMBERED, not
+    //     known absent, and a module with nothing remembered has to run.
+    //
+    // Reuse is all-or-nothing per world by design (the owner's Q1): the key
+    // is the world's, so editing any module in the program throws away every
+    // module's record for that world. No dependency graph, and sound in the
+    // presence of §4's whole-program impl visibility, which an import-closure
+    // key could not be.
+    let reuse_candidates: HashSet<SourceId> = if from_base_cache && !entry_is_module {
+        (1..sources.len() as u32)
+            .map(SourceId)
+            .filter(|source| !analyzer.entry_dirty_sources.contains(source))
+            .collect()
+    } else {
+        HashSet::default()
+    };
+    let replay_records = if reuse_candidates.is_empty() {
+        HashMap::default()
+    } else {
+        checks_key
+            .as_ref()
+            .and_then(|key| checked_cache_lookup(key, &sources, &source_hashes))
+            .unwrap_or_default()
+    };
+    let reusable_sources: HashSet<SourceId> = reuse_candidates
+        .iter()
+        .copied()
+        .filter(|source| replay_records.contains_key(&source.0))
+        .collect();
     unless_cancelled! {
         // Every source range is recorded by now; project the frozen (std) sources
         // onto entity-id space so the definition-site checks below can skip their
         // entities with a binary search (S1, analysis-reuse.md §6).
         analyzer.seal_frozen_ranges();
+        // The widened set, sealed beside it: the cached world's own modules,
+        // which the Class A checks skip and whose diagnostics are replayed.
+        analyzer.seal_world_ranges(&reusable_sources);
+        // The splice (§3.2). Before every check that could add to the lists,
+        // and the published order is `sort_in_step`'s either way.
+        analyzer.replay_world_diagnostics(&replay_records);
         // Infer the `borrows` effect before any check reads it (readonly-mutation
         // and the scalar-view lowering both consult `Function.borrows`).
         analyzer.infer_borrows();
@@ -44948,6 +45543,36 @@ fn analyze_over_world<'src>(
         // rides here with the rest rather than at the declaration's walk (where
         // "which `main` is the entry" is not yet a question the walk can answer).
         analyzer.check_entry_main_parameters(global_scope_id);
+    }
+    // ------------------------------------------------------------------
+    // M19 T1's Class A window (`per-module-analysis-reuse.md` §3.3).
+    //
+    // Every call under `class_a_checks!` is routed through
+    // `Analyzer::reusable_entity`, so on a reusing analysis it does not visit
+    // a cached module's bodies or sites at all — and every call under it
+    // RECORDS what it derived, per source, for the analysis that will.
+    //
+    // The recording is per call rather than per phase because the sequence
+    // interleaves Class B (coherence: an entry impl can make a MODULE's impl a
+    // duplicate) and Class C (instantiation-driven: the entry can ground a
+    // module-level generic), which keep running over every module on every
+    // analysis. A window that swallowed one of those would replay a diagnostic
+    // the next analysis also re-derives, and the module would report it twice.
+    // Adding a check here without routing it through `reusable_entity` is
+    // exactly that bug; adding one there without listing it here silently
+    // loses its module diagnostics on the next hit. The corpus differential in
+    // `check_scope_differential.rs` is what catches either.
+    macro_rules! class_a_checks {
+        ($($call:expr;)+) => {
+            $( if !crate::cancel::cancelled() {
+                let diagnostics_before = analyzer.diagnostics.len();
+                let warnings_before = analyzer.warnings.len();
+                $call;
+                analyzer.record_reusable_window(diagnostics_before, warnings_before);
+            } )+
+        };
+    }
+    class_a_checks! {
         analyzer.check_readonly_mutation();
         analyzer.check_mutable_arguments();
         analyzer.check_mutable_references();
@@ -44960,6 +45585,8 @@ fn analyze_over_world<'src>(
         analyzer.check_view_escape();
         analyzer.check_invalidation();
         analyzer.check_reseat_escape();
+    }
+    unless_cancelled! {
         analyzer.check_wire_boundary();
         analyzer.check_json_boundary();
         analyzer.check_hashable_boundary();
@@ -44971,17 +45598,59 @@ fn analyze_over_world<'src>(
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
         analyzer.check_tuple_spreads();
+    }
+    unless_cancelled! {
         // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
         // inert unless `std::dev` is loaded. Runs inside `analyze()` (like the S2a
         // classification) so both the CLI and the LSP/test pipelines get it.
+        //
+        // NOT in M19 T1's Class A window, though §3.3 files it there. It
+        // re-infers each `stash` value's type through `&mut self` — a mint and
+        // possibly a slot write — so skipping a module's sites moves state a
+        // later pass reads, which is not what "module-local" is allowed to
+        // mean. Freezing it needs the mint frozen with it.
         analyzer.check_hmr_transfer_bounds();
         // The observable half of C4 resource classification (destruction.md §4):
         // R10 (container/external-generic resource arguments) and R12 (no coercion
         // to `any`). R1–R9 (moves, loans, conditional/loop moves, captures) follow;
         // then R11 (per-instantiation move-clean generics). Destructors come later.
+        //
+        // R10 is NOT in the Class A window either, and for a sharper reason:
+        // its report doubles as R11's DEDUP SET
+        // (`reported_container_structures`, read at
+        // `check_instantiation_container_resources`). R11 is Class C and keeps
+        // running whole-program, so a frozen R10 would leave the set short and
+        // R11 would report a structure R10 had already reported — an extra
+        // diagnostic on the reusing analysis and on no other. §3.3's Class A
+        // list misses that this check carries whole-program state; freezing it
+        // means freezing the set with it.
         analyzer.check_container_resource_arguments();
+    }
+    class_a_checks! {
         analyzer.check_resource_any_coercion();
         analyzer.check_resource_moves();
+    }
+    // M19 T1: record what this analysis actually RE-DERIVED, for the analysis
+    // that will replay it (§3.2). Three exclusions, each load-bearing:
+    //
+    //  - a module this analysis REUSED was not re-derived, so its record
+    //    stands and must not be overwritten by nothing;
+    //  - a module the entry DIRTIED was derived against a slot the buffer
+    //    moved, so its answer belongs to this keystroke and not to the
+    //    module — recording it would replay one entry's grounding onto
+    //    another's;
+    //  - a CANCELLED phase is a prefix of itself (M26), and a prefix recorded
+    //    as a whole would publish a truncated module on every later hit.
+    if let Some(key) = &checks_key
+        && !entry_is_module
+        && !crate::cancel::cancelled()
+    {
+        let (derived, unrecordable) = analyzer.take_reuse_record(sources.len());
+        if !derived.is_empty() || !unrecordable.is_empty() {
+            checked_cache_store(key, &sources, &source_hashes, derived, &unrecordable);
+        }
+    }
+    unless_cancelled! {
         // B68 (affine-moves.md §9.4): type every `drop(x)` argument that carries no
         // type on its own expr id — a value argument such as a call result — before
         // anything asks what a sink call destroys. R11's forwarding check below and
@@ -45533,6 +46202,23 @@ fn analyze_over_world<'src>(
         .filter_map(|implementation| implementation.declarations.get("value").copied())
         .collect();
 
+    // M19 T0's census, T1's counter (`per-module-analysis-reuse.md` §5, T0).
+    // Read before the analyzer is dismantled into the `Program` below. Macro
+    // worlds are nested analyses on this same thread, so they leave the outer
+    // analysis's census alone — exactly as they leave its phase line alone.
+    let reuse_census = (
+        analyzer.reused_sources.len(),
+        analyzer
+            .entry_dirty_sources
+            .iter()
+            .filter(|source| source.0 != 0 && source.0 < sources.len() as u32)
+            .count(),
+        sources.len().saturating_sub(1),
+    );
+    if !crate::macros::in_macro_world() {
+        REUSE_CENSUS.with(|census| census.set(reuse_census));
+    }
+
     // The phase split, one line per top-level analysis (macro worlds are
     // nested analyses; their line would be noise inside the outer one).
     // Stderr for the same reason the leak line is: `build --stdout`'s
@@ -45544,6 +46230,16 @@ fn analyze_over_world<'src>(
             phase_marks.base.as_secs_f64() * 1000.0,
             phase_build.as_secs_f64() * 1000.0,
             phase_checks_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        // A second line rather than more fields on the first: N43 made those
+        // labels honest and a reader parses them positionally. `reused` is how
+        // many of the world's modules skipped their Class A checks and
+        // replayed instead; `entry-dirty` is how many the entry's own
+        // resolution moved a type slot in, which is the number T0 exists to
+        // measure and the one that decides whether any of this pays.
+        eprintln!(
+            "[vilan phase] reused {}/{} entry-dirty {}",
+            reuse_census.0, reuse_census.2, reuse_census.1,
         );
     }
 
