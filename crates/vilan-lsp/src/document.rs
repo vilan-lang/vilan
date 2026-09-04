@@ -58,6 +58,21 @@ struct ProjectContext {
     /// still degrades exactly as it did — the difference is that the reason is
     /// now published instead of swallowed.
     manifest_problem: Option<ManifestProblem>,
+    /// The directory of the `vilan.toml` this context resolved from — the
+    /// package's identity for E124's clock, which is keyed per PACKAGE and not
+    /// per file or per source root. `None` when no manifest was found.
+    manifest_dir: Option<PathBuf>,
+    /// E124's module-level slice: the package's entry names when NO entry loads
+    /// this file. `None` — the overwhelmingly common answer — when an entry
+    /// does load it, when the file is not the package's to judge, or when the
+    /// manifest is a `[library]` (no entries, no union, no gray).
+    unloaded_by_entries: Option<Vec<String>>,
+    /// Whether this file lives under the package's declared `generated` root.
+    /// It gets no top-level gray at either granularity: the file is machine-
+    /// written, `vilan fmt` already leaves it alone, and fading kolt's
+    /// 18,198-line lucide module wall to wall would be the paint's single
+    /// largest lie (`dead-code-paint.md` §1.5).
+    generated: bool,
 }
 
 impl ProjectContext {
@@ -69,6 +84,9 @@ impl ProjectContext {
             workspace: BuildWorkspace::default(),
             platform_reasons: Vec::new(),
             manifest_problem: None,
+            manifest_dir: None,
+            unloaded_by_entries: None,
+            generated: false,
         }
     }
 
@@ -167,6 +185,13 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             .iter()
             .map(|choice| (choice.platform, choice.reason.clause()))
             .collect();
+        // E124's module-level slice, taken off the SAME per-entry walk: a
+        // choice with reason `ReachedBy` means an entry loads this file, so for
+        // a multi-entry package the answer is already in hand and the slice is
+        // free. See `dead_items::unreached_module_entries`.
+        let unloaded_by_entries =
+            vilan_core::dead_items::unreached_module_entries(root, &manifest, entry_path, &choices);
+        let generated = vilan_core::dead_items::is_generated(root, &manifest, entry_path);
         let mut platforms = choices.into_iter().map(|choice| choice.platform);
         let platform = platforms.next();
         let shared_platforms: Vec<BuildPlatform> = platforms.collect();
@@ -184,6 +209,9 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             workspace,
             platform_reasons,
             manifest_problem,
+            manifest_dir: Some(root.to_path_buf()),
+            unloaded_by_entries,
+            generated,
         };
     }
 
@@ -229,6 +257,17 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             // above), so there is no colour to explain.
             platform_reasons: Vec::new(),
             manifest_problem,
+            // A `[library]` has no entries — validation refuses them outright —
+            // so it has no union and gets NO top-level gray, workspace member
+            // or not (`dead-code-paint.md` §4, determination 9). Every top-level
+            // item is surface a consumer may import, and that property is what
+            // saves a consumer from forking an under-exported package. Locals,
+            // unused imports and unreachable code stay painted; they need no
+            // entry. The `manifest_dir` stays `None` for the same reason: there
+            // is no package clock to key.
+            manifest_dir: None,
+            unloaded_by_entries: None,
+            generated: vilan_core::dead_items::is_generated(root, &manifest, entry_path),
         };
     }
 
@@ -673,6 +712,29 @@ pub struct Document {
     /// edit that changes which entry reaches a file has to invalidate every one
     /// of them, not only the ones that import the edited file.
     package_root: Option<PathBuf>,
+    /// E124: the directory of the `vilan.toml` this analysis resolved from —
+    /// the package the dead-item paint's clock is keyed by. `None` for a file
+    /// with no project, and for a `[library]`, which gets no top-level gray.
+    manifest_dir: Option<PathBuf>,
+    /// E124's module-level slice: the package's entry names when NO entry
+    /// loads this file. A module nothing builds is dead whole, and the answer
+    /// is a by-product of the per-entry walk `resolve_project_context` already
+    /// runs (`dead_items::unreached_module_entries`).
+    unloaded_by_entries: Option<Vec<String>>,
+    /// Whether this file is under the declared `generated` root — no top-level
+    /// gray at either granularity.
+    generated: bool,
+    /// E124's union, as of the last time the package clock landed one — the
+    /// LIVE side, owned by the server and handed to this document at publish
+    /// time, never by an analysis.
+    ///
+    /// `None` is the withdrawal, and it is the whole staleness rule: a top-level
+    /// gray may be arbitrarily stale in the direction of FEWER grays and must
+    /// never be served stale in the direction of more, because a gray is a
+    /// claim the user acts on by deleting and the fact that falsifies it lives
+    /// in another file (`dead-code-paint.md` §3.2, determination 8). Downgraded
+    /// on edit, upgraded on land.
+    package_reach: Option<Arc<crate::dead_items::PackageReach>>,
     /// E121's keystroke path: what this analysis's answers were, captured once
     /// when it was built, so a request between two landings costs an anchor and
     /// a lex instead of a walk of the whole analyzed program. Part of the
@@ -1184,6 +1246,10 @@ impl Document {
             import_roots: None,
             analysis_revision: 0,
             package_root: None,
+            manifest_dir: None,
+            unloaded_by_entries: None,
+            generated: false,
+            package_reach: None,
             // Nothing landed, so the keystroke path answers from syntax alone.
             landed: LandedSnapshot::default(),
         }
@@ -1235,6 +1301,9 @@ impl Document {
         let mut context = resolve_project_context(entry_path);
         let phase_context = phase_context_start.elapsed();
         let manifest_problem = context.manifest_problem.take();
+        let manifest_dir = context.manifest_dir.take();
+        let unloaded_by_entries = context.unloaded_by_entries.take();
+        let generated = context.generated;
         // E116: the DECLARED root, canonicalized, kept as the file's package
         // identity. Deliberately not the fallback below — a file with no
         // project has no package to be colored by, and rooting it at its own
@@ -1423,6 +1492,12 @@ impl Document {
             import_roots: Some(import_roots),
             analysis_revision: 0,
             package_root,
+            manifest_dir,
+            unloaded_by_entries,
+            generated,
+            // The union is the server's to hand over; a fresh analysis carries
+            // none, which is the withdrawn state and the safe one.
+            package_reach: None,
             landed: LandedSnapshot::default(),
         };
         // E121: the keystroke path's whole-program walk, paid HERE — once per
@@ -2101,6 +2176,13 @@ impl Document {
             import_roots,
             analysis_revision,
             package_root,
+            manifest_dir,
+            unloaded_by_entries,
+            generated,
+            // The union is LIVE state, not an analysis product: the server owns
+            // it and re-hands it at every publish, so an adoption must not
+            // carry the analysis's (always absent) copy over the document's.
+            package_reach: _,
             landed,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
@@ -2123,6 +2205,9 @@ impl Document {
         self.import_roots = import_roots;
         self.analysis_revision = analysis_revision;
         self.package_root = package_root;
+        self.manifest_dir = manifest_dir;
+        self.unloaded_by_entries = unloaded_by_entries;
+        self.generated = generated;
         // E121: the captured answers belong to the program that produced them,
         // so they are adopted with it. Nothing is recomputed here — the walk
         // was paid on the analysis thread.
@@ -3609,6 +3694,121 @@ impl Document {
             })
             .map(|(_, variable)| variable.name_span)
             .collect()
+    }
+
+    /// E124's module-level slice: this file's top-level items, faded whole,
+    /// because NO entry of the package loads the module — with the message
+    /// naming the entries that were asked.
+    ///
+    /// This is the coarse half of the dead-item paint and the one that costs
+    /// nothing: `platform_color::file_platform_choices` already runs a
+    /// per-entry module-level walk per keystroke to decide this file's colour,
+    /// and "no entry reached it" is that walk's own answer read a second way
+    /// (`dead-code-paint.md` §2.5). It also has none of the fine paint's
+    /// false-gray classes — the question is about the FILE, so nothing about
+    /// dispatch refinement, const initializers or context rewrites can make it
+    /// wrong — and it needs no cache and no clock.
+    ///
+    /// What it fades is deliberately the same two item kinds the fine paint
+    /// covers: a top-level `fun` and a module-level `let`. An unloaded module's
+    /// `struct` is as dead as its functions, but the owner's narrowing is the
+    /// narrowing — types are a different analysis — and a user who sees one
+    /// rule at two granularities can hold it in their head.
+    ///
+    /// Gated exactly as E114's three producers are: nothing fades while the
+    /// buffer is ahead of the analysis, and nothing fades in a file carrying a
+    /// diagnostic.
+    pub fn unloaded_module_paint(&self) -> Option<(String, Vec<Span>)> {
+        let entries = self.unloaded_by_entries.as_ref()?;
+        let program = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())?;
+        let spans: Vec<Span> = vilan_core::dead_items::paintable_items(program, SourceId(0))
+            .into_iter()
+            .map(|item| item.name_span)
+            .collect();
+        if spans.is_empty() {
+            return None;
+        }
+        let named = entries
+            .iter()
+            .map(|entry| format!("`{entry}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some((
+            format!("no entry loads this module (the package builds {named})"),
+            spans,
+        ))
+    }
+
+    /// E124's fine paint: the top-level `fun`s and module-level `let`s of this
+    /// file that NO entry of the package reaches — the spans the editor fades.
+    ///
+    /// The union is not computed here and cannot be. The language server
+    /// analyzes the OPEN file as the entry, so for most files there is no
+    /// `main` in the program at all and the reachability walk has no root to
+    /// start from (`dead-code-paint.md` §2.1, probe P5) — every term of the
+    /// union, including the one for the entry this file belongs to, comes from
+    /// a separately computed per-entry set on the package clock
+    /// (`crate::dead_items`). What happens here is the cheap half: this file's
+    /// candidates, minus the union, matched on `(canonical path, name span)`
+    /// because entity ids are minted per analysis and are not comparable across
+    /// the entries' three programs.
+    ///
+    /// Empty whenever there is no union in hand, which is the withdrawal: an
+    /// edit anywhere in the package drops it, and it returns when the clock
+    /// lands. Empty too under a declared `generated` root, and — through
+    /// `manifest_dir` being `None` — for a `[library]` and for a file with no
+    /// project.
+    ///
+    /// Gated as E114's producers are, and it needs the gate more: a salvaged
+    /// parse can lose a whole block or the file's entire tail, and **a smaller
+    /// program reads to a reachability walk as a deader one** (§3.3).
+    pub fn dead_item_spans(&self) -> Vec<Span> {
+        if self.generated {
+            return Vec::new();
+        }
+        let (Some(reach), Some(program)) = (
+            self.package_reach.as_ref(),
+            self.program
+                .as_ref()
+                .filter(|_| self.diagnostics.is_empty() && !self.is_stale()),
+        ) else {
+            return Vec::new();
+        };
+        // The module-level slice already fades this whole file; saying it twice
+        // over the same spans would publish two hints per declaration.
+        if self.unloaded_by_entries.is_some() {
+            return Vec::new();
+        }
+        let Some(path) = program.canonical_sources.first() else {
+            return Vec::new();
+        };
+        vilan_core::dead_items::paintable_items(program, SourceId(0))
+            .into_iter()
+            .filter(|item| {
+                !reach.reached.contains(&vilan_core::dead_items::ItemKey {
+                    path: path.clone(),
+                    name_span: item.name_span,
+                })
+            })
+            .map(|item| item.name_span)
+            .collect()
+    }
+
+    /// The directory of the `vilan.toml` this document's package is declared in
+    /// — the key of E124's per-package clock. `None` for a `[library]` and for
+    /// a file with no project, both of which get no top-level gray.
+    pub fn manifest_dir(&self) -> Option<&Path> {
+        self.manifest_dir.as_deref()
+    }
+
+    /// Hand this document the package union to paint from, or `None` to
+    /// withdraw. Called by the server at publish time and nowhere else — the
+    /// union belongs to the package, not to any one buffer.
+    pub fn set_package_reach(&mut self, reach: Option<Arc<crate::dead_items::PackageReach>>) {
+        self.package_reach = reach;
     }
 
     /// The statements this file can never reach (E114's unreachable third) — the
@@ -15071,5 +15271,321 @@ mod builder_chain_member_completion {
             !found.contains(&"twin".to_string()) && !found.contains(&"x".to_string()),
             "nothing from the OTHER call site's specialization: {found:?}",
         );
+    }
+}
+
+/// E124's paint, at both granularities (`proposal/dead-code-paint.md`).
+///
+/// These are the pins that need a MANIFEST — the module-level slice, the
+/// library rule and the `generated` root are all manifest facts, and the
+/// package union is a fact about several files at once, so none of them can be
+/// pinned on a single source string the way E114's three producers are. The
+/// definition's own pins (the exemptions, the type-level narrowing, the
+/// trait-impl class) live in `vilan-core/tests/dead_items.rs`.
+#[cfg(test)]
+mod dead_item_paint_tests {
+    use super::tests::std_root;
+    use super::*;
+    use std::sync::Arc;
+    use vilan_core::cancel::CancelToken;
+
+    /// The kolt shape, shrunk: two entries, a module both of them load, and a
+    /// module neither does.
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n[entry.client]\n\n[entry.server]\n";
+    const CLIENT: &str =
+        "import pkg::shared::used_by_client;\n\nfun main() {\n\tused_by_client();\n}\n";
+    const SERVER: &str =
+        "import pkg::shared::used_by_server;\n\nfun main() {\n\tused_by_server();\n}\n";
+    const SHARED: &str = "import std::io::print;\n\n\
+         let read_by_client: i32 = 1;\n\n\
+         let read_by_nobody: i32 = 2;\n\n\
+         fun used_by_client() {\n\tprint(i\"{read_by_client}\");\n}\n\n\
+         fun used_by_server() {\n\tprint(\"s\");\n}\n\n\
+         fun used_by_nobody() {\n\tprint(\"n\");\n}\n";
+    const ORPHAN: &str = "import std::io::print;\n\n\
+         let orphan_binding: i32 = 7;\n\n\
+         fun orphan_fun() {\n\tprint(\"o\");\n}\n";
+
+    fn workspace(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan-e124-{name}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        for (relative, contents) in files {
+            let path = directory.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("a scratch directory");
+            }
+            std::fs::write(path, contents).expect("a fixture file");
+        }
+        directory
+    }
+
+    /// The package's own two-entry fixture, on disk.
+    fn package(name: &str) -> PathBuf {
+        workspace(
+            name,
+            &[
+                ("vilan.toml", MANIFEST),
+                ("src/client.vl", CLIENT),
+                ("src/server.vl", SERVER),
+                ("src/shared.vl", SHARED),
+                ("src/orphan.vl", ORPHAN),
+            ],
+        )
+    }
+
+    fn open(directory: &Path, relative: &str) -> Document {
+        let path = directory.join(relative);
+        let text = std::fs::read_to_string(&path).expect("the fixture file");
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{relative} analyzes cleanly: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        document
+    }
+
+    /// The package's union, computed the way the server's clock computes it —
+    /// from disk, since these fixtures have no buffers.
+    fn union(directory: &Path) -> Option<Arc<crate::dead_items::PackageReach>> {
+        let entries = crate::dead_items::entry_paths(directory)?;
+        crate::dead_items::compute(&entries, &std_root(), 0, &CancelToken::new(), |path| {
+            std::fs::read_to_string(path).ok()
+        })
+        .map(Arc::new)
+    }
+
+    /// The source text each faded span covers.
+    fn named(document: &Document, spans: &[Span]) -> Vec<String> {
+        let text = document.analyzed_text();
+        let mut names: Vec<String> = spans
+            .iter()
+            .map(|span| text[span.start..span.end].to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **A module no entry loads is faded whole**, and the message names the
+    /// entries that were asked — the free slice (§2.5), which rides the
+    /// per-entry module walk the analysis already paid for.
+    #[test]
+    fn a_module_no_entry_loads_is_faded_whole() {
+        let directory = package("orphan");
+        let document = open(&directory, "src/orphan.vl");
+        let (message, spans) = document
+            .unloaded_module_paint()
+            .expect("no entry loads `orphan.vl`");
+        assert_eq!(
+            named(&document, &spans),
+            vec!["orphan_binding".to_string(), "orphan_fun".to_string()],
+            "both top-level items of the unloaded module fade",
+        );
+        assert!(
+            message.contains("`client`") && message.contains("`server`"),
+            "the message names the entries that were asked: {message}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other direction: a module an entry DOES load is not faded whole,
+    /// whatever is unused inside it. Without this the pin above would pass on a
+    /// paint that fades everything.
+    #[test]
+    fn a_module_an_entry_loads_is_never_faded_whole() {
+        let directory = package("loaded");
+        for relative in ["src/shared.vl", "src/client.vl", "src/server.vl"] {
+            let document = open(&directory, relative);
+            assert!(
+                document.unloaded_module_paint().is_none(),
+                "{relative} is loaded by an entry",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **The union is a union** (pin 12): an item reached by exactly one of the
+    /// two entries is not gray, and only the item neither reaches is.
+    ///
+    /// This is also the NO-MAIN pin (13): `shared.vl` has no `main`, so its own
+    /// analysis has no root to walk from — every term of the union comes from
+    /// the package clock, which is the finding that reframed the ruling.
+    #[test]
+    fn an_item_no_entry_reaches_is_faded_and_one_a_single_entry_reaches_is_not() {
+        let directory = package("union");
+        let mut document = open(&directory, "src/shared.vl");
+        assert!(
+            vilan_core::platform_color::paint_reachable_nodes(
+                document.program.as_ref().expect("a program")
+            )
+            .is_none(),
+            "`shared.vl` analyzed as its own entry has no `main` — the premise",
+        );
+        document.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&document, &document.dead_item_spans()),
+            vec!["read_by_nobody".to_string(), "used_by_nobody".to_string()],
+            "`used_by_client` and `used_by_server` are each reached by exactly \
+             ONE entry and live in the union; only what neither reaches grays",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Withdrawal** (pin 15, determination 8): with no union in hand the
+    /// paint is silent. This is the state every edit puts the package into, and
+    /// it is why a gray can never be served stale toward MORE grays — there is
+    /// nothing to serve.
+    #[test]
+    fn the_paint_is_silent_until_the_package_union_lands() {
+        let directory = package("withdrawn");
+        let mut document = open(&directory, "src/shared.vl");
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "no union, no gray — the withdrawn state",
+        );
+        document.set_package_reach(union(&directory));
+        assert!(
+            !document.dead_item_spans().is_empty(),
+            "the union lands and the gray returns",
+        );
+        document.set_package_reach(None);
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "withdrawing takes it off again, with no analysis in between",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A broken parse anywhere in the package suppresses the package's
+    /// top-level grays** (pin 17), not merely its own file's. A salvaged parse
+    /// can lose a whole block or the file's entire tail, and a smaller program
+    /// reads to a reachability walk as a deader one.
+    #[test]
+    fn a_broken_module_anywhere_refuses_the_whole_union() {
+        let directory = package("broken");
+        std::fs::write(
+            directory.join("src/shared.vl"),
+            format!("{SHARED}\nfun half_typed(: {{\n"),
+        )
+        .expect("break the module");
+        assert!(
+            union(&directory).is_none(),
+            "one broken module in the package refuses the union outright",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A `[library]`'s top-level items are never gray** (pins 18/19,
+    /// determination 9). A library has no entries — validation refuses them
+    /// outright — so there is no union and nothing to say. Every top-level item
+    /// is surface a consumer may import, and that is the property that saves a
+    /// consumer from forking an under-exported package.
+    #[test]
+    fn a_library_module_is_never_gray_at_either_granularity() {
+        let directory = workspace(
+            "library",
+            &[
+                ("vilan.toml", "[library]\nname = \"lib\"\n"),
+                (
+                    "src/lib.vl",
+                    "import std::io::print;\n\nfun exported() {\n\tprint(\"e\");\n}\n",
+                ),
+                ("src/aside.vl", ORPHAN),
+            ],
+        );
+        for relative in ["src/lib.vl", "src/aside.vl"] {
+            let mut document = open(&directory, relative);
+            assert!(
+                document.unloaded_module_paint().is_none(),
+                "{relative}: a library module is never faded whole",
+            );
+            document.set_package_reach(union(&directory));
+            assert!(
+                document.dead_item_spans().is_empty(),
+                "{relative}: a library item is never gray",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Nothing under a declared `generated` root is gray** (pin 9,
+    /// determination 3). The key already exists, kolt already sets it for
+    /// lucide, and it already means "this is not code you maintain": on kolt
+    /// the paint as ruled would have faded an 18,198-line machine-written
+    /// module wall to wall, 1,815 of its 1,820 items, forever.
+    #[test]
+    fn a_module_under_a_declared_generated_root_is_never_gray() {
+        let directory = workspace(
+            "generated",
+            &[
+                (
+                    "vilan.toml",
+                    "[package]\nname = \"app\"\ngenerated = \"src/icons\"\n\n[entry.server]\n",
+                ),
+                (
+                    "src/server.vl",
+                    "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+                ),
+                ("src/icons/lib.vl", ORPHAN),
+            ],
+        );
+        let mut document = open(&directory, "src/icons/lib.vl");
+        assert!(
+            document.unloaded_module_paint().is_none(),
+            "a generated module is not faded whole even though no entry loads it",
+        );
+        document.set_package_reach(union(&directory));
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "and none of its items is grayed either",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The classic single-entry form (`[package] entry = …`) answers the same
+    /// way as the `[entry.<name>]` form — pin 14's shape: the two manifests
+    /// produce the same grays for an item only one of them reaches.
+    #[test]
+    fn a_single_entry_package_answers_at_both_granularities() {
+        let directory = workspace(
+            "single",
+            &[
+                ("vilan.toml", "[package]\nname = \"app\"\n"),
+                (
+                    "src/main.vl",
+                    "import pkg::shared::used_by_client;\n\nfun main() {\n\tused_by_client();\n}\n",
+                ),
+                ("src/shared.vl", SHARED),
+                ("src/orphan.vl", ORPHAN),
+            ],
+        );
+        let orphan = open(&directory, "src/orphan.vl");
+        let (_, spans) = orphan
+            .unloaded_module_paint()
+            .expect("the single entry does not load `orphan.vl`");
+        assert_eq!(
+            named(&orphan, &spans),
+            vec!["orphan_binding".to_string(), "orphan_fun".to_string()],
+        );
+        let mut shared = open(&directory, "src/shared.vl");
+        shared.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&shared, &shared.dead_item_spans()),
+            vec![
+                "read_by_nobody".to_string(),
+                "used_by_nobody".to_string(),
+                "used_by_server".to_string(),
+            ],
+            "with one entry, what the other entry used to reach grays too",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
