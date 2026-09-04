@@ -885,8 +885,16 @@ impl LandedSnapshot {
 pub enum CursorContext {
     /// A bare word (possibly empty) in expression or statement position.
     Scope { prefix: String },
-    /// `module::pre` — a path segment after `::`.
-    Path { module: String, prefix: String },
+    /// `module::pre` — a path segment after `::`. `nested` says the path has
+    /// MORE than one segment (`style::FlexDirection::pre`), in which case
+    /// `module` is only its last one and the index — which is keyed by module
+    /// name alone — cannot answer it: the question is a descent through the
+    /// head, which only the landed engine can walk (E129).
+    Path {
+        module: String,
+        prefix: String,
+        nested: bool,
+    },
     /// `receiver.pre` — a member after `.`. The receiver's type is a
     /// resolution question, which is why this arm is the one that consults the
     /// landed analysis.
@@ -922,7 +930,11 @@ pub fn cursor_context(text: &str, offset: usize) -> CursorContext {
             });
         let module = head[module_start..].to_string();
         if !module.is_empty() {
-            return CursorContext::Path { module, prefix };
+            return CursorContext::Path {
+                module,
+                prefix,
+                nested: head[..module_start].ends_with("::"),
+            };
         }
     }
     if before.ends_with('.') && !before.ends_with("..") {
@@ -1385,7 +1397,22 @@ mod tests {
             cursor_context(text, offset),
             CursorContext::Path {
                 module: "style".to_string(),
-                prefix: "col".to_string()
+                prefix: "col".to_string(),
+                nested: false,
+            }
+        );
+
+        // E129: a nested path names its LAST segment, and says so — the index
+        // is keyed by module name and would happily answer with an unrelated
+        // module that happens to share it.
+        let text = "fun f() {\n\tstyle::FlexDirection::Ro\n}\n";
+        let offset = text.find("Ro\n").expect("the prefix") + 2;
+        assert_eq!(
+            cursor_context(text, offset),
+            CursorContext::Path {
+                module: "FlexDirection".to_string(),
+                prefix: "Ro".to_string(),
+                nested: true,
             }
         );
 

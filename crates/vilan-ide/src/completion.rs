@@ -1645,27 +1645,66 @@ impl<'a, 'src> Analysis<'a, 'src> {
         }
     }
 
-    /// Items reachable through `left::` in CODE — an enum's variants and
-    /// statics, a struct's statics, or a module's members — where `left` is the
-    /// identifier ending just before the `::` at `colon_offset`.
+    /// Items reachable through a `::` path in CODE — an enum's variants and
+    /// statics, a struct's statics, or a module's members — where the path is
+    /// the whole `a::b::c` chain ending just before the `::` at `colon_offset`.
     ///
-    /// `left` is resolved THROUGH SCOPE (E53). Matching it against every loaded
-    /// module's declarations by name, which is what this did, offered whatever
-    /// any module in the process happened to declare — and nine std modules are
-    /// ALWAYS loaded for the derive prelude, so `Json::` completed `parse`,
-    /// `stringify`, and friends in a file that never imported `std::json`. An
-    /// import path is the opposite case, where reaching what is not in scope is
-    /// the entire point; it is served by [`Self::import_completions`], which
-    /// keeps the by-name lookup ([`Self::namespace_completions_by_name`]).
+    /// The HEAD is resolved THROUGH SCOPE (E53). Matching it against every
+    /// loaded module's declarations by name, which is what this did, offered
+    /// whatever any module in the process happened to declare — and nine std
+    /// modules are ALWAYS loaded for the derive prelude, so `Json::` completed
+    /// `parse`, `stringify`, and friends in a file that never imported
+    /// `std::json`. An import path is the opposite case, where reaching what is
+    /// not in scope is the entire point; it is served by
+    /// [`Self::import_completions`], which keeps the by-name lookup
+    /// ([`Self::namespace_completions_by_name`]).
+    ///
+    /// Everything PAST the head is a descent, not a second scope lookup (E129).
+    /// This used to read one identifier, so `style::FlexDirection::` looked up
+    /// `FlexDirection` in scope — where it is not, and never was: it is a
+    /// MEMBER of `style` — and answered nothing, while the import spelling of
+    /// the same path (`import std::style::FlexDirection::`) descended fine.
+    /// Each further segment is one step through
+    /// [`Self::namespace_member`], the same single-step descent
+    /// [`Self::namespace_completions`] offers the last one's items from; a
+    /// segment that names nothing a path descends into (an enum variant, a
+    /// function, a typo) stops the walk and answers empty, which is what an
+    /// unresolvable path has always answered.
     fn code_path_completions(&self, text: &str, colon_offset: usize) -> Vec<Completion> {
-        let Some(left) = identifier_ending_at(text, colon_offset) else {
+        let Some(segments) = code_path_segments(text, colon_offset) else {
+            return Vec::new();
+        };
+        let Some((head, rest)) = segments.split_first() else {
             return Vec::new();
         };
         let analyzed_offset = self.to_analyzed_offset(colon_offset);
-        let Some(namespace) = self.namespace_in_scope(left, analyzed_offset) else {
+        let Some(mut namespace) = self.namespace_in_scope(head, analyzed_offset) else {
             return Vec::new();
         };
+        for segment in rest {
+            let Some(next) = self.namespace_member(namespace, segment) else {
+                return Vec::new();
+            };
+            namespace = next;
+        }
         self.namespace_completions(namespace)
+    }
+
+    /// One step of a `::` descent: the namespace `namespace::name` denotes.
+    ///
+    /// A module's own scope is the only thing a code path descends THROUGH — a
+    /// module holds enums, structs and nested modules, and each of those is a
+    /// namespace in turn. An enum is where a path STOPS: its variants and
+    /// statics are values, not namespaces, and `import_completions` stops in
+    /// the same place for the same reason (`resolve_import` descends no
+    /// further either). `None` for anything else, which answers empty rather
+    /// than guessing.
+    fn namespace_member(&self, namespace: Id, name: &str) -> Option<Id> {
+        let program = self.program;
+        let module = program.modules.get(&namespace)?;
+        let scope = program.scopes.get(&module.body.1)?;
+        let member = *scope.name_to_id_map.get(name)?;
+        self.is_namespace(member).then_some(member)
     }
 
     /// The struct / enum / module `name` denotes at `analyzed_offset` — the
@@ -2264,6 +2303,31 @@ fn base_type_name(label: &str) -> &str {
 }
 
 /// The identifier ending at byte `end` in `text`, if any.
+/// The `::`-separated identifier path ending at `end` — `["style",
+/// "FlexDirection"]` for `let d = style::FlexDirection::|`, in source order.
+///
+/// [`identifier_ending_at`] walks back over identifier bytes only, so it stops
+/// at a `::` and sees one segment; this repeats it across each `::` it lands
+/// on, which is what lets a code path descend as far as the user has written
+/// it (E129). `None` when there is no identifier at all just before `end`.
+fn code_path_segments(text: &str, end: usize) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut segments = Vec::new();
+    let mut end = end.min(bytes.len());
+    loop {
+        let segment = identifier_ending_at(text, end)?;
+        segments.push(segment);
+        let start = end - segment.len();
+        if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
+            end = start - 2;
+        } else {
+            break;
+        }
+    }
+    segments.reverse();
+    Some(segments)
+}
+
 fn identifier_ending_at(text: &str, end: usize) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut start = end.min(bytes.len());

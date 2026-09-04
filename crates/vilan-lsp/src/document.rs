@@ -3021,10 +3021,27 @@ impl Document {
             // which the landed engine below already does with the ranking tiers
             // and the `additionalTextEdits` that insert the import.
             CursorContext::Scope { prefix } => entry_names(prefix),
-            CursorContext::Path { module, prefix } => index
-                .module(module)
-                .map(|module| candidates(&module.entries, prefix))
-                .unwrap_or_default(),
+            // A one-segment path is the arm the index straightforwardly
+            // replaces. A NESTED one is not: the index is keyed by module
+            // name, `module` here is only the path's last segment, and
+            // answering `style::FlexDirection::` with whatever module happens
+            // to be called `FlexDirection` would be a lie. The descent is a
+            // resolution question — the landed engine's
+            // `code_path_completions` walks it (E129), and this defers.
+            CursorContext::Path {
+                module,
+                prefix,
+                nested,
+            } => {
+                if *nested {
+                    Vec::new()
+                } else {
+                    index
+                        .module(module)
+                        .map(|module| candidates(&module.entries, prefix))
+                        .unwrap_or_default()
+                }
+            }
             // A member position in the exact state: the landed analysis owns
             // the member list, and it arrives below. Otherwise the receiver's
             // binding may have moved, and the module's own names are the
@@ -10090,6 +10107,78 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"Red".to_string()),
             "a locally-declared enum completes mid-edit: {labels:?}"
+        );
+    }
+
+    // --- E129: a NESTED `::` path descends, like an import path already does ---
+    //
+    // `code_path_completions` used to read only the identifier ending at the
+    // `::`, so `style::FlexDirection::` saw `FlexDirection` — a MEMBER of
+    // `style`, never a binding — and answered nothing. The import arm has
+    // always descended (`import std::style::FlexDirection::` → four variants);
+    // these hold the code arm to the same reach, with E53's in-scope rooting
+    // still deciding the HEAD.
+
+    // The owner's own case, spelled the way kolt spells it: a `prelude`
+    // manifest puts `std::web`'s names in scope, so `style` is a module
+    // reachable with no import — and the path descends into the enum from
+    // there.
+    #[test]
+    fn nested_code_path_completion_descends_a_std_module_into_an_enum() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "fun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+            ),
+            (
+                "vilan.toml",
+                "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n",
+            ),
+        ]);
+        assert!(
+            labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
+            "`style::FlexDirection::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    // The same descent through an explicit import, which is the spelling a
+    // file without a prelude uses.
+    #[test]
+    fn nested_code_path_completion_descends_an_imported_std_module() {
+        let labels = completions_at_cursor(
+            "import std::style;\n\nfun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
+            "`style::FlexDirection::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn nested_code_path_completion_descends_a_same_file_module_into_an_enum() {
+        let labels = completions_at_cursor(
+            "mod geo {\n\tenum Shape { Circle, Square }\n}\n\nfun main() {\n\tlet s = geo::Shape::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Circle".to_string()) && labels.contains(&"Square".to_string()),
+            "`geo::Shape::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    // The one-segment control: the head still answers as it did, so the
+    // descent above is an addition and not a replacement.
+    #[test]
+    fn one_segment_code_path_completion_still_answers_the_module() {
+        let labels = completions_at_cursor(
+            "mod geo {\n\tenum Shape { Circle, Square }\n}\n\nfun main() {\n\tlet s = geo::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Shape".to_string()),
+            "`geo::` offers the module's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Circle".to_string()),
+            "and not the enum's variants, which are one level deeper: {labels:?}"
         );
     }
 
