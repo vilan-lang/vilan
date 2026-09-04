@@ -462,6 +462,60 @@ trait Source<T> {
 	fun effect(self, observer: |T| void) {
 		get_owner().take(self.sub(observer));
 	}
+
+	/// Subscribe WITHOUT the immediate first call (backlog A43): `observer`
+	/// runs on every CHANGE from here on, and never for the value the source
+	/// already holds. `sub` is exactly this plus that call, so the pair is the
+	/// eager/lazy opt-out Solid spells `on(deps, fn, { defer: true })` — vilan
+	/// has neither overloading nor optional parameters, so the opt-out is a
+	/// NAME.
+	///
+	/// Reach for it when the first value is already accounted for: a
+	/// derivation that seeded its own initial value (`map`, `combine`), a
+	/// side effect that must not fire on the state the program starts in — a
+	/// "you have unsaved changes" prompt, an analytics ping. Every UI binding
+	/// wants the opposite (the immediate call IS the initial paint), which is
+	/// why `sub`/`effect` keep it.
+	///
+	/// The DEFAULT body wraps `sub` and swallows that first call, which is
+	/// honest against `sub`'s documented contract — one immediate call with
+	/// the current value, then one per change. An impl whose `sub` does not
+	/// fire immediately is already outside that contract and must override
+	/// this. `SignalCell` does override it, with a direct attach that never
+	/// makes the call at all (`observe`).
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription {
+		let seeded: Shared<bool> = Shared::new(false);
+		self.sub(|value| {
+			if seeded.read() {
+				observer(value);
+			} else {
+				seeded.write() = true;
+			}
+		})
+	}
+
+	/// A derived signal: `transform` of this one's value, recomputed on every
+	/// change. DETACHABLE (A28): the subscription into this signal is handed to
+	/// the ambient owner, so a derivation made inside a boundary — a mounted
+	/// view, a `bind_each` row — dies when that boundary is disposed instead of
+	/// notifying a dead derived signal for the rest of the session. Made
+	/// outside every boundary (module level, the top of `main`) it lives as long
+	/// as its source, which is what a module-level `current_path().map(parse)`
+	/// wants.
+	fun map<U>(self, transform: sync |T| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
+		let _owned = register_with_owner(self.on_change(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+
+	/// `on_change` registered with the ambient owner — `effect`'s lazy twin,
+	/// and the same static requirement: an enclosing `owner_scope.run`.
+	fun effect_on_change(self, observer: |T| void) {
+		get_owner().take(self.on_change(observer));
+	}
 }
 
 /// The WRITABLE half of the pair: `Source` reads, `Signal` writes. A component
@@ -524,6 +578,14 @@ impl SignalCell<type T> with Source<T> {
 		let subscription = observe(self, observer);
 		observer(self.get());
 		subscription
+	}
+
+	/// The direct attach — `observe` itself (A43). The trait's default body
+	/// would reach this through `sub` and drop the immediate call on the
+	/// floor; the cell can simply not make it.
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription {
+		observe(self, observer)
 	}
 }
 
@@ -620,22 +682,6 @@ impl SignalCell<type T> {
 		mutate(self.value.write());
 		self.notify();
 	}
-
-	/// A derived signal: `transform` of this one's value, recomputed on every
-	/// change. DETACHABLE (A28): the subscription into this signal is handed to
-	/// the ambient owner, so a derivation made inside a boundary — a mounted
-	/// view, a `bind_each` row — dies when that boundary is disposed instead of
-	/// notifying a dead derived signal for the rest of the session. Made
-	/// outside every boundary (module level, the top of `main`) it lives as long
-	/// as its source, which is what a module-level `current_path().map(parse)`
-	/// wants.
-	fun map<U>(self, transform: sync |T| U): SignalCell<U> {
-		let derived = SignalCell::new(transform(self.get()));
-		let _owned = register_with_owner(observe(self, |value| {
-			derived.set(transform(value));
-		}));
-		derived
-	}
 }
 
 /// A component value that may be STATIC or REACTIVE, with no ceremony at the
@@ -699,10 +745,13 @@ impl type S: Source<type T> with MaybeSignal<T> {
 fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
 	let snapshot = || (source in sources => source.get());
 	let derived = SignalCell::new(snapshot());
-	// Subscribe each input (the comprehension's `.map` runs `sub` per element).
-	// The handles are the AMBIENT OWNER's from here on — the tuple itself is
-	// what is dropped, not the subscriptions.
-	let _owned = (source in sources => register_with_owner(source.sub(|_| {
+	// Subscribe each input LAZILY (A43): `derived` was just seeded with the
+	// snapshot, so an eager `sub` would re-set it to that same value once per
+	// input — n redundant writes, and n redundant snapshots, at construction.
+	// `on_change` attaches without the call. The handles are the AMBIENT
+	// OWNER's from here on — the tuple itself is what is dropped, not the
+	// subscriptions.
+	let _owned = (source in sources => register_with_owner(source.on_change(|_| {
 		derived.set(snapshot());
 	})));
 	derived

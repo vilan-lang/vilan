@@ -20,7 +20,7 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Source<T>` | trait | anything readable + subscribable (`get`/`sub`/`effect`) |
+| `Source<T>` | trait | anything readable + subscribable (`get`/`sub`/`effect`, `on_change`/`effect_on_change`, `map`) |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
@@ -65,13 +65,15 @@ impl SignalCell<type T> with Signal<T> {
 }
 impl SignalCell<type T> {
 	fun update(self, mutate: sync |&mut T| void) // mutate in place, notify once
-	fun map<U>(self, transform: sync |T| U): SignalCell<U>
 }
 impl SignalCell<type T> with Source<T> {
 	fun get(self): T
 	fun sub(self, observer: |T| void): Subscription
-	// from the trait default:
+	fun on_change(self, observer: |T| void): Subscription   // the direct attach
+	// from the trait defaults:
 	fun effect(self, observer: |T| void)    // fires now + on change; owner-registered
+	fun effect_on_change(self, observer: |T| void)  // on change only; owner-registered
+	fun map<U>(self, transform: sync |T| U): SignalCell<U>
 }
 impl SignalCell<SignalCell<type U>> {
 	fun flatten(self): SignalCell<U>            // follow the current inner signal
@@ -129,6 +131,24 @@ fun main() {
 - `sub` fires once immediately with the current value, like `effect`, and
   then on every change; its `Subscription` is yours to dispose (or hand to
   `owner.take`).
+- **`on_change` is the same subscription without that first call**, and
+  `effect_on_change` is its owner-registered form. The eager pair is right for
+  a UI binding — the immediate call *is* the initial paint — and wrong for an
+  effect that must not fire on the state the program starts in: a "you have
+  unsaved changes" prompt, an analytics ping, a derivation that already seeded
+  its own first value. `map` and `combine` attach this way.
+
+```vilan
+import std::reactive::{ Disposable, Signal, SignalCell };
+
+fun main() {
+	let title: SignalCell<str> = Signal::new("untitled");
+	// Nothing prints here — the current value is not a change.
+	let watch = title.on_change(|value| print(i"renamed to {value}"));
+	title.set("plans");        // renamed to plans
+	watch.dispose();
+}
+```
 
 ## Source
 
@@ -138,12 +158,23 @@ trait Source<T> {
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription
 	fun effect(self, observer: |T| void)    // trait default; owner-registered
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription   // default; no first call
+	fun effect_on_change(self, observer: |T| void)          // default; owner-registered
+	fun map<U>(self, transform: sync |T| U): SignalCell<U>  // default; derived signal
 }
 ```
 
 The read-only half of a reactive value. `SignalCell<T>` implements it, and so does
 any type of yours — a storage-backed cell, a mirror over a transport, a wrapper
-that logs. Implement `get` and `sub` and `effect` comes free.
+that logs. Implement `get` and `sub`; `effect`, `on_change`, `effect_on_change`
+and `map` all come free.
+
+`on_change`'s default body wraps `sub` and swallows its one immediate call,
+which is honest against `sub`'s contract — fire once now, then once per change.
+An implementation whose `sub` does *not* fire immediately is outside that
+contract and must override `on_change`. `SignalCell` overrides it anyway, with a
+direct attach that never makes the call at all.
 
 ```vilan
 import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription };

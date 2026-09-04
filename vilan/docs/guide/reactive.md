@@ -159,6 +159,27 @@ Two ways to run code on change. **Use `effect` by default.**
   (On a service mirror, `sub` is also **counted**: the first watcher
   opens the channel and disposing the last one closes it — see
   [Services: reading a mirror](services.md#reading-a-mirror).)
+- `signal.on_change(observer)` and `signal.effect_on_change(observer)`
+  are the same two, **without the immediate first call**. The eager pair
+  is what a UI wants — that first call is the initial paint — so reach
+  for these only when the current value is already accounted for: an
+  effect that must not fire on the state the program starts in (a
+  "you have unsaved changes" prompt, an analytics ping), or a derivation
+  that seeded its own first value.
+
+```vilan
+import std::reactive::{ Disposable, Signal, SignalCell, comp };
+
+fun main() {
+	let title: SignalCell<str> = Signal::new("untitled");
+	let (_built, scope) = comp(|| {
+		// Silent now; one line per rename after this.
+		title.effect_on_change(|value| print(i"renamed to {value}"));
+	});
+	title.set("plans");        // renamed to plans
+	scope.dispose();
+}
+```
 
 ## Ownership: who cleans up
 

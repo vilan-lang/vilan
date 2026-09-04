@@ -1,0 +1,73 @@
+// `Source::on_change` / `Source::effect_on_change` (backlog A43) — the LAZY
+// half of the subscribe pair: attach an observer and do NOT call it with the
+// value the source already holds. `sub`/`effect` keep their immediate first
+// call (every UI binding is the initial paint), so the opt-out is a NAME.
+//
+// Four claims:
+//   1. `on_change` skips the first call and fires on every change after it;
+//      `sub` beside it still fires immediately (they observe one signal).
+//   2. `effect_on_change` is the owner-registered form: it dies with the scope.
+//   3. The trait's DEFAULT body serves a custom `Source` that implements only
+//      `get`/`sub` — it wraps `sub` and swallows the one immediate call.
+//   4. `map` is a `Source` member now (reactive-traits.md Q5's widening rode
+//      in on `on_change`), so a custom source derives like a cell does.
+import std::io::print;
+import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscription, comp, owner_scope };
+
+/// A `Source` of one's own: `get` and `sub`, nothing else. `on_change`,
+/// `effect_on_change` and `map` all arrive as trait defaults.
+struct Stored<T> {
+	inner: SignalCell<T>,
+}
+
+impl Stored<type T> with Source<T> {
+	fun get(self): T {
+		self.inner.get()
+	}
+
+	[must_use]
+	fun sub(self, observer: |T| void): Subscription {
+		self.inner.sub(observer)
+	}
+}
+
+fun main() {
+	let count: SignalCell<i32> = Signal::new(1);
+	// The eager member fires NOW with the current value.
+	let eager = count.sub(|value| print(i"sub {value}"));
+	// The lazy one does not: nothing is printed until `count` changes.
+	let lazy = count.on_change(|value| print(i"on_change {value}"));
+	print("attached");
+	count.set(2);
+	eager.dispose();
+	lazy.dispose();
+	// Both handles are disposed: this change reaches nobody.
+	count.set(3);
+
+	// The owner-registered form, and its disposal.
+	let (_built, scope) = comp(|| {
+		count.effect_on_change(|value| print(i"effect_on_change {value}"));
+	});
+	count.set(4);
+	scope.dispose();
+	count.set(5);
+
+	// The trait default over a custom `Source`: `Stored` writes only `get` and
+	// `sub`, and the default body swallows `sub`'s immediate call — the emitted
+	// wrapper drops the first value on the floor and forwards every one after.
+	// witness: if (seeded.v) { observer(value); } else { seeded.v = true; }
+	let stored = Stored { inner = Signal::new(10) };
+	let watched = stored.on_change(|value| print(i"stored {value}"));
+	stored.inner.set(11);
+	stored.inner.set(12);
+	watched.dispose();
+
+	// Q5's widening: `map` is a `Source` member, so it derives off `Stored`.
+	let labelled = stored.map(|value| i"n={value}");
+	print(labelled.get());
+	let shown = labelled.sub(|value| print(i"label {value}"));
+	stored.inner.set(13);
+	shown.dispose();
+}
+
+main();

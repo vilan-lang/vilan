@@ -246,10 +246,39 @@ function $P(self, value, $r) {
 	self[0].v = value;
 	$Q(self, $r);
 }
+function $aa(self, $t) {
+	const $ab = $t;
+	let $ac = null;
+	if ($ab[0] === 0) {
+		const turn = $ab[1];
+		$ac = enqueue(turn, self[1].v);
+	} else {
+		const $ad = $x(draining_turns.v);
+		let $ae = null;
+		if ($ad[0] === 0) {
+			const draining = $ad[1];
+			$ae = enqueue(draining, self[1].v);
+		} else {
+			for (const subscriber of self[1].v) {
+				subscriber[1]();
+			}
+			$ae = undefined;
+		}
+		$ac = $ae;
+	}
+	return $ac;
+}
+function $Z(self, value, $r) {
+	self[0].v = value;
+	$aa(self, $r);
+}
+function $af(self, observer) {
+	return $B(self, observer);
+}
 function $V(self, transform, $W, $X) {
 	const derived = $b(transform($h(self)));
-	register_with_owner($B(self, (value) => {
-		$q(derived, transform(value), $W);
+	register_with_owner($af(self, (value) => {
+		$Z(derived, transform(value), $W);
 		return;
 	}), $W, $X);
 	return derived;
