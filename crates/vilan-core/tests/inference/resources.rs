@@ -7728,3 +7728,239 @@ fn the_retention_flag_is_per_declaration_not_per_host() {
         "#,
     );
 }
+
+// --- M28: drop planning is per BODY, not per program -------------------------
+//
+// `declares_a_resource()` is a whole-program gate: one `resource` declaration
+// anywhere — and `std::db` / `std::fs` each carry one — turned the per-body
+// ownership walk on for EVERY body in the program. M28 keeps that gate and adds
+// a per-body predicate under it (`Analyzer::resource_reaching_roots`), so a body
+// whose own types cannot reach a resource is not walked at all.
+//
+// The predicate over-approximates by construction: `type_is_resource(T)` implies
+// `type_reaches_resource(T)`, so a route it does not know about would have to be
+// a body that owns a resource with NO resource-reaching type anywhere in its
+// signature, its bindings, its recorded expression types, or its callees'
+// signatures. Each route below is pinned positively — the destructor still runs
+// — and the counter pins the negative half: the bodies that reach nothing are
+// not walked.
+
+/// The M28 exhibit: one resource with an observable destructor, `fillers`
+/// resource-free functions that mention nothing, and `body` on top.
+fn m28_program(fillers: usize, body: &str) -> String {
+    let filler: String = (0..fillers)
+        .map(|n| format!("fun m28_filler{n}(x: i32): i32 {{ let y = x + {n}; y * 2 }}\n"))
+        .collect();
+    format!(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {filler}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn m28_drop_planning_enrols_only_the_bodies_that_reach_a_resource() {
+    // The work order's pin, stated as the property rather than as a number
+    // std's own surface would date: enrolment is a function of WHAT REACHES A
+    // RESOURCE, not of how big the program is. A thousand resource-free
+    // functions added to the same program add nothing to the planner's work.
+    // Under the whole-program gate the two numbers were each the whole
+    // program, so they differed by exactly the thousand.
+    const MAIN: &str = r#"
+        fun main() {
+            let g = Guard { label = "one" };
+            print(g.label);
+        }
+        "#;
+    let (small, small_offered) = drop_plan_enrolment(&m28_program(10, MAIN));
+    let (large, large_offered) = drop_plan_enrolment(&m28_program(1010, MAIN));
+    assert!(
+        large_offered >= small_offered + 1000,
+        "the thousand extra fillers must reach the planner as offered roots: \
+         {small_offered} -> {large_offered}"
+    );
+    assert_eq!(
+        small, large,
+        "a thousand resource-free functions changed the planner's enrolment: \
+         {small} of {small_offered} -> {large} of {large_offered}"
+    );
+    assert!(
+        large * 20 < large_offered,
+        "the planner walked {large} of {large_offered} roots — the exhibit is \
+         overwhelmingly resource-free and the enrolment must say so"
+    );
+}
+
+#[test]
+fn m28_a_program_with_no_resource_type_enrols_nothing() {
+    // `declares_a_resource()`'s own behaviour, unchanged: a world with no
+    // `resource` declaration returns before the predicate is even asked.
+    let filler: String = (0..1000)
+        .map(|n| format!("fun m28_filler{n}(x: i32): i32 {{ let y = x + {n}; y * 2 }}\n"))
+        .collect();
+    let (planned, offered) = drop_plan_enrolment(&format!(
+        r#"
+        import std::io::print;
+        {filler}
+        fun main() {{ print(m28_filler0(1)); }}
+        "#
+    ));
+    assert!(offered > 1000, "got {offered} offered roots");
+    assert_eq!(
+        planned, 0,
+        "a resource-free world plans nothing; the planner walked {planned} of {offered}"
+    );
+}
+
+#[test]
+fn m28_route_signature_an_own_resource_parameter() {
+    // Route 1. `consume` binds nothing and constructs nothing: its only
+    // resource-reaching type is its own parameter, and an `own` resource
+    // parameter still owned at the fall-through end drops there (§6).
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        fun consume(own g: Guard) {
+            print("consumed");
+        }
+        fun main() {
+            consume(Guard { label = "sig" });
+            print("end");
+        }
+        "#,
+        ),
+        // `consume` never READS its parameter, so S3's last-use disposal
+        // destroys it right after the body's entry — before the `print`.
+        "dropped sig\nconsumed\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_container_a_struct_field_holding_a_resource() {
+    // Route 2 through containment: `Holder` is a resource BY CONTAINMENT, so
+    // `Holder`'s nominal is in the reaching set and `main`'s binding selects it.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        struct Holder { held: Guard }
+        fun main() {
+            let h = Holder { held = Guard { label = "held" } };
+            print(h.held.label);
+            print("end");
+        }
+        "#,
+        ),
+        "held\ndropped held\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_generic_instantiation_an_option_of_a_resource() {
+    // Route 5. `Option` is not a resource nominal — its payload is a parameter
+    // — so `Option<i32>` reaches nothing while `Option<Guard>` reaches `Guard`
+    // through its own argument.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<Guard> = Some(Guard { label = "opt" });
+            print(slot.is_some());
+            print("end");
+        }
+        "#,
+        ),
+        "true\ndropped opt\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_callee_signature_a_temporary_nobody_binds() {
+    // Route 4, C11's shape: the body binds nothing, overwrites nothing and
+    // calls no sink — the only thing naming a resource is the CALLEE's return
+    // type, which is why the predicate has to read signatures.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        fun open(label: str): Guard {
+            Guard { label = label }
+        }
+        fun main() {
+            print(open("tmp").label);
+            print("end");
+        }
+        "#,
+        ),
+        "tmp\ndropped tmp\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_closure_body_owns_its_own_resource() {
+    // Route 6. A closure is its own scan root, selected on its own evidence —
+    // an enclosing body that reaches nothing does not enrol it, and must not
+    // need to.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        fun main() {
+            let make = || {
+                let g = Guard { label = "closed" };
+                print(g.label);
+            };
+            make();
+            print("end");
+        }
+        "#,
+        ),
+        "closed\ndropped closed\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_the_drop_sink() {
+    // Route 7. `drop<T>(own value: T)` is generic, so its signature reaches no
+    // resource — the sink is recognized by identity instead.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        import std::drop::drop;
+        fun main() {
+            let g = Guard { label = "sunk" };
+            drop(g);
+            print("end");
+        }
+        "#,
+        ),
+        "dropped sunk\nend\n",
+    );
+}
+
+#[test]
+fn m28_the_resource_free_control_still_compiles_and_runs() {
+    // The negative control the counter pins: the same thousand bodies, with the
+    // resource present but unreachable from any of them.
+    assert_compiles_and_runs(
+        &m28_program(
+            4,
+            r#"
+        fun main() {
+            print(m28_filler0(1));
+            print(m28_filler3(1));
+        }
+        "#,
+        ),
+        "2\n8\n",
+    );
+}

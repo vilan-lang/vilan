@@ -9040,6 +9040,498 @@ impl<'src> Analyzer<'src> {
         crossings
     }
 
+    /// The nominals — struct / enum entity ids — a type can reach a resource
+    /// THROUGH, generic parameters excluded (destruction.md §3, M28).
+    ///
+    /// `N` is here when `N` is declared `resource`, or when some field or
+    /// variant payload `N` declares mentions a nominal that is. The generic
+    /// exclusion is what keeps the set small and the predicate useful:
+    /// `Option`'s payload is a parameter, so `Option` is NOT here, and
+    /// `Option<i32>` reaches nothing — while `Option<Database>` reaches
+    /// `Database` through its own argument, which
+    /// [`Self::type_reaches_resource`] reads off the instantiation.
+    ///
+    /// Empty exactly when nothing in the loaded world is declared `resource` —
+    /// the world `declares_a_resource()` already answers `false` for.
+    fn resource_reaching_nominals(&self) -> HashSet<Id> {
+        let mut reaching: HashSet<Id> = self
+            .structs
+            .values()
+            .filter(|struct_| struct_.resource)
+            .map(|struct_| struct_.id)
+            .chain(
+                self.enums
+                    .values()
+                    .filter(|enum_| enum_.resource)
+                    .map(|enum_| enum_.id),
+            )
+            .collect();
+        if reaching.is_empty() {
+            return reaching;
+        }
+        // Containment closure: an aggregate that DECLARES a member reaching a
+        // resource reaches one itself, at every instantiation.
+        loop {
+            let mut found: Vec<Id> = Vec::new();
+            for struct_ in self.structs.values() {
+                if !reaching.contains(&struct_.id)
+                    && struct_
+                        .fields
+                        .iter()
+                        .any(|field| self.type_mentions_nominal(field.type_id, &reaching))
+                {
+                    found.push(struct_.id);
+                }
+            }
+            for enum_ in self.enums.values() {
+                if !reaching.contains(&enum_.id)
+                    && enum_.variants.iter().any(|variant| {
+                        variant
+                            .data_type_ids
+                            .iter()
+                            .any(|type_id| self.type_mentions_nominal(*type_id, &reaching))
+                    })
+                {
+                    found.push(enum_.id);
+                }
+            }
+            if found.is_empty() {
+                break;
+            }
+            reaching.extend(found);
+        }
+        reaching
+    }
+
+    /// Whether `type_id`'s structure names one of `nominals` — the type itself,
+    /// its generic arguments, tuple members, array elements, and a closure
+    /// type's parameters and return, recursively. Cycle-guarded by `visited`.
+    ///
+    /// A `Generic(c)` names nothing: an abstract parameter is not a resource in
+    /// the base classification, and an instantiation that binds it to one binds
+    /// the resource as an ARGUMENT, which this walk sees.
+    fn type_mentions_nominal(&self, type_id: TypeId, nominals: &HashSet<Id>) -> bool {
+        let mut visited: HashSet<TypeId> = HashSet::default();
+        self.type_mentions_nominal_at(type_id, nominals, &mut visited)
+    }
+
+    fn type_mentions_nominal_at(
+        &self,
+        type_id: TypeId,
+        nominals: &HashSet<Id>,
+        visited: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visited.insert(type_id) {
+            return false;
+        }
+        let any = |analyzer: &Self, members: &[TypeId], visited: &mut HashSet<TypeId>| {
+            members
+                .iter()
+                .any(|member| analyzer.type_mentions_nominal_at(*member, nominals, visited))
+        };
+        match type_id.get_type(self) {
+            Type::Struct(id, arguments) | Type::Enum(id, arguments) => {
+                nominals.contains(&id) || any(self, &arguments, visited)
+            }
+            Type::Trait(_, arguments) => any(self, &arguments, visited),
+            Type::Tuple(members) => any(self, &members, visited),
+            Type::Array(element, _length) => any(self, &[element], visited),
+            Type::Closure(parameters, return_) => {
+                any(self, &parameters, visited) || any(self, &[return_], visited)
+            }
+            Type::Mapped(binder, source, template) => {
+                any(self, &[binder, source, template], visited)
+            }
+            Type::Generic(_)
+            | Type::Any
+            | Type::Never
+            | Type::Void
+            | Type::Unknown
+            | Type::Unresolved
+            | Type::Function(_)
+            | Type::Module(_) => false,
+        }
+    }
+
+    /// [`Self::type_mentions_nominal`] against the resource-reaching nominals,
+    /// memoized per type id for the length of one predicate pass.
+    ///
+    /// **The soundness claim the whole predicate rests on:**
+    /// `type_is_resource(T)` implies `type_reaches_resource(T)`. Either `T`'s
+    /// own nominal is declared `resource` (then it is in the set), or a
+    /// SUBSTITUTED member of `T` is a resource — and every nominal in a
+    /// substituted member comes either from `T`'s arguments (which this walk
+    /// visits) or from the member's declared type (which puts `T`'s nominal in
+    /// the set by the containment closure). So the predicate over-approximates,
+    /// never under-approximates, which is the only direction that keeps the
+    /// emitted bytes still.
+    fn type_reaches_resource(
+        &self,
+        type_id: TypeId,
+        nominals: &HashSet<Id>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        if let Some(&cached) = memo.get(&type_id) {
+            return cached;
+        }
+        let reaches = self.type_mentions_nominal(type_id, nominals);
+        memo.insert(type_id, reaches);
+        reaches
+    }
+
+    /// Whether a binding entity (a variable or a parameter) has a
+    /// resource-reaching type.
+    fn binding_reaches_resource(
+        &self,
+        binding_id: Id,
+        nominals: &HashSet<Id>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        let type_id = self
+            .variables
+            .get(&binding_id)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.parameters
+                    .get(&binding_id)
+                    .map(|parameter| parameter.type_id)
+            });
+        type_id.is_some_and(|type_id| self.type_reaches_resource(type_id, nominals, memo))
+    }
+
+    /// The scan roots — bodied functions and closures — whose body can reach a
+    /// resource (M28). The drop planner walks these and nothing else.
+    ///
+    /// `declares_a_resource()` is a WHOLE-PROGRAM gate: one `resource` type
+    /// anywhere (std declares several) turns drop planning on for every body in
+    /// the program, and on kolt's browser entry — which owns no resource at all
+    /// — that was 355 ms of the `checks` phase spent walking bodies that plan
+    /// nothing and typing 27,016 temporary candidates that are not resources.
+    /// This is the same question asked per body.
+    ///
+    /// **The routes**, each a positive pin in `tests/inference/resources.rs`:
+    ///
+    /// 1. **The signature.** A parameter type or the return type reaches a
+    ///    resource — an `own` resource parameter is one of §6's teardown
+    ///    classes, and a resource-returning body is where R4's move-out lives.
+    /// 2. **A binding.** Any `let` in the body (read off its entity, so a
+    ///    container — `Wrapper { db }` — and a generic instantiation —
+    ///    `Option<Database>` — count through their arguments).
+    /// 3. **A recorded expression type.** Any expression in the body whose
+    ///    stored type reaches a resource: field reads, projections, the results
+    ///    the solver has already typed.
+    /// 4. **A callee's signature.** A call to a function whose declared
+    ///    parameters or return reach a resource — C11's temporary,
+    ///    `File::open(p).read_at(b, 0)`, which binds nothing, overwrites
+    ///    nothing and calls no sink.
+    /// 5. **A generic instantiation.** A call whose type bindings
+    ///    ([`Self::r11_call_type_bindings`] — explicit arguments and the
+    ///    recorded method substitution alike) bind a parameter to a
+    ///    resource-reaching type.
+    /// 6. **A capture.** A closure body reads a captured resource binding,
+    ///    which is route 2 asked of the closure's own subtree (a closure is its
+    ///    own scan root, so it is selected on its own evidence).
+    /// 7. **The sink.** A `drop(x)` call, whose signature is generic and whose
+    ///    argument may be a value the tables have not typed.
+    ///
+    /// An unresolved callee is selected outright: "this signature reaches no
+    /// resource" is a claim about a signature, and one nobody could read is not
+    /// a claim this predicate is allowed to make.
+    fn resource_reaching_roots(&self) -> HashSet<Id> {
+        let mut roots: HashSet<Id> = HashSet::default();
+        let nominals = self.resource_reaching_nominals();
+        if nominals.is_empty() {
+            return roots;
+        }
+        let mut memo: HashMap<TypeId, bool> = HashMap::default();
+        for function in self.functions.values() {
+            if !function.has_body {
+                continue;
+            }
+            let mut signature: Vec<TypeId> = function
+                .parameters
+                .iter()
+                .filter_map(|parameter_id| {
+                    self.parameters
+                        .get(parameter_id)
+                        .map(|parameter| parameter.type_id)
+                })
+                .collect();
+            signature.extend(function.return_type_id);
+            let mut seeds: Vec<Id> = function.body.0.clone();
+            seeds.push(function.body.1);
+            if self.reaches_resource(&signature, &seeds, &nominals, &mut memo) {
+                roots.insert(function.id);
+            }
+        }
+        for closure in self.closures.values() {
+            let signature: Vec<TypeId> = closure.return_type_id.into_iter().collect();
+            let mut seeds: Vec<Id> = closure.parameter_destructures.clone();
+            seeds.push(closure.return_);
+            // A closure's parameters reach expression position inside the body,
+            // but a parameter that is never read would not — so they are asked
+            // as bindings here, exactly as a function's are through its
+            // signature.
+            let mut reaches = false;
+            for parameter_id in &closure.parameters {
+                if self.binding_reaches_resource(*parameter_id, &nominals, &mut memo) {
+                    reaches = true;
+                    break;
+                }
+            }
+            if reaches || self.reaches_resource(&signature, &seeds, &nominals, &mut memo) {
+                roots.insert(closure.id);
+            }
+        }
+        roots
+    }
+
+    /// One root's answer: a signature that reaches a resource, or a body
+    /// subtree holding any of the evidence [`Self::expr_is_resource_evidence`]
+    /// recognizes. The walk does not cross a closure boundary — a closure is
+    /// its own root and is selected on its own evidence.
+    fn reaches_resource(
+        &self,
+        signature: &[TypeId],
+        seeds: &[Id],
+        nominals: &HashSet<Id>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        for type_id in signature {
+            if self.type_reaches_resource(*type_id, nominals, memo) {
+                return true;
+            }
+        }
+        let mut stack: Vec<Id> = seeds.to_vec();
+        let mut visited: HashSet<Id> = HashSet::default();
+        while let Some(expr_id) = stack.pop() {
+            if !visited.insert(expr_id) {
+                continue;
+            }
+            if self.expr_is_resource_evidence(expr_id, nominals, memo) {
+                return true;
+            }
+            self.drop_scan_children(expr_id, &mut stack);
+        }
+        false
+    }
+
+    /// Whether one expression is evidence that its body reaches a resource.
+    ///
+    /// The completeness argument: a resource value has to ORIGINATE somewhere
+    /// in the body that owns it — read off a binding, returned by a call, or
+    /// constructed — and those are exactly the arms below. Every enclosing
+    /// expression (an argument position, an operand, a branch) is reached by
+    /// the subtree walk, so the origin is always seen.
+    fn expr_is_resource_evidence(
+        &self,
+        expr_id: Id,
+        nominals: &HashSet<Id>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        // The type the solver already recorded for this expression, read the
+        // way `drop_sink_argument_type_id` reads it.
+        if let Some(&type_id) = self
+            .expr_id_to_type_id_map
+            .get(&expr_id)
+            .or_else(|| self.resolved_types.get(&expr_id))
+            && self.type_reaches_resource(type_id, nominals, memo)
+        {
+            return true;
+        }
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding)) => {
+                self.binding_reaches_resource(*binding, nominals, memo)
+            }
+            Some(Expr::StructInitializer(struct_id, _)) => nominals.contains(struct_id),
+            Some(Expr::EnumVariant(enum_id, _)) => nominals.contains(enum_id),
+            Some(Expr::Call(call_id)) => self.call_reaches_resource(*call_id, nominals, memo),
+            _ => false,
+        }
+    }
+
+    /// Whether a call can produce, consume or destroy a resource — read off the
+    /// callee's SIGNATURE (routes 4, 5 and 7). An unresolved callee is `true`:
+    /// a signature nobody has read is not one this predicate may clear.
+    fn call_reaches_resource(
+        &self,
+        call_id: Id,
+        nominals: &HashSet<Id>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return true;
+        };
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return true;
+        };
+        // The `drop(x)` sink destroys a value whose type the tables may not
+        // carry (B68 infers it later), and its own signature is generic.
+        if Some(*callee_id) == self.drop_fn_id {
+            return true;
+        }
+        let mut types: Vec<TypeId> = Vec::new();
+        if let Some(function) = self.functions.get(callee_id) {
+            types.extend(function.parameters.iter().filter_map(|parameter_id| {
+                self.parameters
+                    .get(parameter_id)
+                    .map(|parameter| parameter.type_id)
+            }));
+            types.extend(function.return_type_id);
+            types.extend(
+                self.r11_call_type_bindings(call_id, *callee_id)
+                    .into_iter()
+                    .map(|(_, bound)| bound),
+            );
+        } else if let Some(external) = self.external_functions.get(callee_id) {
+            types.extend(external.parameters.iter().filter_map(|parameter_id| {
+                self.parameters
+                    .get(parameter_id)
+                    .map(|parameter| parameter.type_id)
+            }));
+            types.push(external.return_type_id);
+        } else if let Some(Expr::EnumVariant(enum_id, _)) = self.expr_id_to_expr_map.get(callee_id)
+        {
+            // A variant constructor: the enum is the constructed nominal, and
+            // each payload is an argument the subtree walk visits.
+            return nominals.contains(enum_id);
+        } else if self.variables.contains_key(callee_id) || self.parameters.contains_key(callee_id)
+        {
+            // A closure-valued binding. Its own type IS the signature, and the
+            // subject expression is walked as a child of this call.
+            return false;
+        } else {
+            return true;
+        }
+        for type_id in types {
+            if self.type_reaches_resource(type_id, nominals, memo) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every expression id reachable from `expr_id` in one step, for the
+    /// predicate's body sweep. A SUPERSET of what [`Self::plan_expr`] descends
+    /// into — over-seeing a child can only over-select a root, which plans the
+    /// same answer more slowly, where under-seeing one would drop a plan. The
+    /// match is exhaustive so a new `Expr` variant is classified here rather
+    /// than silently missed.
+    fn drop_scan_children(&self, expr_id: Id, out: &mut Vec<Id>) {
+        let Some(expr) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return;
+        };
+        match expr {
+            Expr::Assignment(target_id, value_id) => out.extend([*target_id, *value_id]),
+            Expr::Await(inner)
+            | Expr::TryAssert(inner)
+            | Expr::Unary(_, inner)
+            | Expr::Reference(inner, _)
+            | Expr::Dereference(inner)
+            | Expr::FunctionReturn(Some(inner))
+            | Expr::Repeat(inner, _)
+            | Expr::ArrayLen(inner, _)
+            | Expr::Field(inner, _, _)
+            | Expr::TupleIndex(inner, _, _)
+            | Expr::Destructure(inner, _)
+            | Expr::Is(inner, _) => out.push(*inner),
+            Expr::Binary(_, lhs, rhs) | Expr::Index(lhs, rhs) => out.extend([*lhs, *rhs]),
+            Expr::Block((statements, tail)) => {
+                out.extend(statements.iter().copied());
+                out.push(*tail);
+            }
+            Expr::Call(call_id) => {
+                if let Some(function_call) = self.function_calls.get(call_id) {
+                    out.push(function_call.subject_id);
+                    out.extend(function_call.argument_ids.iter().copied());
+                }
+            }
+            Expr::TupleComprehension(_, source_id, body_id) => out.extend([*source_id, *body_id]),
+            Expr::For(condition, (statements, tail)) => {
+                out.extend(condition.iter().copied());
+                out.extend(statements.iter().copied());
+                out.push(*tail);
+            }
+            Expr::ForEach(iterable_id, _, (statements, tail)) => {
+                out.push(*iterable_id);
+                out.extend(statements.iter().copied());
+                out.push(*tail);
+            }
+            Expr::Lift(subject_id, _, continuation_id) => {
+                out.extend([*subject_id, *continuation_id])
+            }
+            Expr::LiftRegion(steps, body_id) => {
+                out.extend(steps.iter().map(|(step_id, _, _)| *step_id));
+                out.push(*body_id);
+            }
+            Expr::If(branch) => self.drop_scan_if_children(branch, out),
+            Expr::List(ids) | Expr::Tuple(ids) => out.extend(ids.iter().copied()),
+            Expr::Match(subject_id, legs) => {
+                out.push(*subject_id);
+                for leg in legs {
+                    out.extend(leg.guard);
+                    out.push(leg.body);
+                }
+            }
+            Expr::StructInitializer(_, fields) => out.extend(fields.values().copied()),
+            // A `let`'s initializer is a child of the DECLARATION, not a
+            // syntactic child of the block — `plan_expr` reaches it the same way.
+            Expr::Variable(variable_id) => {
+                if let Some(initial) = self.variables.get(variable_id).and_then(|v| v.initial) {
+                    out.push(initial);
+                }
+            }
+            // Closures and spawns are their own scan roots.
+            Expr::Closure(_)
+            | Expr::Async(_)
+            | Expr::FunctionReturn(None)
+            | Expr::Bool(_)
+            | Expr::Number(_, _, _)
+            | Expr::String(_)
+            | Expr::MultilineString(_)
+            | Expr::Null
+            | Expr::Void
+            | Expr::Error
+            | Expr::Jump(_)
+            | Expr::LiftBinder
+            | Expr::EnumVariant(_, _)
+            | Expr::Generic(_)
+            | Expr::Struct(_)
+            | Expr::Enum(_)
+            | Expr::Impl(_)
+            | Expr::Function(_)
+            | Expr::Module(_)
+            | Expr::Trait(_)
+            | Expr::Macro
+            | Expr::Local(_)
+            | Expr::Parameter(_)
+            | Expr::ExternalFunction(_) => {}
+        }
+    }
+
+    fn drop_scan_if_children(&self, branch: &ExprIfBranch, out: &mut Vec<Id>) {
+        let mut current = branch;
+        loop {
+            match current {
+                ExprIfBranch::If(condition_id, (statements, tail), else_branch) => {
+                    out.push(*condition_id);
+                    out.extend(statements.iter().copied());
+                    out.push(*tail);
+                    match else_branch {
+                        Some(next) => current = next,
+                        None => return,
+                    }
+                }
+                ExprIfBranch::Else((statements, tail)) => {
+                    out.extend(statements.iter().copied());
+                    out.push(*tail);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Drop planning (destruction.md §5, §7). Computes, for the whole program:
     /// `dropped_bindings` — the resource locals still owned at their declaring
     /// scope's fall-through end (dropped there, reverse declaration order) — and
@@ -9071,21 +9563,29 @@ impl<'src> Analyzer<'src> {
             place_overwrites,
             explicitly_dropped,
         };
-        // The resource types reached by a `drop(db)` sink call, per enclosing scan
-        // root (destruction.md §8 platform coloring): a sink call is invisible to
-        // reachability (it lowers transformer-side to the `__drop` helper), so its
-        // owning function/closure needs a synthetic edge to that destructor. Same
-        // source of truth as the scope-end drops (`owned_by_root`).
-        let drop_sink_by_root = self.drop_sink_types_by_root();
         // A program with no `resource` declaration anywhere plans nothing and
         // keeps its bytes. The three sets above are NOT enough to decide that
         // since C11: `File::open(p).read_at(b, 0)` binds nothing, overwrites
         // nothing and calls no sink, and is exactly the program whose temporary
         // must be found.
         if !self.declares_a_resource() {
+            crate::drop_plan_stats::record(0, self.offered_drop_scan_roots());
             return;
         }
         self.explicit_drop_bindings = resources.explicitly_dropped.clone();
+        // M28: the per-body half of the gate above. `declares_a_resource()` is
+        // true for every program that loads a std module declaring one, so it
+        // enrolled EVERY body; this asks the same question of each body's own
+        // types and enrolls the ones that can reach a resource.
+        let roots = self.resource_reaching_roots();
+        // The resource types reached by a `drop(db)` sink call, per enclosing scan
+        // root (destruction.md §8 platform coloring): a sink call is invisible to
+        // reachability (it lowers transformer-side to the `__drop` helper), so its
+        // owning function/closure needs a synthetic edge to that destructor. Same
+        // source of truth as the scope-end drops (`owned_by_root`). A `drop(x)`
+        // call is itself route 7's evidence, so an enrolled root is the only kind
+        // that can hold one.
+        let drop_sink_by_root = self.drop_sink_types_by_root(&roots);
         let mut plan = DropPlan::default();
         // Per scan-root, the resource types it drops (for the §8 coloring edges).
         let mut owned_by_root: HashMap<Id, DropSites> = HashMap::default();
@@ -9105,7 +9605,7 @@ impl<'src> Analyzer<'src> {
         let bodies: Vec<(Id, Vec<Id>, Id, Vec<Id>)> = self
             .functions
             .values()
-            .filter(|function| function.has_body)
+            .filter(|function| function.has_body && roots.contains(&function.id))
             .map(|function| {
                 let own_params: Vec<Id> = function
                     .parameters
@@ -9160,6 +9660,7 @@ impl<'src> Analyzer<'src> {
         let closures: Vec<(Id, Id)> = self
             .closures
             .iter()
+            .filter(|(id, _)| roots.contains(id))
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
         for (root_id, return_id) in closures {
@@ -9205,6 +9706,18 @@ impl<'src> Analyzer<'src> {
             }
         }
         self.drop_owned_types_by_root = owned_by_root;
+        // The M28 pin's instrument: how much of the program the planner walked.
+        crate::drop_plan_stats::record(roots.len(), self.offered_drop_scan_roots());
+    }
+
+    /// Every scan root the drop planner is offered — one per bodied function
+    /// and one per closure. The denominator of the M28 enrolment instrument.
+    fn offered_drop_scan_roots(&self) -> usize {
+        self.functions
+            .values()
+            .filter(|function| function.has_body)
+            .count()
+            + self.closures.len()
     }
 
     /// `temporary-drop.md` §7.3, RULED: refuse a resource temporary constructed
@@ -10068,7 +10581,7 @@ impl<'src> Analyzer<'src> {
     /// a closure's from a walk of its return expression. Non-resource / generic
     /// argument types are harmless here — `build_drop_glue` only builds an edge for
     /// a type that has drop glue. Empty when `std::drop` is not loaded.
-    fn drop_sink_types_by_root(&self) -> HashMap<Id, DropSites> {
+    fn drop_sink_types_by_root(&self, roots: &HashSet<Id>) -> HashMap<Id, DropSites> {
         let mut by_root: HashMap<Id, DropSites> = HashMap::default();
         if self.drop_fn_id.is_none() {
             return by_root;
@@ -10076,7 +10589,7 @@ impl<'src> Analyzer<'src> {
         let function_ids: Vec<Id> = self
             .functions
             .values()
-            .filter(|function| function.has_body)
+            .filter(|function| function.has_body && roots.contains(&function.id))
             .map(|function| function.id)
             .collect();
         for function_id in function_ids {
@@ -10089,6 +10602,7 @@ impl<'src> Analyzer<'src> {
         let closures: Vec<(Id, Id)> = self
             .closures
             .iter()
+            .filter(|(id, _)| roots.contains(id))
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
         for (closure_id, return_id) in closures {
