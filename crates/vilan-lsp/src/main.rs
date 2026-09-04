@@ -453,6 +453,21 @@ fn is_manifest(uri: &Url) -> bool {
         .is_some_and(|name| name == "vilan.toml")
 }
 
+/// Whether `uri` names a vilan source file — asked of watched-file events
+/// (E127), which arrive for whatever the client's watcher glob matched and are
+/// not routed by `documentSelector` the way requests are.
+///
+/// On the URI path rather than through `to_file_path`, exactly as
+/// [`is_manifest`] is: an event can name a file that no longer exists (a
+/// delete) or one that never will (a directory the watcher reported), and
+/// neither has to resolve for the extension to be readable.
+fn is_vilan_source(uri: &Url) -> bool {
+    uri.path()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.ends_with(".vl") && name.len() > 3)
+}
+
 struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
@@ -1848,6 +1863,37 @@ impl Backend {
         }
     }
 
+    /// The root a watched-file event sweeps (E127) — the `recolored` argument
+    /// [`reanalyze_dependents`] widens its sweep by: every open document whose
+    /// package root is at or under this path re-analyzes, dependency edge or
+    /// not.
+    ///
+    /// The edge is the wrong gate here for the same reason it is wrong for a
+    /// platform recolor, and one reason of its own: a file that has just been
+    /// CREATED is in nobody's `canonical_sources`, so there is no edge to find
+    /// it by, and yet every open document in its package can see it — a
+    /// `pkg::` import path completes from the module listing, which is a
+    /// `read_dir` the next analysis performs.
+    ///
+    /// A manifest stands for its own directory, exactly as a manifest SAVE
+    /// does. A `.vl` file stands for the package root of the open document
+    /// that contains it, deepest first, so a nested package sweeps itself
+    /// rather than its parent. `None` when no open document's package contains
+    /// the path — a file changing somewhere no open buffer belongs to, where
+    /// the dependency edge alone is exactly the right gate.
+    fn watched_sweep_root(&self, uri: &Url) -> Option<PathBuf> {
+        let path = uri.to_file_path().ok()?;
+        if is_manifest(uri) {
+            return path.parent().map(vilan_core::util::canonical_path);
+        }
+        let path = vilan_core::util::canonical_path(&path);
+        self.documents
+            .iter()
+            .filter_map(|entry| entry.value().package_root().map(Path::to_path_buf))
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+    }
+
     /// Schedule a debounced re-analysis. A burst of edits collapses to a single
     /// analysis once typing pauses, and an edit that leaves the buffer unchanged
     /// is skipped entirely.
@@ -2417,6 +2463,70 @@ impl LanguageServer for Backend {
             .or_else(|| recolored_package(reach_before, package_reach(&self.documents, &saved)));
         landed |= reanalyze_dependents(&context, &saved, recolored.as_deref()).await;
         // Same sweep rule as a typing pause (S5).
+        send_refreshes(&self.client, refresh_plan(landed)).await;
+    }
+
+    /// E127: files that change on DISK, outside every open buffer.
+    ///
+    /// The VS Code client registers `synchronize.fileEvents` and has been
+    /// sending `workspace/didChangeWatchedFiles` all along; the server
+    /// registered no handler, so `tower-lsp`'s default discarded them. A
+    /// package file created, deleted or renamed by something that is not the
+    /// editor — a generator, a `git checkout`, a `mv` in a terminal — was
+    /// therefore invisible until something else happened to re-analyze,
+    /// because the module listing behind the `pkg::` import steer and the
+    /// library contract are read from DISK inside the analyzer
+    /// (`modules_in_root`) and are only ever as fresh as the analysis that read
+    /// them. The listing is captured per analysis rather than cached
+    /// process-globally (M25), which is what keeps this a staleness of TIMING
+    /// rather than of content: nothing here has to be invalidated, something
+    /// has to be re-run.
+    ///
+    /// So this does for a file with no buffer exactly what a save does for one
+    /// that has: drop the by-path caches for it, move the world revision (E117
+    /// — a disk read answers differently now), and sweep the open documents the
+    /// change can reach. The sweep is wider than the dependency edge on
+    /// purpose, for the same reason a manifest save's is: a file that did not
+    /// exist a moment ago is in no program's `canonical_sources`, so the edge
+    /// finds nothing to sweep, and a CREATED file is the case this item is
+    /// about.
+    ///
+    /// An event on a file the editor has OPEN is ignored: the buffer is the
+    /// truth there (the analyzer reads it through the overlay), `did_change`
+    /// and `did_save` already own that path, and acting on the disk copy would
+    /// schedule an analysis against text the user has typed past.
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // A rename arrives as a delete plus a create, and a save-by-tool can
+        // arrive as several events for one path; each path is worth one sweep.
+        let mut changed: Vec<Url> = params
+            .changes
+            .into_iter()
+            .map(|event| event.uri)
+            .filter(|uri| is_manifest(uri) || is_vilan_source(uri))
+            .filter(|uri| !self.documents.contains_key(uri) && !self.manifests.contains_key(uri))
+            .collect();
+        changed.sort();
+        changed.dedup();
+        if changed.is_empty() {
+            return;
+        }
+        // The world moved: every disk read the analyzer does may answer
+        // differently now (E117's ordering stamp).
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        let context = self.analysis_context();
+        let mut landed = false;
+        for uri in changed {
+            if let Ok(path) = uri.to_file_path() {
+                // The line-index cache is stamped by length and mtime, so it
+                // heals itself for a rewrite — but a DELETED file leaves an
+                // entry with nothing left to disagree with its stamp. Dropping
+                // it is correct for every event kind and costs one map probe.
+                self.line_indices.remove(&path);
+            }
+            let root = self.watched_sweep_root(&uri);
+            landed |= reanalyze_dependents(&context, &uri, root.as_deref()).await;
+        }
+        // Same sweep rule as a typing pause and a save (S5).
         send_refreshes(&self.client, refresh_plan(landed)).await;
     }
 
@@ -7295,5 +7405,264 @@ mod linked_editing_range_tests {
             None,
             "and a caret on a plain statement is still not a tag",
         );
+    }
+}
+
+/// E127: a file that appears on disk is offered by the next completion, with
+/// no edit to the open buffer.
+///
+/// The client has always sent `workspace/didChangeWatchedFiles`; the server
+/// registered no handler and `tower-lsp` dropped them. The consequence is not
+/// a wrong answer but a LATE one: `modules_in_root` is a `read_dir` the
+/// analyzer performs, captured per analysis (M25), so a module written by a
+/// generator or arriving with a `git checkout` is offered only once something
+/// else happens to re-analyze — an edit to an unrelated buffer, or a restart.
+///
+/// Driven through the real notification handler against a real directory,
+/// because every part of the claim is about the server's own choice of what to
+/// re-analyze. Non-vacuous by construction: the same completion is asked
+/// BEFORE the file exists and asserted not to offer it, so a pin that passed
+/// because the module was always there would red on its first half.
+#[cfg(test)]
+mod watched_files_tests {
+    use super::session_leak_tests::open_params;
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    const MANIFEST: &str = "[package]\nname = \"app\"\n";
+    /// An import path with nothing after `pkg::` — the completion that reads
+    /// the package's module listing, and the one the B4 import steer is built
+    /// on. The buffer is never edited after the open.
+    const ENTRY: &str = "import pkg::\n\nfun main() {\n}\n";
+    const ARRIVING: &str = "fun helper(): i32 {\n\t1\n}\n";
+
+    fn workspace(name: &str) -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-watched-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        std::fs::write(directory.join("vilan.toml"), MANIFEST).expect("a manifest");
+        std::fs::write(directory.join("src/main.vl"), ENTRY).expect("an entry");
+        let entry = Url::from_file_path(directory.join("src/main.vl")).expect("a file url");
+        (directory, entry)
+    }
+
+    /// The module names `import pkg::|` offers on line 0.
+    async fn module_completions(backend: &Backend, uri: &Url) -> Vec<String> {
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(0, 12),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion answers");
+        match response {
+            Some(CompletionResponse::Array(items)) => {
+                items.into_iter().map(|item| item.label).collect()
+            }
+            None => Vec::new(),
+            other => panic!("the array form is expected, got {other:?}"),
+        }
+    }
+
+    /// Waits for an open's scheduled analysis to land (E123).
+    async fn analyzed(backend: &Backend, uri: &Url) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Waits for the completion to offer `name`. Polls rather than sleeping:
+    /// the sweep the notification starts is a real analysis on a blocking
+    /// thread, and a fixed sleep is what turns a pin like this into a flake on
+    /// a loaded box.
+    async fn offers(backend: &Backend, uri: &Url, name: &str) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if module_completions(backend, uri)
+                .await
+                .iter()
+                .any(|label| label == name)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    fn created(path: &std::path::Path) -> DidChangeWatchedFilesParams {
+        DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(path).expect("a file url"),
+                typ: FileChangeType::CREATED,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_that_appears_on_disk_is_offered_by_the_next_completion() {
+        let (directory, entry_uri) = workspace("created");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(
+            analyzed(backend, &entry_uri).await,
+            "the open's analysis lands (it is scheduled, not inline — E123), \
+             which is the settled starting state this pin changes the disk from",
+        );
+        let before = module_completions(backend, &entry_uri).await;
+        assert!(
+            !before.contains(&"helper".to_string()),
+            "the module does not exist yet — the premise of this pin: {before:?}",
+        );
+
+        // Something that is not the editor writes a new package module. The
+        // open buffer is untouched, and stays untouched for the rest of this
+        // test.
+        let arrived = directory.join("src/helper.vl");
+        std::fs::write(&arrived, ARRIVING).expect("a new module");
+        backend.did_change_watched_files(created(&arrived)).await;
+
+        assert!(
+            offers(backend, &entry_uri, "helper").await,
+            "the notification must re-analyze the package, so the module \
+             listing the completion reads includes the new file",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other direction, so the sweep is not one-way: a module DELETED off
+    /// disk stops being offered. A handler that only ever swept on creation
+    /// would pass the pin above and fail this one.
+    #[tokio::test]
+    async fn a_module_deleted_off_disk_stops_being_offered() {
+        let (directory, entry_uri) = workspace("deleted");
+        let doomed = directory.join("src/spare.vl");
+        std::fs::write(&doomed, ARRIVING).expect("a module to delete");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(analyzed(backend, &entry_uri).await);
+        assert!(
+            module_completions(backend, &entry_uri)
+                .await
+                .contains(&"spare".to_string()),
+            "the module is offered while it exists — the premise of this pin",
+        );
+
+        std::fs::remove_file(&doomed).expect("the module goes away");
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&doomed).expect("a file url"),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        let mut gone = false;
+        while std::time::Instant::now() < deadline {
+            if !module_completions(backend, &entry_uri)
+                .await
+                .contains(&"spare".to_string())
+            {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "a deleted module must stop being offered");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The manifest arm, and the shape of the sweep the notification widens
+    /// to. A `vilan.toml` stands for its own DIRECTORY — it is in no program's
+    /// `canonical_sources`, so the dependency edge finds nothing to sweep for
+    /// it, exactly as a manifest SAVE found nothing before E116 gave it the
+    /// same treatment. A source file stands for the package root of the open
+    /// document that contains it, which is the set a creation is invisible to.
+    #[tokio::test]
+    async fn a_watched_event_names_the_root_its_sweep_covers() {
+        let (directory, entry_uri) = workspace("root");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(analyzed(backend, &entry_uri).await);
+        let manifest_directory = vilan_core::util::canonical_path(&directory);
+        // The package root the analysis resolved is the SOURCE root, one level
+        // below the manifest — which the manifest's own directory contains, so
+        // both answers sweep the same open documents.
+        let source_root = vilan_core::util::canonical_path(directory.join("src"));
+        assert!(source_root.starts_with(&manifest_directory));
+        let manifest = Url::from_file_path(directory.join("vilan.toml")).expect("a file url");
+        assert_eq!(
+            backend.watched_sweep_root(&manifest),
+            Some(manifest_directory),
+            "a manifest stands for its own directory",
+        );
+        let arriving = Url::from_file_path(directory.join("src/helper.vl")).expect("a file url");
+        assert_eq!(
+            backend.watched_sweep_root(&arriving),
+            Some(source_root),
+            "a source file stands for the package root that contains it",
+        );
+        let elsewhere = Url::from_file_path(std::env::temp_dir().join("unrelated-vilan-file.vl"))
+            .expect("a file url");
+        assert_eq!(
+            backend.watched_sweep_root(&elsewhere),
+            None,
+            "a file no open package contains widens nothing — the dependency \
+             edge alone is the right gate there",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An event on a file the editor has OPEN is ignored: the buffer is the
+    /// truth there, `did_change`/`did_save` own that path, and acting on the
+    /// disk copy would schedule an analysis of text the user has typed past.
+    /// Pinned through the observable consequence — the world revision, which
+    /// every other arm of this handler moves.
+    #[tokio::test]
+    async fn an_event_on_an_open_buffer_is_ignored() {
+        let (directory, entry_uri) = workspace("buffered");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(analyzed(backend, &entry_uri).await);
+        let before = backend.revision.load(Ordering::SeqCst);
+        backend
+            .did_change_watched_files(created(&directory.join("src/main.vl")))
+            .await;
+        assert_eq!(
+            backend.revision.load(Ordering::SeqCst),
+            before,
+            "the open buffer's own file moves nothing",
+        );
+        // …and neither does a file this server has no business with.
+        std::fs::write(directory.join("notes.md"), "not vilan\n").expect("a stray file");
+        backend
+            .did_change_watched_files(created(&directory.join("notes.md")))
+            .await;
+        assert_eq!(backend.revision.load(Ordering::SeqCst), before);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
