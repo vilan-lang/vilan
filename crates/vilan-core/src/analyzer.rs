@@ -2276,11 +2276,16 @@ impl Constraint<'_> {
             Constraint::Destructure(constraint) => constraint.id,
             Constraint::MethodCall { id, .. } => *id,
             Constraint::SlotUnification { argument_id, .. } => *argument_id,
-            Constraint::MethodArgCheck {
-                argument_ids,
-                member_id,
-                ..
-            } => argument_ids.first().copied().unwrap_or(*member_id),
+            // The CALL, never the declaration (B228). This used to anchor on
+            // the first argument and fall back to `member_id` — and with zero
+            // arguments there is no first argument, so the fallback stamped the
+            // callee's own file as the diagnostic's source while `error.span`
+            // still held the caller's byte offsets. A missing argument on a std
+            // method then rendered against std's file, at the user's offsets,
+            // with the user's file never named: it read as no diagnostic at
+            // all. `call_id` is caller-side always, and is the same file the
+            // first argument was in for every non-empty call.
+            Constraint::MethodArgCheck { call_id, .. } => *call_id,
             Constraint::ForEachItem { item_id, .. } => *item_id,
             Constraint::CallSubject(constraint) => constraint.call_id,
             Constraint::ReturnType { body_id, .. } => *body_id,

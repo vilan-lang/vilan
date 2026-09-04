@@ -1213,3 +1213,128 @@ fn an_entry_self_import_keeps_main_and_says_the_import_is_a_no_op() {
         "and says why the import does nothing: {stderr}"
     );
 }
+
+/// The file named on the FIRST rendered block's location line — the primary
+/// label's file, which is the one a reader looks at first. B228 is entirely
+/// about this line, so it is asked for by itself rather than through
+/// [`renders_in`], which any block in the diagnostic can satisfy.
+fn primary_label_file(stderr: &str) -> String {
+    stderr
+        .split("╭─[")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The browser fixture the zero-argument pins share: a `std::ui` method that
+/// takes an argument, called with none.
+const BROWSER_MANIFEST: &str = "[package]\nname = \"app\"\ntarget = \"browser\"\n";
+
+#[test]
+fn a_zero_argument_std_method_call_reports_in_the_callers_file() {
+    // B228, the plain form. `MethodArgCheck` anchored on its first ARGUMENT
+    // and fell back to the declaration when there was none — so with zero
+    // arguments the diagnostic's source became std's file while its span still
+    // held the caller's byte offsets. The whole thing rendered against
+    // `std/src/browser/ui.vl`, at offsets belonging to another file, and the
+    // user's own file was never named: it read as no diagnostic at all.
+    let dir = temp_files(
+        "zero_arg_std_method",
+        &[
+            ("vilan.toml", BROWSER_MANIFEST),
+            (
+                "src/main.vl",
+                "import std::ui::{ View, view, mount_root };\n\n\
+                 fun broken(): View {\n\tview(\"div\").styled()\n}\n\n\
+                 fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the missing argument must fail");
+    assert!(
+        stderr.contains("expects 1 argument, but got 0"),
+        "the arity is checked: {stderr}"
+    );
+    assert!(
+        primary_label_file(&stderr).contains("main.vl"),
+        "the primary label belongs to the CALLER's file: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "view(\"div\").styled()"),
+        "and quotes the caller's own line: {stderr}"
+    );
+    assert!(
+        stderr.contains("is declared here"),
+        "the declaration note survives, in std's file: {stderr}"
+    );
+}
+
+#[test]
+fn a_zero_argument_std_method_in_an_element_head_reports_in_the_callers_file() {
+    // The spelling it was found through: `<div .styled() />`, where the call is
+    // built by the element desugar. `redirect_derived_diagnostics` already
+    // handles a `DERIVED_SOURCE` `call_id`, so the caller-side anchor holds
+    // through the desugar too — which is the half that had to be checked
+    // separately from the hand-written chain above.
+    let dir = temp_files(
+        "zero_arg_element_method",
+        &[
+            ("vilan.toml", BROWSER_MANIFEST),
+            (
+                "src/main.vl",
+                "import std::ui::{ View, view, mount_root };\n\n\
+                 fun broken(): View {\n\t<div .styled() />\n}\n\n\
+                 fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the missing argument must fail");
+    assert!(
+        primary_label_file(&stderr).contains("main.vl"),
+        "the element form anchors caller-side too: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "<div .styled() />"),
+        "and quotes the element head: {stderr}"
+    );
+}
+
+#[test]
+fn a_too_many_arguments_std_method_call_still_reports_in_the_callers_file() {
+    // The control that already rendered right, and must keep doing so: with at
+    // least one argument the old anchor was that argument, which is caller-side
+    // — the same file `call_id` names. This is what makes the fix a
+    // restatement rather than a move.
+    let dir = temp_files(
+        "too_many_args_std_method",
+        &[
+            ("vilan.toml", BROWSER_MANIFEST),
+            (
+                "src/main.vl",
+                "import std::ui::{ View, view, mount_root };\n\
+                 import std::style::style;\n\n\
+                 fun broken(): View {\n\tview(\"div\").styled(style(), 1, 2)\n}\n\n\
+                 fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the extra arguments must fail");
+    assert!(
+        stderr.contains("expects 1 argument, but got 3"),
+        "the arity is checked: {stderr}"
+    );
+    assert!(
+        primary_label_file(&stderr).contains("main.vl"),
+        "and reports where the call is written: {stderr}"
+    );
+}
