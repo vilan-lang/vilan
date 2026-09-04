@@ -89,6 +89,13 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     // that requires an ambient context (destruction.md §8). Not a graph input.
     program.context_dependent_functions = plan.param_nodes.iter().map(|(_, node)| *node).collect();
 
+    // E124: the bindings this pass recognized as ambient contexts, published
+    // for the dead-item paint. Recorded BEFORE the `is_empty` short-circuit
+    // below: a context that is created and never read is rewritten by nothing
+    // and is exactly as load-bearing a declaration as one that is
+    // (`dead-code-paint.md` §1.7). Not a graph input either.
+    program.context_bindings = plan.contexts.clone();
+
     if plan.is_empty() {
         // Nothing to rewrite — the common case, since most programs create no
         // context at all. The graph is still the program's.

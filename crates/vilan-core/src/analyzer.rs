@@ -39242,6 +39242,19 @@ pub struct Program<'src> {
     /// source. Tooling checks membership here to answer an explicit, honest
     /// "nothing" instead of relying on the self-loop cycle guard (E73).
     pub context_hidden_parameters: HashMap<Id, Id>,
+    /// E124: the module-level bindings `context::thread_contexts` recognized as
+    /// ambient contexts — `let app_context = Context<AppContext>::new();`.
+    ///
+    /// The pass REWRITES the program: an ambient read stops being a read of
+    /// this binding and becomes a hidden parameter, so the graph the paint
+    /// walks is the post-rewrite one, in which the binding has no readers left
+    /// and no runtime existence. The walk is not wrong about the bundle
+    /// (`dead-code-paint.md` §1.7) — but the declaration is the shipped way to
+    /// hold app-wide state (`ambient-owner.md`), and graying it tells the user
+    /// to delete the thing the file exists for. Recorded by the pass that
+    /// knows, rather than re-derived downstream from a type test on
+    /// `Context<_>`.
+    pub context_bindings: Vec<Id>,
     // `external` std functions the transformer lowers to native JS or a runtime
     // helper (`str.trim()`, `scan()`, `random::range_i32(..)`, ...), keyed by fn id.
     // (The per-type `range_*` are forwarded to by the `Random` trait impls.)
@@ -45609,6 +45622,7 @@ fn analyze_over_world<'src>(
         spawn_nursery_sources: HashMap::default(),
         context_erased_subjects: HashMap::default(),
         context_hidden_parameters: HashMap::default(),
+        context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,
         modules: analyzer.modules,

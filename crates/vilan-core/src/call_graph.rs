@@ -120,6 +120,23 @@ pub struct CallGraph {
     /// which is what makes module-level spawn legal). Module initialization is
     /// synchronous, so any entry here is a refusal; `async_infer` reports it.
     initializer_awaits: HashMap<Id, Vec<Id>>,
+    /// E124: the edges out of a `const`-marked module binding's initializer,
+    /// collected BESIDE the emission graph rather than into it — the four maps
+    /// above, for exactly the bindings the loop below skips.
+    ///
+    /// The skip is load-bearing for emission and must not be disturbed: a
+    /// `const` initializer is evaluated by the compile-time interpreter and
+    /// serialized as a value, so at runtime it is data, and following its calls
+    /// would drag (say) a `node:` import into a browser bundle. It is wrong for
+    /// PAINT, though, and measurably so — `dead-code-paint.md` §1.6 traces 27 of
+    /// kolt's 1,859 grays to two `const` initializers in one file, every one of
+    /// them a function whose deletion breaks the build. So the edges are kept,
+    /// unused by every consumer but [`crate::dead_items`], which asks the
+    /// traversal to follow them.
+    const_initializer_calls: HashMap<Id, Vec<Call>>,
+    const_initializer_closures: HashMap<Id, Vec<Id>>,
+    const_global_references: HashMap<Id, Vec<(Id, Id)>>,
+    const_function_references: HashMap<Id, Vec<(Id, Id)>>,
 }
 
 thread_local! {
@@ -200,9 +217,7 @@ impl CallGraph {
             else {
                 continue;
             };
-            if const_exprs.contains(&initial) {
-                continue;
-            }
+            let is_const = const_exprs.contains(&initial);
             let mut collector = Collector {
                 program,
                 globals: &module_bindings,
@@ -214,6 +229,26 @@ impl CallGraph {
                 visited: HashSet::default(),
             };
             collector.walk(initial);
+            // A `const` initializer's edges go to the paint-only maps and
+            // NOWHERE else: not `initializer_awaits` (module init is
+            // synchronous and a const initializer does not run at run time at
+            // all, so an entry there would be a refusal about code that never
+            // executes), and not the reverse edges below.
+            if is_const {
+                graph
+                    .const_initializer_calls
+                    .insert(binding, collector.calls);
+                graph
+                    .const_initializer_closures
+                    .insert(binding, collector.nested_closures);
+                graph
+                    .const_global_references
+                    .insert(binding, collector.global_references);
+                graph
+                    .const_function_references
+                    .insert(binding, collector.function_references);
+                continue;
+            }
             graph.initializer_calls.insert(binding, collector.calls);
             graph
                 .initializer_awaits
@@ -322,6 +357,42 @@ impl CallGraph {
     /// The calls inside a module-level binding's (non-`const`) initializer.
     pub fn initializer_calls_of(&self, id: Id) -> &[Call] {
         self.initializer_calls
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the calls inside a module-level binding's `const` initializer —
+    /// the edges [`initializer_calls_of`](Self::initializer_calls_of)
+    /// deliberately does not carry. Only the dead-item paint reads these; see
+    /// the field's own note for why they are kept apart.
+    pub fn const_initializer_calls_of(&self, id: Id) -> &[Call] {
+        self.const_initializer_calls
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the closures created inside a module-level binding's `const`
+    /// initializer.
+    pub fn const_initializer_closures_of(&self, id: Id) -> &[Id] {
+        self.const_initializer_closures
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the module-level bindings a `const` initializer references.
+    pub fn const_global_references_of(&self, id: Id) -> &[(Id, Id)] {
+        self.const_global_references
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the functions a `const` initializer references as values.
+    pub fn const_function_references_of(&self, id: Id) -> &[(Id, Id)] {
+        self.const_function_references
             .get(&id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
