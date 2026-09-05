@@ -2219,7 +2219,13 @@ fun main(): i32 {
             .rename_edits(offset, "greeting")
             .expect("a rename through an alias");
         assert_eq!(
-            aliased_texts(&document, edits),
+            aliased_texts(
+                &document,
+                edits
+                    .into_iter()
+                    .map(|(source, span, _)| (source, span))
+                    .collect(),
+            ),
             vec!["greet", "hello", "hello", "hello"],
             "rename rewrites exactly what find-references reported",
         );
