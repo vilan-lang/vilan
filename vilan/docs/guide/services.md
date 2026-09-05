@@ -312,6 +312,144 @@ opened the channel — the mirror stays `Waiting` until something that
 renders the value (`or`, `map`, `sub`) subscribes. That is the passive
 read being honest, and the count is what makes the active ones cheap.
 
+### Keyed mirrors: `[expose(keyed)]`
+
+A plain `[expose]` sends the **whole value** on every change. That is the
+right trade for a settings record or a counter, and the wrong one for a
+collection that grows: exposing a message platform's five thousand
+messages means every edit, every post and every delete resends all five
+thousand, to every connected client.
+
+`[expose(keyed)]` makes the collection **keyed**, and then only what moved
+crosses. Two things are required of it:
+
+- the field's element is written as a **`Map<K, V>`** — that is where the
+  key type comes from, and the `[service]` expansion reads it before any
+  type resolves;
+- the value implements **`Keyed<K>`** (its own identity) and
+  **`PartialEq`** (what "changed" means).
+
+```vilan,fragment
+import std::map::Map;
+import std::reactive::SignalCell;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(ChatClient)]
+struct Chat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+```
+
+The server writes `self.messages` exactly as before — `insert`, `remove`,
+whatever it likes. What changed is the wire: the channel diffs successive
+snapshots by key and sends a **`Patch`** of `Delta` ops (`Reset`,
+`Insert`, `Update`, `Remove`) instead of an `Update` carrying the whole
+map.
+
+### Reading a keyed mirror
+
+The mirror is a `KeyedSource<K, T>`, and it holds **exactly what this
+client subscribed to**, in the server's order. It reads two ways.
+
+**The whole collection** — the same four calls a `RemoteSource` has, with
+`List<T>` in place of `T`:
+
+```vilan,fragment
+fun feed(client: ChatClient<SocketTransport>): View {
+	let messages = client.messages.or([]);
+	view("ul").bind_each(messages, |message| message.id, |message| view("li").text(message.body))
+}
+```
+
+**One key** — the part a plain mirror has no spelling for:
+
+```vilan,fragment
+fun message_row(client: ChatClient<SocketTransport>, id: str): View {
+	// Counted per KEY: this opens a subscription for `id` alone, and the
+	// server forwards that message's changes and nothing else. Released
+	// when the row unmounts, like any other lease.
+	let message = client.messages.of(id);
+	view("li").bind_text(message.map(|held| match held {
+		Some(let found) => found.body,
+		None => "…",
+	}))
+}
+```
+
+`of(key)` is the view seam (owner-released, like `or`/`map`);
+`sub_key(key, |value| …)` is its manual form, for code with no owner.
+`get()`, `status()` and `fault()` are passive.
+
+**Whole-collection demand subsumes per-key demand.** Holding both leases
+on one channel does not double anything: while the whole collection is
+held, a key asks for nothing, and when the whole lease is released the
+keys still held take the wire back. You never have to reason about which
+of two forwards a message arrived through.
+
+**`fault()`** is the keyed mirror's one extra read: `Some(reason)` if a
+patch ever named a key the mirror does not hold. That is a server bug or a
+lost frame — never something application code can cause — so the op is
+refused rather than applied, and the first fault is the one kept.
+
+### What it costs
+
+Measured over twenty channels of fifty messages (`reactive_channels.rs`),
+server → client bytes for one event:
+
+| event | `[expose]`, whole platform | `[expose]`, one channel | `[expose(keyed)]` | one key leased |
+| --- | --- | --- | --- | --- |
+| open the channel | 123,816 | 6,156 | 123,827 | 160 |
+| edit one message | 123,753 | 6,093 | **95** | **95** |
+| edit another message | 123,693 | 6,033 | 98 | **0** |
+| post a message | 123,813 | 6,033 | **163** | **0** |
+| delete a message | 123,691 | 5,911 | **34** | **0** |
+
+Three things that table says out loud:
+
+- a keyed channel is **not cheaper to open** — it sends the collection
+  once, as a `Reset`. Leasing one key is what makes a seed small;
+- an edit costs the message, not the platform;
+- a per-key subscriber is told **nothing** about keys it did not ask for,
+  which is the column no amount of client-side filtering can produce.
+
+### The rules worth knowing
+
+- **A reorder falls back to `Reset`.** There is no move op: when the
+  elements retained across a change are not in the same relative order on
+  both sides, the whole collection goes again. Appending, editing and
+  deleting never reorder, so the fallback is rare — and correct where a
+  cleverer diff would be subtly wrong.
+- **A reconnect clears the mirror first.** A plain mirror may keep its
+  last value across a reconnect because the fresh subscription resends
+  the whole value; a keyed forward reseeds only what it is asked for, so
+  a keeping mirror could hold an element deleted while the connection was
+  down and no later op would ever name it. The keys you still hold are
+  re-subscribed and re-seeded.
+- **The contract hash moves — and only for services that use the form.**
+  A keyed exposure is its own surface entry, so a client built against
+  `[expose]` will not connect to a server that has since made the field
+  keyed. That is the point: the frames differ.
+- **Hand-wired exposures have the same two shapes.**
+  `ReactiveServer::expose_keyed(source, key_of)` for a `List<T>` and
+  `expose_keyed_map(source, key_of)` for a `Map<K, V>`, with
+  `ReactiveClient::attached_keyed_source` / `keyed_source` on the other
+  end. The `List<T>` form is only reachable this way: the macro needs the
+  key type written in the field, and a list does not carry one.
+
 ## Connection state and reconnection
 
 Connections drop. The transport handles it: it reconnects with backoff,

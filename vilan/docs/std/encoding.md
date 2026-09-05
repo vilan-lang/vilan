@@ -188,6 +188,35 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
 
+`Map<K, V>` is Wire when both its key and its value are (the key is
+already `Hashable` by the type's own bound). It narrates as a list of
+`{key, value}` pairs — codec-neutral, readable in JSON, and
+insertion-ordered in both directions.
+
+### Keyed collections
+
+Two more names carry the *keyed* half of the reactive protocol
+(`[expose(keyed)]`, see the [services guide](../guide/services.md#keyed-mirrors-exposekeyed)):
+
+```vilan,fragment
+trait Keyed<K> {
+	fun key(self): K;
+}
+
+enum Delta<K, T> {
+	Reset(List<T>),      // the collection BECOMES this
+	Insert(K, T, i32),   // a new element at an index; a key already held is replaced
+	Update(K, T),        // the element under this key takes a new value
+	Remove(K),           // the element under this key is gone
+}
+```
+
+`Keyed` is what makes two snapshots of a collection comparable element by
+element: without it, the only thing a channel can say is "here is the
+whole value again". `Delta` is what it says instead. `Update` and `Remove`
+name a key that must already be present — an absent one is a protocol
+error, not a silent no-op.
+
 ### Backed enums on the wire
 
 A **backed enum** — one whose variants carry an explicit value, `enum

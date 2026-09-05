@@ -14,6 +14,8 @@
 // them entirely.
 
 import pkg::bytes::Bytes;
+import pkg::hash::Hashable;
+import pkg::map::Map;
 import pkg::option::Option::{ None, Some, self };
 import pkg::result::Result::{ Err, Ok, self };
 
@@ -375,6 +377,158 @@ impl Option<type T: Wire> with Wire {
 		} else {
 			Some(T::rebuild(deserializer))
 		}
+	}
+}
+
+// --- Keyed collections (A39) -------------------------------------------------
+
+/// A value that carries its own identity. What makes a `List<T>` a *keyed*
+/// collection: two snapshots of the list can be diffed element by element
+/// instead of replaced wholesale, because `key()` says which element is which
+/// across the change. A message keys by its id, a row by its primary key.
+///
+/// The key must be stable for the value's lifetime and unique within the
+/// collection — a duplicate key makes the diff ambiguous, and the keyed
+/// exposure treats the FIRST occurrence as the element (`std::rpc`).
+trait Keyed<K> {
+	fun key(self): K;
+}
+
+/// One element-grained change to a keyed collection — the delta vocabulary the
+/// reactive protocol's `Patch` frame carries (`proposal/transport-rpc.md` §8;
+/// tracker A39). Before this the only thing a channel could say was "here is
+/// the whole value again", so editing one message in a channel of five
+/// thousand cost the channel.
+///
+/// The four arms, and the semantics a receiver applies them by:
+///
+/// - `Reset(items)` — the collection *becomes* `items`. The seed of a
+///   whole-collection subscription, and the fallback whenever the order of
+///   retained elements changed (a reorder has no op of its own).
+/// - `Insert(key, value, index)` — a NEW element at `index` (clamped to the
+///   list's length). A key that is already present is REPLACED in place
+///   instead: that is the re-seed a per-key subscription sends when demand
+///   returns, and it must not duplicate the element.
+/// - `Update(key, value)` — the element under `key` takes a new value. The key
+///   must be present; an absent one is a protocol error.
+/// - `Remove(key)` — the element under `key` is gone. The key must be present;
+///   an absent one is a protocol error.
+///
+/// `K` and `T` are both `Wire` on the impl, so a patch of deltas encodes with
+/// the connection's codec exactly like any other payload.
+enum Delta<K, T> {
+	Reset(List<T>),
+	Insert(K, T, i32),
+	Update(K, T),
+	Remove(K),
+}
+
+impl Delta<type K: Wire, type T: Wire> with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		match self {
+			Delta::Reset(let items) => {
+				serializer.begin_variant("Reset", 1);
+				items.describe(serializer);
+				serializer.end_variant();
+			},
+			Delta::Insert(let key, let value, let index) => {
+				serializer.begin_variant("Insert", 3);
+				key.describe(serializer);
+				value.describe(serializer);
+				index.describe(serializer);
+				serializer.end_variant();
+			},
+			Delta::Update(let key, let value) => {
+				serializer.begin_variant("Update", 2);
+				key.describe(serializer);
+				value.describe(serializer);
+				serializer.end_variant();
+			},
+			Delta::Remove(let key) => {
+				serializer.begin_variant("Remove", 1);
+				key.describe(serializer);
+				serializer.end_variant();
+			},
+		}
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): Delta<K, T> {
+		let tag = deserializer.variant_tag();
+		match tag {
+			"Reset" => {
+				deserializer.begin_variant("Reset", 1);
+				let items = List<T>::rebuild(deserializer);
+				deserializer.end_variant();
+				Delta::Reset(items)
+			},
+			"Insert" => {
+				deserializer.begin_variant("Insert", 3);
+				let key = K::rebuild(deserializer);
+				let value = T::rebuild(deserializer);
+				let index = i32::rebuild(deserializer);
+				deserializer.end_variant();
+				Delta::Insert(key, value, index)
+			},
+			"Update" => {
+				deserializer.begin_variant("Update", 2);
+				let key = K::rebuild(deserializer);
+				let value = T::rebuild(deserializer);
+				deserializer.end_variant();
+				Delta::Update(key, value)
+			},
+			"Remove" => {
+				deserializer.begin_variant("Remove", 1);
+				let key = K::rebuild(deserializer);
+				deserializer.end_variant();
+				Delta::Remove(key)
+			},
+			_ => {
+				deserializer.fail(i"unknown delta variant '{tag}'");
+				Delta::Reset([])
+			},
+		}
+	}
+}
+
+// A map narrates as a list of `{key, value}` pairs — codec-neutral (a binary
+// codec reads the two positionally and ignores the names) and readable in
+// JSON. Backlog I1's gap: Q8 launched without it because no payload needed
+// one, and A39's keyed exposure is the payload that does.
+//
+// Insertion order is what `entries()` reports and what rebuild replays, so a
+// round trip preserves it. A duplicate key on the wire keeps the LAST pair,
+// matching `Map::insert`.
+impl Map<type K: Hashable + Wire, type V: Wire> with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		let entries = self.entries();
+		serializer.begin_list(entries.len());
+		for entry in entries {
+			serializer.begin_struct(2);
+			serializer.field("key");
+			entry.0.describe(serializer);
+			serializer.field("value");
+			entry.1.describe(serializer);
+			serializer.end_struct();
+		}
+		serializer.end_list();
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): Map<K, V> {
+		let length = deserializer.begin_list();
+		mut result: Map<K, V> = Map::new();
+		mut index = 0;
+		for index < length {
+			deserializer.begin_struct();
+			deserializer.field("key");
+			let key = K::rebuild(deserializer);
+			deserializer.field("value");
+			let value = V::rebuild(deserializer);
+			deserializer.end_struct();
+			result.insert(key, value);
+			index += 1;
+		}
+		deserializer.end_list();
+		result
 	}
 }
 

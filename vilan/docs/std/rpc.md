@@ -15,6 +15,7 @@ signal fields, the macro generates:
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
 client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
+client.some_map: KeyedSource<K, V>              // per [expose(keyed)] field; a patched mirror (below)
 client.transport: SocketTransport               // connection state lives here
 
 // server side
@@ -70,6 +71,51 @@ writes nothing back (the server owns the source) and the next update
 overwrites it. An empty-list `initial` needs no annotation — the `[]`
 takes its element type from the mirror
 (`let notes = client.notes.or([]);` is a `SignalCell<List<Note>>`).
+
+## Keyed mirrors: `KeyedSource<K, T>`
+
+The mirror an `[expose(keyed)]` field produces. Where a `RemoteSource<T>`
+receives the whole value on every change, this one receives a `Patch` of
+`Delta` ops and applies them in order — and it can lease **one key**.
+
+```vilan,fragment
+struct KeyedSource<K, T> { … }
+
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
+	fun get(self): Option<List<T>>                            // passive: what this client subscribed to
+	fun status(self): SignalCell<Status>                      // passive: `Waiting` until the first patch
+	fun fault(self): Option<str>                              // passive: the first protocol fault, sticky
+	fun or(self, initial: List<T>): SignalCell<List<T>>       // counted, owner-scoped: the whole collection
+	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U>
+	[must_use]
+	fun sub(self, observer: |List<T>| void): Subscription     // counted, manual: the whole collection
+	fun of(self, key: K): SignalCell<Option<T>>               // counted per KEY, owner-scoped
+	[must_use]
+	fun sub_key(self, key: K, observer: |Option<T>| void): Subscription   // counted per KEY, manual
+	fun rebind(self, channel: i32)                            // reconnect: re-subscribe every demand held
+}
+```
+
+The counted lease is `RemoteSource`'s, applied **per demand** rather than
+per channel: a per-key 0→1 sends `Subscribe(channel, Some(key))` and the
+server forwards that key's changes and nothing else; the 1→0 releases that
+key alone. Whole-collection demand **subsumes** per-key demand — while the
+whole collection is held, a key asks for nothing, and when the whole lease
+is released the keys still held take the wire back — so holding both never
+doubles a delivery.
+
+The mirror holds exactly what this client asked for, which is why a
+per-key subscriber's `get()` is a one-element list rather than the
+collection. `fault()` is `Some(reason)` if a patch ever named a key the
+mirror does not hold; that op is refused rather than applied.
+
+Hand-wired exposures use `ReactiveServer::expose_keyed(source, key_of)`
+(for a `Source<List<T>>`) or `expose_keyed_map(source, key_of)` (for a
+`Source<Map<K, V>>`), with `ReactiveClient::attached_keyed_source` /
+`keyed_source` on the other end. `key_of` is a value parameter rather than
+a `Keyed<K>` bound alone because `K` appears nowhere else in the
+signature, and vilan infers a type parameter from a call's types, not from
+its bounds.
 
 ## Errors
 

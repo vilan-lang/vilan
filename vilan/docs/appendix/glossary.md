@@ -107,8 +107,14 @@ background, instead of waiting on the network. What [drafts](#draft)
 implement. [Reactive state](../guide/reactive.md).
 
 <a id="mirror"></a>**mirror**: an `[expose]`d server signal that every connected client
-receives a live copy of. The server writes; every client updates.
+receives a live copy of. The server writes; every client updates. A
+[keyed mirror](#keyed-mirror) sends only what changed.
 [Services & RPC](../guide/services.md).
+
+<a id="keyed-mirror"></a>**keyed mirror**: an `[expose(keyed)]`d collection, where the wire
+carries the CHANGE (an insert, an update, a removal) rather than the whole
+collection — and a client may subscribe to one key rather than all of them.
+[Services & RPC](../guide/services.md#keyed-mirrors-exposekeyed).
 
 <a id="monomorphization"></a>**monomorphization**: how generics compile: each concrete use gets its
 own specialized code, so generic dispatch has no runtime cost.
