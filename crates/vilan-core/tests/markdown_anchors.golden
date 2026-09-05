@@ -275,7 +275,7 @@ spec/types.md h2 56-generic-binding-and-inference
 spec/types.md h2 57-operator-and-method-dispatch
 spec/types.md h2 58-conversions-and-coercions
 spec/types.md h2 59-variadic-tuples
-spec/types.md h2 510--and-
+spec/types.md h2 510---and-
 spec/types.md h2 511-type-errors-of-note
 std/browser.md h1 browser-modules-reference
 std/browser.md h2 stddom

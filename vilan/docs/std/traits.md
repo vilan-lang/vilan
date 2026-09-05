@@ -91,7 +91,7 @@ operator's result type is `Self` (the left operand's type).
 
 ## std::operators: `Try` and `Lift`
 
-The machinery behind `!` and `?.`
+The machinery behind `!`, `?.` and `?`
 ([control flow](../tour/control-flow.md)):
 
 ```vilan,fragment

@@ -336,7 +336,8 @@ postfix = "." member
         | "!"                            (* try-assert, §5.10 *)
         | "(" [ entry { "," entry } [ "," ] ] ")"
                                           (* direct call on the chain result *)
-        | "?." member ;                  (* lift link, §5.10 *)
+        | "?." member                    (* lift link, §5.10 *)
+        | "?" ;                           (* expression lift, §5.10 *)
 
 atom    = literal | IDENT | IDENT generic-args | struct-init
         | "(" expression ")" | tuple | list
@@ -377,7 +378,11 @@ chain's result, calling a closure-typed value
 (`self.hook.read()(a, b)`). A `?.` link's **continuation** extends
 through the following plain postfixes up to the next `?.` or `!`:
 `a?.b.c()!` lifts `b.c()` into the container, then try-asserts the
-result (§5.10).
+result (§5.10). A bare `?` — a `?` with no `.` after it — is the
+**expression lift**: it takes no member and lifts its whole enclosing
+SLOT rather than a continuation, so the slot receives the container
+(§5.10). It has been in the language since 2026-07-16 and had no
+production here until now.
 
 A leading `..` marks a **tuple-value spread** (§5.9). It is recognized
 only where an *entry* begins — a tuple construction's entry, or a call
@@ -437,7 +442,7 @@ From tightest to loosest; every binary level is left-associative:
 
 | Level | Operators | Notes |
 |---|---|---|
-| 1 | `::` paths, calls, `.` `[]` `!` `?.` | §3.6 |
+| 1 | `::` paths, calls, `.` `[]` `!` `?.` `?` | §3.6 |
 | 2 | prefix `!` `-` `await` `async` `&` `&mut` `*` | unary; `async` also takes a block |
 | 3 | `*` `/` `%` | |
 | 4 | `+` `-` | |

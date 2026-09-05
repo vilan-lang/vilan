@@ -80,7 +80,7 @@ test suite builds it on every run.
   cleans up deterministically at scope end, with the double-close family
   rejected at compile time.
 - **No `null`, no exceptions.** Absence is `Option`, failure is `Result`,
-  and the `!` and `?.` operators keep both ergonomic.
+  and the `!`, `?.` and `?` operators keep both ergonomic.
 - **`await` is implicit.** Calling an async function gives you the
   value. You only write `async` to *opt out* of waiting.
 - **Fine-grained reactive UI.** Signals bind to individual DOM
