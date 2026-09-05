@@ -3200,6 +3200,69 @@ main();
     assert_fails_without(source, "context `a_ctx` is read here");
 }
 
+// --- B232: a stalled method call speaks for itself ---
+//
+// The post-solve residual sweep reported StructInitializer / FieldAccessor /
+// Variable / CallSubject leftovers only, so a `MethodCall` the fixpoint never
+// selected was spoken about by whatever error stalled it — and, when nothing
+// else was wrong, by nothing at all. That silence is why B229's stand-down
+// asked first whether the program was clean: excusing a coverage verdict on a
+// program carrying no diagnostic would have turned a fence into a silent
+// miscompile. With the call reporting itself, the question is gone.
+
+/// The previously silent program: a method on a binder whose type is never
+/// determined compiled to nothing and said nothing. One diagnostic now.
+#[test]
+fn b232_a_stalled_method_call_on_a_clean_program_reports_once() {
+    assert_fails_once_with(
+        r#"
+fun main() {
+    let empty = [];
+    for item in empty {
+        item.len();
+    }
+}
+main();
+        "#,
+        "this call could not be resolved: the type of `len`'s receiver is never determined",
+    );
+}
+
+/// B229's dangerous case, made honest: a `run` the fixpoint never selected on
+/// an otherwise clean program. The guard used to keep the coverage fence here
+/// — a wall of "read here, but this code can be reached without an enclosing
+/// `run`" about a `run` the program plainly writes — because the alternative
+/// was saying nothing. The residual names the argument that stalled it, and
+/// the fence stands down.
+#[test]
+fn b232_a_stalled_run_reports_its_own_argument_instead_of_fencing() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let app_ctx: Context<i32> = Context::new();
+
+fun label(): i32 {
+    app_ctx.get()
+}
+
+fun main() {
+    let empty = [];
+    for item in empty {
+        app_ctx.run(item, || {
+            print(label());
+        });
+    }
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "this call could not be resolved: the type of argument 1 of `run` is never determined",
+    );
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
 // --- E84: the demotion/trace contract widens to any dependency package ---
 // (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
 // user did not write — std or ANY external/linked package — demotes and

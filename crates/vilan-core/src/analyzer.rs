@@ -39389,6 +39389,81 @@ impl<'src> Analyzer<'src> {
                 self.push_anchored(error, anchor);
             }
         }
+        // B232: a leftover `MethodCall` had no residual of its own — a stalled
+        // method call was spoken about only by whatever error stalled it, and
+        // when nothing else was wrong it was spoken about by nothing at all.
+        // That silence is what forced B229's stand-down to ask first whether
+        // the program was clean: a `run` the fixpoint never selected on an
+        // otherwise clean program would have turned a coverage fence into a
+        // silent miscompile. With the call speaking for itself the question
+        // goes away — an unselected method call means a diagnostic, always.
+        //
+        // Collected before the loop, because naming the operand needs `&mut
+        // self` (the same shape the subscript residual below uses).
+        let unresolved_method_calls: Vec<(Id, Id, &'src str, Vec<Id>, Span)> =
+            if residuals_are_cascade {
+                Vec::new()
+            } else {
+                self.constraints
+                    .iter()
+                    .filter_map(|constraint| match constraint {
+                        Constraint::MethodCall {
+                            id,
+                            subject_id,
+                            member_name,
+                            argument_ids,
+                            arguments_span,
+                            ..
+                        } => Some((
+                            *id,
+                            *subject_id,
+                            *member_name,
+                            argument_ids.clone(),
+                            *arguments_span,
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            };
+        for (call_id, subject_id, member_name, argument_ids, arguments_span) in
+            unresolved_method_calls
+        {
+            // The operand that stalled it, named — "this call could not be
+            // resolved" on its own says nothing a reader can act on. A method
+            // call defers on its RECEIVER (the member cannot be looked up
+            // until the receiver's type is known) or on an ARGUMENT that never
+            // landed, so those are the two answers; a slot that never got a
+            // type reads back as `any` here, because the post-fixpoint commits
+            // below have already run.
+            let undetermined =
+                |type_: &Type| matches!(type_, Type::Unresolved | Type::Unknown | Type::Any);
+            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+            let operand = if undetermined(&subject_type) {
+                format!("`{member_name}`'s receiver")
+            } else {
+                let mut stalled = None;
+                for (index, argument_id) in argument_ids.iter().enumerate() {
+                    let argument_type =
+                        self.infer_type(*argument_id, &Type::Unknown, &HashMap::default());
+                    if undetermined(&argument_type) {
+                        stalled = Some(format!("argument {} of `{member_name}`", index + 1));
+                        break;
+                    }
+                }
+                stalled.unwrap_or_else(|| format!("an operand of `{member_name}`"))
+            };
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&call_id).unwrap_or(&&arguments_span),
+                    msg: format!(
+                        "this call could not be resolved: the type of {operand} is never determined"
+                    ),
+                },
+                call_id,
+            );
+        }
         // A subscript left deferred because its list's element slot never
         // grounded (one that DID ground resolved during the fixpoint): the
         // never-determined error, at the subscript. Other deferral causes (an

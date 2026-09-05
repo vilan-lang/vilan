@@ -924,23 +924,23 @@ fn analyze(
     // question that can be answered about a program whose `run` sites are not
     // all on record, and the diagnostic explaining why is already in hand.
     //
-    // Narrow on purpose, in both directions. Only the contexts an unresolved
-    // `run` actually names are excused — every other context in the same
-    // program keeps its verdict. And nothing is excused in a program that
-    // carries no diagnostic: a suppression that could fire on a clean program
-    // would trade a confusing refusal for a silent miscompile, which is the
-    // one thing this check exists to prevent.
-    let unresolved_run_contexts: HashSet<Id> = if program.diagnostics.is_empty() {
-        HashSet::default()
-    } else {
-        program
-            .unresolved_method_calls
-            .iter()
-            .filter(|(_, _, member_name)| *member_name == "run")
-            .filter_map(|(_, subject_id, _)| local_target(program, *subject_id))
-            .filter(|context| contexts.contains(context))
-            .collect()
-    };
+    // Narrow on purpose: only the contexts an unresolved `run` actually names
+    // are excused — every other context in the same program keeps its verdict.
+    //
+    // The stand-down shipped with a second narrowing, a `program.diagnostics`
+    // non-empty guard, because a stalled `MethodCall` had no residual of its
+    // own: on an otherwise clean program the excuse would have turned a
+    // coverage fence into a silent miscompile, which is the one thing this
+    // check exists to prevent. B232 gave the stalled call its own residual, so
+    // an unresolved `run` IS a diagnostic and the guard asked a question that
+    // can no longer have the answer it was written for.
+    let unresolved_run_contexts: HashSet<Id> = program
+        .unresolved_method_calls
+        .iter()
+        .filter(|(_, _, member_name)| *member_name == "run")
+        .filter_map(|(_, subject_id, _)| local_target(program, *subject_id))
+        .filter(|context| contexts.contains(context))
+        .collect();
 
     // --- Per-context effect inference + coverage. ---
     for &context in &plan.contexts {
