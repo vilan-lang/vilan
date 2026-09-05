@@ -1742,3 +1742,262 @@ fn an_overlay_served_sibling_edit_evicts_the_record_with_the_world() {
     let _ = std::fs::remove_dir_all(&root);
     vilan_core::analyzer::base_cache_clear();
 }
+
+/// M41: `type_id_sources` — T0's per-`TypeId` minting-source census — is
+/// ~4 bytes for every type a world ever minted, and `base_cache_world_bytes`
+/// could not see it. That made M24's LRU budget optimistic by exactly that
+/// much on every retained world, and the direction matters: a budget that
+/// under-counts what it retains is a budget the session exceeds silently.
+///
+/// Three claims, and the third is the item's:
+///
+/// 1. the split is EXHAUSTIVE — texts plus census is the very figure the
+///    budget is compared against, so neither half can quietly stop counting;
+/// 2. the census is a real, non-zero share of a std world (it is not a
+///    rounding error being accounted for form's sake);
+/// 3. **the tally MOVES when a world gains types, and moves on TYPES rather
+///    than on text.** The two sibling fixtures below are within a byte of the
+///    same length; one declares thirty-two nominals and the other is the same
+///    bulk in comments. If the tally were only a second reading of the text
+///    length — which is exactly what it was — the two worlds would be
+///    recorded as worth the same. They are not.
+#[test]
+fn the_world_tally_counts_the_type_id_census_and_moves_when_a_world_gains_types() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let root = std::env::temp_dir().join(format!("vilan_m41_census_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // Type-dense: thirty-two nominals, each minting types of its own.
+    let mut dense = String::new();
+    for index in 0..32 {
+        dense.push_str(&format!("struct Dense{index:02} {{\n\tvalue: i32,\n}}\n"));
+    }
+    // Type-free, and the same bulk: comment lines, which mint nothing.
+    let mut sparse = String::new();
+    for index in 0..32 {
+        sparse.push_str(&format!("// sparse{index:02} .............\n//\n//\n"));
+    }
+    assert_eq!(
+        dense.len(),
+        sparse.len(),
+        "the fixtures must be the same length, or this pin reads a text \
+         difference and calls it a type difference"
+    );
+    std::fs::write(root.join("dense.vl"), &dense).expect("write dense");
+    std::fs::write(root.join("sparse.vl"), &sparse).expect("write sparse");
+    const DENSE: &str = "import std::io::print;\nimport pkg::dense::Dense00;\n\
+                         fun main() { print(1); }\n";
+    const SPARSE: &str = "import std::io::print;\nimport pkg::sparse;\n\
+                          fun main() { print(1); }\n";
+
+    let entry_path = root.join("main.vl");
+    let read_split = |spec: &PackageSpec, source: &'static str| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_path.clone();
+        on_one_thread(move || {
+            // One world at a time, so the split belongs to a known program
+            // rather than to whatever an earlier test left behind.
+            vilan_core::analyzer::base_cache_clear();
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            drop(program);
+            let (texts, census) = vilan_core::analyzer::base_cache_retained_split();
+            (
+                vilan_core::analyzer::base_cache_retained_bytes(),
+                texts,
+                census,
+                format!("{errors:?}"),
+            )
+        })
+    };
+    let (dense_bytes, dense_texts, dense_census, dense_errors) = read_split(&spec, DENSE);
+    let (sparse_bytes, sparse_texts, sparse_census, sparse_errors) = read_split(&spec, SPARSE);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+
+    println!(
+        "M41-CENSUS dense: {dense_bytes} B = {dense_texts} B texts + {dense_census} B census; \
+         sparse: {sparse_bytes} B = {sparse_texts} B texts + {sparse_census} B census"
+    );
+    assert_eq!(dense_errors, "[]", "the dense fixture must analyze clean");
+    assert_eq!(sparse_errors, "[]", "the sparse fixture must analyze clean");
+
+    // (1) Exhaustive: the two halves ARE the budgeted figure.
+    assert_eq!(
+        dense_texts + dense_census,
+        dense_bytes,
+        "the split must account for every byte the budget is compared against"
+    );
+    assert_eq!(sparse_texts + sparse_census, sparse_bytes);
+
+    // (2) Real: a std world mints thousands of types, so its census is tens of
+    // kilobytes — not zero, which is what the tally used to report.
+    assert!(
+        sparse_census > 10_000,
+        "a std world's `TypeId` census must be a real share of what it \
+         retains, not {sparse_census} B"
+    );
+
+    // (3) The item's pin. Same text, more types, bigger tally.
+    assert_eq!(
+        dense_texts, sparse_texts,
+        "the fixtures were written the same length, so the TEXT halves must \
+         agree — if they do not, the census comparison below proves nothing"
+    );
+    assert!(
+        dense_census > sparse_census,
+        "a world that gained thirty-two nominals must be recorded as worth \
+         more than one that gained the same bulk in comments: {dense_census} B \
+         is not more than {sparse_census} B"
+    );
+}
+
+/// The process CPU this process has burned, in milliseconds — every thread's,
+/// summed, read off `/proc/self/stat`'s `utime`/`stime` (fields 14 and 15).
+///
+/// Wall is not an instrument on this tree's box: the numbers below are taken
+/// beside other lanes and the load average swings by an order of magnitude
+/// between runs. `None` where the file is not there (every non-Linux host),
+/// which is why the measurement that reads it refuses rather than reporting a
+/// wall number and calling it CPU.
+fn process_cpu_ms() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The comm field can contain spaces and parentheses; everything after the
+    // LAST `)` is the space-separated remainder, whose first entry is `state`
+    // (field 3).
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    // `sysconf(_SC_CLK_TCK)` is 100 on every Linux this runs on; the value is
+    // fixed in the kernel ABI (USER_HZ), not a tunable.
+    Some((utime + stime) as f64 * 10.0)
+}
+
+fn loadavg_1m() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// M36: **the per-process floor an on-disk base cache would remove.**
+///
+/// The base cache is process-global and in memory. Inside one process the
+/// second analysis of an import set is a hit and costs almost nothing; across
+/// processes there is no cache at all, so every process that analyzes any
+/// program pays the whole cold `std` analysis again. That is what N52's split
+/// bought its schedulability with: one process per corpus program took the
+/// inference differential from 12.4 s as a single unit to 47.3 s across 128,
+/// and the release differential pays the same bill.
+///
+/// This measures the floor rather than asserting a budget on it. Cold is a
+/// cleared cache; warm is the very next analysis of the same import set,
+/// which is the cache hit an on-disk world would give the SECOND PROCESS. The
+/// difference is what a cross-process cache is worth per process, and the
+/// ratio is what says whether it is worth building.
+///
+/// **What it does not do, and why the item stays open.** Serving that hit
+/// across processes means writing a `World<'static>` to a file and reading it
+/// back. The world is a graph of `&'src str` into the parse cache's leaked
+/// module texts and of `Span` offsets into them, spread over some forty maps;
+/// nothing in the tree serializes it, and the design that would (texts plus
+/// offsets, keyed by M21's key — the std sources' content hashes and the
+/// toolchain hash — under M24's byte budget for eviction, M9's leak-soak rules
+/// for what a served world may retain, a temp-file-plus-rename write so a
+/// killed process cannot leave a half-file, and a checksum that turns a
+/// corrupt file into a MISS rather than into a wrong answer) is a tranche of
+/// its own. The number below is what that tranche would buy.
+#[test]
+#[ignore = "M36: a MEASUREMENT of the cross-process floor, not a budget — it prints the cold/warm split a cross-process world cache would remove; run deliberately"]
+fn the_cold_std_analysis_is_the_per_process_floor_an_on_disk_world_would_remove() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let load = loadavg_1m();
+
+    let (cold, warm, hits, misses) = on_one_thread(move || {
+        // Warm the process ONCE first and throw the result away: the parse
+        // cache, the interner and the allocator's arenas are per-process too,
+        // and this measurement is about the base cache alone.
+        // A realistic std closure, not a one-import toy: the floor an on-disk
+        // world removes is the BASE world's, and the base world is whatever
+        // `std` surface the program reaches. A corpus program reaches a good
+        // deal of it.
+        const WIDE_A: &str = "import std::io::print;\nimport std::list::List;\n\
+                              import std::map::Map;\nimport std::set::Set;\n\
+                              import std::json;\nimport std::math::PI;\n\
+                              fun main() { print(PI); }\n";
+        const WIDE_B: &str = "import std::io::print;\nimport std::list::List;\n\
+                              import std::map::Map;\nimport std::set::Set;\n\
+                              import std::json;\nimport std::math::PI;\n\
+                              fun main() { print(PI + 1.0); }\n";
+        vilan_core::analyzer::base_cache_clear();
+        analyze_on_this_thread(&spec, WIDE_A);
+
+        vilan_core::analyzer::base_cache_clear();
+        let (hits_before, misses_before) = stats();
+        let before = process_cpu_ms();
+        analyze_on_this_thread(&spec, WIDE_A);
+        let cold = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+        // Same import set, different body: the base-cache hit.
+        let before = process_cpu_ms();
+        analyze_on_this_thread(&spec, WIDE_B);
+        let warm = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+        let (hits_after, misses_after) = stats();
+        vilan_core::analyzer::base_cache_clear();
+        (
+            cold,
+            warm,
+            hits_after - hits_before,
+            misses_after - misses_before,
+        )
+    });
+
+    let (Some(cold), Some(warm)) = (cold, warm) else {
+        panic!(
+            "no process CPU clock on this host (no /proc/self/stat), so this \
+             measurement would be a wall number wearing a CPU label (M15)"
+        );
+    };
+    println!(
+        "M36-FLOOR profile={} cold={cold:.0} ms warm={warm:.0} ms floor={:.0} ms \
+         ({:.0}% of a cold analysis) hits={hits} misses={misses} load={load}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        cold - warm,
+        (cold - warm) / cold.max(1.0) * 100.0,
+    );
+    // The instrument, not the finding: one miss then one hit is the shape the
+    // two numbers are supposed to be, and without it they measure something
+    // else entirely.
+    assert_eq!(misses, 1, "the cold analysis must MISS exactly once");
+    assert_eq!(hits, 1, "the warm analysis must HIT exactly once");
+    // Non-vacuity: if a warm analysis cost what a cold one costs, there would
+    // be no floor to lift and nothing for M36 to build. A THIRD of a cold
+    // analysis is the bar, not half — the measured share is 46% and the point
+    // of the bar is to catch the day it goes to nothing, not to encode this
+    // run's figure as a budget.
+    assert!(
+        cold - warm > cold / 3.0,
+        "the base world is only {:.0} ms of a {cold:.0} ms cold analysis, so \
+         there is no per-process floor worth removing (warm {warm:.0} ms, \
+         loadavg {load})",
+        cold - warm,
+    );
+}

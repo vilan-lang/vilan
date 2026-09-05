@@ -87,11 +87,27 @@ pub struct Analysis<'a, 'src> {
 /// [`entity_at`]'s innermost-containing lookup. Computed once per analysis by
 /// both front-ends through this one function, so neither can drift.
 pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
+    // M27: walked by the ENTRY'S ID RANGE, not by scanning `span_map`.
+    //
+    // The map is whole-program, and this table is the entry file's alone: on
+    // kolt's client that was ~100,000 rows visited (each paying `source_of`'s
+    // linear scan over ~60 source ranges) to keep the few thousand the open
+    // buffer wrote. Ids are assigned per file in contiguous blocks, so the
+    // entry's rows can be FETCHED — the same move `Program::id_ranges_of` was
+    // introduced for (E114). The cost is now the edited buffer's size, which
+    // is what M27 asks of `lsp-index`.
+    //
+    // The rows are the same rows; they come out in ascending id order rather
+    // than in the map's arbitrary one, which is the more defined of the two —
+    // `entity_at` breaks a tie on span width by taking the first, and "the
+    // first" now means something.
     let mut entity_spans = Vec::new();
-    for (id, span) in &program.span_map {
-        if program.source_of(*id) != Some(SourceId(0)) {
+    let entry_ids = program.id_ranges_of(SourceId(0));
+    for id in entry_ids.into_iter().flatten().map(Id) {
+        let Some(span) = program.span_map.get(&id) else {
             continue;
-        }
+        };
+        let id = &id;
         // A synthesized `Expr::Void` (S3, editing-dx.md §3.9: the parser's
         // filler for a block with no trailing expression, now spanning the
         // closing brace instead of a zero-width point past it) is not
@@ -441,7 +457,40 @@ impl<'a, 'src> Analysis<'a, 'src> {
             owned = self.source_text(source)?;
             &owned
         };
-        let start = name_span.into_range().start.min(text.len());
+        doc_comment_above(text, name_span.into_range().start)
+    }
+
+    /// The first paragraph of a declaration's `///` doc — up to the first blank
+    /// line — for a completion item's brief documentation (WO-3). `None` when
+    /// there is no doc.
+    ///
+    /// **M39.** The captured index answers first. Rendering this from the
+    /// declaring module's text costs that module's TEXT — a non-entry source is
+    /// read through [`Self::source_text`], which is a cache per QUERY, so a
+    /// completion that offers names imported from a large module pays that
+    /// module's read on every keystroke (0.415 ms per request against 0.324 ms
+    /// with the render stubbed out). The paragraphs are a function of the
+    /// analysis alone, so they are rendered once where the analysis is — the
+    /// server's analysis thread, the playground's retained handle — into
+    /// [`crate::CompletionIndex`], and a request reads a lookup. The entry's
+    /// own declarations are deliberately NOT in that table and still render
+    /// here: their text is `self.analyzed`, already in hand, and it is the one
+    /// text a keystroke changes.
+    pub fn doc_first_paragraph(&self, declaration_id: Id) -> Option<String> {
+        if let Some(covered) = self.index.doc_paragraph(declaration_id) {
+            return covered.map(|paragraph| paragraph.to_string());
+        }
+        first_paragraph(&self.doc_comment_of(declaration_id)?)
+    }
+}
+
+/// The contiguous `///` block directly above the declaration whose name starts
+/// at `start` in `text`, markers stripped — [`Analysis::doc_comment_of`]'s
+/// body, over a text and an offset so the captured index (M39) can render the
+/// same answer off the analysis thread.
+pub(crate) fn doc_comment_above(text: &str, name_start: usize) -> Option<String> {
+    {
+        let start = name_start.min(text.len());
         let head = &text[..start];
         // The lines above the declaration, read BACKWARDS from it — never
         // collected (M29). `head.lines().collect()` was O(the whole prefix),
@@ -497,20 +546,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
         docs.reverse();
         Some(docs.join("\n"))
     }
+}
 
-    /// The first paragraph of a declaration's `///` doc — up to the first blank
-    /// line — for a completion item's brief documentation (WO-3). `None` when
-    /// there is no doc.
-    pub fn doc_first_paragraph(&self, declaration_id: Id) -> Option<String> {
-        let docs = self.doc_comment_of(declaration_id)?;
-        let paragraph = docs.split("\n\n").next().unwrap_or(&docs).trim();
-        if paragraph.is_empty() {
-            None
-        } else {
-            Some(paragraph.to_string())
-        }
-    }
+/// A doc comment's first paragraph — up to the first blank line — or `None`
+/// when it is empty.
+pub(crate) fn first_paragraph(docs: &str) -> Option<String> {
+    let paragraph = docs.split("\n\n").next().unwrap_or(docs).trim();
+    (!paragraph.is_empty()).then(|| paragraph.to_string())
+}
 
+impl Analysis<'_, '_> {
     /// The requirement-carrying entity the cursor *names*, if any: a function
     /// declaration name, a binding that resolves to a function or to a
     /// module-level binding with a requirement (its initializer is code), or

@@ -302,6 +302,13 @@ impl ReferenceIndex {
     pub fn build(program: &Program) -> Self {
         let mut rows: Vec<Occurrence> = Vec::new();
         let mut dropped: HashMap<Definition, usize> = HashMap::new();
+        // M27: `source_of` is a linear scan of the program's source ranges,
+        // and this build asks it once per declaration and once per use — on
+        // kolt's client that is tens of thousands of questions against ~60
+        // ranges, inside a table the editor rebuilds on every landed
+        // keystroke. The lookup is hoisted once and answers the identical
+        // question.
+        let source_of = program.source_lookup();
 
         let push = |rows: &mut Vec<Occurrence>,
                     dropped: &mut HashMap<Definition, usize>,
@@ -339,7 +346,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(variable.name_span),
                 variable.name,
                 Anchor::Exact,
@@ -352,7 +359,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 span_of(program, *id),
                 parameter.name,
                 Anchor::Exact,
@@ -364,7 +371,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(function.name_span),
                 function.name,
                 Anchor::Exact,
@@ -376,7 +383,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(function.name_span),
                 function.name,
                 Anchor::Exact,
@@ -388,7 +395,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(structure.name_span),
                 structure.name,
                 Anchor::Exact,
@@ -399,7 +406,7 @@ impl ReferenceIndex {
                 push(
                     &mut rows,
                     &mut dropped,
-                    program.source_of(*id),
+                    source_of.of(*id),
                     Some(field.name_span),
                     field.name,
                     Anchor::Exact,
@@ -412,7 +419,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(enumeration.name_span),
                 enumeration.name,
                 Anchor::Exact,
@@ -424,7 +431,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(definition.name_span),
                 definition.name,
                 Anchor::Exact,
@@ -446,7 +453,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         span_of(program, *use_id),
                         name,
                         Anchor::Start,
@@ -478,7 +485,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         Some(span),
                         name,
                         anchor,
@@ -495,7 +502,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         program.member_name_spans.get(use_id).copied(),
                         name,
                         Anchor::Exact,
@@ -522,7 +529,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         Some(*member_span),
                         name,
                         Anchor::Exact,
@@ -544,7 +551,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         span_of(program, *use_id),
                         name,
                         Anchor::Start,

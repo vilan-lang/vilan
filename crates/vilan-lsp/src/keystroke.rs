@@ -2990,4 +2990,274 @@ fun main() {
     fn keystroke_path_gate_smoke_view() {
         keystroke_path_budget_at(Subject::View, SMOKE_FUNCTIONS, false);
     }
+    /// **M39: a completion request materializes no module text.**
+    ///
+    /// A completion item carries its declaration's `///` first paragraph, and
+    /// rendering one used to cost the DECLARING MODULE'S TEXT: `doc_comment_of`
+    /// slices it out of the module, and `Analysis::source_text` caches that
+    /// text per QUERY — so a request offering names imported from a large
+    /// module read (and allocated) that module on every keystroke. It was the
+    /// last table-shaped cost left in a request after M25 and M29, worth
+    /// 0.415 ms against 0.324 ms with the render stubbed out.
+    ///
+    /// The paragraphs are a function of the analysis, so they are rendered
+    /// once into the captured index and a request reads a lookup. The number
+    /// this pins is deterministic rather than a duration — `source_read_count`
+    /// is E83's per-thread counter of source texts MATERIALIZED, so the claim
+    /// "the request touches no module" is a count, not a timing, and it holds
+    /// on any box under any load.
+    ///
+    /// Non-vacuity is the second assertion: the request has to actually be
+    /// offering documented candidates, or a zero here would mean the popup was
+    /// empty rather than that the reads were gone.
+    #[test]
+    fn a_completion_request_materializes_no_module_text() {
+        let (directory, mut document, _) = land_view(SMOKE_FUNCTIONS);
+        let edited = view_keystroke();
+        document.set_text(&edited);
+        let offset = edited
+            .find(Subject::View.cursor_needle())
+            .expect("a scope position");
+        // One call first: whatever is lazy anywhere below this is not what the
+        // count is about.
+        let warm = document.keystroke_completion(offset, false);
+        let documented = warm
+            .iter()
+            .filter(|completion| completion.documentation.is_some())
+            .count();
+        let before = vilan_core::util::source_read_count();
+        let offered = document.keystroke_completion(offset, false);
+        let reads = vilan_core::util::source_read_count() - before;
+        // What the cost became, on the same run: deriving the index reads each
+        // declaring module ONCE, and that happens once per analysis rather
+        // than once per request. Reported, not asserted — the trade is the
+        // finding and the number is what makes it checkable.
+        let before = vilan_core::util::source_read_count();
+        std::hint::black_box(document.keystroke_completion_rebuilding_index(offset, false));
+        let index_reads = vilan_core::util::source_read_count() - before;
+        let _ = std::fs::remove_dir_all(&directory);
+        println!(
+            "M39 {{\"section\":\"completion\",\"subject\":\"view{SMOKE_FUNCTIONS}\",\
+             \"offered\":{},\"documented\":{documented},\"source_reads\":{reads},\
+             \"index_build_reads\":{index_reads},\"profile\":\"{}\",\"load\":\"{}\"}}",
+            offered.len(),
+            profile(),
+            loadavg_1m(),
+        );
+        assert!(
+            documented > 0,
+            "the request offered {} candidates and none of them carried \
+             documentation, so a zero read count below would say nothing",
+            offered.len(),
+        );
+        assert_eq!(
+            reads, 0,
+            "a completion request materialized {reads} source texts. The \
+             paragraphs are captured with the analysis; a request that reads a \
+             module is paying the codebase for an answer about the file \
+             (E121 §2.1)"
+        );
+    }
+    /// The pre-M27 shape of [`vilan_ide::entity_spans`], kept as the planted
+    /// regression the pin below measures against: a scan of the WHOLE
+    /// program's `span_map`, asking `source_of` — itself a linear scan of the
+    /// source ranges — of every row, to keep the entry file's.
+    fn entity_spans_by_whole_program_scan(
+        program: &vilan_core::Program<'_>,
+    ) -> Vec<(usize, usize, vilan_core::id::Id)> {
+        let mut rows = Vec::new();
+        for (id, span) in &program.span_map {
+            if program.source_of(*id) != Some(vilan_core::analyzer::SourceId(0)) {
+                continue;
+            }
+            if matches!(
+                program.entity_map.get(id),
+                Some(vilan_core::analyzer::Expr::Void)
+            ) {
+                continue;
+            }
+            let range = span.into_range();
+            if range.start < range.end {
+                rows.push((range.start, range.end, *id));
+            }
+        }
+        rows
+    }
+
+    /// **M27: the entity table is the EDITED BUFFER's, and costs the edited
+    /// buffer.**
+    ///
+    /// `entity_spans` is the first of `lsp-index`'s tables and the whole of
+    /// what hover, go-to-definition and completion's receiver resolution read
+    /// positionally. It is an ENTRY-FILE table — every row it keeps is a span
+    /// in the open buffer — and it was built by scanning the whole program's
+    /// `span_map` and asking `source_of` (itself a linear scan of the source
+    /// ranges) of every row. So the table's cost followed the CODEBASE, which
+    /// is the shape M27 filed and E121 §2.1 forbids: a per-keystroke cost must
+    /// follow the file.
+    ///
+    /// The subject is the view exhibit at two sizes with a BYTE-IDENTICAL
+    /// entry — the same `VIEW_ENTRY`, the same component band, more icons
+    /// behind it — so anything that grows between the two runs grew with the
+    /// program and not with the buffer. Three claims, and the planted
+    /// regression is measured on the same run so none of them can go green
+    /// vacuously:
+    ///
+    /// 1. **The answer does not move.** The rows the fetch produces are the
+    ///    rows the scan produces, as a set, on both exhibits — the fix is a
+    ///    change of route, not of content. (They differ in ORDER: the fetch
+    ///    yields ascending ids where the scan yielded the map's arbitrary
+    ///    sequence. `entity_at` breaks a tie on span width by taking the
+    ///    first, so "the first" now means something.)
+    /// 2. **The answer does not grow with the program.** Same entry, same row
+    ///    count, on a program that grew by the printed entity ratio.
+    /// 3. **Neither does the cost**, where the scan's does: thread CPU per
+    ///    build (M15's load-proof clock, `REPETITIONS` calls) stays flat
+    ///    across the two exhibits and is a large multiple cheaper than the
+    ///    scan on each of them.
+    #[test]
+    fn the_entity_table_costs_the_edited_buffer_not_the_program() {
+        const SMALL: usize = 8;
+        const LARGE: usize = 128;
+        let measure = |icons: usize| {
+            let (directory, document, _) = land_view(icons);
+            let shape = census(&document);
+            let program = document
+                .program
+                .as_ref()
+                .expect("the view exhibit must analyze");
+            let mut fetched = vilan_ide::entity_spans(program);
+            let mut scanned = entity_spans_by_whole_program_scan(program);
+            fetched.sort_unstable_by_key(|(start, end, id)| (*start, *end, id.0));
+            scanned.sort_unstable_by_key(|(start, end, id)| (*start, *end, id.0));
+            let (cpu, wall) = per_call(|| {
+                std::hint::black_box(vilan_ide::entity_spans(program));
+            });
+            let (scan_cpu, scan_wall) = per_call(|| {
+                std::hint::black_box(entity_spans_by_whole_program_scan(program));
+            });
+            let _ = std::fs::remove_dir_all(&directory);
+            (
+                fetched,
+                scanned,
+                cpu,
+                wall,
+                scan_cpu,
+                scan_wall,
+                shape.entities,
+            )
+        };
+        let (
+            small_rows,
+            small_scan,
+            small_cpu,
+            small_wall,
+            small_scan_cpu,
+            small_scan_wall,
+            small_entities,
+        ) = measure(SMALL);
+        let (
+            large_rows,
+            large_scan,
+            large_cpu,
+            large_wall,
+            large_scan_cpu,
+            large_scan_wall,
+            large_entities,
+        ) = measure(LARGE);
+        row(
+            "view",
+            "entity_spans",
+            small_cpu,
+            small_wall,
+            small_rows.len(),
+        );
+        row(
+            "view",
+            "entity_spans_scan",
+            small_scan_cpu,
+            small_scan_wall,
+            small_scan.len(),
+        );
+        row(
+            "view",
+            "entity_spans",
+            large_cpu,
+            large_wall,
+            large_rows.len(),
+        );
+        row(
+            "view",
+            "entity_spans_scan",
+            large_scan_cpu,
+            large_scan_wall,
+            large_scan.len(),
+        );
+        println!(
+            "M27 {{\"section\":\"lsp_index\",\"small_icons\":{SMALL},\"large_icons\":{LARGE},\
+             \"small_entities\":{small_entities},\"large_entities\":{large_entities},\
+             \"rows\":{},\"load\":\"{}\"}}",
+            small_rows.len(),
+            loadavg_1m(),
+        );
+
+        // (1) A change of route, not of content — on both exhibits.
+        assert_eq!(
+            small_rows, small_scan,
+            "the fetched entity table is not the scanned one on the \
+             {SMALL}-icon exhibit"
+        );
+        assert_eq!(
+            large_rows, large_scan,
+            "the fetched entity table is not the scanned one on the \
+             {LARGE}-icon exhibit"
+        );
+        // (2) The program really did grow, and the table did not.
+        assert!(
+            large_entities > small_entities,
+            "the two exhibits must differ in PROGRAM size or nothing below \
+             proves anything: {small_entities} against {large_entities} entities"
+        );
+        assert_eq!(
+            small_rows.len(),
+            large_rows.len(),
+            "the entry is byte-identical between the two runs, so its entity \
+             table must be the same size; a table that grows with the program \
+             is indexing the codebase"
+        );
+        let (Some(small_cpu), Some(large_cpu), Some(small_scan_cpu), Some(large_scan_cpu)) =
+            (small_cpu, large_cpu, small_scan_cpu, large_scan_cpu)
+        else {
+            panic!(
+                "no thread CPU clock on this host, so the cost claim cannot be \
+                 made load-proof (M15); wall was {small_wall:.3} ms and \
+                 {large_wall:.3} ms at loadavg {}",
+                loadavg_1m(),
+            );
+        };
+        // (3) Flat across the two exhibits...
+        assert!(
+            large_cpu < small_cpu * 3.0,
+            "building the entity table cost {large_cpu:.3} ms of thread CPU on \
+             the {LARGE}-icon exhibit against {small_cpu:.3} ms on the \
+             {SMALL}-icon one, while the program grew from {small_entities} to \
+             {large_entities} entities — the table is following the codebase, \
+             not the edited buffer (loadavg {})",
+            loadavg_1m(),
+        );
+        // ...and a large multiple cheaper than the walk it replaced, on each,
+        // which is what says the instrument can tell the two apart at all.
+        for (label, built, scanned) in [
+            ("small", small_cpu, small_scan_cpu),
+            ("large", large_cpu, large_scan_cpu),
+        ] {
+            assert!(
+                scanned > built * 5.0,
+                "on the {label} exhibit the whole-program scan cost \
+                 {scanned:.3} ms against the fetch's {built:.3} ms — under 5x, \
+                 so the green above is not measuring the change (loadavg {})",
+                loadavg_1m(),
+            );
+        }
+    }
 }

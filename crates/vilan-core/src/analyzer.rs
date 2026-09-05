@@ -8202,7 +8202,7 @@ impl<'src> Analyzer<'src> {
         // whole check — the per-instantiation descent and the inferred sweep
         // included — is dead work for a program with no `resource` declaration
         // anywhere.
-        if !self.any_declared_resource() {
+        if !self.declares_a_resource() {
             return;
         }
         let containers = self.resource_rejecting_containers();
@@ -8983,8 +8983,36 @@ impl<'src> Analyzer<'src> {
     /// The resource-typed binding entities (variables + parameters), by
     /// per-instantiation classification. `&mut` because `type_is_resource`
     /// memoizes; the scan then runs against the returned (owned) set as `&self`.
+    /// Every binding — variable or parameter — whose type is a resource.
+    ///
+    /// **M38, and what MEASURING it decided.** The item asked for a
+    /// per-nominal "can any instantiation of this be a resource" pre-filter
+    /// (M28's `resource_reaching_nominals` / `type_reaches_resource`) ahead of
+    /// the field recursion, on the reading that `type_is_resource` over every
+    /// variable and parameter was ~100 ms on kolt's browser entry. It was
+    /// built, it is answer-identical (M28 proves `type_is_resource(T)` implies
+    /// `type_reaches_resource(T)`), and it was measured: **+2,312,262
+    /// instructions on `vilan check src/client.vl` over the full kolt copy —
+    /// a LOSS, not a win.** It could not be otherwise on a program that
+    /// declares a resource: the filter substitutes one recursive walk over the
+    /// distinct `TypeId`s (`classify_resource`) for another over the same ones
+    /// (`type_mentions_nominal`), and `resource_classification` — the
+    /// analyzer's persistent memo — had already made the first cost once per
+    /// distinct type rather than once per binding. The filter is a wash by
+    /// construction, and pays for the nominals closure on top. It is not here.
+    ///
+    /// **What IS here is the gate the filter was carrying.** A world where
+    /// nothing is declared `resource` has no resource type at all —
+    /// containment bottoms out at a declared leaf — so no binding can be one
+    /// and both sweeps below can be skipped outright. `check_resource_moves`
+    /// tested that only AFTER them, by finding the result empty: two whole-map
+    /// walks and a `type_is_resource` call per binding, on every corpus
+    /// program that owns no resource, for an answer two `.any()` scans give.
     fn collect_resource_bindings(&mut self) -> HashSet<Id> {
         let mut bindings = HashSet::default();
+        if !self.declares_a_resource() {
+            return bindings;
+        }
         let variables: Vec<(Id, TypeId)> =
             self.variables.values().map(|v| (v.id, v.type_id)).collect();
         for (id, type_id) in variables {
@@ -10034,6 +10062,14 @@ impl<'src> Analyzer<'src> {
     /// calls) that C11 made unsound as a gate: `File::open(p).read_at(b, 0)`
     /// binds nothing, overwrites nothing and calls no sink, and is precisely
     /// the program whose temporary the scan has to find.
+    ///
+    /// **R11's gate too** (M38): `check_resource_generic_instantiations` asked
+    /// the identical question through an `any_declared_resource` of its own —
+    /// three identical lines, written twice, which is two places for one rule
+    /// to drift apart. A program with no `resource` leaf has no resource type
+    /// at all (containment bottoms out at a declared leaf), so no
+    /// instantiation can be a resource one and the whole R11 pass is skipped;
+    /// std and the corpus pay nothing either way.
     fn declares_a_resource(&self) -> bool {
         self.structs.values().any(|struct_| struct_.resource)
             || self.enums.values().any(|enum_| enum_.resource)
@@ -11729,6 +11765,25 @@ impl<'src> Analyzer<'src> {
             .is_some_and(|external| external.retains)
     }
 
+    /// Whether the call through `subject_id` reaches a callee this analysis
+    /// RESOLVED — a bodied function or a declared extern. Exactly
+    /// [`Self::callee_conventions`]`(..).is_some()`, without the `Vec`
+    /// (M37).
+    ///
+    /// `collect_unfollowable_loans` asks this of every call in the program and
+    /// only ever reads the `is_some()`, so on kolt's client it was building
+    /// and dropping one convention vector per call to answer a yes/no about
+    /// the callee's identity. The two functions must agree, so they are
+    /// written adjacent and share the one lookup chain: a subject that is not
+    /// a `Local`, or a `Local` naming neither a function nor an external, has
+    /// no conventions and is not resolved.
+    fn callee_is_resolved(&self, subject_id: Id) -> bool {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        self.functions.contains_key(callee_id) || self.external_functions.contains_key(callee_id)
+    }
+
     fn callee_conventions(&self, subject_id: Id) -> Option<Vec<Convention>> {
         let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return None;
@@ -12828,22 +12883,13 @@ impl<'src> Analyzer<'src> {
     // treating the parameter set as resources), never forking R1–R9.
     // ---------------------------------------------------------------------
 
-    /// R11: whether the program declares any resource at all. A program with no
-    /// `resource` leaf has no resource type (containment bottoms out at a
-    /// declared leaf), so no instantiation can be a resource one — the whole pass
-    /// is skipped (std / corpus pay nothing).
-    fn any_declared_resource(&self) -> bool {
-        self.structs.values().any(|struct_| struct_.resource)
-            || self.enums.values().any(|enum_| enum_.resource)
-    }
-
     /// R11 (destruction.md §4): re-check every generic body instantiated with a
     /// resource. Seeds a worklist from every call whose callee's generic
     /// parameters are bound to a concrete resource, then propagates through the
     /// call graph (a generic passing its resource `T` on to another generic —
     /// the indirect case), scanning each `(callee, resource-parameter set)` once.
     fn check_resource_generic_instantiations(&mut self) {
-        if !self.any_declared_resource() {
+        if !self.declares_a_resource() {
             return;
         }
         let mut worklist: VecDeque<R11Instance> = VecDeque::new();
@@ -18765,16 +18811,47 @@ impl<'src> Analyzer<'src> {
                 origins.insert(*item, vec![root]);
             }
         }
+        // M37: the fixpoint's two candidate sets are collected ONCE, outside
+        // the loop. Neither `variables` nor `expr_id_to_expr_map` is touched
+        // by the body (`&self`), so re-deriving them per round re-read the
+        // whole expression map each time to find the handful of shapes that
+        // can carry an origin — and a fixpoint always pays at least two
+        // rounds, one to converge and one to notice. Collecting preserves the
+        // iteration order exactly (an unmodified `HashMap` yields the same
+        // sequence every time), so the answer is unchanged.
+        let seeded: Vec<(Id, Id)> = self
+            .variables
+            .values()
+            .filter_map(|variable| variable.initial.map(|initial| (variable.id, initial)))
+            .collect();
+        let wrapped_captures: Vec<(Id, Id)> = self
+            .expr_id_to_expr_map
+            .values()
+            .filter_map(|expr| match expr {
+                Expr::Match(subject_id, legs) => Some((subject_id, legs)),
+                _ => None,
+            })
+            .flat_map(|(subject_id, legs)| {
+                legs.iter().filter_map(move |leg| {
+                    let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern else {
+                        return None;
+                    };
+                    let [ExprPattern::Binding(capture_id)] = sub_patterns.as_slice() else {
+                        return None;
+                    };
+                    self.wrapped_view_captures
+                        .contains_key(capture_id)
+                        .then_some((*capture_id, *subject_id))
+                })
+            })
+            .collect();
         loop {
             let mut changed = false;
-            for variable in self.variables.values() {
-                if origins.contains_key(&variable.id) {
+            for (variable_id, initial) in &seeded {
+                if origins.contains_key(variable_id) {
                     continue;
                 }
-                let Some(initial) = variable.initial else {
-                    continue;
-                };
-                let roots = match self.expr_id_to_expr_map.get(&initial) {
+                let roots = match self.expr_id_to_expr_map.get(initial) {
                     Some(Expr::Reference(operand_id, _)) => {
                         self.place_root(*operand_id).map(|root| vec![root])
                     }
@@ -18786,29 +18863,21 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 };
                 if let Some(roots) = roots {
-                    origins.insert(variable.id, roots);
+                    origins.insert(*variable_id, roots);
                     changed = true;
                 }
             }
             // Wrapped-view `match` captures have no initial — their origin is
             // the match SUBJECT's projection. Runs inside the fixpoint so a
             // later copy of a capture (`let w = v`) still resolves.
-            for expr in self.expr_id_to_expr_map.values() {
-                let Expr::Match(subject_id, legs) = expr else {
+            for (capture_id, subject_id) in &wrapped_captures {
+                if origins.contains_key(capture_id) {
                     continue;
-                };
-                for leg in legs {
-                    if let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern
-                        && let [ExprPattern::Binding(capture_id)] = sub_patterns.as_slice()
-                        && self.wrapped_view_captures.contains_key(capture_id)
-                        && !origins.contains_key(capture_id)
-                    {
-                        let roots = self.subject_view_roots(*subject_id, &origins);
-                        if !roots.is_empty() {
-                            origins.insert(*capture_id, roots);
-                            changed = true;
-                        }
-                    }
+                }
+                let roots = self.subject_view_roots(*subject_id, &origins);
+                if !roots.is_empty() {
+                    origins.insert(*capture_id, roots);
+                    changed = true;
                 }
             }
             if !changed {
@@ -41389,6 +41458,36 @@ pub struct SourceRange {
     pub source: SourceId,
 }
 
+/// [`Program::source_lookup`]'s answerer: `source_of` without the per-row
+/// linear scan (M27).
+pub struct SourceLookup<'a> {
+    ranges: &'a [SourceRange],
+    /// The ranges are ascending and disjoint, so a binary search is exact.
+    /// When they are not, [`Self::of`] runs `source_of`'s own scan instead —
+    /// the two must never differ, and the way to guarantee that is to fall
+    /// back rather than to reason about it.
+    searchable: bool,
+}
+
+impl SourceLookup<'_> {
+    /// The source `id` originated from — [`Program::source_of`]'s answer,
+    /// exactly.
+    pub fn of(&self, id: Id) -> Option<SourceId> {
+        if self.searchable {
+            let at = self.ranges.partition_point(|range| range.end <= id.0);
+            return self
+                .ranges
+                .get(at)
+                .filter(|range| id.0 >= range.start && id.0 < range.end)
+                .map(|range| range.source);
+        }
+        self.ranges
+            .iter()
+            .find(|range| id.0 >= range.start && id.0 < range.end)
+            .map(|range| range.source)
+    }
+}
+
 /// Per-type destruction glue (destruction.md §5/§7). The transformer emits it as
 /// a `__drop_<type>` helper: run the value's own `drop(&mut self)` first (if the
 /// type has a `Drop` impl), then destroy its resource members — so a value cannot
@@ -42215,6 +42314,32 @@ impl<'src> Program<'src> {
             .iter()
             .find(|range| id.0 >= range.start && id.0 < range.end)
             .map(|range| range.source)
+    }
+
+    /// [`Self::source_of`], hoisted out of a whole-program loop (M27).
+    ///
+    /// `source_of` is a LINEAR scan of `source_ranges`, and the editor tables
+    /// ask it once per row: on kolt's client that is ~100,000 rows against ~60
+    /// ranges, and the product is most of what `lsp-index` costs. The ranges
+    /// are minted from a monotonically increasing entity counter, so they come
+    /// out ascending and disjoint and a binary search answers the same
+    /// question — but this refuses to ASSUME that. It checks, once, that the
+    /// ranges really are ascending and disjoint, and falls back to the very
+    /// scan `source_of` runs when they are not, so the lookup is
+    /// answer-identical to `source_of` for every id under every ordering.
+    pub fn source_lookup(&self) -> SourceLookup<'_> {
+        let searchable = self
+            .source_ranges
+            .windows(2)
+            .all(|pair| pair[0].end <= pair[1].start)
+            && self
+                .source_ranges
+                .iter()
+                .all(|range| range.start <= range.end);
+        SourceLookup {
+            ranges: &self.source_ranges,
+            searchable,
+        }
     }
 
     /// [`Self::source_of`] INVERTED: the entity-id ranges `source`'s own
@@ -45280,6 +45405,30 @@ pub fn base_cache_retained() -> usize {
         .unwrap_or(0)
 }
 
+/// The retained worlds' recorded bytes, split into the two things they are
+/// made of (M41): the module texts, and T0's per-`TypeId` minting-source
+/// census. The sum is [`base_cache_retained_bytes`] exactly — which is the
+/// property the M41 pin asserts, so the budget can never be compared against
+/// a figure that has quietly stopped counting one of its halves.
+#[doc(hidden)]
+pub fn base_cache_retained_split() -> (usize, usize) {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .worlds
+                .values()
+                .fold((0, 0), |(texts, census), stored| {
+                    let world_census = base_cache_world_type_census_bytes(&stored.world);
+                    (texts + stored.bytes - world_census, census + world_census)
+                })
+        })
+        .unwrap_or((0, 0))
+}
+
 /// How many ANALYSIS-OWNED overlay module allocations the retained worlds are
 /// holding claims on right now (M23), and what their texts are worth — the
 /// retention M9's store gate used to trade away, made countable in the same
@@ -45313,20 +45462,41 @@ pub fn base_cache_overlay_claims() -> (usize, usize) {
 }
 
 /// The bytes a stored world is recorded as retaining (backlog M11): the module
-/// texts it was built from, summed. Source-proportional rather than a heap
-/// audit, for the reason [`crate::leak_tally::LeakSite::BaseCacheWorld`]
-/// states — the derived analyzer state a world holds scales with the text it
-/// was derived from, and the texts themselves are the parse cache's own
-/// (shared) sites. Deliberately a pure function of the world, so an eviction
-/// can compute exactly what the store recorded without the map having to carry
-/// the figure alongside the value.
+/// texts it was built from, summed, PLUS T0's per-`TypeId` minting-source
+/// census (M41). Source-proportional rather than a heap audit, for the reason
+/// [`crate::leak_tally::LeakSite::BaseCacheWorld`] states — the derived
+/// analyzer state a world holds scales with the text it was derived from, and
+/// the texts themselves are the parse cache's own (shared) sites.
+/// Deliberately a pure function of the world, so an eviction can compute
+/// exactly what the store recorded without the map having to carry the figure
+/// alongside the value.
+///
+/// **M41.** `type_id_sources` is the one piece of stored-world state that is
+/// NOT the parse cache's and NOT proportional to the texts in the way the
+/// paragraph above assumes: it is a dense `Vec<SourceId>` indexed by the id's
+/// own counter, so it costs `size_of::<SourceId>()` for every type the world
+/// ever minted — including every instantiation, which is a count the text
+/// length does not predict. Under-reporting it made M24's LRU budget
+/// optimistic by exactly that much on every retained world. Counted by `len`
+/// rather than `capacity` deliberately: `len` is the honest per-`TypeId`
+/// figure the item asks for, it moves the instant a world gains a type
+/// (`capacity` moves in doubling steps, so a small gain would leave the tally
+/// still), and it cannot depend on a growth history the eviction-side
+/// recompute has no way to see.
 fn base_cache_world_bytes(world: &World<'_>) -> usize {
-    world
+    let texts: usize = world
         .analyzer
         .source_texts
         .iter()
         .map(|(_, text)| text.len())
-        .sum()
+        .sum();
+    texts + base_cache_world_type_census_bytes(world)
+}
+
+/// The M41 half of [`base_cache_world_bytes`], alone: T0's dirty-bit census
+/// (`type_id_sources`), one [`SourceId`] per `TypeId` the world minted.
+fn base_cache_world_type_census_bytes(world: &World<'_>) -> usize {
+    world.analyzer.type_id_sources.len() * std::mem::size_of::<SourceId>()
 }
 
 #[doc(hidden)]
