@@ -16466,6 +16466,222 @@ mod dead_item_paint_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// E140: the union records the CLOSURE it walked, which is what the
+    /// withdrawal's cone test reads. The entries and the module they load are
+    /// in it; the orphan module in the same package is not, and that is the
+    /// whole distinction the narrowed withdrawal rests on.
+    #[test]
+    fn the_union_records_the_sources_its_entries_loaded() {
+        let directory = package("cone");
+        let union = union(&directory).expect("the package's union");
+        for relative in ["src/client.vl", "src/server.vl", "src/shared.vl"] {
+            assert!(
+                union.depends_on(&directory.join(relative)),
+                "{relative} is in an entry's closure",
+            );
+        }
+        assert!(
+            !union.depends_on(&directory.join("src/orphan.vl")),
+            "no entry loads `orphan.vl`, so an edit to it cannot move a term of \
+             the union",
+        );
+        assert!(
+            !union.sources.is_empty() && union.sources.len() > 3,
+            "std is in the closure too — the union carries what it READ, not a \
+             filtered view of it: {}",
+            union.sources.len(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E140: the legs are computed separately now (concurrently, in the
+    /// server), so the rule that a refused leg refuses the WHOLE union has to
+    /// be stated where the legs are joined rather than fall out of an early
+    /// `return` in a loop. One `None` leg — a broken module, an entry with no
+    /// `main`, an unreadable file — and there is no union.
+    #[test]
+    fn one_refused_leg_refuses_the_whole_union() {
+        let directory = package("legs");
+        let entries = crate::dead_items::entry_paths(&directory).expect("two entries");
+        let legs: Vec<Option<crate::dead_items::EntryReach>> = entries
+            .iter()
+            .map(|(_, path)| {
+                let text = std::fs::read_to_string(path).expect("the entry");
+                crate::dead_items::analyze_entry(path, &std_root(), &CancelToken::new(), &text)
+            })
+            .collect();
+        assert!(
+            legs.iter().all(Option::is_some),
+            "both legs answer on a clean package",
+        );
+        assert!(
+            crate::dead_items::union_of(legs, 0).is_some(),
+            "and their union is a union",
+        );
+        let broken = vec![
+            Some(crate::dead_items::EntryReach {
+                reached: Default::default(),
+                sources: Default::default(),
+            }),
+            None,
+        ];
+        assert!(
+            crate::dead_items::union_of(broken, 0).is_none(),
+            "one refused leg refuses the whole union",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 10** (E140) — a `[platform("browser")]` item reached by the
+    /// BROWSER entry is not gray in a package whose other entry is node.
+    ///
+    /// This is the fence's own case, and the reason the union is a union of
+    /// per-entry walks rather than one walk: each entry is analyzed under its
+    /// own platform, so a browser-only item is simply unreachable from the
+    /// server entry's program — not exempt, not special-cased, absent. If the
+    /// union were taken from the default entry alone, every browser-fenced
+    /// item in a fullstack package would gray at once. The negative beside it
+    /// is what makes the pin about the fence: a browser-fenced item NO entry
+    /// reaches still grays, so the platform is not being read as an exemption.
+    #[test]
+    fn a_browser_fenced_item_the_browser_entry_reaches_is_not_gray() {
+        let directory = workspace(
+            "platform",
+            &[
+                (
+                    "vilan.toml",
+                    "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                     [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+                ),
+                (
+                    "src/client.vl",
+                    "import pkg::ui::mount;\n\nfun main() {\n\tmount();\n}\n",
+                ),
+                (
+                    "src/server.vl",
+                    "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+                ),
+                (
+                    "src/ui.vl",
+                    "import std::ui::{ View, view };\n\n\
+                     [platform(\"browser\")]\n\
+                     fun mount(): View {\n\tview(\"div\")\n}\n\n\
+                     [platform(\"browser\")]\n\
+                     fun never_mounted(): View {\n\tview(\"span\")\n}\n",
+                ),
+            ],
+        );
+        let mut document = open(&directory, "src/ui.vl");
+        document.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&document, &document.dead_item_spans()),
+            vec!["never_mounted".to_string()],
+            "`mount` lives in the union through the BROWSER entry; the \
+             browser-fenced item no entry reaches still grays, so the fence is \
+             not being read as an exemption",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 16** (E140) — deleting the last use of an item does not have to
+    /// gray it immediately. **Lateness is allowed**, and this pin asserts that
+    /// it is, so a later optimization cannot be justified by a promise the
+    /// design never made.
+    ///
+    /// The asymmetry is deliberate and it is the whole safety argument.
+    /// Withdrawal is instant, because a gray that has become WRONG is a lie
+    /// about the user's own code — pin 15 and `withdraw_package_grays`.
+    /// Restoration rides the idle clock, because a gray that has not appeared
+    /// YET says nothing at all. So an edit that removes the last call to
+    /// `used_by_server` may leave the union standing until the clock re-walks:
+    /// the paint the user sees is a paint that was true, one clock tick ago,
+    /// and the direction it is stale in is the one that cannot mislead.
+    #[test]
+    fn deleting_the_last_use_of_an_item_may_gray_it_late() {
+        let directory = package("lateness");
+        let union_before = union(&directory).expect("the package's union");
+        // The edit that kills `used_by_server`: the server entry stops calling
+        // it. The union in hand was computed BEFORE it and is now out of date.
+        std::fs::write(
+            directory.join("src/server.vl"),
+            "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+        )
+        .expect("rewrite the server entry");
+        let mut document = open(&directory, "src/shared.vl");
+        document.set_package_reach(Some(Arc::clone(&union_before)));
+        assert!(
+            !named(&document, &document.dead_item_spans()).contains(&"used_by_server".to_string()),
+            "the stale union still reaches `used_by_server`, and serving it is \
+             ALLOWED: a gray that has not appeared yet says nothing",
+        );
+        // And the clock catches up: recomputed against the edited package, the
+        // item is gray. Lateness is a permission, not a ceiling.
+        document.set_package_reach(union(&directory));
+        assert!(
+            named(&document, &document.dead_item_spans()).contains(&"used_by_server".to_string()),
+            "the next union grays it",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 19** (E140) — a `[library]` that is a WORKSPACE MEMBER consumed by
+    /// a sibling `[package]` is still never gray.
+    ///
+    /// Pin 18's library stands alone; this one is inside a `[project]` and has
+    /// a consumer in the same tree, which is the shape where "surely we can see
+    /// every use of it" is most tempting and most wrong. A workspace is not a
+    /// closed world: the library is publishable, the sibling is one consumer of
+    /// it, and an item no sibling happens to call today is still surface. The
+    /// rule holds for the same reason it holds anywhere — a library declares no
+    /// entries, so there is no union and nothing to say.
+    #[test]
+    fn a_library_that_is_a_workspace_member_is_never_gray() {
+        let directory = workspace(
+            "workspace-library",
+            &[
+                ("vilan.toml", "[project]\npackages = [\"lib\", \"app\"]\n"),
+                ("lib/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                (
+                    "lib/src/lib.vl",
+                    "import std::io::print;\n\n\
+                     fun used_by_the_sibling() {\n\tprint(\"u\");\n}\n\n\
+                     fun used_by_nobody_here() {\n\tprint(\"n\");\n}\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { path = \"../lib\" }\n",
+                ),
+                (
+                    "app/src/main.vl",
+                    "import shapes::used_by_the_sibling;\n\n\
+                     fun main() {\n\tused_by_the_sibling();\n}\n",
+                ),
+            ],
+        );
+        let mut document = open(&directory, "lib/src/lib.vl");
+        assert!(
+            document.unloaded_module_paint().is_none(),
+            "a workspace library's module is never faded whole",
+        );
+        document.set_package_reach(union(&directory.join("lib")));
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "no item of a workspace-member library is gray, including the one \
+             its sibling does not call: {:?}",
+            named(&document, &document.dead_item_spans()),
+        );
+        // The consumer's own package still paints, so the pin is about the
+        // LIBRARY rule rather than about a paint that is off in this fixture.
+        let mut consumer = open(&directory, "app/src/main.vl");
+        consumer.set_package_reach(union(&directory.join("app")));
+        assert!(
+            consumer.dead_item_spans().is_empty(),
+            "the app's own entry reaches everything it declares",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// The classic single-entry form (`[package] entry = …`) answers the same
     /// way as the `[entry.<name>]` form — pin 14's shape: the two manifests
     /// produce the same grays for an item only one of them reaches.

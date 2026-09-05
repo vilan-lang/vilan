@@ -298,3 +298,144 @@ fn an_underscore_led_top_level_item_is_never_a_candidate() {
         "an `_`-led top-level item is exempt by its name: {names:?}"
     );
 }
+
+/// Pin 4, both states (§6.1) — an `[rpc]` method is reached through the
+/// `dispatcher(self)` the analyzer synthesizes for a `[service]`, so nothing
+/// here is exempt and nothing here is special-cased: the WALK answers it. A
+/// service some entry installs has live methods; the same method on a service
+/// no entry installs is genuinely dead, and grays.
+///
+/// The two states share one exhibit and differ by one line, which is what makes
+/// this one pin rather than two: `main` either reaches the dispatcher or does
+/// not.
+#[test]
+fn an_rpc_method_is_reached_through_the_dispatcher_and_gray_without_it() {
+    const INSTALLED: &str = "import std::reactive::{ Signal, SignalCell };\n\
+         \n\
+         [service(NotesClient)]\n\
+         struct Notes {\n\t[expose] count: SignalCell<i32>,\n}\n\
+         \n\
+         impl Notes {\n\
+         \t[rpc]\n\
+         \tfun bump(self): i32 { self.count.get() + 1 }\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet notes = Notes { count = Signal::new(1) };\n\
+         \tlet installed = notes.dispatcher();\n\
+         }\n";
+    const UNINSTALLED: &str = "import std::reactive::{ Signal, SignalCell };\n\
+         \n\
+         [service(NotesClient)]\n\
+         struct Notes {\n\t[expose] count: SignalCell<i32>,\n}\n\
+         \n\
+         impl Notes {\n\
+         \t[rpc]\n\
+         \tfun bump(self): i32 { self.count.get() + 1 }\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet notes = Notes { count = Signal::new(1) };\n\
+         }\n";
+    assert!(
+        !grays(INSTALLED).contains(&"bump".to_string()),
+        "an `[rpc]` method of an INSTALLED service is reached through the \
+         synthesized dispatcher: {:?}",
+        grays(INSTALLED),
+    );
+    assert!(
+        grays(UNINSTALLED).contains(&"bump".to_string()),
+        "the same method on a service no entry installs is genuinely dead: {:?}",
+        grays(UNINSTALLED),
+    );
+}
+
+/// Pin 11, in its two-state form, and the DECISION it records (E140).
+///
+/// The paper asked for one pin over two states: a trait-impl member for a type
+/// constructed nowhere is gray, and stops being gray the moment any entry
+/// constructs the type. E124 shipped v1 with the whole class unpainted, so the
+/// two-state pin as written would have contradicted the code — and E140 asked
+/// for the question to be decided rather than left open.
+///
+/// **Decided: a trait-impl member never paints, and not in this order.** The
+/// state below is what makes it more than a preference. The walk's dispatch
+/// refinement is per INSTANTIATION, so `Ci::area`'s grayness is a fact about
+/// whether any entry anywhere constructs a `Ci` — and a package's entries are
+/// analyzed on an idle clock the user cannot see. Constructing one `Ci` in any
+/// entry makes every one of its trait members un-gray at once, and deleting the
+/// last construction grays a dozen members in files nobody touched. That is
+/// correct by the definition and it is the jumpiest true gray the definition
+/// has; a paint whose answer moves in blocks, on a clock, in files the user is
+/// not editing, is the class most likely to read as noise. Painting it would
+/// want a different presentation (a report, not an inline fade) and a different
+/// question (which types are constructed), and neither is E124's.
+///
+/// So the two states are pinned as they SHIP: neither paints, and the inherent
+/// member beside them paints in both — which is what keeps this a decision
+/// about trait-impl members rather than a paint that has quietly stopped
+/// working.
+#[test]
+fn a_trait_impl_member_paints_in_neither_state_and_an_inherent_one_paints_in_both() {
+    const UNCONSTRUCTED: &str = "trait Shape { fun area(self): i32; }\n\
+         \n\
+         struct Sq { side: i32 }\n\
+         struct Ci { r: i32 }\n\
+         \n\
+         impl Sq with Shape {\n\
+         \tfun area(self): i32 { self.side * self.side }\n\
+         }\n\
+         \n\
+         impl Ci with Shape {\n\
+         \tfun area(self): i32 { self.r * self.r * 3 }\n\
+         }\n\
+         \n\
+         impl Ci {\n\
+         \tfun width(self): i32 { self.r * 2 }\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet s = Sq { side = 3 };\n\
+         \tprint(i\"{s.area()}\");\n\
+         }\n";
+    /// The same program with `Ci` CONSTRUCTED — the state change pin 11 is
+    /// about, and the only line that differs.
+    const CONSTRUCTED: &str = "trait Shape { fun area(self): i32; }\n\
+         \n\
+         struct Sq { side: i32 }\n\
+         struct Ci { r: i32 }\n\
+         \n\
+         impl Sq with Shape {\n\
+         \tfun area(self): i32 { self.side * self.side }\n\
+         }\n\
+         \n\
+         impl Ci with Shape {\n\
+         \tfun area(self): i32 { self.r * self.r * 3 }\n\
+         }\n\
+         \n\
+         impl Ci {\n\
+         \tfun width(self): i32 { self.r * 2 }\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet s = Sq { side = 3 };\n\
+         \tlet c = Ci { r = 1 };\n\
+         \tprint(i\"{s.area()}\");\n\
+         }\n";
+    for (label, source) in [
+        ("`Ci` constructed nowhere", UNCONSTRUCTED),
+        ("`Ci` constructed by the entry", CONSTRUCTED),
+    ] {
+        let names = grays(source);
+        assert!(
+            !names.contains(&"area".to_string()),
+            "{label}: a trait-impl member is unpainted in BOTH states: {names:?}",
+        );
+        assert!(
+            names.contains(&"width".to_string()),
+            "{label}: the inherent member beside it is a true find and grays, so \
+             the pin above is about the class rather than about a paint that \
+             stopped working: {names:?}",
+        );
+    }
+}
