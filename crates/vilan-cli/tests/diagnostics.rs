@@ -1527,3 +1527,156 @@ fn check_of_a_sound_entry_is_green_and_writes_nothing() {
     );
     assert!(!wrote_dist && !wrote_beside, "and no emitted artifact");
 }
+
+// --- M35: a multi-entry check compiles its entries in parallel -------------
+//
+// The members of a workspace are independent analyses that shared one thread.
+// They now share a process instead: the first runs alone (it fills the
+// process-global caches every later one hits), and the rest run one thread
+// each. Their diagnostics are captured rather than raced to stderr, and
+// replayed in MEMBER order with the B182 ledger applied there — so what a
+// reader sees is what a sequential round wrote, and nothing about the
+// scheduler reaches the terminal.
+
+/// A three-entry package with a mistake in the module all three reach AND one
+/// mistake of its own per entry — the shape that makes both halves of the
+/// ordering observable: the shared error is claimed by exactly one member, and
+/// the per-entry errors say which member reported when.
+fn three_entries_each_with_a_mistake() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "struct Store {\n\tname: str,\n}\n\nfun shared_oops(): i32 {\n\t\"shared\"\n}\n",
+        ),
+        (
+            "src/client.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun client_oops(): i32 {\n\t\"client\"\n}\n\n\
+             fun main() {\n\tprint(\"client\");\n}\n",
+        ),
+        (
+            "src/server.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun server_oops(): i32 {\n\t\"server\"\n}\n\n\
+             fun main() {\n\tprint(\"server\");\n}\n",
+        ),
+        (
+            "src/probe.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun probe_oops(): i32 {\n\t\"probe\"\n}\n\n\
+             fun main() {\n\tprint(\"probe\");\n}\n",
+        ),
+    ]
+}
+
+/// `vilan check .` with the members compiled one after another
+/// (`VILAN_SEQUENTIAL_CHECK=1`) — the reference a parallel round is held to.
+fn check_stderr_sequential(dir: &Path) -> (Output, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(dir)
+        .args(["check", "."])
+        .env("NO_COLOR", "1")
+        .env("VILAN_SEQUENTIAL_CHECK", "1")
+        .output()
+        .expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output, stderr)
+}
+
+/// Determinism, asserted the only way it can be: the same round, run again,
+/// writes the same bytes. Three runs, because two agreeing could be two runs
+/// the scheduler happened to order the same way.
+#[test]
+fn a_parallel_check_writes_the_same_bytes_every_run() {
+    let dir = temp_files("m35_determinism", &three_entries_each_with_a_mistake());
+    let runs: Vec<(Option<i32>, String)> = (0..3)
+        .map(|_| {
+            let (output, stderr) = check_stderr(&dir);
+            (output.status.code(), stderr)
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        error_headers(&runs[0].1).len(),
+        4,
+        "the fixture must actually produce several diagnostics from several \
+         members: {}",
+        runs[0].1
+    );
+    for (index, run) in runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            run, &runs[0],
+            "run {index} differs from the first — the round's output must not \
+             depend on which member finished when"
+        );
+    }
+}
+
+/// And the bytes are the SEQUENTIAL round's bytes, which is the stronger
+/// claim: a parallel round that were merely self-consistent could still have
+/// re-ordered or re-attributed what it printed.
+#[test]
+fn a_parallel_check_writes_what_a_sequential_one_writes() {
+    let dir = temp_files("m35_sequential_twin", &three_entries_each_with_a_mistake());
+    let (parallel, parallel_stderr) = check_stderr(&dir);
+    let (sequential, sequential_stderr) = check_stderr_sequential(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        parallel.status.code(),
+        sequential.status.code(),
+        "the verdict is the same"
+    );
+    assert_eq!(
+        parallel_stderr, sequential_stderr,
+        "and so is every byte of the report"
+    );
+}
+
+/// The order itself, named rather than inferred from the twin above: members
+/// arrive alphabetically (a `BTreeMap`), and the report follows them — so the
+/// shared module's one error is claimed by the FIRST member that reaches it,
+/// exactly as it was when the loop was a loop.
+#[test]
+fn a_parallel_check_reports_in_member_order() {
+    let dir = temp_files("m35_member_order", &three_entries_each_with_a_mistake());
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    // The file each diagnostic renders in, which is what the location header
+    // names — the function names are a line above the quoted one and never
+    // reach the report.
+    let positions: Vec<(&str, usize)> = ["client.vl", "probe.vl", "server.vl"]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                stderr
+                    .find(name)
+                    .unwrap_or_else(|| panic!("{name} must be reported: {stderr}")),
+            )
+        })
+        .collect();
+    assert!(
+        positions[0].1 < positions[1].1 && positions[1].1 < positions[2].1,
+        "client, probe, server — the members' own order: {positions:?}\n{stderr}"
+    );
+    // And the shared module's one report sits with the FIRST member that
+    // reached it, not wherever a thread happened to finish.
+    let shared_at = stderr.find("store.vl").expect("the shared error renders");
+    assert!(
+        positions[0].1 < shared_at && shared_at < positions[1].1,
+        "the shared error is the first member's: {stderr}"
+    );
+    let shared = error_headers(&stderr)
+        .iter()
+        .filter(|header| header.contains("Expected i32, but got str"))
+        .count();
+    assert_eq!(
+        shared, 4,
+        "three per-entry mistakes and the shared one, reported once: {stderr}"
+    );
+}

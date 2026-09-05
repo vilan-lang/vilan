@@ -201,6 +201,12 @@ enum Command {
     },
 }
 
+/// The stack every compile runs on — the one this process's whole CLI runs on,
+/// and the one each member of a PARALLEL check gets (M35), because a member is
+/// a complete analysis and the reasoning below is about an analysis, not about
+/// a process.
+const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
+
 fn main() -> ExitCode {
     // Compilation recurses over deeply-nested ASTs and type graphs, which can
     // run past the default main-thread stack on otherwise-valid programs. Do the
@@ -232,7 +238,6 @@ fn main() -> ExitCode {
     // room over. Bounding the parser is what made the number finite at all —
     // before B142 there was no worst case to size anything against, and the
     // margin was standing in for a bound that did not exist.
-    const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
     std::thread::Builder::new()
         .stack_size(COMPILER_STACK_SIZE)
         .spawn(run_cli)
@@ -4519,19 +4524,82 @@ fn current_source_hash(path: &Path) -> Option<u64> {
 /// each `check` starts with an empty one, so a `--watch` round always reports.
 fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
     let _round = RoundReports::arm();
-    let mut ok = true;
-    for (unit, platform) in members {
-        ok &= compile_unit(
-            unit,
-            *platform,
-            CompileGoal::Check,
-            debug,
-            false,
-            None,
-            None,
-        )
-        .is_ok();
+    let Some(((first_unit, first_platform), rest)) = members.split_first() else {
+        return RoundOutcome::Succeeded;
+    };
+    let check = |unit: &Unit, platform: Platform| {
+        compile_unit(unit, platform, CompileGoal::Check, debug, false, None, None).is_ok()
+    };
+
+    // The FIRST member runs alone, on this thread, writing its diagnostics
+    // straight out (M35). It is what fills the process-global caches — the
+    // clean-parse cache, the base world, the macro worlds — and starting every
+    // member cold at once would have each of them analyze `std` from scratch:
+    // N times the CPU for one world, and N threads queued on the one mutex that
+    // hands it out. Every member after it meets those caches warm, which is
+    // where the parallelism is actually free. The caches themselves need
+    // nothing: each is a content-keyed `Mutex`, M23's claims are taken under
+    // the lookup's own lock, and every counter and scope inside an analysis
+    // (`cancel`, `owned_modules`, `leak_tally`, `depth_stats`, the analyzer's
+    // own probes) is already thread-local, because an analysis has run on a
+    // thread of its own since the language server's first one.
+    let mut ok = check(first_unit, *first_platform);
+    if rest.is_empty() || sequential_check() {
+        for (unit, platform) in rest {
+            ok &= check(unit, *platform);
+        }
+        return outcome(ok);
     }
+
+    // The rest, one thread each, each capturing its diagnostics rather than
+    // racing to stderr with them.
+    let captured: Vec<(bool, Vec<CapturedReport>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = rest
+            .iter()
+            .map(|(unit, platform)| {
+                std::thread::Builder::new()
+                    .stack_size(COMPILER_STACK_SIZE)
+                    .spawn_scoped(scope, || {
+                        capture_arm();
+                        let ok = check(unit, *platform);
+                        (ok, capture_take())
+                    })
+                    .expect("spawn a check worker")
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+
+    // MEMBER order, which is the order a sequential round reported in — the
+    // members arrive alphabetically (a `BTreeMap`), and the B182 ledger is
+    // applied here rather than on the workers so the same member claims the
+    // same shared-module diagnostic whatever the scheduler did.
+    for (member_ok, reports) in captured {
+        ok &= member_ok;
+        replay_captured(reports);
+    }
+    outcome(ok)
+}
+
+/// `VILAN_SEQUENTIAL_CHECK`, read once: compiles a workspace's members one
+/// after another, as every check did before M35. The escape hatch a
+/// parallelism change owes its users, and the instrument its determinism pin
+/// compares against — a parallel round's bytes must be the sequential round's
+/// bytes.
+fn sequential_check() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VILAN_SEQUENTIAL_CHECK").is_ok_and(|value| value != "0"))
+}
+
+/// A round's verdict from whether every member compiled.
+fn outcome(ok: bool) -> RoundOutcome {
     if ok {
         RoundOutcome::Succeeded
     } else {
@@ -5711,11 +5779,11 @@ fn compile_to_js(
     let src = match vilan_core::util::read_source(file) {
         Ok(src) => src,
         Err(error) => {
-            eprintln!(
+            diagnostic_line(&format!(
                 "{} cannot read {}: {error}",
                 paint::error_prefix(),
                 file.display()
-            );
+            ));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -5726,20 +5794,20 @@ fn compile_to_js(
     // names it), so it reports like the read failure above rather than through
     // the diagnostic channel.
     if let Some((requested, on_disk)) = entry_case_mismatch(file, pkg_root) {
-        eprintln!(
+        diagnostic_line(&format!(
             "{} entry {} resolved to `{on_disk}` on disk, but it is named `{requested}`: \
              Vilan matches source files by exact case, so this builds only where the \
              filesystem ignores case; rename one to match the other",
             paint::error_prefix(),
             file.display()
-        );
+        ));
         return Err(ExitCode::FAILURE);
     }
     let filename = file.to_string_lossy().into_owned();
     let std = match std_dir(file) {
         Ok(directory) => vilan_core::manifest::resolve_std(&directory),
         Err(error) => {
-            eprintln!("{} {error}", paint::error_prefix());
+            diagnostic_line(&format!("{} {error}", paint::error_prefix()));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -6485,20 +6553,154 @@ impl Drop for RoundReports {
     }
 }
 
+/// The ledger's key: file, position and reason — see [`RENDERED_THIS_ROUND`].
+type ReportKey = (String, usize, usize, String);
+
 /// Whether this diagnostic has not been rendered yet this round — always true
 /// while the ledger is disarmed. Recording is the same call, as
 /// `HashSet::insert` already answers both halves.
+///
+/// A CAPTURING member (M35) defers the question: its diagnostics are rendered
+/// into a buffer on its own thread, in an order the scheduler chose, and the
+/// ledger is a claim about the ROUND's order. [`replay_captured`] asks it
+/// instead, member by member, which is the order a sequential round asked in —
+/// so the same diagnostic is suppressed for the same member.
 fn first_report_this_round(file: &str, span: &std::ops::Range<usize>, message: &str) -> bool {
+    if capturing() {
+        return true;
+    }
+    claim_report(&(file.to_string(), span.start, span.end, message.to_string()))
+}
+
+/// The ledger proper: `true` the first time this round is asked about `key`.
+fn claim_report(key: &ReportKey) -> bool {
     match RENDERED_THIS_ROUND
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_mut()
     {
-        Some(rendered) => {
-            rendered.insert((file.to_string(), span.start, span.end, message.to_string()))
-        }
+        Some(rendered) => rendered.insert(key.clone()),
         None => true,
     }
+}
+
+/// One rendered diagnostic, held until the round can print it in MEMBER order
+/// (M35). `key` is present for the diagnostics [`RENDERED_THIS_ROUND`]
+/// deduplicates and `None` for a warning or a status line, which a sequential
+/// round prints once per member too.
+struct CapturedReport {
+    key: Option<ReportKey>,
+    bytes: Vec<u8>,
+}
+
+thread_local! {
+    /// This thread's captured diagnostics while it is compiling a member of a
+    /// PARALLEL round, and `None` on every other thread and in every other
+    /// command. Thread-local because it is exactly a property of the analysis
+    /// running here — the same reason every counter in `vilan_core` is.
+    static CAPTURED_REPORTS: std::cell::RefCell<Option<Vec<CapturedReport>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this thread is writing its diagnostics to a buffer rather than to
+/// stderr.
+fn capturing() -> bool {
+    CAPTURED_REPORTS.with(|reports| reports.borrow().is_some())
+}
+
+/// Arms the capture on this thread.
+fn capture_arm() {
+    CAPTURED_REPORTS.with(|reports| *reports.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarms it and takes what was captured.
+fn capture_take() -> Vec<CapturedReport> {
+    CAPTURED_REPORTS.with(|reports| reports.borrow_mut().take().unwrap_or_default())
+}
+
+/// Opens a new captured chunk under `key`, so the bytes a renderer is about to
+/// write are one addressable diagnostic. A no-op when nothing is capturing.
+fn capture_open(key: Option<ReportKey>) {
+    CAPTURED_REPORTS.with(|reports| {
+        if let Some(reports) = reports.borrow_mut().as_mut() {
+            reports.push(CapturedReport {
+                key,
+                bytes: Vec::new(),
+            });
+        }
+    });
+}
+
+/// Where every diagnostic byte goes: this thread's open capture chunk while a
+/// parallel round is running, and stderr otherwise. One type rather than a
+/// branch at each renderer, because ariadne wants a `Write` and the two
+/// destinations must be indistinguishable to it — the rendering, colour gate
+/// included, is the same either way.
+struct DiagnosticStream;
+
+impl std::io::Write for DiagnosticStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let captured = CAPTURED_REPORTS.with(|reports| match reports.borrow_mut().as_mut() {
+            Some(reports) => {
+                // A writer that starts before any `capture_open` still has
+                // somewhere to go: an unkeyed chunk, which replays unfiltered.
+                if reports.is_empty() {
+                    reports.push(CapturedReport {
+                        key: None,
+                        bytes: Vec::new(),
+                    });
+                }
+                reports
+                    .last_mut()
+                    .expect("just pushed")
+                    .bytes
+                    .extend_from_slice(buffer);
+                true
+            }
+            None => false,
+        });
+        if !captured {
+            std::io::Write::write_all(&mut std::io::stderr(), buffer)?;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if capturing() {
+            return Ok(());
+        }
+        std::io::Write::flush(&mut std::io::stderr())
+    }
+}
+
+/// Prints one member's captured diagnostics, applying the round ledger in the
+/// order a sequential round would have applied it (M35).
+fn replay_captured(reports: Vec<CapturedReport>) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    for report in reports {
+        if let Some(key) = &report.key
+            && !claim_report(key)
+        {
+            continue;
+        }
+        let _ = stderr.write_all(&report.bytes);
+    }
+    let _ = stderr.flush();
+}
+
+/// One line of the CLI's own (non-ariadne) diagnostic output, routed through
+/// the capture so a parallel member's read failure lands in its member's place
+/// rather than wherever the scheduler happened to put it. Everything a
+/// COMPILE writes goes through here or through the three ariadne renderers
+/// above; the status lines a command writes around its compiles do not, because
+/// the round that writes them is the sequential one.
+/// One line of the CLI's own (non-ariadne) diagnostic output, routed through
+/// the capture (M35) — see [`DiagnosticStream`].
+fn diagnostic_line(text: &str) {
+    capture_open(None);
+    let _ = std::io::Write::write_all(&mut DiagnosticStream, text.as_bytes());
+    let _ = std::io::Write::write_all(&mut DiagnosticStream, b"\n");
 }
 
 /// Renders parser diagnostics (via the handwritten frontend's `render`) and
@@ -6524,6 +6726,15 @@ fn report(
     for (source, span, message) in diagnostics {
         let (filename, text) = diagnostic_file(files, source);
         let char_span = char_range(text, &span);
+        // The ledger's key, re-derived from the same three things it is made of
+        // (M35). A capturing member defers the dedup to the replay, and the
+        // replay needs to know which diagnostic this rendering IS.
+        capture_open(Some((
+            filename.to_string(),
+            span.start,
+            span.end,
+            message.clone(),
+        )));
         Report::build(ReportKind::Error, (filename.to_string(), char_span.clone()))
             .with_config(diagnostic_config())
             .with_message(&message)
@@ -6535,10 +6746,10 @@ fn report(
             .finish()
             // stderr, like the warnings (ratified call (f)): a diagnostic must
             // never land in `build --stdout`'s JavaScript.
-            .eprint(sources([(
-                filename.to_string(),
-                snippet(text, &span).to_string(),
-            )]))
+            .write(
+                sources([(filename.to_string(), snippet(text, &span).to_string())]),
+                DiagnosticStream,
+            )
             .unwrap()
     }
 }
@@ -6641,16 +6852,26 @@ fn report_error_with_labels(
                 .with_color(color),
         );
     }
+    capture_open(Some((
+        filename.to_string(),
+        primary_span.start,
+        primary_span.end,
+        error.msg.clone(),
+    )));
     report
         .finish()
         // stderr, like the warnings (ratified call (f)).
-        .eprint(sources(files))
+        .write(sources(files), DiagnosticStream)
         .unwrap();
 }
 
 /// Renders a single analyzer warning (e.g. an unused `[must_use]` result) — like
 /// `report`, but `ReportKind::Warning` and non-fatal. Carries its own file too.
 fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, message: &str) {
+    // Unkeyed: the round ledger covers errors only, so a warning a shared
+    // module raises is printed once per member under a sequential check too,
+    // and the capture must reproduce that rather than improve on it (M35).
+    capture_open(None);
     let char_span = char_range(src, &span);
     Report::build(
         ReportKind::Warning,
@@ -6666,10 +6887,10 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
     .finish()
     // stderr, so it doesn't corrupt `build --stdout` JS — the call the
     // errors now match too.
-    .eprint(sources([(
-        filename.to_string(),
-        snippet(src, &span).to_string(),
-    )]))
+    .write(
+        sources([(filename.to_string(), snippet(src, &span).to_string())]),
+        DiagnosticStream,
+    )
     .unwrap();
 }
 
