@@ -44025,6 +44025,30 @@ pub fn base_cache_retained() -> usize {
         .unwrap_or(0)
 }
 
+/// The retained worlds' recorded bytes, split into the two things they are
+/// made of (M41): the module texts, and T0's per-`TypeId` minting-source
+/// census. The sum is [`base_cache_retained_bytes`] exactly — which is the
+/// property the M41 pin asserts, so the budget can never be compared against
+/// a figure that has quietly stopped counting one of its halves.
+#[doc(hidden)]
+pub fn base_cache_retained_split() -> (usize, usize) {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .worlds
+                .values()
+                .fold((0, 0), |(texts, census), stored| {
+                    let world_census = base_cache_world_type_census_bytes(&stored.world);
+                    (texts + stored.bytes - world_census, census + world_census)
+                })
+        })
+        .unwrap_or((0, 0))
+}
+
 /// How many ANALYSIS-OWNED overlay module allocations the retained worlds are
 /// holding claims on right now (M23), and what their texts are worth — the
 /// retention M9's store gate used to trade away, made countable in the same
@@ -44058,20 +44082,41 @@ pub fn base_cache_overlay_claims() -> (usize, usize) {
 }
 
 /// The bytes a stored world is recorded as retaining (backlog M11): the module
-/// texts it was built from, summed. Source-proportional rather than a heap
-/// audit, for the reason [`crate::leak_tally::LeakSite::BaseCacheWorld`]
-/// states — the derived analyzer state a world holds scales with the text it
-/// was derived from, and the texts themselves are the parse cache's own
-/// (shared) sites. Deliberately a pure function of the world, so an eviction
-/// can compute exactly what the store recorded without the map having to carry
-/// the figure alongside the value.
+/// texts it was built from, summed, PLUS T0's per-`TypeId` minting-source
+/// census (M41). Source-proportional rather than a heap audit, for the reason
+/// [`crate::leak_tally::LeakSite::BaseCacheWorld`] states — the derived
+/// analyzer state a world holds scales with the text it was derived from, and
+/// the texts themselves are the parse cache's own (shared) sites.
+/// Deliberately a pure function of the world, so an eviction can compute
+/// exactly what the store recorded without the map having to carry the figure
+/// alongside the value.
+///
+/// **M41.** `type_id_sources` is the one piece of stored-world state that is
+/// NOT the parse cache's and NOT proportional to the texts in the way the
+/// paragraph above assumes: it is a dense `Vec<SourceId>` indexed by the id's
+/// own counter, so it costs `size_of::<SourceId>()` for every type the world
+/// ever minted — including every instantiation, which is a count the text
+/// length does not predict. Under-reporting it made M24's LRU budget
+/// optimistic by exactly that much on every retained world. Counted by `len`
+/// rather than `capacity` deliberately: `len` is the honest per-`TypeId`
+/// figure the item asks for, it moves the instant a world gains a type
+/// (`capacity` moves in doubling steps, so a small gain would leave the tally
+/// still), and it cannot depend on a growth history the eviction-side
+/// recompute has no way to see.
 fn base_cache_world_bytes(world: &World<'_>) -> usize {
-    world
+    let texts: usize = world
         .analyzer
         .source_texts
         .iter()
         .map(|(_, text)| text.len())
-        .sum()
+        .sum();
+    texts + base_cache_world_type_census_bytes(world)
+}
+
+/// The M41 half of [`base_cache_world_bytes`], alone: T0's dirty-bit census
+/// (`type_id_sources`), one [`SourceId`] per `TypeId` the world minted.
+fn base_cache_world_type_census_bytes(world: &World<'_>) -> usize {
+    world.analyzer.type_id_sources.len() * std::mem::size_of::<SourceId>()
 }
 
 #[doc(hidden)]

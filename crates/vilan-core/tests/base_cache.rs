@@ -1742,3 +1742,123 @@ fn an_overlay_served_sibling_edit_evicts_the_record_with_the_world() {
     let _ = std::fs::remove_dir_all(&root);
     vilan_core::analyzer::base_cache_clear();
 }
+
+/// M41: `type_id_sources` — T0's per-`TypeId` minting-source census — is
+/// ~4 bytes for every type a world ever minted, and `base_cache_world_bytes`
+/// could not see it. That made M24's LRU budget optimistic by exactly that
+/// much on every retained world, and the direction matters: a budget that
+/// under-counts what it retains is a budget the session exceeds silently.
+///
+/// Three claims, and the third is the item's:
+///
+/// 1. the split is EXHAUSTIVE — texts plus census is the very figure the
+///    budget is compared against, so neither half can quietly stop counting;
+/// 2. the census is a real, non-zero share of a std world (it is not a
+///    rounding error being accounted for form's sake);
+/// 3. **the tally MOVES when a world gains types, and moves on TYPES rather
+///    than on text.** The two sibling fixtures below are within a byte of the
+///    same length; one declares thirty-two nominals and the other is the same
+///    bulk in comments. If the tally were only a second reading of the text
+///    length — which is exactly what it was — the two worlds would be
+///    recorded as worth the same. They are not.
+#[test]
+fn the_world_tally_counts_the_type_id_census_and_moves_when_a_world_gains_types() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let root = std::env::temp_dir().join(format!("vilan_m41_census_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // Type-dense: thirty-two nominals, each minting types of its own.
+    let mut dense = String::new();
+    for index in 0..32 {
+        dense.push_str(&format!("struct Dense{index:02} {{\n\tvalue: i32,\n}}\n"));
+    }
+    // Type-free, and the same bulk: comment lines, which mint nothing.
+    let mut sparse = String::new();
+    for index in 0..32 {
+        sparse.push_str(&format!("// sparse{index:02} .............\n//\n//\n"));
+    }
+    assert_eq!(
+        dense.len(),
+        sparse.len(),
+        "the fixtures must be the same length, or this pin reads a text \
+         difference and calls it a type difference"
+    );
+    std::fs::write(root.join("dense.vl"), &dense).expect("write dense");
+    std::fs::write(root.join("sparse.vl"), &sparse).expect("write sparse");
+    const DENSE: &str = "import std::io::print;\nimport pkg::dense::Dense00;\n\
+                         fun main() { print(1); }\n";
+    const SPARSE: &str = "import std::io::print;\nimport pkg::sparse;\n\
+                          fun main() { print(1); }\n";
+
+    let entry_path = root.join("main.vl");
+    let read_split = |spec: &PackageSpec, source: &'static str| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_path.clone();
+        on_one_thread(move || {
+            // One world at a time, so the split belongs to a known program
+            // rather than to whatever an earlier test left behind.
+            vilan_core::analyzer::base_cache_clear();
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            drop(program);
+            let (texts, census) = vilan_core::analyzer::base_cache_retained_split();
+            (
+                vilan_core::analyzer::base_cache_retained_bytes(),
+                texts,
+                census,
+                format!("{errors:?}"),
+            )
+        })
+    };
+    let (dense_bytes, dense_texts, dense_census, dense_errors) = read_split(&spec, DENSE);
+    let (sparse_bytes, sparse_texts, sparse_census, sparse_errors) = read_split(&spec, SPARSE);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+
+    println!(
+        "M41-CENSUS dense: {dense_bytes} B = {dense_texts} B texts + {dense_census} B census; \
+         sparse: {sparse_bytes} B = {sparse_texts} B texts + {sparse_census} B census"
+    );
+    assert_eq!(dense_errors, "[]", "the dense fixture must analyze clean");
+    assert_eq!(sparse_errors, "[]", "the sparse fixture must analyze clean");
+
+    // (1) Exhaustive: the two halves ARE the budgeted figure.
+    assert_eq!(
+        dense_texts + dense_census,
+        dense_bytes,
+        "the split must account for every byte the budget is compared against"
+    );
+    assert_eq!(sparse_texts + sparse_census, sparse_bytes);
+
+    // (2) Real: a std world mints thousands of types, so its census is tens of
+    // kilobytes — not zero, which is what the tally used to report.
+    assert!(
+        sparse_census > 10_000,
+        "a std world's `TypeId` census must be a real share of what it \
+         retains, not {sparse_census} B"
+    );
+
+    // (3) The item's pin. Same text, more types, bigger tally.
+    assert_eq!(
+        dense_texts, sparse_texts,
+        "the fixtures were written the same length, so the TEXT halves must \
+         agree — if they do not, the census comparison below proves nothing"
+    );
+    assert!(
+        dense_census > sparse_census,
+        "a world that gained thirty-two nominals must be recorded as worth \
+         more than one that gained the same bulk in comments: {dense_census} B \
+         is not more than {sparse_census} B"
+    );
+}
