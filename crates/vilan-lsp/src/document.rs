@@ -6212,9 +6212,10 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(
-            reads, 2,
-            "each module's text is read ONCE per request: math.vl for the imported \
-             candidates, io.vl for the prelude's `print`"
+            reads, 0,
+            "a completion request reads NO module text: the imported candidates' \
+             and the prelude's docs come from the captured index (M39 over M29), \
+             read once when the index is built, never per request"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
