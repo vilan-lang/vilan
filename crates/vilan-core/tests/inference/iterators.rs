@@ -3080,6 +3080,54 @@ fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
     );
 }
 
+#[test]
+fn a_default_body_self_call_is_not_colored_by_an_unrelated_inherent_async_member() {
+    // A49's second helping of the same collision, one layer in. The narrowing
+    // above dropped same-named STATICS; this one drops same-named members of
+    // types that do not implement the trait at all. `Self` inside a default
+    // body is the type the default is specialized for, and that type
+    // implements this trait — so `Client`, which implements nothing, can never
+    // be selected by `self.get()` however its own `get` is spelled.
+    //
+    // The live instance was std's: A49 made `Source::sub` a trait default whose
+    // body calls `self.get()`, and the `[service]` macro generates an async
+    // `get` on the client struct for a `[rpc] fun get`. Every `[service]`
+    // program then colored the whole `Source` protocol async.
+    assert_compiles_without_async(
+        r#"
+        import std::io::print;
+
+        struct Client { }
+
+        impl Client {
+            async fun get(self): i32 {
+                1
+            }
+        }
+
+        trait Peek {
+            fun get(self): i32;
+
+            fun doubled(self): i32 {
+                self.get() * 2
+            }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Peek {
+            fun get(self): i32 {
+                self.n
+            }
+        }
+
+        fun main() {
+            print(Cell { n = 3 }.doubled());
+        }
+        "#,
+    );
+}
+
 // --- B79: the enum discriminant family ---------------------------------------
 //
 // `proposal/backed-enums.md` §1.7 surveyed the existing integer discriminant
