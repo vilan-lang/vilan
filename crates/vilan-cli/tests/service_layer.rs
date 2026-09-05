@@ -1486,3 +1486,143 @@ fun run(port: i32) {
 
     drop(dir);
 }
+
+// --- A48: bounding the verifier, and the address a limit is keyed on ---------
+
+/// `authorize_timeout`: a verifier that does not answer is refused and the
+/// socket destroyed, rather than held for as long as the verifier hangs — one
+/// held socket per client trying to connect, which is a denial of service the
+/// server inflicts on itself without a single malformed byte from anyone.
+///
+/// The refusal is 429 (`Reject::TooMany`), deliberately: the `Reject` enum
+/// draws judgement (401/403) against LIMIT (429), and a verifier that ran out
+/// of time says nothing about the credential — it is the one refusal a client
+/// SHOULD retry. It is answered on the timeout's own turn, not when the hook
+/// eventually returns, which is the whole point.
+///
+/// Proven red first by planting `authorize_timeout(0)` (the default, and what
+/// every service had before A48): the same handshake reads back EMPTY — the
+/// socket held, unanswered, past the reader's own 1500 ms bound while the
+/// verifier is still sleeping, which is the shape of the item.
+#[test]
+fn a_verifier_that_does_not_answer_in_time_is_refused_and_the_socket_destroyed() {
+    let source = AUTHORIZED_SERVER
+        .replace(
+            "import std::io::print;",
+            "import std::io::print;\nimport std::time::{ Duration, sleep_for };",
+        )
+        .replace(
+            "			.authorize(|handshake: Handshake| match handshake.token() {",
+            "			.authorize_timeout(300)\n			.authorize(|handshake: Handshake| {\n				sleep_for(Duration::millis(3000));\n				match handshake.token() {",
+        )
+        .replace(
+            "				None => Result::Err(Reject::Unauthorized),\n			}))",
+            "				None => Result::Err(Reject::Unauthorized),\n				}\n			}))",
+        );
+    assert!(
+        source.contains("authorize_timeout(300)")
+            && source.contains("sleep_for(Duration::millis(3000))"),
+        "the bound and the slow verifier must both be spliced into the server source:\n{source}"
+    );
+    let (server, port) = spawn_service_server("verifier_bound", &source);
+
+    let started = Instant::now();
+    let refused = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        refused.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "a verifier over its bound must be refused 429: {refused}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the refusal must land on the bound, not when the hook finally answers ({elapsed:?})"
+    );
+    assert!(
+        !refused.contains("101 Switching Protocols") && !refused.contains("__reject:"),
+        "a timed-out verification is a limit, not a judgement, so it takes the cheap path: {refused}"
+    );
+
+    drop(server);
+}
+
+/// `trust_forwarded_for`: behind a proxy every client shares the proxy's
+/// socket address, so a per-address `handshake_rate` degenerates into a global
+/// one that refuses everybody as soon as one client is noisy. With the switch
+/// on, the key is the first entry of `X-Forwarded-For`.
+///
+/// The control is the load-bearing half and it is the DEFAULT: with the switch
+/// OFF the header is not read at all, so a client cannot pick its own bucket
+/// by writing one line — which is exactly what a directly-exposed server that
+/// trusted the header would let anybody do.
+///
+/// Proven red first by planting the old key (`socket.remote_address()`
+/// unconditionally): "client 1 attempt 0 is inside its own budget: HTTP/1.1
+/// 429 Too Many Requests" — the third handshake overall, from the one socket
+/// peer they all share, which is the degeneration the switch exists to undo.
+#[test]
+fn a_trusted_forwarded_header_is_what_the_handshake_rate_keys_on() {
+    let trusting = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_rate(2, 10000.0).trust_forwarded_for(true))",
+    );
+    assert!(trusting.contains("trust_forwarded_for(true)"));
+    let (server, port) = spawn_service_server("forwarded_trusted", &trusting);
+
+    // Three handshakes, three claimed clients: each has its own budget of two.
+    for client in 0..3 {
+        for attempt in 0..2 {
+            let reply = raw_upgrade(
+                port,
+                "/",
+                &format!("X-Forwarded-For: 203.0.113.{client}\r\n"),
+            );
+            assert!(
+                reply.starts_with("HTTP/1.1 101 "),
+                "client {client} attempt {attempt} is inside its own budget: {reply}"
+            );
+        }
+    }
+    // The third from one of them is over that client's budget, and nobody
+    // else's.
+    let over = raw_upgrade(port, "/", "X-Forwarded-For: 203.0.113.1\r\n");
+    assert!(
+        over.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "the third handshake from one forwarded client must be refused: {over}"
+    );
+    let neighbour = raw_upgrade(port, "/", "X-Forwarded-For: 203.0.113.9\r\n");
+    assert!(
+        neighbour.starts_with("HTTP/1.1 101 "),
+        "a different forwarded client must be unaffected by its neighbour: {neighbour}"
+    );
+    drop(server);
+
+    // The control: with the switch off — the default — the header is ignored
+    // and every one of these shares the socket peer's single budget.
+    let plain = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_rate(2, 10000.0))",
+    );
+    let (untrusting, plain_port) = spawn_service_server("forwarded_untrusted", &plain);
+    for client in 0..2 {
+        let reply = raw_upgrade(
+            plain_port,
+            "/",
+            &format!("X-Forwarded-For: 203.0.113.{client}\r\n"),
+        );
+        assert!(
+            reply.starts_with("HTTP/1.1 101 "),
+            "the first two share one budget and are inside it: {reply}"
+        );
+    }
+    let spoofed = raw_upgrade(plain_port, "/", "X-Forwarded-For: 203.0.113.77\r\n");
+    assert!(
+        spoofed.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "an untrusting server must not let a header buy a fresh budget: {spoofed}"
+    );
+
+    drop(untrusting);
+}

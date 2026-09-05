@@ -472,21 +472,55 @@ connection.
 
 ### Cheap limits, with or without a gate
 
-Three knobs on the same seam, all refusing before the upgrade, all
-working with no `authorize` at all:
+Four knobs on the same seam, all refusing at the handshake, all working
+with no `authorize` at all:
 
 ```vilan,fragment
 Service::new(protocol)
 	.max_connections(500)          // 429 over the ceiling
-	.handshake_rate(20, 10000.0)   // 20 handshakes per address per 10s
+	.handshake_rate(20, 10000.0)   // 20 handshakes per client per 10s
 	.handshake_timeout(5000)       // a socket that never greets is destroyed
+	.authorize_timeout(2000)       // a verifier that never answers is refused
 ```
+
+`max_connections` counts **upgraded sockets on this mount**, and nothing
+else: not the SSE or POST legs, which hold no connection to count, and
+not a handshake still inside `authorize`. A service whose clients arrive
+over `{mount}events` is not limited by it at all.
 
 `handshake_timeout` bounds the **greeting**, not idleness: the first
 inbound byte disarms it, so a client that connected and is only watching
-mirrors is never touched. Behind a proxy every client shares the proxy's
-address, which makes `handshake_rate` a limit for a directly-exposed
-server.
+mirrors is never touched.
+
+`authorize_timeout` is its twin on the other side of the upgrade. The
+hook is awaited **inside** the upgrade handler, so a verifier that hangs
+— a token endpoint that stopped answering, a database that is gone —
+holds an unanswered socket for as long as it hangs, one per client trying
+to connect. That is a denial of service the server inflicts on itself,
+reached without a single malformed byte from anyone. `handshake_rate`
+caps how fast the pile grows; only this caps how big it gets. The refusal
+is `429`, not `503`: it says nothing about the credential, and it is the
+one refusal a client should retry. A hook that answers late is not raced
+back in — the socket is already gone.
+
+**Behind a proxy**, every client shares the proxy's socket address, so a
+per-address `handshake_rate` becomes a global one that refuses everybody
+as soon as one client is noisy. `trust_forwarded_for(true)` reads the
+client's address from the first entry of `X-Forwarded-For` instead — for
+`handshake_rate`, for `Handshake.remote_addr`, and for
+`Connection.remote_addr`, one switch for all three.
+
+```vilan,fragment
+Service::new(protocol)
+	.trust_forwarded_for(true)
+	.handshake_rate(20, 10000.0)
+```
+
+It is **off by default and must stay off** unless a proxy you control is
+the only way to reach the server: the header is written by whoever spoke
+last, so a directly-exposed server that trusts it lets any client pick
+its own rate-limit bucket — and its own audit trail — by writing one
+line.
 
 ## Where the service lives
 

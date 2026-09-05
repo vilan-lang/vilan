@@ -260,6 +260,11 @@ fun is_judgement(reject: Reject): bool {
 /// subprotocol — this protocol's own clients, and nothing else — and when the
 /// handshake carries the key an upgrade needs.
 fun refuse_upgrade(request: NodeRequest, socket: NodeSocket, reject: Reject) {
+	// An `authorize` that ran out of time destroyed the socket already (A48);
+	// there is nothing left to answer on.
+	if socket.destroyed() {
+		ret;
+	}
 	let headers = request.headers();
 	// "the client offered `vilan-rpc`", asked through the selection itself:
 	// the selection IS that name exactly when it was offered.
@@ -387,6 +392,19 @@ struct Service {
 	/// the first inbound byte, so it bounds the greeting and never a
 	/// legitimately idle connection.
 	handshake_timeout: i32,
+	/// Milliseconds the `authorize` hook may take before the handshake is
+	/// refused and the socket destroyed; `0` — the default — waits forever
+	/// (A48). `handshake_timeout`'s twin on the OTHER side of the upgrade:
+	/// that one bounds a client that says nothing, this one bounds a VERIFIER
+	/// that answers nothing.
+	authorize_timeout: i32,
+	/// Whether this server sits behind a proxy it trusts (A48). When it does,
+	/// a client's address is the first entry of `X-Forwarded-For` rather than
+	/// the socket peer — which is the proxy, and the same one for every
+	/// client, so a per-address rate limit degenerates to a global one.
+	/// OFF by default, because a directly-exposed server must never believe a
+	/// header the client itself writes.
+	trust_forwarded_for: bool,
 }
 
 impl Service {
@@ -415,6 +433,8 @@ impl Service {
 			handshake_window = 10000.0,
 			handshakes = Shared::new([]),
 			handshake_timeout = 0,
+			authorize_timeout = 0,
+			trust_forwarded_for = false,
 		}
 	}
 
@@ -457,6 +477,8 @@ impl Service {
 			handshake_window = 10000.0,
 			handshakes = Shared::new([]),
 			handshake_timeout = 0,
+			authorize_timeout = 0,
+			trust_forwarded_for = false,
 		}
 	}
 
@@ -518,19 +540,52 @@ impl Service {
 
 	/// Refuse an upgrade (429) once this mount already holds `limit` live
 	/// connections. `0` — the default — is unlimited. The cheapest of the
-	/// three limits, and the one that works with no `authorize` at all.
+	/// limits on this seam, and one of the three that work with no
+	/// `authorize` at all.
+	///
+	/// It counts UPGRADED SOCKETS on this mount and nothing else (A48): the
+	/// counter moves in `accept_socket`, one up per 101 and one down per
+	/// teardown. The SSE/POST legs are not counted — they hold no connection
+	/// to count — and neither is a handshake still inside `authorize`, which
+	/// is what `authorize_timeout` and `handshake_rate` are for. So a service
+	/// whose clients arrive over `{mount}events` is not limited by this at
+	/// all, and a flood that never finishes its handshake is not either.
 	fun max_connections(own self, limit: i32): Service {
 		self.max_connections = limit;
 		self
 	}
 
-	/// Refuse an upgrade (429) once one remote address has completed
+	/// Refuse an upgrade (429) once one client address has attempted
 	/// `attempts` handshakes inside `window_millis`. `0` attempts — the
-	/// default — is unlimited. Behind a proxy every client shares the proxy's
-	/// address, so this is a limit for a directly-exposed server.
+	/// default — is unlimited.
+	///
+	/// The address is the socket's peer unless `trust_forwarded_for(true)`
+	/// says otherwise: behind a proxy every client shares the proxy's address
+	/// and a per-address limit becomes a global one, refusing everybody as
+	/// soon as one client is noisy.
 	fun handshake_rate(own self, attempts: i32, window_millis: f64): Service {
 		self.handshake_rate = attempts;
 		self.handshake_window = window_millis;
+		self
+	}
+
+	/// Read a client's address from the first entry of `X-Forwarded-For`
+	/// instead of the socket peer (A48) — what `handshake_rate` keys on, what
+	/// `authorize` sees in `Handshake.remote_addr`, and what a connection
+	/// reports as `Connection.remote_addr`. One switch for all three, because
+	/// a deployment either sits behind a proxy or it does not.
+	///
+	/// OFF by default and it must stay off unless a proxy you control is the
+	/// ONLY way to reach this server: the header is written by whoever spoke
+	/// last, so a directly-exposed server that trusts it lets any client pick
+	/// its own rate-limit bucket — and its own audit trail — by writing one
+	/// line. A trusted proxy overwrites (or appends to) the header, which is
+	/// what makes the first entry the real client.
+	///
+	/// Falls back to the socket peer when the header is absent or empty, so
+	/// turning it on never leaves an address blank.
+	fun trust_forwarded_for(own self, trusted: bool): Service {
+		self.trust_forwarded_for = trusted;
 		self
 	}
 
@@ -540,6 +595,35 @@ impl Service {
 	/// and is only watching mirrors is never touched.
 	fun handshake_timeout(own self, millis: i32): Service {
 		self.handshake_timeout = millis;
+		self
+	}
+
+	/// Refuse a handshake whose `authorize` hook has not answered `millis`
+	/// after it was called, and destroy the socket (A48). `0` — the default —
+	/// waits forever, which is what the hook got before this existed.
+	///
+	/// `authorize` is AWAITED inside the upgrade handler, so a verifier that
+	/// hangs — a token endpoint that stopped answering, a database that is
+	/// gone — holds an unanswered socket for as long as it hangs, and one per
+	/// client trying to connect. That is a denial of service the server
+	/// inflicts on itself, reached without a single malformed byte from
+	/// anyone. `handshake_rate` caps how fast the pile grows; only a bound on
+	/// the verifier caps how big it gets.
+	///
+	/// The refusal is `Reject::TooMany` — 429, not 503. The distinction the
+	/// `Reject` enum draws is judgement (401/403) against LIMIT (429), and a
+	/// verifier that did not answer in time is a limit: it says nothing about
+	/// the credential, and it is exactly the case a client should retry. 503
+	/// would be the more precise HTTP word for "this server is not well", and
+	/// it is deliberately not used, because a fourth status would mean a
+	/// fourth arm on an enum whose three arms are the three answers an app's
+	/// own `authorize` may give — and this refusal is not one an app gives.
+	///
+	/// A hook that answers LATE is not raced back in: the socket is already
+	/// destroyed and the timeout is one-way, so a straggling verifier's reply
+	/// is discarded rather than written to a socket that is gone.
+	fun authorize_timeout(own self, millis: i32): Service {
+		self.authorize_timeout = millis;
 		self
 	}
 }
@@ -569,15 +653,45 @@ fun admit_handshake(service: Service, remote: str): bool {
 	true
 }
 
+/// A client's address: the socket peer, or — when the service is configured
+/// behind a proxy it trusts (A48) — the first entry of `X-Forwarded-For`.
+///
+/// The FIRST entry, because a proxy chain appends: `client, proxy1, proxy2`.
+/// Empty entries are skipped and the socket peer is the fallback, so a missing
+/// or blank header never yields a blank address.
+fun client_address(service: Service, request: NodeRequest, socket: NodeSocket): str {
+	let peer = socket.remote_address();
+	if !service.trust_forwarded_for {
+		ret peer;
+	}
+	match header_text(request.headers(), "x-forwarded-for") {
+		Some(let raw) => {
+			for part in raw.split(",") {
+				let candidate = part.trim();
+				if candidate.len() > 0 {
+					ret candidate;
+				}
+			}
+			peer
+		},
+		None => peer,
+	}
+}
+
 /// The pre-upgrade gate: the limits that work with no auth at all, then the
 /// app's own check. The order is deliberate — a flood is refused without
 /// running (or paying for) a signature verification.
+///
+/// `Err(Reject)` here means the socket has NOT been written to and is still
+/// open, with one exception the caller must respect: an `authorize` that ran
+/// out of time has already destroyed it (`refuse_upgrade` checks, and writes
+/// nothing to a destroyed socket).
 fun gate_upgrade(
 	service: Service,
 	request: NodeRequest,
 	socket: NodeSocket,
 ): Result<Session, Reject> {
-	let remote = socket.remote_address();
+	let remote = client_address(service, request, socket);
 	if service.max_connections > 0 && service.live.read() >= service.max_connections {
 		ret Err(Reject::TooMany);
 	}
@@ -591,12 +705,44 @@ fun gate_upgrade(
 			// the hook may verify a signature, and nothing may be written to
 			// the socket until it has.
 			let gate: async |Handshake| Result<Session, Reject> = check;
-			gate(Handshake {
+			// The verification bound (A48): armed before the hook is called
+			// and disarmed the moment it answers. `settled` is what makes the
+			// listener one-way — node's `"timeout"` handler stays attached for
+			// the life of the socket, and `accept_socket` re-arms the same
+			// timer for the greeting bound, so an authorized connection must
+			// not be destroyed later by the listener this arm left behind.
+			let settled: Shared<bool> = Shared::new(false);
+			let expired: Shared<bool> = Shared::new(false);
+			if service.authorize_timeout > 0 {
+				socket.set_timeout(service.authorize_timeout);
+				socket.on_signal("timeout", || {
+					if !settled.read() {
+						settled.write() = true;
+						expired.write() = true;
+						// Answered HERE and not by the caller: the point of
+						// the bound is to release the socket now, and the
+						// caller does not run again until the hook returns —
+						// which is the thing that may never happen.
+						refuse_upgrade(request, socket, Reject::TooMany);
+					}
+				});
+			}
+			let outcome = gate(Handshake {
 				path = request.url(),
 				headers = request.headers(),
 				protocols = offered_protocols(request.headers()),
 				remote_addr = remote,
-			})
+			});
+			if service.authorize_timeout > 0 {
+				socket.set_timeout(0);
+			}
+			if expired.read() {
+				// The socket is already gone; the hook's answer, whenever it
+				// came, is discarded rather than written to it.
+				ret Err(Reject::TooMany);
+			}
+			settled.write() = true;
+			outcome
 		},
 	}
 }
@@ -881,7 +1027,8 @@ fun accept_socket(
 	let protocol = (service.build_protocol)(Connection {
 		id = id,
 		session = session,
-		remote_addr = socket.remote_address(),
+		// The same reading `authorize` and the rate limit used (A48).
+		remote_addr = client_address(service, request, socket),
 	});
 	service.live.write() = service.live.read() + 1;
 	let on_connect = service.on_connect;
