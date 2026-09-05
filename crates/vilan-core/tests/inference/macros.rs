@@ -3263,6 +3263,244 @@ main();
     assert_fails_without(source, "is read here, but this code can be reached without");
 }
 
+// --- B242: a DECLARED context requirement ---
+//
+// An inferred requirement is a fact about a body, so every diagnostic about it
+// is a fact about a body — and surfaces wherever inference breaks (B229,
+// B241), leaving the reader to walk back to the boundary themself. A clause on
+// the declaration makes it a fact about the SIGNATURE: the body's reads must
+// be a subset of it, callers are checked against it alone, and nothing a
+// caller is told depends on the callee's body any more.
+
+/// The accepted shape: the clause covers what the body reads, and a call under
+/// a `run` of that context compiles.
+#[test]
+fn b242_a_declared_clause_covering_the_body_compiles() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// The subset rule: a strict read the clause does not declare is refused AT
+/// the declaration, naming the clause the body needs — which is what the
+/// editor's fix writes.
+#[test]
+fn b242_a_clause_narrower_than_the_body_is_refused_at_the_declaration() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun both(): i32 {
+    a_ctx.get() + b_ctx.get()
+}
+
+fun render(): i32 context a_ctx {
+    both()
+}
+
+fun main() {
+    a_ctx.run(1, || {
+        b_ctx.run(2, || {
+            print(render());
+        });
+    });
+}
+main();
+        "#,
+        "`render`'s body reads context `b_ctx`, which this `context` clause does not declare \
+         — write `context (a_ctx, b_ctx)`",
+    );
+}
+
+/// The other direction is a WARNING, not an error: declaring a context the
+/// body does not yet read is a deliberate API surface — the signature is the
+/// promise, and adding the read later must not break callers.
+#[test]
+fn b242_a_clause_wider_than_the_body_warns_and_still_compiles() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun render(x: i32): i32 context settings {
+    x + 1
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#;
+    assert_compiles(source);
+    let warnings = warning_diagnostics(source);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| {
+            message.contains(
+                "this `context` clause declares `settings`, which `render`'s body never reads",
+            )
+        })
+        .collect();
+    assert_eq!(matching.len(), 1, "{warnings:#?}");
+    // Anchored on the clause's NAME LIST — the span the editor's fix rewrites.
+    assert_eq!(&source[matching[0].1.clone()], "settings");
+}
+
+/// Callers are checked against the DECLARATION: the refusal lands at the call,
+/// names the clause and the callee, and says nothing about what the body reads
+/// — one hop, not a walk down into `deep`.
+#[test]
+fn b242_an_undeclared_caller_is_refused_at_the_call_naming_the_clause() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun main() {
+    print(render(1));
+    settings.run(3, || {
+        print(render(2));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `settings` is required by `render`'s `context` clause, but this code can be \
+         reached without an enclosing `run`",
+    );
+    // The declaring function's own body is never the site of the refusal —
+    // that is the boundary the clause draws — and the covered call is clean.
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// A caller that declares the clause ITSELF is covered by its own signature,
+/// and the demand moves up one more hop.
+#[test]
+fn b242_a_declaring_caller_is_covered_by_its_own_clause() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun panel(): i32 context settings {
+    render(1)
+}
+
+fun main() {
+    settings.run(3, || {
+        print(panel());
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// B241's shape with the boundary drawn: an arity-invalid call to a declaring
+/// function reports the arity error and nothing else — no coverage fence, no
+/// value-use refusal, and nothing at all about the callee's body.
+#[test]
+fn b242_the_b241_shape_with_a_declared_clause_reports_at_the_boundary_only() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32, y: i32): i32 context settings {
+    deep() + x + y
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`render` expects 2 arguments, but got 1 instead");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+    assert_fails_without(source, "so it can't be used as a value");
+}
+
+/// Trait and `impl` methods are DEFERRED: a dispatched call selects its callee
+/// at the call site, so there is no single declaration to check against.
+#[test]
+fn b242_a_clause_on_a_method_is_refused_for_now() {
+    assert_fails_once_with(
+        r#"
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+struct Row {
+    id: i32,
+}
+
+impl Row {
+    fun render(self): i32 context settings {
+        settings.get() + self.id
+    }
+}
+
+fun main() {}
+main();
+        "#,
+        "a `context` clause on a trait or `impl` method is not supported yet",
+    );
+}
+
 // --- E84: the demotion/trace contract widens to any dependency package ---
 // (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
 // user did not write — std or ANY external/linked package — demotes and

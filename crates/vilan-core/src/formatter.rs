@@ -2787,9 +2787,21 @@ impl<'src> Printer<'src> {
             self.out.push_str(": ");
             self.print_type(&return_type.0);
         }
+        // B242's clause: written right after the return type when there is one
+        // (the type grammar's own `context` suffix, §3.9, takes it there and
+        // the declaration peels it back off), and otherwise closing the
+        // signature. Printed where it was written, because `format` bails on
+        // any token REORDERING — so a canonical position that moved the clause
+        // across `borrows` would leave the file untouched instead.
+        if func.return_type.is_some() {
+            self.print_context_clause(func);
+        }
         if let Some(borrows) = func.borrows {
             self.out.push_str(" borrows ");
             self.out.push_str(borrows);
+        }
+        if func.return_type.is_none() {
+            self.print_context_clause(func);
         }
         match &func.body {
             Some(body) => {
@@ -2885,6 +2897,27 @@ impl<'src> Printer<'src> {
         }
         self.out.push('(');
         self.print_parameters_inner(parameters);
+        self.out.push(')');
+    }
+
+    /// ` context name` / ` context (a, b)` — a declaration's B242 clause, or
+    /// nothing when it carries none.
+    fn print_context_clause(&mut self, func: &crate::node::Func<'src>) {
+        let Some((names, _)) = &func.contexts else {
+            return;
+        };
+        self.out.push_str(" context ");
+        if let [(single, _)] = names.as_slice() {
+            self.out.push_str(single);
+            return;
+        }
+        self.out.push('(');
+        for (index, (name, _)) in names.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(", ");
+            }
+            self.out.push_str(name);
+        }
         self.out.push(')');
     }
 
@@ -5025,6 +5058,34 @@ mod reformats {
         assert_eq!(format(source), expected);
         // The output must be a fixed point — formatting it again is a no-op.
         assert_eq!(format(expected), expected, "output is not idempotent");
+    }
+
+    // B242: a DECLARED `context` clause round-trips byte-exactly. It is
+    // printed where it was written — after the return type when there is one
+    // (where the type grammar's own suffix puts it), otherwise last — because
+    // `format` bails on a token REORDERING, so a canonical position that moved
+    // the clause across `borrows` would leave the file untouched instead of
+    // formatting it.
+    #[test]
+    fn a_declared_context_clause_closes_the_signature() {
+        assert_formats(
+            "fun render(x: i32): i32 context settings {\n\tx\n}\n",
+            "fun render(x: i32): i32 context settings {\n\tx\n}\n",
+        );
+        assert_formats(
+            "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
+            "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
+        );
+        // With a return type the clause follows it; with none it closes the
+        // signature, after `borrows`. Both are byte-exact round trips.
+        assert_formats(
+            "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
+            "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
+        );
+        assert_formats(
+            "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+            "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+        );
     }
 
     // The extern retention flag (`lifetimes.md` §6.4) round-trips. It is

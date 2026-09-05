@@ -418,3 +418,8 @@ row	flagship	key
 387	-	`pkg::{name}` is this program's entry file, which is the…
 388	-	a name after `::`
 NEW	-	this call could not be resolved: the type of {operand} is never determined
+NEW	-	a `context` clause on a trait or `impl` method is not supported yet: a dispatched call selects its callee at the call site, so the requirement cannot be checked against one declaration. Declare it on a free `fun` and call that from the method
+NEW	-	this `context` clause names a value that is not a context
+NEW	-	context `{context}` is required by `{name}`'s `context` clause, but this code can be reached without an enclosing `run` — call it under `{context}.run(..)`, or declare `context {context}` here too
+NEW	-	`{name}`'s body reads {contexts}, which this `context` clause does not declare — write `{spelling}`
+NEW	-	this `context` clause declares `{context}`, which `{name}`'s body never reads; callers must supply it anyway

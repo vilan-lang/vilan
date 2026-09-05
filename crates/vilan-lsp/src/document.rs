@@ -4292,6 +4292,16 @@ impl Document {
                     span: diagnostic.span,
                     replacement: suggestion.to_string(),
                 });
+            } else if let Some(spelling) = declare_contexts_spelling(&diagnostic.msg) {
+                // B242: the subset refusal anchors at the clause's NAME LIST and
+                // carries the clause its body needs, so the fix is that span
+                // and the names out of that spelling — the message and the edit
+                // are one string, and cannot disagree (E58c's rule).
+                fixes.push(QuickFix {
+                    title: "Declare the inferred contexts".to_string(),
+                    span: diagnostic.span,
+                    replacement: spelling.to_string(),
+                });
             } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
                 // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
                 // span IS the gap — the parser's `gap_span` already computed
@@ -4591,6 +4601,15 @@ fn unresolved_name(message: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The NAME LIST of the clause B242's subset refusal spells out — the text
+/// after "write `context " in ``… — write `context (a, b)` ``, which is exactly
+/// what the refusal's own span (the clause's names) holds. `None` for every
+/// other message.
+fn declare_contexts_spelling(message: &str) -> Option<&str> {
+    let rest = message.split("— write `context ").nth(1)?;
+    rest.strip_suffix('`')
 }
 
 /// The suggested name in a "did you mean" note E58 attaches to the
@@ -5681,6 +5700,41 @@ pub(crate) mod tests {
                 "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
             );
         }
+    }
+
+    // B242: the subset refusal spells the clause the body needs, and the fix
+    // writes exactly that over the clause's own name list — the message and
+    // the edit are one string.
+    #[test]
+    fn quickfix_declares_the_inferred_contexts_on_a_narrow_clause() {
+        let source = "import std::context::Context;\n\nlet a_ctx: Context<i32> = Context::new();\nlet b_ctx: Context<i32> = Context::new();\n\nfun both(): i32 {\n\ta_ctx.get() + b_ctx.get()\n}\n\nfun render(): i32 context a_ctx {\n\tboth()\n}\n\nfun main() {}\n";
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().expect("the fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes: Vec<(String, String, String)> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| {
+                (
+                    fix.title,
+                    text[fix.span.into_range()].to_string(),
+                    fix.replacement,
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            fixes.contains(&(
+                "Declare the inferred contexts".to_string(),
+                "a_ctx".to_string(),
+                "(a_ctx, b_ctx)".to_string(),
+            )),
+            "{fixes:?}"
+        );
     }
 
     // §7.2 fix 2. `@` is the `#`'s twin, refused for the same context-free
@@ -8794,6 +8848,17 @@ pub(crate) mod tests {
         )
         .expect("hover on the declaration");
         assert!(hover.contains("context owner_scope"), "{hover}");
+    }
+
+    // B242: a `fun`'s DECLARED `context` clause renders in its hovered
+    // signature, closing it exactly as it does in source.
+    #[test]
+    fn hover_renders_a_declared_context_clause() {
+        let hover = hover_at_cursor(
+            "import std::context::Context;\n\nlet settings: Context<i32> = Context::new();\n\nfun ren|der(x: i32): i32 context settings {\n\tsettings.get() + x\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the declaration");
+        assert!(hover.contains("context settings"), "{hover}");
     }
 
     // std is documented with `///` (user decision): hovering a std function
