@@ -228,11 +228,14 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         return ProjectContext {
             platform,
             shared_platforms,
-            pkg_root: Some(pkg_root),
+            // Both canonical at the source: the manifest directory keys the package
+            // clock (E124) and the root is compared with canonical paths (E127,
+            // E140); on Windows a URI can carry a directory's short spelling.
+            pkg_root: Some(vilan_core::util::canonical_path(&pkg_root)),
             workspace,
             platform_reasons,
             manifest_problem,
-            manifest_dir: Some(root.to_path_buf()),
+            manifest_dir: Some(vilan_core::util::canonical_path(root)),
             unloaded_by_entries,
             generated,
         };

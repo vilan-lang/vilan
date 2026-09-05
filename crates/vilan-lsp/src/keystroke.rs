@@ -3228,12 +3228,15 @@ fun main() {
         let (Some(small_cpu), Some(large_cpu), Some(small_scan_cpu), Some(large_scan_cpu)) =
             (small_cpu, large_cpu, small_scan_cpu, large_scan_cpu)
         else {
-            panic!(
-                "no thread CPU clock on this host, so the cost claim cannot be \
-                 made load-proof (M15); wall was {small_wall:.3} ms and \
-                 {large_wall:.3} ms at loadavg {}",
+            // No thread CPU clock on this host (Windows), so the cost claim cannot
+            // be made load-proof (M15): the shape claims above hold; decline the
+            // cost one, as the budget gates do, rather than fail.
+            eprintln!(
+                "no thread CPU clock on this host, so the cost claim is not asserted \
+                 (M15); wall was {small_wall:.3} ms and {large_wall:.3} ms at loadavg {}",
                 loadavg_1m(),
             );
+            return;
         };
         // (3) Flat across the two exhibits...
         assert!(
