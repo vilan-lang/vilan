@@ -8,8 +8,8 @@ use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::node::{
-    BackingLiteral, BinaryOp, Convention, EnumVariant, ExternBinding, Func, GenericParameters,
-    ImportBranch, Node, NodeIfBranch, NodeList, Pattern,
+    BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure, ExternBinding, Func,
+    GenericParameters, ImportBranch, Node, NodeIfBranch, NodeList, Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -2725,7 +2725,7 @@ type RpcSignatureCheck<'src> = (&'src str, Id, Vec<(String, Option<&'src Node<'s
 /// field's WRITTEN type node (for rendering), the field's RESOLVED type id (what
 /// the `std::Source` reconciliation runs against), the annotation's span, and
 /// the declaring struct.
-type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, TypeId, Span, Id);
+type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, TypeId, Span, Id, Exposure);
 
 #[derive(Clone, Debug)]
 pub struct Analyzer<'src> {
@@ -5682,7 +5682,12 @@ impl<'src> Analyzer<'src> {
                 if self.wire_names.contains(*name) {
                     return true;
                 }
-                matches!(*name, "List" | "Option")
+                // `Map` joined `List`/`Option` with A39: `impl Map<K, V> with
+                // Wire` (backlog I1's gap, which Q8 launched without) narrates
+                // a map as a list of `{key, value}` pairs. Its key must also be
+                // `Hashable`, which is the `Map` declaration's own bound rather
+                // than this predicate's business.
+                matches!(*name, "List" | "Option" | "Map")
                     && arguments
                         .0
                         .iter()
@@ -13906,7 +13911,7 @@ impl<'src> Analyzer<'src> {
         // `Source`, so every exposed field takes the refusal below rather than
         // going unchecked.
         let source_trait_id = self.source_trait_id;
-        for (label, type_node, field_type_id, span, declaration_id) in checks {
+        for (label, type_node, field_type_id, span, declaration_id, exposure) in checks {
             let field_type = field_type_id.get_type(self);
             // A field that never grounded is another diagnostic's business.
             if matches!(field_type, Type::Unknown | Type::Unresolved) {
@@ -13986,6 +13991,32 @@ impl<'src> Analyzer<'src> {
                         declaration_id,
                     );
                 }
+                // The KEYED form (A39) reads TWO written types off the
+                // annotation where the whole-value form reads one: the mirror
+                // is a `KeyedSource<K, T>`, and vilan has no associated types,
+                // so `K` has nowhere to come from but the field's own type.
+                // `Map<K, V>` names both; a `List<T>` names only the element.
+                // Said here for the arm above's reason — the expansion skips
+                // such a field, so without this nothing would say why.
+                Some(_) if exposure.is_keyed() && !sole_argument_is_map(type_node) => {
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "{label} is `[expose(keyed)]`d, but its element is not written \
+                             as a `Map<K, V>`: a keyed mirror is a `KeyedSource<K, T>`, and \
+                             the `[service]` expansion reads BOTH types off the annotation \
+                             (there are no associated types to read the key from). Write the \
+                             field as `SignalCell<Map<K, V>>`, or drop `keyed` for a channel \
+                             that resends the whole value on every change"
+                            ),
+                        },
+                        declaration_id,
+                    );
+                }
                 Some(_) => {}
                 None => {
                     // Same covering, same reason: the field cannot be exposed
@@ -14034,7 +14065,7 @@ impl<'src> Analyzer<'src> {
         if self.wire_names.contains(name) {
             return true;
         }
-        matches!(name, "List" | "Option")
+        matches!(name, "List" | "Option" | "Map")
             && arguments
                 .iter()
                 .all(|argument| self.resolved_type_is_wire(*argument))
@@ -23839,7 +23870,7 @@ impl<'src> Analyzer<'src> {
                     // over a Wire element — recorded now with the type it walked
                     // to, checked once every module's Wire names and impls are
                     // collected (`check_expose_fields`).
-                    if child.0.2 {
+                    if child.0.2.is_exposed() {
                         self.expose_fields_to_check.push((
                             format!("field `{field_name}` of struct `{name}`"),
                             child.0.1.as_ref().map(|type_node| &type_node.0),
@@ -23851,6 +23882,7 @@ impl<'src> Analyzer<'src> {
                                 .map(|type_node| type_node.1)
                                 .unwrap_or(child.1),
                             id,
+                            child.0.2,
                         ));
                     }
                     fields.push(Field {
@@ -42163,6 +42195,22 @@ fn derive_enum_impls(
     out
 }
 
+/// Whether an exposed field's SOLE written type argument is a `Map<K, V>` — the
+/// one shape `[expose(keyed)]` can read both a key and an element from.
+fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
+    let Some(Node::AccessorWithGenerics(_, arguments)) = type_node else {
+        return false;
+    };
+    let [element] = arguments.0.as_slice() else {
+        return false;
+    };
+    matches!(
+        &element.0,
+        Node::AccessorWithGenerics(head, key_and_value)
+            if *head == "Map" && key_and_value.0.len() == 2
+    )
+}
+
 /// A stable fingerprint of a service's surface (Q6 v2): method names, parameter
 /// types, return types, and exposed fields — djb2 over the canonical string, so
 /// the same contract always hashes the same and any drift changes it.
@@ -42216,7 +42264,7 @@ pub(crate) fn service_impl_source(
     let exposed: Vec<(&str, String)> = fields
         .0
         .iter()
-        .filter(|field| field.0.2)
+        .filter(|field| field.0.2.is_exposed())
         .filter_map(|field| {
             let element = match field.0.1.as_ref().map(|type_node| &type_node.0) {
                 Some(Node::AccessorWithGenerics(_, arguments)) if arguments.0.len() == 1 => {

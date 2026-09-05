@@ -10,8 +10,8 @@
 use std::cell::Cell;
 
 use crate::node::{
-    BinaryOp, Convention, ExternBinding, Func, GenericArguments, GenericParameters, ImportBranch,
-    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    BinaryOp, Convention, Exposure, ExternBinding, Func, GenericArguments, GenericParameters,
+    ImportBranch, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -2207,8 +2207,10 @@ impl<'src> Printer<'src> {
                                 self.blank_line();
                             }
                             self.line();
-                            if *exposed {
-                                self.out.push_str("[expose] ");
+                            match exposed {
+                                Exposure::None => {}
+                                Exposure::Whole => self.out.push_str("[expose] "),
+                                Exposure::Keyed => self.out.push_str("[expose(keyed)] "),
                             }
                             self.out.push_str(field_name.0);
                             if let Some(field_type) = field_type {

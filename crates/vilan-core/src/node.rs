@@ -1090,10 +1090,39 @@ impl std::fmt::Display for BackingLiteral<'_> {
     }
 }
 
+/// Whether a struct field is exposed to a service's client, and in what shape
+/// (`proposal/transport-rpc.md` §4.2; tracker A39).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Exposure {
+    /// Not exposed.
+    #[default]
+    None,
+    /// `[expose]` — the source's WHOLE value crosses on every change, as an
+    /// `Update` frame, and the client mirrors it in a `RemoteSource<T>`.
+    Whole,
+    /// `[expose(keyed)]` — the source is a keyed collection, and only what
+    /// changed crosses, as a `Patch` of `Delta` ops. The client mirrors it in a
+    /// `KeyedSource<K, T>`, which can also subscribe to ONE key.
+    Keyed,
+}
+
+impl Exposure {
+    /// Whether the field crosses to the client at all — the question every
+    /// caller that does not care about the shape is asking.
+    pub fn is_exposed(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether the field is the keyed form.
+    pub fn is_keyed(self) -> bool {
+        matches!(self, Self::Keyed)
+    }
+}
+
 // One struct field: its name (with the name's own span), optional type
-// annotation, and whether it is `[expose]`d — observable by a service's client
-// as a mirrored `Source` (`proposal/transport-rpc.md` §4.2).
-pub type StructField<'src> = (Spanned<&'src str>, Option<Spanned<Node<'src>>>, bool);
+// annotation, and whether (and how) it is `[expose]`d — observable by a
+// service's client as a mirrored `Source` (`proposal/transport-rpc.md` §4.2).
+pub type StructField<'src> = (Spanned<&'src str>, Option<Spanned<Node<'src>>>, Exposure);
 
 // One field of a struct LITERAL: its name, and the value assigned to it —
 // `None` for the shorthand form, where the name is also the value's binding.

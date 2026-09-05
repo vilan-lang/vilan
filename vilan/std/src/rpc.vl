@@ -2807,15 +2807,43 @@ macro fun service(item: Item): Source {
 	// is no source at all was told so once by the compiler and then twice more
 	// as `cannot find type '_'`, in code the author never wrote. The curated
 	// refusal stands alone.
+	//
+	// A KEYED field (`[expose(keyed)]`, A39) reads TWO types off the annotation
+	// rather than one — the mirror is a `KeyedSource<K, T>` — and vilan has no
+	// associated types, so `K` can only come from the field's written type.
+	// `SignalCell<Map<K, V>>` names both; the refusal for anything else is the
+	// analyzer's, said in the vocabulary of the field (`check_expose_fields`),
+	// for B202's reason: a field this loop skips would otherwise be silently
+	// unexposed.
 	mut exposed_names: List<str> = [];
 	mut exposed_elements: List<str> = [];
+	// The key type per exposed field, or `""` for the whole-value form — the
+	// discriminator every later loop reads.
+	mut exposed_keys: List<str> = [];
 	for field in target.fields {
 		if field.exposed {
 			if field.type_.arguments.len() == 1 {
 				match field.type_.arguments.get(0) {
 					Some(let element) => {
-						exposed_names.push(field.name);
-						exposed_elements.push(element.render());
+						if field.keyed {
+							if element.name == "Map" && element.arguments.len() == 2 {
+								match element.arguments.get(0) {
+									Some(let key) => match element.arguments.get(1) {
+										Some(let value) => {
+											exposed_names.push(field.name);
+											exposed_elements.push(value.render());
+											exposed_keys.push(key.render());
+										},
+										None => {},
+									},
+									None => {},
+								}
+							}
+						} else {
+							exposed_names.push(field.name);
+							exposed_elements.push(element.render());
+							exposed_keys.push("");
+						}
 					},
 					None => {},
 				}
@@ -2846,7 +2874,18 @@ macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "_",
 		};
-		surface = surface + "expose:" + field_name + ":" + element + ";";
+		let key = match exposed_keys.get(expose_index) {
+			Some(let found) => found,
+			None => "",
+		};
+		// A keyed exposure is its OWN surface entry, so the contract hash moves
+		// only for a service that uses the form — a plain `[expose]` service
+		// hashes byte-identically to what it hashed before A39.
+		if key == "" {
+			surface = surface + "expose:" + field_name + ":" + element + ";";
+		} else {
+			surface = surface + "keyed:" + field_name + ":" + key + ":" + element + ";";
+		}
 		expose_index = expose_index + 1;
 	}
 	let hash = service_hash(surface);
@@ -2882,8 +2921,25 @@ macro fun service(item: Item): Source {
 	}
 	routes.push(".on(" + quote("__contract") + ", |_| reply(self.contract_hash()))");
 	mut exposures: List<str> = [];
+	mut exposure_index = 0;
 	for field_name in exposed_names {
-		exposures.push(i"session.expose(self.{field_name})");
+		let key = match exposed_keys.get(exposure_index) {
+			Some(let found) => found,
+			None => "",
+		};
+		if key == "" {
+			exposures.push(i"session.expose(self.{field_name})");
+		} else {
+			let element = match exposed_elements.get(exposure_index) {
+				Some(let found) => found,
+				None => "_",
+			};
+			// The key projection is a value parameter (`std::rpc`'s
+			// `expose_keyed_map` documents why); `Keyed` is what makes
+			// `element.key()` resolve on the element type.
+			exposures.push(i"session.expose_keyed_map(self.{field_name}, |element: {element}| element.key())");
+		}
+		exposure_index = exposure_index + 1;
 	}
 	let exposure_list = join(exposures, ", ");
 	let attach_reply = match_of("session_of(connection)")
@@ -2932,7 +2988,15 @@ macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "_",
 		};
-		client_struct = client_struct.field(i"{field_name}: RemoteSource<{element}>");
+		let key = match exposed_keys.get(mirror_index) {
+			Some(let found) => found,
+			None => "",
+		};
+		if key == "" {
+			client_struct = client_struct.field(i"{field_name}: RemoteSource<{element}>");
+		} else {
+			client_struct = client_struct.field(i"{field_name}: KeyedSource<{key}, {element}>");
+		}
 		mirror_index = mirror_index + 1;
 	}
 	mut client_impl = impl_of(target.client_name).generics("<type T>");
@@ -2988,9 +3052,21 @@ macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "_",
 		};
-		body.push(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.attached_source(channels[{channel_index}]);");
+		let key = match exposed_keys.get(channel_index) {
+			Some(let found) => found,
+			None => "",
+		};
+		if key == "" {
+			body.push(i"let mirror_{field_name}: RemoteSource<{element}> = reactive.attached_source(channels[{channel_index}]);");
+			rebind_lines.push(i"|channel: i32, subscribe: Frame| mirror_{field_name}.rebind(channel, subscribe)");
+		} else {
+			body.push(i"let mirror_{field_name}: KeyedSource<{key}, {element}> = reactive.attached_keyed_source(channels[{channel_index}]);");
+			// A keyed mirror re-encodes its own `Subscribe` frames — one per
+			// demand it still holds — so the positional frame the plain path
+			// rebinds with is not its to use.
+			rebind_lines.push(i"|channel: i32, _subscribe: Frame| mirror_{field_name}.rebind(channel)");
+		}
 		ok_fields.push(i"{field_name} = mirror_{field_name}");
-		rebind_lines.push(i"|channel: i32, subscribe: Frame| mirror_{field_name}.rebind(channel, subscribe)");
 		channel_index = channel_index + 1;
 	}
 	// The reconnect hook: re-verify the contract, re-attach under the fresh
@@ -3031,6 +3107,6 @@ macro fun service(item: Item): Source {
 		.method(connect_with.expr(client_value))
 		.render();
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
+	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame, Keyed };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
 	source(imports + service_impl + service_trait_impl + client_struct.render() + client_impl.render() + connect_impl)
 }

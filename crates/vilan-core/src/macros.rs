@@ -2107,7 +2107,8 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                             .as_ref()
                             .map(|type_| construct_type_expr(type_, text))
                             .unwrap_or_else(void_type_expr),
-                        js::Node::Bool(*exposed),
+                        js::Node::Bool(exposed.is_exposed()),
+                        js::Node::Bool(exposed.is_keyed()),
                     ])
                 })
                 .collect();
@@ -2235,7 +2236,8 @@ pub(crate) fn construct_service(
                     .as_ref()
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),
-                js::Node::Bool(*exposed),
+                js::Node::Bool(exposed.is_exposed()),
+                js::Node::Bool(exposed.is_keyed()),
             ])
         })
         .collect();

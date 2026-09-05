@@ -39,12 +39,16 @@ impl TypeExpr {
 	}
 }
 
-// One struct field: its name, its written type, and whether it is marked
-// `[expose]` (a service-surface field, transport-rpc.md §4.2).
+// One struct field: its name, its written type, whether it is marked
+// `[expose]` (a service-surface field, transport-rpc.md §4.2), and whether that
+// exposure is the KEYED form `[expose(keyed)]` — a keyed collection patched
+// element by element rather than resent whole (A39). `keyed` is only ever true
+// where `exposed` is.
 export struct Field {
 	name: str,
 	type_: TypeExpr,
 	exposed: bool,
+	keyed: bool,
 }
 
 // One declared generic parameter of a struct or enum: its name, its written

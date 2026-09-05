@@ -57,9 +57,9 @@ use std::cell::Cell;
 use crate::lexing;
 use crate::node::{
     BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration, CssItem, CssNested,
-    CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExternBinding, Func,
-    GenericArguments, GenericParameter, GenericParameters, If, ImportBranch, MatchLeg, Node,
-    NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
+    CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, Exposure,
+    ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If, ImportBranch,
+    MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -4927,7 +4927,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (the inner name keeps its own span).
     fn parse_struct_field(&mut self) -> Option<Spanned<StructField<'src>>> {
         let start = self.position;
-        let exposed = self.eat_marker_attribute("expose");
+        let exposed = self.eat_expose_attribute();
         let name_start = self.position;
         let name = self.eat_ident()?;
         let name = (name, self.span_from(name_start));
@@ -5317,6 +5317,54 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `[ marker ]` — a bare marker attribute (`[must_use]`, `[rpc]`, `[trait_only]`,
     /// `[expose]`). Consumes it and returns `true` when the exact `[ marker ]` is
     /// next; leaves the cursor untouched and returns `false` otherwise.
+    /// `[expose]` or `[expose(keyed)]` — a struct field's exposure, or
+    /// [`Exposure::None`] when no expose attribute leads.
+    ///
+    /// The argument form is parsed rather than matched as a marker so that an
+    /// unrecognized one is REFUSED by name instead of silently reading as a
+    /// plain `[expose]` (the shapes differ on the wire, so a typo would ship a
+    /// whole-value channel where the author asked for a keyed one). The
+    /// attribute is still consumed on that path, so the field itself parses and
+    /// the file keeps going.
+    fn eat_expose_attribute(&mut self) -> Exposure {
+        let form = self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("expose")) {
+                return None;
+            }
+            parser.bump();
+            let form = if parser.eat_ctrl('(') {
+                let name_start = parser.position;
+                let name = parser.eat_ident()?;
+                let name_span = parser.span_from(name_start);
+                parser.expect_ctrl(')')?;
+                Some((name, name_span))
+            } else {
+                None
+            };
+            parser.expect_ctrl(']')?;
+            Some(form)
+        });
+        match form {
+            None => Exposure::None,
+            Some(None) => Exposure::Whole,
+            Some(Some(("keyed", _span))) => Exposure::Keyed,
+            Some(Some((_other, span))) => {
+                self.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(
+                        "the only argument `[expose]` takes is `keyed` — write `[expose]` for a \
+                         whole-value channel, `[expose(keyed)]` for a keyed collection patched \
+                         element by element",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+                Exposure::Whole
+            }
+        }
+    }
+
     fn eat_marker_attribute(&mut self, marker: &str) -> bool {
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
@@ -6433,8 +6481,8 @@ mod tests {
     fn exposed_struct_field_is_recorded() {
         match only_item("struct Room { [expose] count: Signal, name: str }") {
             Node::Struct(_, _, _, _, Some(fields)) => {
-                let exposed: Vec<bool> = fields.0.iter().map(|field| field.0.2).collect();
-                assert_eq!(exposed, vec![true, false]);
+                let exposed: Vec<Exposure> = fields.0.iter().map(|field| field.0.2).collect();
+                assert_eq!(exposed, vec![Exposure::Whole, Exposure::None]);
             }
             other => panic!("expected a struct with fields, got {other:?}"),
         }
