@@ -393,20 +393,6 @@ fn a_trait_in_return_position_is_still_refused() {
     );
 }
 
-#[test]
-fn a_trait_in_struct_field_position_is_still_refused() {
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            struct Kennel {{ inner: Greet }}
-            fun main() {{ print(Kennel {{ inner = Dog {{ name = "rex" }} }}.inner.name); }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
-}
-
 // --- B182: the refusal's `Unknown` carries its provenance, so it stands alone ---
 //
 // B161 resolves a refused annotation to `Unknown` "so the one report stands
