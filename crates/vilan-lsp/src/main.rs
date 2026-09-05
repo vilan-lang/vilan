@@ -2118,7 +2118,12 @@ impl Backend {
         if is_manifest(uri) {
             return path.parent().map(vilan_core::util::canonical_path);
         }
-        let path = vilan_core::util::canonical_path(&path);
+        // The arriving file may not exist yet (a create event, or a delete
+        // that already happened), so resolve it through its deepest EXISTING
+        // ancestor — `canonical_path` alone would fall back to a lexical
+        // normalization and keep the URI's spelling (short on Windows) while
+        // the root below is canonical.
+        let path = vilan_core::util::canonical_path_of_unwritten(&path);
         self.documents
             .iter()
             // Both sides canonical: on Windows a document's root can carry the
