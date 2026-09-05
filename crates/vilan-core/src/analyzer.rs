@@ -35846,6 +35846,51 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// One queued assignment, wired to the variable its target resolved to.
+    ///
+    /// Lifted out of `resolve_world`'s drain (B237) for the reason
+    /// [`Self::resolve_prepped_local`] was (B222): the drain runs in TWO parts
+    /// around the guard-continuation pass, and an assignment whose TARGET is
+    /// one of the held-back names cannot be wired until that name has resolved.
+    /// Before, it was simply dropped — the target was not yet an `Expr::Local`,
+    /// so it fell past every arm below including the refusal.
+    fn wire_prepped_assignment(&mut self, target_id: Id, value_id: Id) {
+        let Some(Expr::Local(variable_id)) = self.expr_id_to_expr_map.get(&target_id) else {
+            return;
+        };
+        let variable_id = *variable_id;
+        // A parameter's assignability is governed by its convention in
+        // `check_readonly_mutation`: bare / `&` are readonly and rejected
+        // there, while `own` rebinds its owned copy and `&mut` writes
+        // *through* — both allowed. A view binding is likewise handled by
+        // `check_readonly_mutation` + the write-through rewrite, and its type
+        // is fixed by the view it was bound to, not by later assignments. So
+        // skip both here (don't reject, don't feed type inference).
+        if self.parameters.contains_key(&variable_id) || self.binding_or_param_is_view(variable_id)
+        {
+            return;
+        }
+        // Anything else that is not a variable cannot be assigned (e.g. a
+        // function name); a plain immutable local is rejected by
+        // `check_readonly_mutation`.
+        if self.variables.get(&variable_id).is_none() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: "cannot assign to this expression".to_string(),
+            });
+            return;
+        }
+        if let Some(Constraint::Variable(constraint)) =
+            self.constraints.iter_mut().find(|constraint| {
+                matches!(constraint, Constraint::Variable(constraint) if constraint.variable_id == variable_id)
+            })
+        {
+            constraint.value_ids.push(value_id);
+        }
+    }
+
     /// The resolution preamble and the constraint fixpoint — everything
     /// `build()` does BEFORE the commit tail. The S3 two-phase shape runs
     /// this alone over the pre-entry world (analysis-reuse.md §6.7): the
@@ -36018,42 +36063,20 @@ impl<'src> Analyzer<'src> {
         // joins the variable's constraint so reassignments are type checked
         // against the variable's type, and assigning to an immutable binding
         // is rejected.
+        //
+        // B237: "now resolved" is what the drain above just stopped being true
+        // of. A target held back for the guard pass is not an `Expr::Local`
+        // yet, so it fell to `_ => continue` and the wiring never saw it at
+        // all — `n = 5` beside a guard whose capture is also called `n`
+        // compiled CLEAN and emitted an assignment to a top-level function.
+        // Those go into the second part, at the seam the guard pass uses.
+        let mut guarded_assignments = Vec::new();
         for (target_id, value_id) in std::mem::take(&mut self.prepped_assignments) {
-            let variable_id = match self.expr_id_to_expr_map.get(&target_id) {
-                Some(Expr::Local(variable_id)) => *variable_id,
-                _ => continue,
-            };
-            // A parameter's assignability is governed by its convention in
-            // `check_readonly_mutation`: bare / `&` are readonly and rejected
-            // there, while `own` rebinds its owned copy and `&mut` writes
-            // *through* — both allowed. A view binding is likewise handled by
-            // `check_readonly_mutation` + the write-through rewrite, and its type
-            // is fixed by the view it was bound to, not by later assignments. So
-            // skip both here (don't reject, don't feed type inference).
-            if self.parameters.contains_key(&variable_id)
-                || self.binding_or_param_is_view(variable_id)
-            {
+            if guarded_locals.iter().any(|(id, _)| *id == target_id) {
+                guarded_assignments.push((target_id, value_id));
                 continue;
             }
-            // Anything else that is not a variable cannot be assigned (e.g. a
-            // function name); a plain immutable local is rejected by
-            // `check_readonly_mutation`.
-            if self.variables.get(&variable_id).is_none() {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: "cannot assign to this expression".to_string(),
-                });
-                continue;
-            }
-            if let Some(Constraint::Variable(constraint)) =
-                self.constraints.iter_mut().find(|constraint| {
-                    matches!(constraint, Constraint::Variable(constraint) if constraint.variable_id == variable_id)
-                })
-            {
-                constraint.value_ids.push(value_id);
-            }
+            self.wire_prepped_assignment(target_id, value_id);
         }
 
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
@@ -37367,6 +37390,15 @@ impl<'src> Analyzer<'src> {
         // about.
         for (id, name) in guarded_locals {
             self.resolve_prepped_local(id, name);
+        }
+
+        // B237: and the assignments to those names, wired now that their
+        // targets have resolved. Same seam, same reason — the wiring reads the
+        // target's resolution, so it belongs on the side of the guard pass
+        // where that resolution exists. The constraints it feeds are queued,
+        // not solved, so this is still before the fixpoint below.
+        for (target_id, value_id) in guarded_assignments {
+            self.wire_prepped_assignment(target_id, value_id);
         }
 
         // --- Constraint solving loop ---

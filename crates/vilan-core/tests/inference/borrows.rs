@@ -8777,3 +8777,99 @@ fn b223_the_if_control_is_unchanged() {
         "cannot find 'n' in this scope",
     );
 }
+
+// --- B237: the assignment wiring and the guard pass's seam -------------------
+
+#[test]
+fn b237_an_assignment_to_a_late_resolving_target_reaches_the_wirings_refusal() {
+    // B222 moved a guard clause's continuation binding out of the walk: a
+    // bare-name use a guard MIGHT publish is held back and resolved after the
+    // guard verdict. The assignment wiring runs between those two halves and
+    // reads its target's resolution, so a held-back target was not an
+    // `Expr::Local` when it looked — it fell to the loop's `_ => continue` and
+    // the wiring never saw the assignment at all.
+    //
+    // Nothing else catches this shape. `n = 5` targets the top-level FUNCTION
+    // `n` (the capture is visible only from the end of the `if`), which is not
+    // a binding, so `check_readonly_mutation` has nothing to refuse — and the
+    // program below compiled CLEAN, emitting an assignment to a function.
+    // Held back only because a guard in an enclosing scope captures the same
+    // NAME.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun n(): i32 { 3 }
+        fun guard(maybe: Option<i32>) {
+            n = 5;
+            if !(maybe is Some(let n)) { panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot assign to this expression",
+    );
+}
+
+#[test]
+fn b237_the_same_assignment_without_the_name_collision_is_the_control() {
+    // The identical program with the capture spelled `m`: nothing is held back,
+    // the wiring resolves the target in its first part, and the refusal was
+    // always reported. The ONE difference between this and the pin above is
+    // whether the target's name collides with a guard capture's — which is
+    // exactly the seam, and nothing about the assignment itself.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun n(): i32 { 3 }
+        fun guard(maybe: Option<i32>) {
+            n = 5;
+            if !(maybe is Some(let m)) { panic("missing"); }
+            print(m);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot assign to this expression",
+    );
+}
+
+#[test]
+fn b237_assigning_to_the_continuation_binding_itself_still_reports_once() {
+    // The other half of the seam, and the shape the re-run must not double.
+    // The continuation binding IS a variable, so the wiring's job for it is to
+    // feed the variable's constraint — not to refuse. The refusal is
+    // `check_readonly_mutation`'s (the capture is an immutable declaration),
+    // and it must stay the only one now that the wiring runs on this target
+    // too.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot mutate immutable 'n'",
+    );
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot assign to this expression",
+    );
+}
