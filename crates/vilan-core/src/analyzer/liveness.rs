@@ -807,14 +807,47 @@ impl Analyzer<'_> {
                 projected_anchors.insert(initial);
             }
         }
+        // M37: ONE sweep for the anchor sets and the retention refusal. The
+        // two were written as separate passes over `expr_id_to_expr_map` and
+        // are independent — the anchor sets are read only by the third sweep
+        // below, and the retention arm reads neither of them, writing straight
+        // into `opaque`. Fusing them is therefore order-independent as well as
+        // answer-identical (both destinations are sets), and on kolt's client
+        // it is one walk of a 200,000-entry map saved.
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::Call(call_id) => {
                     let Some(function_call) = self.function_calls.get(call_id) else {
                         continue;
                     };
-                    if self.callee_conventions(function_call.subject_id).is_some() {
+                    // M37: the yes/no this position wants, without the
+                    // `Vec<Convention>` that `callee_conventions(..).is_some()`
+                    // built and dropped once per call in the program.
+                    if self.callee_is_resolved(function_call.subject_id) {
                         anchored.extend(function_call.argument_ids.iter().copied());
+                    }
+                    if !self.callee_retains(function_call.subject_id) {
+                        continue;
+                    }
+                    for argument_id in &function_call.argument_ids {
+                        // `&place` is the ordinary spelling at a loan position,
+                        // so the reference is looked through to the place it
+                        // names.
+                        let place_id = match self.expr_id_to_expr_map.get(argument_id) {
+                            Some(Expr::Reference(operand_id, _)) => *operand_id,
+                            _ => *argument_id,
+                        };
+                        let roots = match self.expr_id_to_expr_map.get(&place_id) {
+                            Some(Expr::Local(binding_id)) => view_origins
+                                .get(binding_id)
+                                .cloned()
+                                .unwrap_or_else(|| vec![*binding_id]),
+                            _ => self
+                                .place_root(place_id)
+                                .map(|root| vec![root])
+                                .unwrap_or_default(),
+                        };
+                        opaque.extend(roots);
                     }
                 }
                 Expr::ForEach(iterable_id, _, _) => {
@@ -827,36 +860,8 @@ impl Analyzer<'_> {
                 _ => {}
             }
         }
-        for expr in self.expr_id_to_expr_map.values() {
-            let Expr::Call(call_id) = expr else {
-                continue;
-            };
-            let Some(function_call) = self.function_calls.get(call_id) else {
-                continue;
-            };
-            if !self.callee_retains(function_call.subject_id) {
-                continue;
-            }
-            for argument_id in &function_call.argument_ids {
-                // `&place` is the ordinary spelling at a loan position, so the
-                // reference is looked through to the place it names.
-                let place_id = match self.expr_id_to_expr_map.get(argument_id) {
-                    Some(Expr::Reference(operand_id, _)) => *operand_id,
-                    _ => *argument_id,
-                };
-                let roots = match self.expr_id_to_expr_map.get(&place_id) {
-                    Some(Expr::Local(binding_id)) => view_origins
-                        .get(binding_id)
-                        .cloned()
-                        .unwrap_or_else(|| vec![*binding_id]),
-                    _ => self
-                        .place_root(place_id)
-                        .map(|root| vec![root])
-                        .unwrap_or_default(),
-                };
-                opaque.extend(roots);
-            }
-        }
+        // The refusal sweep stays separate: it READS the two anchor sets, so
+        // it cannot be fused with the pass that fills them.
         for (expr_id, expr) in &self.expr_id_to_expr_map {
             match expr {
                 Expr::Reference(operand_id, _) if !anchored.contains(expr_id) => {

@@ -11551,6 +11551,25 @@ impl<'src> Analyzer<'src> {
             .is_some_and(|external| external.retains)
     }
 
+    /// Whether the call through `subject_id` reaches a callee this analysis
+    /// RESOLVED — a bodied function or a declared extern. Exactly
+    /// [`Self::callee_conventions`]`(..).is_some()`, without the `Vec`
+    /// (M37).
+    ///
+    /// `collect_unfollowable_loans` asks this of every call in the program and
+    /// only ever reads the `is_some()`, so on kolt's client it was building
+    /// and dropping one convention vector per call to answer a yes/no about
+    /// the callee's identity. The two functions must agree, so they are
+    /// written adjacent and share the one lookup chain: a subject that is not
+    /// a `Local`, or a `Local` naming neither a function nor an external, has
+    /// no conventions and is not resolved.
+    fn callee_is_resolved(&self, subject_id: Id) -> bool {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        self.functions.contains_key(callee_id) || self.external_functions.contains_key(callee_id)
+    }
+
     fn callee_conventions(&self, subject_id: Id) -> Option<Vec<Convention>> {
         let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return None;
@@ -18395,16 +18414,47 @@ impl<'src> Analyzer<'src> {
                 origins.insert(*item, vec![root]);
             }
         }
+        // M37: the fixpoint's two candidate sets are collected ONCE, outside
+        // the loop. Neither `variables` nor `expr_id_to_expr_map` is touched
+        // by the body (`&self`), so re-deriving them per round re-read the
+        // whole expression map each time to find the handful of shapes that
+        // can carry an origin — and a fixpoint always pays at least two
+        // rounds, one to converge and one to notice. Collecting preserves the
+        // iteration order exactly (an unmodified `HashMap` yields the same
+        // sequence every time), so the answer is unchanged.
+        let seeded: Vec<(Id, Id)> = self
+            .variables
+            .values()
+            .filter_map(|variable| variable.initial.map(|initial| (variable.id, initial)))
+            .collect();
+        let wrapped_captures: Vec<(Id, Id)> = self
+            .expr_id_to_expr_map
+            .values()
+            .filter_map(|expr| match expr {
+                Expr::Match(subject_id, legs) => Some((subject_id, legs)),
+                _ => None,
+            })
+            .flat_map(|(subject_id, legs)| {
+                legs.iter().filter_map(move |leg| {
+                    let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern else {
+                        return None;
+                    };
+                    let [ExprPattern::Binding(capture_id)] = sub_patterns.as_slice() else {
+                        return None;
+                    };
+                    self.wrapped_view_captures
+                        .contains_key(capture_id)
+                        .then_some((*capture_id, *subject_id))
+                })
+            })
+            .collect();
         loop {
             let mut changed = false;
-            for variable in self.variables.values() {
-                if origins.contains_key(&variable.id) {
+            for (variable_id, initial) in &seeded {
+                if origins.contains_key(variable_id) {
                     continue;
                 }
-                let Some(initial) = variable.initial else {
-                    continue;
-                };
-                let roots = match self.expr_id_to_expr_map.get(&initial) {
+                let roots = match self.expr_id_to_expr_map.get(initial) {
                     Some(Expr::Reference(operand_id, _)) => {
                         self.place_root(*operand_id).map(|root| vec![root])
                     }
@@ -18416,29 +18466,21 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 };
                 if let Some(roots) = roots {
-                    origins.insert(variable.id, roots);
+                    origins.insert(*variable_id, roots);
                     changed = true;
                 }
             }
             // Wrapped-view `match` captures have no initial — their origin is
             // the match SUBJECT's projection. Runs inside the fixpoint so a
             // later copy of a capture (`let w = v`) still resolves.
-            for expr in self.expr_id_to_expr_map.values() {
-                let Expr::Match(subject_id, legs) = expr else {
+            for (capture_id, subject_id) in &wrapped_captures {
+                if origins.contains_key(capture_id) {
                     continue;
-                };
-                for leg in legs {
-                    if let ExprPattern::Variant(_, _, sub_patterns) = &leg.pattern
-                        && let [ExprPattern::Binding(capture_id)] = sub_patterns.as_slice()
-                        && self.wrapped_view_captures.contains_key(capture_id)
-                        && !origins.contains_key(capture_id)
-                    {
-                        let roots = self.subject_view_roots(*subject_id, &origins);
-                        if !roots.is_empty() {
-                            origins.insert(*capture_id, roots);
-                            changed = true;
-                        }
-                    }
+                }
+                let roots = self.subject_view_roots(*subject_id, &origins);
+                if !roots.is_empty() {
+                    origins.insert(*capture_id, roots);
+                    changed = true;
                 }
             }
             if !changed {
