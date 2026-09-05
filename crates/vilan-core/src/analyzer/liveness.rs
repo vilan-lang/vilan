@@ -92,7 +92,7 @@
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 
-use super::{Analyzer, Expr, ExprIfBranch, ExprPattern};
+use super::{Analyzer, Expr, ExprIfBranch, ExprPattern, ModuleTables, SourceId};
 
 /// Where a binding's teardown region ENDS (`lifetimes.md` §6, slice S3).
 ///
@@ -139,6 +139,29 @@ pub(super) struct LastUse {
     /// only refusal the SYNTACTIC answer honours: a chain it did not see every
     /// read of cannot be trusted to name the last one.
     unreached: HashSet<Id>,
+    /// M19 T1b: the opacity this WALK derived — `conflicted` plus the
+    /// completeness net's `unreached` — before the two whole-program merges
+    /// below it (`collect_unfollowable_loans` and the view-origin closure).
+    ///
+    /// Only this half is recorded. The other two are scans over
+    /// `expr_id_to_expr_map` that run on every analysis whether or not a module
+    /// was reused, and they can be reached from the ENTRY's own expressions —
+    /// a buffer that hands a module's binding to a retaining callee makes that
+    /// binding opaque. Recording the merged set would remember one entry's
+    /// loans as if they were the module's, and the next keystroke would restore
+    /// an opacity its own text no longer justifies.
+    derived_opaque: HashSet<Id>,
+    /// M19 T1b: bindings this walk touched from a region belonging to a
+    /// DIFFERENT source — a module-level binding read by the entry, or a view
+    /// root the loan-extension rule reached across a file boundary.
+    ///
+    /// Their answers are not the declaring module's own: `use_region` and the
+    /// statement chains are first-wins across regions, so which one is recorded
+    /// depends on the buffer being edited. They are excluded from the record,
+    /// and a restoring analysis derives them exactly as a full one does — the
+    /// live walk sees the foreign read, finds no declaration region for it, and
+    /// marks it opaque, which is what the full walk concludes too.
+    foreign_touched: HashSet<Id>,
 }
 
 impl LastUse {
@@ -216,6 +239,12 @@ impl LastUse {
     /// Run the pass over every region of the program.
     pub(super) fn compute(analyzer: &Analyzer<'_>) -> Self {
         let view_origins = analyzer.compute_view_origins();
+        // M19 T1b: a reused module's rows come back verbatim and its regions
+        // are not walked. The seed goes in FIRST, so `or_insert_with` on a
+        // statement chain keeps the restored answer if a live region also
+        // reaches the binding — the two agree, since the module's text and the
+        // world around it are the same bytes the record was derived from.
+        let restored = &analyzer.restored_tables;
         let mut walk = Liveness {
             analyzer,
             view_origins: &view_origins,
@@ -223,21 +252,23 @@ impl LastUse {
             repeat_carry: None,
             dry: false,
             region: Id(0),
-            last_uses: HashSet::default(),
+            region_source: None,
+            last_uses: restored.last_uses.clone(),
             statement_stack: Vec::new(),
-            last_use_statements: HashMap::default(),
-            declaration_statements: HashMap::default(),
+            last_use_statements: restored.last_use_statements.clone(),
+            declaration_statements: restored.declaration_statements.clone(),
             walked_uses: HashMap::default(),
             use_region: HashMap::default(),
             declaration_region: HashMap::default(),
-            conflicted: HashSet::default(),
+            conflicted: restored.last_use_opaque.clone(),
+            foreign_touched: HashSet::default(),
         };
 
         // Function bodies. A nested `fun` is a region of its own and is not
         // descended into from its enclosing body, exactly as the call graph's
         // traversal treats it.
         for function in analyzer.functions.values() {
-            if function.has_body {
+            if function.has_body && !analyzer.table_entity(function.id) {
                 walk.enter(function.id);
                 walk.walk_block(&function.body.0, function.body.1);
                 // Parameters come into existence at the body's entry, which a
@@ -252,6 +283,9 @@ impl LastUse {
         // Module bodies (module-level bindings live here; a function READING
         // one crosses regions and is refused below).
         for module in analyzer.modules.values() {
+            if analyzer.table_entity(module.id) {
+                continue;
+            }
             walk.enter(module.id);
             walk.walk_block(&module.body.0, module.body.1);
         }
@@ -260,6 +294,9 @@ impl LastUse {
         // parameter destructures run before the body, so they are walked after
         // it going backward.
         for closure in analyzer.closures.values() {
+            if analyzer.table_entity(closure.id) {
+                continue;
+            }
             walk.enter(closure.id);
             walk.walk(closure.return_);
             for destructure_id in closure.parameter_destructures.iter().rev() {
@@ -270,7 +307,8 @@ impl LastUse {
         let mut opaque = walk.conflicted;
         // The completeness net's own half, kept separate: it is the ONE refusal
         // the syntactic answer honours (see [`LastUse::syntactic_extent`]).
-        let mut unreached: HashSet<Id> = HashSet::default();
+        let mut unreached: HashSet<Id> = restored.last_use_unreached.clone();
+        opaque.extend(unreached.iter().copied());
         // The completeness net: every `Expr::Local` naming a variable that
         // exists in the program must have been REACHED by the walk. A form the
         // traversal does not know about would otherwise hide a use and turn a
@@ -283,6 +321,14 @@ impl LastUse {
             if !analyzer.variables.contains_key(binding_id)
                 && !analyzer.parameters.contains_key(binding_id)
             {
+                continue;
+            }
+            // M19 T1b: a reused module's reads were not walked because its
+            // answer was restored, so the net has nothing to prove about them.
+            // Both halves of the test are the module's own — the site and the
+            // binding — because a use of a module binding from a LIVE region is
+            // a foreign touch, and the record never carried such a binding.
+            if analyzer.table_entity(*expr_id) && analyzer.table_entity(*binding_id) {
                 continue;
             }
             let reached = walk
@@ -307,6 +353,9 @@ impl LastUse {
                 }
             }
         }
+        // M19 T1b: the walk's own verdict, snapshotted before the two
+        // whole-program merges below add to it (see `derived_opaque`).
+        let derived_opaque = opaque.clone();
         analyzer.collect_unfollowable_loans(&view_origins, &mut opaque);
         // A view the pass cannot answer for drags its owners down with it: the
         // extension rule is only as good as the view's own liveness. Views copy
@@ -332,6 +381,69 @@ impl LastUse {
             last_use_statements: walk.last_use_statements,
             declaration_statements: walk.declaration_statements,
             unreached,
+            derived_opaque,
+            foreign_touched: walk.foreign_touched,
+        }
+    }
+
+    /// Partitions the rows this pass DERIVED into the per-module slices M19
+    /// T1b records (`per-module-analysis-reuse.md` §3.3, class D).
+    ///
+    /// Two exclusions and both are load-bearing. A source already in
+    /// `skip` was RESTORED, not derived, so its record stands and must not be
+    /// rewritten from a copy of itself. And a binding in
+    /// [`Self::foreign_touched`] was reached from another file's region, so its
+    /// answer belongs to that analysis's entry and not to the module — the same
+    /// rule T1's `reaches_outside_the_world` applies to a diagnostic.
+    pub(super) fn record_rows(
+        &self,
+        analyzer: &Analyzer<'_>,
+        skip: &dyn Fn(SourceId) -> bool,
+        into: &mut HashMap<u32, ModuleTables>,
+    ) {
+        let file = |analyzer: &Analyzer<'_>, id: Id| -> Option<u32> {
+            if self.foreign_touched.contains(&id) {
+                return None;
+            }
+            let source = analyzer.source_of_id(id)?;
+            (source.0 != 0 && !skip(source)).then_some(source.0)
+        };
+        for use_id in &self.last_uses {
+            if let Some(source) = file(analyzer, *use_id) {
+                into.entry(source).or_default().last_uses.push(*use_id);
+            }
+        }
+        for binding_id in &self.derived_opaque {
+            if let Some(source) = file(analyzer, *binding_id) {
+                into.entry(source)
+                    .or_default()
+                    .last_use_opaque
+                    .push(*binding_id);
+            }
+        }
+        for binding_id in &self.unreached {
+            if let Some(source) = file(analyzer, *binding_id) {
+                into.entry(source)
+                    .or_default()
+                    .last_use_unreached
+                    .push(*binding_id);
+            }
+        }
+        for (binding_id, chain) in &self.last_use_statements {
+            if let Some(source) = file(analyzer, *binding_id) {
+                into.entry(source)
+                    .or_default()
+                    .last_use_statements
+                    .push((*binding_id, chain.clone()));
+            }
+        }
+        for (binding_id, chain) in &self.declaration_statements {
+            if let Some(source) = file(analyzer, *binding_id) {
+                into.entry(source)
+                    .or_default()
+                    .declaration_statements
+                    .push((*binding_id, chain.clone()));
+            }
         }
     }
 }
@@ -352,6 +464,9 @@ struct Liveness<'a, 'src> {
     dry: bool,
     /// The region root the walk is inside (a function, module or closure id).
     region: Id,
+    /// M19 T1b: the file that region belongs to, resolved once per region
+    /// rather than once per read.
+    region_source: Option<SourceId>,
     last_uses: HashSet<Id>,
     /// The chain of block STATEMENTS the walk is inside, outermost first — the
     /// statement-boundary coordinate a `finally` region can be cut at.
@@ -368,15 +483,29 @@ struct Liveness<'a, 'src> {
     declaration_region: HashMap<Id, Id>,
     /// Bindings read from two regions, or declared twice.
     conflicted: HashSet<Id>,
+    /// M19 T1b: bindings touched from a region of another file.
+    foreign_touched: HashSet<Id>,
 }
 
 impl Liveness<'_, '_> {
     /// Start a fresh region: nothing is live at a body's end.
     fn enter(&mut self, region: Id) {
         self.region = region;
+        self.region_source = self.analyzer.source_of_id(region);
         self.live.clear();
         self.repeat_carry = None;
         self.statement_stack.clear();
+    }
+
+    /// M19 T1b: record a touch of `binding_id` from a region belonging to
+    /// another file. Every write this walk makes about such a binding is
+    /// first-wins across regions and therefore depends on which buffer was
+    /// being edited, so the record refuses it and the next analysis derives it
+    /// live.
+    fn note_touch(&mut self, binding_id: Id) {
+        if self.analyzer.source_of_id(binding_id) != self.region_source {
+            self.foreign_touched.insert(binding_id);
+        }
     }
 
     /// Remember where `binding_id`'s last read sits, as a statement chain. The
@@ -387,6 +516,7 @@ impl Liveness<'_, '_> {
         if self.dry {
             return;
         }
+        self.note_touch(binding_id);
         self.last_use_statements
             .entry(binding_id)
             .or_insert_with(|| self.statement_stack.clone());
@@ -434,6 +564,7 @@ impl Liveness<'_, '_> {
     /// body itself declares a genuine last use.
     fn record_declaration(&mut self, binding_id: Id) {
         if !self.dry {
+            self.note_touch(binding_id);
             self.declaration_statements
                 .entry(binding_id)
                 .or_insert_with(|| self.statement_stack.clone());
