@@ -50,6 +50,13 @@ importing module's scope:
 - `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
   unqualified use.
+- `import std::json::Json as Document;` binds `Document`. `as` renames the
+  leaf and changes nothing else: the path resolves exactly as it would
+  without one, and the imported item is the same item under a second
+  spelling — go-to-definition on `Document` lands on `Json`, and a rename
+  of `Json` rewrites the alias with every other reference to it. The form
+  reaches a set member too (`import a::{ b as x, c };`), and a re-export
+  publishes the alias (`export import a::b as c;` publishes `c`).
 
 `use path` binds names from an already-visible type's namespace without
 loading (variants, statics). `export statement` re-exports: importers of

@@ -347,10 +347,26 @@ pub enum NodeIfBranch<'src> {
 
 #[derive(Debug)]
 pub enum ImportBranch<'src> {
-    // A path segment: its name, the span of that name, and an optional `::`
-    // continuation. The span drives go-to-definition / hover on imports.
-    Path(&'src str, Span, Option<Box<Self>>),
+    // A path segment: its name, the span of that name, and what follows it.
+    // The span drives go-to-definition / hover on imports.
+    Path(&'src str, Span, ImportTail<'src>),
     Set(Vec<Self>),
+}
+
+/// What follows one segment of an `import`/`use` path. A tail is a THREE-way
+/// choice rather than an `Option<continuation>` plus an `Option<alias>`,
+/// because `a::b as c::d` is not a path anyone can write: an alias renames the
+/// LEAF, so the two are alternatives and the type says so (E142).
+#[derive(Debug)]
+pub enum ImportTail<'src> {
+    /// Nothing follows: this segment is the leaf and binds under its own name.
+    Leaf,
+    /// `:: <branch>` — the path continues into a further path or a brace set.
+    Continue(Box<ImportBranch<'src>>),
+    /// `as <name>` — the leaf binds under `name` instead of its own, with the
+    /// span of the alias as written (which is the identifier the language
+    /// server renames and finds references for).
+    Alias(&'src str, Span),
 }
 
 pub type NodeList<'src> = Vec<Spanned<Node<'src>>>;

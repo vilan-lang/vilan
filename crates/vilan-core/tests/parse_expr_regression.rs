@@ -332,13 +332,19 @@ fn an_unfinished_path_names_the_missing_name() {
 /// statement` on the `::` — the element on the next line read as a comparison
 /// once the `::` rolled back, and the whole statement degenerated. The second is
 /// the same mistake terminated on its own line.
+///
+/// E142 sharpened the FIRST of the two. Its `<` is on the line below the `::`,
+/// so the line rule now recognizes it before the missing-name arm does, and
+/// says the more specific thing: the name is not missing, it is on another
+/// line. The second pin — terminated on its own line — still carries E135's
+/// own message, which is the pair working exactly as intended.
 #[test]
 fn an_unfinished_path_before_an_element_reports_once_at_the_element() {
     let source = "fun panel(): View {\n\tlet x = style::\n\t<div class(\"panel\")></div>\n}\n";
     assert_eq!(
         diagnostics_at(source),
         vec![(
-            "found '<' expected a name after `::`".to_string(),
+            A_NAME_ON_THIS_LINE.replace("found 'print'", "found '<'"),
             "<".to_string()
         )],
     );
@@ -354,6 +360,176 @@ fn an_unfinished_path_reports_once_when_the_statement_is_terminated() {
             ";".to_string()
         )],
     );
+}
+
+/// B238's census, standing. The report was that `disabled` cannot be used as a
+/// binding name; it can, in every position, and no lexer or parser table claims
+/// it — the only table in the compiler holding the word is the FORMATTER's
+/// `STYLE_CONDITION_METHODS`, which sorts a `.name(…)` chain link and never
+/// looks at an identifier. What the report was really asking for is a gate, so
+/// this is one: every word the compiler matches BY TEXT outside the keyword
+/// table must still lex and parse as an ordinary name.
+///
+/// The tables are read programmatically, so a word added to any of them is
+/// covered the day it lands, and a leak reds by name. A word that IS a keyword
+/// is skipped — that is a deliberate reservation, and `grammar_ebnf` is what
+/// holds the keyword list itself.
+fn table_words() -> Vec<(&'static str, &'static str)> {
+    use vilan_core::formatter::{
+        STYLE_BARRIER_METHODS, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS,
+        STYLE_PROPERTY_METHODS,
+    };
+    let mut words: Vec<(&str, &str)> = Vec::new();
+    for marker in vilan_core::parsing::KNOWN_ATTRIBUTE_MARKERS {
+        words.push((marker, "an attribute marker"));
+    }
+    for method in STYLE_PROPERTY_METHODS {
+        words.push((method.name, "a style property method"));
+    }
+    for (name, _) in STYLE_CONDITION_METHODS {
+        words.push((name, "a style condition method"));
+    }
+    for name in STYLE_BARRIER_METHODS {
+        words.push((name, "a style barrier method"));
+    }
+    for (name, _) in STYLE_BREAKPOINT_WIDTHS {
+        words.push((name, "a style breakpoint"));
+    }
+    // The contextual words the parser matches by text, and the one the report
+    // named. `as` is E142's import alias; `on` opens an element event; `context`
+    // and `sync` mark a closure type; `hidden` is `[doc(hidden)]`'s argument.
+    for word in [
+        "as", "on", "context", "sync", "hidden", "retains", "disabled",
+    ] {
+        words.push((word, "a contextual word"));
+    }
+    let keywords: Vec<&str> = vilan_core::lexing::KEYWORDS
+        .iter()
+        .map(|(word, _)| *word)
+        .collect();
+    words.retain(|(word, _)| !keywords.contains(word));
+    words.sort();
+    words.dedup();
+    words
+}
+
+#[test]
+fn b238_every_table_word_is_still_an_ordinary_identifier() {
+    let words = table_words();
+    assert!(
+        words.len() > 40,
+        "the census needs the real tables, got {} words",
+        words.len()
+    );
+    let mut leaked: Vec<String> = Vec::new();
+    for (word, what) in &words {
+        for (position, source) in [
+            ("a binding", format!("fun main() {{ let {word} = 1; }}")),
+            (
+                "a field",
+                format!("struct S {{ {word}: i32 }}\nfun main() {{ let s = S {{ {word} = 1 }}; }}"),
+            ),
+            ("a function", format!("fun {word}(): i32 {{ 1 }}")),
+            (
+                "a parameter",
+                format!("fun take({word}: i32): i32 {{ {word} }}"),
+            ),
+        ] {
+            if parse_clean(&source).is_none() {
+                leaked.push(format!("`{word}` ({what}) is not usable as {position}"));
+            }
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "{} table word(s) leaked into identifier position: {leaked:#?}",
+        leaked.len()
+    );
+}
+
+#[test]
+fn b238_the_census_is_non_vacuous() {
+    // The same four positions with a real KEYWORD in them: every one must
+    // decline, or the census above proves nothing.
+    for word in ["match", "is", "with", "let"] {
+        let sources = [
+            format!("fun main() {{ let {word} = 1; }}"),
+            format!("struct S {{ {word}: i32 }}\nfun main() {{ let s = S {{ {word} = 1 }}; }}"),
+            format!("fun {word}(): i32 {{ 1 }}"),
+            format!("fun take({word}: i32): i32 {{ {word} }}"),
+        ];
+        assert!(
+            sources.iter().all(|source| parse_clean(source).is_none()),
+            "`{word}` is a keyword and must not parse as a name",
+        );
+    }
+}
+
+/// E142. E135's UNFIXED face: `style::` at the end of a line and `print(..)` on
+/// the next is the perfectly legal path `style::print`, so the parser read the
+/// following statement as this one's tail and swallowed it — no diagnostic
+/// could exist, because nothing was wrong. A `::` path may not cross a line
+/// break, which is what turns the swallow into something the parser can see.
+///
+/// The census that made the rule free is in the lane report: zero lines end in
+/// `::` across the 228 `.vl` files of the tree, kolt's 25, and the book.
+const A_NAME_ON_THIS_LINE: &str = "found 'print' expected a name after `::` on the same line: \
+     a `::` path does not cross a line break, because `a::` at the end of a line joins whatever \
+     the next line starts with — join the line, or import the path under a shorter name \
+     (`import a::b::c as d;`) and write `d`";
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_an_expression() {
+    let source = "fun demo() {\n\tlet x = style::\n\tprint(\"swallowed\");\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(A_NAME_ON_THIS_LINE.to_string(), "print".to_string())],
+    );
+}
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_an_import() {
+    let source = "import std::io::\nprint;\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(A_NAME_ON_THIS_LINE.to_string(), "print".to_string())],
+    );
+}
+
+#[test]
+fn a_path_on_one_line_is_untouched_by_the_rule() {
+    // The control the rule must not eat: the same two paths, joined. Both parse
+    // clean, so the rule is about the LINE BREAK and nothing else.
+    assert!(
+        parse_clean("import std::io::print;\nfun demo() { let x = style::print; }\n").is_some()
+    );
+    // And a break INSIDE a brace set — which is not a `::` continuation — is
+    // still how a long import wraps.
+    assert!(parse_clean("import std::io::{\n\tprint,\n};\n").is_some());
+}
+
+/// E142's other half: `as` renames an import's leaf, and it is CONTEXTUAL — a
+/// module or item genuinely called `as` still parses, because the alias is only
+/// read where a segment has ended and a NAME follows.
+#[test]
+fn an_import_alias_parses_in_every_position_it_is_offered() {
+    for source in [
+        "import a::b::c as d;\n",
+        "import a as b;\n",
+        "import a::{ b as x, c };\n",
+        "import a::b::{ self as base, c as z };\n",
+        "use a::B::{ C as Alias };\n",
+        "export import a::b as c;\n",
+    ] {
+        assert!(parse_clean(source).is_some(), "{source:?} should parse");
+    }
+    // `as` is not a keyword: it is still an ordinary name.
+    assert!(parse_clean("import a::as;\n").is_some());
+    assert!(parse_clean("fun demo() { let as = 1; }\n").is_some());
+    // An alias renames the LEAF, so it cannot be followed by more path.
+    assert!(parse_clean("import a::b as c::d;\n").is_none());
+    // And `as` with nothing after it is not an alias.
+    assert!(parse_clean("import a::b as;\n").is_none());
 }
 
 /// E136. A multi-value attribute is one mistake with one message, and the

@@ -9,7 +9,7 @@ use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::node::{
     BackingLiteral, BinaryOp, Convention, EnumVariant, ExternBinding, Func, GenericParameters,
-    ImportBranch, Node, NodeIfBranch, NodeList, Pattern,
+    ImportBranch, ImportTail, Node, NodeIfBranch, NodeList, Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -3202,7 +3202,7 @@ pub struct Analyzer<'src> {
     // from the type, so this records it for the R1 check that a view annotation
     // binds a view and a value annotation binds a value. Absent ⇒ no annotation.
     binding_annotation_view: HashMap<Id, bool>,
-    prepped_imports: Vec<(Vec<(&'src str, Span)>, &'src str, Id, Span, Span, SourceId)>,
+    prepped_imports: PreppedImports<'src>,
     // Macro invocations (macro-engine.md §2), keyed by the invocation NODE's
     // address (stable: all walked ASTs are leaked or outlive the analysis).
     // Item-position invocations walk to nothing (their output was appended to
@@ -3485,7 +3485,7 @@ pub struct Analyzer<'src> {
     // NAME the impl wrote, after the queue itself is consumed. Accumulates
     // across builds, matching the drain-once contract.
     written_type_spellings: Vec<(TypeId, &'src str)>,
-    prepped_uses: Vec<(Vec<(&'src str, Span)>, &'src str, Id, Span, Span, SourceId)>,
+    prepped_uses: PreppedImports<'src>,
     // Deferred module-qualified type references (`style::Style`), drained after
     // `prepped_type_locals` so a path's namespace head has resolved by the time
     // its member is looked up in it.
@@ -3854,17 +3854,19 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
         {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
-            for (path, leaf, _) in entries {
+            for (path, leaf, _, alias) in entries {
                 // A `self` leaf re-binds the namespace it sits in
                 // (`Option::{ self }` publishes `Option`), exactly as
-                // `resolve_import` reads it.
-                let name = if leaf == "self" {
-                    match path.last() {
+                // `resolve_import` reads it — and an `as` alias renames what
+                // the re-export publishes, so `export import a::b as c;`
+                // publishes `c` (E142).
+                let name = match (alias, leaf) {
+                    (Some((alias, _)), _) => alias,
+                    (None, "self") => match path.last() {
                         Some((last, _)) => *last,
                         None => continue,
-                    }
-                } else {
-                    leaf
+                    },
+                    (None, leaf) => leaf,
                 };
                 out.push(Importable {
                     name,
@@ -4171,17 +4173,47 @@ fn operator_trait_required_method(trait_name: &str) -> Option<(&'static str, &'s
     }
 }
 
-/// Flattens an `import`/`use` tree into (path, leaf-name) pairs, e.g.
-/// `a::{ b, c::d }` becomes `([a], b)` and `([a, c], d)`.
+/// The queue an `import`/`use` statement's leaves wait in until the world can
+/// resolve them: the namespace path, the leaf name the path RESOLVES to, the
+/// scope the statement binds into, the statement's span, the leaf's span, the
+/// file, and the `as` alias the leaf BINDS under when it has one (E142).
+type PreppedImports<'src> = Vec<(
+    Vec<(&'src str, Span)>,
+    &'src str,
+    Id,
+    Span,
+    Span,
+    SourceId,
+    Option<(&'src str, Span)>,
+)>;
+
+/// One flattened `import`/`use` leaf: the namespace segments leading to it
+/// (each with its span), the leaf's own name and span, and the `as` alias it
+/// binds under when it has one (E142).
+pub(crate) type NamespaceEntry<'src> = (
+    Vec<(&'src str, Span)>,
+    &'src str,
+    Span,
+    Option<(&'src str, Span)>,
+);
+
+/// Flattens an `import`/`use` tree into (path, leaf-name, leaf-span, alias)
+/// tuples, e.g. `a::{ b, c::d }` becomes `([a], b, …, None)` and
+/// `([a, c], d, …, None)`. The alias is the `as <name>` a leaf carries with
+/// the span of the alias as written (E142) — the name the leaf BINDS under,
+/// where the leaf name stays what the path RESOLVES to.
 pub(crate) fn flatten_namespace_branch<'src>(
     branch: &ImportBranch<'src>,
     path: Vec<(&'src str, Span)>,
-    entries: &mut Vec<(Vec<(&'src str, Span)>, &'src str, Span)>,
+    entries: &mut Vec<NamespaceEntry<'src>>,
 ) {
     match branch {
-        ImportBranch::Path(name, span, child_branch) => match child_branch {
-            None => entries.push((path, name, *span)),
-            Some(child) => {
+        ImportBranch::Path(name, span, tail) => match tail {
+            ImportTail::Leaf => entries.push((path, name, *span, None)),
+            ImportTail::Alias(alias, alias_span) => {
+                entries.push((path, name, *span, Some((*alias, *alias_span))))
+            }
+            ImportTail::Continue(child) => {
                 let mut path = path;
                 path.push((name, *span));
                 flatten_namespace_branch(child, path, entries);
@@ -22758,7 +22790,7 @@ impl<'src> Analyzer<'src> {
             Node::Import(root_branch) => {
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
-                for (path, name, leaf_span) in entries {
+                for (path, name, leaf_span, alias) in entries {
                     self.prepped_imports.push((
                         path,
                         name,
@@ -22766,6 +22798,7 @@ impl<'src> Analyzer<'src> {
                         node.1,
                         leaf_span,
                         self.current_source_id,
+                        alias,
                     ));
                 }
                 Some(Expr::Void)
@@ -22773,7 +22806,7 @@ impl<'src> Analyzer<'src> {
             Node::Use(root_branch) => {
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
-                for (path, name, leaf_span) in entries {
+                for (path, name, leaf_span, alias) in entries {
                     self.prepped_uses.push((
                         path,
                         name,
@@ -22781,6 +22814,7 @@ impl<'src> Analyzer<'src> {
                         node.1,
                         leaf_span,
                         self.current_source_id,
+                        alias,
                     ));
                 }
                 Some(Expr::Void)
@@ -29793,6 +29827,10 @@ impl<'src> Analyzer<'src> {
         self.module_id_by_name.get(root).copied()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one queued import's whole record; the queue's own tuple, spread"
+    )]
     fn resolve_import(
         &mut self,
         path: &[(&'src str, Span)],
@@ -29802,6 +29840,7 @@ impl<'src> Analyzer<'src> {
         report: bool,
         leaf_span: Span,
         source_id: SourceId,
+        alias: Option<(&'src str, Span)>,
     ) -> bool {
         // The segments to walk, each with its source span. A `self` leaf re-binds
         // the namespace it sits in (e.g. `Option::{ self }` binds `Option`);
@@ -29896,6 +29935,20 @@ impl<'src> Analyzer<'src> {
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
         }
+        // E142: an `as` alias renames the binding and nothing else — the path
+        // resolved exactly as it would have without one. The alias's own span
+        // records a reference to the entity it names, so hover, go-to-definition
+        // and find-references all answer at the name the file actually writes,
+        // and a rename of the definition rewrites the alias with everything
+        // else rather than leaving the import pointing at a name that no longer
+        // exists.
+        let bind_name = match alias {
+            Some((alias, alias_span)) => {
+                self.record_reference(source_id, alias_span, target_id);
+                alias
+            }
+            None => bind_name,
+        };
         let scope = self.mut_scope_for_scope_id(scope_id);
         scope.name_to_id_map.insert(bind_name, target_id);
         true
@@ -36084,20 +36137,25 @@ impl<'src> Analyzer<'src> {
         let mut remaining = std::mem::take(&mut self.prepped_imports);
         loop {
             let before = remaining.len();
-            remaining.retain(|(path, name, scope_id, span, leaf_span, source_id)| {
-                let diagnostics_before = self.diagnostics.len();
-                let resolved = self
-                    .resolve_import(path, name, *scope_id, *span, false, *leaf_span, *source_id);
-                self.attribute_new_diagnostics(diagnostics_before, *source_id);
-                !resolved
-            });
+            remaining.retain(
+                |(path, name, scope_id, span, leaf_span, source_id, alias)| {
+                    let diagnostics_before = self.diagnostics.len();
+                    let resolved = self.resolve_import(
+                        path, name, *scope_id, *span, false, *leaf_span, *source_id, *alias,
+                    );
+                    self.attribute_new_diagnostics(diagnostics_before, *source_id);
+                    !resolved
+                },
+            );
             if remaining.len() == before || remaining.is_empty() {
                 break;
             }
         }
-        for (path, name, scope_id, span, leaf_span, source_id) in remaining {
+        for (path, name, scope_id, span, leaf_span, source_id, alias) in remaining {
             let diagnostics_before = self.diagnostics.len();
-            self.resolve_import(&path, name, scope_id, span, true, leaf_span, source_id);
+            self.resolve_import(
+                &path, name, scope_id, span, true, leaf_span, source_id, alias,
+            );
             self.attribute_new_diagnostics(diagnostics_before, source_id);
         }
         // The prelude binds HERE — after every import has resolved (so a
@@ -36111,7 +36169,7 @@ impl<'src> Analyzer<'src> {
         // `use Namespace::{ a, b }` binds items out of a namespace — a module
         // or an enum (whose namespace holds its variants) — into the scope the
         // statement appears in.
-        for (path, name, scope_id, _span, leaf_span, source_id) in
+        for (path, name, scope_id, _span, leaf_span, source_id, alias) in
             std::mem::take(&mut self.prepped_uses)
         {
             let use_diagnostics_before = self.diagnostics.len();
@@ -36179,8 +36237,19 @@ impl<'src> Analyzer<'src> {
                 self.record_reference(source_id, segment_span, current);
             }
             if resolved {
+                // E142: an `as` alias renames what the `use` BINDS; the path it
+                // walked is unchanged. The alias span records a reference to
+                // the same entity, which is what lets the language server find
+                // and rename through it.
+                let bind_name = match alias {
+                    Some((alias, alias_span)) => {
+                        self.record_reference(source_id, alias_span, current);
+                        alias
+                    }
+                    None => name,
+                };
                 let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, current);
+                scope.name_to_id_map.insert(bind_name, current);
             }
             self.attribute_new_diagnostics(use_diagnostics_before, source_id);
         }
@@ -43601,7 +43670,7 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
         if let Node::Import(branch) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
-            for (path, leaf, leaf_span) in entries {
+            for (path, leaf, leaf_span, _alias) in entries {
                 if path.first().map(|(name, _)| *name) != Some(root) {
                     continue;
                 }

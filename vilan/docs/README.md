@@ -68,7 +68,7 @@ move an anchor, and a moved anchor is a broken link.
 | [Values & types](tour/values-and-types.md) | bindings, primitives & numeric widths, strings & interpolation, tuples, collections |
 | [Functions & closures](tour/functions-and-closures.md) | `fun`, closure types, named-fn coercion, async closures and their seams, context clauses |
 | [Data & traits](tour/data-and-traits.md) | structs, enums, `impl`, generics & bounds, traits, derives |
-| [Control flow](tour/control-flow.md) | `match`/`is`, loops, `ret`, Option/Result idioms, `!` and `?.` |
+| [Control flow](tour/control-flow.md) | `match`/`is`, loops, `ret`, Option/Result idioms, `!`, `?.` and `?` |
 | [The memory model](tour/memory-model.md) | value semantics, views, `mut`/`own`, `Shared`, `Arena`/`Handle` |
 | [Async](tour/async.md) | implicit await, `async expr` spawn, promises, timers |
 | [Resources](tour/resources.md) | `resource`, moves & loans, `Drop`, `drop(x)`, `Option.take`, `Database`, `OwnedNursery` |

@@ -61,7 +61,7 @@ pub use transformer::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use node::{Func, ImportBranch, Node, NodeList};
+use node::{Func, ImportBranch, ImportTail, Node, NodeList};
 use target::PlatformPattern as Pattern;
 
 /// Infers a build platform for editor analysis (which has no `--platform`) from a
@@ -168,8 +168,10 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
                     return true;
                 }
                 // A twin: only a name the browser side alone declares says
-                // browser. A bare `import std::ui;` names nothing — neutral.
-                let Some(sub) = sub else {
+                // browser. A bare `import std::ui;` names nothing — neutral,
+                // and so is an aliased one (`import std::ui as u;`), which
+                // takes the module and no name out of it.
+                let ImportTail::Continue(sub) = sub else {
                     return false;
                 };
                 let mut names = Vec::new();
@@ -184,7 +186,10 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
                 .any(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
         }
     }
-    let imports_browser_layer = |branch: &ImportBranch| matches!(branch, ImportBranch::Path("std", _, Some(child)) if child_is_browser_evidence(child, browser_root, &other_roots));
+    let imports_browser_layer = |branch: &ImportBranch| {
+        matches!(branch, ImportBranch::Path("std", _, ImportTail::Continue(child))
+            if child_is_browser_evidence(child, browser_root, &other_roots))
+    };
     // Imports are block-scoped statements (backlog H2), so scan at every depth —
     // a browser import inside a function body flags the file too.
     fn any_node(nodes: &NodeList, matches: &mut dyn FnMut(&Node) -> bool) -> bool {

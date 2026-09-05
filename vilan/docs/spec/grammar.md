@@ -42,7 +42,8 @@ instead the block's **trailing expression** and supplies the block's value
 ```text
 import  = "import" path-branch ;
 use     = "use"    path-branch ;
-path-branch = NAME [ "::" ( path-branch | path-set ) ] ;
+path-branch = NAME [ "::" ( path-branch | path-set )
+                   | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" path-branch { "," path-branch } [ "," ] "}" ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 ```
@@ -52,6 +53,24 @@ from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
 variants). Semantics: §4. `export statement` re-exports an import or
 exposes a declaration to importers of the module.
+
+`as` renames the LEAF a branch ends at — `import a::b::c as d;` binds
+`d`, and `import a::{ b as x, c }` binds `x` and `c`. It is an
+alternative to the `::` continuation, not something that may follow one
+(`a::b as c::d` does not parse), and it is **contextual**: `as` is an
+ordinary identifier everywhere else in the language, including as a
+module or item name, and reads as an alias only where a path segment has
+ended and a NAME follows it.
+
+A `::` path may **not cross a line break**: the segment after a `::`
+must begin on the same line the `::` is on. Without the rule `a::` at the
+end of a line joins whatever the next line starts with — `style::` then
+`print(…)` on the line below is the legal path `style::print`, and the
+next statement is silently swallowed. Import a long path under a shorter
+name instead. The rule binds the two productions that COMMIT to a
+separator, the expression path (§3.6) and the import path here; a type
+path and a struct-literal head read the `::` and the name that follows it
+together and leave a trailing separator where it was.
 
 ## 3.3 Items
 
@@ -336,7 +355,8 @@ postfix = "." member
         | "!"                            (* try-assert, §5.10 *)
         | "(" [ entry { "," entry } [ "," ] ] ")"
                                           (* direct call on the chain result *)
-        | "?." member ;                  (* lift link, §5.10 *)
+        | "?." member                    (* lift link, §5.10 *)
+        | "?" ;                           (* expression lift, §5.10 *)
 
 atom    = literal | IDENT | IDENT generic-args | struct-init
         | "(" expression ")" | tuple | list
@@ -377,7 +397,11 @@ chain's result, calling a closure-typed value
 (`self.hook.read()(a, b)`). A `?.` link's **continuation** extends
 through the following plain postfixes up to the next `?.` or `!`:
 `a?.b.c()!` lifts `b.c()` into the container, then try-asserts the
-result (§5.10).
+result (§5.10). A bare `?` — a `?` with no `.` after it — is the
+**expression lift**: it takes no member and lifts its whole enclosing
+SLOT rather than a continuation, so the slot receives the container
+(§5.10). It has been in the language since 2026-07-16 and had no
+production here until now.
 
 A leading `..` marks a **tuple-value spread** (§5.9). It is recognized
 only where an *entry* begins — a tuple construction's entry, or a call
@@ -437,7 +461,7 @@ From tightest to loosest; every binary level is left-associative:
 
 | Level | Operators | Notes |
 |---|---|---|
-| 1 | `::` paths, calls, `.` `[]` `!` `?.` | §3.6 |
+| 1 | `::` paths, calls, `.` `[]` `!` `?.` `?` | §3.6 |
 | 2 | prefix `!` `-` `await` `async` `&` `&mut` `*` | unary; `async` also takes a block |
 | 3 | `*` `/` `%` | |
 | 4 | `+` `-` | |

@@ -11,7 +11,7 @@ use std::cell::Cell;
 
 use crate::node::{
     BinaryOp, Convention, ExternBinding, Func, GenericArguments, GenericParameters, ImportBranch,
-    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    ImportTail, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -88,9 +88,9 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// canonical when a block's items are permuted around it — the block scan then
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_css_blocks(sort_style_chains(sort_import_runs(&drop_trailing_commas(
-        tokens,
-    ))))
+    sort_css_blocks(sort_style_chains(sort_import_runs(
+        &collapse_field_shorthands(drop_trailing_commas(tokens)),
+    )))
 }
 
 /// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
@@ -109,6 +109,47 @@ fn drop_trailing_commas(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
             }
         }
         result.push(token);
+    }
+    result
+}
+
+/// Collapses a struct-literal field written long — `x = x` — to the shorthand
+/// `x`, so the safety check accepts the formatter canonicalizing one into the
+/// other (E143). Recognized by SHAPE, since a token stream has no tree to ask:
+/// the three-token run `IDENT "=" IDENT` with both names equal, opened by a `{`
+/// or a `,` and closed by a `,` or a `}`.
+///
+/// That shape also covers a block whose tail expression is the self-assignment
+/// `{ x = x }`, which the printer never collapses. Being wider than the printer
+/// costs nothing and cannot hide a drift: the collapse runs over BOTH streams,
+/// so a form neither side produces reduces identically on both — exactly the
+/// looseness [`drop_trailing_commas`] carries for the trailing comma.
+pub fn collapse_field_shorthands(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let opened = matches!(result.last(), Some(Token::Ctrl('{') | Token::Ctrl(',')));
+        let long_form = match (
+            tokens.get(index),
+            tokens.get(index + 1),
+            tokens.get(index + 2),
+            tokens.get(index + 3),
+        ) {
+            (
+                Some(Token::Ident(name)),
+                Some(Token::Op("=")),
+                Some(Token::Ident(read)),
+                Some(Token::Ctrl(',') | Token::Ctrl('}')),
+            ) => name == read,
+            _ => false,
+        };
+        if opened && long_form {
+            result.push(tokens[index].clone());
+            index += 3;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
     }
     result
 }
@@ -187,7 +228,10 @@ struct ImportSortKey {
 /// reduce to this shape, from which the shared key and the canonical token
 /// re-emission are derived.
 enum TokenBranch<'src> {
-    Path(&'src str, Option<Box<TokenBranch<'src>>>),
+    /// A segment: its name, an optional `::` continuation, and an optional
+    /// `as` alias (E142 — never both; the parser's tail type is what enforces
+    /// that, and this shape mirrors it flattened).
+    Path(&'src str, Option<Box<TokenBranch<'src>>>, Option<&'src str>),
     Set(Vec<TokenBranch<'src>>),
 }
 
@@ -195,10 +239,13 @@ enum TokenBranch<'src> {
 /// the shared key operates on.
 fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
     match branch {
-        ImportBranch::Path(name, _, child) => TokenBranch::Path(
-            name,
-            child.as_ref().map(|child| Box::new(branch_from_ast(child))),
-        ),
+        ImportBranch::Path(name, _, tail) => match tail {
+            ImportTail::Leaf => TokenBranch::Path(name, None, None),
+            ImportTail::Continue(child) => {
+                TokenBranch::Path(name, Some(Box::new(branch_from_ast(child))), None)
+            }
+            ImportTail::Alias(alias, _) => TokenBranch::Path(name, None, Some(alias)),
+        },
         ImportBranch::Set(branches) => {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
@@ -218,7 +265,7 @@ fn unwrap_singleton_set<'branch, 'src>(
     let mut current = branch;
     while let TokenBranch::Set(branches) = current {
         match branches.as_slice() {
-            [only @ TokenBranch::Path(name, _)] if *name != "self" => current = only,
+            [only @ TokenBranch::Path(name, ..)] if *name != "self" => current = only,
             _ => break,
         }
     }
@@ -230,10 +277,17 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, None) => {
-            BranchKey::Path((*name).to_string(), Box::new(BranchKey::End))
-        }
-        TokenBranch::Path(name, Some(child)) => {
+        // An alias keys as the segment it renames plus the alias itself, so
+        // `a::b as c` and `a::b as d` are two imports the run orders stably
+        // rather than two spellings of one key (E142).
+        TokenBranch::Path(name, None, alias) => BranchKey::Path(
+            match alias {
+                Some(alias) => format!("{name} as {alias}"),
+                None => (*name).to_string(),
+            },
+            Box::new(BranchKey::End),
+        ),
+        TokenBranch::Path(name, Some(child), _) => {
             BranchKey::Path((*name).to_string(), Box::new(branch_key(child)))
         }
         TokenBranch::Set(branches) => {
@@ -250,7 +304,7 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
 /// collapsed reprint `import a;` land in the same place.
 fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey {
     let (root, rest) = match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, child) => {
+        TokenBranch::Path(name, child, _) => {
             let root = match *name {
                 "std" => RootRank::Std,
                 "pkg" => RootRank::Pkg,
@@ -313,6 +367,19 @@ fn token_name<'src>(tokens: &[Token<'src>], index: usize) -> Option<&'src str> {
     }
 }
 
+/// The contextual `as <name>` alias at `*index`, advancing past it when there
+/// is one (E142). Mirrors the parser's own two-token probe: `as` is an
+/// ordinary identifier everywhere else, so it only reads as an alias when a
+/// NAME follows it.
+fn token_alias<'src>(tokens: &[Token<'src>], index: &mut usize) -> Option<&'src str> {
+    if tokens.get(*index) != Some(&Token::Ident("as")) {
+        return None;
+    }
+    let alias = token_name(tokens, *index + 1)?;
+    *index += 2;
+    Some(alias)
+}
+
 /// Parses the `::`-separated import path beginning at `index` (mirroring the
 /// parser's `parse_namespace_path`: a name-headed path is tried before a brace
 /// set), returning the branch and the index just past it, or `None` if the
@@ -323,14 +390,16 @@ fn parse_token_branch<'src>(
 ) -> Option<(TokenBranch<'src>, usize)> {
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
+        let mut alias = None;
         let continuation = if tokens.get(next) == Some(&Token::Op("::")) {
             let (child, after) = parse_token_branch(tokens, next + 1)?;
             next = after;
             Some(Box::new(child))
         } else {
+            alias = token_alias(tokens, &mut next);
             None
         };
-        Some((TokenBranch::Path(name, continuation), next))
+        Some((TokenBranch::Path(name, continuation, alias), next))
     } else if tokens.get(index) == Some(&Token::Ctrl('{')) {
         let mut branches = Vec::new();
         let mut next = index + 1;
@@ -339,14 +408,16 @@ fn parse_token_branch<'src>(
         while tokens.get(next) != Some(&Token::Ctrl('}')) {
             let name = token_name(tokens, next)?;
             let mut after = next + 1;
+            let mut alias = None;
             let continuation = if tokens.get(after) == Some(&Token::Op("::")) {
                 let (child, past) = parse_token_branch(tokens, after + 1)?;
                 after = past;
                 Some(Box::new(child))
             } else {
+                alias = token_alias(tokens, &mut after);
                 None
             };
-            branches.push(TokenBranch::Path(name, continuation));
+            branches.push(TokenBranch::Path(name, continuation, alias));
             next = after;
             match tokens.get(next) {
                 Some(Token::Ctrl(',')) => next += 1,
@@ -393,11 +464,15 @@ fn parse_import_statement<'src>(
 /// braced source and the collapsed reprint to the same canonical tokens.
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
     match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, child) => {
+        TokenBranch::Path(name, child, alias) => {
             out.push(Token::Ident(name));
             if let Some(child) = child {
                 out.push(Token::Op("::"));
                 emit_branch_tokens(child, out);
+            }
+            if let Some(alias) = alias {
+                out.push(Token::Ident("as"));
+                out.push(Token::Ident(alias));
             }
         }
         TokenBranch::Set(branches) => {
@@ -1208,11 +1283,24 @@ fn prune_import_branch<'src>(
     keep: &dyn Fn(Span) -> bool,
 ) -> Option<ImportBranch<'src>> {
     match branch {
-        ImportBranch::Path(name, span, None) => {
-            keep(*span).then_some(ImportBranch::Path(name, *span, None))
+        ImportBranch::Path(name, span, ImportTail::Leaf) => {
+            keep(*span).then_some(ImportBranch::Path(name, *span, ImportTail::Leaf))
         }
-        ImportBranch::Path(name, span, Some(child)) => prune_import_branch(child, keep)
-            .map(|pruned| ImportBranch::Path(name, *span, Some(Box::new(pruned)))),
+        // An aliased leaf is asked about at its ALIAS span, which is the name
+        // the file actually binds and therefore the one it can fail to use
+        // (E142); `collect_import_leaf_spans` offers the same span, so the
+        // organizer and the editor's fade go on asking one question.
+        ImportBranch::Path(name, span, ImportTail::Alias(alias, alias_span)) => keep(*alias_span)
+            .then_some(ImportBranch::Path(
+                name,
+                *span,
+                ImportTail::Alias(alias, *alias_span),
+            )),
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => {
+            prune_import_branch(child, keep).map(|pruned| {
+                ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(pruned)))
+            })
+        }
         ImportBranch::Set(branches) => {
             let kept: Vec<ImportBranch<'src>> = branches
                 .iter()
@@ -1277,8 +1365,11 @@ pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
 /// terminal `Path` IS the leaf.
 fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
     match branch {
-        ImportBranch::Path(_, span, None) => out.push(*span),
-        ImportBranch::Path(_, _, Some(child)) => collect_import_leaf_spans(child, out),
+        ImportBranch::Path(_, span, ImportTail::Leaf) => out.push(*span),
+        ImportBranch::Path(_, _, ImportTail::Alias(_, alias_span)) => out.push(*alias_span),
+        ImportBranch::Path(_, _, ImportTail::Continue(child)) => {
+            collect_import_leaf_spans(child, out)
+        }
         ImportBranch::Set(branches) => {
             for branch in branches {
                 collect_import_leaf_spans(branch, out);
@@ -1339,6 +1430,9 @@ enum ImportLeafShape<'ast, 'src> {
     Single(&'src str, Span),
     /// A brace-set of trailing names (`import std::json::{ A, B }`).
     Set(&'ast [ImportBranch<'src>]),
+    /// An ALIASED leaf (`import std::json::Json as J`) — a shape the
+    /// add-import quickfix declines to extend (E142).
+    Aliased,
 }
 
 /// Splits a parsed import path into the segments leading to its terminal
@@ -1350,8 +1444,15 @@ fn decompose_import_branch<'ast, 'src>(
     branch: &'ast ImportBranch<'src>,
 ) -> (Vec<&'src str>, ImportLeafShape<'ast, 'src>) {
     match branch {
-        ImportBranch::Path(name, span, None) => (Vec::new(), ImportLeafShape::Single(name, *span)),
-        ImportBranch::Path(name, _, Some(child)) => match child.as_ref() {
+        ImportBranch::Path(name, span, ImportTail::Leaf) => {
+            (Vec::new(), ImportLeafShape::Single(name, *span))
+        }
+        // An aliased leaf is not a name the add-import quickfix may fold into a
+        // brace set — `{ Json as J, Encode }` would have to keep the alias with
+        // its own member and there is no span arithmetic that does — so it
+        // decomposes to a shape nothing matches.
+        ImportBranch::Path(_, _, ImportTail::Alias(..)) => (Vec::new(), ImportLeafShape::Aliased),
+        ImportBranch::Path(name, _, ImportTail::Continue(child)) => match child.as_ref() {
             ImportBranch::Set(branches) => (vec![*name], ImportLeafShape::Set(branches)),
             ImportBranch::Path(..) => {
                 let (mut prefix, shape) = decompose_import_branch(child);
@@ -1393,6 +1494,7 @@ fn try_extend_import<'src>(
         return ExtendOutcome::NoMatch;
     }
     match shape {
+        ImportLeafShape::Aliased => ExtendOutcome::NoMatch,
         ImportLeafShape::Single(name, span) => {
             if name == leaf {
                 return ExtendOutcome::AlreadyImported;
@@ -1408,7 +1510,7 @@ fn try_extend_import<'src>(
             let mut members: Vec<(&str, Span)> = Vec::with_capacity(branches.len());
             for member in branches {
                 match member {
-                    ImportBranch::Path(name, span, None) => {
+                    ImportBranch::Path(name, span, ImportTail::Leaf) => {
                         if *name == leaf {
                             return ExtendOutcome::AlreadyImported;
                         }
@@ -1455,9 +1557,9 @@ fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node Im
 /// would have, for finding where it belongs among a run's existing entries —
 /// without constructing a throwaway AST node to feed [`node_import_key`].
 fn fresh_import_sort_key(module_path: &[&str], leaf: &str) -> ImportSortKey {
-    let mut branch = TokenBranch::Path(leaf, None);
+    let mut branch = TokenBranch::Path(leaf, None, None);
     for segment in module_path.iter().rev() {
-        branch = TokenBranch::Path(segment, Some(Box::new(branch)));
+        branch = TokenBranch::Path(segment, Some(Box::new(branch)), None);
     }
     import_sort_key(ImportKind::Import, &branch)
 }
@@ -2390,12 +2492,19 @@ impl<'src> Printer<'src> {
         // the `::` — and the set is what consumes it.
         let split = std::mem::take(&mut self.split);
         match branch {
-            ImportBranch::Path(name, _, child) => {
+            ImportBranch::Path(name, _, tail) => {
                 self.out.push_str(name);
-                if let Some(child) = child {
-                    self.out.push_str("::");
-                    self.split = split;
-                    self.print_import_branch(child, sort);
+                match tail {
+                    ImportTail::Leaf => {}
+                    ImportTail::Continue(child) => {
+                        self.out.push_str("::");
+                        self.split = split;
+                        self.print_import_branch(child, sort);
+                    }
+                    ImportTail::Alias(alias, _) => {
+                        self.out.push_str(" as ");
+                        self.out.push_str(alias);
+                    }
                 }
             }
             ImportBranch::Set(branches) => {
@@ -3959,14 +4068,36 @@ impl<'src> Printer<'src> {
     /// the pending split the way `print_expr` does, so a shorthand field — which
     /// has no value position to hand it to — drops it rather than leaking an
     /// armed split onto whatever prints next.
+    ///
+    /// E143: `A { x = x }` and `A { x }` are ONE construct written two ways —
+    /// the analyzer synthesizes the same local read for the shorthand that the
+    /// long form spells out — and the formatter picks the shorthand as the
+    /// canonical spelling, the way it picks one import order and one style-chain
+    /// order. The collapse is a REPRINT of an equal field, not a rewrite of the
+    /// program: the tokens the safety net compares are normalized through
+    /// [`collapse_field_shorthands`] so both spellings reduce to the same
+    /// stream.
+    ///
+    /// A comment written between the name and the value (`x = // why⏎ x`) is
+    /// NOT a reason to keep the long form. The printer has no inline slot for
+    /// one there — such a comment already flushed out below the statement
+    /// before this rule existed, since it sits INSIDE a field span and so does
+    /// not force the split the way a comment between fields does — and
+    /// suppressing the collapse for it would make the reprint non-idempotent:
+    /// the first pass would keep `x = x` and relocate the comment, and the
+    /// second, with the comment now outside the field, would collapse anyway.
     fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
         let split = std::mem::take(&mut self.split);
         self.out.push_str(field_name);
-        if let Some(value) = value {
-            self.out.push_str(" = ");
-            self.split = split;
-            self.print_expr(value);
+        let Some(value) = value else {
+            return;
+        };
+        if matches!(value.0, Node::Accessor(read) if read == field_name) {
+            return;
         }
+        self.out.push_str(" = ");
+        self.split = split;
+        self.print_expr(value);
     }
 
     /// Whether a standalone comment sits in one of the GAPS between the source
@@ -6994,15 +7125,15 @@ mod struct_literal_layout {
     /// used to collapse onto one 357-column line.
     #[test]
     fn an_over_budget_struct_literal_splits_one_field_per_line() {
-        let source = "let store = KoltStore { workspaces = workspaces, tasks = tasks, \
+        let source = "let store = KoltStore { workspaces = all_workspaces, tasks = open_tasks, \
                       register_hook = Shared::new(register), login_hook = Shared::new(login), \
                       create_hook = Shared::new(create) };\n";
         assert_over_budget(source.trim_end());
         assert_construct(
             source,
             "let store = KoltStore {\n\
-             \tworkspaces = workspaces,\n\
-             \ttasks = tasks,\n\
+             \tworkspaces = all_workspaces,\n\
+             \ttasks = open_tasks,\n\
              \tregister_hook = Shared::new(register),\n\
              \tlogin_hook = Shared::new(login),\n\
              \tcreate_hook = Shared::new(create),\n\
@@ -7207,8 +7338,8 @@ mod struct_literal_layout {
         let source = "fun demo() {\n\
                       \tlet store = KoltStore {\n\
                       \t\t// the authoritative lists\n\
-                      \t\tworkspaces = workspaces,\n\
-                      \t\ttasks = tasks,\n\
+                      \t\tworkspaces = all_workspaces,\n\
+                      \t\ttasks = open_tasks,\n\
                       \t\tregister_hook = Shared::new(register),\n\
                       \t};\n\
                       }\n";
@@ -7222,14 +7353,117 @@ mod struct_literal_layout {
     fn a_file_mixing_split_and_inline_struct_literals_is_a_fixed_point() {
         let canonical = "let fits = Point { x = 1, y = 2 };\n\
                          let store = KoltStore {\n\
-                         \tworkspaces = workspaces,\n\
-                         \ttasks = tasks,\n\
+                         \tworkspaces = all_workspaces,\n\
+                         \ttasks = open_tasks,\n\
                          \tregister_hook = Shared::new(register),\n\
                          \tlogin_hook = Shared::new(login),\n\
                          \tcreate_hook = Shared::new(create),\n\
                          };\n";
         assert_construct(canonical, canonical);
         assert_eq!(format(canonical), canonical);
+    }
+}
+
+#[cfg(test)]
+mod struct_field_shorthand {
+    //! E143: `A { x = x }` and `A { x }` are one construct written two ways —
+    //! the analyzer synthesizes the same local read for the shorthand that the
+    //! long form spells out — and the formatter picks ONE, the way it picks one
+    //! import order and one style-chain order. The shorthand is the pick: it is
+    //! the spelling the language added the syntax for.
+    //!
+    //! There is no opt-out, and the census is why. Over the estate at the old
+    //! formatter's fixed point the rule reprints 91 fields across 23 of 228
+    //! `.vl` files, every one of them mechanical; a knob would fork every file's
+    //! shape for a spelling nobody has a reason to prefer, which is the same
+    //! ground `LINE_BUDGET` is not a knob on.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_field_written_long_collapses_to_the_shorthand() {
+        assert_construct(
+            "let point = Point { x = x, y = y };\n",
+            "let point = Point { x, y };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_is_a_different_name_keeps_its_long_form() {
+        // The control: only a value that is the FIELD'S OWN name collapses. A
+        // rule keyed on "the value is a bare name" would eat this one.
+        assert_construct(
+            "let point = Point { x = origin, y = y };\n",
+            "let point = Point { x = origin, y };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_is_not_a_bare_name_keeps_its_long_form() {
+        assert_construct(
+            "let point = Point { x = x.offset(), y = -y, z = z };\n",
+            "let point = Point { x = x.offset(), y = -y, z };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_already_written_short_is_unchanged() {
+        assert_construct(
+            "let point = Point { x, y };\n",
+            "let point = Point { x, y };\n",
+        );
+    }
+
+    #[test]
+    fn the_collapse_reaches_the_split_form_too() {
+        // The split printer and the inline printer share one field printer, so
+        // a literal broken one field per line collapses exactly as an inline one
+        // does — and the collapse does not un-split a literal that is still over
+        // budget without it.
+        let source = "let store = Store { workspaces = workspaces, tasks = tasks, \
+                      register_hook = Shared::new(register), login_hook = Shared::new(login), \
+                      create_hook = Shared::new(create) };\n";
+        assert_construct(
+            source,
+            "let store = Store {\n\
+             \tworkspaces,\n\
+             \ttasks,\n\
+             \tregister_hook = Shared::new(register),\n\
+             \tlogin_hook = Shared::new(login),\n\
+             \tcreate_hook = Shared::new(create),\n\
+             };\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_a_collapsing_field_is_kept_and_the_reprint_is_idempotent() {
+        // A comment written between the name and the value has no inline slot
+        // in either spelling — it sat inside a field span, so it never forced
+        // the split the way a comment BETWEEN fields does, and it already
+        // relocated below the statement before this rule existed. It must still
+        // survive, and the reprint must settle in one pass: suppressing the
+        // collapse for it would collapse on the SECOND pass instead, with the
+        // comment then outside the field.
+        let source = "fun demo() {\n\
+                      \tlet point = Point {\n\
+                      \t\tx = // deliberately the same name\n\
+                      \t\t\tx,\n\
+                      \t\ty = y,\n\
+                      \t};\n\
+                      }\n";
+        let formatted = super::format(source);
+        assert!(
+            formatted.contains("deliberately the same name"),
+            "the comment was dropped:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("Point { x, y }"),
+            "the fields did not collapse:\n{formatted}"
+        );
+        assert_eq!(
+            super::format(&formatted),
+            formatted,
+            "not idempotent:\n{formatted}"
+        );
     }
 }
 
@@ -7777,8 +8011,8 @@ mod split_comment_attachment {
         let source = "fun demo() {\n\
                       \tlet store = Store {\n\
                       \t\t// the authoritative lists\n\
-                      \t\tworkspaces = workspaces,\n\
-                      \t\ttasks = tasks,\n\
+                      \t\tworkspaces = all_workspaces,\n\
+                      \t\ttasks = open_tasks,\n\
                       \t};\n\
                       }\n";
         assert_construct(source, source);
@@ -8743,6 +8977,61 @@ mod import_sorting {
             normalize(raw_tokens("fun f() {\nuse b::y;\nuse a::x;\n}\n")),
             normalize(raw_tokens("fun f() {\nuse a::x;\nuse b::y;\n}\n")),
             "normalize must not reorder block-scoped imports"
+        );
+    }
+
+    // --- E142: `as` aliases ride the sort ------------------------------------
+
+    // An alias is part of the statement the run orders, and part of the member
+    // a brace set orders: both survive the reprint verbatim, in the position
+    // the path (not the alias) puts them in.
+    #[test]
+    fn an_aliased_import_sorts_by_its_path_and_keeps_its_alias() {
+        assert_sorts(
+            "import pkg::z::thing as t;\nimport std::io::print as say;\n\
+             import std::json::Json as Doc;\n",
+            "import std::io::print as say;\nimport std::json::Json as Doc;\n\
+             import pkg::z::thing as t;\n",
+        );
+    }
+
+    #[test]
+    fn an_aliased_brace_member_sorts_and_keeps_its_alias() {
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None };\n",
+            "import std::option::Option::{ None, Some, self as Maybe };\n",
+        );
+    }
+
+    // A one-member set still collapses to its unbraced spelling with the alias
+    // attached — `a::{ b as c }` IS `a::b as c` — and the net reduces both to
+    // the same tokens, which is what lets the reprint through.
+    #[test]
+    fn a_one_member_aliased_set_collapses_and_the_net_agrees() {
+        assert_sorts(
+            "import std::json::{ Json as Doc };\n",
+            "import std::json::Json as Doc;\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::json::{ Json as Doc };\n")),
+            normalize(raw_tokens("import std::json::Json as Doc;\n")),
+            "the net must see the braced and collapsed spellings as one",
+        );
+    }
+
+    // The net is not blind to the alias itself: two imports differing only by
+    // the name they bind are different programs and must stay distinct.
+    #[test]
+    fn net_does_not_forgive_a_changed_alias() {
+        assert_ne!(
+            normalize(raw_tokens("import a::b as c;\n")),
+            normalize(raw_tokens("import a::b as d;\n")),
+            "an alias is part of what the net compares"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b as c;\n")),
+            normalize(raw_tokens("import a::b;\n")),
+            "dropping an alias is a token drift, not a canonicalization"
         );
     }
 }

@@ -145,13 +145,19 @@ pub(crate) fn scope_for<'r>(
         }
     }
     // 2. The file's imports, resolved to registered macros by leaf name.
-    let mut imports: Vec<(Vec<&str>, &str)> = Vec::new();
-    fn collect_imports<'a>(node: &'a Spanned<Node<'a>>, out: &mut Vec<(Vec<&'a str>, &'a str)>) {
+    // (module path, the leaf as the registry knows it, the name this FILE
+    // calls it by — the `as` alias when there is one, E142.)
+    let mut imports: Vec<(Vec<&str>, &str, &str)> = Vec::new();
+    fn collect_imports<'a>(
+        node: &'a Spanned<Node<'a>>,
+        out: &mut Vec<(Vec<&'a str>, &'a str, &'a str)>,
+    ) {
         if let Node::Import(branch) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             crate::analyzer::flatten_namespace_branch(branch, Vec::new(), &mut entries);
-            for (path, leaf, _leaf_span) in entries {
-                out.push((path.iter().map(|(name, _)| *name).collect(), leaf));
+            for (path, leaf, _leaf_span, alias) in entries {
+                let local = alias.map_or(leaf, |(alias, _)| alias);
+                out.push((path.iter().map(|(name, _)| *name).collect(), leaf, local));
             }
         }
         node.0
@@ -160,7 +166,7 @@ pub(crate) fn scope_for<'r>(
     for node in nodes {
         collect_imports(node, &mut imports);
     }
-    for (path, leaf) in imports {
+    for (path, leaf, local) in imports {
         let Some(root) = path.first().copied() else {
             continue;
         };
@@ -192,7 +198,7 @@ pub(crate) fn scope_for<'r>(
         if let Some(target) = target
             && let Some(def) = registry.module(&target).and_then(|macros| macros.get(leaf))
         {
-            names.insert(leaf.to_string(), def);
+            names.insert(local.to_string(), def);
         }
     }
     // 3. The file's own macros (highest precedence).

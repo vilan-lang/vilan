@@ -4,7 +4,7 @@
 `Result<T, E>` is how it says "this can fail" (there are no exceptions).
 Both are plain enums with a large helper-method surface, listed here. For
 how they replace `null` checks and `try`/`catch` in practice (including
-the `!` and `?.` operators), read [Control flow](../tour/control-flow.md)
+the `!`, `?.` and `?` operators), read [Control flow](../tour/control-flow.md)
 first.
 
 ```vilan,fragment

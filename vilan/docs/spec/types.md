@@ -1143,9 +1143,9 @@ Positional access and destructuring are the element-wise spellings a
 tuple has: a tuple is **not iterable**, and `for x in t` is refused
 because the binder would have no single type to take (§3.5).
 
-## 5.10 `!` and `?.`
+## 5.10 `!`, `?.` and `?`
 
-Both dispatch through lang-item traits and desugar per expression:
+All three dispatch through lang-item traits and desugar per expression:
 
 - `e!`: **try-assert**. With `v = e` of a type implementing
   `Try<T, B>`: if `v.verdict()` is `Good(t)`, the value is `t`;

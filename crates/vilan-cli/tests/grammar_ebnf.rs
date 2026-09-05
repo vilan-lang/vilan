@@ -78,6 +78,10 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
     ),
     ("on", "the element head's event form: `on:click(..)`"),
     ("hidden", "the sole argument of `[doc(hidden)]`"),
+    (
+        "as",
+        "the contextual alias on an import/use path leaf (§3.2, E142)",
+    ),
     ("_", "the wildcard pattern"),
 ];
 

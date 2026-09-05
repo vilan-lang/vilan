@@ -418,3 +418,4 @@ row	flagship	key
 387	-	`pkg::{name}` is this program's entry file, which is the…
 388	-	a name after `::`
 389	-	this {construct} is `{label}`, and a condition must be `bool`: `bool`'s set is `bool` itself and no trait names it, so no bound on `{label}` can prove membership
+390	-	a name after `::` on the same line: a `::` path does not cross a line break, because `a::` at the end of a line joins whatever the next line starts with — join the line, or import the path under a shorter name (`import a::b::c as d;`) and write `d`

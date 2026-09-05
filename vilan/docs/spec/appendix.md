@@ -57,7 +57,7 @@ has it with no prelude at all.
 | primitives (`bool`, `str`, numerics, `BigInt`) | `std::boolean`/`string`/`number` | literal types | built-in |
 | `List<T>` | `std::list` | list literals, `for` | built-in |
 | `Option<T>` | `std::option` | `?.` results, view-returning lookups | base (with `Some`/`None`) |
-| `Try`, `Verdict`, `Lift` | `std::operators` | `!`, `?.` (§5.10) | — (but `Result`/`Ok`/`Err` are base) |
+| `Try`, `Verdict`, `Lift` | `std::operators` | `!`, `?.`, `?` (§5.10) | — (but `Result`/`Ok`/`Err` are base) |
 | `Add Sub Mul Div Rem Shl Shr BitAnd BitOr BitXor` | `std::operators` | operators (§5.7) | — |
 | `PartialEq`, `PartialOrd` | `std::compare` | `==`/ordering (§5.7) | — |
 | `Iterator`/`Iterable` | `std::iterator` | `for … in` | — |
