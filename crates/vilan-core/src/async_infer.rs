@@ -613,9 +613,136 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
                 precise
             }
         }
-        // A trait-default re-dispatch doesn't carry its trait on the record, so
-        // consider every same-named member.
-        GenericDispatch::OnType(_, member) => members_named(program, member),
+        // An INHERITED default called on a concrete value carries no trait
+        // either, and the receiver is not `Self`, so it keeps the widest answer.
+        GenericDispatch::OnType(Some(_), member) => members_named(program, member),
+        // A `self` call inside a default BODY: narrowed to what a `Self` can be.
+        GenericDispatch::OnType(None, member) => default_body_candidates(program, member),
+    }
+}
+
+/// The candidate set for a `self` re-dispatch inside a trait DEFAULT body
+/// (`GenericDispatch::OnType(None, member)`).
+///
+/// The record does not carry its trait, so the fallback answer is every
+/// same-named member — and that set is wide by a class no such call can ever
+/// select. `Self` inside a default body is the type the default is
+/// SPECIALIZED for, and that type implements the trait whose body this is: a
+/// trait that declares `member`, since finding the member in the trait is what
+/// recorded the dispatch. So an IMPL-declared candidate is reachable only if
+/// its subject implements some trait declaring `member`; an unrelated type's
+/// inherent same-named method is not reachable at all. (The candidate may
+/// still be inherent — an impl's own member outranks the trait's, which is
+/// what `dispatch_candidates_for` reads for a concrete receiver — so the test
+/// is on the SUBJECT, never on the member's own home.)
+///
+/// A49 is why this matters. `Source::sub` became a trait DEFAULT whose body
+/// calls `self.get()`, so every program that also spells an async inherent
+/// `get` — the `[service]` macro generates one per `[rpc]` route — colored
+/// that default async, and with it every `S: Source<T>` dispatch to `sub`.
+/// `std::rpc`'s `|| source.sub(..)` starters, stored into plain
+/// `|| Subscription` fields, then reported the field-escape divergence against
+/// std's own source. Same shape as the same-named-STATIC miscoloring
+/// `is_self_method` closed: a name collision reaching across unrelated types.
+fn default_body_candidates(program: &Program, member: &str) -> Vec<Id> {
+    // The traits that could own the body: the ones declaring `member`, plus —
+    // since a member reached from a SUPERTRAIT is declared there and inherited
+    // here (B205) — every trait whose supertraits reach one. Closing the set
+    // downward once is what lets the impl scan below read `trait_ids` flat,
+    // rather than expanding each impl's provided set at every call site.
+    let mut declaring: HashSet<Id> = program
+        .traits
+        .iter()
+        .filter(|(_, trait_)| trait_.declarations.contains_key(member))
+        .map(|(trait_id, _)| *trait_id)
+        .collect();
+    if declaring.is_empty() {
+        return members_named(program, member);
+    }
+    loop {
+        let inheriting: Vec<Id> = program
+            .traits
+            .iter()
+            .filter(|(trait_id, trait_)| {
+                !declaring.contains(trait_id)
+                    && trait_.supertraits.iter().any(|supertrait| {
+                        matches!(
+                            program.type_id_to_type_map.get(supertrait),
+                            Some(Type::Trait(super_id, _)) if declaring.contains(super_id)
+                        )
+                    })
+            })
+            .map(|(trait_id, _)| *trait_id)
+            .collect();
+        if inheriting.is_empty() {
+            break;
+        }
+        declaring.extend(inheriting);
+    }
+    // Every subject that implements one of them — the types this body can
+    // specialize to. Nominal heads are matched by head (a conditional impl and
+    // its unconditional twin share one, which keeps the answer an
+    // over-approximation); a subject that is not nominal — a blanket
+    // `impl type T with ..`, a primitive — is kept whole and matched with the
+    // impl-selection rule instead.
+    let mut heads: HashSet<Id> = HashSet::default();
+    let mut wide: Vec<TypeId> = Vec::new();
+    for implementation in &program.implementations {
+        if !implementation
+            .trait_ids
+            .iter()
+            .any(|trait_id| declaring.contains(trait_id))
+        {
+            continue;
+        }
+        match subject_head(program, implementation.subject) {
+            Some(head) => {
+                heads.insert(head);
+            }
+            None => wide.push(implementation.subject),
+        }
+    }
+    let mut candidates: Vec<Id> = Vec::new();
+    for implementation in &program.implementations {
+        let Some(member_id) = implementation.declarations.get(member) else {
+            continue;
+        };
+        let reachable = match subject_head(program, implementation.subject) {
+            Some(head) => {
+                heads.contains(&head)
+                    || wide.iter().any(|subject| {
+                        crate::impl_select::subject_applies(
+                            program,
+                            *subject,
+                            implementation.subject,
+                        )
+                    })
+            }
+            // The candidate's own subject is not nominal either (a blanket
+            // impl's member): it applies to whatever binds, this trait's
+            // implementors included.
+            None => true,
+        };
+        if reachable {
+            candidates.push(*member_id);
+        }
+    }
+    // A trait's own declaration — the requirement or the default — has no
+    // concrete subject to test, and the enclosing trait's is always in here.
+    for trait_ in program.traits.values() {
+        if let Some(member_id) = trait_.declarations.get(member) {
+            candidates.push(*member_id);
+        }
+    }
+    candidates.retain(|member_id| is_self_method(program, *member_id));
+    candidates
+}
+
+/// An impl subject's nominal head, or `None` when it has none to match on.
+fn subject_head(program: &Program, subject: TypeId) -> Option<Id> {
+    match program.type_id_to_type_map.get(&subject) {
+        Some(Type::Struct(id, _) | Type::Enum(id, _)) => Some(*id),
+        _ => None,
     }
 }
 

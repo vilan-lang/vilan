@@ -3928,6 +3928,65 @@ fn an_async_closure_assigned_into_a_plain_field_is_refused() {
 }
 
 #[test]
+fn a_trait_default_starter_stored_in_a_plain_field_is_not_refused() {
+    // A49's regression, minimal. `sub` is a trait DEFAULT whose body calls the
+    // requirement through `Self` (`GenericDispatch::OnType(None, ..)` — the
+    // re-dispatch that carries no trait), a generic function stores
+    // `|| source.sub(..)` into a plain `|| i32` field, and an UNRELATED struct
+    // spells an inherent async member with the requirement's name. The
+    // candidate scan used to reach that member, color the default async, and
+    // report this store as a field escape — against std's own `rpc.vl`, where
+    // `Source::sub` is the default and the `[service]` macro generates the
+    // async `get`.
+    //
+    // Nothing here awaits, so the store is honest and the starter runs
+    // synchronously. `an_async_closure_into_a_plain_field_is_refused` above is
+    // the other half: a closure that really does await is still refused.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Client { }
+
+        impl Client {
+            async fun get(self): i32 {
+                1
+            }
+        }
+
+        trait Source {
+            fun get(self): i32;
+
+            fun sub(self, observer: |i32| void): i32 {
+                observer(self.get());
+                self.get()
+            }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Source {
+            fun get(self): i32 {
+                self.n
+            }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun expose<S: Source>(source: S): Holder {
+            Holder { start = || source.sub(|value| { print(i"saw {value}") }) }
+        }
+
+        fun main() {
+            let holder = expose(Cell { n = 7 });
+            print((holder.start)());
+        }
+        "#,
+        "saw 7\n7\n",
+    );
+}
+
+#[test]
 fn a_plain_declared_return_of_an_async_closure_is_refused() {
     assert_fails_with(
         r#"
