@@ -3108,6 +3108,13 @@ pub struct Analyzer<'src> {
     // not during the walk); member resolution on a `T`-typed value searches every
     // bound.
     generic_bounds: HashMap<TypeId, Vec<TypeId>>,
+    // The type ids a DEFAULTED trait/declaration parameter (`trait Mixer<A =
+    // Self, B = Self>`) interns as — its default's type, not a binder (B235).
+    // A default is not a bound: it says what the position MEANS when no
+    // argument is supplied, never what an argument must implement. The ids are
+    // minted per spelling and never interned, so recording the occurrence is
+    // enough to tell `A = Self` apart from a genuine `T: Mixer`.
+    defaulted_parameter_types: HashSet<TypeId>,
     // The tuple bound of a generic parameter (`T: (2..)` / `(..: Display)` —
     // variadic-generics.md §"Arity & element bounds"), keyed by the parameter's
     // constraint id. Enforced wherever trait bounds are
@@ -4254,6 +4261,7 @@ impl<'src> Analyzer<'src> {
             generic_constraint_names: HashMap::default(),
             generic_dispatch: HashMap::default(),
             generic_bounds: HashMap::default(),
+            defaulted_parameter_types: HashSet::default(),
             tuple_bounds: HashMap::default(),
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
@@ -21811,6 +21819,11 @@ impl<'src> Analyzer<'src> {
                 if let Some(default) = &parameter.default {
                     let default_type_id = self.walk_type_node(default, scope_id);
                     self.register_defaulted_parameter(parameter.name, default_type_id, scope_id);
+                    // B235: and it is a DEFAULT, not a bound. Recorded here, at
+                    // the one place a default interns, so every reader of "what
+                    // does this parameter REQUIRE" gets the same answer:
+                    // nothing.
+                    self.defaulted_parameter_types.insert(default_type_id);
                     generic_parameter_constraint_ids.push(default_type_id);
                     continue;
                 }
@@ -22246,6 +22259,24 @@ impl<'src> Analyzer<'src> {
     /// (`F: Feed<T>` -> `[(feed_id, [T])]`), so a method call on the parameter can
     /// substitute the trait's parameters with the caller's concrete arguments.
     fn generic_bound_traits(&self, constraint_id: TypeId) -> Vec<(Id, Vec<TypeId>)> {
+        // B235: a DEFAULTED parameter (`trait Mixer<A = Self, B = Self>`)
+        // interns as its default's type rather than as a binder, so the
+        // fallback below — "an unlisted parameter's own type IS its single
+        // bound", which is how `<T: Display>` recovers `Display` from the id —
+        // read the DEFAULT as a requirement. Under a sub-trait's parameterized
+        // clause (`trait Mixed with Mixer<i32, str>`) the clause argument is
+        // substituted for the parameter and then checked against it, so the
+        // declaring trait was demanded of its own arguments: `'i32' does not
+        // implement trait 'Mixer'`. A default says what the position MEANS when
+        // no argument is supplied; it never says what an argument must be.
+        // (`Add<i32>` escaped only because `i32` genuinely implements `Add`.)
+        // A parameter's own bounds still apply to the argument — they live in
+        // `generic_bounds`, which this consults first, and are untouched here.
+        if self.defaulted_parameter_types.contains(&constraint_id)
+            && !self.generic_bounds.contains_key(&constraint_id)
+        {
+            return Vec::new();
+        }
         let bound_type_ids = self
             .generic_bounds
             .get(&constraint_id)
