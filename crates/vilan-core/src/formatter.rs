@@ -88,9 +88,9 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// canonical when a block's items are permuted around it — the block scan then
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_css_blocks(sort_style_chains(sort_import_runs(&drop_trailing_commas(
-        tokens,
-    ))))
+    sort_css_blocks(sort_style_chains(sort_import_runs(
+        &collapse_field_shorthands(drop_trailing_commas(tokens)),
+    )))
 }
 
 /// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
@@ -109,6 +109,47 @@ fn drop_trailing_commas(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
             }
         }
         result.push(token);
+    }
+    result
+}
+
+/// Collapses a struct-literal field written long — `x = x` — to the shorthand
+/// `x`, so the safety check accepts the formatter canonicalizing one into the
+/// other (E143). Recognized by SHAPE, since a token stream has no tree to ask:
+/// the three-token run `IDENT "=" IDENT` with both names equal, opened by a `{`
+/// or a `,` and closed by a `,` or a `}`.
+///
+/// That shape also covers a block whose tail expression is the self-assignment
+/// `{ x = x }`, which the printer never collapses. Being wider than the printer
+/// costs nothing and cannot hide a drift: the collapse runs over BOTH streams,
+/// so a form neither side produces reduces identically on both — exactly the
+/// looseness [`drop_trailing_commas`] carries for the trailing comma.
+pub fn collapse_field_shorthands(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let opened = matches!(result.last(), Some(Token::Ctrl('{') | Token::Ctrl(',')));
+        let long_form = match (
+            tokens.get(index),
+            tokens.get(index + 1),
+            tokens.get(index + 2),
+            tokens.get(index + 3),
+        ) {
+            (
+                Some(Token::Ident(name)),
+                Some(Token::Op("=")),
+                Some(Token::Ident(read)),
+                Some(Token::Ctrl(',') | Token::Ctrl('}')),
+            ) => name == read,
+            _ => false,
+        };
+        if opened && long_form {
+            result.push(tokens[index].clone());
+            index += 3;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
     }
     result
 }
@@ -3959,14 +4000,36 @@ impl<'src> Printer<'src> {
     /// the pending split the way `print_expr` does, so a shorthand field — which
     /// has no value position to hand it to — drops it rather than leaking an
     /// armed split onto whatever prints next.
+    ///
+    /// E143: `A { x = x }` and `A { x }` are ONE construct written two ways —
+    /// the analyzer synthesizes the same local read for the shorthand that the
+    /// long form spells out — and the formatter picks the shorthand as the
+    /// canonical spelling, the way it picks one import order and one style-chain
+    /// order. The collapse is a REPRINT of an equal field, not a rewrite of the
+    /// program: the tokens the safety net compares are normalized through
+    /// [`collapse_field_shorthands`] so both spellings reduce to the same
+    /// stream.
+    ///
+    /// A comment written between the name and the value (`x = // why⏎ x`) is
+    /// NOT a reason to keep the long form. The printer has no inline slot for
+    /// one there — such a comment already flushed out below the statement
+    /// before this rule existed, since it sits INSIDE a field span and so does
+    /// not force the split the way a comment between fields does — and
+    /// suppressing the collapse for it would make the reprint non-idempotent:
+    /// the first pass would keep `x = x` and relocate the comment, and the
+    /// second, with the comment now outside the field, would collapse anyway.
     fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
         let split = std::mem::take(&mut self.split);
         self.out.push_str(field_name);
-        if let Some(value) = value {
-            self.out.push_str(" = ");
-            self.split = split;
-            self.print_expr(value);
+        let Some(value) = value else {
+            return;
+        };
+        if matches!(value.0, Node::Accessor(read) if read == field_name) {
+            return;
         }
+        self.out.push_str(" = ");
+        self.split = split;
+        self.print_expr(value);
     }
 
     /// Whether a standalone comment sits in one of the GAPS between the source
@@ -6994,15 +7057,15 @@ mod struct_literal_layout {
     /// used to collapse onto one 357-column line.
     #[test]
     fn an_over_budget_struct_literal_splits_one_field_per_line() {
-        let source = "let store = KoltStore { workspaces = workspaces, tasks = tasks, \
+        let source = "let store = KoltStore { workspaces = all_workspaces, tasks = open_tasks, \
                       register_hook = Shared::new(register), login_hook = Shared::new(login), \
                       create_hook = Shared::new(create) };\n";
         assert_over_budget(source.trim_end());
         assert_construct(
             source,
             "let store = KoltStore {\n\
-             \tworkspaces = workspaces,\n\
-             \ttasks = tasks,\n\
+             \tworkspaces = all_workspaces,\n\
+             \ttasks = open_tasks,\n\
              \tregister_hook = Shared::new(register),\n\
              \tlogin_hook = Shared::new(login),\n\
              \tcreate_hook = Shared::new(create),\n\
@@ -7207,8 +7270,8 @@ mod struct_literal_layout {
         let source = "fun demo() {\n\
                       \tlet store = KoltStore {\n\
                       \t\t// the authoritative lists\n\
-                      \t\tworkspaces = workspaces,\n\
-                      \t\ttasks = tasks,\n\
+                      \t\tworkspaces = all_workspaces,\n\
+                      \t\ttasks = open_tasks,\n\
                       \t\tregister_hook = Shared::new(register),\n\
                       \t};\n\
                       }\n";
@@ -7222,14 +7285,117 @@ mod struct_literal_layout {
     fn a_file_mixing_split_and_inline_struct_literals_is_a_fixed_point() {
         let canonical = "let fits = Point { x = 1, y = 2 };\n\
                          let store = KoltStore {\n\
-                         \tworkspaces = workspaces,\n\
-                         \ttasks = tasks,\n\
+                         \tworkspaces = all_workspaces,\n\
+                         \ttasks = open_tasks,\n\
                          \tregister_hook = Shared::new(register),\n\
                          \tlogin_hook = Shared::new(login),\n\
                          \tcreate_hook = Shared::new(create),\n\
                          };\n";
         assert_construct(canonical, canonical);
         assert_eq!(format(canonical), canonical);
+    }
+}
+
+#[cfg(test)]
+mod struct_field_shorthand {
+    //! E143: `A { x = x }` and `A { x }` are one construct written two ways —
+    //! the analyzer synthesizes the same local read for the shorthand that the
+    //! long form spells out — and the formatter picks ONE, the way it picks one
+    //! import order and one style-chain order. The shorthand is the pick: it is
+    //! the spelling the language added the syntax for.
+    //!
+    //! There is no opt-out, and the census is why. Over the estate at the old
+    //! formatter's fixed point the rule reprints 91 fields across 23 of 228
+    //! `.vl` files, every one of them mechanical; a knob would fork every file's
+    //! shape for a spelling nobody has a reason to prefer, which is the same
+    //! ground `LINE_BUDGET` is not a knob on.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_field_written_long_collapses_to_the_shorthand() {
+        assert_construct(
+            "let point = Point { x = x, y = y };\n",
+            "let point = Point { x, y };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_is_a_different_name_keeps_its_long_form() {
+        // The control: only a value that is the FIELD'S OWN name collapses. A
+        // rule keyed on "the value is a bare name" would eat this one.
+        assert_construct(
+            "let point = Point { x = origin, y = y };\n",
+            "let point = Point { x = origin, y };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_is_not_a_bare_name_keeps_its_long_form() {
+        assert_construct(
+            "let point = Point { x = x.offset(), y = -y, z = z };\n",
+            "let point = Point { x = x.offset(), y = -y, z };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_already_written_short_is_unchanged() {
+        assert_construct(
+            "let point = Point { x, y };\n",
+            "let point = Point { x, y };\n",
+        );
+    }
+
+    #[test]
+    fn the_collapse_reaches_the_split_form_too() {
+        // The split printer and the inline printer share one field printer, so
+        // a literal broken one field per line collapses exactly as an inline one
+        // does — and the collapse does not un-split a literal that is still over
+        // budget without it.
+        let source = "let store = Store { workspaces = workspaces, tasks = tasks, \
+                      register_hook = Shared::new(register), login_hook = Shared::new(login), \
+                      create_hook = Shared::new(create) };\n";
+        assert_construct(
+            source,
+            "let store = Store {\n\
+             \tworkspaces,\n\
+             \ttasks,\n\
+             \tregister_hook = Shared::new(register),\n\
+             \tlogin_hook = Shared::new(login),\n\
+             \tcreate_hook = Shared::new(create),\n\
+             };\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_a_collapsing_field_is_kept_and_the_reprint_is_idempotent() {
+        // A comment written between the name and the value has no inline slot
+        // in either spelling — it sat inside a field span, so it never forced
+        // the split the way a comment BETWEEN fields does, and it already
+        // relocated below the statement before this rule existed. It must still
+        // survive, and the reprint must settle in one pass: suppressing the
+        // collapse for it would collapse on the SECOND pass instead, with the
+        // comment then outside the field.
+        let source = "fun demo() {\n\
+                      \tlet point = Point {\n\
+                      \t\tx = // deliberately the same name\n\
+                      \t\t\tx,\n\
+                      \t\ty = y,\n\
+                      \t};\n\
+                      }\n";
+        let formatted = super::format(source);
+        assert!(
+            formatted.contains("deliberately the same name"),
+            "the comment was dropped:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("Point { x, y }"),
+            "the fields did not collapse:\n{formatted}"
+        );
+        assert_eq!(
+            super::format(&formatted),
+            formatted,
+            "not idempotent:\n{formatted}"
+        );
     }
 }
 
@@ -7777,8 +7943,8 @@ mod split_comment_attachment {
         let source = "fun demo() {\n\
                       \tlet store = Store {\n\
                       \t\t// the authoritative lists\n\
-                      \t\tworkspaces = workspaces,\n\
-                      \t\ttasks = tasks,\n\
+                      \t\tworkspaces = all_workspaces,\n\
+                      \t\ttasks = open_tasks,\n\
                       \t};\n\
                       }\n";
         assert_construct(source, source);

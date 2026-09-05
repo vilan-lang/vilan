@@ -331,7 +331,34 @@ fn normalized_tokens(source: &str) -> Option<Vec<Token<'_>>> {
         }
         result.push(token);
     }
-    Some(result)
+    // A struct-literal field written long — `x = x` — is the shorthand `x`
+    // (E143), and the formatter canonicalizes one into the other, so the check
+    // reduces both spellings. Recognized by shape, opened by `{` or `,` and
+    // closed by `,` or `}`; re-implemented here rather than imported, like
+    // everything else in this function, because a tripwire that shares the
+    // implementation it watches proves nothing.
+    let mut collapsed: Vec<Token<'_>> = Vec::with_capacity(result.len());
+    let mut index = 0;
+    while index < result.len() {
+        let opened = matches!(collapsed.last(), Some(Token::Ctrl('{') | Token::Ctrl(',')));
+        let long_form = matches!(
+            (
+                result.get(index),
+                result.get(index + 1),
+                result.get(index + 2),
+                result.get(index + 3),
+            ),
+            (
+                Some(Token::Ident(name)),
+                Some(Token::Op("=")),
+                Some(Token::Ident(read)),
+                Some(Token::Ctrl(',') | Token::Ctrl('}')),
+            ) if name == read
+        );
+        collapsed.push(result[index].clone());
+        index += if opened && long_form { 3 } else { 1 };
+    }
+    Some(collapsed)
 }
 
 fn corpus_files() -> Vec<PathBuf> {

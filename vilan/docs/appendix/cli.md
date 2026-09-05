@@ -230,6 +230,10 @@ is the current directory. Formatting is conservative and a fixed point:
   — the last included, so adding an entry is a one-line diff. One that
   fits stays inline *without* a trailing comma, so the comma marks a
   split and nothing else.
+- A struct literal's field written long where the shorthand says the same
+  thing — `A { x = x }` — is printed as the shorthand `A { x }`. The two are
+  one construct with two spellings, and the formatter picks one; a field whose
+  value is any other expression, `A { x = y }` included, is left as written.
 - Width is measured on a line, not on a statement: a construct that opens
   a line and continues below it — a block-bodied closure, a `match`, a
   block — is judged by the line it opens, and its body lines are measured
