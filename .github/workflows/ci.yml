@@ -114,6 +114,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # The suite's wall clock on a GitHub runner is COLD COMPILE, not test
+        # time (L19). The last green run: every other job at or under 3 minutes,
+        # `test(ubuntu)` at 25 and `test(windows)` at 30 — while the identical
+        # suite runs in ~4.5 minutes warm on the owner's box. Two levers, and
+        # they fix different halves. The CACHE below removes the compile on the
+        # runs that get a hit; the SHARD splits what is left, because a warm
+        # compile still leaves the suite itself serial on one runner. Two is the
+        # count, not four: each shard pays its own cache restore and its own
+        # link, so the split stops buying long before the parallelism does.
+        partition: [1, 2]
     runs-on: ${{ matrix.os }}
     # The suite proves the tree against CURRENT stable, not against the pin in
     # rust-toolchain.toml — that file is the formatter's pin (backlog N21; the
@@ -145,6 +155,17 @@ jobs:
       - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
           tool: cargo-nextest
+      # The registry, the git checkouts and `target/`, carried between runs.
+      # The key is per-OS by construction — the action folds `runner.os`, the
+      # rustc version and the lockfile into it — and `shared-key` makes both
+      # shards of one OS read ONE entry rather than two that each hold half a
+      # `target/`. `save-if` keeps the WRITERS to the branches PRs are cut from:
+      # a PR warms itself off `next`'s entry and does not evict it, which is the
+      # difference between a cache and a queue of PRs overwriting each other.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: suite-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
       # THE gate command, and it is not written here: `scripts/ci-local.sh`
       # holds it, this job calls the script, and `ci_local_script.rs` holds the
       # two together. release.yml's `gate` job runs the same legs, character
@@ -154,10 +175,18 @@ jobs:
       # script is POSIX shell; the runner ships git-bash for exactly this.
       - name: The suite is green
         shell: bash
+        env:
+          # nextest's own sharding: `count:N/M` selects a deterministic Mth of
+          # the tests, so the two shards together are the whole suite and
+          # neither runs a test twice.
+          VILAN_CI_PARTITION: ${{ matrix.partition }}/2
         run: scripts/ci-local.sh test
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
+      # ONCE per OS: the shards split the SUITE, not this, and a doc-test run
+      # on both shards is a doc-test run twice.
       - name: The doc-tests are green
+        if: matrix.partition == 1
         shell: bash
         run: scripts/ci-local.sh doctest
 
@@ -183,6 +212,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: wasm32-unknown-unknown
+      # This job's three minutes are a cold `wasm-release` build and a
+      # `cargo install wasm-bindgen-cli`; the cache holds both (the installed
+      # binary lands in `~/.cargo/bin`, which the action carries).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: wasm
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
       # Pinned to the `wasm-bindgen` crate version in vilan-wasm/Cargo.toml.
       # The two must match exactly — a mismatch fails in the browser at
       # runtime, not here, which is the worst place to find out.
@@ -241,6 +277,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Clippy compiles the workspace's every target, so this leg's clock is a
+      # build too. Its own `shared-key`: clippy's `target/` holds `.rmeta` where
+      # the suite's holds linked test binaries, and one entry serving both would
+      # thrash rather than hit.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
       - name: The tree is clippy-clean
         run: scripts/ci-local.sh clippy
 
