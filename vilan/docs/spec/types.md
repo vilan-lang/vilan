@@ -833,6 +833,19 @@ function's own parameter is.
 — so a parameter is refused on **either** side, whatever it is bounded
 to, and the fix is to change the type rather than to add a bound.
 
+An `if` or `for` **condition** is that same set with no operator at all.
+It takes a `bool`, nothing names `bool`'s set, and there is no
+truthiness: a parameter the enclosing declaration owns is refused there
+too, bounded or not, because the body is checked once for every
+instantiation and the caller is what fixed the type. Test the value and
+branch on the `bool` the test produces.
+
+```vilan,fragment
+fun check<T>(x: T) { if x { … } }             // error: a condition takes a `bool`
+fun check<T: Display>(x: T) { for x { … } }   // error: no bound can prove `bool`
+fun check<T: PartialEq>(x: T, y: T) { if x == y { … } }  // the test produces one
+```
+
 ```vilan,fragment
 "n=" + count                 // str + i32 — concatenation
 "p=" + point                 // error: `Point` has no string form

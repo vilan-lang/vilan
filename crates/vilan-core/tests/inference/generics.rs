@@ -6751,3 +6751,114 @@ fn b233_a_nominal_left_operand_keeps_b180s_own_steer() {
         "one impl written over that same parameter (`impl Bag<type Q> with Add<Q>`)",
     );
 }
+
+// --- B234: a rigid parameter is not a condition -----------------------------
+//
+// The B28 condition check skipped `Type::Generic` outright, so `fun f<T>(x: T)
+// { if x { } }` compiled and every instantiation reached the host's truthiness
+// test — `f(1)` took the branch, `f(0)` did not, and `for x { }` over a truthy
+// value looped forever. Under B211 a parameter is a fixed, unknown type inside
+// its own body, and nothing can fix this at the declaration either: `bool`'s
+// admitted set is `bool` itself and no trait names it, which is `!`'s ruling
+// (B200) one position along. Refused through `generic_is_rigid_here`, so a
+// parameter the SITE is still inferring stays the call's business.
+//
+// CENSUS across std, the corpus, the docs fences, the examples, kolt and the
+// website: 67 bare-identifier `if`/`for` conditions, ZERO of them on a value
+// typed by a generic parameter (the one grep hit, `binary.vl`'s `if value`, is
+// a `value: bool`). Nothing in the estate stops compiling.
+
+#[test]
+fn b234_a_parameter_is_not_an_if_condition() {
+    assert_fails_with(
+        r#"
+        fun f<T>(x: T) { if x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "this `if` condition is `T`, and a condition must be `bool`",
+    );
+}
+
+#[test]
+fn b234_a_parameter_is_not_a_for_condition() {
+    // The same check, the other construct it guards — and the worse miscompile:
+    // a truthy instantiation never leaves the loop.
+    assert_fails_with(
+        r#"
+        fun f<T>(x: T) { for x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "this `for` condition is `T`, and a condition must be `bool`",
+    );
+}
+
+#[test]
+fn b234_a_bound_cannot_make_a_parameter_a_bool() {
+    // Bounding it changes nothing, and the message says why: no trait names
+    // `bool`'s set, so no bound can prove membership.
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        fun f<T: Display>(x: T) { if x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b234_an_impls_own_binder_is_refused_in_its_body() {
+    // The impl-binder half of the same rigidity (B77: an impl binder inherits
+    // the subject declaration's ids, so the method body owns it too).
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun show(self) { if self.value { print("y"); } }
+        }
+        fun main() { Cell { value = 1 }.show(); }
+        "#,
+        "and a condition must be `bool`",
+    );
+}
+
+#[test]
+fn b234_the_negation_keeps_b200s_own_refusal() {
+    // `!x` was already refused, by the unary operand rule, and keeps its own
+    // wording — the two rules are the same ruling at two sites, not one
+    // diagnostic wearing two hats.
+    assert_fails_with(
+        r#"
+        fun f<T>(x: T) { if !x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "`!` negates a `bool`, and `T` is a type parameter",
+    );
+}
+
+#[test]
+fn b234_a_concrete_bool_condition_still_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun f(x: bool) { if x { print("y"); } }
+        fun main() { f(true); }
+        "#,
+        "y\n",
+    );
+}
+
+#[test]
+fn b234_a_parameter_the_call_site_binds_to_bool_still_compiles() {
+    // The other side of `generic_is_rigid_here`: the condition here is a CALL's
+    // return, whose parameter this site is inferring rather than owning, and the
+    // call binds it to `bool`. Nothing rigid meets the condition.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun pick<T>(a: T, b: T): T { a }
+        fun main() { if pick(true, false) { print("y"); } }
+        "#,
+        "y\n",
+    );
+}

@@ -37864,10 +37864,51 @@ impl<'src> Analyzer<'src> {
             let bool_type = self.bool_type();
             for (condition_id, construct) in std::mem::take(&mut self.prepped_conditions) {
                 let condition = self.infer_type(condition_id, &bool_type, &HashMap::default());
-                if !matches!(
-                    condition,
-                    Type::Unknown | Type::Unresolved | Type::Generic(_)
-                ) && !self.compare_type(&bool_type, &condition, &HashMap::default())
+                // B234: a generic parameter skipped the check outright, and a
+                // parameter the ENCLOSING declaration owns is not a hole this
+                // site may fill — it is a fixed, unknown type inside its own
+                // body (B211), decided once by the caller. `fun f<T>(x: T) { if
+                // x { } }` compiled and every instantiation reached the host's
+                // truthiness test: `f(1)` took the branch, `f(0)` did not, and
+                // `for x { }` over a truthy value looped forever. Nothing can
+                // fix it at the declaration either — `bool`'s admitted set is
+                // `bool` itself and no trait names it, which is `!`'s ruling one
+                // position along (B200).
+                //
+                // The predicate is B219's shared `generic_is_rigid_here`, asked
+                // with the condition's own scope: this check runs after the
+                // fixpoint, where `rigid_binder_scope` is `None`, and a
+                // parameter the site is still INFERRING stays a hole the call
+                // fills.
+                if let Type::Generic(constraint_id) = condition {
+                    let scope_id = self.expr_id_to_scope_id_map.get(&condition_id).copied();
+                    let saved_scope = std::mem::replace(&mut self.rigid_binder_scope, scope_id);
+                    let rigid = self.generic_is_rigid_here(constraint_id);
+                    self.rigid_binder_scope = saved_scope;
+                    if rigid {
+                        let label = self.pretty_print_type(&condition, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "this {construct} is `{label}`, and a condition must be \
+                                     `bool`: `bool`'s set is `bool` itself and no trait names \
+                                     it, so no bound on `{label}` can prove membership — a \
+                                     bound promises a trait's methods, never that the parameter \
+                                     IS `bool`. Test the value and branch on the `bool` \
+                                     (`{label}: PartialEq` gives `==`), or declare this \
+                                     condition `bool`"
+                                ),
+                            },
+                            condition_id,
+                        );
+                    }
+                    continue;
+                }
+                if !matches!(condition, Type::Unknown | Type::Unresolved)
+                    && !self.compare_type(&bool_type, &condition, &HashMap::default())
                 {
                     let label = self.pretty_print_type(&condition, &HashMap::default());
                     self.push_anchored(
