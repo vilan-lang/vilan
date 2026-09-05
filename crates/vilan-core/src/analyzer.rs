@@ -7988,7 +7988,7 @@ impl<'src> Analyzer<'src> {
         // whole check — the per-instantiation descent and the inferred sweep
         // included — is dead work for a program with no `resource` declaration
         // anywhere.
-        if !self.any_declared_resource() {
+        if !self.declares_a_resource() {
             return;
         }
         let containers = self.resource_rejecting_containers();
@@ -8769,12 +8769,38 @@ impl<'src> Analyzer<'src> {
     /// The resource-typed binding entities (variables + parameters), by
     /// per-instantiation classification. `&mut` because `type_is_resource`
     /// memoizes; the scan then runs against the returned (owned) set as `&self`.
+    /// Every binding — variable or parameter — whose type is a resource.
+    ///
+    /// **M38: the pre-filter.** `type_is_resource` is a per-instantiation
+    /// question answered by recursing through substituted fields, and asking it
+    /// of every variable and every parameter in a loaded world was ~100 ms on
+    /// kolt's browser entry — a program that owns no resource at all, but
+    /// imports std modules that declare several, so `declares_a_resource()`
+    /// cannot skip it. M28's `resource_reaching_nominals` / `type_reaches_
+    /// resource` pair answers the CHEAP over-approximation ("can any
+    /// instantiation of this nominal be a resource") off the declared shapes
+    /// and the instantiation's own arguments, with no field recursion and no
+    /// substitution, and M28's soundness claim is stated where the predicate
+    /// is: `type_is_resource(T)` implies `type_reaches_resource(T)`. So a type
+    /// the filter rejects cannot be a resource, and the set this returns is
+    /// answer-identical to the unfiltered sweep.
     fn collect_resource_bindings(&mut self) -> HashSet<Id> {
         let mut bindings = HashSet::default();
+        // Empty exactly when nothing in the loaded world is declared
+        // `resource` — the whole-program gate, arrived at for free.
+        let nominals = self.resource_reaching_nominals();
+        if nominals.is_empty() {
+            return bindings;
+        }
+        // One reach memo across both sweeps: a parameter and a local of the
+        // same type are one question.
+        let mut reaches: HashMap<TypeId, bool> = HashMap::default();
         let variables: Vec<(Id, TypeId)> =
             self.variables.values().map(|v| (v.id, v.type_id)).collect();
         for (id, type_id) in variables {
-            if self.type_is_resource(type_id) {
+            if self.type_reaches_resource(type_id, &nominals, &mut reaches)
+                && self.type_is_resource(type_id)
+            {
                 bindings.insert(id);
             }
         }
@@ -8784,7 +8810,9 @@ impl<'src> Analyzer<'src> {
             .map(|p| (p.id, p.type_id))
             .collect();
         for (id, type_id) in parameters {
-            if self.type_is_resource(type_id) {
+            if self.type_reaches_resource(type_id, &nominals, &mut reaches)
+                && self.type_is_resource(type_id)
+            {
                 bindings.insert(id);
             }
         }
@@ -9820,6 +9848,14 @@ impl<'src> Analyzer<'src> {
     /// calls) that C11 made unsound as a gate: `File::open(p).read_at(b, 0)`
     /// binds nothing, overwrites nothing and calls no sink, and is precisely
     /// the program whose temporary the scan has to find.
+    ///
+    /// **R11's gate too** (M38): `check_resource_generic_instantiations` asked
+    /// the identical question through an `any_declared_resource` of its own —
+    /// three identical lines, written twice, which is two places for one rule
+    /// to drift apart. A program with no `resource` leaf has no resource type
+    /// at all (containment bottoms out at a declared leaf), so no
+    /// instantiation can be a resource one and the whole R11 pass is skipped;
+    /// std and the corpus pay nothing either way.
     fn declares_a_resource(&self) -> bool {
         self.structs.values().any(|struct_| struct_.resource)
             || self.enums.values().any(|enum_| enum_.resource)
@@ -12614,22 +12650,13 @@ impl<'src> Analyzer<'src> {
     // treating the parameter set as resources), never forking R1–R9.
     // ---------------------------------------------------------------------
 
-    /// R11: whether the program declares any resource at all. A program with no
-    /// `resource` leaf has no resource type (containment bottoms out at a
-    /// declared leaf), so no instantiation can be a resource one — the whole pass
-    /// is skipped (std / corpus pay nothing).
-    fn any_declared_resource(&self) -> bool {
-        self.structs.values().any(|struct_| struct_.resource)
-            || self.enums.values().any(|enum_| enum_.resource)
-    }
-
     /// R11 (destruction.md §4): re-check every generic body instantiated with a
     /// resource. Seeds a worklist from every call whose callee's generic
     /// parameters are bound to a concrete resource, then propagates through the
     /// call graph (a generic passing its resource `T` on to another generic —
     /// the indirect case), scanning each `(callee, resource-parameter set)` once.
     fn check_resource_generic_instantiations(&mut self) {
-        if !self.any_declared_resource() {
+        if !self.declares_a_resource() {
             return;
         }
         let mut worklist: VecDeque<R11Instance> = VecDeque::new();
