@@ -8777,3 +8777,142 @@ fn b223_the_if_control_is_unchanged() {
         "cannot find 'n' in this scope",
     );
 }
+
+// --- B231: a block-like expression as the operand of a binary operator -------
+//
+// `match`, an `if`-expression and a block are values everywhere else — an
+// initializer, an argument, a `ret` tail — and the operator tower was the one
+// position that refused them: `flag && match probe() { … }` read as
+// `found 'match' expected an expression`. Each pin RUNS, because the parse is
+// only half the claim: B224 gave the emitter a statement slot for a
+// short-circuit operand, so an operand that lowers to statements must still
+// evaluate on the operator's own side of the test.
+
+#[test]
+fn b231_a_match_is_an_and_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            let flag = true;
+            if flag && match probe(3) { Some(let n) => n > 0, None => false } {
+                print("yes");
+            } else {
+                print("no");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+#[test]
+fn b231_a_match_is_an_or_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            let flag = false;
+            if flag || match probe(0) { Some(let n) => n > 0, None => true } {
+                print("yes");
+            } else {
+                print("no");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+#[test]
+fn b231_a_match_operand_keeps_the_short_circuit() {
+    // The half only a RUN can say: the operand lowers to statements, and B224's
+    // slot is what keeps them on the operator's own side of the test. A left
+    // operand that settles the answer must leave `probe` uncalled.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        mut hits = 0;
+        fun probe(): Option<i32> { hits = hits + 1; Some(1) }
+        fun main() {
+            let no = false;
+            if no && match probe() { Some(_) => true, None => false } { print("and"); }
+            let yes = true;
+            if yes || match probe() { Some(_) => true, None => false } { print("or"); }
+            print(hits);
+        }
+        "#,
+        "or\n0\n",
+    );
+}
+
+#[test]
+fn b231_a_match_is_an_arithmetic_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            print(1 + match probe(4) { Some(let n) => n, None => 0 });
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b231_an_if_expression_is_an_and_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let flag = true;
+            print(true && if flag { true } else { false });
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b231_a_block_is_an_operand_in_expression_position() {
+    // A bare block is admitted where an operand is unambiguous. In CONDITION
+    // position it stays refused — a `{` after an operator there is the
+    // enclosing construct's body, the ambiguity `no_struct` already resolves
+    // for struct literals and `css` blocks — and parentheses are the spelling.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(2 + { let a = 3; a });
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b231_the_parenthesized_control_is_unchanged() {
+    // The spelling that already worked, and the one the old refusal steered to:
+    // it must go on producing the same answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            let flag = true;
+            if flag && (match probe(1) { Some(_) => true, None => false }) {
+                print("yes");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}

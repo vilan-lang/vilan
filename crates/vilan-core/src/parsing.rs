@@ -2354,6 +2354,29 @@ impl<'a, 'src> Parser<'a, 'src> {
             })?;
             return Some((Node::Dereference(Box::new(inner)), self.span_from(start)));
         }
+        // B231: a BLOCK-LIKE expression as an operand. `match`/`if` are values
+        // everywhere else — an initializer, an argument, a `ret` tail — and the
+        // operator tower was the one position that refused them (`flag && match
+        // probe() { … }` read as `found 'match' expected an expression`), so the
+        // steer was "bind it first" for no reason the grammar could state. Both
+        // are led by a KEYWORD, so admitting them here is unambiguous: the
+        // construct's own braces are its legs/body, and the token after them is
+        // left for whatever wanted it (an enclosing `if`'s block, the next
+        // operator). B224's `Sequence` slot is what makes the lowering uniform —
+        // an operand that lowers to statements no longer loses its
+        // short-circuit.
+        //
+        // A BARE block is admitted in expression mode only. In condition mode
+        // (`no_struct`) a `{` after an operator is the enclosing construct's
+        // body — the same ambiguity `no_struct` already resolves for struct
+        // literals and `css` blocks — so there it stays refused and parentheses
+        // are the spelling.
+        match self.peek() {
+            Some(Token::Match) => return self.parse_match(),
+            Some(Token::If) => return self.parse_if(),
+            Some(Token::Ctrl('{')) if !no_struct => return self.parse_block_as_expression(),
+            _ => {}
+        }
         self.parse_member_accessor(no_struct)
     }
 
