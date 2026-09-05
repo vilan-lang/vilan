@@ -40306,6 +40306,36 @@ pub struct SourceRange {
     pub source: SourceId,
 }
 
+/// [`Program::source_lookup`]'s answerer: `source_of` without the per-row
+/// linear scan (M27).
+pub struct SourceLookup<'a> {
+    ranges: &'a [SourceRange],
+    /// The ranges are ascending and disjoint, so a binary search is exact.
+    /// When they are not, [`Self::of`] runs `source_of`'s own scan instead —
+    /// the two must never differ, and the way to guarantee that is to fall
+    /// back rather than to reason about it.
+    searchable: bool,
+}
+
+impl SourceLookup<'_> {
+    /// The source `id` originated from — [`Program::source_of`]'s answer,
+    /// exactly.
+    pub fn of(&self, id: Id) -> Option<SourceId> {
+        if self.searchable {
+            let at = self.ranges.partition_point(|range| range.end <= id.0);
+            return self
+                .ranges
+                .get(at)
+                .filter(|range| id.0 >= range.start && id.0 < range.end)
+                .map(|range| range.source);
+        }
+        self.ranges
+            .iter()
+            .find(|range| id.0 >= range.start && id.0 < range.end)
+            .map(|range| range.source)
+    }
+}
+
 /// Per-type destruction glue (destruction.md §5/§7). The transformer emits it as
 /// a `__drop_<type>` helper: run the value's own `drop(&mut self)` first (if the
 /// type has a `Drop` impl), then destroy its resource members — so a value cannot
@@ -41102,6 +41132,32 @@ impl<'src> Program<'src> {
             .iter()
             .find(|range| id.0 >= range.start && id.0 < range.end)
             .map(|range| range.source)
+    }
+
+    /// [`Self::source_of`], hoisted out of a whole-program loop (M27).
+    ///
+    /// `source_of` is a LINEAR scan of `source_ranges`, and the editor tables
+    /// ask it once per row: on kolt's client that is ~100,000 rows against ~60
+    /// ranges, and the product is most of what `lsp-index` costs. The ranges
+    /// are minted from a monotonically increasing entity counter, so they come
+    /// out ascending and disjoint and a binary search answers the same
+    /// question — but this refuses to ASSUME that. It checks, once, that the
+    /// ranges really are ascending and disjoint, and falls back to the very
+    /// scan `source_of` runs when they are not, so the lookup is
+    /// answer-identical to `source_of` for every id under every ordering.
+    pub fn source_lookup(&self) -> SourceLookup<'_> {
+        let searchable = self
+            .source_ranges
+            .windows(2)
+            .all(|pair| pair[0].end <= pair[1].start)
+            && self
+                .source_ranges
+                .iter()
+                .all(|range| range.start <= range.end);
+        SourceLookup {
+            ranges: &self.source_ranges,
+            searchable,
+        }
     }
 
     /// [`Self::source_of`] INVERTED: the entity-id ranges `source`'s own

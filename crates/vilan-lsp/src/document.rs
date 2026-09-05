@@ -1620,32 +1620,54 @@ impl Document {
             stamp: None,
             entries: Vec::new(),
         }];
-        let slot_of = |source: SourceId, by_module: &mut Vec<ModuleSymbols>| -> Option<usize> {
-            if source == SourceId(0) {
-                return Some(SymbolIndex::ENTRY);
+        // M27: the slot a source's symbols land in, remembered.
+        //
+        // This closure ran once per DECLARATION in the program and found the
+        // module by scanning `by_module` and comparing paths — so a program
+        // with M modules and D declarations paid M path comparisons D times,
+        // on every landed keystroke. Two sources can still share a slot
+        // (that is what the path comparison was for), so the memo is keyed by
+        // SourceId and filled through the same path search the first time each
+        // source is seen: the slots come out identical, in the identical
+        // order, and the search runs once per source instead of once per
+        // declaration.
+        let mut slot_by_source: HashMap<SourceId, Option<usize>> = HashMap::default();
+        let mut slot_of = |source: SourceId, by_module: &mut Vec<ModuleSymbols>| -> Option<usize> {
+            if let Some(known) = slot_by_source.get(&source) {
+                return *known;
             }
-            if source == DERIVED_SOURCE {
-                return None;
-            }
-            let path = program.canonical_sources.get(source.0 as usize)?;
-            if let Some(existing) = by_module
-                .iter()
-                .position(|module| module.path.as_deref() == Some(path.as_path()))
-            {
-                return Some(existing);
-            }
-            by_module.push(ModuleSymbols {
-                path: Some(path.clone()),
-                module_name: module_name_of(path),
-                stamp: None,
-                entries: Vec::new(),
-            });
-            Some(by_module.len() - 1)
+            let slot = (|| {
+                if source == SourceId(0) {
+                    return Some(SymbolIndex::ENTRY);
+                }
+                if source == DERIVED_SOURCE {
+                    return None;
+                }
+                let path = program.canonical_sources.get(source.0 as usize)?;
+                if let Some(existing) = by_module
+                    .iter()
+                    .position(|module| module.path.as_deref() == Some(path.as_path()))
+                {
+                    return Some(existing);
+                }
+                by_module.push(ModuleSymbols {
+                    path: Some(path.clone()),
+                    module_name: module_name_of(path),
+                    stamp: None,
+                    entries: Vec::new(),
+                });
+                Some(by_module.len() - 1)
+            })();
+            slot_by_source.insert(source, slot);
+            slot
         };
         let epoch = self.analysis_revision.max(1);
-        let push =
+        // M27: `source_of`'s linear range scan, hoisted out of the per-
+        // declaration loop the same way.
+        let source_of = program.source_lookup();
+        let mut push =
             |id: Id, name: String, kind: CompletionKind, by_module: &mut Vec<ModuleSymbols>| {
-                let Some(source) = program.source_of(id) else {
+                let Some(source) = source_of.of(id) else {
                     return;
                 };
                 let Some(slot) = slot_of(source, by_module) else {

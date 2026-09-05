@@ -87,11 +87,27 @@ pub struct Analysis<'a, 'src> {
 /// [`entity_at`]'s innermost-containing lookup. Computed once per analysis by
 /// both front-ends through this one function, so neither can drift.
 pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
+    // M27: walked by the ENTRY'S ID RANGE, not by scanning `span_map`.
+    //
+    // The map is whole-program, and this table is the entry file's alone: on
+    // kolt's client that was ~100,000 rows visited (each paying `source_of`'s
+    // linear scan over ~60 source ranges) to keep the few thousand the open
+    // buffer wrote. Ids are assigned per file in contiguous blocks, so the
+    // entry's rows can be FETCHED — the same move `Program::id_ranges_of` was
+    // introduced for (E114). The cost is now the edited buffer's size, which
+    // is what M27 asks of `lsp-index`.
+    //
+    // The rows are the same rows; they come out in ascending id order rather
+    // than in the map's arbitrary one, which is the more defined of the two —
+    // `entity_at` breaks a tie on span width by taking the first, and "the
+    // first" now means something.
     let mut entity_spans = Vec::new();
-    for (id, span) in &program.span_map {
-        if program.source_of(*id) != Some(SourceId(0)) {
+    let entry_ids = program.id_ranges_of(SourceId(0));
+    for id in entry_ids.into_iter().flatten().map(Id) {
+        let Some(span) = program.span_map.get(&id) else {
             continue;
-        }
+        };
+        let id = &id;
         // A synthesized `Expr::Void` (S3, editing-dx.md §3.9: the parser's
         // filler for a block with no trailing expression, now spanning the
         // closing brace instead of a zero-width point past it) is not
