@@ -3,7 +3,7 @@
 // keep firing after the extent exits and die with their owner. Extents nest;
 // the nearest wins.
 import std::io::print;
-import std::reactive::{ Signal, Owner, Disposable, owner_scope, get_owner, run_with_owner, comp };
+import std::reactive::{ Disposable, Owner, Signal, comp, get_owner, owner_scope, run_with_owner };
 
 fun main() {
 	let count = Signal::new(1);

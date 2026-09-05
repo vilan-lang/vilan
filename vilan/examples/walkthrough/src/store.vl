@@ -89,7 +89,7 @@ impl NotesStore {
 					.run([title, ""]);
 				self.notes.set_with(|list| {
 					mut updated = list;
-					updated.push(Note { id = id, title = title, body = "" });
+					updated.push(Note { id, title, body = "" });
 					updated
 				});
 				id
@@ -107,7 +107,7 @@ impl NotesStore {
 				db.prepare("UPDATE note SET title = ? WHERE id = ?").run([title, note_id]);
 				self.notes.set_with(|list| list.map(|note| {
 					if note.id == note_id {
-						Note { id = note.id, title = title, body = note.body }
+						Note { id = note.id, title, body = note.body }
 					} else {
 						note
 					}
@@ -126,7 +126,7 @@ impl NotesStore {
 				db.prepare("UPDATE note SET body = ? WHERE id = ?").run([body, note_id]);
 				self.notes.set_with(|list| list.map(|note| {
 					if note.id == note_id {
-						Note { id = note.id, title = note.title, body = body }
+						Note { id = note.id, title = note.title, body }
 					} else {
 						note
 					}
@@ -187,7 +187,7 @@ fun session_user(db: Database, token: str): Option<str> {
 fun open_session(db: Database, username: str): AuthOutcome {
 	let token = fresh_token();
 	db.prepare("INSERT INTO session (token, username) VALUES (?, ?)").run([token, username]);
-	AuthOutcome { ok = true, token = token, reason = "" }
+	AuthOutcome { ok = true, token, reason = "" }
 }
 
 fun load_notes(db: Database): List<Note> {

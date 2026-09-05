@@ -387,7 +387,12 @@ fun scan_dir(path: str): List<Entry> {
 	let options = new_fs_options();
 	options.set_with_file_types(true);
 	let raw = raw_scan_dir(path, options);
-	raw.map(|entry| Entry { name = entry.name(), is_directory = entry.is_directory(), is_file = entry.is_file(), is_symlink = entry.is_symlink() })
+	raw.map(|entry| Entry {
+		name = entry.name(),
+		is_directory = entry.is_directory(),
+		is_file = entry.is_file(),
+		is_symlink = entry.is_symlink(),
+	})
 }
 
 // --- stat --------------------------------------------------------------
@@ -745,7 +750,7 @@ impl Reader {
 	/// a `modify` handle is as legitimate as one over an `open` handle. A
 	/// single-name form would have to pick `"r"` silently.
 	fun of(own file: File): Reader {
-		Reader { file = file, cursor = Shared::new(0i53) }
+		Reader { file, cursor = Shared::new(0i53) }
 	}
 
 	/// The next `size` bytes from the cursor, advancing it by however many

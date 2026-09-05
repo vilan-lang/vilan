@@ -249,7 +249,7 @@ impl Document {
 	/// (E70) rather than trusting it.
 	fun of(build: LegBuild): Document {
 		Document {
-			build = build,
+			build,
 			shell = None,
 			source = "",
 			title = "",
@@ -275,7 +275,7 @@ impl Document {
 	/// precisely so that dropping a rung never drops the check.
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
 		match check_shell(shell, build, default_mount) {
-			Ok(let _checked) => Ok(Document { build = build, shell = Some(shell), source = "this supplied shell", title = "", description = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
+			Ok(let _checked) => Ok(Document { build, shell = Some(shell), source = "this supplied shell", title = "", description = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
 			Err(let faults) => Err(faults),
 		}
 	}
@@ -771,13 +771,7 @@ fun tags_of(markup: str): List<Tag> {
 			}
 			let name = markup.substring(index + 2, cursor).to_lowercase_ascii();
 			let end = past(index_of(markup, ">", cursor), 1, length);
-			tags.push(Tag {
-				name = name,
-				attributes = [],
-				start = index,
-				end = end,
-				closing = true,
-			});
+			tags.push(Tag { name, attributes = [], start = index, end, closing = true });
 			index = end;
 			jump continue;
 		}
@@ -792,13 +786,7 @@ fun tags_of(markup: str): List<Tag> {
 		}
 		let name = markup.substring(index + 1, cursor).to_lowercase_ascii();
 		let (attributes, end) = attributes_of(markup, cursor);
-		tags.push(Tag {
-			name = name,
-			attributes = attributes,
-			start = index,
-			end = end,
-			closing = false,
-		});
+		tags.push(Tag { name, attributes, start = index, end, closing = false });
 		index = if name == "script" || name == "style" {
 			skip_raw_text(markup, end, name)
 		} else {

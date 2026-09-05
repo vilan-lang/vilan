@@ -49,10 +49,10 @@ fun main() {
 	right.insert(2);
 	right.insert(3);
 	right.insert(4);
-	print(left.union(right).len());        // 4 -- {1,2,3,4}
+	print(left.union(right).len()); // 4 -- {1,2,3,4}
 	print(left.intersection(right).len()); // 2 -- {2,3}
-	print(left.difference(right).len());   // 1 -- {1}
-	print(left.union(empty).len());        // 3 -- identity
+	print(left.difference(right).len()); // 1 -- {1}
+	print(left.union(empty).len()); // 3 -- identity
 	print(left.intersection(empty).len()); // 0
-	print(left.difference(empty).len());   // 3 -- nothing removed
+	print(left.difference(empty).len()); // 3 -- nothing removed
 }

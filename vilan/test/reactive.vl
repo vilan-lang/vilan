@@ -1,5 +1,5 @@
 import std::io::print;
-import std::reactive::{ Signal, Owner };
+import std::reactive::{ Owner, Signal };
 
 // `std::reactive` — explicit-dependency reactivity. A `Signal` is a writable
 // root; `map` builds a `Signal` whose dependency is structural (no

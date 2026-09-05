@@ -1,6 +1,6 @@
 import std::io::print;
 import std::map::Map;
-import std::reactive::{ Signal, SignalCell, Owner, batch };
+import std::reactive::{ Owner, Signal, SignalCell, batch };
 
 // `Signal::update` (A18, proposal/signal-update.md) — the closure receives a
 // writable view of the STORED value and the runtime notifies ONCE,
@@ -12,7 +12,9 @@ fun main() {
 
 	// In place: no copy-transform-return, and a later `get` sees the push.
 	let todos = Signal::new([1, 2]);
-	todos.update(|&mut list| { list.push(5); });
+	todos.update(|&mut list| {
+		list.push(5);
+	});
 	print(todos.get().len()); // 3
 
 	// The same method serves a `Map` — no per-container twin.
@@ -25,7 +27,9 @@ fun main() {
 
 	// A scalar element writes through the view (`*` reads it out).
 	let count = Signal::new(1);
-	count.update(|&mut value| { value = *value + 10; });
+	count.update(|&mut value| {
+		value = *value + 10;
+	});
 	print(count.get()); // 11
 
 	// One notification per call, whatever the closure did — including nothing.
@@ -40,8 +44,12 @@ fun main() {
 
 	// Under a turn the notification defers and coalesces like any other write.
 	batch(|| {
-		watched.update(|&mut list| { list.push(3); });
-		watched.update(|&mut list| { list.push(4); });
+		watched.update(|&mut list| {
+			list.push(3);
+		});
+		watched.update(|&mut list| {
+			list.push(4);
+		});
 		print("inside");
 	}); // len 5, once, at the boundary
 

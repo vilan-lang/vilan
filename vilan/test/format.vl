@@ -1,5 +1,5 @@
-import std::io::print;
 import std::display::{ Display, format };
+import std::io::print;
 
 // `format(value)` renders any `Display` value to its string form, so a complex
 // value logs readably. `print(value)` alone shows the raw runtime form (a struct

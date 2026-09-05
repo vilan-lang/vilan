@@ -24,8 +24,13 @@
 //!    `release.yml` running the same command. A leg added to CI and not to the
 //!    release reds here.
 //! 2. **The commands are identical, not merely similar.** Read out of both
-//!    files and compared as strings, which is what "character for character"
-//!    has to mean to be checkable.
+//!    sides and compared as strings, which is what "character for character"
+//!    has to mean to be checkable. The CI side is `scripts/ci-local.sh` rather
+//!    than `ci.yml` since L19: the workflow's leg jobs CALL that script, so the
+//!    script is where CI's commands now are, and reading `ci.yml` for them
+//!    would find nothing and pass vacuously. That the calling is complete —
+//!    every leg job invokes the script, no leg job runs a cargo gate inline —
+//!    is `ci_local_script.rs`'s property, and this file leans on it.
 //! 3. **The publishing jobs wait on all of them.** A leg that runs but that
 //!    nothing needs cannot stop a publish, which is the failure mode with no
 //!    outward symptom: a green tick beside a job whose verdict was discarded.
@@ -50,6 +55,13 @@ fn workflow(name: &str) -> String {
         .join("../../.github/workflows")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{name}: {error}"))
+}
+
+/// The CI side's gate commands: `scripts/ci-local.sh`, which is what every leg
+/// job in `ci.yml` runs (L19).
+fn ci_side() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ci-local.sh");
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("ci-local.sh: {error}"))
 }
 
 /// The legs both files must run, by the `run:` command that IS the leg.
@@ -97,15 +109,20 @@ fn job_body(text: &str, job: &str) -> String {
 
 #[test]
 fn every_ci_leg_runs_on_the_release_side_too() {
-    let ci = run_commands(&workflow("ci.yml"));
+    // The CI side is read as TEXT rather than as `run:` lines: the commands sit
+    // in shell functions in `scripts/ci-local.sh` now, one per leg, and a
+    // substring match is what "the same command, character for character"
+    // means against a file that is not YAML.
+    let ci = ci_side();
     let release = run_commands(&workflow("release.yml"));
     let mut missing = Vec::new();
     for (leg, command) in LEGS {
         assert!(
-            ci.iter().any(|run| run == command),
-            "`{leg}` is listed here as a CI leg but ci.yml does not run `{command}` — \
-             the leg was reworded or dropped, and this file's roster is now describing \
-             a workflow that no longer exists"
+            ci.contains(command),
+            "`{leg}` is listed here as a CI leg but `scripts/ci-local.sh` — the script \
+             every ci.yml leg job runs — does not run `{command}`. The leg was \
+             reworded or dropped, and this file's roster is now describing a gate \
+             that no longer exists"
         );
         if !release.iter().any(|run| run == command) {
             missing.push(format!("  {leg}: `{command}`"));
@@ -173,9 +190,19 @@ fn the_formatter_and_clippy_legs_pin_through_the_toolchain_file_on_both_sides() 
             ),
         ] {
             let body = job_body(&text, job);
+            // ci.yml's leg jobs call `scripts/ci-local.sh <leg>`; release.yml's
+            // still carry the command inline. Either spelling proves the job
+            // runs the leg — what this test is really about is the LINE BELOW,
+            // and a job whose body no longer names its leg at all would make
+            // that assertion vacuous.
+            let runs_the_leg = body.contains(command)
+                || (name == "ci.yml"
+                    && body.contains(&format!("scripts/ci-local.sh {job}"))
+                    && ci_side().contains(command));
             assert!(
-                body.contains(command),
-                "{name}'s `{job}` job does not run `{command}`:\n{body}"
+                runs_the_leg,
+                "{name}'s `{job}` job does not run `{command}`, directly or through \
+                 `scripts/ci-local.sh {job}`:\n{body}"
             );
             assert!(
                 !body.contains("RUSTUP_TOOLCHAIN"),

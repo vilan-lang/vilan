@@ -141,7 +141,7 @@ fn the_required_check_does_not_wait_on_the_advisory_leg() {
         .expect("`check` declares its needed jobs on one line");
     assert_eq!(
         needs.trim(),
-        "needs: [changes, test, wasm, fmt, clippy, audit]",
+        "needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit]",
         "`check` gained or lost a needed job — if the advisory ignored-pins leg is in \
          there, a weekly report can now block a PR. (Two senses of the word meet in \
          this file: `ci.yml`'s `audit` job is N21's RustSec leg, which is BLOCKING on \

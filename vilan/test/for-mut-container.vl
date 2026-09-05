@@ -1,11 +1,14 @@
 import std::io::print;
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 // Phase 5: mutable iteration over a *user* container. `for e in &mut c` drives a
 // `next_mut(&mut self): Option<&mut T>` iterator — the view-returning Option
 // from the wrapped-view work — binding each element as a writable view, so the
 // loop body writes through. A plain `for x in c` would drive `next` (a copy).
-struct Counter { items: List<i32>, pos: i32 }
+struct Counter {
+	items: List<i32>,
+	pos: i32,
+}
 
 impl Counter {
 	fun next_mut(&mut self): Option<&mut i32> {

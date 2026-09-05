@@ -1,6 +1,6 @@
 import std::io::print;
 import std::json::FromJson;
-import std::result::Result::{ self, Ok, Err };
+import std::result::Result::{ Err, Ok, self };
 
 // Derives extend to enums via a `match` over the variants. `Json` is externally
 // tagged: a payload-less variant is a string `"V"`, a single payload is

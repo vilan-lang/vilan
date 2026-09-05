@@ -425,7 +425,7 @@ impl Gradient {
 				self.stops + ", " + rendered
 			},
 			stop_count = self.stop_count + 1,
-			roots = roots,
+			roots,
 		}
 	}
 
@@ -814,7 +814,7 @@ impl Style {
 		emit("css", render_rule(media, condition, property, class, declaration));
 		mut rules = without_covered(self.rules, media, condition, property);
 		rules.insert(key, (class, declaration));
-		Style { rules = rules }
+		Style { rules }
 	}
 
 	/// The escape hatch: any property, any value, atomic like the rest. The
@@ -1515,7 +1515,7 @@ impl Style with Add {
 				None => {}
 			}
 		}
-		Style { rules = rules }
+		Style { rules }
 	}
 }
 
@@ -1572,7 +1572,7 @@ impl Declarations {
 			} else {
 				self.text + ";" + pair
 			},
-			roots = roots,
+			roots,
 		}
 	}
 

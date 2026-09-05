@@ -99,18 +99,24 @@ fun not_found_page(): View {
 
 fun app(route: SignalCell<Route>): View {
 	view("main")
-		.child(view("nav")
-			.child(link("Home", Route::Home))
-			.child(link("Docs", Route::Docs(1))))
+		.child(view("nav").child(link("Home", Route::Home)).child(link("Docs", Route::Docs(1))))
 		// The loading story's two hooks: true while a route chunk is fetching,
 		// with the previous page still on screen behind it — and the reason the
 		// last fetch failed, if one did. The failure renders `!` rather than the
 		// host's own message so the pin stays stable, but it renders it only
 		// when the reason is a non-empty string, so the message really did
 		// travel from the fetch to the app.
-		.child(view("p").class("pending").bind_text(pending().map(|busy| if busy { "..." } else { "" })))
+		.child(view("p").class("pending").bind_text(pending().map(|busy| if busy {
+			"..."
+		} else {
+			""
+		})))
 		.child(view("p").class("failed").bind_text(chunk_error().map(|reason| match reason {
-			Some(let text) => if text.len() > 0 { "!" } else { "?" },
+			Some(let text) => if text.len() > 0 {
+				"!"
+			} else {
+				"?"
+			},
 			None => "",
 		})))
 		.swap(route, |current| match current {

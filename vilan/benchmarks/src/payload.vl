@@ -4,13 +4,13 @@
 // compare the enveloped sizes against the bare values. Sizes are real UTF-8
 // byte counts, not code units.
 
-import std::io::print;
-import std::option::Option::{ self, Some, None };
-import std::bytes::encode_utf8;
-import std::json::{ Json, json_codec };
 import std::binary::binary_codec;
-import std::wire::{ Wire, Frame, Codec, Serializer, encode };
-import std::rpc::{ encode_request, encode_reply, reply };
+import std::bytes::encode_utf8;
+import std::io::print;
+import std::json::{ Json, json_codec };
+import std::option::Option::{ None, Some, self };
+import std::rpc::{ encode_reply, encode_request, reply };
+import std::wire::{ Codec, Frame, Serializer, Wire, encode };
 import pkg::report::section;
 
 [derive(Wire)]
@@ -29,7 +29,11 @@ fun sample_list(count: i32): List<BenchTodo> {
 			id = index,
 			label = i"todo item number {index}",
 			done = index & 1 == 1,
-			notes = if index & 3 == 0 { Some("with a note attached") } else { None },
+			notes = if index & 3 == 0 {
+				Some("with a note attached")
+			} else {
+				None
+			},
 		});
 		index += 1;
 	}
@@ -49,8 +53,12 @@ fun measure(label: str, count: i32) {
 	let bare_binary = frame_bytes(encode(binary_codec(), todos));
 	// The request envelope carrying the list as its one argument, and the
 	// success reply carrying it as the result — single-pass, both codecs.
-	let request_json = frame_bytes(encode_request(json_codec(), "sync", [|s: Serializer| todos.describe(s)]));
-	let request_binary = frame_bytes(encode_request(binary_codec(), "sync", [|s: Serializer| todos.describe(s)]));
+	let request_json = frame_bytes(encode_request(json_codec(), "sync", [
+		|s: Serializer| todos.describe(s),
+	]));
+	let request_binary = frame_bytes(encode_request(binary_codec(), "sync", [
+		|s: Serializer| todos.describe(s),
+	]));
 	let reply_json = frame_bytes(encode_reply(json_codec(), reply(todos)));
 	let reply_binary = frame_bytes(encode_reply(binary_codec(), reply(todos)));
 	print(i"{label}: bare {bare_json} B json / {bare_binary} B binary; request {request_json} / {request_binary}; reply {reply_json} / {reply_binary}");

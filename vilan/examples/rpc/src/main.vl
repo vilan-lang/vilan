@@ -233,7 +233,7 @@ fun main() {
 	// transport — the wiring a client stub connects to. Both the RPC and reactive protocols
 	// below are `Protocol`s (§2).
 	let transport = local_rpc(accounts_dispatcher().into_protocol(json_codec()));
-	let client = AccountsClient { transport = transport, codec = json_codec() };
+	let client = AccountsClient { transport, codec = json_codec() };
 
 	// A hit (id 1 -> ada), a miss (id 9 -> None, an application-level absence), and a
 	// bogus call made directly through the transport (a clean RpcError, no crash).

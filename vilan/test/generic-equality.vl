@@ -1,7 +1,10 @@
-import std::{ io::print, option::Option::{ self, Some, None } };
 import std::compare::PartialEq;
+import std::{ io::print, option::Option::{ None, Some, self } };
 
-struct Point { x: i32, y: i32 }
+struct Point {
+	x: i32,
+	y: i32,
+}
 
 impl Point with PartialEq {
 	fun eq(self, b: Point): bool {

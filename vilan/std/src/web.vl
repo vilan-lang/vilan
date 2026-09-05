@@ -9,8 +9,8 @@
 // (§8) applied to std itself: a prelude REPLACES, extension is spelled by
 // re-export, and std does not get a merge mechanism its users lack.
 export import pkg::io::print;
-export import pkg::option::Option::{ self, None, Some };
-export import pkg::result::Result::{ self, Err, Ok };
+export import pkg::option::Option::{ None, Some, self };
+export import pkg::result::Result::{ Err, Ok, self };
 
 // `Signal` — rank 1 in application code (21 of 42 app files, ahead of `print`
 // at 15). Base layer, so a server-rendered build reaches it too.
@@ -29,7 +29,7 @@ export import pkg::reactive::SignalCell;
 // tree is dense with `view("div")` calls, which is why these are bare members
 // and not left to `ui::`. `std::ui` is declared by BOTH platform layers, so
 // neither name colors this prelude to one target.
-export import pkg::ui::{ view, View };
+export import pkg::ui::{ View, view };
 
 // Ambient MODULES (§5.2). A module entry costs one name in the bare namespace —
 // its own — and buys a whole namespace behind one qualifying segment.

@@ -7,7 +7,9 @@
 // subscript gets a temp, a pure one is left exactly as it was.
 import std::io::print;
 
-struct Cell { n: i32 }
+struct Cell {
+	n: i32,
+}
 
 mut calls = 0;
 

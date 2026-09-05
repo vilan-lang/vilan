@@ -188,7 +188,8 @@ impl View {
 	/// `prevent_default`, modifier keys, key names. The same turn discipline:
 	/// each dispatch settles as one wave.
 	fun on_event(self, event: str, handler: (|Event| void) context turn_scope): View {
-		self.element.on_event(event, |dispatched| turn(FlushPolicy::AtSuspension, || handler(dispatched)));
+		self.element
+			.on_event(event, |dispatched| turn(FlushPolicy::AtSuspension, || handler(dispatched)));
 		self
 	}
 

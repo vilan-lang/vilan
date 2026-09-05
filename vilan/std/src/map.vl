@@ -17,7 +17,7 @@ struct Map<K: Hashable, V> {
 impl Map<type K: Hashable, type V> {
 	fun new(): Map<K, V> {
 		let table: NativeMap<(K, V)> = NativeMap::new();
-		Map { table = table }
+		Map { table }
 	}
 
 	fun insert(&mut self, key: K, value: V) {

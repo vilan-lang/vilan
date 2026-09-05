@@ -9,7 +9,7 @@ trait Pick {
 }
 
 struct Pair {
-	x: i32
+	x: i32,
 }
 
 impl i32 with Pick {

@@ -18,12 +18,16 @@
 // witness: const guard = [ "teardown" ]; $b(guard); console.log("body");
 // witness: $a = 7; process.exit($a);
 // witness-absent: finally
-import std::io::print;
 import std::drop::Drop;
+import std::io::print;
 
-resource struct Guard { tag: str }
+resource struct Guard {
+	tag: str,
+}
 impl Guard with Drop {
-	fun drop(&mut self) { print(self.tag); }
+	fun drop(&mut self) {
+		print(self.tag);
+	}
 }
 
 fun main(): i32 {

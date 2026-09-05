@@ -3,7 +3,10 @@
 // JS-reference semantics both would change.
 import std::io::print;
 
-struct Point { x: i32, y: i32 }
+struct Point {
+	x: i32,
+	y: i32,
+}
 
 fun main() {
 	// Struct copy: `b` is an independent copy of `a`.

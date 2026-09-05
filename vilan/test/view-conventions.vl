@@ -3,7 +3,9 @@
 // pass-through this slice, so these behave like the bare forms.
 import std::io::print;
 
-struct Counter { value: i32 }
+struct Counter {
+	value: i32,
+}
 
 fun bump(c: &mut Counter) {
 	c.value = c.value + 1;
@@ -15,7 +17,7 @@ fun peek(own c: Counter): i32 {
 
 fun main() {
 	mut c = Counter { value = 10 };
-	bump(&mut c);   // type-position `&mut Counter` parameter
+	bump(&mut c); // type-position `&mut Counter` parameter
 	print(c.value); // 11
 	print(peek(c)); // 11 — `own` parameter
 }

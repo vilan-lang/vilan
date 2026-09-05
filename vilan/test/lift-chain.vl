@@ -1,6 +1,6 @@
 import std::io::print;
-import std::option::Option::{ self, Some, None };
-import std::result::Result::{ self, Ok, Err };
+import std::option::Option::{ None, Some, self };
+import std::result::Result::{ Err, Ok, self };
 
 // `a?.b.c` (try-and-lift §3): the continuation applies INSIDE the container —
 // map when it yields a plain value, flatten when it yields the container.

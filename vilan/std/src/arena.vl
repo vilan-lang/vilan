@@ -74,12 +74,12 @@ impl Arena<type T> {
 		match self.free.pop() {
 			Some(let index) => {
 				self.slots[index].value = value;
-				Handle { index = index, generation = self.slots[index].generation }
+				Handle { index, generation = self.slots[index].generation }
 			},
 			None => {
 				let index = self.slots.len();
-				self.slots.push(Slot { generation = self.brand, value = value });
-				Handle { index = index, generation = self.brand }
+				self.slots.push(Slot { generation = self.brand, value });
+				Handle { index, generation = self.brand }
 			},
 		}
 	}

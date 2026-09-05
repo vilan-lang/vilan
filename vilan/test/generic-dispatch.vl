@@ -1,6 +1,6 @@
 import std::io::print;
 import std::json::Json;
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 // A generic function dispatching a trait method on its argument. The concrete
 // type may be a primitive whose `Json` impl is an `[extern]` host binding

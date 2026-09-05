@@ -17,7 +17,12 @@
 import std::io::print;
 
 fun main() {
-	let clamp = |x: i32| { if x > 1 { ret 9; } x };
+	let clamp = |x: i32| {
+		if x > 1 {
+			ret 9;
+		}
+		x
+	};
 	print(clamp(0));
 	print(clamp(5));
 	mut i = 0;

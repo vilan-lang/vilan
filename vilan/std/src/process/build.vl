@@ -173,16 +173,16 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 	}
 	Ok(LegBuild {
 		leg = coerce_str(manifest.field("leg")),
-		dist = dist,
+		dist,
 		bundle = coerce_str(manifest.field("entry")),
 		styles = if styles.is_null() {
 			None
 		} else {
 			Some(coerce_str(styles))
 		},
-		chunks = chunks,
+		chunks,
 		classic_script = coerce_bool(manifest.field("classic_script")),
-		assets = assets,
+		assets,
 	})
 }
 
@@ -232,12 +232,7 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 				if fs::stat(file).is_none() {
 					panic(i"the `{build.leg}` build names {file}, which is not on disk — rebuild the leg (`vilan build .`), and run the server from the project root");
 				}
-				assets.push(BuildAsset {
-					url = url,
-					file = file,
-					content_type = content_type,
-					content = fs::read_bytes(file),
-				});
+				assets.push(BuildAsset { url, file, content_type, content = fs::read_bytes(file) });
 			},
 		}
 	}

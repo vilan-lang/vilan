@@ -17,7 +17,11 @@ fun pick(values: List<i32>): Option<i32> {
 }
 
 fun parse(text: str): Result<i32, str> {
-	if text == "7" { Ok(7) } else { Err("not seven") }
+	if text == "7" {
+		Ok(7)
+	} else {
+		Err("not seven")
+	}
 }
 
 fun main() {

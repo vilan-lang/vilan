@@ -89,7 +89,7 @@ impl Session {
 
 	/// The ordinary `authorize` result: this connection is `identity`.
 	fun of(identity: str): Session {
-		Session { identity = identity, credential = "" }
+		Session { identity, credential = "" }
 	}
 
 	/// `of`, keeping the credential the identity was proved with.
@@ -466,7 +466,7 @@ impl Service {
 		Service {
 			build_protocol = |connection| build(connection).dispatcher_for().into_protocol(codec),
 			shared = None,
-			codec = codec,
+			codec,
 			mount = "/",
 			on_connect = |connection, wire| register_session(connection, wire, codec),
 			on_disconnect = |connection| drop_session(connection),
@@ -1025,8 +1025,8 @@ fun accept_socket(
 	// `respond` below routes through it. `session` is what `authorize` proved
 	// about this client (A40) — anonymous when the service gates nothing.
 	let protocol = (service.build_protocol)(Connection {
-		id = id,
-		session = session,
+		id,
+		session,
 		// The same reading `authorize` and the rate limit used (A48).
 		remote_addr = client_address(service, request, socket),
 	});

@@ -61,7 +61,7 @@
 // captures bind with no copy and no declaration, and admitting it would take
 // back B53 §2's elision.
 import std::io::print;
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 enum Feed {
 	Ready(List<str>, i32),
@@ -183,11 +183,17 @@ fun grow_first(pair: (List<i32>, i32)): i32 {
 	0
 }
 
-struct Cell { pair: (List<i32>, i32) }
+struct Cell {
+	pair: (List<i32>, i32),
+}
 
 impl Cell {
-	fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.pair }
-	fun peek(&self): &(List<i32>, i32) borrows self { &self.pair }
+	fun slot(&mut self): &mut (List<i32>, i32) borrows self {
+		&mut self.pair
+	}
+	fun peek(&self): &(List<i32>, i32) borrows self {
+		&self.pair
+	}
 }
 
 fun called_component(): i32 {

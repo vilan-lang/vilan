@@ -389,7 +389,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 		} else if c == 33 {
 			if i + 1 < n && text.code_at(i + 1) == 91 {
 				ret Err(ParseError {
-					line = line,
+					line,
 					message = "an image (![alt](destination)) — images are outside the census grammar",
 				});
 			}
@@ -397,7 +397,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 		} else if c == 91 {
 			if i + 1 < n && text.code_at(i + 1) == 94 {
 				ret Err(ParseError {
-					line = line,
+					line,
 					message = "a footnote ([^label]) — footnotes are outside the census grammar",
 				});
 			}
@@ -422,7 +422,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 						}
 					} else if after < n && text.code_at(after) == 91 {
 						ret Err(ParseError {
-							line = line,
+							line,
 							message = "a reference-style link ([text][label]) — only inline [text](destination) links are in the census grammar",
 						});
 					} else {
@@ -436,7 +436,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 		} else if c == 126 {
 			if i + 1 < n && text.code_at(i + 1) == 126 {
 				ret Err(ParseError {
-					line = line,
+					line,
 					message = "strikethrough (~~text~~) — outside the census grammar",
 				});
 			}
@@ -445,7 +445,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 			if i + 1 < n && is_ascii_punctuation(text.code_at(i + 1)) {
 				let escaped = text.substring(i + 1, i + 2);
 				ret Err(ParseError {
-					line = line,
+					line,
 					message = "a backslash escape (\\" + escaped + ") — the census grammar's only escape is \\| inside a table cell",
 				});
 			}
@@ -474,7 +474,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 						plain_from = i;
 					} else if is_tag_shape(inner) {
 						ret Err(ParseError {
-							line = line,
+							line,
 							message = "a raw HTML tag (<" + inner + ">) — the census grammar's only HTML passthrough is <a id=\"…\"></a>; wrap literal <…> text (a generic like List<T>) in backticks",
 						});
 					} else {
@@ -690,7 +690,7 @@ fun assign_ids(blocks: List<Block>, used_before: List<str>): IdWalk {
 			}
 		}
 	}
-	IdWalk { blocks = out, used = used }
+	IdWalk { blocks = out, used }
 }
 
 // --- tables ------------------------------------------------------------------

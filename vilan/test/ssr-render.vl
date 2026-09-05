@@ -38,7 +38,9 @@ fun main() {
 
 	// An svg root carries its namespace (B37) — seeded first, so a component's
 	// own attributes follow it; descendants inherit and need none.
-	print(render(view("svg").attr("viewBox", "0 0 24 24").child(view("path").attr("d", "M5 12h14"))));
+	print(render(view("svg")
+		.attr("viewBox", "0 0 24 24")
+		.child(view("path").attr("d", "M5 12h14"))));
 
 	// Mixed content (element-syntax S1): text children — plain and
 	// signal-read-once — interleave with elements as real siblings, in written

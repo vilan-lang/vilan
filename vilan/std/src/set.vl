@@ -16,7 +16,7 @@ impl Set<type T: Hashable> {
 		// The annotated `let` directs `NativeMap::new()`'s element type; a
 		// struct-literal field doesn't direct a generic call (a known gap).
 		let table: NativeMap<T> = NativeMap::new();
-		Set { table = table }
+		Set { table }
 	}
 
 	fun insert(&mut self, value: T) {

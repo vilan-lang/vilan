@@ -30,7 +30,16 @@
 
 import pkg::compare::PartialEq;
 import pkg::option::Option::{ None, self };
-import pkg::reactive::{ Draft, Owner, Signal, SignalCell, Source, owner_scope, run_with_owner, turn_scope };
+import pkg::reactive::{
+	Draft,
+	Owner,
+	Signal,
+	SignalCell,
+	Source,
+	owner_scope,
+	run_with_owner,
+	turn_scope,
+};
 import pkg::shared::Shared;
 import pkg::style::Style;
 

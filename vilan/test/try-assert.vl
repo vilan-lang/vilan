@@ -1,7 +1,7 @@
 import std::io::print;
-import std::option::Option::{ self, Some, None };
-import std::result::Result::{ self, Ok, Err };
 import std::operators::{ Try, Verdict };
+import std::option::Option::{ None, Some, self };
+import std::result::Result::{ Err, Ok, self };
 
 // `expr!` (try-and-lift §2): unwrap the good half, or return the bad half from
 // the nearest enclosing function.

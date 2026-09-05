@@ -11,7 +11,7 @@ struct Range {
 
 impl Range {
 	fun new(start: i32, end: i32): Range {
-		Range { current = start, end = end }
+		Range { current = start, end }
 	}
 }
 

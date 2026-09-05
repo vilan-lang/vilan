@@ -41,13 +41,17 @@
 // collapse one, so a by-value return emits `cell[0]` / `value[0][value[1]]` —
 // the value — while the `borrows` twin one line down emits the pair itself.
 // Again only the return type separates them.
-import std::io::print;
 import std::compare::Ordering;
-import std::option::Option::{ self, Some, None };
+import std::io::print;
+import std::option::Option::{ None, Some, self };
 
-struct Holder { items: List<i32> }
+struct Holder {
+	items: List<i32>,
+}
 
-struct Cell { n: i32 }
+struct Cell {
+	n: i32,
+}
 
 fun hold_in_list(items: List<i32>): List<List<i32>> {
 	[items]
@@ -76,7 +80,11 @@ fun keep_scalars(a: i32, b: i32): (i32, i32) {
 }
 
 fun first_of(primary: List<i32>, fallback: List<i32>): List<i32> {
-	if primary.len() > 0 { primary } else { fallback }
+	if primary.len() > 0 {
+		primary
+	} else {
+		fallback
+	}
 }
 
 fun own_through(own items: List<i32>): List<i32> {

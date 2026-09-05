@@ -31,7 +31,10 @@ async fun main() {
 		// Create, serialize, discard: a fresh `app()` is built and rendered per
 		// request into a copy of the document. No effects, no subscriptions, no
 		// owner survives the response.
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page.render(app()).html()).build())
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html")
+			.body(page.render(app()).html())
+			.build())
 		.on_start(|server| print("ssr example: http://localhost:8791/"))
 		.build()
 		.start();

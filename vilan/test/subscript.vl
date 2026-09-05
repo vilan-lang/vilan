@@ -6,7 +6,10 @@ import std::io::print;
 // writing never creates a slot (growth is `push`), and `get(i)` is the total,
 // Option-returning form. An aggregate element read copies (value semantics),
 // and an aggregate element view aliases.
-struct Point { x: i32, y: i32 }
+struct Point {
+	x: i32,
+	y: i32,
+}
 
 fun bump(slot: &mut i32) {
 	slot = *slot + 100;

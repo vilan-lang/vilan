@@ -142,12 +142,12 @@ struct Request {
 
 /// Start a GET request.
 fun get(url: str): Request {
-	Request { url = url, method = "GET", body = "", headers = [] }
+	Request { url, method = "GET", body = "", headers = [] }
 }
 
 /// Start a POST request carrying `body`.
 fun post(url: str, body: str): Request {
-	Request { url = url, method = "POST", body = body, headers = [] }
+	Request { url, method = "POST", body, headers = [] }
 }
 
 /// A one-shot binary POST (no header chaining): send `body` as bytes and await
@@ -163,7 +163,7 @@ fun post_bytes(url: str, body: Bytes): Response {
 impl Request {
 	/// Add a request header (e.g. `Content-Type`, `Authorization`).
 	fun header(own self, name: str, value: str): Request {
-		self.headers.push(Header { name = name, value = value });
+		self.headers.push(Header { name, value });
 		self
 	}
 

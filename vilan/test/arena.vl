@@ -1,6 +1,6 @@
-import std::io::print;
 import std::arena::{ Arena, Handle };
-import std::option::Option::{ self, Some, None };
+import std::io::print;
+import std::option::Option::{ None, Some, self };
 
 // `Arena<T>` + `Handle<T>`: stable, deletion-safe identities. A handle is two
 // integers, so — unlike a view — it is storable in a struct field, which is what

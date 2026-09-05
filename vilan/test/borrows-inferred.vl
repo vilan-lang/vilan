@@ -4,7 +4,9 @@ import std::io::print;
 // projecting one of its parameters borrows that parameter automatically — no
 // `borrows` clause needed. (A returned view of a local still dangles and is
 // rejected; only parameter projections are admitted.)
-struct Wrapper { value: i32 }
+struct Wrapper {
+	value: i32,
+}
 
 impl Wrapper {
 	// `&mut` return → a writable projection, inferred `borrows self`.

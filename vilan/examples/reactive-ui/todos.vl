@@ -63,7 +63,7 @@ fun todos(): View {
 			next_id.set(id + 1);
 			items.set_with(|list| {
 				mut next = list;
-				next.push(Todo { id = id, label = label, done = false });
+				next.push(Todo { id, label, done = false });
 				next
 			});
 			draft.set("");

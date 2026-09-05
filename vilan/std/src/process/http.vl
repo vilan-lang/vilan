@@ -581,7 +581,7 @@ impl Server {
 			// suspend" — and a synchronous file read in `std::fs` was justified
 			// by that claim for the length of its life.
 			let content = read_request_bytes(node_request);
-			let response = request_handler(Request { node = node_request, content = content });
+			let response = request_handler(Request { node = node_request, content });
 			node_response.set_status_code(response.status);
 			if response.headers.len() == 0 {
 				node_response.set_header_raw("Content-Type", "text/plain");

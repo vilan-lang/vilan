@@ -186,7 +186,7 @@ struct BinaryReader {
 
 impl BinaryReader {
 	fun new(bytes: Bytes): BinaryReader {
-		BinaryReader { bytes = bytes, cursor = Shared::new(0), error = Shared::new(None) }
+		BinaryReader { bytes, cursor = Shared::new(0), error = Shared::new(None) }
 	}
 
 	fun ok(self): bool {

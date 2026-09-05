@@ -38,7 +38,7 @@ impl TodoStore {
 		self.next_id.write() = id + 1;
 		self.todos.set_with(|list| {
 			mut updated = list;
-			updated.push(Todo { id = id, label = label, done = false });
+			updated.push(Todo { id, label, done = false });
 			updated
 		});
 		id

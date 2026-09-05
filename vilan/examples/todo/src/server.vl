@@ -43,7 +43,10 @@ async fun main() {
 		.port(59386)
 		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
 		.serve_build(build)
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html")
+			.body(page)
+			.build())
 		.on_start(|server| print(i"todo server: {server.url()} — open it in two tabs"))
 		.build()
 		.start();

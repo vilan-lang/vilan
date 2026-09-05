@@ -1,5 +1,5 @@
 import std::io::print;
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 fun main() {
 	print("42".parse_i32().unwrap_or(0 - 1)); // 42

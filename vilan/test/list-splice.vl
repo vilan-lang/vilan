@@ -4,20 +4,20 @@ fun main() {
 	mut xs = [1, 2, 4];
 
 	xs.insert(2, 3);
-	print(xs.len());     // 4
-	print(xs[2]);        // 3
-	print(xs[3]);        // 4
+	print(xs.len()); // 4
+	print(xs[2]); // 3
+	print(xs[3]); // 4
 
-	xs.insert(4, 5);     // index == len appends
-	print(xs[4]);        // 5
+	xs.insert(4, 5); // index == len appends
+	print(xs[4]); // 5
 
-	xs.insert(0, 0);     // index 0 shifts everything right
-	print(xs[0]);        // 0
-	print(xs[1]);        // 1
-	print(xs.len());     // 6
+	xs.insert(0, 0); // index 0 shifts everything right
+	print(xs[0]); // 0
+	print(xs[1]); // 1
+	print(xs.len()); // 6
 
 	print(xs.remove(0)); // 0 — the removed element, not an Option
-	print(xs[0]);        // 1
+	print(xs[0]); // 1
 	print(xs.remove(4)); // 5 — the last one
-	print(xs.len());     // 4
+	print(xs.len()); // 4
 }

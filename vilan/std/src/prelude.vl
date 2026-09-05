@@ -18,5 +18,5 @@
 // Selected as `prelude = "std::prelude"`, which is also what omitting the key
 // means. The web set is next door in `web.vl`.
 export import pkg::io::print;
-export import pkg::option::Option::{ self, None, Some };
-export import pkg::result::Result::{ self, Err, Ok };
+export import pkg::option::Option::{ None, Some, self };
+export import pkg::result::Result::{ Err, Ok, self };

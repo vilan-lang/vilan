@@ -1,4 +1,4 @@
-import std::{ io::print, compare::Ordering };
+import std::{ compare::Ordering, io::print };
 
 struct Entry {
 	key: i32,
@@ -8,27 +8,33 @@ struct Entry {
 fun main() {
 	let xs = [3, 1, 2];
 
-	print(xs.reverse()[0]);   // 2
-	print(xs.reverse()[2]);   // 3
-	print(xs.sort()[0]);      // 1
-	print(xs.sort()[2]);      // 3
-	print(xs[0]);             // 3 — every one of them leaves the receiver alone
+	print(xs.reverse()[0]); // 2
+	print(xs.reverse()[2]); // 3
+	print(xs.sort()[0]); // 1
+	print(xs.sort()[2]); // 3
+	print(xs[0]); // 3 — every one of them leaves the receiver alone
 
 	// Numeric, not lexicographic: the host's bare `.sort()` would order these
 	// 1, 10, 2.
 	let numeric = [10, 2, 1].sort();
-	print(numeric[0]);        // 1
-	print(numeric[2]);        // 10
+	print(numeric[0]); // 1
+	print(numeric[2]); // 10
 
 	let words = ["pear", "apple", "fig"].sort();
-	print(words[0]);          // apple
+	print(words[0]); // apple
 
 	let descending = xs.sort_by(|a, b| {
-		if a > b { Ordering::Less } else {
-			if a < b { Ordering::Greater } else { Ordering::Equal }
+		if a > b {
+			Ordering::Less
+		} else {
+			if a < b {
+				Ordering::Greater
+			} else {
+				Ordering::Equal
+			}
 		}
 	});
-	print(descending[0]);     // 3
+	print(descending[0]); // 3
 
 	// Stability: equal keys keep their input order (b, d before a, c).
 	mut entries: List<Entry> = [];
@@ -40,5 +46,5 @@ fun main() {
 	for entry in entries.sort_by(|a, b| a.key.compare(b.key)) {
 		order = order + entry.tag;
 	}
-	print(order);             // bdac
+	print(order); // bdac
 }
