@@ -592,10 +592,22 @@ fn analyze(
         .filter(|(call_id, _)| !owned_call_ids.contains(call_id))
         .filter_map(|(_, call)| local_target(program, call.subject_id))
         .collect();
+    // Every entity that names a callee IN CALL POSITION. `function_calls`
+    // holds the calls the solver WIRED; an arity-invalid call is refused
+    // before wiring, and its subject would otherwise read as the callee taken
+    // as a value (B241) — the same "a written call the site scan cannot see"
+    // hole B229 found under `run`, with a different lid. A call written with
+    // the wrong number of arguments is still a CALL of the name it wrote.
     let call_subject_entities: HashSet<Id> = program
         .function_calls
         .values()
         .map(|call| call.subject_id)
+        .chain(
+            program
+                .arity_invalid_calls
+                .iter()
+                .map(|(_, subject_id)| *subject_id),
+        )
         .collect();
     let value_taken: HashSet<Id> = program
         .entity_map
@@ -1433,15 +1445,10 @@ fn analyze(
             .copied()
             .filter(|&id| is_function(id))
             .collect();
-        let call_subjects: HashSet<Id> = program
-            .function_calls
-            .values()
-            .map(|call| call.subject_id)
-            .collect();
         for (&entity_id, expr) in &program.entity_map {
             if let Expr::Local(target) = expr
                 && needs_functions.contains(target)
-                && !call_subjects.contains(&entity_id)
+                && !call_subject_entities.contains(&entity_id)
             {
                 errors.push(anchored(
                     program,

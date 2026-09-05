@@ -3046,6 +3046,160 @@ main();
     );
 }
 
+// --- B241: an arity-invalid call is still a CALL of its callee ---
+//
+// B229's hole, second lid. The context pass reads every call's subject out of
+// `function_calls`, which holds the calls the solver WIRED — and an arity
+// mismatch is refused before wiring. The written subject then appeared in
+// `entity_map` as an `Expr::Local` naming a function with no call in sight:
+// the callee read as taken AS A VALUE, which for a context reader is a
+// refusal of its own AND makes the callee permanently uncovered, so its whole
+// transitive read set fenced too (the owner's kolt report: one missing
+// argument, three value-use refusals and five coverage fences, four of them
+// inside std's `reactive.vl`). `Program::arity_invalid_calls` keeps the shape.
+
+/// The owner's shape (kolt views.vl:107, 2026-09-05): the call sits inside a
+/// closure handed to a method, under a component the `run` calls. ONE error,
+/// the arity one.
+#[test]
+fn b241_an_arity_invalid_call_is_not_a_value_use() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun channel_component(user: str, extra: str): str {
+    label() + user + extra
+}
+
+struct Holder {
+    value: str,
+}
+
+impl Holder {
+    fun swap(self, next: str, make: (|str| str)): str {
+        make(next)
+    }
+}
+
+fun shell(): str {
+    let holder = Holder { value = "a" };
+    holder.swap("route", |route| channel_component(route))
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(shell());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`channel_component` expects 2 arguments");
+    assert_fails_without(source, "so it can't be used as a value");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The isolated shape the report expected to be clean and is not: the closure
+/// argument was never the ingredient — ANY arity-invalid call to a
+/// context-reading function cascaded, straight inside the `run` body.
+#[test]
+fn b241_the_isolated_arity_shape_reports_the_arity_error_alone() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun f(x: i32): i32 {
+    settings.get() + x
+}
+
+fun main() {
+    settings.run(10, || {
+        print(f());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`f` expects 1 argument, but got 0 instead");
+    assert_fails_without(source, "so it can't be used as a value");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The refusal the stand-down may not swallow: a context reader written
+/// where a VALUE is wanted is still an indirect call that would bypass the
+/// hidden parameter.
+#[test]
+fn b241_a_real_value_use_of_a_context_reader_is_still_refused() {
+    assert_fails_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun f(x: i32): i32 {
+    settings.get() + x
+}
+
+fun apply(g: (|i32| i32)): i32 {
+    g(1)
+}
+
+fun main() {
+    settings.run(10, || {
+        print(apply(f));
+    });
+}
+main();
+        "#,
+        "`f` reads context `settings`, so it can't be used as a value",
+    );
+}
+
+/// And the stand-down is the invalid call's own, not the program's: a second
+/// context read outside every `run` keeps its fence in the same program.
+#[test]
+fn b241_a_genuinely_uncovered_read_beside_an_arity_error_still_fences() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun reads_a(x: i32): i32 {
+    a_ctx.get() + x
+}
+
+fun reads_b(): i32 {
+    b_ctx.get()
+}
+
+fun main() {
+    print(reads_b());
+    a_ctx.run(10, || {
+        print(reads_a());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `b_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "context `a_ctx` is read here");
+}
+
 // --- E84: the demotion/trace contract widens to any dependency package ---
 // (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
 // user did not write — std or ANY external/linked package — demotes and

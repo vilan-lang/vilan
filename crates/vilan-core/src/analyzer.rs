@@ -2917,6 +2917,9 @@ pub struct Analyzer<'src> {
     /// entity, member name)` — filled once, after the fixpoint. See
     /// [`Program::unresolved_method_calls`] for why anyone wants them.
     unresolved_method_calls: Vec<(Id, Id, &'src str)>,
+    /// Calls refused on ARITY, before anything was wired, as `(call entity,
+    /// subject entity)`. See [`Program::arity_invalid_calls`].
+    arity_invalid_calls: Vec<(Id, Id)>,
     struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     /// E119: the platform this analysis runs under, and why (the latter already
     /// rendered) — copied off the call's arguments and the `Workspace` so the
@@ -4218,6 +4221,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
             unresolved_method_calls: Vec::new(),
+            arity_invalid_calls: Vec::new(),
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             or_operand_end: None,
@@ -31160,6 +31164,7 @@ impl<'src> Analyzer<'src> {
                             msg,
                         });
                         self.expr_id_to_expr_map.insert(call_id, Expr::Error);
+                        self.arity_invalid_calls.push((call_id, subject_id));
                         return Resolution::Failed;
                     }
                     // `...` is a call convention over an ordinary tuple
@@ -31197,6 +31202,10 @@ impl<'src> Analyzer<'src> {
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
                             msg,
                         });
+                        // B241: nothing is wired past here, so record the
+                        // SHAPE — this call names this callee — for the passes
+                        // that read `function_calls` to find call sites.
+                        self.arity_invalid_calls.push((call_id, subject_id));
                         return Resolution::Failed;
                     }
                     let mut substitution_context = HashMap::default();
@@ -40740,6 +40749,22 @@ pub struct Program<'src> {
     /// the shape the program stated, kept for a pass that needs to know a call
     /// WAS written even though nothing could be resolved about it.
     pub unresolved_method_calls: Vec<(Id, Id, &'src str)>,
+    /// The calls refused on ARITY — `(call entity, subject entity)` — recorded
+    /// because the refusal happens BEFORE `wire_call`, so the site never
+    /// reaches `function_calls` at all.
+    ///
+    /// B229's problem in its second shape (B241): a pass that finds its sites
+    /// by scanning `function_calls` cannot tell `f(1)` written one argument
+    /// short from `f` never being called. The context pass reads the subject
+    /// of every call that way, so an arity-invalid call to a context-reading
+    /// function looked like the function being taken AS A VALUE — three
+    /// "`f` reads context `X`, so it can't be used as a value" refusals at the
+    /// failed call — and, with the value-use entry making the callee
+    /// permanently uncovered, a wall of coverage fences for its whole
+    /// transitive read set (four of them inside std's `reactive.vl`). This is
+    /// the shape the program stated: the call WAS written, and it names its
+    /// callee, whatever the argument list got wrong.
+    pub arity_invalid_calls: Vec<(Id, Id)>,
     /// Use-site identifier spans for struct-initializer field KEYS: `(file, name
     /// span, owning struct id, field index)`, one per `x` in `Point { x = 1 }`.
     ///
@@ -47705,6 +47730,7 @@ fn analyze_over_world<'src>(
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
         unresolved_method_calls: std::mem::take(&mut analyzer.unresolved_method_calls),
+        arity_invalid_calls: std::mem::take(&mut analyzer.arity_invalid_calls),
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,
