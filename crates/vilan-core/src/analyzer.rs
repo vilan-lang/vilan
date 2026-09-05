@@ -1,11 +1,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use indexmap::IndexMap;
-
 use crate::closest_name;
 use crate::error::{Error, Note};
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet, FxIndexMap as IndexMap};
 use crate::id::Id;
 use crate::node::{
     BackingLiteral, BinaryOp, Convention, EnumVariant, ExternBinding, Func, GenericParameters,
@@ -1353,7 +1351,7 @@ pub(crate) fn read_enum_backing<'a>(
     // C onto 1 and collides just as loudly. Two variants sharing a value ARE
     // one runtime value: the second `match` arm is unreachable and an
     // exhaustive match returns the wrong answer with exit 0.
-    let mut backing_owners: IndexMap<String, (&'a str, Span)> = IndexMap::new();
+    let mut backing_owners: IndexMap<String, (&'a str, Span)> = IndexMap::default();
     let mut read: Vec<VariantBacking<'a>> = Vec::with_capacity(variants.len());
     for variant in variants {
         let (variant_name, payload, explicit_backing) = &variant.0;
@@ -4176,8 +4174,8 @@ pub(crate) fn flatten_namespace_branch<'src>(
 impl<'src> Analyzer<'src> {
     fn new() -> Self {
         Self {
-            assignment_values: IndexMap::new(),
-            closures: IndexMap::new(),
+            assignment_values: IndexMap::default(),
+            closures: IndexMap::default(),
             diagnostics: Vec::new(),
             wire_names: HashSet::default(),
             drop_impls_to_check: Vec::new(),
@@ -4212,7 +4210,7 @@ impl<'src> Analyzer<'src> {
             warnings: Vec::new(),
             warning_sources: Vec::new(),
             entity_id: 0,
-            enums: IndexMap::new(),
+            enums: IndexMap::default(),
             expr_id_to_expr_map: HashMap::default(),
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
@@ -4242,15 +4240,15 @@ impl<'src> Analyzer<'src> {
             entry_phase: false,
             source_texts: Vec::new(),
             type_references: Vec::new(),
-            external_functions: IndexMap::new(),
+            external_functions: IndexMap::default(),
             constraints: Vec::new(),
             deferred: Vec::new(),
             current_waiting_on: None,
             rigid_binder_scope: None,
             inferable_generics: Vec::new(),
             struct_literal_instantiations: HashMap::default(),
-            function_calls: IndexMap::new(),
-            functions: IndexMap::new(),
+            function_calls: IndexMap::default(),
+            functions: IndexMap::default(),
             generic_constraint_names: HashMap::default(),
             generic_dispatch: HashMap::default(),
             generic_bounds: HashMap::default(),
@@ -4265,8 +4263,8 @@ impl<'src> Analyzer<'src> {
             prelude_seeds: Vec::new(),
             prelude_entry_bindings: Vec::new(),
             prelude_entry_scope: None,
-            modules: IndexMap::new(),
-            parameters: IndexMap::new(),
+            modules: IndexMap::default(),
+            parameters: IndexMap::default(),
             primitive_struct_ids: HashMap::default(),
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
@@ -4338,14 +4336,14 @@ impl<'src> Analyzer<'src> {
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             scope_id: 0,
-            scopes: IndexMap::new(),
+            scopes: IndexMap::default(),
             span_map: HashMap::default(),
             struct_initializer_to_def: HashMap::default(),
-            structs: IndexMap::new(),
-            traits: IndexMap::new(),
+            structs: IndexMap::default(),
+            traits: IndexMap::default(),
             type_id_to_type_map: HashMap::default(),
             type_id: 0,
-            variables: IndexMap::new(),
+            variables: IndexMap::default(),
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
@@ -6108,7 +6106,7 @@ impl<'src> Analyzer<'src> {
         // collide, and the pairwise subject comparison is the expensive half.
         // An impl contributes one entry per DECLARATION, so a block that
         // declares a name twice appears twice.
-        let mut by_name: IndexMap<&'src str, Vec<(usize, Id)>> = IndexMap::new();
+        let mut by_name: IndexMap<&'src str, Vec<(usize, Id)>> = IndexMap::default();
         for (index, implementation) in self.implementations.iter().enumerate() {
             for (name, member_id) in &implementation.declared_members {
                 by_name.entry(name).or_default().push((index, *member_id));
@@ -6310,7 +6308,7 @@ impl<'src> Analyzer<'src> {
         for (declared_members, subject_label) in blocks {
             // First declaration per name; every later one is reported against
             // it, so three copies produce two errors.
-            let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::new();
+            let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::default();
             for (member_name, member_id) in declared_members {
                 match first_by_name.get(member_name) {
                     Some(first_id) => {
@@ -16071,9 +16069,9 @@ impl<'src> Analyzer<'src> {
         Scope {
             id,
             parent_id,
-            name_to_id_map: IndexMap::new(),
-            macro_name_to_id: IndexMap::new(),
-            local_value_declarations: IndexMap::new(),
+            name_to_id_map: IndexMap::default(),
+            macro_name_to_id: IndexMap::default(),
+            local_value_declarations: IndexMap::default(),
             declaration_order: Vec::new(),
         }
     }
@@ -16227,9 +16225,9 @@ impl<'src> Analyzer<'src> {
         let scope = Scope {
             id,
             parent_id,
-            name_to_id_map: IndexMap::new(),
-            macro_name_to_id: IndexMap::new(),
-            local_value_declarations: IndexMap::new(),
+            name_to_id_map: IndexMap::default(),
+            macro_name_to_id: IndexMap::default(),
+            local_value_declarations: IndexMap::default(),
             declaration_order: Vec::new(),
         };
         self.scopes.insert(id, scope);
@@ -35137,7 +35135,7 @@ impl<'src> Analyzer<'src> {
         }
         let initializer_id = constraint.initializer_id;
         let struct_name = constraint.struct_name;
-        let mut initializer_fields = IndexMap::new();
+        let mut initializer_fields = IndexMap::default();
         // The literal's OWN parameters (B225): the struct's, except that any the
         // enclosing declaration also owns is instantiated to a fresh id here, so
         // the literal cannot bind the impl binder B77 aliases to it. Everything

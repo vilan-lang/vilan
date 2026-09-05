@@ -101,6 +101,22 @@ pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
 /// A `HashSet` of small integers — the twin of [`FxHashMap`].
 pub type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
+/// An insertion-ordered map keyed by small integers — the analyzer's
+/// registration tables (`functions`, `traits`, `scopes`, …), which need
+/// `IndexMap`'s stable iteration order *and* the cheap hash.
+///
+/// `indexmap`'s own default is `RandomState`, i.e. SipHash-1-3, so the tables
+/// E48 could not convert kept paying setup costs against a `u32` key
+/// (backlog M31: 7.4M SipHash calls, 6.7% of a cold kolt client check).
+/// Swapping the hasher moves **nothing observable**: an `IndexMap` iterates in
+/// insertion order whatever hashes its keys, which is the property the
+/// analyzer's emission and diagnostic order already rests on. Everything the
+/// module header argues about the hash — the dense-id bijection, the
+/// collision-resistance question, the `enable_seed_shuffle` instrument —
+/// applies here unchanged, and no dependency was added: `indexmap` was already
+/// this crate's.
+pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
+
 /// The hash-order shuffle, forced on in-process by [`enable_seed_shuffle`].
 static FORCED_SHUFFLE: AtomicBool = AtomicBool::new(false);
 
@@ -399,5 +415,38 @@ mod tests {
         assert_eq!(set.len(), 1000);
         assert!(set.contains(&crate::type_::TypeId(500)));
         assert!(!set.contains(&crate::type_::TypeId(1000)));
+    }
+
+    /// The whole argument for swapping the analyzer's `IndexMap`s onto this
+    /// hasher (backlog M31): an `IndexMap` iterates in INSERTION order, so the
+    /// hash decides bucket placement and nothing else. Pinned two ways — the
+    /// literal insertion sequence, and against the same insertions into
+    /// indexmap's own default (`RandomState`) table — because it is the
+    /// property every golden this change must not move rests on. It goes red
+    /// the moment `FxIndexMap` stops being an `IndexMap`.
+    #[test]
+    fn the_index_map_alias_iterates_in_insertion_order() {
+        // Deliberately not ascending: an id-ordered walk would agree with a
+        // sorted map by accident and pin nothing.
+        let inserted: Vec<u32> = vec![900, 3, 41, 7, 1000, 0, 512, 64, 5, 99];
+        let mut ours: FxIndexMap<crate::id::Id, u32> = FxIndexMap::default();
+        let mut theirs: indexmap::IndexMap<crate::id::Id, u32> = indexmap::IndexMap::new();
+        for id in &inserted {
+            ours.insert(crate::id::Id(*id), id * 2);
+            theirs.insert(crate::id::Id(*id), id * 2);
+        }
+        let ours_order: Vec<u32> = ours.keys().map(|id| id.0).collect();
+        assert_eq!(ours_order, inserted);
+        assert_eq!(
+            ours_order,
+            theirs.keys().map(|id| id.0).collect::<Vec<_>>(),
+            "the hasher must not change which order the table is walked in"
+        );
+        // Re-inserting an existing key keeps its ORIGINAL position — the rule
+        // the analyzer's registration tables re-write entries under.
+        ours.insert(crate::id::Id(900), 1);
+        assert_eq!(ours.keys().map(|id| id.0).collect::<Vec<_>>(), inserted);
+        assert_eq!(ours.get(&crate::id::Id(900)), Some(&1));
+        assert_eq!(ours.get(&crate::id::Id(1)), None);
     }
 }
