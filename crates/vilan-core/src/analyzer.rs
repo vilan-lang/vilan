@@ -3009,6 +3009,25 @@ pub struct Analyzer<'src> {
     // by the record pass, which must never re-record a source it did not
     // actually re-derive.
     reused_sources: Vec<SourceId>,
+    // M19 T1b: the reused sources whose class D TABLES this analysis also
+    // restored, projected onto entity-id space beside `world_ranges`. A
+    // SUBSET of it: a module can have a diagnostics record with no table
+    // record (an analysis cancelled between the two stores wrote one), and
+    // such a module replays its diagnostics and recomputes its tables.
+    world_table_ranges: Vec<(u32, u32)>,
+    // M19 T1b: those sources, in ascending order — the phase line's second
+    // count and the record pass's exclusion list.
+    reused_table_sources: Vec<SourceId>,
+    // M19 T1b: the restored rows themselves, merged across every source in
+    // `world_table_ranges`. Per-analysis scratch, empty in every stored world.
+    restored_tables: RestoredTables,
+    // M19 T1b / T0's free fix: `source_ranges` sorted by start, for a binary
+    // search instead of `source_of_id`'s linear scan. Sealed beside
+    // `frozen_ranges`, from the same ranges, and empty until then — the scan
+    // is the fallback, so a caller that asks before the seal still gets the
+    // right answer. The ranges are disjoint by construction (the entity
+    // counter only grows), which is what makes the search well-defined.
+    sorted_source_ranges: Vec<(u32, u32, SourceId)>,
     // M19 T0 (`per-module-analysis-reuse.md` §3.3): the source each `TypeId`
     // was minted in, indexed by the id's own dense counter. `Id`s get this
     // through `source_ranges`; `TypeId`s are a separate counter and had
@@ -4235,6 +4254,10 @@ impl<'src> Analyzer<'src> {
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
+            world_table_ranges: Vec::new(),
+            reused_table_sources: Vec::new(),
+            restored_tables: RestoredTables::default(),
+            sorted_source_ranges: Vec::new(),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
             reuse_unrecordable: HashSet::default(),
@@ -17605,10 +17628,42 @@ impl<'src> Analyzer<'src> {
             }
         }
         let function_ids: Vec<Id> = self.functions.keys().copied().collect();
+        // M19 T1b (`per-module-analysis-reuse.md` §3.3, class D): the fixpoint
+        // is MONOTONE and a module function's callees are all in the world, so
+        // a reused module's verdicts are not merely a sound seed — they are the
+        // answer, and the fixpoint has nothing left to add to them. Write them
+        // back and take those functions out of the loop; the entry's own nodes
+        // then iterate against settled callees instead of against empty.
+        let restored_bumps: Vec<(Id, BTreeSet<u32>)> = if self.world_table_ranges.is_empty() {
+            Vec::new()
+        } else {
+            function_ids
+                .iter()
+                // A curated native-container verdict is authoritative and is
+                // never inferred, so it is never restored over either: the
+                // table seeded it two statements ago and the record must not
+                // undo that.
+                .filter(|function_id| {
+                    self.table_entity(**function_id) && !self.bumps_tabled.contains(function_id)
+                })
+                .filter_map(|function_id| {
+                    self.restored_tables
+                        .bumps
+                        .get(function_id)
+                        .map(|positions| (*function_id, positions.clone()))
+                })
+                .collect()
+        };
+        let restored_ids: HashSet<Id> = restored_bumps.iter().map(|(id, _)| *id).collect();
+        for (function_id, positions) in restored_bumps {
+            if let Some(function) = self.functions.get_mut(&function_id) {
+                function.bumps = positions;
+            }
+        }
         loop {
             let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
             for function_id in &function_ids {
-                if self.bumps_tabled.contains(function_id) {
+                if self.bumps_tabled.contains(function_id) || restored_ids.contains(function_id) {
                     continue;
                 }
                 let (has_body, current) = {
@@ -18847,24 +18902,36 @@ impl<'src> Analyzer<'src> {
     /// Call exprs that resolve to a `borrows` function returning a scalar view, so
     /// `*call` reads/writes through `call[0][call[1]]`.
     fn compute_scalar_view_calls(&self) -> HashSet<Id> {
-        self.function_calls
-            .keys()
-            .copied()
-            .filter(|call_id| self.call_returns_scalar_view(*call_id))
-            .collect()
+        // M19 T1b: the row key IS the site the loop visits, so the partition
+        // between "restored" and "derived here" is exact — every call this skips
+        // contributed exactly the row the record holds for it.
+        let mut calls: HashSet<Id> = self.restored_tables.scalar_view_calls.clone();
+        calls.extend(
+            self.function_calls
+                .keys()
+                .copied()
+                .filter(|call_id| !self.table_entity(*call_id))
+                .filter(|call_id| self.call_returns_scalar_view(*call_id)),
+        );
+        calls
     }
 
     /// `Reference` exprs (`&place` / `&mut place`) whose target is a scalar — the
     /// ones that lower to a `[base, key]` pair (a boxed local's cell at slot 0, or
     /// a struct's field slot) rather than to the aggregate's own JS reference.
     fn compute_scalar_view_refs(&self) -> HashSet<Id> {
-        self.expr_id_to_expr_map
-            .iter()
-            .filter_map(|(expr_id, expr)| match expr {
-                Expr::Reference(operand, _) if self.place_is_scalar(*operand) => Some(*expr_id),
-                _ => None,
-            })
-            .collect()
+        // M19 T1b: as above — the key is the expression the loop is standing on.
+        let mut refs: HashSet<Id> = self.restored_tables.scalar_view_refs.clone();
+        refs.extend(
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(expr_id, _)| !self.table_entity(**expr_id))
+                .filter_map(|(expr_id, expr)| match expr {
+                    Expr::Reference(operand, _) if self.place_is_scalar(*operand) => Some(*expr_id),
+                    _ => None,
+                }),
+        );
+        refs
     }
 
     /// Bindings/parameters whose deref reads/writes a scalar slot through a
@@ -20723,7 +20790,17 @@ impl<'src> Analyzer<'src> {
                 candidates.push((value_id, type_id));
             }
         };
-        for expr in self.expr_id_to_expr_map.values() {
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            // M19 T1b: a reused module's decisions are restored below. Every
+            // position this loop `consider`s is a sub-expression of the entry it
+            // is standing on, so skipping the expression skips exactly the rows
+            // the record holds — and `is_elidable_copy`, the one input that
+            // could have been the ENTRY's, cannot be: it answers true only for a
+            // binding the last-use pass is not opaque about, and a binding
+            // touched from a second region is opaque by construction.
+            if self.table_entity(*expr_id) {
+                continue;
+            }
             match expr {
                 Expr::Variable(variable_id) => {
                     if let Some(variable) = self.variables.get(variable_id)
@@ -20825,6 +20902,12 @@ impl<'src> Analyzer<'src> {
             };
             sites.insert(value_id, decision);
         }
+        sites.extend(
+            self.restored_tables
+                .clone_sites
+                .iter()
+                .map(|(id, decision)| (*id, decision.clone())),
+        );
         sites
     }
 
@@ -20871,20 +20954,30 @@ impl<'src> Analyzer<'src> {
         // A closure cannot declare a view return — rule 3 rejects a view
         // escaping, and `check_view_escape` is what enforces it — so the
         // `returns_view` flag is false for every closure seam.
+        // M19 T1b: a seam owned by a reused module is not re-walked — its
+        // leaves and their decisions are restored below. The seam id is the
+        // returning expression, which lives in the same file as the leaves it
+        // reaches, so skipping it skips exactly the rows the record holds.
         let mut seams: Vec<(Id, Option<Id>, bool)> = self
             .closures
             .values()
+            .filter(|closure| !self.table_entity(closure.id))
             .map(|closure| (closure.return_, Some(closure.id), false))
             .collect();
-        seams.extend(self.return_sites.iter().map(|(function_id, value_id)| {
-            (
-                *value_id,
-                None,
-                self.functions
-                    .get(function_id)
-                    .is_some_and(|function| function.returns_view),
-            )
-        }));
+        seams.extend(
+            self.return_sites
+                .iter()
+                .filter(|(function_id, _)| !self.table_entity(*function_id))
+                .map(|(function_id, value_id)| {
+                    (
+                        *value_id,
+                        None,
+                        self.functions
+                            .get(function_id)
+                            .is_some_and(|function| function.returns_view),
+                    )
+                }),
+        );
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
         let mut view_reads: HashSet<Id> = HashSet::default();
         for (seam, closure_id, returns_view) in seams {
@@ -20952,6 +21045,13 @@ impl<'src> Analyzer<'src> {
             };
             sites.insert(value_id, decision);
         }
+        sites.extend(
+            self.restored_tables
+                .return_clone_sites
+                .iter()
+                .map(|(id, decision)| (*id, decision.clone())),
+        );
+        view_reads.extend(self.restored_tables.return_view_reads.iter().copied());
         (sites, view_reads)
     }
 
@@ -29865,6 +29965,18 @@ impl<'src> Analyzer<'src> {
     /// The source file an entity was walked from (`Program::source_of`, but
     /// usable during `build()`). `None` for synthetic entities.
     fn source_of_id(&self, id: Id) -> Option<SourceId> {
+        // M19 T0's free fix (`per-module-analysis-reuse.md` §5): once the
+        // ranges are sealed this is a binary search over a sorted, disjoint
+        // index rather than a linear scan of 50-odd ranges asked once per
+        // expression. `check_deprecated` asks it per site across two full
+        // `entity_map` passes, which is most of what it cost.
+        if !self.sorted_source_ranges.is_empty() {
+            let index = self
+                .sorted_source_ranges
+                .partition_point(|(start, _, _)| *start <= id.0);
+            let (_, end, source) = *self.sorted_source_ranges.get(index.checked_sub(1)?)?;
+            return (id.0 < end).then_some(source);
+        }
         self.source_ranges
             .iter()
             .find(|range| id.0 >= range.start && id.0 < range.end)
@@ -29879,6 +29991,16 @@ impl<'src> Analyzer<'src> {
     /// is folded in here: forced full scan seals an empty index, and every
     /// entity reads as unfrozen.
     fn seal_frozen_ranges(&mut self) {
+        // M19 T1b: the sorted index `source_of_id` binary-searches, sealed from
+        // the same ranges and at the same moment. It is NOT gated on the
+        // full-scan override — that override turns a SKIP off, and answering
+        // "which file minted this id" faster changes no answer at all.
+        self.sorted_source_ranges = self
+            .source_ranges
+            .iter()
+            .map(|range| (range.start, range.end, range.source))
+            .collect();
+        self.sorted_source_ranges.sort_unstable();
         self.frozen_ranges.clear();
         if self.std_sources.is_empty() || full_scan_checks_forced() {
             return;
@@ -29946,6 +30068,70 @@ impl<'src> Analyzer<'src> {
             .world_ranges
             .partition_point(|(start, _)| *start <= id.0);
         index > 0 && id.0 < self.world_ranges[index - 1].1
+    }
+
+    /// Seals [`Self::world_table_ranges`] and merges the restored rows (M19
+    /// T1b). `reusable` is the subset of T1's reusable set whose record also
+    /// carries tables.
+    fn seal_world_table_ranges(
+        &mut self,
+        reusable: &HashSet<SourceId>,
+        records: &HashMap<u32, ModuleDiagnostics>,
+    ) {
+        self.world_table_ranges.clear();
+        self.reused_table_sources.clear();
+        self.restored_tables = RestoredTables::default();
+        if reusable.is_empty() || full_scan_checks_forced() || !world_table_reuse_enabled() {
+            return;
+        }
+        let with_tables: HashSet<SourceId> = reusable
+            .iter()
+            .copied()
+            .filter(|source| {
+                records
+                    .get(&source.0)
+                    .is_some_and(|record| record.tables.is_some())
+            })
+            .collect();
+        if with_tables.is_empty() {
+            return;
+        }
+        for source in &with_tables {
+            if let Some(tables) = records.get(&source.0).and_then(|r| r.tables.as_ref()) {
+                self.restored_tables.absorb(tables);
+            }
+        }
+        self.world_table_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| with_tables.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.world_table_ranges.sort_unstable();
+        self.reused_table_sources = with_tables.into_iter().collect();
+        self.reused_table_sources.sort_unstable();
+        // The plant: keep the skip, throw the rows away. See
+        // [`STALE_TABLE_PLANT`].
+        if stale_table_planted() {
+            self.restored_tables = RestoredTables::default();
+        }
+    }
+
+    /// The predicate the **class D** passes and the drop planner's neighbours
+    /// ask: is `id`'s row already in hand, so the walk that would re-derive it
+    /// can be skipped?
+    ///
+    /// Distinct from [`Self::reusable_entity`] on both sides. A std entity is
+    /// NOT covered unless std's own source is in the restored set — the S1 seam
+    /// says a std definition-site DIAGNOSTIC is known absent, which is no claim
+    /// at all about a `LastUse` row or a clone decision the emitter reads. And
+    /// a module whose diagnostics replay may still have no tables recorded, in
+    /// which case it recomputes them.
+    fn table_entity(&self, id: Id) -> bool {
+        let index = self
+            .world_table_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < self.world_table_ranges[index - 1].1
     }
 
     /// The predicate the **Class A** checks ask (§3.3): module-local given the
@@ -41562,6 +41748,55 @@ pub(crate) fn world_reuse_enabled() -> bool {
     WORLD_REUSE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// M19 T1b's own disable switch (`per-module-analysis-reuse.md` §5, T1's
+/// class D and the drop planner): turns the TABLE half of the seam off — a
+/// reused module's `LastUse` rows, `bumps` verdicts and clone-site decisions
+/// are recomputed instead of restored — while leaving T1's diagnostic replay
+/// and std's S1 skip exactly as they were.
+///
+/// Separate from `WORLD_REUSE` for the reason that one is separate from
+/// `FULL_SCAN_CHECKS`: a differential that could only turn the whole seam off
+/// cannot tell "the restored tables broke it" from "the replayed diagnostics
+/// broke it", and those are the two halves this tranche has to keep apart. It
+/// is also the switch the phase pin reads: a restore that costs nothing to
+/// disable is a restore that never ran.
+static WORLD_TABLE_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_world_table_reuse(enabled: bool) {
+    WORLD_TABLE_REUSE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn world_table_reuse_enabled() -> bool {
+    WORLD_TABLE_REUSE.load(std::sync::atomic::Ordering::SeqCst) && world_reuse_enabled()
+}
+
+/// M19 T1b's PLANT: serve a reused module a stale table.
+///
+/// The differential proves that restoring equals recomputing. It cannot, on
+/// its own, prove that anything was restored at ALL — a seam that skipped
+/// nothing and restored nothing would agree with itself perfectly, which is
+/// the vacuous green M12 taught this tree to refuse and which a no-op splice
+/// already produced once, for T1's diagnostics half.
+///
+/// So the pin plants the failure the design is built to prevent: the module's
+/// bodies are skipped exactly as they are on the fast path, and the rows that
+/// were supposed to come back in their place are EMPTY — a record that
+/// describes a different program, which is what a table read for a module the
+/// world no longer matches would be. The emitted JavaScript must move. If it
+/// does not, the tables are not load-bearing and the differential's agreement
+/// says nothing.
+static STALE_TABLE_PLANT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_stale_table_plant(planted: bool) {
+    STALE_TABLE_PLANT.store(planted, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn stale_table_planted() -> bool {
+    STALE_TABLE_PLANT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 // How many sources the last top-level analysis on this thread REUSED, how many
 // the entry dirtied, and how many the world held — M19 T0's census and T1's own
 // counter, read by the pins the way `generic_bound_checks()` is read by tranche
@@ -41578,6 +41813,20 @@ thread_local! {
 #[doc(hidden)]
 pub fn reuse_census() -> (usize, usize, usize) {
     REUSE_CENSUS.with(std::cell::Cell::get)
+}
+
+// M19 T1b's own count, beside T0's census rather than inside it: how many of
+// the reused modules also had their class D TABLES restored. A separate cell
+// because the T1 census is read positionally by three pins and by the phase
+// line, and because the two numbers answer different questions — `reused` is
+// "whose checks did we skip", this is "whose emitter tables did we keep".
+thread_local! {
+    static TABLE_REUSE_CENSUS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[doc(hidden)]
+pub fn table_reuse_census() -> usize {
+    TABLE_REUSE_CENSUS.with(std::cell::Cell::get)
 }
 
 /// Forces `analyze` to run `build()` twice back-to-back — the S2 pin's
@@ -44160,6 +44409,110 @@ fn workspace_fingerprint(
 struct ModuleDiagnostics {
     diagnostics: Vec<crate::error::Error>,
     warnings: Vec<crate::error::Error>,
+    /// M19 T1b: the module's slice of the tables the EMITTER reads — class D
+    /// (`per-module-analysis-reuse.md` §3.3), which produces no diagnostics at
+    /// all and so has nothing to replay, only rows to keep.
+    ///
+    /// `None` is not "the module had no rows": it is "no analysis has recorded
+    /// this module's tables yet", which is what a record written by an analysis
+    /// that was CANCELLED between the diagnostics store and the table store
+    /// looks like. Such a module replays its diagnostics and recomputes its
+    /// tables, which is exactly T1's behaviour and is always sound.
+    tables: Option<ModuleTables>,
+}
+
+/// One reused module's rows in the class D tables, kept in ascending id order
+/// so a record is compact and its restore is deterministic.
+///
+/// **Every row is keyed by an `Id` the module itself minted**, and §2.1 is the
+/// guarantee that makes them re-usable verbatim: across two analyses that hit
+/// the same base-cache entry, a module's entities occupy the byte-identical id
+/// prefix, in the same `SourceRange`, in the same order. Nothing here carries a
+/// `TypeId`, and that is a deliberate boundary rather than an accident — a
+/// `TypeId` minted after the world was stored is minted per OCCURRENCE against
+/// THIS entry's buffer (`type_id_for_type`, B77/B95), so it names a slot the
+/// next analysis never mints. The tables that do carry one — the drop
+/// planner's `resource_temporaries` and `drop_owned_types_by_root`, whose
+/// values come from `infer_type(..).get_type_id(..)` inside the checks phase —
+/// are therefore NOT in this record and stay live.
+#[derive(Debug, Clone, Default)]
+struct ModuleTables {
+    last_uses: Vec<Id>,
+    last_use_opaque: Vec<Id>,
+    last_use_unreached: Vec<Id>,
+    last_use_statements: Vec<(Id, Vec<Id>)>,
+    declaration_statements: Vec<(Id, Vec<Id>)>,
+    bumps: Vec<(Id, BTreeSet<u32>)>,
+    clone_sites: Vec<(Id, CopyDecision)>,
+    return_clone_sites: Vec<(Id, CopyDecision)>,
+    return_view_reads: Vec<Id>,
+    scalar_view_calls: Vec<Id>,
+    scalar_view_refs: Vec<Id>,
+}
+
+impl ModuleTables {
+    /// How many rows this slice holds — the record's own size, in the only
+    /// unit that is cheap to add up (see [`CHECKED_CACHE_TABLE_ROWS`]).
+    fn rows(&self) -> usize {
+        self.last_uses.len()
+            + self.last_use_opaque.len()
+            + self.last_use_unreached.len()
+            + self.last_use_statements.len()
+            + self.declaration_statements.len()
+            + self.bumps.len()
+            + self.clone_sites.len()
+            + self.return_clone_sites.len()
+            + self.return_view_reads.len()
+            + self.scalar_view_calls.len()
+            + self.scalar_view_refs.len()
+    }
+}
+
+/// The reused modules' rows, merged into the shape the passes read (M19 T1b).
+///
+/// Held on the [`Analyzer`] rather than threaded through the ten pass
+/// signatures: every consumer is already a method on it, and a pass that
+/// forgets to consult this is a pass that recomputes — a lost optimisation,
+/// never a wrong answer. The reverse mistake — a pass that SKIPS a reused
+/// module's entities without restoring its rows — is the one that loses a
+/// table, and the differential's emitted-JS leg is what catches it.
+#[derive(Clone, Debug, Default)]
+struct RestoredTables {
+    last_uses: HashSet<Id>,
+    last_use_opaque: HashSet<Id>,
+    last_use_unreached: HashSet<Id>,
+    last_use_statements: HashMap<Id, Vec<Id>>,
+    declaration_statements: HashMap<Id, Vec<Id>>,
+    bumps: HashMap<Id, BTreeSet<u32>>,
+    clone_sites: HashMap<Id, CopyDecision>,
+    return_clone_sites: HashMap<Id, CopyDecision>,
+    return_view_reads: HashSet<Id>,
+    scalar_view_calls: HashSet<Id>,
+    scalar_view_refs: HashSet<Id>,
+}
+
+impl RestoredTables {
+    fn absorb(&mut self, tables: &ModuleTables) {
+        self.last_uses.extend(tables.last_uses.iter().copied());
+        self.last_use_opaque
+            .extend(tables.last_use_opaque.iter().copied());
+        self.last_use_unreached
+            .extend(tables.last_use_unreached.iter().copied());
+        self.last_use_statements
+            .extend(tables.last_use_statements.iter().cloned());
+        self.declaration_statements
+            .extend(tables.declaration_statements.iter().cloned());
+        self.bumps.extend(tables.bumps.iter().cloned());
+        self.clone_sites.extend(tables.clone_sites.iter().cloned());
+        self.return_clone_sites
+            .extend(tables.return_clone_sites.iter().cloned());
+        self.return_view_reads
+            .extend(tables.return_view_reads.iter().copied());
+        self.scalar_view_calls
+            .extend(tables.scalar_view_calls.iter().copied());
+        self.scalar_view_refs
+            .extend(tables.scalar_view_refs.iter().copied());
+    }
 }
 
 /// What one [`BaseCacheKey`]'s world remembers about its own modules' checks.
@@ -44175,6 +44528,10 @@ struct WorldChecks {
     source_hashes: Vec<u64>,
     sources_fingerprint: u64,
     per_source: HashMap<u32, ModuleDiagnostics>,
+    /// M19 T1b: how many class D table rows this record holds — the input to
+    /// the row budget below, kept as a running total so the budget costs an
+    /// addition rather than a walk.
+    table_rows: usize,
 }
 
 /// The recorded checks, keyed exactly as the worlds are. Not stored inside
@@ -44184,13 +44541,27 @@ struct WorldChecks {
 static CHECKED_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, WorldChecks>>> =
     std::sync::OnceLock::new();
 
-/// The record map's key bound. The values are diagnostics — kilobytes at
-/// worst against the base cache's megabytes — so this is a leak stop, not a
-/// budget, and it does the crudest thing that cannot grow: past the bound the
-/// map starts over. A session that meets more than this many world shapes
-/// pays one full check phase per shape afterwards, which is what it paid
-/// before this cache existed.
+/// The record map's key bound. It does the crudest thing that cannot grow:
+/// past the bound the map starts over. A session that meets more than this
+/// many world shapes pays one full check phase per shape afterwards, which is
+/// what it paid before this cache existed.
 const CHECKED_CACHE_KEYS: usize = 256;
+
+/// M19 T1b's second bound, and the one that actually holds the memory down.
+///
+/// T1's values were diagnostics — kilobytes at worst against the base cache's
+/// megabytes — so a key count was budget enough. T1b's are TABLES: a 58-source
+/// application records a row per last use, per statement chain, per clone
+/// site and per scalar-view site, which is hundreds of thousands of rows for
+/// one world. A key count cannot see that, so the rows are counted too, and
+/// past the bound the map starts over exactly as it does past the key count.
+///
+/// Sized against M24's own retained-world budget rather than invented: eight
+/// million rows is on the order of a hundred megabytes of `Id`s and their
+/// chains, a fraction of [`BASE_CACHE_DEFAULT_BUDGET`]'s 512 MB of worlds, and
+/// far past what any editing session reaches — one world shape per package,
+/// platform and prelude.
+const CHECKED_CACHE_TABLE_ROWS: usize = 8_000_000;
 
 /// §3.2's `sources_fingerprint`: the WORLD's source paths, in order, hashed.
 ///
@@ -44296,14 +44667,70 @@ fn checked_cache_store(
     if state.len() >= CHECKED_CACHE_KEYS && !state.contains_key(key) {
         state.clear();
     }
+    let table_rows = per_source
+        .values()
+        .map(|module| module.tables.as_ref().map_or(0, ModuleTables::rows))
+        .sum();
     state.insert(
         key.clone(),
         WorldChecks {
             source_hashes: source_hashes.to_vec(),
             sources_fingerprint: fingerprint,
             per_source,
+            table_rows,
         },
     );
+}
+
+/// Attaches M19 T1b's class D table slices to a record the diagnostics store
+/// already wrote for this key.
+///
+/// **It never creates a source entry.** A module whose diagnostics this
+/// analysis refused to record — one whose refusal reaches into the entry
+/// (`reaches_outside_the_world`), or one purged by an earlier such refusal —
+/// has no `per_source` entry, and writing one here would make it look
+/// replayable with an EMPTY diagnostic list. The two halves of a module's
+/// record are written at different points of the phase and this is the seam
+/// where they could come apart; the entry check is what keeps them together.
+fn checked_cache_store_tables(
+    key: &BaseCacheKey,
+    source_hashes: &[u64],
+    tables: HashMap<u32, ModuleTables>,
+) {
+    let Some(cache) = CHECKED_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(recorded) = state.get_mut(key) else {
+        return;
+    };
+    // The world moved under the record between the two stores (another thread
+    // analyzed a different content for this key): the tables describe text this
+    // record no longer holds, so they are dropped rather than mixed in.
+    if recorded.source_hashes.len() != source_hashes.len()
+        || recorded.source_hashes[1..] != source_hashes[1..]
+    {
+        return;
+    }
+    for (index, slice) in tables {
+        if let Some(module) = recorded.per_source.get_mut(&index) {
+            recorded.table_rows = recorded
+                .table_rows
+                .saturating_sub(module.tables.as_ref().map_or(0, ModuleTables::rows))
+                + slice.rows();
+            module.tables = Some(slice);
+        }
+    }
+    // The row budget (see [`CHECKED_CACHE_TABLE_ROWS`]), enforced where the
+    // rows are written. Crude on purpose and in the same shape as the key
+    // bound: past it the map starts over and every world pays one full class D
+    // phase again, which is what it paid before this tranche.
+    let rows: usize = state.values().map(|record| record.table_rows).sum();
+    if rows > CHECKED_CACHE_TABLE_ROWS {
+        state.clear();
+    }
 }
 
 /// Drops every recorded checks set — the companion of [`base_cache_clear`],
@@ -46789,6 +47216,10 @@ fn analyze_over_world<'src>(
         // The widened set, sealed beside it: the cached world's own modules,
         // which the Class A checks skip and whose diagnostics are replayed.
         analyzer.seal_world_ranges(&reusable_sources);
+        // M19 T1b: and the TABLE half of the same seam — the subset of those
+        // modules whose class D rows are recorded too, merged into the shape
+        // the passes read.
+        analyzer.seal_world_table_ranges(&reusable_sources, &replay_records);
         // The splice (§3.2). Before every check that could add to the lists,
         // and the published order is `sort_in_step`'s either way.
         analyzer.replay_world_diagnostics(&replay_records);
@@ -47343,6 +47774,100 @@ fn analyze_over_world<'src>(
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
     let scalar_view_calls = analyzer.compute_scalar_view_calls();
 
+    // M19 T1b: record what this analysis DERIVED for the class D tables, for
+    // the analysis that will restore it (`per-module-analysis-reuse.md` §3.3).
+    //
+    // The exclusions are T1's, for T1's reasons: a module this analysis
+    // RESTORED was not re-derived, and a module the entry DIRTIED was derived
+    // against a slot the buffer moved. A cancelled analysis never reaches this
+    // line at all — the tail above returns `None` first.
+    if let Some(key) = &checks_key
+        && !entry_is_module
+        && world_table_reuse_enabled()
+    {
+        let restored: HashSet<SourceId> = analyzer.reused_table_sources.iter().copied().collect();
+        let skip = |source: SourceId| {
+            source == DERIVED_SOURCE
+                || restored.contains(&source)
+                || analyzer.entry_dirty_sources.contains(&source)
+        };
+        let mut tables: HashMap<u32, ModuleTables> = HashMap::default();
+        analyzer.last_use.record_rows(&analyzer, &skip, &mut tables);
+        let file = |id: Id| -> Option<u32> {
+            let source = analyzer.source_of_id(id)?;
+            (source.0 != 0 && !skip(source)).then_some(source.0)
+        };
+        for (function_id, function) in &analyzer.functions {
+            // A function with an empty verdict is the overwhelming majority and
+            // its row is the default, so only the non-empty ones are stored.
+            if function.bumps.is_empty() {
+                continue;
+            }
+            if let Some(source) = file(*function_id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .bumps
+                    .push((*function_id, function.bumps.clone()));
+            }
+        }
+        for (site_id, decision) in &clone_sites {
+            if let Some(source) = file(*site_id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .clone_sites
+                    .push((*site_id, decision.clone()));
+            }
+        }
+        for (site_id, decision) in &return_clone_sites {
+            if let Some(source) = file(*site_id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .return_clone_sites
+                    .push((*site_id, decision.clone()));
+            }
+        }
+        for read_id in &return_view_reads {
+            if let Some(source) = file(*read_id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .return_view_reads
+                    .push(*read_id);
+            }
+        }
+        for call_id in &scalar_view_calls {
+            if let Some(source) = file(*call_id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .scalar_view_calls
+                    .push(*call_id);
+            }
+        }
+        for ref_id in &scalar_view_refs {
+            if let Some(source) = file(*ref_id) {
+                tables
+                    .entry(source)
+                    .or_default()
+                    .scalar_view_refs
+                    .push(*ref_id);
+            }
+        }
+        // Every source this analysis re-derived gets a slice, including the
+        // ones with nothing in any table: "I computed this module and it
+        // contributed no rows" is the answer for most of a program's files, and
+        // a missing slice would make the next analysis recompute it forever.
+        for index in 1..sources.len() as u32 {
+            if !skip(SourceId(index)) {
+                tables.entry(index).or_default();
+            }
+        }
+        checked_cache_store_tables(key, &source_hashes, tables);
+    }
+
     // The HMR transfer classification (`hmr.md` §4), computed while the analyzer
     // still holds the type tables and the resource classifier. Always computed (a
     // cheap type-level pass over the entry's module-level bindings); the transformer
@@ -47593,8 +48118,10 @@ fn analyze_over_world<'src>(
             .count(),
         sources.len().saturating_sub(1),
     );
+    let table_census = analyzer.reused_table_sources.len();
     if !crate::macros::in_macro_world() {
         REUSE_CENSUS.with(|census| census.set(reuse_census));
+        TABLE_REUSE_CENSUS.with(|census| census.set(table_census));
     }
 
     // The phase split, one line per top-level analysis (macro worlds are
@@ -47616,8 +48143,8 @@ fn analyze_over_world<'src>(
         // resolution moved a type slot in, which is the number T0 exists to
         // measure and the one that decides whether any of this pays.
         eprintln!(
-            "[vilan phase] reused {}/{} entry-dirty {}",
-            reuse_census.0, reuse_census.2, reuse_census.1,
+            "[vilan phase] reused {}/{} entry-dirty {} tables {}",
+            reuse_census.0, reuse_census.2, reuse_census.1, table_census,
         );
     }
 
