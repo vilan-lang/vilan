@@ -101,6 +101,10 @@ guide/services.md h2 naming-server-entities-handlet
 guide/services.md h2 what-rpc-calls-do
 guide/services.md h2 mirrors
 guide/services.md h3 reading-a-mirror
+guide/services.md h3 keyed-mirrors-exposekeyed
+guide/services.md h3 reading-a-keyed-mirror
+guide/services.md h3 what-it-costs
+guide/services.md h3 the-rules-worth-knowing
 guide/services.md h2 connection-state-and-reconnection
 guide/services.md h2 authentication
 guide/services.md h3 authorizing-the-connection
@@ -309,6 +313,7 @@ std/dev.md h2 stash--take
 std/encoding.md h1 encoding-reference
 std/encoding.md h2 json
 std/encoding.md h2 the-wire-layer-stdwire
+std/encoding.md h3 keyed-collections
 std/encoding.md h3 backed-enums-on-the-wire
 std/encoding.md h2 bytes
 std/encoding.md h2 binary-codec-stdbinary
@@ -379,6 +384,7 @@ std/reactive.md h2 reconcile-keyed-list-diffing
 std/rpc.md h1 stdrpc-reference
 std/rpc.md h2 the-generated-surface-service
 std/rpc.md h2 mirrors-remotesourcet
+std/rpc.md h2 keyed-mirrors-keyedsourcek-t
 std/rpc.md h2 errors
 std/rpc.md h2 connection-state
 std/rpc.md h2 transports
