@@ -45,6 +45,28 @@ filter = '''
 '''
 priority = 100
 
+# M19 T1's replay differential is the run's single longest member, and it is a
+# member of its own binary for that reason (tracker N57). It re-hosts all ~124
+# corpus programs as package modules, then analyzes every one of them warm
+# TWICE — once replaying its modules' remembered checks, once re-deriving them —
+# so 60-170 s is not a bound anyone tuned, it is the sweep. Started last it IS
+# the critical path, exactly as `dependent_edit_measurement` was above; started
+# first it overlaps the wide middle of the run.
+#
+# It is deliberately NOT in `wall-clock-waits` below, for the reason the two
+# other differentials are not: that group is one thread because its members WAIT
+# on work happening elsewhere and pile onto each other doing nothing. This one
+# waits on nothing — it is compute, on a 16-way `thread::scope` of its own — and
+# one thread for it would turn the run's longest test into a longer one.
+#
+# `slow-timeout` is raised from the 60 s default so a leg whose honest cost is
+# two and a half minutes is not reported as a runaway on every run; the kill is
+# at 15 minutes, which nothing but a hang can reach.
+[[profile.default.overrides]]
+filter = 'binary(replay_differential)'
+priority = 100
+slow-timeout = { period = "180s", terminate-after = 5 }
+
 # The wall-clock waits run ONE AT A TIME (tracker N46).
 #
 # Every member waits, on the wall clock, for work happening on ANOTHER thread or
