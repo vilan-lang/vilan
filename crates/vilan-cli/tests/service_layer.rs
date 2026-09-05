@@ -1337,3 +1337,193 @@ fn the_greeting_bound_destroys_a_silent_socket_and_spares_a_speaking_one() {
 
     drop(server);
 }
+
+/// A `[expose(keyed)]` service, end to end over a real WebSocket: the keyed
+/// channel the macro mints, the `KeyedSource` mirror the generated client
+/// carries, and a per-key subscription taken through it (A39).
+const KEYED_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::rpc_server::Service;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(ChatClient)]
+struct Chat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl Chat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		self.messages.update(|&mut store| {
+			store.insert(id, Message { id, channel, body });
+		});
+		self.messages.get().len()
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		match self.messages.get().get(id) {
+			Some(let held) => {
+				self.messages.update(|&mut store| {
+					store.insert(id, Message { id, channel = held.channel, body });
+				});
+				true
+			},
+			None => false,
+		}
+	}
+}
+
+// The same surface with the exposure shape as its ONLY difference — the twin
+// that shows the contract hash moving for the keyed form and only for it.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+	[expose] messages: SignalCell<Map<str, Message>>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: Chat = Chat { topic = Signal::new("general"), messages = Signal::new(Map::new()) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun render(list: List<Message>): str {
+	mut out = "";
+	for message in list {
+		out = out + message.id + "=" + message.body + " ";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match ChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// Both mirrors are the generated ones: `topic` is a
+			// `RemoteSource<str>`, `messages` a `KeyedSource<str, Message>`.
+			let topic = client.topic.sub(|value| print(i"topic:{value}"));
+			let watch = client.messages.sub_key("m2", |value| match value {
+				Some(let message) => print(i"m2:{message.body}"),
+				None => print("m2:absent"),
+			});
+			print(i"post:{client.post("m1", 0, "hello").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", 0, "world").unwrap_or(0 - 1)}");
+			print(i"edit:{client.edit("m1", "hello again").unwrap_or(false)}");
+			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
+			// The per-key mirror holds ITS message and no other, even though
+			// the service's map holds two.
+			print(i"held:{render(client.messages.get().unwrap_or([]))}");
+			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			print(i"hash:{client.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"fault:{client.messages.fault().is_some()}");
+			watch.dispose();
+			topic.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subscribe_per_key() {
+    // The macro half of A39, exercised where it actually has to work: a real
+    // server, a real handshake, the generated `connect`. `topic` is a plain
+    // `[expose]` and mirrors as a `RemoteSource<str>`; `messages` is
+    // `[expose(keyed)]` over a `Map<str, Message>` and mirrors as a
+    // `KeyedSource<str, Message>`, which is what makes `sub_key` reachable
+    // from generated client code at all — the thing A39 recorded as stopping
+    // at the client, because the `ReactiveClient` behind the generated mirrors
+    // is not public (A30) and a hand-wired channel could not be reached.
+    //
+    // The load-bearing line is `held:`: the client leased ONE key, so its
+    // mirror holds exactly that message while the service's map holds two.
+    // Under `[expose]` the same subscription would have carried both, and
+    // every other message the service ever accepts.
+    let dir = temp_project("keyed");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The per-key mirror seeds absent, then follows its own key alone.
+        "m2:absent",
+        "m2:world",
+        "m2:world again",
+        // The plain mirror beside it is untouched by any of this.
+        "topic:general",
+        "topic-held:general",
+        // Two messages posted, one message held.
+        "post:1",
+        "post:2",
+        "edit:true",
+        "held:m2=world again",
+        "fault:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the keyed service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("held:m1="),
+        "a per-key subscription received a message it never asked for:\n{stdout}"
+    );
+    // The contract hash moves for the keyed form and ONLY for it. `PlainChat`
+    // is the same surface with the exposure shape as its only difference, and
+    // it hashes differently — a client built against one cannot connect to the
+    // other, which is exactly right: the frames differ. The plain-`[expose]`
+    // hash pinned in `a_factory_service_builds_one_instance_per_connection`
+    // (`d1d5fba0`) is the other half of the claim: it did not move at all.
+    assert!(
+        stdout.contains("hash:43077e29"),
+        "the keyed service's contract hash moved:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("plain-hash:c63e39e3"),
+        "the plain twin's contract hash moved:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
