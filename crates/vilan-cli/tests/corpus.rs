@@ -749,3 +749,114 @@ fn concurrent_builds_of_one_program_agree_byte_for_byte() {
         }
     }
 }
+
+/// N54 — the filesystem program's scratch path belongs to its RUN, not to the
+/// working directory.
+///
+/// `file.vl` opens, reads, rewrites and removes a file it creates itself, and it
+/// used to create it as `file-corpus.txt` relative to the process working
+/// directory — one name, one directory, for every run of the program that ever
+/// happens at once. The two differentials in `vilan-core` each run every corpus
+/// program, in processes that know nothing about each other, so overlapping runs
+/// are not a hazard the program might meet: they are how it is run. Shared, the
+/// run that gets to `remove` first deletes the file another run is still
+/// reading, and the loser fails on an `ENOENT` about a file that was never its
+/// own — a red that says nothing about the handle tier this program exists to
+/// pin. `watch.vl` was given a random-suffixed scratch directory for the same
+/// reason one item earlier (tracker N51); this is that fix on the sibling that
+/// still had the disease.
+///
+/// The pin is the property, not the mechanism: eight copies of the emitted
+/// program, started together **in one directory** — the arrangement that makes
+/// a fixed name collide — must each print the same bytes and exit 0. It is not a
+/// timing claim; eight runs that never overlapped would pass it too, and every
+/// run that DOES overlap is a run this would have caught.
+#[test]
+fn eight_concurrent_runs_of_the_filesystem_program_agree_byte_for_byte() {
+    const COPIES: usize = 8;
+
+    let work = std::env::temp_dir().join(format!("vilan_file_corpus_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("create the work directory");
+    let source = work.join("file.vl");
+    std::fs::copy(corpus_dir().join("file.vl"), &source).expect("stage the program");
+    let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        built.status.success(),
+        "file.vl must build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let program = source.with_extension(GOLDEN_EXTENSION);
+
+    // Started together, and all eight in the SAME working directory: a
+    // scratch path built from the working directory alone is one path for all of
+    // them, which is the collision under test.
+    let children: Vec<_> = (0..COPIES)
+        .map(|_| {
+            Command::new("node")
+                .arg(&program)
+                .current_dir(&work)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn node")
+        })
+        .collect();
+    let runs: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("wait for node"))
+        .collect();
+
+    let failures: Vec<String> = runs
+        .iter()
+        .enumerate()
+        .filter(|(_, run)| !run.status.success())
+        .map(|(which, run)| {
+            format!(
+                "copy {which} exited {:?}: {}",
+                run.status.code(),
+                String::from_utf8_lossy(&run.stderr)
+            )
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {COPIES} concurrent runs failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let first = String::from_utf8_lossy(&runs[0].stdout).into_owned();
+    assert!(
+        first.contains("data.txt") && !first.contains("file-corpus-"),
+        "the program prints the BASENAME of its scratch file, so the random \
+         suffix that keeps the runs apart never reaches stdout: {first:?}"
+    );
+    for (which, run) in runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            first,
+            "copy {which} printed something else — the runs are sharing a path"
+        );
+    }
+
+    // Every run removes what it made: nothing of the program's is left beside
+    // the sources, so a leftover directory is a teardown that did not run.
+    let leftovers: Vec<String> = std::fs::read_dir(&work)
+        .expect("read the work directory")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            (name != "file.vl" && name != format!("file.{GOLDEN_EXTENSION}")).then_some(name)
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the program left {leftovers:?} behind — the scratch tree is removed on exit"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}

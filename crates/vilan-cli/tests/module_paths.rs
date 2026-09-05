@@ -292,3 +292,185 @@ fn a_std_root_that_is_not_utf8_still_loads_and_still_steers() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- Which `std` a path-addressed file compiles against (tracker N56) --------
+//
+// A file names a location, and a location decides a toolchain. Before N56 the
+// PROCESS working directory got a vote: std resolution walked the entry's
+// ancestors for a `vilan/std` checkout and then walked the shell's, so
+// `vilan check ~/code/app/src/x.vl` typed by someone standing in this repository
+// compiled that application against the working tree's std — 37
+// `macro PartialEq's definition did not compile` from here, 0 from the
+// application's own directory, on one unchanged file. `file_project` has
+// resolved the PACKAGE from the file's own location since G20; these pin that
+// the std comes from the same place, and that the one case where the working
+// directory still legitimately answers — a bare file belonging to no package —
+// is the case that keeps it.
+
+/// A second checkout, standing in for another clone of the toolchain: a
+/// `vilan/std` package with no modules at all, so anything compiled against it
+/// fails on its first import. Returns the directory to stand in.
+fn a_stand_in_checkout(root: &Path) -> PathBuf {
+    let other = root.join("other");
+    let std = other.join("vilan").join("std");
+    std::fs::create_dir_all(std.join("src")).unwrap();
+    std::fs::write(std.join("vilan.toml"), "[library]\nname = \"std\"\n").unwrap();
+    let macro_std = other.join("vilan").join("macro_std");
+    std::fs::create_dir_all(macro_std.join("src")).unwrap();
+    std::fs::write(
+        macro_std.join("vilan.toml"),
+        "[library]\nname = \"macro_std\"\n",
+    )
+    .unwrap();
+    other
+}
+
+/// `vilan` with `$VILAN_STD` explicitly OUT of the environment: these tests are
+/// about the resolution that runs when nothing names a std, and an inherited
+/// variable would answer for all of them and pin nothing.
+fn vilan_without_std_env(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env_remove("VILAN_STD")
+        .args(args)
+        .output()
+        .expect("run vilan")
+}
+
+#[test]
+fn a_file_in_a_package_takes_its_own_toolchains_std_from_any_directory() {
+    let root = temp_root("std-by-location");
+    let package = root.join("app");
+    write_package(
+        &package,
+        &[(
+            "main.vl",
+            "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
+        )],
+    );
+    let other = a_stand_in_checkout(&root);
+    let entry = package.join("main.vl");
+    let entry = entry.to_str().expect("a UTF-8 temp path");
+
+    // The same absolute path, checked from two directories. Neither is named in
+    // the command; only one of them holds a checkout.
+    let from_its_own_directory = vilan_without_std_env(&package, &["check", entry]);
+    let from_another_checkout = vilan_without_std_env(&other, &["check", entry]);
+
+    assert!(
+        from_its_own_directory.status.success(),
+        "the fixture must be clean where its own toolchain answers: {}",
+        combined(&from_its_own_directory)
+    );
+    assert_eq!(
+        combined(&from_another_checkout),
+        combined(&from_its_own_directory),
+        "one file, one verdict: the working directory is not a toolchain"
+    );
+    assert_eq!(
+        from_another_checkout.status.code(),
+        from_its_own_directory.status.code()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_bare_file_belonging_to_no_package_still_takes_the_working_directorys_checkout() {
+    // The case the rule KEEPS, and the control that makes the pin above a claim
+    // rather than a tautology: it is the same stand-in checkout, and it does
+    // change the answer — for a scratch program with no `vilan.toml` at or above
+    // it, which has no toolchain of its own for the shell's to override.
+    let root = temp_root("std-bare-file");
+    let bare = root.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let scratch = bare.join("scratch.vl");
+    std::fs::write(
+        &scratch,
+        "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
+    )
+    .unwrap();
+    let other = a_stand_in_checkout(&root);
+    let path = scratch.to_str().expect("a UTF-8 temp path");
+
+    let from_its_own_directory = vilan_without_std_env(&bare, &["check", path]);
+    assert!(
+        from_its_own_directory.status.success(),
+        "with no checkout anywhere, the binary's own std compiles it: {}",
+        combined(&from_its_own_directory)
+    );
+    let from_the_checkout = vilan_without_std_env(&other, &["check", path]);
+    assert!(
+        !from_the_checkout.status.success(),
+        "a bare file compiles against the checkout the shell is standing in, and \
+         this one has an empty std — so the stand-in checkout above is reachable \
+         and it does decide verdicts: {}",
+        combined(&from_the_checkout)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_cascade_of_macro_definition_failures_names_the_std_that_was_resolved() {
+    // Which std answered is invisible on a clean compile and invisible on a
+    // broken one, and this is the failure where it is the whole question: a
+    // mismatched std fails EVERY derive in the file at once, so the screen
+    // fills with a message about the user's own code. Two failing macro
+    // definitions are a cascade; one is a macro.
+    let root = temp_root("std-named-in-cascade");
+    let package = root.join("app");
+    write_package(
+        &package,
+        &[(
+            "main.vl",
+            "fun main() {\n\tlet first = macro { 42 };\n\tlet second = macro { 43 };\n}\n",
+        )],
+    );
+    let std = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std");
+    let entry = package.join("main.vl");
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(&package)
+        .env("NO_COLOR", "1")
+        .env("VILAN_STD", &std)
+        .arg("check")
+        .arg(&entry)
+        .output()
+        .expect("run vilan");
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("Error: the `macro { .. }` block's definition did not compile")
+            .count(),
+        2,
+        "the fixture must produce a cascade: {text}"
+    );
+    assert!(
+        text.contains("2 macro definitions failed to compile"),
+        "the note counts them: {text}"
+    );
+    assert!(
+        text.contains(&std.display().to_string()),
+        "and names the std this compile resolved: {text}"
+    );
+
+    // One failure is not a cascade, and a note on it would be noise.
+    std::fs::write(
+        package.join("main.vl"),
+        "fun main() {\n\tlet only = macro { 42 };\n}\n",
+    )
+    .unwrap();
+    let single = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(&package)
+        .env("NO_COLOR", "1")
+        .env("VILAN_STD", &std)
+        .arg("check")
+        .arg(&entry)
+        .output()
+        .expect("run vilan");
+    let text = combined(&single);
+    assert!(
+        text.contains("definition did not compile") && !text.contains("macro definitions failed"),
+        "a lone failure carries no note: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

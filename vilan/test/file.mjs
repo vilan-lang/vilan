@@ -1,4 +1,4 @@
-import { open, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, rm, unlink, writeFile } from "node:fs/promises";
 function __fs_close(file) {
 	file.close().catch((error) => {
 		console.error("vilan: closing a dropped file failed:", error);
@@ -7,14 +7,32 @@ function __fs_close(file) {
 async function __fs_close_awaited(file) {
 	await file.close();
 }
+function __random_int(low, high) {
+	return Math.floor(Math.random() * (high - low + 1)) + low;
+}
 function __shared_new(value) {
 	return { v: value };
+}
+function __substring(text, start, end) {
+	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
+	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
 }
 function encode_utf8(text) {
 	return new TextEncoder().encode(text);
 }
 function decode_utf8(bytes) {
 	return new TextDecoder().decode(bytes);
+}
+async function create_dir_all(path) {
+	const options = Object();
+	options.recursive = true;
+	return await (mkdir(path, options));
+}
+async function remove_dir_all(path) {
+	const options = Object();
+	options.recursive = true;
+	options.force = true;
+	return await (rm(path, options));
 }
 async function open2(path) {
 	return await (open(path, "r"));
@@ -51,63 +69,84 @@ function as_i53(self) {
 	const widened = Number(self);
 	return Number(Math.trunc(widened));
 }
-function $a($b) {
-	drop($b);
+function basename(path) {
+	let end = path.length;
+	while (end > 0 && __substring(path, end - 1, end) === "/") {
+		end = end - 1;
+	}
+	let start = end;
+	while (start > 0 && __substring(path, start - 1, start) !== "/") {
+		start = start - 1;
+	}
+	return __substring(path, start, end);
 }
-async function $f(file, body) {
+function range(low, high) {
+	return __random_int(low, high);
+}
+function $a(low, high) {
+	return range(low, high);
+}
+function $b($c) {
+	drop($c);
+}
+async function $g(file, body) {
 	try {
 		const result = await (body(file));
 		await (__fs_close_awaited(file));
 		return result;
 	} finally {
-		$a(file);
+		$b(file);
 	}
 }
-async function $e(path, body) {
-	return await ($f(await (open2(path)), body));
+async function $f(path, body) {
+	return await ($g(await (open2(path)), body));
 }
-async function $g(path, body) {
-	return await ($f(await (create(path)), body));
+async function $h(path, body) {
+	return await ($g(await (create(path)), body));
 }
-function $i($j) {
-	$a($j[0]);
+function $j($k) {
+	$b($k[0]);
 }
 (async () => {
-	await (writeFile("file-corpus.txt", "0123456789"));
-	let file = await (open2("file-corpus.txt"));
+	const root = "file-corpus-" + $a(100000, 999999);
+	await (create_dir_all(root));
+	const scratch = "" + root + "/data.txt";
+	console.log(basename(scratch));
+	await (writeFile(scratch, "0123456789"));
+	let file = await (open2(scratch));
 	try {
 		const buffer = new Uint8Array(4);
 		console.log(await (read_at(file, buffer, 3)));
 		console.log(decode_utf8(buffer.slice(0, 4)));
 		console.log((await (stat(file)))[0]);
-		$a(file);
+		$b(file);
 		file = null;
-		const $c = await (open2("file-corpus.txt"));
+		const $d = await (open2(scratch));
 		try {
-			console.log(await (read_at($c, buffer, 0)));
+			console.log(await (read_at($d, buffer, 0)));
 		} finally {
-			$a($c);
+			$b($d);
 		}
 	} finally {
 		if (file !== null) {
-			$a(file);
+			$b(file);
 		}
 	}
-	const $d = await (open2("file-corpus.txt"));
+	const $e = await (open2(scratch));
 	try {
-		console.log((await (stat($d)))[0]);
+		console.log((await (stat($e)))[0]);
 	} finally {
-		$a($d);
+		$b($e);
 	}
-	const size = await ($e("file-corpus.txt", async (f) => {
+	const size = await ($f(scratch, async (f) => {
 		return (await (stat(f)))[0];
 	}));
 	console.log(size);
-	await ($g("file-corpus.txt", async (f) => {
+	await ($h(scratch, async (f) => {
 		await (write_at(f, encode_utf8("0123456789"), 0));
 		return;
 	}));
-	let reader = of(await (open2("file-corpus.txt")));
+	let reader = of(await (open2(scratch)));
 	try {
 		let whole = "";
 		while (true) {
@@ -119,15 +158,16 @@ function $i($j) {
 		}
 		console.log(whole);
 		console.log(position(reader));
-		$i(reader);
+		$j(reader);
 		reader = null;
 	} finally {
 		if (reader !== null) {
-			$i(reader);
+			$j(reader);
 		}
 	}
-	await (unlink("file-corpus.txt"));
-})().catch(($k) => {
-	console.error(String($k));
+	await (unlink(scratch));
+	await (remove_dir_all(root));
+})().catch(($l) => {
+	console.error(String($l));
 	process.exit(1);
 });

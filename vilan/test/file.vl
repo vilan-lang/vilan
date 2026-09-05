@@ -2,6 +2,8 @@ import std::bytes::{ Bytes, decode_utf8, encode_utf8 };
 import std::drop::drop;
 import std::fs;
 import std::fs::{ File, Reader, with_file, with_file_create };
+import std::path::basename;
+import std::random;
 
 // The handle tier (kolt.local 031 S3, proposal/filesystem.md §3.2): positional
 // reads off an open file, the postfix-off-an-awaited-call spellings the tier
@@ -13,12 +15,36 @@ import std::fs::{ File, Reader, with_file, with_file_create };
 // owns, and a WRITING scoped form, whose close is the same awaited one.
 // Excluded from the macro interpreter gate — the filesystem is a host
 // capability, and every call here awaits.
+//
+// The scratch directory carries a random suffix because two runs of this
+// program overlap by construction — the two differentials each run it, in
+// processes that know nothing about each other — and a fixed `file-corpus.txt`
+// relative to the working directory is one file for both of them (tracker N54,
+// `watch.vl`'s N51 fix one program over). Shared, the run that finishes first
+// `remove`s the file the other is still reading, and the loser fails on an
+// ENOENT that has nothing to do with what it was claiming; the same name in the
+// same directory also makes the two runs' writes each other's reads. Only the
+// BASENAME is printed, so the suffix never reaches stdout, and the whole
+// directory goes at the end.
+//
+// Each claim below carries a `// witness:` line naming the emitted bytes it
+// rests on; `corpus.rs`'s `every_declared_witness_is_in_its_golden` checks them.
 
 fun main() {
-	fs::write_file("file-corpus.txt", "0123456789");
+	let root = i"file-corpus-{random::range(100000, 999999)}";
+	fs::create_dir_all(root);
+	let scratch = i"{root}/data.txt";
+	print(basename(scratch));
 
-	// A held handle: positional read, handle stat, early drop.
-	let file = File::open("file-corpus.txt");
+	fs::write_file(scratch, "0123456789");
+
+	// A held handle: positional read, handle stat, early drop. The read is
+	// positional off the OPEN file — no cursor, no seek — and the early drop
+	// runs the close AND clears the slot, so the scope's finally, still emitted
+	// because the drop is conditional on the path taken, does not close twice.
+	// witness: console.log(await (read_at(file, buffer, 3)));
+	// witness: $b(file); file = null;
+	let file = File::open(scratch);
 	let buffer = Bytes::alloc(4);
 	print(file.read_at(buffer, 3));
 	print(decode_utf8(buffer.slice(0, 4)));
@@ -26,22 +52,30 @@ fun main() {
 	drop(file);
 
 	// B141's historically-broken spellings, positive: a postfix chain straight
-	// off the implicitly-awaited constructor call.
-	print(File::open("file-corpus.txt").read_at(buffer, 0));
-	print(File::open("file-corpus.txt").stat().size);
+	// off the implicitly-awaited constructor call. The temporary is bound, used
+	// and closed out of a finally of its own.
+	// witness: console.log(await (read_at($d, buffer, 0)));
+	print(File::open(scratch).read_at(buffer, 0));
+	print(File::open(scratch).stat().size);
 
 	// The documented idiom: the body gets the file as a per-call parameter,
-	// and the close is awaited before with_file returns.
-	let size = with_file("file-corpus.txt", |f| f.stat().size);
+	// and the close is AWAITED before with_file returns — the awaited close and
+	// the Drop that backs it are both emitted, in that order.
+	// witness: await (__fs_close_awaited(file)); return result; } finally { $b(file); }
+	let size = with_file(scratch, |f| f.stat().size);
 	print(size);
 
 	// S5: the writing scoped form — the same awaited close over a `create`.
-	with_file_create("file-corpus.txt", |f| {
+	// witness: return await ($g(await (create(path)), body));
+	with_file_create(scratch, |f| {
 		f.write_at(encode_utf8("0123456789"), 0i53);
 	});
 
-	// S5: the chunk loop, over `read_at` and a cursor this program owns.
-	let reader = Reader::of(File::open("file-corpus.txt"));
+	// S5: the chunk loop, over `read_at` and a cursor this program owns. Its
+	// teardown is the containment one — the destructor reaches through a plain
+	// struct into the `File` the reader holds.
+	// witness: function $j($k) { $b($k[0]); }
+	let reader = Reader::of(File::open(scratch));
 	mut whole = "";
 	for {
 		let chunk = reader.next(4);
@@ -54,6 +88,7 @@ fun main() {
 	print(reader.position());
 	drop(reader);
 
-	fs::remove("file-corpus.txt");
+	fs::remove(scratch);
+	fs::remove_dir_all(root);
 }
 main();
