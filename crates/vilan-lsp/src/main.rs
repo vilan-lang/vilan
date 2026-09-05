@@ -3213,13 +3213,17 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter(|entry| *entry.key() != uri)
                 .map(|entry| entry.value());
-            let spans = match document.rename_edits_across(offset, &new_name, neighbors) {
-                Ok(spans) => spans,
+            let edits = match document.rename_edits_across(offset, &new_name, neighbors) {
+                Ok(edits) => edits,
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
                 Err(refusal) => return Err(rename_refused(&refusal)),
             };
             let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-            for (path, span) in spans {
+            // Each edit carries its OWN text (E143). It is `new_name` for every
+            // site that is a plain identifier — which is all of them but one —
+            // and the struct-init shorthand's expansion (`A { new = x }`) where
+            // the one identifier had to become two.
+            for (path, span, new_text) in edits {
                 // An occurrence that cannot be turned into a location would be a
                 // reference this rename silently skips — the partial edit set the
                 // rule forbids — so refuse rather than drop it.
@@ -3233,7 +3237,7 @@ impl LanguageServer for Backend {
                 };
                 changes.entry(location.uri).or_default().push(TextEdit {
                     range: location.range,
-                    new_text: new_name.clone(),
+                    new_text,
                 });
             }
             Ok(Some(WorkspaceEdit {
@@ -3784,6 +3788,37 @@ mod snapshot_consistency_tests {
             edit.changes.expect("one file's edits")[&uri].len(),
             2,
             "the declaration and its use",
+        );
+    }
+
+    // E143: the handler carries a rename edit's OWN text. Every edit it emits
+    // used to be `new_name`, unconditionally, which is exactly why a
+    // struct-init shorthand could not be renamed at all — an expansion is not
+    // an identifier. The pin drives the real handler, because the expansion
+    // reaching the client is the whole deliverable and the document layer
+    // cannot prove it.
+    #[tokio::test]
+    async fn rename_at_a_shorthand_sends_the_expansion_as_the_edits_text() {
+        const SHORTHAND: &str = "struct A { x: i32 }\n\nfun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(SHORTHAND));
+        // `\tlet x = 1;` is line 3; the binding's name is at character 5.
+        let edit = backend
+            .rename(rename_params(&uri, Position::new(3, 5)))
+            .await
+            .expect("a rename at the local")
+            .expect("`x` is renameable");
+        let mut texts: Vec<String> = edit.changes.expect("one file's edits")[&uri]
+            .iter()
+            .map(|edit| edit.new_text.clone())
+            .collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            vec!["renamed".to_string(), "x = renamed".to_string()],
+            "the declaration takes the plain name, the shorthand takes the expansion",
         );
     }
 

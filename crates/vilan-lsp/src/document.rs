@@ -482,23 +482,6 @@ pub enum RenameRefusal {
     /// The index knows it is missing references to this definition: use sites
     /// whose recorded span could not be proven to cover an identifier.
     Incomplete { what: String, missing: usize },
-    /// One of the definition's references is a struct-init field SHORTHAND
-    /// (`A { x }`), whose single identifier names two things at once: the
-    /// field `A::x` and the local `x` it reads (E134). There is no span to
-    /// rewrite that serves both — renaming from either side would silently
-    /// break the other, which is the "half-applied rename" this enum exists to
-    /// forbid, and today renaming the field does exactly that. A correct
-    /// rename has to EXPAND the site to `A { x = value }` first, which is a
-    /// text rewrite rather than a span rewrite: every other edit this module
-    /// emits replaces an identifier with `new_name`, so an expansion cannot be
-    /// expressed in the edit set at all. The refusal names the expansion and
-    /// the user does it once, after which both names have spans of their own
-    /// and the rename goes through.
-    SharedSpan {
-        what: String,
-        with: String,
-        name: String,
-    },
     /// An open file that imports the definition's file has un-analyzed edits,
     /// so its analyzed spans cannot be trusted against its live buffer —
     /// applying them could corrupt it, and skipping it would emit the partial
@@ -524,10 +507,6 @@ impl RenameRefusal {
             ),
             RenameRefusal::Incomplete { what, missing } => format!(
                 "cannot rename {what}: {missing} of its references could not be located, so the edit would be incomplete"
-            ),
-            RenameRefusal::SharedSpan { what, with, name } => format!(
-                "cannot rename {what}: it is written as a field shorthand, where the one `{name}` names both it and {with}. \
-                 Expand that site to `{name} = {name}` first, so each name has a span of its own"
             ),
             RenameRefusal::StillAnalyzing { what } => format!(
                 "cannot rename {what} yet: an open file that references it is still being analyzed; retry in a moment"
@@ -3498,6 +3477,23 @@ impl Document {
             .collect()
     }
 
+    /// [`Self::spans_by_path`] for a rename's edits, which carry their own
+    /// replacement text (E143).
+    fn edits_by_path(&self, edits: Vec<(SourceId, Span, String)>) -> Vec<(PathBuf, Span, String)> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        edits
+            .into_iter()
+            .filter_map(|(source, span, text)| {
+                program
+                    .canonical_sources
+                    .get(source.0 as usize)
+                    .map(|path| (path.clone(), span, text))
+            })
+            .collect()
+    }
+
     /// The canonical path of the file this document's analysis read as its
     /// entry (`None` when nothing was analyzed) — how the location conversion
     /// recognizes a path-space span as belonging to an open document.
@@ -3536,9 +3532,9 @@ impl Document {
         &self,
         offset: usize,
         new_name: &str,
-    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+    ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
         let (definition, what) = self.rename_target(offset, new_name)?;
-        self.rename_spans(definition, &what)
+        self.rename_spans(definition, &what, new_name)
     }
 
     /// [`Document::rename_edits`] unioned over each `neighbors` (the other
@@ -3553,9 +3549,9 @@ impl Document {
         offset: usize,
         new_name: &str,
         neighbors: impl IntoIterator<Item = &'a Document>,
-    ) -> std::result::Result<Vec<(PathBuf, Span)>, RenameRefusal> {
+    ) -> std::result::Result<Vec<(PathBuf, Span, String)>, RenameRefusal> {
         let (definition, what) = self.rename_target(offset, new_name)?;
-        let mut merged = self.spans_by_path(self.rename_spans(definition, &what)?);
+        let mut merged = self.edits_by_path(self.rename_spans(definition, &what, new_name)?);
         if let Some(key) = self.definition_key(definition) {
             for neighbor in neighbors {
                 if !neighbor.depends_on(key.path()) {
@@ -3571,7 +3567,8 @@ impl Document {
                 let Some(local) = neighbor.definition_of_key(&key) else {
                     continue;
                 };
-                merged.extend(neighbor.spans_by_path(neighbor.rename_spans(local, &what)?));
+                merged
+                    .extend(neighbor.edits_by_path(neighbor.rename_spans(local, &what, new_name)?));
             }
         }
         merged.sort();
@@ -3607,7 +3604,8 @@ impl Document {
         &self,
         definition: Definition,
         what: &str,
-    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+        new_name: &str,
+    ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
         let Some(program) = self.program.as_ref() else {
             return Err(RenameRefusal::NotAnIdentifier);
         };
@@ -3619,45 +3617,28 @@ impl Document {
             });
         }
 
-        // E134: a struct-init field shorthand `A { x }` is ONE identifier
-        // naming two definitions — the field key and the local it reads — so
-        // there is no rewrite of that span that serves both. Refuse from
-        // either side rather than emit the edit that silently breaks the other
-        // name (which is what renaming the field used to do). The refusal
-        // names the expansion that gives each name a span of its own.
-        if let Some(other) = self
+        // The index guarantees one row per `(source, span)` in a file, so this
+        // cannot hold a duplicate — but a duplicate span is what the CLIENT
+        // rejects ("Rename failed to apply edits"), so the guarantee is
+        // re-stated where the edit set is actually produced rather than relied
+        // on from two layers away.
+        let mut spans: Vec<(SourceId, Span, String)> = self
             .reference_index()
             .occurrences_of(definition)
-            .find_map(|occurrence| occurrence.shared_with(definition))
-        {
-            let name = crate::references::name_of(program, definition).unwrap_or("this symbol");
-            let with = match crate::references::kind_of(program, other) {
-                Some(kind) => format!("the {} `{name}`", kind.noun()),
-                None => format!("`{name}`"),
-            };
-            return Err(RenameRefusal::SharedSpan {
-                what: what.to_string(),
-                with,
-                name: name.to_string(),
-            });
-        }
-
-        // The index guarantees one row per `(source, span)`, so this cannot
-        // hold a duplicate — but a duplicate span is what the CLIENT rejects
-        // ("Rename failed to apply edits"), so the guarantee is re-stated
-        // where the edit set is actually produced rather than relied on from
-        // two layers away.
-        let mut spans: Vec<(SourceId, Span)> = self
-            .reference_index()
-            .occurrences_of(definition)
-            .map(|occurrence| (occurrence.source, occurrence.span))
+            .map(|occurrence| {
+                (
+                    occurrence.source,
+                    occurrence.span,
+                    self.replacement_for(program, definition, occurrence, new_name),
+                )
+            })
             .collect();
-        spans.sort_by_key(|(source, span)| (source.0, span.start, span.end));
+        spans.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
         spans.dedup();
         if spans.is_empty() {
             return Err(RenameRefusal::NotAnIdentifier);
         }
-        for (source, _) in &spans {
+        for (source, _, _) in &spans {
             // Generated code has no path, so an edit there cannot be expressed —
             // and dropping it silently is the partial rename the rule forbids.
             if *source == DERIVED_SOURCE {
@@ -3682,6 +3663,54 @@ impl Document {
             }
         }
         Ok(spans)
+    }
+
+    /// The text one occurrence of `definition` is replaced with by a rename to
+    /// `new_name` — `new_name` itself for every site that is a plain
+    /// identifier, and an EXPANSION for the one site that is not (E143).
+    ///
+    /// A struct-init field shorthand `A { x }` is one identifier naming two
+    /// definitions: the field key `A::x` and a read of the local `x`
+    /// (E134's co-reference). Rewriting that identifier serves one name and
+    /// silently breaks the other, so rename refused there and named the
+    /// expansion for the user to write by hand. Ruled 2026-09-05: emit the
+    /// expansion instead. Renaming the FIELD gives `A { new = x }`; renaming
+    /// the LOCAL gives `A { x = new }`. The shorthand is exactly the form in
+    /// which the two names coincide, so writing them out is not a rewrite of
+    /// the user's code so much as the removal of an abbreviation that has run
+    /// out of room — and it is the same text the refusal used to ask for.
+    ///
+    /// This is the whole reason a rename edit carries its own text. Every
+    /// other edit in the set is `new_name`, and it stays that way; what
+    /// changed is that the module can now express a site where it is not.
+    fn replacement_for(
+        &self,
+        program: &Program,
+        definition: Definition,
+        occurrence: &crate::references::Occurrence,
+        new_name: &str,
+    ) -> String {
+        let Some(other) = occurrence.shared_with(definition) else {
+            return new_name.to_string();
+        };
+        // Both halves of a shorthand spell one name — that is what makes it a
+        // shorthand — so the surviving side keeps the name the site already
+        // has, and only the renamed side moves.
+        let existing = crate::references::name_of(program, definition).unwrap_or(new_name);
+        match crate::references::kind_of(program, definition) {
+            // The field key is on the LEFT of a struct initializer entry.
+            Some(crate::references::DefinitionKind::Field) => format!("{new_name} = {existing}"),
+            // Anything else reaching here is the value side: E134's
+            // co-reference pairs a field with the BINDING the shorthand reads,
+            // and there is no third shape.
+            _ => {
+                debug_assert!(matches!(
+                    crate::references::kind_of(program, other),
+                    Some(crate::references::DefinitionKind::Field)
+                ));
+                format!("{existing} = {new_name}")
+            }
+        }
     }
 
     /// The reference index this document's queries read.
