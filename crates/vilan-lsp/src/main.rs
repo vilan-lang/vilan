@@ -569,7 +569,7 @@ struct Backend {
     /// and rides an idle timer well above the debounce.
     package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
     package_revision: Arc<DashMap<PathBuf, u64>>,
-    union_tokens: Arc<DashMap<PathBuf, CancelToken>>,
+    union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
 }
 
 /// What a cached read of a file is only valid for: the file's length and its
@@ -1408,7 +1408,7 @@ struct AnalysisContext {
     /// debounced analysis itself neither computes a union nor waits for one.
     package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
     package_revision: Arc<DashMap<PathBuf, u64>>,
-    union_tokens: Arc<DashMap<PathBuf, CancelToken>>,
+    union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
 }
 
 /// What one scheduled analysis did (M26).
@@ -1485,6 +1485,7 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
     let package_unions = Arc::clone(&context.package_unions);
     let package_revision = Arc::clone(&context.package_revision);
     let union_tokens = Arc::clone(&context.union_tokens);
+    let schedule = Arc::clone(&context.schedule);
     let client = context.client.clone();
     let publish_state = Arc::clone(&context.publish_state);
     let publish_gate = Arc::clone(&context.publish_gate);
@@ -1524,20 +1525,60 @@ fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
             })
             .collect();
         let std_dir = discover_std_dir(&manifest_dir);
-        let token = CancelToken::new();
-        union_tokens.insert(manifest_dir.clone(), token.clone());
         let walked = manifest_dir.clone();
-        let computed = tokio::task::spawn_blocking(move || {
-            dead_items::compute(&entries, &std_dir, started_at, &token, |path| {
-                buffers
-                    .get(&vilan_core::util::canonical_path(path))
-                    .cloned()
-                    .or_else(|| std::fs::read_to_string(path).ok())
-            })
-        })
-        .await;
+        // E140: one task per entry, not one task over every entry. A package's
+        // union costs a full analysis per leg — kolt's three are 9.2 s, 1.6 s
+        // and 1.3 s in a debug build — and the serial loop paid them end to
+        // end AND gave them one token between them, so an edit to `client.vl`
+        // could only stop the union by stopping all of it.
+        //
+        // Each leg registers with M26's scheduler under its OWN entry's
+        // document when that entry is open, so the token it runs under is the
+        // one a `did_change` to that entry already cancels — the same
+        // instrument, the same checkpoints, no second mechanism. An entry with
+        // no open buffer gets a plain token. Both are recorded on the package
+        // so the withdrawal above can stop every leg at once.
+        let mut legs = Vec::with_capacity(entries.len());
+        let mut tokens = Vec::with_capacity(entries.len());
+        for (_, entry) in &entries {
+            let entry_uri = Url::from_file_path(entry).ok();
+            let started = entry_uri.as_ref().and_then(|uri| {
+                let generation = schedule.generation(uri)?;
+                Some((uri.clone(), schedule.start(uri, generation)))
+            });
+            let token = match &started {
+                Some((_, started)) => started.token.clone(),
+                None => CancelToken::new(),
+            };
+            tokens.push(token.clone());
+            let entry = entry.clone();
+            let std_dir = std_dir.clone();
+            let text = buffers
+                .get(&vilan_core::util::canonical_path(&entry))
+                .cloned()
+                .or_else(|| std::fs::read_to_string(&entry).ok());
+            let schedule_for_leg = Arc::clone(&schedule);
+            legs.push(tokio::spawn(async move {
+                let text = text?;
+                let leg = tokio::task::spawn_blocking(move || {
+                    dead_items::analyze_entry(&entry, &std_dir, &token, &text)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some((uri, started)) = started {
+                    schedule_for_leg.finish(&uri, &started);
+                }
+                leg
+            }));
+        }
+        union_tokens.insert(manifest_dir.clone(), tokens);
+        let mut computed = Vec::with_capacity(legs.len());
+        for leg in legs {
+            computed.push(leg.await.ok().flatten());
+        }
         union_tokens.remove(&walked);
-        let Ok(Some(reach)) = computed else {
+        let Some(reach) = dead_items::union_of(computed, started_at) else {
             return;
         };
         // The world may have moved while the entries were analyzed. A union
@@ -2071,27 +2112,54 @@ impl Backend {
     /// opposite of E114's locals and unreachable paint, which are file-local,
     /// cheap, and stay on throughout.
     ///
-    /// The whole package, not the edited file's dependency cone. A use can only
-    /// be added from a file that imports the item's module, and inverting
-    /// `depends_on` would give exactly that set — but the union is computed and
-    /// cached per package, so the package IS the granularity the withdrawal has
-    /// to speak in, and it errs toward fewer grays, which is the safe side.
+    /// **The cone, not the whole package** (E140). The first cut withdrew a
+    /// package's entire paint on a keystroke anywhere in it, on the reasoning
+    /// that the union is cached per package so the package is the granularity
+    /// the withdrawal has to speak in. It is safe — withdrawal only ever
+    /// removes grays — and in a package of any size it means the grays are off
+    /// essentially all the time, because some file in the package is always
+    /// being typed in. The relation that decides it was already computable: a
+    /// union is a walk over the closure of its entries, so an edit can only
+    /// change a term of it if the edited file is IN that closure. The union
+    /// carries the closure it read (`PackageReach::sources`, the inverted
+    /// `depends_on` relation materialized where the answer was already in
+    /// hand), and an edit to a file outside it — an orphan module, a file no
+    /// entry reaches under any platform, a sibling package's file that
+    /// resolved to this manifest — leaves the paint standing.
+    ///
+    /// The narrowing is only ever applied against a union that EXISTS. While
+    /// one is in flight there is no closure to test, so the old package-wide
+    /// behavior stands for that window: the revision bumps and the legs are
+    /// cancelled. That is the conservative direction and it costs one idle
+    /// cycle, not a wrong gray.
     fn withdraw_package_grays_for(&self, uri: &Url) {
-        if let Some(manifest_dir) = package_of(&self.documents, uri) {
-            self.withdraw_package_grays(&manifest_dir);
+        let Some(manifest_dir) = package_of(&self.documents, uri) else {
+            return;
+        };
+        if let Ok(path) = uri.to_file_path()
+            && let Some(union) = self.package_unions.get(&manifest_dir)
+            && !union.depends_on(&path)
+        {
+            return;
         }
+        self.withdraw_package_grays(&manifest_dir);
     }
 
     /// [`withdraw_package_grays_for`](Backend::withdraw_package_grays_for) with
-    /// the package already resolved.
+    /// the package already resolved, and unconditionally — the cone test is the
+    /// caller's, because a caller that has no single edited file (a manifest
+    /// save, a recolor) has no cone to test against.
     fn withdraw_package_grays(&self, manifest_dir: &Path) {
         let key = manifest_dir.to_path_buf();
         *self.package_revision.entry(key.clone()).or_insert(0) += 1;
         self.package_unions.remove(&key);
         // A union already walking is a union for a world that has moved. It
-        // costs a full analysis per entry, so stopping it is worth the token.
-        if let Some(token) = self.union_tokens.get(&key) {
-            token.cancel();
+        // costs a full analysis per entry, so stopping it is worth the tokens —
+        // one per leg since E140 fanned them out.
+        if let Some(tokens) = self.union_tokens.get(&key) {
+            for token in tokens.value() {
+                token.cancel();
+            }
         }
     }
 
@@ -3213,13 +3281,17 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter(|entry| *entry.key() != uri)
                 .map(|entry| entry.value());
-            let spans = match document.rename_edits_across(offset, &new_name, neighbors) {
-                Ok(spans) => spans,
+            let edits = match document.rename_edits_across(offset, &new_name, neighbors) {
+                Ok(edits) => edits,
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
                 Err(refusal) => return Err(rename_refused(&refusal)),
             };
             let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-            for (path, span) in spans {
+            // Each edit carries its OWN text (E143). It is `new_name` for every
+            // site that is a plain identifier — which is all of them but one —
+            // and the struct-init shorthand's expansion (`A { new = x }`) where
+            // the one identifier had to become two.
+            for (path, span, new_text) in edits {
                 // An occurrence that cannot be turned into a location would be a
                 // reference this rename silently skips — the partial edit set the
                 // rule forbids — so refuse rather than drop it.
@@ -3233,7 +3305,7 @@ impl LanguageServer for Backend {
                 };
                 changes.entry(location.uri).or_default().push(TextEdit {
                     range: location.range,
-                    new_text: new_name.clone(),
+                    new_text,
                 });
             }
             Ok(Some(WorkspaceEdit {
@@ -3784,6 +3856,37 @@ mod snapshot_consistency_tests {
             edit.changes.expect("one file's edits")[&uri].len(),
             2,
             "the declaration and its use",
+        );
+    }
+
+    // E143: the handler carries a rename edit's OWN text. Every edit it emits
+    // used to be `new_name`, unconditionally, which is exactly why a
+    // struct-init shorthand could not be renamed at all — an expansion is not
+    // an identifier. The pin drives the real handler, because the expansion
+    // reaching the client is the whole deliverable and the document layer
+    // cannot prove it.
+    #[tokio::test]
+    async fn rename_at_a_shorthand_sends_the_expansion_as_the_edits_text() {
+        const SHORTHAND: &str = "struct A { x: i32 }\n\nfun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(SHORTHAND));
+        // `\tlet x = 1;` is line 3; the binding's name is at character 5.
+        let edit = backend
+            .rename(rename_params(&uri, Position::new(3, 5)))
+            .await
+            .expect("a rename at the local")
+            .expect("`x` is renameable");
+        let mut texts: Vec<String> = edit.changes.expect("one file's edits")[&uri]
+            .iter()
+            .map(|edit| edit.new_text.clone())
+            .collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            vec!["renamed".to_string(), "x = renamed".to_string()],
+            "the declaration takes the plain name, the shorthand takes the expansion",
         );
     }
 
@@ -8004,6 +8107,109 @@ mod dead_item_clock_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// E140: **the withdrawal is the cone, not the package.** An edit to a file
+    /// no entry loads cannot move a term of the union, so the paint stays up.
+    /// The first cut dropped the whole package's grays on any keystroke
+    /// anywhere in it, which in a package of any size means the grays are off
+    /// essentially all the time.
+    ///
+    /// The orphan is opened as its own document, which is what puts it in the
+    /// package and gives `withdraw_package_grays_for` something to resolve; it
+    /// is in no entry's closure, so it is outside the union's `sources`.
+    #[tokio::test]
+    async fn an_edit_outside_the_unions_cone_leaves_the_paint_up() {
+        let (directory, shared) = workspace();
+        std::fs::write(
+            directory.join("src/orphan.vl"),
+            "import std::io::print;\n\nfun nobody_loads_this() {\n\tprint(\"o\");\n}\n",
+        )
+        .expect("the orphan module");
+        let orphan = Url::from_file_path(directory.join("src/orphan.vl")).expect("a file url");
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        // The orphan is opened FIRST and waited for: `withdraw_package_grays_for`
+        // resolves a document's package off its landed analysis, so an orphan
+        // whose analysis has not landed resolves to no package at all and the
+        // withdrawal never reaches the cone test. Waiting for it is what makes
+        // this pin able to fail.
+        let orphan_text =
+            "import std::io::print;\n\nfun nobody_loads_this() {\n\tprint(\"o\");\n}\n";
+        server.did_open(open_params(&orphan, orphan_text)).await;
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline
+            && server
+                .documents
+                .get(&orphan)
+                .and_then(|document| document.manifest_dir().map(Path::to_path_buf))
+                .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            server
+                .documents
+                .get(&orphan)
+                .and_then(|document| document.manifest_dir().map(Path::to_path_buf)),
+            Some(vilan_core::util::canonical_path(&directory)),
+            "the orphan resolves to the package, which is the premise",
+        );
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union and `used_by_nobody` fades",
+        );
+        let union_before = server
+            .package_unions
+            .iter()
+            .next()
+            .map(|entry| entry.value().revision)
+            .expect("a union");
+
+        server
+            .did_change(whole_file_change(
+                &orphan,
+                2,
+                &format!("{orphan_text}\nfun also_nobodys() {{\n\tprint(\"a\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            !server.package_unions.is_empty(),
+            "an edit outside the union's cone leaves it standing",
+        );
+        assert_eq!(
+            server
+                .package_unions
+                .iter()
+                .next()
+                .map(|entry| entry.value().revision),
+            Some(union_before),
+            "and does not bump the package revision either",
+        );
+        assert_eq!(
+            grays(server, &shared),
+            1,
+            "so the paint on the file the user is NOT editing stays up",
+        );
+
+        // The control: an edit INSIDE the cone still withdraws, so the
+        // narrowing is about the relation rather than about withdrawal
+        // having quietly stopped.
+        server
+            .did_change(whole_file_change(
+                &shared,
+                3,
+                &format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            server.package_unions.is_empty(),
+            "an edit to a file the entries DO load withdraws, as it always did",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[tokio::test]

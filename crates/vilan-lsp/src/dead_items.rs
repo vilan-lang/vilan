@@ -40,10 +40,96 @@ pub struct PackageReach {
     /// entry loads — std and dependencies included, which costs nothing to
     /// carry and saves the consumer a filter it would have to get right.
     pub reached: HashSet<ItemKey>,
+    /// Every source the union READ, canonical — the union of each entry's
+    /// `Program::canonical_sources`. This is the inverted `depends_on`
+    /// relation, materialized once where the answer is already in hand, and it
+    /// is what narrows withdraw-on-edit from the whole package to the cone
+    /// that can actually change the answer (E140).
+    ///
+    /// The first cut withdrew a package's whole paint on any keystroke
+    /// anywhere in it. That is safe — withdrawal only ever removes grays — and
+    /// in a large package it means the grays are gone essentially all the
+    /// time, since some file in the package is always being typed in. An edit
+    /// to a file NO entry loads (an orphan module, a sibling package's file, a
+    /// file this package's entries do not reach under any platform) cannot move
+    /// a single term of this union, so it does not withdraw it.
+    ///
+    /// It is a set of paths and not a set of edges on purpose: the question
+    /// "could an edit to this file change the union" is answered by membership,
+    /// and a file that is in no entry's closure is in no entry's closure
+    /// however the imports are arranged.
+    pub sources: HashSet<PathBuf>,
     /// The package edit revision this union was computed against. The paint is
     /// served only while it still matches the package's current revision, which
     /// is what makes withdrawal instant and restoration the clock's job.
     pub revision: u64,
+}
+
+impl PackageReach {
+    /// Whether an edit to `path` can change this union — whether the file is
+    /// in the cone the union was computed over. `true` for a union that
+    /// recorded no sources at all, which cannot happen for a computed one and
+    /// is the safe answer if it ever does.
+    pub fn depends_on(&self, path: &Path) -> bool {
+        self.sources.is_empty()
+            || self
+                .sources
+                .contains(&vilan_core::util::canonical_path(path))
+    }
+}
+
+/// One entry's contribution to a union: the keys its walk reached, and the
+/// sources its analysis loaded.
+///
+/// Split out of [`compute`] so the legs can run CONCURRENTLY and each be
+/// cancelled on its own (E140). A package with many entries used to pay them
+/// serially inside one `spawn_blocking` — kolt's three cost 9.2 s + 1.6 s +
+/// 1.3 s in a debug build — and a serial loop is also a loop with one token:
+/// an edit to `client.vl` could only stop the union by stopping all of it.
+pub struct EntryReach {
+    pub reached: HashSet<ItemKey>,
+    pub sources: HashSet<PathBuf>,
+}
+
+/// One entry's leg of the union: analyze it, walk it, and report what it
+/// reached and what it read.
+///
+/// `None` in the three cases [`compute`] documents — unreadable text, no
+/// program, no `main`, or any diagnostic anywhere in the entry's closure — and
+/// each is the safe direction, because a `None` leg refuses the whole union
+/// rather than contributing a smaller one.
+///
+/// Does a full analysis; never call it on a request path.
+pub fn analyze_entry(
+    entry: &Path,
+    std_dir: &Path,
+    cancel: &CancelToken,
+    text: &str,
+) -> Option<EntryReach> {
+    let document = Document::analyze_cancellable(text, std_dir, entry, cancel)?;
+    if !document.diagnostics.is_empty() {
+        return None;
+    }
+    let program = document.program.as_ref()?;
+    let reached = reached_item_keys(program)?;
+    let sources = program.canonical_sources.iter().cloned().collect();
+    Some(EntryReach { reached, sources })
+}
+
+/// The union of the legs, or `None` if any of them refused.
+pub fn union_of(legs: Vec<Option<EntryReach>>, revision: u64) -> Option<PackageReach> {
+    let mut reached: HashSet<ItemKey> = HashSet::default();
+    let mut sources: HashSet<PathBuf> = HashSet::default();
+    for leg in legs {
+        let leg = leg?;
+        reached.extend(leg.reached);
+        sources.extend(leg.sources);
+    }
+    Some(PackageReach {
+        reached,
+        sources,
+        revision,
+    })
 }
 
 /// The package's declared entries as `(name, path)`, or `None` when the
@@ -77,8 +163,12 @@ fn entries_of(manifest_dir: &Path, manifest: &Manifest) -> Option<Vec<(String, P
     )
 }
 
-/// Compute the union: one analysis per entry, then one paint walk per entry,
-/// then the union of their keys.
+/// Compute the union SERIALLY: one analysis per entry, then one paint walk per
+/// entry, then the union of their keys.
+///
+/// The server does not call this — it fans the legs out concurrently through
+/// [`analyze_entry`] and [`union_of`] (E140). This is the same computation in
+/// one call for the pins, which want a union without a runtime.
 ///
 /// `entry_text` supplies each entry's current text — the server passes the open
 /// buffer when it has one, so the union describes what the user is looking at
@@ -104,6 +194,7 @@ fn entries_of(manifest_dir: &Path, manifest: &Manifest) -> Option<Vec<(String, P
 ///
 /// Called from `spawn_blocking`; it does a full analysis per entry and must
 /// never run on a request path.
+#[cfg(test)]
 pub fn compute(
     entries: &[(String, PathBuf)],
     std_dir: &Path,
@@ -111,17 +202,12 @@ pub fn compute(
     cancel: &CancelToken,
     entry_text: impl Fn(&Path) -> Option<String>,
 ) -> Option<PackageReach> {
-    let mut reached: HashSet<ItemKey> = HashSet::default();
+    let mut legs = Vec::with_capacity(entries.len());
     for (_, entry) in entries {
         let text = entry_text(entry)?;
-        let document = Document::analyze_cancellable(&text, std_dir, entry, cancel)?;
-        if !document.diagnostics.is_empty() {
-            return None;
-        }
-        let program = document.program.as_ref()?;
-        reached.extend(reached_item_keys(program)?);
+        legs.push(analyze_entry(entry, std_dir, cancel, &text));
     }
-    Some(PackageReach { reached, revision })
+    union_of(legs, revision)
 }
 
 /// E124's cost, on a GENERATED multi-entry exhibit (`dead-code-paint.md` §6.3).

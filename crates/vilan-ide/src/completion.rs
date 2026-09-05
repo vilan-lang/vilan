@@ -1458,9 +1458,15 @@ impl<'a, 'src> Analysis<'a, 'src> {
         if !self.analyzed_agrees_at(receiver_end) {
             return Vec::new();
         }
-        receiver_end
-            .checked_sub(1)
-            .map(|offset| self.to_analyzed_offset(offset))
+        // Asked AT `receiver_end`, not one byte inside it: `entity_at` is
+        // end-inclusive (E139), so the entity that ENDS where the receiver
+        // ends is exactly the receiver, and the old `receiver_end - 1` probe —
+        // strict containment one byte in — now answers whatever narrower
+        // entity happens to close there (`Some(1).` resolved to the literal
+        // `1`). The question this arm is asking has always been "what ends
+        // here"; only the strict test made "one byte inside" the way to spell
+        // it.
+        Some(self.to_analyzed_offset(receiver_end))
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| {
                 self.expression_element_nominal_id(receiver).or_else(|| {
@@ -1507,9 +1513,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
         if !self.analyzed_agrees_at(receiver_end) {
             return None;
         }
-        receiver_end
-            .checked_sub(1)
-            .map(|offset| self.to_analyzed_offset(offset))
+        // At `receiver_end`, for the reason `member_completions_for` states:
+        // `entity_at` is end-inclusive (E139), so the receiver is the entity
+        // that ends where the receiver ends.
+        Some(self.to_analyzed_offset(receiver_end))
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| {
                 self.expression_nominal_id(receiver).or_else(|| {

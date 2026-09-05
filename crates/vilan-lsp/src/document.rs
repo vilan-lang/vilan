@@ -492,23 +492,6 @@ pub enum RenameRefusal {
     /// The index knows it is missing references to this definition: use sites
     /// whose recorded span could not be proven to cover an identifier.
     Incomplete { what: String, missing: usize },
-    /// One of the definition's references is a struct-init field SHORTHAND
-    /// (`A { x }`), whose single identifier names two things at once: the
-    /// field `A::x` and the local `x` it reads (E134). There is no span to
-    /// rewrite that serves both — renaming from either side would silently
-    /// break the other, which is the "half-applied rename" this enum exists to
-    /// forbid, and today renaming the field does exactly that. A correct
-    /// rename has to EXPAND the site to `A { x = value }` first, which is a
-    /// text rewrite rather than a span rewrite: every other edit this module
-    /// emits replaces an identifier with `new_name`, so an expansion cannot be
-    /// expressed in the edit set at all. The refusal names the expansion and
-    /// the user does it once, after which both names have spans of their own
-    /// and the rename goes through.
-    SharedSpan {
-        what: String,
-        with: String,
-        name: String,
-    },
     /// An open file that imports the definition's file has un-analyzed edits,
     /// so its analyzed spans cannot be trusted against its live buffer —
     /// applying them could corrupt it, and skipping it would emit the partial
@@ -534,10 +517,6 @@ impl RenameRefusal {
             ),
             RenameRefusal::Incomplete { what, missing } => format!(
                 "cannot rename {what}: {missing} of its references could not be located, so the edit would be incomplete"
-            ),
-            RenameRefusal::SharedSpan { what, with, name } => format!(
-                "cannot rename {what}: it is written as a field shorthand, where the one `{name}` names both it and {with}. \
-                 Expand that site to `{name} = {name}` first, so each name has a span of its own"
             ),
             RenameRefusal::StillAnalyzing { what } => format!(
                 "cannot rename {what} yet: an open file that references it is still being analyzed; retry in a moment"
@@ -3508,6 +3487,23 @@ impl Document {
             .collect()
     }
 
+    /// [`Self::spans_by_path`] for a rename's edits, which carry their own
+    /// replacement text (E143).
+    fn edits_by_path(&self, edits: Vec<(SourceId, Span, String)>) -> Vec<(PathBuf, Span, String)> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        edits
+            .into_iter()
+            .filter_map(|(source, span, text)| {
+                program
+                    .canonical_sources
+                    .get(source.0 as usize)
+                    .map(|path| (path.clone(), span, text))
+            })
+            .collect()
+    }
+
     /// The canonical path of the file this document's analysis read as its
     /// entry (`None` when nothing was analyzed) — how the location conversion
     /// recognizes a path-space span as belonging to an open document.
@@ -3546,9 +3542,9 @@ impl Document {
         &self,
         offset: usize,
         new_name: &str,
-    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+    ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
         let (definition, what) = self.rename_target(offset, new_name)?;
-        self.rename_spans(definition, &what)
+        self.rename_spans(definition, &what, new_name)
     }
 
     /// [`Document::rename_edits`] unioned over each `neighbors` (the other
@@ -3563,9 +3559,9 @@ impl Document {
         offset: usize,
         new_name: &str,
         neighbors: impl IntoIterator<Item = &'a Document>,
-    ) -> std::result::Result<Vec<(PathBuf, Span)>, RenameRefusal> {
+    ) -> std::result::Result<Vec<(PathBuf, Span, String)>, RenameRefusal> {
         let (definition, what) = self.rename_target(offset, new_name)?;
-        let mut merged = self.spans_by_path(self.rename_spans(definition, &what)?);
+        let mut merged = self.edits_by_path(self.rename_spans(definition, &what, new_name)?);
         if let Some(key) = self.definition_key(definition) {
             for neighbor in neighbors {
                 if !neighbor.depends_on(key.path()) {
@@ -3581,7 +3577,8 @@ impl Document {
                 let Some(local) = neighbor.definition_of_key(&key) else {
                     continue;
                 };
-                merged.extend(neighbor.spans_by_path(neighbor.rename_spans(local, &what)?));
+                merged
+                    .extend(neighbor.edits_by_path(neighbor.rename_spans(local, &what, new_name)?));
             }
         }
         merged.sort();
@@ -3617,7 +3614,8 @@ impl Document {
         &self,
         definition: Definition,
         what: &str,
-    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+        new_name: &str,
+    ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
         let Some(program) = self.program.as_ref() else {
             return Err(RenameRefusal::NotAnIdentifier);
         };
@@ -3629,45 +3627,28 @@ impl Document {
             });
         }
 
-        // E134: a struct-init field shorthand `A { x }` is ONE identifier
-        // naming two definitions — the field key and the local it reads — so
-        // there is no rewrite of that span that serves both. Refuse from
-        // either side rather than emit the edit that silently breaks the other
-        // name (which is what renaming the field used to do). The refusal
-        // names the expansion that gives each name a span of its own.
-        if let Some(other) = self
+        // The index guarantees one row per `(source, span)` in a file, so this
+        // cannot hold a duplicate — but a duplicate span is what the CLIENT
+        // rejects ("Rename failed to apply edits"), so the guarantee is
+        // re-stated where the edit set is actually produced rather than relied
+        // on from two layers away.
+        let mut spans: Vec<(SourceId, Span, String)> = self
             .reference_index()
             .occurrences_of(definition)
-            .find_map(|occurrence| occurrence.shared_with(definition))
-        {
-            let name = crate::references::name_of(program, definition).unwrap_or("this symbol");
-            let with = match crate::references::kind_of(program, other) {
-                Some(kind) => format!("the {} `{name}`", kind.noun()),
-                None => format!("`{name}`"),
-            };
-            return Err(RenameRefusal::SharedSpan {
-                what: what.to_string(),
-                with,
-                name: name.to_string(),
-            });
-        }
-
-        // The index guarantees one row per `(source, span)`, so this cannot
-        // hold a duplicate — but a duplicate span is what the CLIENT rejects
-        // ("Rename failed to apply edits"), so the guarantee is re-stated
-        // where the edit set is actually produced rather than relied on from
-        // two layers away.
-        let mut spans: Vec<(SourceId, Span)> = self
-            .reference_index()
-            .occurrences_of(definition)
-            .map(|occurrence| (occurrence.source, occurrence.span))
+            .map(|occurrence| {
+                (
+                    occurrence.source,
+                    occurrence.span,
+                    self.replacement_for(program, definition, occurrence, new_name),
+                )
+            })
             .collect();
-        spans.sort_by_key(|(source, span)| (source.0, span.start, span.end));
+        spans.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
         spans.dedup();
         if spans.is_empty() {
             return Err(RenameRefusal::NotAnIdentifier);
         }
-        for (source, _) in &spans {
+        for (source, _, _) in &spans {
             // Generated code has no path, so an edit there cannot be expressed —
             // and dropping it silently is the partial rename the rule forbids.
             if *source == DERIVED_SOURCE {
@@ -3692,6 +3673,54 @@ impl Document {
             }
         }
         Ok(spans)
+    }
+
+    /// The text one occurrence of `definition` is replaced with by a rename to
+    /// `new_name` — `new_name` itself for every site that is a plain
+    /// identifier, and an EXPANSION for the one site that is not (E143).
+    ///
+    /// A struct-init field shorthand `A { x }` is one identifier naming two
+    /// definitions: the field key `A::x` and a read of the local `x`
+    /// (E134's co-reference). Rewriting that identifier serves one name and
+    /// silently breaks the other, so rename refused there and named the
+    /// expansion for the user to write by hand. Ruled 2026-09-05: emit the
+    /// expansion instead. Renaming the FIELD gives `A { new = x }`; renaming
+    /// the LOCAL gives `A { x = new }`. The shorthand is exactly the form in
+    /// which the two names coincide, so writing them out is not a rewrite of
+    /// the user's code so much as the removal of an abbreviation that has run
+    /// out of room — and it is the same text the refusal used to ask for.
+    ///
+    /// This is the whole reason a rename edit carries its own text. Every
+    /// other edit in the set is `new_name`, and it stays that way; what
+    /// changed is that the module can now express a site where it is not.
+    fn replacement_for(
+        &self,
+        program: &Program,
+        definition: Definition,
+        occurrence: &crate::references::Occurrence,
+        new_name: &str,
+    ) -> String {
+        let Some(other) = occurrence.shared_with(definition) else {
+            return new_name.to_string();
+        };
+        // Both halves of a shorthand spell one name — that is what makes it a
+        // shorthand — so the surviving side keeps the name the site already
+        // has, and only the renamed side moves.
+        let existing = crate::references::name_of(program, definition).unwrap_or(new_name);
+        match crate::references::kind_of(program, definition) {
+            // The field key is on the LEFT of a struct initializer entry.
+            Some(crate::references::DefinitionKind::Field) => format!("{new_name} = {existing}"),
+            // Anything else reaching here is the value side: E134's
+            // co-reference pairs a field with the BINDING the shorthand reads,
+            // and there is no third shape.
+            _ => {
+                debug_assert!(matches!(
+                    crate::references::kind_of(program, other),
+                    Some(crate::references::DefinitionKind::Field)
+                ));
+                format!("{existing} = {new_name}")
+            }
+        }
     }
 
     /// The reference index this document's queries read.
@@ -7542,6 +7571,98 @@ pub(crate) mod tests {
         );
     }
 
+    // --- E138: the comparison traits' members resolve as hover targets ------
+    //
+    // E128 pinned the `= Self` rendering on a USER trait shaped like
+    // `PartialEq` because hover on the std comparison traits' own members was
+    // seen to answer nothing through either route — read as a target-resolution
+    // gap. It is not one. `PartialEq`/`PartialOrd` live in `std::compare`, not
+    // `std::operators` where `Add`/`Sub`/`Mul` do, and the probe that found the
+    // silence imported them from the latter: the trait then does not exist, the
+    // member does not resolve, and no label is the honest answer. These four
+    // pin resolution through both routes on the RIGHT path; the fifth pins the
+    // misroute itself — the diagnostics that name the mistake and the fix — so
+    // the silence is never again read as a hover defect. Planting
+    // `std::operators` back into any of the four returns them to `None`, which
+    // is what the fifth records.
+
+    #[test]
+    fn e138_hover_on_partial_eq_eq_through_a_default_body() {
+        let hover = hover_at_cursor(
+            "import std::compare::PartialEq;\n\ntrait Same with PartialEq {\n\tfun alike(self): bool {\n\t\tself.e|q(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_eq_eq_through_a_bound() {
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialEq;\n\nfun alike<T: PartialEq>(a: T, b: T): bool {\n\ta.e|q(b)\n}\n\nfun main() {\n\tprint(alike(1, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_ord_lt_through_a_default_body() {
+        let hover = hover_at_cursor(
+            "import std::compare::PartialOrd;\n\ntrait Ranked with PartialOrd {\n\tfun below(self): bool {\n\t\tself.l|t(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `lt` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_ord_lt_through_a_bound() {
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialOrd;\n\nfun below<T: PartialOrd>(a: T, b: T): bool {\n\ta.l|t(b)\n}\n\nfun main() {\n\tprint(below(1, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `lt` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_importing_partial_eq_from_std_operators_is_diagnosed_and_hovers_nothing() {
+        // The probe's own shape, kept as the record: the import fails, the
+        // compiler names `std::compare` as the fix, the trait bound resolves to
+        // nothing, and hover on `eq` is correctly silent.
+        let source = "import std::operators::PartialEq;\n\ntrait Same with PartialEq {\n\tfun alike(self): bool {\n\t\tself.eq(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let diagnostics = document.published_diagnostics();
+        let published = messages(&diagnostics);
+        assert!(
+            published
+                .iter()
+                .any(|message| message.contains("cannot find 'PartialEq' in the imported path")),
+            "{published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .any(|message| message.contains("import std::compare::PartialEq;")),
+            "the diagnostic names the module the trait actually lives in: {published:?}"
+        );
+        let offset = source.find("self.eq").expect("exhibit has `self.eq`") + "self.e".len();
+        assert_eq!(
+            document.hover(offset),
+            None,
+            "a member of a trait that did not resolve has no declaration to show"
+        );
+    }
+
     // Hovering a function name appends its inferred platform requirement — the
     // coloring fixpoint surfaced in the editor, with the same via-chain
     // vocabulary the diagnostics use.
@@ -8082,6 +8203,120 @@ pub(crate) mod tests {
     }
 
     // A `mut` binding hovers with the `mut` keyword — it can be reassigned.
+    // --- E139: `entity_at` is end-inclusive too -----------------------------
+    //
+    // E133 gave the REFERENCE INDEX the end-inclusive convention, which fixed
+    // rename, find-references and hover on a DECLARATION. Hover on a bare USE
+    // does not go through the index at all: it goes through
+    // `vilan_ide::analysis::entity_at`, whose containment was separately
+    // end-exclusive — and, because entity spans NEST, the strict test did not
+    // fail there, it answered the enclosing function instead. `let _ = count|`
+    // showed `fun main()`.
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_bare_use_answers_the_use() {
+        let inside = hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = cou|nt;\n}\n")
+            .expect("hover inside the use");
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count|;\n}\n"),
+            Some(inside.clone()),
+            "the caret at `count|` on a USE is on `count`, not on `main`",
+        );
+        assert!(inside.contains("count: i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_called_functions_name_answers_the_function() {
+        // The other bare-use shape: the callee of a call, whose own span is
+        // nested inside the call's. `helper|(` used to answer the call's
+        // enclosing entity.
+        let inside = hover_at_cursor(
+            "fun helper(): i32 {\n\t1\n}\n\nfun main() {\n\tlet _ = hel|per();\n}\n",
+        )
+        .expect("hover inside the callee's name");
+        assert_eq!(
+            hover_at_cursor(
+                "fun helper(): i32 {\n\t1\n}\n\nfun main() {\n\tlet _ = helper|();\n}\n"
+            ),
+            Some(inside.clone()),
+        );
+        assert!(inside.contains("fun helper(): i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_field_read_answers_the_field() {
+        let inside = hover_at_cursor(
+            "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _ = p.|x;\n}\n",
+        )
+        .expect("hover inside the field name");
+        assert_eq!(
+            hover_at_cursor(
+                "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _ = p.x|;\n}\n",
+            ),
+            Some(inside.clone()),
+        );
+        assert!(inside.contains("x: i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_a_caret_past_the_name_is_not_on_it() {
+        // The convention's other edge: end-INCLUSIVE, not end-plus-one. A
+        // caret one byte further on has left the word, and whatever it
+        // answers, it is not the use.
+        let on_the_name =
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count| ;\n}\n");
+        let past_it = hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count |;\n}\n");
+        assert!(
+            on_the_name
+                .as_deref()
+                .is_some_and(|hover| hover.contains("count: i32")),
+            "{on_the_name:?}"
+        );
+        assert_ne!(on_the_name, past_it);
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_use_a_larger_expression_continues() {
+        // The shape that moved an existing pin: `xs|[0]` used to answer the
+        // INDEX expression, because the caret is not strictly inside the use
+        // and the index expression is the innermost entity that strictly
+        // contains it. A caret at the end of a word is on the word even when
+        // the expression goes on.
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+            .expect("the use hovers");
+        assert_eq!(hover, "```vilan\nlet xs: List<i32>\n```");
+    }
+
+    #[test]
+    fn e139_completions_receiver_is_unchanged_at_the_dot() {
+        // The other half of `entity_at`'s traffic. Completion resolves `x|.`
+        // by asking about the receiver's END, and the end-inclusive rule is
+        // what makes that literal — the probe used to ask one byte inside and
+        // lean on strict containment, which the widening would have handed the
+        // innermost entity closing there (`Some(1).` answered the literal `1`,
+        // and Option's members were lost). A bare name, a call and a
+        // constructor call, all three at the dot.
+        let bare = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tp.|\n}\n",
+        );
+        assert!(
+            bare.contains(&"x".to_string()) && bare.contains(&"y".to_string()),
+            "{bare:?}"
+        );
+        let call = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\nfun make(): Point {\n\tPoint { x = 1, y = 2 }\n}\n\nfun main() {\n\tmake().|\n}\n",
+        );
+        assert!(
+            call.contains(&"x".to_string()) && call.contains(&"y".to_string()),
+            "{call:?}"
+        );
+        let constructed = call_receiver_completions("\tSome(1).|\n");
+        assert!(
+            constructed.contains(&"unwrap_or".to_string()),
+            "{constructed:?}"
+        );
+    }
+
     #[test]
     fn hover_on_a_mut_binding_shows_mut() {
         let hover = hover_at_cursor("fun main() {\n\tmut tot|al = 0;\n\ttotal = 1;\n}\n")
@@ -8604,9 +8839,17 @@ pub(crate) mod tests {
 
     // "Anything else" keeps the bare rendered type but gains the fence: an
     // index expression's hover is its element type, as code.
+    //
+    // The caret moved one expression to the right when `entity_at` became
+    // end-inclusive (E139): it used to sit at `xs|[0]`, where the index
+    // expression was the innermost STRICTLY containing entity, and a caret
+    // there is now on `xs` — which is the whole point of that convention, and
+    // is pinned as such beside E139's other three. `xs[0]|` is the index
+    // expression's own end, so it is the index expression this asks about, as
+    // it always meant to be.
     #[test]
     fn a_bare_expression_type_hover_wears_the_fence() {
-        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs[0]|;\n}\n")
             .expect("the index expression hovers");
         assert_eq!(hover, "```vilan\ni32\n```");
     }
@@ -16281,6 +16524,222 @@ mod dead_item_paint_tests {
         assert!(
             document.dead_item_spans().is_empty(),
             "and none of its items is grayed either",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E140: the union records the CLOSURE it walked, which is what the
+    /// withdrawal's cone test reads. The entries and the module they load are
+    /// in it; the orphan module in the same package is not, and that is the
+    /// whole distinction the narrowed withdrawal rests on.
+    #[test]
+    fn the_union_records_the_sources_its_entries_loaded() {
+        let directory = package("cone");
+        let union = union(&directory).expect("the package's union");
+        for relative in ["src/client.vl", "src/server.vl", "src/shared.vl"] {
+            assert!(
+                union.depends_on(&directory.join(relative)),
+                "{relative} is in an entry's closure",
+            );
+        }
+        assert!(
+            !union.depends_on(&directory.join("src/orphan.vl")),
+            "no entry loads `orphan.vl`, so an edit to it cannot move a term of \
+             the union",
+        );
+        assert!(
+            !union.sources.is_empty() && union.sources.len() > 3,
+            "std is in the closure too — the union carries what it READ, not a \
+             filtered view of it: {}",
+            union.sources.len(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E140: the legs are computed separately now (concurrently, in the
+    /// server), so the rule that a refused leg refuses the WHOLE union has to
+    /// be stated where the legs are joined rather than fall out of an early
+    /// `return` in a loop. One `None` leg — a broken module, an entry with no
+    /// `main`, an unreadable file — and there is no union.
+    #[test]
+    fn one_refused_leg_refuses_the_whole_union() {
+        let directory = package("legs");
+        let entries = crate::dead_items::entry_paths(&directory).expect("two entries");
+        let legs: Vec<Option<crate::dead_items::EntryReach>> = entries
+            .iter()
+            .map(|(_, path)| {
+                let text = std::fs::read_to_string(path).expect("the entry");
+                crate::dead_items::analyze_entry(path, &std_root(), &CancelToken::new(), &text)
+            })
+            .collect();
+        assert!(
+            legs.iter().all(Option::is_some),
+            "both legs answer on a clean package",
+        );
+        assert!(
+            crate::dead_items::union_of(legs, 0).is_some(),
+            "and their union is a union",
+        );
+        let broken = vec![
+            Some(crate::dead_items::EntryReach {
+                reached: Default::default(),
+                sources: Default::default(),
+            }),
+            None,
+        ];
+        assert!(
+            crate::dead_items::union_of(broken, 0).is_none(),
+            "one refused leg refuses the whole union",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 10** (E140) — a `[platform("browser")]` item reached by the
+    /// BROWSER entry is not gray in a package whose other entry is node.
+    ///
+    /// This is the fence's own case, and the reason the union is a union of
+    /// per-entry walks rather than one walk: each entry is analyzed under its
+    /// own platform, so a browser-only item is simply unreachable from the
+    /// server entry's program — not exempt, not special-cased, absent. If the
+    /// union were taken from the default entry alone, every browser-fenced
+    /// item in a fullstack package would gray at once. The negative beside it
+    /// is what makes the pin about the fence: a browser-fenced item NO entry
+    /// reaches still grays, so the platform is not being read as an exemption.
+    #[test]
+    fn a_browser_fenced_item_the_browser_entry_reaches_is_not_gray() {
+        let directory = workspace(
+            "platform",
+            &[
+                (
+                    "vilan.toml",
+                    "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                     [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+                ),
+                (
+                    "src/client.vl",
+                    "import pkg::ui::mount;\n\nfun main() {\n\tmount();\n}\n",
+                ),
+                (
+                    "src/server.vl",
+                    "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+                ),
+                (
+                    "src/ui.vl",
+                    "import std::ui::{ View, view };\n\n\
+                     [platform(\"browser\")]\n\
+                     fun mount(): View {\n\tview(\"div\")\n}\n\n\
+                     [platform(\"browser\")]\n\
+                     fun never_mounted(): View {\n\tview(\"span\")\n}\n",
+                ),
+            ],
+        );
+        let mut document = open(&directory, "src/ui.vl");
+        document.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&document, &document.dead_item_spans()),
+            vec!["never_mounted".to_string()],
+            "`mount` lives in the union through the BROWSER entry; the \
+             browser-fenced item no entry reaches still grays, so the fence is \
+             not being read as an exemption",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 16** (E140) — deleting the last use of an item does not have to
+    /// gray it immediately. **Lateness is allowed**, and this pin asserts that
+    /// it is, so a later optimization cannot be justified by a promise the
+    /// design never made.
+    ///
+    /// The asymmetry is deliberate and it is the whole safety argument.
+    /// Withdrawal is instant, because a gray that has become WRONG is a lie
+    /// about the user's own code — pin 15 and `withdraw_package_grays`.
+    /// Restoration rides the idle clock, because a gray that has not appeared
+    /// YET says nothing at all. So an edit that removes the last call to
+    /// `used_by_server` may leave the union standing until the clock re-walks:
+    /// the paint the user sees is a paint that was true, one clock tick ago,
+    /// and the direction it is stale in is the one that cannot mislead.
+    #[test]
+    fn deleting_the_last_use_of_an_item_may_gray_it_late() {
+        let directory = package("lateness");
+        let union_before = union(&directory).expect("the package's union");
+        // The edit that kills `used_by_server`: the server entry stops calling
+        // it. The union in hand was computed BEFORE it and is now out of date.
+        std::fs::write(
+            directory.join("src/server.vl"),
+            "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+        )
+        .expect("rewrite the server entry");
+        let mut document = open(&directory, "src/shared.vl");
+        document.set_package_reach(Some(Arc::clone(&union_before)));
+        assert!(
+            !named(&document, &document.dead_item_spans()).contains(&"used_by_server".to_string()),
+            "the stale union still reaches `used_by_server`, and serving it is \
+             ALLOWED: a gray that has not appeared yet says nothing",
+        );
+        // And the clock catches up: recomputed against the edited package, the
+        // item is gray. Lateness is a permission, not a ceiling.
+        document.set_package_reach(union(&directory));
+        assert!(
+            named(&document, &document.dead_item_spans()).contains(&"used_by_server".to_string()),
+            "the next union grays it",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 19** (E140) — a `[library]` that is a WORKSPACE MEMBER consumed by
+    /// a sibling `[package]` is still never gray.
+    ///
+    /// Pin 18's library stands alone; this one is inside a `[project]` and has
+    /// a consumer in the same tree, which is the shape where "surely we can see
+    /// every use of it" is most tempting and most wrong. A workspace is not a
+    /// closed world: the library is publishable, the sibling is one consumer of
+    /// it, and an item no sibling happens to call today is still surface. The
+    /// rule holds for the same reason it holds anywhere — a library declares no
+    /// entries, so there is no union and nothing to say.
+    #[test]
+    fn a_library_that_is_a_workspace_member_is_never_gray() {
+        let directory = workspace(
+            "workspace-library",
+            &[
+                ("vilan.toml", "[project]\npackages = [\"lib\", \"app\"]\n"),
+                ("lib/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                (
+                    "lib/src/lib.vl",
+                    "import std::io::print;\n\n\
+                     fun used_by_the_sibling() {\n\tprint(\"u\");\n}\n\n\
+                     fun used_by_nobody_here() {\n\tprint(\"n\");\n}\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { path = \"../lib\" }\n",
+                ),
+                (
+                    "app/src/main.vl",
+                    "import shapes::used_by_the_sibling;\n\n\
+                     fun main() {\n\tused_by_the_sibling();\n}\n",
+                ),
+            ],
+        );
+        let mut document = open(&directory, "lib/src/lib.vl");
+        assert!(
+            document.unloaded_module_paint().is_none(),
+            "a workspace library's module is never faded whole",
+        );
+        document.set_package_reach(union(&directory.join("lib")));
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "no item of a workspace-member library is gray, including the one \
+             its sibling does not call: {:?}",
+            named(&document, &document.dead_item_spans()),
+        );
+        // The consumer's own package still paints, so the pin is about the
+        // LIBRARY rule rather than about a paint that is off in this fixture.
+        let mut consumer = open(&directory, "app/src/main.vl");
+        consumer.set_package_reach(union(&directory.join("app")));
+        assert!(
+            consumer.dead_item_spans().is_empty(),
+            "the app's own entry reaches everything it declares",
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

@@ -1832,6 +1832,55 @@ pub(crate) mod gate {
         }
     }
 
+    /// Whether this build may assert a budget — **false under
+    /// `debug_assertions`**, where it prints why instead (E141).
+    ///
+    /// Every per-request and per-keystroke budget in this module is a RELEASE
+    /// figure. M25 derived [`COMPLETION_BUDGET_MS`] from 0.628 ms → 0.126 ms
+    /// measured in release; the mandate's 10 ms and `diagnostics_budget`'s
+    /// 500 ms are release figures for the same reason — they are about what an
+    /// editor's user waits for, and nobody edits against a debug compiler. The
+    /// gates carry `#[ignore]` for their cost, so PR CI never runs them, and
+    /// two Order 27 lanes that ran them the only way an ignored test is
+    /// normally run — `cargo nextest run --run-ignored`, in the default debug
+    /// profile — measured completion at 0.705–0.813 ms against the 0.2 ms
+    /// budget and read a 4× drift into the tranche. There was none: the same
+    /// gate on a quiet box in release measures **0.038–0.041 ms** per
+    /// completion and **0.042–0.043 ms** for the burst. The whole gap was the
+    /// profile.
+    ///
+    /// A budget asserted in a profile it was not derived in is not a stricter
+    /// gate, it is a different question with the same number on it, so the
+    /// assertions do not run there. **The measurements still do**: every row
+    /// above this call is printed in both profiles, tagged with
+    /// [`profile`], because a debug number is a useful thing to look at and a
+    /// useless thing to fail on. What is skipped, and why, and what the
+    /// release figure is, is printed too — a silent skip would be the drift
+    /// this exists to prevent, one level up.
+    pub(crate) fn budgets_are_assertable(gate: &str, release_figure: &str) -> bool {
+        if !cfg!(debug_assertions) {
+            return true;
+        }
+        println!("{}", budget_skip_notice(gate, release_figure));
+        false
+    }
+
+    /// The line [`budgets_are_assertable`] prints when it declines — named so
+    /// it can be asserted rather than only read (E141's pin: the gate names
+    /// its profile, and the figure it is not asserting, in its reason).
+    pub(crate) fn budget_skip_notice(gate: &str, release_figure: &str) -> String {
+        format!(
+            "E141 {{\"section\":\"budget_skip\",\"gate\":\"{gate}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"reason\":\"{gate}'s budgets are RELEASE figures \
+             ({release_figure}); this run is a {} build, so the rows above are informational \
+             only and nothing is asserted. Re-run with --release to assert them: cargo nextest \
+             run --release -p vilan-lsp --run-ignored all -E 'test(budget)'\"}}",
+            profile(),
+            loadavg_1m(),
+            profile(),
+        )
+    }
+
     /// **The generated exhibit** (§6.1, Q6). A module of `functions` functions
     /// of one shape over a shared wrapper — lucide's shape, not lucide's
     /// content, and nothing copied from anyone's checkout.
@@ -2346,6 +2395,14 @@ fun main() {
         if !assert_budget {
             return;
         }
+        // E141: the budgets below are release figures. Under `debug_assertions`
+        // the rows above stand as informational and nothing is asserted.
+        if !budgets_are_assertable(
+            "the keystroke path",
+            "completion 0.038-0.041 ms and the burst 0.042-0.043 ms in release on a quiet box, against 0.2 ms and 10 ms",
+        ) {
+            return;
+        }
         let Some(burst_cpu) = burst_cpu else {
             panic!(
                 "no thread CPU clock on this host, so the gate cannot assert anything \
@@ -2648,7 +2705,7 @@ fun main() {
 
     /// §6.2's `keystroke_path_budget`, on the exhibit at kolt's size.
     #[test]
-    #[ignore = "E121: the keystroke-path gate — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    #[ignore = "E121/E141: the keystroke-path gate — a generated 1,791-function exhibit, minutes of analysis; its budgets are RELEASE figures and are not asserted under debug_assertions (the rows still print). Run deliberately, in release (proposal/editor-latency.md §6)"]
     fn keystroke_path_budget() {
         keystroke_path_budget_at(Subject::Arithmetic, GATE_FUNCTIONS, true);
     }
@@ -2659,6 +2716,50 @@ fun main() {
     #[test]
     fn keystroke_path_gate_smoke() {
         keystroke_path_budget_at(Subject::Arithmetic, SMOKE_FUNCTIONS, false);
+    }
+
+    // --- E141: a budget is a figure IN A PROFILE ----------------------------
+
+    /// The profile guard itself, in whichever profile this binary was built
+    /// in — the one pin in this module that costs nothing and runs on every
+    /// PR, precisely because what it guards is a gate PR CI never runs.
+    #[test]
+    fn e141_a_budget_is_only_asserted_in_the_profile_it_was_derived_in() {
+        assert_eq!(
+            profile(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+        );
+        assert_eq!(
+            budgets_are_assertable("the keystroke path", "0.2 ms"),
+            !cfg!(debug_assertions),
+            "a release build asserts its budgets; a debug build declines and says so",
+        );
+    }
+
+    /// E141's own pin: the decline NAMES the profile it is declining in, and
+    /// the release figure it is not asserting. A silent skip would be the
+    /// drift this guard exists to prevent, one level up — two Order 27 lanes
+    /// read a debug run's 0.705-0.813 ms completion as a 4x regression in the
+    /// tranche, and the number was the profile.
+    #[test]
+    fn e141_the_skipped_gate_names_its_profile_and_the_release_figure() {
+        let notice = budget_skip_notice(
+            "the keystroke path",
+            "completion 0.038-0.041 ms in release on a quiet box, against 0.2 ms",
+        );
+        assert!(notice.contains("\"profile\":\"debug\"") || !cfg!(debug_assertions));
+        assert!(notice.contains("RELEASE figures"), "{notice}");
+        assert!(notice.contains("0.038-0.041 ms"), "{notice}");
+        assert!(notice.contains("against 0.2 ms"), "{notice}");
+        assert!(notice.contains("--release"), "{notice}");
+        assert!(
+            notice.contains(&format!("this run is a {} build", profile())),
+            "{notice}"
+        );
     }
 
     /// §6.2's `diagnostics_budget`, **re-anchored on E126's view-shaped
@@ -2726,6 +2827,14 @@ fun main() {
                 .collect::<Vec<_>>(),
         );
         let _ = std::fs::remove_dir_all(&directory);
+        // E141: 500 ms is a release figure, and the debug profile's number is
+        // a different question. The row above is printed either way.
+        if !budgets_are_assertable(
+            "the diagnostics path",
+            "500 ms of process CPU per keystroke, measured in release",
+        ) {
+            return;
+        }
         let Some(cpu) = cpu else {
             panic!(
                 "no process CPU clock on this host, so the gate cannot assert anything \
@@ -2868,7 +2977,7 @@ fun main() {
     /// about `i32` programs: the path serves a landed snapshot, and the
     /// snapshot of a 1,791-icon view program is the one an application has.
     #[test]
-    #[ignore = "E121/E126: the keystroke-path gate on the view exhibit — a generated 1,791-icon package, minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    #[ignore = "E121/E126/E141: the keystroke-path gate on the view exhibit — a generated 1,791-icon package, minutes of analysis; its budgets are RELEASE figures and are not asserted under debug_assertions (the rows still print). Run deliberately, in release (proposal/editor-latency.md §6)"]
     fn keystroke_path_budget_view() {
         keystroke_path_budget_at(Subject::View, GATE_FUNCTIONS, true);
     }
