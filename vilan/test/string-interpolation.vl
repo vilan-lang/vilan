@@ -1,11 +1,11 @@
-import std::{ io::print };
+import std::io::print;
 
 fun main() {
 	let name = "John";
-	
+
 	print("Hello, {name}!"); // should print "Hello, {name}!"
-	
+
 	print(i"Hello, {name}!"); // should print "Hello, John!"
-	
+
 	print(i"Hello, \{name\}!"); // should print "Hello, {name}!"
 }

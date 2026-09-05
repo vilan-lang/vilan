@@ -6,9 +6,9 @@
 import std::binary::binary_codec;
 import std::http::{ Response, Server };
 import std::io::panic;
+import std::io::print;
 import std::json::{ Json, json_codec };
 import std::option::Option::{ None, Some };
-import std::io::print;
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{
 	Dispatcher,
@@ -114,7 +114,10 @@ fun run(finished: || void) {
 						.with_service(Service::new(add_protocol(json_codec()))
 							.on_connect(|id, end| {})
 							.on_disconnect(|id| {}))
-						.on_request(|request| Response::builder().code(404).body("benchmark").build())
+						.on_request(|request| Response::builder()
+							.code(404)
+							.body("benchmark")
+							.build())
 						.on_start(|server| {
 							let ws_port = server.port();
 							print(i"[port] {ws_port}");

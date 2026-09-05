@@ -1,6 +1,6 @@
+import std::db::{ Database, Row, Statement };
 import std::io::print;
-import std::db::{ Database, Statement, Row };
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 // SQLite over the host's built-in node:sqlite (proposal/kolt-migration.md
 // §2.2): server-only storage, no package dependency. Excluded from the macro

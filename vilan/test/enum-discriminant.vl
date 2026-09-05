@@ -9,7 +9,7 @@ enum Ordering {
 	Greater = 1,
 }
 
-use Ordering::{ Less, Equal, Greater };
+use Ordering::{ Equal, Greater, Less };
 
 fun describe(order: Ordering): str {
 	match order {

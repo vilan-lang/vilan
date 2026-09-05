@@ -2,15 +2,15 @@
 // number that decides how much the serializer call mechanism (closure records
 // vs monomorphized traits, §6.1) matters. Uses the payload module's sample.
 
+import std::binary::{ binary_codec, decode_binary, encode_binary };
 import std::io::print;
-import std::option::Option::{ Some, None };
-import std::result::Result::{ self, Ok, Err };
+import std::json::{ Json, decode_json, encode_json, json_codec };
+import std::option::Option::{ None, Some };
+import std::result::Result::{ Err, Ok, self };
 import std::time::now_millis;
-import std::json::{ Json, json_codec, encode_json, decode_json };
-import std::binary::{ binary_codec, encode_binary, decode_binary };
-import std::wire::{ Wire, Frame, Codec, encode, decode };
+import std::wire::{ Codec, Frame, Wire, decode, encode };
 import pkg::payload::{ BenchTodo, sample_list };
-import pkg::report::{ section, rate, round };
+import pkg::report::{ rate, round, section };
 
 fun run() {
 	section("codec throughput (encode+decode round-trips, 25-todo list)");

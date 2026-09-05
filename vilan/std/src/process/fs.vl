@@ -387,7 +387,12 @@ fun scan_dir(path: str): List<Entry> {
 	let options = new_fs_options();
 	options.set_with_file_types(true);
 	let raw = raw_scan_dir(path, options);
-	raw.map(|entry| Entry { name = entry.name(), is_directory = entry.is_directory(), is_file = entry.is_file(), is_symlink = entry.is_symlink() })
+	raw.map(|entry| Entry {
+		name = entry.name(),
+		is_directory = entry.is_directory(),
+		is_file = entry.is_file(),
+		is_symlink = entry.is_symlink(),
+	})
 }
 
 // --- stat --------------------------------------------------------------

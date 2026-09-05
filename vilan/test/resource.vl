@@ -13,25 +13,36 @@
 // against `resource.mjs`. That gate exists because of THIS file: audit run 7
 // (F7/F8) found two claims here asserting the opposite of the golden beside
 // them, and a byte gate cannot notice a sentence going stale.
-import std::io::print;
 import std::drop::Drop;
+import std::io::print;
 
 // A leaf resource that announces its teardown.
-resource struct Res { tag: str }
+resource struct Res {
+	tag: str,
+}
 impl Res with Drop {
-	fun drop(&mut self) { print(self.tag); }
+	fun drop(&mut self) {
+		print(self.tag);
+	}
 }
 
 // A resource that OWNS resources and has its own `Drop`: the body runs first,
 // then the fields drop in reverse declaration order.
 // witness: drop2($d); $a($d[1]); $a($d[0]);
-resource struct Pair { first: Res, second: Res }
+resource struct Pair {
+	first: Res,
+	second: Res,
+}
 impl Pair with Drop {
-	fun drop(&mut self) { print("pair-body"); }
+	fun drop(&mut self) {
+		print("pair-body");
+	}
 }
 
 // A resource by containment only (no `Drop` impl) still drops its field.
-resource struct Bag { item: Res }
+resource struct Bag {
+	item: Res,
+}
 
 // Two locals still owned at the scope end drop THERE, in reverse declaration
 // order: `b` before `a`. The trailing read is what holds them that long — with
@@ -86,12 +97,16 @@ fun containment() {
 // another body owns, so it drops what it replaces exactly as `overwrite` above
 // does — and the drop is emitted BEFORE the `__replace` that truncates the
 // payload out from under it.
-resource struct Slot { held: Res }
+resource struct Slot {
+	held: Res,
+}
 
 impl Slot {
 	// The `&mut self` spelling.
 	// witness: $g(self); __replace(self, [ [ "refilled" ] ]);
-	fun refill(&mut self) { self = Slot { held = Res { tag = "refilled" } }; }
+	fun refill(&mut self) {
+		self = Slot { held = Res { tag = "refilled" } };
+	}
 }
 
 // The `&mut x` parameter spelling of the same write.
@@ -145,7 +160,10 @@ fun component_view(slot: &mut Slot) {
 // The final statement reads `counted`, which is what puts that teardown at the
 // scope end rather than at the declaration.
 // witness: counted[1] = 2; console.log("component-data-body " + counted[0][0]); } finally { $i(counted); }
-struct Counted { held: Res, count: i32 }
+struct Counted {
+	held: Res,
+	count: i32,
+}
 
 fun component_data() {
 	mut counted = Counted { held = Res { tag = "counted" }, count = 1 };

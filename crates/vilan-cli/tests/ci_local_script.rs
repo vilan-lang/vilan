@@ -58,6 +58,7 @@ fn workflow() -> String {
 /// cost more than the leg does.
 const LEG_JOBS: &[(&str, &str)] = &[
     ("fmt", "fmt"),
+    ("vilan-fmt", "vilan-fmt"),
     ("clippy", "clippy"),
     ("test", "test"),
     ("doctest", "test"),

@@ -4,8 +4,8 @@
 // sanity-checked against a claim that holds for any working clock.
 
 import std::binary::binary_codec;
-import std::json::json_codec;
 import std::io::print;
+import std::json::json_codec;
 import std::result::Result::{ Err, Ok, self };
 import std::time::{ Duration, Instant, now, sleep_for };
 import std::wire::{ decode, encode };

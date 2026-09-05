@@ -1,5 +1,5 @@
-import std::io::print;
 import std::display::Display;
+import std::io::print;
 
 struct Point {
 	x: i32,

@@ -1,13 +1,15 @@
-import std::compare::{ Ord, Ordering, PartialOrd, PartialEq };
-import std::option::Option::{ self, Some };
+import std::compare::{ Ord, Ordering, PartialEq, PartialOrd };
 import std::io::print;
+import std::option::Option::{ Some, self };
 
 // A concrete type implementing `Ord` supplies only the required members
 // (`compare` from Ord, `eq` from PartialEq, `partial_compare` from PartialOrd);
 // the default methods `min`/`max`/`clamp` are inherited. Calling them dispatches
 // to a per-type specialization of the trait default whose inner `self.compare`/
 // `self.min`/`self.max` calls re-dispatch to this type's `compare`.
-struct Num { v: i32 }
+struct Num {
+	v: i32,
+}
 
 impl Num with Ord {
 	fun compare(self, b: Num): Ordering {

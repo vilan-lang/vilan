@@ -3,8 +3,13 @@ import std::io::print;
 // A view of a scalar *field* lowers to a `[base, key]` pair, so writes go
 // through to the struct's slot (previously this silently copied the value out
 // and the write was a no-op). A whole-aggregate view still writes in place.
-struct Counter { value: i32 }
-struct Pair { first: i32, second: i32 }
+struct Counter {
+	value: i32,
+}
+struct Pair {
+	first: i32,
+	second: i32,
+}
 
 fun bump(slot: &mut i32) {
 	slot = *slot + 1;

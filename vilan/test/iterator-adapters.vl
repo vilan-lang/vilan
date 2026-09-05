@@ -3,10 +3,10 @@
 // defaults returning named concrete structs, and each stage monomorphizes to a
 // direct call — no dispatch table, no vtable. `Naturals` is unbounded, so the
 // short-circuiting stages are what make this program terminate at all.
+import std::io::print;
 import std::iterator::Iterator;
 import std::map::Map;
 import std::option::Option::{ None, Some, self };
-import std::io::print;
 import std::range::Range;
 import std::set::Set;
 
@@ -23,7 +23,13 @@ impl Naturals with Iterator<i32> {
 
 fun main() {
 	// A four-stage chain over a `List`, terminated explicitly.
-	print([1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).map(|n| n * 10).skip(1).take(2).to_list());
+	print([1, 2, 3, 4, 5, 6]
+		.iter()
+		.filter(|n| n % 2 == 0)
+		.map(|n| n * 10)
+		.skip(1)
+		.take(2)
+		.to_list());
 
 	// The same adapters over a stateful custom conformer with no end.
 	print(Naturals { at = 0 }.map(|n| n * n).take(4).to_list());

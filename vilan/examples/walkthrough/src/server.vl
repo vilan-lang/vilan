@@ -31,7 +31,10 @@ async fun main() {
 		.port(4600)
 		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
 		.serve_build(build)
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html")
+			.body(page)
+			.build())
 		.on_start(|server| print(i"notes server listening on {server.url()}"))
 		.build()
 		.start();

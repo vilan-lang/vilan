@@ -4,11 +4,11 @@
 // paren-delimited regions composing with `!`, a twice-evaluated receiver, and
 // §4's TRAIT path — a user `Lift` container lifting through its own
 // `map`/`and_then`, nested left to right.
-import std::io::print;
 import std::display::format;
-import std::option::Option::{ self, Some, None };
-import std::result::Result::{ self, Ok, Err };
+import std::io::print;
 import std::operators::Lift;
+import std::option::Option::{ None, Some, self };
+import std::result::Result::{ Err, Ok, self };
 
 // A user `Lift` container that tags every member it runs through, so the
 // printed tag names which method the lowering picked and in what order.

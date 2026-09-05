@@ -5,7 +5,7 @@ trait Default {
 }
 
 struct Id {
-	n: u32
+	n: u32,
 }
 
 impl Id {

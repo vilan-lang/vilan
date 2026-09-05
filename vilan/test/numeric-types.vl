@@ -4,9 +4,9 @@
 // conversions (Rust-`as` semantics: truncate toward zero, fold two's-
 // complement into the target's width).
 import std::debug::Debug;
+import std::io::print;
 import std::json::Json;
 import std::operators::Div;
-import std::io::print;
 
 [derive(Json)]
 struct Packet {

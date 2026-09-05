@@ -1,7 +1,10 @@
-import std::operators::{ Add, Mul };
 import std::io::print;
+import std::operators::{ Add, Mul };
 
-struct Vec2 { x: i32, y: i32 }
+struct Vec2 {
+	x: i32,
+	y: i32,
+}
 
 impl Vec2 with Add {
 	fun add(self, b: Vec2): Vec2 {

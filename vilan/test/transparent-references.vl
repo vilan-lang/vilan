@@ -4,7 +4,7 @@
 // `Option<&mut T>` view — for both plain `=` and compound `+=` / `/=`. Reading a
 // view as a value keeps its explicit `*`.
 import std::io::print;
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 fun add_ten(x: &mut i32) {
 	x += 10; // compound write-through a `&mut` parameter
@@ -67,7 +67,11 @@ fun main() {
 	print(n); // 8
 
 	let live = false;
-	match if live { Some(&mut n) } else { None } { // the conditional form
+	match if live {
+		Some(&mut n) // the conditional form
+	} else {
+		None
+	} {
 		Some(let v) => {
 			v = 0;
 		}

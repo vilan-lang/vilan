@@ -1,4 +1,4 @@
-import std::{ io::print };
+import std::io::print;
 
 trait Iterator<T> {
 	fun next(self): T;
@@ -26,7 +26,7 @@ fun main() {
 		i += 1;
 		i
 	});
-	
+
 	print(naturals.next());
 	print(naturals.next());
 	print(naturals.next());

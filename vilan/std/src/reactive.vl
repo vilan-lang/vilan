@@ -229,7 +229,11 @@ fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T {
 /// `Optimistic::over` and `ui`'s `bind_value`). `Source` declares `get`/`sub`
 /// and no `set`, so the whole point of this function is outside it — and any
 /// impl of the writable trait serves, not only the canonical cell.
-fun optimistic<T, E, S: Signal<T>>(signal: S, value: T, commit: async || Result<T, E>): Result<T, E> {
+fun optimistic<T, E, S: Signal<T>>(
+	signal: S,
+	value: T,
+	commit: async || Result<T, E>,
+): Result<T, E> {
 	let previous = signal.get();
 	signal.set(value);
 	let outcome = commit();

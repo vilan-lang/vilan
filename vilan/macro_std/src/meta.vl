@@ -1,4 +1,4 @@
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 // The compiler-interaction surface (proposal/macro-engine.md §3): the types a
 // `macro fun` receives and returns. These are ordinary vilan values — the
@@ -162,8 +162,7 @@ fun mentions(type_: TypeExpr, parameter: str): bool {
 // Whether a `TypeExpr` name is raw source text rather than a written type's
 // head identifier — the punctuation no named head can contain.
 fun opaque_type_text(name: str): bool {
-	name.contains("(") || name.contains("[") || name.contains("|") || name.contains("&")
-		|| name.contains(",") || name.contains(" ") || name.contains("*")
+	name.contains("(") || name.contains("[") || name.contains("|") || name.contains("&") || name.contains(",") || name.contains(" ") || name.contains("*")
 }
 
 export struct StructItem {
@@ -356,9 +355,7 @@ impl Arguments {
 				if "0123456789".contains(text.substring(0, 1)) {
 					ret None;
 				}
-				if text.contains(" ") || text.contains("\"") || text.contains("(")
-					|| text.contains(".") || text.contains("+") || text.contains("-")
-					|| text.contains("|") || text.contains(":") {
+				if text.contains(" ") || text.contains("\"") || text.contains("(") || text.contains(".") || text.contains("+") || text.contains("-") || text.contains("|") || text.contains(":") {
 					ret None;
 				}
 				Some(text)

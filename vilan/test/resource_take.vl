@@ -5,9 +5,9 @@
 // every teardown prints so the ORDER is visible.
 // Synchronous + host-free, so the interpreter equivalence gate checks it against
 // `node` too (exercising the new `__option_take`/`__option_replace` helper arms).
-import std::io::print;
-import std::option::Option::{ self, Some, None };
 import std::drop::{ Drop, drop };
+import std::io::print;
+import std::option::Option::{ None, Some, self };
 
 resource struct Res {
 	tag: str,

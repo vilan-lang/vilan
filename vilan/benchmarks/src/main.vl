@@ -7,11 +7,11 @@
 
 import std::io::print;
 import std::process::exit;
-import pkg::payload;
-import pkg::codec;
 import pkg::coalescing;
-import pkg::throughput;
+import pkg::codec;
+import pkg::payload;
 import pkg::realtime;
+import pkg::throughput;
 
 fun main() {
 	print("vilan network benchmarks");

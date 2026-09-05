@@ -883,7 +883,10 @@ macro fun enum_json_impls(target: EnumItem): str {
 			coerce = "coerce_i53";
 		}
 		let backed_result = i"Result<{subject}, str>";
-		let backed_to_json = fun_of("to_json").parameter("self").returns("str").expr("self.value().to_json()");
+		let backed_to_json = fun_of("to_json")
+			.parameter("self")
+			.returns("str")
+			.expr("self.value().to_json()");
 		let backed_from_json = fun_of("from_json")
 			.parameter("text: str")
 			.returns(backed_result)

@@ -3,7 +3,10 @@
 // at `mut b = a` and never again, so the copy is elided; `b` simply reuses it.
 import std::io::print;
 
-struct Point { x: i32, y: i32 }
+struct Point {
+	x: i32,
+	y: i32,
+}
 
 fun main() {
 	mut a = Point { x = 1, y = 2 };

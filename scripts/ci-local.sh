@@ -34,7 +34,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # misformatted tree is a 20-second red rather than a 10-minute one, then the
 # suite, then the two builds, then the cross-check. THIS LIST IS THE JOB LIST —
 # ci_local_script.rs holds it against ci.yml's jobs in both directions.
-LEGS="fmt clippy test doctest audit wasm windows"
+LEGS="fmt vilan-fmt clippy test doctest audit wasm windows"
 
 # Legs with no ci.yml job, and why (see THE WINDOWS LEG above). A leg named here
 # must not appear in any workflow `run:` step; the pin checks that too, so a leg
@@ -49,6 +49,18 @@ LOCAL_ONLY="windows"
 
 leg_fmt() {
     cargo fmt --all --check
+}
+
+# The tree's `.vl` held to `vilan fmt`'s own answer (tracker N55). Until this
+# leg existed the formatter's output was ADVISORY — 96 files, seven of them
+# under `vilan/std`, differed from what the compiler in the same commit would
+# have written for them, and E137's reflow reached only the one file a gate
+# already covered. `.` from the repository root is the whole tree: the corpus,
+# std, macro_std, the benchmarks, the examples, the templates and the `.vl`
+# fixtures under `crates/`. Products under a declared `generated` root are
+# excluded by `fmt` itself (build-hooks.md §12.4), not by an argument here.
+leg_vilan_fmt() {
+    cargo run --quiet -p vilan-cli -- fmt --check .
 }
 
 leg_clippy() {

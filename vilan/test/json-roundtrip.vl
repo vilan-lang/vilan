@@ -1,7 +1,7 @@
 import std::io::print;
-import std::json::{ Json, FromJson };
-import std::option::Option::{ self, Some, None };
-import std::result::Result::{ self, Ok, Err };
+import std::json::{ FromJson, Json };
+import std::option::Option::{ None, Some, self };
+import std::result::Result::{ Err, Ok, self };
 
 // `[derive(Json)]` gives a struct both directions; `List`/`Option` serialize and
 // parse each element via its own `Json`/`FromJson`. Decoding is fallible (I3), so
@@ -27,9 +27,9 @@ fun main() {
 
 	// A struct whose fields are themselves a `List` and an `Option`.
 	let json = "{\"name\":\"Reds\",\"members\":[\"Ada\",\"Bob\"],\"captain\":\"Ada\"}";
-	print(Team::from_json(json) is Ok(let team)
-		&& team.to_json() == json          // round-trips to the same document
-		&& team.members.to_json() == "[\"Ada\",\"Bob\"]"); // true
+	print(Team::from_json(json) is Ok(let team) && team.to_json() == json && team.members.to_json() == "[\"Ada\",\"Bob\"]");
+	// round-trips to the same document
+	// true
 
 	// A list of those structs.
 	let teams: Result<List<Team>, str> = List::from_json("[" + json + "]");

@@ -1,5 +1,5 @@
 import std::io::print;
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 
 // A generic method returning `T` / `Option<T>` resolves `T` from the receiver's
 // concrete type argument (`Box<Node>` → `T = Node`), so the result's fields are
