@@ -2881,4 +2881,72 @@ fun main() {
     fn keystroke_path_gate_smoke_view() {
         keystroke_path_budget_at(Subject::View, SMOKE_FUNCTIONS, false);
     }
+    /// **M39: a completion request materializes no module text.**
+    ///
+    /// A completion item carries its declaration's `///` first paragraph, and
+    /// rendering one used to cost the DECLARING MODULE'S TEXT: `doc_comment_of`
+    /// slices it out of the module, and `Analysis::source_text` caches that
+    /// text per QUERY — so a request offering names imported from a large
+    /// module read (and allocated) that module on every keystroke. It was the
+    /// last table-shaped cost left in a request after M25 and M29, worth
+    /// 0.415 ms against 0.324 ms with the render stubbed out.
+    ///
+    /// The paragraphs are a function of the analysis, so they are rendered
+    /// once into the captured index and a request reads a lookup. The number
+    /// this pins is deterministic rather than a duration — `source_read_count`
+    /// is E83's per-thread counter of source texts MATERIALIZED, so the claim
+    /// "the request touches no module" is a count, not a timing, and it holds
+    /// on any box under any load.
+    ///
+    /// Non-vacuity is the second assertion: the request has to actually be
+    /// offering documented candidates, or a zero here would mean the popup was
+    /// empty rather than that the reads were gone.
+    #[test]
+    fn a_completion_request_materializes_no_module_text() {
+        let (directory, mut document, _) = land_view(SMOKE_FUNCTIONS);
+        let edited = view_keystroke();
+        document.set_text(&edited);
+        let offset = edited
+            .find(Subject::View.cursor_needle())
+            .expect("a scope position");
+        // One call first: whatever is lazy anywhere below this is not what the
+        // count is about.
+        let warm = document.keystroke_completion(offset, false);
+        let documented = warm
+            .iter()
+            .filter(|completion| completion.documentation.is_some())
+            .count();
+        let before = vilan_core::util::source_read_count();
+        let offered = document.keystroke_completion(offset, false);
+        let reads = vilan_core::util::source_read_count() - before;
+        // What the cost became, on the same run: deriving the index reads each
+        // declaring module ONCE, and that happens once per analysis rather
+        // than once per request. Reported, not asserted — the trade is the
+        // finding and the number is what makes it checkable.
+        let before = vilan_core::util::source_read_count();
+        std::hint::black_box(document.keystroke_completion_rebuilding_index(offset, false));
+        let index_reads = vilan_core::util::source_read_count() - before;
+        let _ = std::fs::remove_dir_all(&directory);
+        println!(
+            "M39 {{\"section\":\"completion\",\"subject\":\"view{SMOKE_FUNCTIONS}\",\
+             \"offered\":{},\"documented\":{documented},\"source_reads\":{reads},\
+             \"index_build_reads\":{index_reads},\"profile\":\"{}\",\"load\":\"{}\"}}",
+            offered.len(),
+            profile(),
+            loadavg_1m(),
+        );
+        assert!(
+            documented > 0,
+            "the request offered {} candidates and none of them carried \
+             documentation, so a zero read count below would say nothing",
+            offered.len(),
+        );
+        assert_eq!(
+            reads, 0,
+            "a completion request materialized {reads} source texts. The \
+             paragraphs are captured with the analysis; a request that reads a \
+             module is paying the codebase for an answer about the file \
+             (E121 §2.1)"
+        );
+    }
 }

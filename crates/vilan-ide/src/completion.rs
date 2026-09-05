@@ -2628,6 +2628,7 @@ pub struct CompletionIndex {
     auto_import: AutoImportOrder,
     origins: Vec<OriginListing>,
     members: MemberTable,
+    docs: DocParagraphs,
 }
 
 impl CompletionIndex {
@@ -2647,13 +2648,107 @@ impl CompletionIndex {
                 .map(|roots| OriginListing::build(roots, program.platform))
                 .unwrap_or_default(),
             members: MemberTable::build(program),
+            docs: DocParagraphs::build(program),
         }
+    }
+
+    /// A non-entry declaration's rendered first doc paragraph (M39).
+    ///
+    /// `None` means the table does not COVER this declaration — the entry's
+    /// own, a derived one, something that is not a function — and the caller
+    /// must render it itself. `Some(None)` means it is covered and has no
+    /// doc, which is the answer, and is why this is not a plain
+    /// `Option<&str>`: an undocumented std function that fell through to the
+    /// renderer would read its module's whole text to discover there was
+    /// nothing above it, which is the very cost the table exists to remove.
+    pub(crate) fn doc_paragraph(&self, declaration_id: Id) -> Option<Option<&str>> {
+        self.docs
+            .by_declaration
+            .get(&declaration_id)
+            .map(|paragraph| paragraph.as_deref())
     }
 
     /// The modules and surface `origin::` offers, as the package tree stood
     /// when the analysis ran. `None` for a name that is not an origin.
     fn origin(&self, origin: &str) -> Option<&OriginListing> {
         self.origins.iter().find(|listing| listing.origin == origin)
+    }
+}
+
+/// Every NON-ENTRY function's `///` first paragraph, rendered ONCE per
+/// analysis (M39).
+///
+/// Rendering one costs the DECLARING MODULE'S TEXT. `Analysis::source_text`
+/// caches a module's text per QUERY, so a completion offering names imported
+/// from a large module read that module on every keystroke — the last cost
+/// left in a completion request once M25 and M29 had taken the table
+/// derivations out (0.415 ms per request, 0.324 ms with the render stubbed).
+///
+/// Nothing about it depends on the cursor or the live buffer, which is the
+/// same argument [`MemberTable`] and [`AutoImportOrder`] rest on, and the
+/// freshness rule is theirs unchanged: an entry is as old as the analysis it
+/// was built from and is replaced wholesale when the next one lands, so an
+/// edit to any module — the declaring one included — is already an event that
+/// rebuilds this.
+///
+/// **The entry's own declarations are excluded.** Their text is the analyzed
+/// text the query already holds, so rendering them here would buy nothing and
+/// would put the one text a keystroke changes into a captured table. One read
+/// per declaring module, not one per declaration: the sources are visited in
+/// order and each is read once.
+#[derive(Clone, Debug, Default)]
+struct DocParagraphs {
+    /// Every non-entry function and external the program declares, whether or
+    /// not it HAS a doc — an absent entry means "not covered", never "not
+    /// documented", so an undocumented declaration is answered from the table
+    /// rather than by reading its module to find nothing.
+    by_declaration: HashMap<Id, Option<String>>,
+}
+
+impl DocParagraphs {
+    fn build(program: &Program) -> DocParagraphs {
+        // (declaration, name-span start), grouped by declaring source, so a
+        // module's text is read once however many declarations it carries.
+        let mut by_source: HashMap<SourceId, Vec<(Id, usize)>> = HashMap::default();
+        let declarations = program
+            .functions
+            .iter()
+            .map(|(id, function)| (*id, function.name_span))
+            .chain(
+                program
+                    .external_functions
+                    .iter()
+                    .map(|(id, external)| (*id, external.name_span)),
+            );
+        for (id, name_span) in declarations {
+            let Some(source) = program.source_of(id) else {
+                continue;
+            };
+            // The entry (and the derived sentinel, which has no file) render
+            // lazily where the text is already in hand.
+            if source == SourceId(0) || program.source_path(source).is_none() {
+                continue;
+            }
+            by_source
+                .entry(source)
+                .or_default()
+                .push((id, name_span.into_range().start));
+        }
+        let mut by_declaration: HashMap<Id, Option<String>> = HashMap::default();
+        for (source, declarations) in by_source {
+            let Some(path) = program.source_path(source) else {
+                continue;
+            };
+            let Ok(text) = vilan_core::util::read_source(path) else {
+                continue;
+            };
+            for (id, start) in declarations {
+                let paragraph = crate::analysis::doc_comment_above(&text, start)
+                    .and_then(|docs| crate::analysis::first_paragraph(&docs));
+                by_declaration.insert(id, paragraph);
+            }
+        }
+        DocParagraphs { by_declaration }
     }
 }
 
