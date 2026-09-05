@@ -4111,18 +4111,38 @@ fn b186_a_bare_trait_parameter_is_the_generic_the_steer_asked_for() {
 #[test]
 fn b72_the_bare_trait_steer_names_the_position_that_works() {
     // The actionable half — without it the message diagnoses without directing.
-    // Read at a FIELD since B186: the steer now names the parameter form first,
-    // because that is where a reader who wrote a trait most often meant to.
+    // Read at a RETURN since B184, and the steer names BOTH positions that take
+    // the spelling now (the parameter, B186; the field, B184) before falling
+    // back to the written generic, which is what a return actually needs.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { v: A }
+        fun make(): A { Bag { n = 1 } }
         fun main() { }
         "#,
-        "write `fun f(x: A)` for a parameter, or a generic for a field/return",
+        "write `fun f(x: A)` for a parameter or `struct S { f: A }` for a field, or a \
+         generic for a return",
     );
+    // And on an ATTRIBUTED declaration the field clause is DROPPED, because a
+    // field is not one of the positions that works there: a generator writes
+    // code from the types the author wrote and cannot spell a hidden parameter.
+    let attributed = r#"
+        import std::io::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        [derive(Wire)]
+        struct Holder { v: A }
+        fun main() { print(1); }
+        main();
+        "#;
+    assert_fails_with(
+        attributed,
+        "write `fun f(x: A)` for a parameter, or a generic for a return",
+    );
+    assert_fails_with(attributed, "not on a declaration carrying an attribute");
 }
 
 #[test]
@@ -4137,7 +4157,7 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { subject: A }
+        fun subject(): A { Bag { n = 1 } }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4192,13 +4212,15 @@ fn b72_the_refusal_does_not_wait_for_an_argument() {
 #[test]
 fn b72_an_unused_bare_trait_declaration_is_still_refused() {
     // The half a use-site steer structurally could not reach: a declaration
-    // nobody uses. B72 was silent here; the rule is not.
+    // nobody uses. B72 was silent here; the rule is not. Read at a RETURN since
+    // B184 — the field this was written on is the hidden parameter now, and the
+    // return is the value position with no binding source to ground one from.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { v: A }
+        fun make(): A { Bag { n = 1 } }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4340,15 +4362,32 @@ fn b72_a_bare_trait_return_is_refused() {
 }
 
 #[test]
-fn b72_a_bare_trait_field_is_refused() {
-    // The fifth position — the one §2.2's resource leak rode in on.
+fn b184_a_bare_trait_field_is_the_hidden_parameter() {
+    // SUPERSEDED BY B184 (was `b72_a_bare_trait_field_is_refused`). The fifth
+    // position — the one §2.2's resource leak rode in on — now reads as a
+    // hidden type parameter, and the leak is shut by the semantics instead
+    // (`b184_a_trait_typed_field_cannot_swallow_a_resources_destructor_either`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; print(h.item.name()); }
+        main();
+        "#,
+        "bag\n",
+    );
+    // The NESTED spelling at a field is not the sugar and stays refused: the
+    // inner type id was never an annotation id (B161's rule, B186's rule).
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { item: A }
-        fun main() { let h = Holder { item = Bag { n = 1 } }; }
+        struct Holder { item: List<A> }
+        fun main() { let h = Holder { item = [] }; }
         "#,
         "'A' is a trait, not a type",
     );
@@ -4404,17 +4443,25 @@ fn b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program() 
 }
 
 #[test]
-fn b4_the_internal_error_route_through_a_field_is_a_clean_refusal() {
-    assert_fails_with(
+fn b184_the_internal_error_route_through_a_field_is_now_an_ordinary_program() {
+    // SUPERSEDED BY B184 (was
+    // `b4_the_internal_error_route_through_a_field_is_a_clean_refusal`), the way
+    // B161 superseded the binding route. B55's internal error came from a value
+    // CARRYING a trait type into a bounded generic, where monomorphization had
+    // no concrete type to reach. B184 removes the carrier: `h.item` is a `Bag`,
+    // the hidden parameter's argument, so `use_it` monomorphizes on `Bag`.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         struct Holder { item: A }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; print(use_it(h.item)); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4441,18 +4488,20 @@ fn b4_no_route_to_the_internal_error_survives() {
     // appear, because it is the one that asks the user to file a bug for their
     // own mistake.
     //
-    // The BINDING route left this list with B161 — it is a clean, running
-    // program now, not a diagnostic (see
-    // `b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program`),
-    // and a program that compiles reaches no guard at all.
+    // The BINDING route left this list with B161 and the FIELD route with B184 —
+    // both are clean, running programs now, not diagnostics (see
+    // `b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program`
+    // and `b184_the_internal_error_route_through_a_field_is_now_an_ordinary_program`),
+    // and a program that compiles reaches no guard at all. The RETURN is the
+    // route that is left, plus the nested spelling that never was a reading.
     for source in [
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { item: A }
+        struct Holder { item: List<A> }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        fun main() { let h = Holder { item = [] }; let s = use_it(h.item); }
         "#,
         r#"
         trait A { fun name(self): str; }
@@ -4948,10 +4997,15 @@ fn a_resource_field_runs_its_destructor() {
 }
 
 #[test]
-fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
-    // P8 row 4 — the field route, which is the dangerous one: the resource is
-    // reachable, owned, and invisible to containment inference.
-    assert_fails_with(
+fn b184_a_trait_typed_field_cannot_swallow_a_resources_destructor_either() {
+    // SUPERSEDED BY B184 (was `a_bare_trait_field_cannot_swallow_a_resources_destructor`).
+    // P8 row 4 was the field route, and the leak it named — a resource reachable,
+    // owned, and invisible to containment inference — is shut by SEMANTICS now
+    // rather than by the ban, exactly as B161 shut the binding route: the field
+    // IS its concrete type (`Handle`, the hidden parameter's argument), so
+    // containment sees it and the destructor runs. `closing` before `ok` is the
+    // whole pin — a leak would print `ok` alone.
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::drop::Drop;
@@ -4966,7 +5020,7 @@ fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
         }
         main();
         "#,
-        "a trait is not a value type (vilan has no trait objects)",
+        "closing\nok\n",
     );
 }
 

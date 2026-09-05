@@ -5716,11 +5716,12 @@ fn an_unresolved_value_in_a_module_is_attributed_to_the_module_too() {
 #[test]
 fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
     // The other diagnostic the same drain raises, carrying the same defect: an
-    // annotation that RESOLVED, to a trait, in value position (§12.2). A FIELD
-    // since B186 — the parameter this was written on became the implicit
-    // generic, and a field is the nearest position that still refuses.
-    const ALPHA: &str = "trait Shape {\n\tfun area(&self): i32;\n}\n\nstruct Holder {\n\tshape: \
-                         Shape,\n}\n\nfun size(): i32 {\n\t0\n}\n";
+    // annotation that RESOLVED, to a trait, in value position (§12.2). A RETURN
+    // since B184 — the parameter this was written on became B186's implicit
+    // generic and the field became B184's hidden parameter, so the return is
+    // the nearest position that still refuses.
+    const ALPHA: &str = "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun shape(): \
+                         Shape {\n\t0\n}\n\nfun size(): i32 {\n\t0\n}\n";
     let outcome = analyze_package(
         &[
             (
@@ -5736,7 +5737,7 @@ fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
         .iter()
         .find(|(message, _, _)| message.contains("'Shape' is a trait, not a type"))
         .expect("the bare trait in value position is refused");
-    let start = ALPHA.find("shape: Shape").unwrap() + "shape: ".len();
+    let start = ALPHA.find("shape(): Shape").unwrap() + "shape(): ".len();
     assert_eq!(
         (file.as_deref(), span.clone()),
         (Some("alpha.vl"), start..start + "Shape".len()),

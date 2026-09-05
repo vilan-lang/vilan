@@ -3577,6 +3577,13 @@ pub struct Analyzer<'src> {
     // The constraints those annotations recorded, checked after `build()` —
     // where the binding's own type has settled (B161).
     binding_trait_constraints: Vec<BindingTraitConstraint>,
+    // B184's twin of the above, for a BINDING annotated with a struct that
+    // carries a hidden type parameter (`let c: C = C { x = A {} }`). The
+    // annotation cannot name the hidden argument and must not invent one, so it
+    // reads exactly as B161's does — a CONSTRAINT on the type the initializer
+    // grounds, checked once that type has settled — rather than as a type the
+    // binding is forced to.
+    binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
     // B182: the annotation slots a REFUSED bare trait resolved to `Unknown`,
     // each with the site its one report was filed at. B161 resolves a refused
     // annotation to `Unknown` "so the one report stands alone instead of
@@ -3648,6 +3655,51 @@ pub struct Analyzer<'src> {
     // B161's constraint over one. A CLOSURE's parameters are absent
     // deliberately: a closure has no generic list to append to.
     parameter_annotation_type_ids: HashMap<TypeId, (Id, Id)>,
+    // B184: the annotation type ids of a struct's FIELDS, to the struct that
+    // owns them and the scope its generics live in. The third value position
+    // where a trait is a reading rather than a refusal, and the one that makes
+    // the struct itself generic: `struct C { x: X }` is `struct C<#0: X> { x: #0 }`,
+    // with `#0` a parameter the author never writes. Recorded by type id for
+    // B161's and B186's reason — whether the annotation names a trait is the
+    // drain's to discover, and a NESTED spelling (`List<X>`) mints its own
+    // inner id, which is not in this map and stays refused.
+    field_annotation_type_ids: HashMap<TypeId, (Id, Id)>,
+    // B184: an `impl`'s SUBJECT annotation, to the scope its binders live in.
+    // `impl C { … }` over a struct with a hidden parameter is
+    // `impl C<type S: X> { … }`: the impl is generic over the parameter exactly
+    // as it is over a written `type S`, and `Self` is `C<S>`. An impl keeps its
+    // generics in its body SCOPE rather than on an entity's list (see
+    // `register_subject_binders`), so the mint has nothing to append to and the
+    // scope is the whole record.
+    impl_subject_annotation_type_ids: HashMap<TypeId, (Id, Id)>,
+    // B184: the HIDDEN generic parameters a declaration carries, in the order
+    // they were appended to its `generic_parameter_constraint_ids` — always its
+    // tail, always after every parameter the author wrote. Separate from
+    // `declared_generic_parameters` on purpose: that table is what the author
+    // WROTE, and it is what the arity check counts, so a hidden parameter is
+    // absent from it and `C<A>` stays "takes 0 type arguments, 1 given". The
+    // author never writes the argument; the mention's own binder supplies it.
+    hidden_generic_parameters: HashMap<Id, Vec<TypeId>>,
+    // B184: the declarations an ATTRIBUTE wraps — `[derive(..)]`, `[service(..)]`
+    // and any user macro attribute. The sugar is refused on these in v1, and
+    // for a reason that is the paper's own §4: macro reflection is SYNTACTIC
+    // (`macro_std/src/meta.vl` — "a `TypeExpr` is a WRITTEN type… nothing here
+    // is resolved"), so a generator cannot see a parameter that was never
+    // written and cannot spell it in the code it emits. `[derive(Wire)] struct
+    // Kennel { inner: Greet }` would generate `fun from_json_value(..): Kennel`
+    // — the one position that cannot ground a hidden parameter — over and over.
+    // Keeping the old refusal at the field gives one report at the annotation
+    // instead of a page of generated-code follow-ons, which is the B182 answer
+    // to the same shape.
+    attributed_declarations: HashSet<Id>,
+    // B184: what a FIELD annotation naming a trait (or naming a struct that
+    // carries hidden parameters) resolves to, decided by
+    // `resolve_hidden_struct_parameters` BEFORE the drain runs. The pre-pass is
+    // not an optimization: a struct's hidden parameters must exist before any
+    // MENTION of the struct drains, and the drain's order is walk order — the
+    // entry walks before the modules it imports, so a use routinely drains
+    // before its declaration.
+    hidden_annotation_types: HashMap<TypeId, Type>,
     // The constraint ids the sugar minted, to the scope whose declaration
     // binds them (B186). An implicit generic has no NAME, so the two
     // "is this parameter fixed by an enclosing binder?" tests — which resolve
@@ -4415,6 +4467,12 @@ impl<'src> Analyzer<'src> {
             expose_refused_elements: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
+            field_annotation_type_ids: HashMap::default(),
+            impl_subject_annotation_type_ids: HashMap::default(),
+            binding_hidden_nominal_constraints: Vec::new(),
+            hidden_generic_parameters: HashMap::default(),
+            attributed_declarations: HashSet::default(),
+            hidden_annotation_types: HashMap::default(),
             implicit_generic_scopes: HashMap::default(),
             panic_fn_id: None,
             call_subjects: Vec::new(),
@@ -5427,6 +5485,89 @@ impl<'src> Analyzer<'src> {
                     ),
                 },
                 constraint.variable_id,
+            );
+        }
+    }
+
+    /// B184's twin of the check above: a binding annotated with a struct that
+    /// carries a hidden type parameter (`let c: C = C { x = A {} }`).
+    ///
+    /// The annotation cannot spell the hidden argument — that is the whole
+    /// point of the sugar — so it cannot be the binding's type; it is a
+    /// CONSTRAINT on the type the initializer grounds, and the only thing left
+    /// to check is that the initializer really produced one of this struct's
+    /// values. The wording follows B161's, for the same reason: the annotation
+    /// did not widen anything, and the binding's type is what it always was.
+    fn check_binding_hidden_nominal_constraints(&mut self) {
+        for (variable_id, struct_id, written_arguments, span) in
+            std::mem::take(&mut self.binding_hidden_nominal_constraints)
+        {
+            let Some(variable) = self.variables.get(&variable_id) else {
+                continue;
+            };
+            let name = variable.name;
+            let value_type = variable.type_id.get_type(self);
+            // Indeterminate values are other diagnostics' business: a binding
+            // that never grounded already failed elsewhere.
+            if matches!(
+                value_type,
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_)
+            ) {
+                continue;
+            }
+            // The struct AND the arguments the annotation wrote. Only the hidden
+            // tail is unwritable: `Held<i32>` still says its element is an `i32`,
+            // and a `Held<str>` behind it would be exactly the erasure B188
+            // closed one spelling over.
+            if let Type::Struct(id, arguments) = &value_type
+                && *id == struct_id
+                && written_arguments
+                    .iter()
+                    .zip(arguments)
+                    .all(|(written_id, argument_id)| {
+                        let written = written_id.get_type(self);
+                        let argument = argument_id.get_type(self);
+                        self.compare_type_rigid(
+                            &written,
+                            &argument,
+                            &SubstitutionContext::default(),
+                            &[],
+                        )
+                    })
+            {
+                continue;
+            }
+            let Some(struct_name) = self.structs.get(&struct_id).map(|struct_| struct_.name) else {
+                continue;
+            };
+            let type_label = self.pretty_print_type(&value_type, &HashMap::default());
+            let mut expected = struct_name.to_string();
+            if !written_arguments.is_empty() {
+                let rendered: Vec<String> = written_arguments
+                    .iter()
+                    .map(|written_id| {
+                        let written = written_id.get_type(self);
+                        self.pretty_print_type(&written, &HashMap::default())
+                    })
+                    .collect();
+                expected.push('<');
+                expected.push_str(&rendered.join(", "));
+                expected.push('>');
+            }
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "Expected {expected}, but got {type_label} instead. \
+                         '{struct_name}' has a trait-typed field, so the annotation on \
+                         '{name}' is a CONSTRAINT on the initializer's own type — it names \
+                         the struct and every argument the author may write, and the hidden \
+                         argument comes from the value"
+                    ),
+                },
+                variable_id,
             );
         }
     }
@@ -22008,8 +22149,212 @@ impl<'src> Analyzer<'src> {
             function
                 .generic_parameter_constraint_ids
                 .push(constraint_id);
+        } else if let Some(struct_) = self.structs.get_mut(&owner_id) {
+            // B184: a STRUCT owner. The parameter lands in the same list a
+            // written `<S: X>` lands in, so instantiation, impl selection and
+            // emission need no new code at all — `C`'s field is a
+            // `Type::Generic` bound at the literal, which is the case every
+            // written generic already takes. It is recorded as HIDDEN as well,
+            // because the arity check counts what the author wrote.
+            struct_.generic_parameter_constraint_ids.push(constraint_id);
+            self.hidden_generic_parameters
+                .entry(owner_id)
+                .or_default()
+                .push(constraint_id);
         }
         constraint_id
+    }
+
+    /// B184's pre-pass: gives every struct whose fields name a trait — or name
+    /// a struct that already carries one — its HIDDEN generic parameters,
+    /// before the `prepped_type_locals` drain resolves a single mention.
+    ///
+    /// It has to run first, and the reason is the drain's ORDER. The drain is
+    /// walk order, and walk order is the entry file and then the modules it
+    /// imports — while a struct's mentions live in the modules that import its
+    /// declaration. So `fun tell(c: C)` in `main.vl` routinely drains before
+    /// `struct C { x: X }` in `store.vl`, and a mention that drained first
+    /// would see a struct with no parameters and erase the field. (That
+    /// erasure is exactly B188's miscompile, in a new carrier.)
+    ///
+    /// Two stages, because the parameter is VIRAL in the way a written one is:
+    ///
+    /// 1. a field annotated with a bare trait mints one hidden parameter on its
+    ///    struct, bounded by that trait — `struct C { x: X }` is
+    ///    `struct C<#0: X> { x: #0 }`;
+    /// 2. a field annotated with a bare struct that carries hidden parameters
+    ///    mints one of its OWN per parameter, with the same bound —
+    ///    `struct Outer { c: C }` is `struct Outer<#0: X> { c: C<#0> }`.
+    ///
+    /// Stage 2 feeds itself (an `Outer` may be held by an `Outermost`), so it
+    /// runs to a fixpoint. It is bounded: each round that changes anything adds
+    /// a parameter to some struct, and a struct gains at most one per field.
+    fn resolve_hidden_struct_parameters(&mut self) {
+        // The field annotations, in walk order — a deterministic order, which
+        // is what makes the parameter LIST a struct ends up with deterministic
+        // too, and with it the arguments a mention's mint zips against.
+        let field_annotations: Vec<(TypeId, &'src str, Id, Vec<TypeId>, Id, Id)> = self
+            .prepped_type_locals
+            .iter()
+            .filter_map(|(type_id, name, scope_id, _span, arguments, _source_id)| {
+                self.field_annotation_type_ids
+                    .get(type_id)
+                    .map(|(struct_id, body_scope_id)| {
+                        (
+                            *type_id,
+                            *name,
+                            *scope_id,
+                            arguments.clone(),
+                            *struct_id,
+                            *body_scope_id,
+                        )
+                    })
+            })
+            .collect();
+        if field_annotations.is_empty() {
+            return;
+        }
+        // A field annotation that is a path head is not an application of the
+        // name it starts with, and one written where a bound belongs is B212's
+        // refusal — neither is this reading.
+        let mut rounds = 0;
+        loop {
+            let mut changed = false;
+            for (type_id, name, scope_id, arguments, struct_id, body_scope_id) in &field_annotations
+            {
+                if self.hidden_annotation_types.contains_key(type_id)
+                    || self.path_head_type_ids.contains(type_id)
+                    || self.attributed_declarations.contains(struct_id)
+                {
+                    continue;
+                }
+                let Some(subject_id) = self
+                    .try_get_type_id_by_name(name, *scope_id)
+                    .or_else(|| self.try_get_expr_id_by_name(name, *scope_id))
+                else {
+                    continue;
+                };
+                // The SORT the name resolved to, read off the entity rather
+                // than off a type. `infer_type` is not available here: the
+                // pre-pass runs before the drain that resolves the ids it would
+                // walk, and a defaulted parameter (`<S = i32>`) is enough to
+                // make it index a slot that has no content yet. Every question
+                // this pass asks — trait or struct, which one, with what
+                // declared arguments — is answerable from the entity map and a
+                // non-panicking read of the type map, which is the same reason
+                // `bare_trait_in_value_position` reads `Self` that way.
+                let sort = self.expr_id_to_expr_map.get(&subject_id).cloned();
+                let declared_type = self
+                    .expr_id_to_type_id_map
+                    .get(&subject_id)
+                    .and_then(|declared_id| self.type_id_to_type_map.get(declared_id))
+                    .cloned();
+                let subject_type = match sort {
+                    Some(Expr::Trait(trait_id)) => Type::Trait(trait_id, Vec::new()),
+                    Some(Expr::Struct(struct_id)) => Type::Struct(struct_id, Vec::new()),
+                    _ => continue,
+                };
+                // An application already refused on its arity is not this
+                // reading either: one report per written spelling (B188).
+                if self
+                    .written_application_arity_error(
+                        subject_id,
+                        &subject_type,
+                        name,
+                        arguments.len(),
+                    )
+                    .is_some()
+                {
+                    continue;
+                }
+                let bounds: Vec<TypeId> = match &subject_type {
+                    // Stage 1. Keyed on the ENTITY, not on the type it produced,
+                    // for the reason the value-position refusal is: `Self` and a
+                    // generic defaulted to a trait resolve to the same
+                    // `Type::Trait` and are neither of them this spelling.
+                    Type::Trait(trait_id, _) => {
+                        let declared_arguments = match declared_type {
+                            Some(Type::Trait(_, declared_arguments)) => declared_arguments,
+                            _ => Vec::new(),
+                        };
+                        let arguments = match arguments.is_empty() {
+                            true => declared_arguments,
+                            false => arguments.clone(),
+                        };
+                        let bound = self.type_id_for_type(Type::Trait(*trait_id, arguments));
+                        if let Some(trait_) = self.traits.get(trait_id) {
+                            let name = trait_.name;
+                            self.generic_constraint_names.insert(bound, name);
+                        }
+                        vec![bound]
+                    }
+                    // Stage 2 — the virality, which is the price §R2.2 named and
+                    // is invisible exactly as intended. The held struct's hidden
+                    // parameters are not shared: this struct mints its own, one
+                    // per, carrying the same bound.
+                    Type::Struct(held_id, _) if arguments.is_empty() && *held_id != *struct_id => {
+                        let held: Vec<TypeId> = self
+                            .hidden_generic_parameters
+                            .get(held_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        if held.is_empty() {
+                            continue;
+                        }
+                        held.into_iter()
+                            .map(|held_constraint_id| {
+                                let bound = held_constraint_id.get_type(self);
+                                let name = self
+                                    .generic_constraint_names
+                                    .get(&held_constraint_id)
+                                    .copied();
+                                let minted = self.type_id_for_type(bound);
+                                if let Some(name) = name {
+                                    self.generic_constraint_names.insert(minted, name);
+                                }
+                                minted
+                            })
+                            .collect()
+                    }
+                    _ => continue,
+                };
+                let mut minted = Vec::new();
+                for bound in bounds {
+                    self.implicit_generic_scopes.insert(bound, *body_scope_id);
+                    if let Some(struct_) = self.structs.get_mut(struct_id) {
+                        struct_.generic_parameter_constraint_ids.push(bound);
+                    }
+                    self.hidden_generic_parameters
+                        .entry(*struct_id)
+                        .or_default()
+                        .push(bound);
+                    minted.push(bound);
+                }
+                // Stage 1's field IS the parameter; stage 2's field is the held
+                // struct APPLIED to the parameters this struct just minted.
+                let field_type = match &subject_type {
+                    Type::Struct(held_id, _) => {
+                        // As at a mention: the held struct's arguments are
+                        // TYPES over this struct's new parameters, not the
+                        // parameters themselves.
+                        let arguments = minted
+                            .iter()
+                            .map(|constraint_id| {
+                                self.type_id_for_type(Type::Generic(*constraint_id))
+                            })
+                            .collect();
+                        Type::Struct(*held_id, arguments)
+                    }
+                    _ => Type::Generic(minted[0]),
+                };
+                self.hidden_annotation_types.insert(*type_id, field_type);
+                changed = true;
+            }
+            rounds += 1;
+            if !changed || rounds > field_annotations.len() {
+                break;
+            }
+        }
     }
 
     /// Whether `scope_id` is `ancestor_scope_id` or lies inside it — the
@@ -23023,7 +23368,8 @@ impl<'src> Analyzer<'src> {
             // the generated items; the annotated item itself walks normally.
             Node::MacroAttribute(name, name_span, _, inner) => {
                 self.record_macro_reference(name, *name_span, scope_id);
-                self.walk_expr_node(inner, scope_id);
+                let declaration_id = self.walk_expr_node(inner, scope_id);
+                self.attributed_declarations.insert(declaration_id);
                 Some(Expr::Void)
             }
             // A macro invocation: item-position ones already appended their
@@ -23117,6 +23463,7 @@ impl<'src> Analyzer<'src> {
                 // type to test it for resource-ness). `walk_expr_node` returns
                 // the struct/enum entity id.
                 let declaration_id = self.walk_expr_node(inner, scope_id);
+                self.attributed_declarations.insert(declaration_id);
                 // A `Wire`/`Json` derive REFUSED for a resource subject (B117)
                 // records nothing: the name must not enter `wire_names` (Wire's
                 // case — a refused `resource struct Conn` would still satisfy
@@ -23149,7 +23496,8 @@ impl<'src> Analyzer<'src> {
             // struct; the generated dispatcher/client are appended separately
             // (`service_impl_source`).
             Node::Service(_client_name, inner) => {
-                self.walk_expr_node(inner, scope_id);
+                let declaration_id = self.walk_expr_node(inner, scope_id);
+                self.attributed_declarations.insert(declaration_id);
                 None
             }
             // `!` yields `bool`; `-` yields its operand's type. Both hold their
@@ -24075,9 +24423,21 @@ impl<'src> Analyzer<'src> {
                         self.async_fields.insert((id, fields.len()));
                         field_type_node = Some(inner);
                     }
-                    let type_id = field_type_node
-                        .map(|x| self.walk_type_node(x, body_scope_id))
-                        .unwrap_or(Type::Unknown.get_type_id(self));
+                    let type_id = match field_type_node {
+                        Some(node) => {
+                            let type_id = self.walk_type_node(node, body_scope_id);
+                            // B184: the third value position where a trait is a
+                            // reading rather than an error. Recorded by type id
+                            // because the name has not resolved yet — whether
+                            // the annotation names a trait is the pre-pass's to
+                            // discover, exactly as B161's `let` and B186's
+                            // parameter are the drain's.
+                            self.field_annotation_type_ids
+                                .insert(type_id, (id, body_scope_id));
+                            type_id
+                        }
+                        None => Type::Unknown.get_type_id(self),
+                    };
                     // An `[expose]`d field's type must implement `std::Source`
                     // over a Wire element — recorded now with the type it walked
                     // to, checked once every module's Wire names and impls are
@@ -24314,6 +24674,12 @@ impl<'src> Analyzer<'src> {
                 // and `impl Iterator<type T> with Iterable<T>` blanket over a
                 // bound, which is how std writes "every iterator also iterates".
                 let subject_type_id = self.walk_trait_position_type_node(subject, body_scope_id);
+                // B184: the fourth position that can ground a hidden parameter,
+                // and the one that makes a sugared struct usable at all — a
+                // struct with methods. The impl owns the mint, so `Self` is
+                // `C<S>` for a parameter the impl is generic over.
+                self.impl_subject_annotation_type_ids
+                    .insert(subject_type_id, (id, body_scope_id));
                 // Within an `impl`, `Self` refers to the subject type.
                 self.register_self_type(body_scope_id, subject_type_id);
                 // Record the subject's generic arguments (the `<...>` on the head)
@@ -30751,6 +31117,7 @@ impl<'src> Analyzer<'src> {
         &self,
         trait_id: Id,
         scope_id: Id,
+        attributed_field: bool,
     ) -> (String, Option<crate::error::Note>) {
         let trait_ = self.traits.get(&trait_id);
         let trait_name = trait_.map(|trait_| trait_.name).unwrap_or("this trait");
@@ -30759,18 +31126,36 @@ impl<'src> Analyzer<'src> {
             msg: format!("'{trait_name}' is declared here, as a trait"),
             source: self.source_of_id(trait_.id),
         });
-        // The steer names the two positions that DO take the spelling — a
-        // parameter (B186's implicit generic) and a binding (B161's checked
-        // constraint) — because a reader who wrote a trait here almost always
-        // meant one of them, and the old text's `<T: Trait>` recipe is now the
-        // answer only for a field or a return.
+        // The steer names the three positions that DO take the spelling — a
+        // parameter (B186's implicit generic), a binding (B161's checked
+        // constraint) and now a struct field (B184's hidden parameter) —
+        // because a reader who wrote a trait here almost always meant one of
+        // them, and the `<T: Trait>` recipe is what is left for a RETURN, the
+        // one value position with no binding source to ground a parameter from.
+        //
+        // The field clause is dropped where a field is NOT one of them: on a
+        // declaration carrying an attribute, where B184's hidden parameter is
+        // refused because a generator cannot spell it. Steering an author into
+        // a second refusal is the failure mode B188's arity message was
+        // rewritten to avoid (audit run 7, F4).
+        let field_clause = match attributed_field {
+            true => String::new(),
+            false => format!(" or `struct S {{ f: {trait_name} }}` for a field"),
+        };
         let mut message = format!(
             "'{trait_name}' is a trait, not a type: a trait is not a value type (vilan has \
              no trait objects), so no value can have this type. Here a trait names a \
              parameter's bound, not a value type; write `fun f(x: {trait_name})` for a \
-             parameter, or a generic for a field/return — `<T: {trait_name}>`, with 'T' \
-             written here."
+             parameter{field_clause}, or a generic for a return — `<T: {trait_name}>`, with \
+             'T' written here."
         );
+        if attributed_field {
+            message.push_str(
+                " A field MAY name a trait, but not on a declaration carrying an attribute: \
+                 `[derive]` and `[service]` write code from the types the author wrote, and a \
+                 trait-typed field's type parameter is not written anywhere.",
+            );
+        }
         // `Self` in scope, resolving to this very trait, means the annotation
         // sits inside the trait's own declaration. The lookup is by the type
         // map directly rather than `get_type`, which panics on an id that has
@@ -30787,6 +31172,51 @@ impl<'src> Analyzer<'src> {
             ));
         }
         (message, note)
+    }
+
+    /// B184's refusal: a struct carrying a HIDDEN type parameter, written where
+    /// nothing can ground one.
+    ///
+    /// The hidden parameter is the sugar's whole mechanism — `struct C { x: X }`
+    /// is `struct C<#0: X> { x: #0 }` — and like a written parameter it needs an
+    /// argument. What the author never has to write is that argument, because
+    /// every position that holds a VALUE supplies it: a literal binds it, a
+    /// `fun` parameter takes it from the call, a field takes it from the struct
+    /// around it. A return type, a module-level type argument and a nested
+    /// spelling have no value in them, so there is nothing to take it from, and
+    /// the honest report says which positions do (§R3, case 4's consequences).
+    ///
+    /// It names the FIELD that made the struct generic, because a reader who
+    /// meets this at `fun get(): C` has no other way to know `C` is not the
+    /// plain nominal it looks like.
+    fn hidden_parameter_has_nothing_to_ground_it(&self, name: &str, struct_id: Id) -> String {
+        let bound = self
+            .hidden_generic_parameters
+            .get(&struct_id)
+            .and_then(|hidden| hidden.first())
+            .and_then(|first| self.generic_constraint_names.get(first).copied());
+        let field = self
+            .structs
+            .get(&struct_id)
+            .and_then(|struct_| {
+                let field = struct_
+                    .fields
+                    .iter()
+                    .find(|field| self.hidden_annotation_types.contains_key(&field.type_id))?;
+                Some((field.name, bound?))
+            })
+            .map(|(field, bound)| {
+                format!("has a field, `{field}`, annotated with the trait `{bound}`, so it ")
+            })
+            .unwrap_or_else(|| "has a trait-typed field, so it ".to_string());
+        format!(
+            "`{name}` {field}carries a hidden type parameter — \
+             and nothing here can supply one. A hidden parameter is grounded by a VALUE: a \
+             literal (`let c = {name} {{ … }}`), a `fun` parameter (`fun f(c: {name})`), or \
+             another struct's field (`struct Outer {{ c: {name} }}`). Write the field's \
+             implementation on the declaration, or make `{name}` generic over it \
+             (`struct {name}<S: …> {{ … }}`) and supply the argument here."
+        )
     }
 
     /// The "not callable" message for a call subject that isn't one.
@@ -36323,6 +36753,11 @@ impl<'src> Analyzer<'src> {
             self.wire_prepped_assignment(target_id, value_id);
         }
 
+        // B184: every struct's hidden parameters, decided before the first
+        // mention resolves — see `resolve_hidden_struct_parameters` for why it
+        // cannot ride along in the drain below.
+        self.resolve_hidden_struct_parameters();
+
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
             std::mem::take(&mut self.prepped_type_locals)
         {
@@ -36385,7 +36820,13 @@ impl<'src> Analyzer<'src> {
                     // With the generators generic-aware, exempting them would
                     // only hide the next generator that forgets.
                     let is_path_head = self.path_head_type_ids.contains(&type_id);
-                    let arity_error = match is_path_head {
+                    // B184: a FIELD annotation the pre-pass already decided —
+                    // the trait it named became this struct's hidden parameter,
+                    // or the struct it named lent this one its own. Nothing
+                    // below re-reads it: it is neither an application (no
+                    // arguments were written) nor a value-position mistake.
+                    let hidden_field_type = self.hidden_annotation_types.get(&type_id).cloned();
+                    let arity_error = match is_path_head || hidden_field_type.is_some() {
                         true => None,
                         false => self.written_application_arity_error(
                             subject_id,
@@ -36437,6 +36878,7 @@ impl<'src> Analyzer<'src> {
                     // Attach the written generic arguments to the nominal type
                     // (`Option<i32>` -> `Enum(option_id, [i32])`). A bare name
                     // keeps whatever the reference resolved to.
+                    let no_written_arguments = argument_type_ids.is_empty();
                     let subject_type = match (subject_type, argument_type_ids.is_empty()) {
                         (Type::Enum(id, _), false) => Type::Enum(id, argument_type_ids),
                         (Type::Struct(id, _), false) => Type::Struct(id, argument_type_ids),
@@ -36445,6 +36887,135 @@ impl<'src> Analyzer<'src> {
                         (Type::Trait(id, _), false) => Type::Trait(id, argument_type_ids),
                         (other, _) => other,
                     };
+                    // B184: a bare MENTION of a struct that carries hidden
+                    // parameters. `C` is really `C<impl X>`, so the mention
+                    // mints one fresh implicit generic per hidden parameter,
+                    // bound where the mention is grounded — the same
+                    // per-annotation mint B186 makes for `fun f(x: Trait)`, one
+                    // level out. A PARAMETER is the position that can ground
+                    // one: the call binds it, exactly as it binds a written
+                    // `<S: X>`. Every other position refuses, and refuses HERE,
+                    // at the annotation, rather than erasing the parameter and
+                    // failing somewhere downstream (B188's lesson).
+                    let mut hidden_mention_type = None;
+                    let hidden_mention = match (
+                        &subject_type,
+                        self.expr_id_to_expr_map.get(&subject_id),
+                        hidden_field_type.is_none() && !is_path_head && !refused_arity,
+                    ) {
+                        (Type::Struct(id, carried), Some(Expr::Struct(_)), true) => self
+                            .hidden_generic_parameters
+                            .get(id)
+                            .filter(|hidden| !hidden.is_empty())
+                            .map(|hidden| (*id, carried.clone(), hidden.clone())),
+                        _ => None,
+                    };
+                    if let Some((struct_id, carried, hidden)) = hidden_mention {
+                        // The WRITTEN arguments keep their positions and the
+                        // hidden ones are appended, for the reason B186 appends
+                        // its parameter: a written argument list is positional,
+                        // so a parameter minted before them would steal one.
+                        // With none written the declaration's own carried
+                        // arguments stand in — which is how a DEFAULTED
+                        // parameter (`<S = i32>`) supplies itself — truncated to
+                        // the arity the author may write, so the hidden tail is
+                        // never counted twice.
+                        let written_arity = self
+                            .declared_generic_parameters
+                            .get(&struct_id)
+                            .map(|declared| declared.len())
+                            .unwrap_or_default();
+                        let mut arguments: Vec<TypeId> = match no_written_arguments {
+                            true => carried.into_iter().take(written_arity).collect(),
+                            false => carried,
+                        };
+                        // A BINDING's annotation grounds nothing — the
+                        // initializer does — so it reads as B161's constraint
+                        // rather than as a mint: resolve it to `Unknown`, let
+                        // the binding take the concrete type its initializer
+                        // gave it, and check afterwards that the type really is
+                        // one of this struct's.
+                        let binding_id = self.binding_annotation_type_ids.get(&type_id).copied();
+                        let owner = match binding_id {
+                            Some(variable_id) => {
+                                self.binding_hidden_nominal_constraints.push((
+                                    variable_id,
+                                    struct_id,
+                                    arguments.clone(),
+                                    span,
+                                ));
+                                hidden_mention_type = Some(Type::Unknown);
+                                None
+                            }
+                            None => self
+                                .parameter_annotation_type_ids
+                                .get(&type_id)
+                                .or_else(|| self.impl_subject_annotation_type_ids.get(&type_id))
+                                .copied(),
+                        };
+                        match (owner, binding_id) {
+                            (_, Some(_)) => {}
+                            (Some((owner_id, owner_scope_id)), None) => {
+                                // The hidden parameter's BOUND may mention the
+                                // struct's own written parameters
+                                // (`struct Holder<T> { list: Signal<List<T>> }`),
+                                // and at a mention those stand for the
+                                // arguments written HERE. Substituting them is
+                                // what the author does by hand when they write
+                                // the parameter out — `fun read<T, S: Signal<List<T>>>`
+                                // restates the bound in the caller's terms.
+                                let context = Self::instantiation_context(
+                                    &self.declared_parameter_constraint_ids(struct_id),
+                                    &arguments,
+                                );
+                                let mut minted = Vec::new();
+                                for hidden_id in hidden {
+                                    let bound = hidden_id.get_type(self);
+                                    let bound = self.substitute_type(&bound, &context);
+                                    let constraint_id = match bound {
+                                        Type::Trait(trait_id, arguments) => self
+                                            .mint_implicit_generic(
+                                                trait_id,
+                                                arguments,
+                                                owner_id,
+                                                owner_scope_id,
+                                            ),
+                                        _ => hidden_id,
+                                    };
+                                    // The ARGUMENT is a type, not a constraint:
+                                    // `Type::Generic(constraint_id)`, the same
+                                    // shape a written parameter's name resolves
+                                    // to (`register_generic_parameter`). Handing
+                                    // the constraint id over directly types the
+                                    // field as the BOUND — a bare trait, which
+                                    // is the one thing no value may have.
+                                    minted
+                                        .push(self.type_id_for_type(Type::Generic(constraint_id)));
+                                }
+                                arguments.extend(minted);
+                                hidden_mention_type = Some(Type::Struct(struct_id, arguments));
+                            }
+                            (None, None) => {
+                                let message =
+                                    self.hidden_parameter_has_nothing_to_ground_it(name, struct_id);
+                                self.push_at_written_type(
+                                    Error {
+                                        trace: Vec::new(),
+                                        note: None,
+                                        span,
+                                        msg: message,
+                                    },
+                                    source_id,
+                                    type_id,
+                                );
+                                // B182's provenance: everything downstream reads
+                                // `Unknown` here, and this report accounts for it.
+                                self.refused_annotation_slots
+                                    .insert(type_id, (source_id, span));
+                                hidden_mention_type = Some(Type::Unknown);
+                            }
+                        }
+                    }
                     // Record the reference for the language server: the type name
                     // span, the definition it points at, and a hover label. A
                     // generic resolves to its binder entity (`subject_id`), which
@@ -36509,6 +37080,7 @@ impl<'src> Analyzer<'src> {
                             // one report per written spelling (B188).
                             if names_the_trait
                                 && !refused_arity
+                                && hidden_field_type.is_none()
                                 && !self.trait_position_type_ids.contains(&type_id) =>
                         {
                             Some((*trait_id, arguments.clone()))
@@ -36561,8 +37133,20 @@ impl<'src> Analyzer<'src> {
                                 owner_scope_id,
                             ));
                         } else {
-                            let (message, note) =
-                                self.bare_trait_in_value_position(*trait_id, scope_id);
+                            // B184: whether a FIELD is one of the positions
+                            // this steer may name depends on the declaration —
+                            // an attributed one keeps the refusal.
+                            let attributed_field = self
+                                .field_annotation_type_ids
+                                .get(&type_id)
+                                .is_some_and(|(struct_id, _)| {
+                                    self.attributed_declarations.contains(struct_id)
+                                });
+                            let (message, note) = self.bare_trait_in_value_position(
+                                *trait_id,
+                                scope_id,
+                                attributed_field,
+                            );
                             // Attributed to the walk that wrote the
                             // annotation, for the reason the unresolved arm
                             // below is (E108) — this is the same drain, and
@@ -36608,13 +37192,24 @@ impl<'src> Analyzer<'src> {
                     // type IS that generic, which is the whole desugaring. The
                     // write goes through `write_type_slot`, which owns the
                     // solver's progress accounting (E43).
+                    //
+                    // A FIELD's annotation resolves to what B184's pre-pass
+                    // decided — the struct's own hidden parameter, or the held
+                    // struct applied to it — and a bare mention of such a struct
+                    // to the mint above. Both are the same desugaring one level
+                    // apart, and both are written here so the one arm that owns
+                    // an annotation's slot keeps owning it.
                     self.write_type_slot(
                         type_id,
-                        match (&bare_trait_id, implicit_generic_id) {
-                            (Some(_), Some(constraint_id)) => Type::Generic(constraint_id),
-                            (Some(_), None) => Type::Unknown,
-                            (None, _) if refused_arity => Type::Unknown,
-                            (None, _) => subject_type,
+                        match (hidden_field_type, hidden_mention_type) {
+                            (Some(field_type), _) => field_type,
+                            (None, Some(mention_type)) => mention_type,
+                            (None, None) => match (&bare_trait_id, implicit_generic_id) {
+                                (Some(_), Some(constraint_id)) => Type::Generic(constraint_id),
+                                (Some(_), None) => Type::Unknown,
+                                (None, _) if refused_arity => Type::Unknown,
+                                (None, _) => subject_type,
+                            },
                         },
                     );
                 }
@@ -47467,6 +48062,7 @@ fn analyze_over_world<'src>(
         // B161's binding-position twin of the bound check above, in the same place
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
+        analyzer.check_binding_hidden_nominal_constraints();
         analyzer.check_tuple_spreads();
     }
     unless_cancelled! {

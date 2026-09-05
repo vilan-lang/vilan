@@ -461,7 +461,7 @@ may carry defaults
 value ever has a trait as its type.
 
 That rule is enforced **at the annotation**, in every value position — a
-return type, a field, a generic argument (`List<Display>`) — and reported
+return type, a generic argument (`List<Display>`) — and reported
 where the trait's name is written, whether or not the
 declaration is ever used. A trait's name stays legal in the positions
 that name a bound or a namespace rather than a value's type: a generic
@@ -474,10 +474,10 @@ unaffected.
 
 ### A trait annotation on a binding
 
-A `let` binding's annotation is one of two exceptions — the other is a
-parameter's, below — and neither is an exception to the rule above but an
-application of it: a trait written here is a **checked constraint**, not
-the binding's type.
+A `let` binding's annotation is one of three exceptions — the others are a
+parameter's and a struct field's, below — and none is an exception to the
+rule above but an application of it: a trait written here is a **checked
+constraint**, not the binding's type.
 
 ```
 let count: Signal<i32> = SignalCell::new(1);
@@ -511,7 +511,7 @@ let cell: Signal<i32> = if c { SignalCell::new(1) } else { OtherSignal::new(2) }
 
 ### A trait annotation on a parameter
 
-A parameter's annotation is the other position that takes a trait name,
+A parameter's annotation is the second position that takes a trait name,
 and it means something different from a binding's: an **implicit generic
 parameter**.
 
@@ -544,6 +544,62 @@ parameter's OWN annotation, never to a trait nested inside one
 is a call convention, erased before the annotation is read — so
 `&Display` is "a view of something implementing `Display`" at a parameter
 and at a binding alike.
+
+### A trait annotation on a struct field
+
+A struct field's annotation is the third position, and it is the
+parameter's reading moved onto the struct: a trait written here is a
+**hidden type parameter** of the struct, bounded by that trait.
+
+```
+struct Store { count: Signal<i32> }   // == struct Store<S: Signal<i32>> { count: S }
+```
+
+One hidden parameter per such field, appended after every parameter the
+declaration writes. The author never writes it and never writes an
+argument for it: `Store` is really `Store<impl Signal<i32>>`, and the
+argument comes from a **value**.
+
+- A struct **literal** grounds it, exactly as it grounds a written
+  parameter: `Store { count = SignalCell::new(1) }` is a `Store<SignalCell<i32>>`,
+  and reading `.count`'s members reaches `SignalCell`'s own.
+- Two literals may ground it differently. `let a = Store { count = SignalCell::new(1) }`
+  and `let b = Store { count = OtherCell::new(2) }` in one scope are two
+  types, both legal — the same per-binding answer a `let` annotation and a
+  parameter annotation already give. Reassigning one to the other is the
+  ordinary mismatch it would be for any two types, and the report names the
+  hidden argument: `Expected Store<SignalCell<i32>>, but got
+  Store<OtherCell<i32>> instead.`
+- A **parameter** whose annotation is such a struct mints a fresh implicit
+  generic for it, so `fun read(s: Store): i32` is generic and accepts both
+  of the values above. Two mentions in one signature are two independent
+  hidden arguments, as two trait-typed parameters are.
+- A **field of another struct** makes that struct hidden-generic in turn:
+  `struct Outer { store: Store }` is `struct Outer<S: Signal<i32>> { store: Store<S> }`.
+  The genericity is viral in exactly the way a written parameter's is.
+- An **`impl` subject** grounds it the way `impl Store<type S>` would:
+  `impl Store { … }` is generic over the hidden parameter, and `Self` is
+  `Store<S>`.
+- A **binding's** annotation grounds nothing, so it reads as a binding
+  annotation always does — a constraint on the initializer's own type.
+  `let s: Store = Store { count = … }` keeps `Store<SignalCell<i32>>`.
+
+Every other position is refused **at the annotation**, because it holds no
+value to take the argument from: a return type (`fun get(): Store`), a
+type argument (`Context<Store>`), and any nested spelling. Writing the
+argument is refused too — the hidden parameter is not part of the written
+arity, so `Store<SignalCell<i32>>` is over-supply; a declaration that wants
+to be named with its argument writes the parameter instead.
+
+The reading is the parameter's in one further respect: it applies to the
+field's OWN annotation, never to a trait nested inside one
+(`List<Display>`).
+
+**Not on an attributed declaration.** A `[derive(..)]`, `[service(..)]` or
+user macro attribute generates code from the types the declaration
+**wrote**, and a hidden parameter is written nowhere, so a field of such a
+declaration keeps the refusal and its steer says so. Name the
+implementation there, or write the parameter.
 
 ### Associated functions
 
