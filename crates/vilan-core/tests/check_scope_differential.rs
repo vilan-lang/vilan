@@ -19,9 +19,7 @@ mod replay_harness;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use replay_harness::{
-    module_entry, observe_in_package, std_root, std_spec, warm_pair, write_module_package,
-};
+use replay_harness::{std_root, std_spec};
 use vilan_core::{BuildOptions, Platform, Workspace, analyze_source, transform};
 
 static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
