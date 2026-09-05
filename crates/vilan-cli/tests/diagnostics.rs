@@ -1338,3 +1338,72 @@ fn a_too_many_arguments_std_method_call_still_reports_in_the_callers_file() {
         "and reports where the call is written: {stderr}"
     );
 }
+
+#[test]
+fn checking_a_module_file_a_sibling_imports_is_clean() {
+    // B239, end to end: `vilan check src/views.vl` analyzes the named file AS
+    // the entry, because a file is all it was given — and `views.vl` is one of
+    // the package's MODULES, which `channel.vl` imports back. B226's refusal
+    // (correct for a declared entry, which is the program and not a module) fired
+    // there too, and everything `channel` took from `views` missed after it: the
+    // owner saw seven errors in the editor over a package `vilan check .`
+    // compiled clean.
+    //
+    // Both verdicts are asserted, in one fixture, because the whole complaint
+    // was that they disagreed.
+    let dir = temp_files(
+        "open_module_file",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                 [entry.client]\n\n[entry.server]\n",
+            ),
+            (
+                "src/views.vl",
+                "import pkg::channel::render;\n\n\
+                 [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 struct Style { padding: i32 }\n\n\
+                 impl Style {\n\tfun flex_row(self): Style {\n\t\t\
+                 Style { padding = self.padding + 1 }\n\t}\n}\n\n\
+                 fun button_style(): Style { Style { padding = 1 } }\n\n\
+                 fun icon(name: str): str { name }\n\n\
+                 fun shown(): bool { Tab::Messages == Tab::Other }\n\n\
+                 fun total(): i32 { render() }\n",
+            ),
+            (
+                "src/channel.vl",
+                "import pkg::views::{ Style, button_style, icon };\n\n\
+                 fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
+                 let label = icon(\"x\");\n\tbase.padding\n}\n",
+            ),
+            (
+                "src/client.vl",
+                "import std::io::print;\nimport pkg::views::{ shown, total };\n\n\
+                 fun main() {\n\tprint(i\"{shown()} {total()}\");\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ],
+    );
+    let file = vilan(&dir, &["check", "src/views.vl"], true);
+    let file_stderr = String::from_utf8_lossy(&file.stderr).into_owned();
+    let package = vilan(&dir, &["check", "."], true);
+    let package_stderr = String::from_utf8_lossy(&package.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        package.status.success() && error_headers(&package_stderr).is_empty(),
+        "the package itself compiles: {package_stderr}"
+    );
+    assert!(
+        file.status.success(),
+        "and so does the module the editor opens: {file_stderr}"
+    );
+    assert!(
+        error_headers(&file_stderr).is_empty(),
+        "with no refusal of the sibling's import: {file_stderr}"
+    );
+}

@@ -481,16 +481,15 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
             mut unit,
             platform: package_platform,
             shared_platforms,
-            module_file,
             ..
         } => match effective_platform(platform.as_deref(), package_platform) {
             // A `none` package is a pure library — not buildable, but type-checkable
             // (against the base layer only).
             Ok(first) => {
-                let goal = if module_file {
-                    CompileGoal::CheckModule
-                } else {
+                let goal = if unit.entry_declared {
                     CompileGoal::Check
+                } else {
+                    CompileGoal::CheckModule
                 };
                 let mut platforms = vec![first];
                 if platform.is_none() {
@@ -2359,6 +2358,18 @@ struct Unit {
     /// which the manifest already says out loud. Empty means "nothing to
     /// explain", and the diagnostic then names the overlay alone.
     platform_reasons: Vec<(Platform, String)>,
+    /// Whether this unit's `entry` is a program the package DECLARES — a
+    /// package leg, the single `[package] entry`, a bare file — rather than one
+    /// of the package's MODULES addressed by path (E113's `is_package_module`).
+    ///
+    /// Two things read it, and they used to be one: `check` skips the `main`
+    /// demand and the emission walk for a module (E113), and the analysis is
+    /// told which kind of entry it has been handed, so a sibling that imports
+    /// the module can still import it (B239, `EntryMode`). It rides on the unit
+    /// beside `platform_reasons` because it is the same kind of fact — what the
+    /// manifest says about the file the caller named — and because every
+    /// compile of the unit needs it, not only `check`'s.
+    entry_declared: bool,
 }
 
 /// The `[build] run` hooks of the addressed manifest (A9): external commands —
@@ -3174,10 +3185,6 @@ enum Project {
         /// including a build, which writes one artifact and so uses `platform`
         /// alone.
         shared_platforms: Vec<Platform>,
-        /// The addressed file is a MODULE of its package rather than one of its
-        /// program entries — only file mode can produce it, and only `check`
-        /// reads it (a module has no `main` to lack, E113).
-        module_file: bool,
         /// The `[build] run` hooks to run before building it (A9).
         hooks: BuildHooks,
     },
@@ -3307,11 +3314,11 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             // No project to colour it: the CLI's `node` default answers, and
             // there is nothing about the file's own situation to explain.
             platform_reasons: Vec::new(),
+            // A file with no `[package]` above it IS the program it names.
+            entry_declared: true,
         },
         platform: None,
         shared_platforms: Vec::new(),
-        // A file with no `[package]` above it IS the program it names.
-        module_file: false,
         hooks: BuildHooks::default(),
     };
     let Some((directory, manifest)) = owning_package(&entry)? else {
@@ -3345,7 +3352,7 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
     let mut platforms = choices.into_iter().map(|choice| choice.platform);
     let platform = platforms.next();
     let shared_platforms: Vec<Platform> = platforms.collect();
-    let module_file = is_package_module(&pkg_root, &manifest, &entry);
+    let entry_declared = !is_package_module(&pkg_root, &manifest, &entry);
     Ok(Project::Single {
         unit: Unit {
             name: String::new(),
@@ -3355,10 +3362,10 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             split: false,
             options,
             platform_reasons,
+            entry_declared,
         },
         platform,
         shared_platforms,
-        module_file,
         hooks: BuildHooks::default(),
     })
 }
@@ -3368,28 +3375,13 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
 /// `main.vl`, or an `[entry.<name>]` path). A module has no `main`, and nothing
 /// should ask it for one (E113).
 ///
-/// A file OUTSIDE the source root is not the package's module — it is a program
-/// that happens to sit in the directory, and it keeps the demand it always had.
-///
-/// Compared canonically on both sides, never textually: `./src/main.vl` and
-/// `src/main.vl` name one file and must get one answer, and — the symlink
-/// doctrine, `spec/const.md` §9.2 — so must a file reached through a link.
+/// The rule itself lives in `vilan_core::platform_color` beside
+/// `file_platform_choices`, because the language server asks the same question
+/// about the same file and the two surfaces must not answer it twice (B239 —
+/// the editor reads it to say whether the analyzed entry is a declared program
+/// or one of the package's modules opened as one).
 fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> bool {
-    let Some(package) = manifest.package.as_ref() else {
-        return false;
-    };
-    let file = vilan_core::util::canonical_path(file);
-    if !file.starts_with(vilan_core::util::canonical_path(pkg_root)) {
-        return false;
-    }
-    let same = |candidate: PathBuf| vilan_core::util::canonical_path(candidate) == file;
-    if manifest.entries.is_empty() {
-        return !same(pkg_root.join(package.entry()));
-    }
-    !manifest
-        .entries
-        .iter()
-        .any(|(name, declared)| same(pkg_root.join(declared.path(name))))
+    vilan_core::platform_color::is_package_module(pkg_root, manifest, file)
 }
 
 /// Reads, parses, validates, and reports warnings for the `vilan.toml` in
@@ -3493,6 +3485,8 @@ fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions)
         // A package leg is compiled under its own declared `target`, which the
         // manifest says out loud — nothing for E119 to explain.
         platform_reasons: Vec::new(),
+        // The `[package] entry` itself: the program the manifest declares.
+        entry_declared: true,
     }
 }
 
@@ -3527,6 +3521,8 @@ fn package_units(
                     // As above: this leg's `[entry.<name>] target` IS the
                     // explanation, and the author wrote it.
                     platform_reasons: Vec::new(),
+                    // An `[entry.<name>]` path: declared, by name.
+                    entry_declared: true,
                 },
                 entry.resolved_target().unwrap_or_default(),
             )
@@ -3701,10 +3697,10 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
     Ok(Project::Single {
         unit: unit_from_package(directory, package, options),
         platform: package.resolved_target(),
-        // A package addressed as a DIRECTORY builds its own entry: one leg, one
-        // color, and an entry it is. Both are file-mode questions (E113).
+        // A package addressed as a DIRECTORY builds its own entry: one leg and
+        // one color — a file-mode question (E113), and it has no file to ask
+        // about.
         shared_platforms: Vec::new(),
-        module_file: false,
         hooks: BuildHooks::from_manifest(directory, &manifest),
     })
 }
@@ -3843,6 +3839,15 @@ fn compile_unit(
         .iter()
         .find(|(colored, _)| *colored == platform)
         .map(|(_, reason)| reason.clone());
+    // B239: whether the file this compile was pointed at is a program the
+    // package declares, or one of its modules addressed by path. Threaded on
+    // the same context and for the same reason as the line above — a fact about
+    // THIS compile that only the front end, which read the manifest, can know.
+    workspace.entry_mode = if unit.entry_declared {
+        vilan_core::EntryMode::Declared
+    } else {
+        vilan_core::EntryMode::OpenFile
+    };
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.
@@ -6853,6 +6858,7 @@ mod tests {
                 split: false,
                 options: BuildOptions::default(),
                 platform_reasons: Vec::new(),
+                entry_declared: true,
             },
             platform,
         )
