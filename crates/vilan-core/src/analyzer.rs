@@ -8771,36 +8771,38 @@ impl<'src> Analyzer<'src> {
     /// memoizes; the scan then runs against the returned (owned) set as `&self`.
     /// Every binding — variable or parameter — whose type is a resource.
     ///
-    /// **M38: the pre-filter.** `type_is_resource` is a per-instantiation
-    /// question answered by recursing through substituted fields, and asking it
-    /// of every variable and every parameter in a loaded world was ~100 ms on
-    /// kolt's browser entry — a program that owns no resource at all, but
-    /// imports std modules that declare several, so `declares_a_resource()`
-    /// cannot skip it. M28's `resource_reaching_nominals` / `type_reaches_
-    /// resource` pair answers the CHEAP over-approximation ("can any
-    /// instantiation of this nominal be a resource") off the declared shapes
-    /// and the instantiation's own arguments, with no field recursion and no
-    /// substitution, and M28's soundness claim is stated where the predicate
-    /// is: `type_is_resource(T)` implies `type_reaches_resource(T)`. So a type
-    /// the filter rejects cannot be a resource, and the set this returns is
-    /// answer-identical to the unfiltered sweep.
+    /// **M38, and what MEASURING it decided.** The item asked for a
+    /// per-nominal "can any instantiation of this be a resource" pre-filter
+    /// (M28's `resource_reaching_nominals` / `type_reaches_resource`) ahead of
+    /// the field recursion, on the reading that `type_is_resource` over every
+    /// variable and parameter was ~100 ms on kolt's browser entry. It was
+    /// built, it is answer-identical (M28 proves `type_is_resource(T)` implies
+    /// `type_reaches_resource(T)`), and it was measured: **+2,312,262
+    /// instructions on `vilan check src/client.vl` over the full kolt copy —
+    /// a LOSS, not a win.** It could not be otherwise on a program that
+    /// declares a resource: the filter substitutes one recursive walk over the
+    /// distinct `TypeId`s (`classify_resource`) for another over the same ones
+    /// (`type_mentions_nominal`), and `resource_classification` — the
+    /// analyzer's persistent memo — had already made the first cost once per
+    /// distinct type rather than once per binding. The filter is a wash by
+    /// construction, and pays for the nominals closure on top. It is not here.
+    ///
+    /// **What IS here is the gate the filter was carrying.** A world where
+    /// nothing is declared `resource` has no resource type at all —
+    /// containment bottoms out at a declared leaf — so no binding can be one
+    /// and both sweeps below can be skipped outright. `check_resource_moves`
+    /// tested that only AFTER them, by finding the result empty: two whole-map
+    /// walks and a `type_is_resource` call per binding, on every corpus
+    /// program that owns no resource, for an answer two `.any()` scans give.
     fn collect_resource_bindings(&mut self) -> HashSet<Id> {
         let mut bindings = HashSet::default();
-        // Empty exactly when nothing in the loaded world is declared
-        // `resource` — the whole-program gate, arrived at for free.
-        let nominals = self.resource_reaching_nominals();
-        if nominals.is_empty() {
+        if !self.declares_a_resource() {
             return bindings;
         }
-        // One reach memo across both sweeps: a parameter and a local of the
-        // same type are one question.
-        let mut reaches: HashMap<TypeId, bool> = HashMap::default();
         let variables: Vec<(Id, TypeId)> =
             self.variables.values().map(|v| (v.id, v.type_id)).collect();
         for (id, type_id) in variables {
-            if self.type_reaches_resource(type_id, &nominals, &mut reaches)
-                && self.type_is_resource(type_id)
-            {
+            if self.type_is_resource(type_id) {
                 bindings.insert(id);
             }
         }
@@ -8810,9 +8812,7 @@ impl<'src> Analyzer<'src> {
             .map(|p| (p.id, p.type_id))
             .collect();
         for (id, type_id) in parameters {
-            if self.type_reaches_resource(type_id, &nominals, &mut reaches)
-                && self.type_is_resource(type_id)
-            {
+            if self.type_is_resource(type_id) {
                 bindings.insert(id);
             }
         }
