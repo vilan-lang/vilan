@@ -7604,6 +7604,70 @@ pub(crate) mod tests {
         assert_eq!(kind_of("abs", 0), Some(TokenKind::Method), "{tokens:?}");
     }
 
+    // --- B184: a trait-typed struct field, in the editor ---------------------
+    //
+    // trait-typed-fields.md rev 2 §R4.2 answered the `impl Trait` grammar
+    // question with the editor's own evidence: the LSP classifies a name in a
+    // type position from the ENTITY it resolved to, so a trait annotation is
+    // already a different colour from a struct annotation with no keyword. That
+    // was probed on a program the compiler refused; it is a legal program now,
+    // and the argument only holds if the answer survives.
+
+    #[test]
+    fn b184_a_trait_typed_field_paints_as_an_interface_and_hovers_as_the_bound() {
+        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: X,\n}\n\nstruct D {\n\ta: A,\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        let kind_at = |at: usize, len: usize| -> Option<TokenKind> {
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + len
+                })
+                .map(|(_, kind, _)| *kind)
+        };
+        // The two annotations, in the SAME position, one line apart in shape:
+        // the trait paints `interface`, the struct paints `struct`. That is the
+        // whole of §R4.2's argument for the bare grammar.
+        let trait_annotation = text.find("x: X").unwrap() + "x: ".len();
+        let struct_annotation = text.find("a: A").unwrap() + "a: ".len();
+        assert_eq!(
+            kind_at(trait_annotation, 1),
+            Some(TokenKind::Interface),
+            "{tokens:?}"
+        );
+        assert_eq!(
+            kind_at(struct_annotation, 1),
+            Some(TokenKind::Struct),
+            "{tokens:?}"
+        );
+        // And hover on the annotation answers with the trait — the bound is what
+        // the author wrote and what the hidden parameter is quantified over.
+        let hover = document.hover(trait_annotation).unwrap_or_default();
+        assert!(hover.contains('X'), "hover on the annotation: {hover:?}");
+    }
+
+    #[test]
+    fn b184_an_inlay_hint_on_a_trait_typed_struct_shows_the_hidden_argument() {
+        // The display rule where a reader meets it most often. An unannotated
+        // binding's hint is the value's type, and the value's type is `C<A>` —
+        // B186's trait-name display would have printed a bare `C` here, which
+        // says nothing about which `C` the binding holds.
+        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: X,\n}\n\nfun main() {\n\tlet holder = C { x = A {} };\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let hints = document.inlay_hints();
+        let at = text.find("holder").unwrap() + "holder".len();
+        assert_eq!(
+            hints
+                .iter()
+                .find(|(offset, _)| *offset == at)
+                .map(|(_, label)| label.clone()),
+            Some(": C<A>".to_string()),
+            "{hints:?}"
+        );
+    }
+
     #[test]
     fn semantic_tokens_paint_markup() {
         // Element-syntax S5: tags (open AND close) paint as Tag, attribute and
