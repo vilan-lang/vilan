@@ -43,6 +43,10 @@ thread_local! {
     /// entered — the analyzer's unit of real work, and what a re-derived call
     /// chain multiplies. See [`inference_entry_count`].
     static INFERENCE_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Lookups [`Analyzer::impl_binder_generics`] and
+    /// [`Analyzer::declaring_trait_generics`] have made, and the declaration
+    /// rows they examined answering them. See [`bindable_set_cost`].
+    static BINDABLE_SET_COST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     /// Times a RECORDED return answer was served to an ask that carried a
     /// caller's generic bindings — which must never happen. See
     /// [`return_records_served_under_substitution`].
@@ -102,6 +106,54 @@ pub fn reset_generic_bound_checks() {
 /// binary sharing a process with other tests cannot promise.
 pub fn inference_entry_count() -> u64 {
     INFERENCE_ENTRIES.with(std::cell::Cell::get)
+}
+
+/// `(lookups, declaration rows examined)` for this thread's bindable-set
+/// questions — the probe M30's pin reads, in the shape of
+/// [`inference_entry_count`] above and for the reason
+/// [`crate::parsing::atom_parse_count`] exists.
+///
+/// B102's bindable set asks two questions per call — which IMPL declares this
+/// member, and which TRAIT does — and both used to be answered by walking every
+/// impl (or every trait) and, inside each, its whole declaration map. The cost
+/// was therefore a PRODUCT of the call count and the program's declaration
+/// count; on a browser application's client entry it summed to 856,908 calls
+/// and 10.4% of a cold check. A reverse index filled at registration answers
+/// each in one lookup, and **that** is the property worth pinning: rows can
+/// never exceed lookups, whatever the program holds.
+///
+/// A count and not a clock, exactly as `atom_parse_count`'s module argues — the
+/// index changes no diagnostic, so no behaviour test can see it, and a wall
+/// ceiling loose enough to be stable on a shared box would not separate a
+/// constant from a smaller scan. A count and not a RATIO between two program
+/// sizes, which was tried first and is not discriminating: `std` contributes
+/// several hundred impls to every program, so a plant would have to be enormous
+/// before its own impls moved a scan's total by an order of magnitude, and at
+/// realistic sizes a scan passes such a ratio comfortably (1.0e6 rows against
+/// 1.1e6 for fifty times the impls, measured).
+///
+/// One thread-local `Cell` read-modify-write per lookup, unconditional, for
+/// `atom_parse_count`'s reason: an env-gated probe would have to be armed
+/// before the process's first analysis, which a test binary sharing a process
+/// cannot promise. It is affordable because the thing it measures collapsed —
+/// `callee_bindable_generics`, probe and both lookups included, is 0.31% of a
+/// cold check of that same client entry where it was 12.4%.
+pub fn bindable_set_cost() -> (u64, u64) {
+    BINDABLE_SET_COST.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`bindable_set_cost`].
+pub fn reset_bindable_set_cost() {
+    BINDABLE_SET_COST.with(|cost| cost.set((0, 0)));
+}
+
+/// Records one bindable-set lookup that examined `rows` declaration rows.
+#[inline]
+fn note_bindable_set_lookup(rows: u64) {
+    BINDABLE_SET_COST.with(|cost| {
+        let (lookups, examined) = cost.get();
+        cost.set((lookups + 1, examined.saturating_add(rows)));
+    });
 }
 
 /// How many times this thread served a RECORDED return answer to an ask that
@@ -3128,6 +3180,26 @@ pub struct Analyzer<'src> {
     /// clones the whole `Analyzer`; a warm analysis walks its entry into that
     /// clone through the same registration).
     implementations_by_member: HashMap<&'src str, Vec<usize>>,
+    /// Member id -> the index into `implementations` of the impl that DECLARES
+    /// it, and the twin for `traits` — the inverses of each impl's and each
+    /// trait's `declarations` map, keyed the way B102's bindable set asks the
+    /// question (backlog M30).
+    ///
+    /// `impl_binder_generics` and `declaring_trait_generics` used to answer it
+    /// by scanning every impl and every trait and, inside each, that one's whole
+    /// declaration map — 856,908 times in one cold check of a browser
+    /// application's client entry, because the fixpoint re-resolves every call
+    /// SITE once per round. The answer was fixed at registration all along.
+    ///
+    /// Written in the same breath as the row they describe, at the ONE place
+    /// each collection grows, so they cannot describe a declaration that does
+    /// not exist — the same discipline `implementations_by_member` above keeps,
+    /// and for the same reason. `or_insert` rather than `insert` because a scan
+    /// answered with the FIRST match: a member id is unique to the body it was
+    /// collected from, so the two agree, and where they could not the index
+    /// still says what the scan said.
+    implementation_by_declaration: HashMap<Id, usize>,
+    trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
     // the entry (index 0, when there are dependencies), each dependency, and `std`
@@ -4256,6 +4328,8 @@ impl<'src> Analyzer<'src> {
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
             implementations_by_member: HashMap::default(),
+            implementation_by_declaration: HashMap::default(),
+            trait_by_declaration: HashMap::default(),
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
             package_of_source: HashMap::default(),
@@ -24135,6 +24209,14 @@ impl<'src> Analyzer<'src> {
                         .or_default()
                         .push(implementation_index);
                 }
+                // M30's index, written here for exactly the reason the name
+                // index above is: this is where `implementations` grows, and
+                // `declarations` is final by now.
+                for member_id in declarations.values().copied() {
+                    self.implementation_by_declaration
+                        .entry(member_id)
+                        .or_insert(implementation_index);
+                }
                 self.implementations.push(Implementation {
                     subject,
                     declarations,
@@ -24184,6 +24266,10 @@ impl<'src> Analyzer<'src> {
                 let declared_members = self.collect_declared_members(body_scope_id);
                 let declarations: IndexMap<&'src str, Id> =
                     declared_members.iter().copied().collect();
+                // M30's twin of the impl index, at the one place `traits` grows.
+                for member_id in declarations.values().copied() {
+                    self.trait_by_declaration.entry(member_id).or_insert(id);
+                }
                 self.traits.insert(
                     id,
                     Trait {
@@ -26007,18 +26093,28 @@ impl<'src> Analyzer<'src> {
     /// constraint ids (the `<U>` it declares, not any inherited from an enclosing
     /// impl). `None` if `member_id` isn't a function.
     fn method_signature(&self, member_id: Id) -> Option<(Vec<Id>, Vec<TypeId>)> {
+        self.method_signature_ref(member_id)
+            .map(|(parameters, own_generics)| (parameters.to_vec(), own_generics.to_vec()))
+    }
+
+    /// [`Self::method_signature`] without the two clones — the borrowing form,
+    /// for the callers that read one half and drop the other (M30). The owning
+    /// form is the one a caller that then takes `&mut self` needs, and it is
+    /// written in terms of this so the two can never disagree about which
+    /// entities have a signature.
+    fn method_signature_ref(&self, member_id: Id) -> Option<(&[Id], &[TypeId])> {
         match self.expr_id_to_expr_map.get(&member_id) {
             Some(Expr::Function(function_id)) => self.functions.get(function_id).map(|function| {
                 (
-                    function.parameters.clone(),
-                    function.generic_parameter_constraint_ids.clone(),
+                    function.parameters.as_slice(),
+                    function.generic_parameter_constraint_ids.as_slice(),
                 )
             }),
             Some(Expr::ExternalFunction(function_id)) => {
                 self.external_functions.get(function_id).map(|function| {
                     (
-                        function.parameters.clone(),
-                        function.generic_parameter_constraint_ids.clone(),
+                        function.parameters.as_slice(),
+                        function.generic_parameter_constraint_ids.as_slice(),
                     )
                 })
             }
@@ -26122,10 +26218,13 @@ impl<'src> Analyzer<'src> {
     /// It is also exactly the set the callee's BODY can mention, which is why a
     /// call's RECORDED substitution keys on nothing else (B102).
     fn callee_bindable_generics(&self, member_id: Id) -> Vec<TypeId> {
-        let Some((_, own_generics)) = self.method_signature(member_id) else {
+        // The borrowing accessor: this reads the OWN generics and drops the
+        // parameter list, and cloning a parameter vector 856,908 times to
+        // discard it is most of what the call cost before M30.
+        let Some((_, own_generics)) = self.method_signature_ref(member_id) else {
             return Vec::new();
         };
-        let mut bindable = own_generics;
+        let mut bindable = own_generics.to_vec();
         bindable.extend(self.impl_binder_generics(member_id));
         bindable.extend(self.declaring_trait_generics(member_id));
         bindable
@@ -26147,14 +26246,13 @@ impl<'src> Analyzer<'src> {
     /// same ids: an already-bound id reconciles to itself and re-inserts
     /// unchanged.
     fn declaring_trait_generics(&self, member_id: Id) -> Vec<TypeId> {
-        self.traits
-            .values()
-            .find(|trait_| {
-                trait_
-                    .declarations
-                    .values()
-                    .any(|declared| *declared == member_id)
-            })
+        // O(1) through `trait_by_declaration` (M30). The scan this replaces
+        // walked every trait and, inside each, its whole declaration map, per
+        // call — and the fixpoint calls it once per call site per round.
+        let declaring = self.trait_by_declaration.get(&member_id);
+        note_bindable_set_lookup(u64::from(declaring.is_some()));
+        declaring
+            .and_then(|trait_id| self.traits.get(trait_id))
             .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
             .unwrap_or_default()
     }
@@ -26195,12 +26293,12 @@ impl<'src> Analyzer<'src> {
     /// instantiation (`iterator.vl`'s `Iterator::from_fn` stopped
     /// monomorphizing).
     fn impl_binder_generics(&self, member_id: Id) -> Vec<TypeId> {
-        let Some(implementation) = self.implementations.iter().find(|implementation| {
-            implementation
-                .declarations
-                .values()
-                .any(|declared| *declared == member_id)
-        }) else {
+        // O(1) through `implementation_by_declaration` (M30) — see there for
+        // what the linear scan cost and why the index cannot lie.
+        let declaring = self.implementation_by_declaration.get(&member_id);
+        note_bindable_set_lookup(u64::from(declaring.is_some()));
+        let Some(implementation) = declaring.and_then(|index| self.implementations.get(*index))
+        else {
             return Vec::new();
         };
         let mut argument_ids: Vec<TypeId> = Vec::new();

@@ -6576,3 +6576,134 @@ fn b230_the_payload_check_holds_inside_an_async_body() {
         "Expected Result<i32, str>, but got Result<bool, str> instead.",
     );
 }
+
+// --- M30: the bindable set answers in one lookup, not one scan per call ----
+//
+// B102's `callee_bindable_generics` asks two questions per call — which IMPL
+// declares this member, and which TRAIT does — and both were answered by
+// walking every impl (or every trait) and, inside each, its whole declaration
+// map. The cost was a PRODUCT of the call count and the program's declaration
+// count: 856,908 calls and 10.4% of a cold check on a real browser
+// application, where the answer had been fixed at registration all along.
+//
+// A COUNT and not a clock, for `parse_nesting_cost.rs`'s reasons exactly: the
+// reverse index changes no diagnostic, so no behaviour test can see it, and a
+// wall ceiling loose enough to be stable on a shared box would not separate a
+// constant from a smaller scan.
+
+/// A program with `impls` inert one-method impls and 60 calls into a generic
+/// method that has both its own generic and an impl binder, so every call asks
+/// the bindable set. The inert impls are registered BEFORE the one the calls
+/// reach, because a scan short-circuits on its match — with `Box`'s impl first,
+/// the inert ones behind it cost a scan nothing.
+fn bindable_plant(impls: usize) -> String {
+    let mut source = String::from("struct Box<T> { value: T }\n");
+    for index in 0..impls {
+        source.push_str(&format!(
+            "struct Inert{index} {{ value: i32 }}\n\
+             impl Inert{index} {{ fun inert{index}(self): i32 {{ self.value }} }}\n"
+        ));
+    }
+    source.push_str(
+        "impl Box<type T> {\n\
+         \tfun map<U>(self, f: |T| U): Box<U> { Box { value = f(self.value) } }\n\
+         \tfun get(self): T { self.value }\n\
+         }\n",
+    );
+    source.push_str("fun main() {\n\tlet seed = Box { value = 1 };\n");
+    for index in 0..60 {
+        source.push_str(&format!(
+            "\tlet mapped{index} = seed.map(|v| v + {index}).get();\n"
+        ));
+    }
+    source.push_str("}\n");
+    source
+}
+
+/// `(lookups, declaration rows examined)` while `source` compiled cleanly, read
+/// on the worker because the probe is thread-local.
+fn bindable_set_cost(source: String) -> (u64, u64) {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            // COLD, and forced rather than assumed: the plants are analyzed in
+            // one process, and a warm base world lets a later one do a fraction
+            // of the first's work — a difference in the fixpoint's ROUNDS, not
+            // in what a lookup costs.
+            vilan_core::analyzer::base_cache_clear();
+            vilan_core::macro_world_cache_clear();
+            vilan_core::parse_clean_cache_clear();
+            vilan_core::analyzer::reset_bindable_set_cost();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("bindable.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                program.is_some() && errors.is_empty(),
+                "the plant must compile cleanly, got {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            vilan_core::analyzer::bindable_set_cost()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// The pin, stated as the property rather than as a proxy for it: a
+/// bindable-set lookup touches at most the ONE declaration row its key names,
+/// so the rows examined can never exceed the lookups made — whatever the
+/// program holds, and whatever `std` brings with it. The linear scan this
+/// replaced examined every impl and every one of its declarations per lookup:
+/// ~4,000 rows apiece on these plants, so a planted scan reds this by three
+/// orders of magnitude. Asserted at two impl counts, which is where the O(1)
+/// claim is visible: fifty times the impls, the same relation.
+#[test]
+fn a_bindable_set_lookup_examines_at_most_one_declaration_row() {
+    for impls in [4usize, 200] {
+        let (lookups, rows) = bindable_set_cost(bindable_plant(impls));
+        assert!(
+            lookups > 100,
+            "the plant must actually ask the bindable set, got {lookups} lookups at {impls} impls"
+        );
+        assert!(
+            rows <= lookups,
+            "a lookup may examine one row and no more: {rows} rows over {lookups} lookups \
+             at {impls} impls"
+        );
+    }
+}
+
+/// The answer is what a scan's was, not merely cheaper: the impl binder and the
+/// trait's own parameter both still reach a call that can only bind through
+/// them. A reverse index keyed on the wrong row would type these at an abstract
+/// generic and refuse, or emit an unmonomorphized instance.
+#[test]
+fn the_bindable_set_still_binds_an_impl_binder_and_a_trait_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Wrap<T> { value: T }
+        // B162's shape: an associated function the TRAIT carries, reached with
+        // no receiver and no impl, so the trait's own `T` is the call's ONLY
+        // binding channel — `declaring_trait_generics`' whole reason to exist.
+        trait Make<T> { fun of(value: T): Wrap<T> { Wrap { value = value } } }
+        impl Wrap<type T> {
+            fun swap<U>(self, other: U): Wrap<U> { Wrap { value = other } }
+            fun show(self): T { self.value }
+        }
+        fun main() {
+            let w = Wrap { value = 1 };
+            print(w.swap("two").show());
+            print(Make::of(3).show());
+        }
+        "#,
+        "two\n3\n",
+    );
+}
