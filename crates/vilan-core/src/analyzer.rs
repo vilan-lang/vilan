@@ -15573,7 +15573,21 @@ impl<'src> Analyzer<'src> {
             _ => None,
         }
         .unwrap_or_else(|| subject_label.clone());
-        let steer = if matches!(rhs_type, Type::Generic(_)) {
+        let steer = if matches!(rhs_type, Type::Generic(_)) && matches!(lhs_type, Type::Generic(_))
+        {
+            // B233: the left operand is a PARAMETER, so the impl advice above
+            // has no subject to name (`impl P<type Q>` is not a declaration).
+            // The declaration that works is the bound itself — a parameterized
+            // one says exactly "a `P` takes a `Q` here", which is the whole of
+            // what this refusal is missing.
+            format!(
+                "a parameter promises a trait's METHODS, never that it IS \
+                 `{declared_label}`, so no bound on `{rhs_label}` can prove membership. \
+                 Declare the operand `{declared_label}`, or say so in the bound \
+                 (`<{subject_label}: {trait_name}<{rhs_label}>>`), which every \
+                 instantiation must then satisfy"
+            )
+        } else if matches!(rhs_type, Type::Generic(_)) {
             format!(
                 "a parameter promises a trait's METHODS, never that it IS \
                  `{declared_label}`, so no bound on `{rhs_label}` can prove membership. \
@@ -15602,6 +15616,131 @@ impl<'src> Analyzer<'src> {
             binary_id,
         );
         true
+    }
+
+    /// The argument a parameterized use of `trait_id` supplies for the position
+    /// `declared_id` — matched by the position's WRITTEN spelling against the
+    /// trait's own parameter names, which is the only thing separating a
+    /// `= Self`-defaulted parameter from a `Self` spelled outright (B216, and
+    /// `supertrait_position_type`'s rule). `None` when the spelling cannot be
+    /// recovered, when it names no parameter of the trait, or when the use
+    /// supplied no argument in that position — and the caller then leaves the
+    /// position exactly as declared.
+    fn written_parameter_argument(
+        &self,
+        trait_id: Id,
+        arguments: &[TypeId],
+        declared_id: TypeId,
+    ) -> Option<TypeId> {
+        let written = self
+            .written_type_spellings
+            .iter()
+            .find(|(written_id, _)| *written_id == declared_id)
+            .map(|(_, name)| *name)?;
+        let index = self
+            .traits
+            .get(&trait_id)?
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written)?;
+        arguments.get(index).copied()
+    }
+
+    /// B233: the right operand of an operator dispatched through the left
+    /// operand's BOUND — `a + b` inside `fun sum<P: Add, Q>(a: P, b: Q)`.
+    /// Pushes the refusal and answers `true` when the operand does not belong
+    /// there.
+    ///
+    /// B180 ruled the operand roles for a NOMINAL left operand and B174 ruled
+    /// the bound the parameter needs, and between them the generic-bounded
+    /// dispatch path checked the LEFT operand and then recorded the dispatch
+    /// without ever looking at the right one. So `fun sum<P: Add, Q>(a: P, b:
+    /// Q): P { a + b }` compiled and `sum(1, "two")` printed `1two` — a `str`
+    /// returned through a signature declaring `P`, which the call bound to
+    /// `i32`. Every dispatched operator had it: `-`, `*`, the bitwise pair,
+    /// `==` and the orderings all reach the same `GenericDispatch::OnConstraint`
+    /// channel.
+    ///
+    /// The declared `B` comes from the bound, and the bound is where a
+    /// parameterized one supplies it: `P: Add<Q>` DOES declare that a `P` adds
+    /// a `Q`, and is accepted, while a bare `P: Add` means `Add<B = Self>` —
+    /// the operand is a `P`, and only a `P`. The trait that declares the
+    /// operator method may be a SUPERTRAIT of the bound (`P: Ord` reaching
+    /// `PartialOrd`'s `lt`), so the arguments are taken at the declaring trait
+    /// through `method_member_in_trait_at`, exactly as a method call on a
+    /// bounded receiver takes them.
+    ///
+    /// The rule fires only when the right operand is a parameter the ENCLOSING
+    /// declaration owns — `generic_is_rigid_here`, B219's shared predicate,
+    /// asked here with the operator's own scope in `rigid_binder_scope` (this
+    /// check runs in `finalize_build`, outside constraint resolution, where the
+    /// scope is otherwise `None`). A parameter the site is INFERRING is a hole
+    /// the call fills and the call site's own business; a CONCRETE right
+    /// operand against a bounded parameter (`fun bump<P: Add>(a: P) { a + 1 }`)
+    /// is a wider question than this one, left as it stands.
+    fn refuse_operator_right_operand_on_bound(
+        &mut self,
+        op: BinaryOp,
+        symbol: &str,
+        binary_id: Id,
+        rhs_id: Option<Id>,
+        constraint_id: TypeId,
+        lhs_type: &Type,
+    ) -> bool {
+        let (Some(rhs_id), Some((_, method_name))) = (rhs_id, operator_trait_method(op)) else {
+            return false;
+        };
+        let rhs_type = self.infer_type(rhs_id, lhs_type, &HashMap::default());
+        let Type::Generic(rhs_constraint_id) = rhs_type else {
+            return false;
+        };
+        let scope_id = self.expr_id_to_scope_id_map.get(&binary_id).copied();
+        let saved_scope = std::mem::replace(&mut self.rigid_binder_scope, scope_id);
+        let both_rigid = self.generic_is_rigid_here(constraint_id)
+            && self.generic_is_rigid_here(rhs_constraint_id);
+        self.rigid_binder_scope = saved_scope;
+        if !both_rigid {
+            return false;
+        }
+        let Some((member_id, declaring_trait_id, declaring_arguments)) = self
+            .generic_bound_traits(constraint_id)
+            .into_iter()
+            .find_map(|(trait_id, trait_arguments)| {
+                self.method_member_in_trait_at(trait_id, &trait_arguments, method_name)
+            })
+        else {
+            return false;
+        };
+        let mut bindings =
+            self.trait_parameter_substitution(declaring_trait_id, &declaring_arguments);
+        // The operand position's own id, bound to the argument the BOUND wrote
+        // for it. A defaulted parameter interns as its default rather than as a
+        // binder, so `Add<B = Self>`'s `b: B` is `Type::Trait(Add, [])` — the
+        // very type `Self` spells inside the same trait, and an id distinct
+        // from the one the trait recorded for the parameter, so neither the
+        // positional substitution above nor `substitute_type` reaches it. It is
+        // decided by its SPELLING instead, B216's rule at
+        // `supertrait_position_type` applied at the operand: a position spelled
+        // with one of the declaring trait's parameter names IS that parameter,
+        // and takes the matching argument.
+        if let Some(declared_id) = self.second_parameter_type_id(member_id)
+            && let Some(argument_id) = self.written_parameter_argument(
+                declaring_trait_id,
+                &declaring_arguments,
+                declared_id,
+            )
+        {
+            bindings.insert(declared_id, argument_id);
+        }
+        self.refuse_operator_right_operand(
+            op,
+            symbol,
+            binary_id,
+            Some(rhs_id),
+            member_id,
+            lhs_type,
+            &bindings,
+        )
     }
 
     /// Resolves a method `member_name` declared by `trait_id` — a default method
@@ -38641,6 +38780,21 @@ impl<'src> Analyzer<'src> {
                             .is_some()
                     });
                     if provides {
+                        // B233: the bound says WHAT the left operand can add —
+                        // it never says the right operand belongs there. This
+                        // path recorded the dispatch and asked nothing about
+                        // it, so two different rigid parameters met on an
+                        // operator.
+                        if self.refuse_operator_right_operand_on_bound(
+                            op,
+                            symbol,
+                            binary_id,
+                            rhs_id,
+                            constraint_id,
+                            &lhs_type,
+                        ) {
+                            continue;
+                        }
                         self.generic_dispatch.insert(
                             binary_id,
                             GenericDispatch::OnConstraint(constraint_id, method_name),

@@ -806,6 +806,22 @@ models a trait. Merely being bounded is not enough, for the same reason
 it is not enough on the right: `T: Display` promises `to_string`, not
 `add`.
 
+The bound then decides the **right** operand too, the way a dispatching
+impl does below: the operand must be admitted by the `B` *that bound
+declares*. A bare `T: Add` is `Add<B = Self>`, so the admitted operand
+is a `T`, and only a `T` — a second parameter is not one, whatever it is
+bounded to, because a bound promises a trait's methods and never that
+the parameter *is* the declared `B`. A parameterized bound says
+otherwise outright: `T: Add<U>` declares that a `T` takes a `U` there,
+and is the spelling that makes a two-parameter shape legal.
+
+```vilan,fragment
+fun sum<P: Add, Q>(a: P, b: Q): P { a + b }      // error: `P`'s `add` accepts `P`
+fun sum<P: Add, Q: Add>(a: P, b: Q): P { a + b } // error: same — a bound is not membership
+fun sum<P: Add>(a: P, b: P): P { a + b }         // one parameter twice: the same type
+fun sum<Q, P: Add<Q>>(a: P, b: Q): P { a + b }   // the bound declares the operand
+```
+
 Inside a trait's own default body the rule is unchanged, and the
 parameter is then the **trait's**. The bound goes on the trait, so the
 refusal names it: adding it there moves every `impl` of the trait and
