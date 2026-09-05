@@ -1851,4 +1851,112 @@ fun main(): i32 {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- E142: an `as` alias is a second SPELLING of one definition ----------
+    //
+    // The scope binds the alias to the very entity the path resolved to, which
+    // is what makes an alias a rename rather than a copy — so find-references
+    // and rename see ONE symbol with two spellings, exactly as they do for a
+    // prelude name and an explicit import of it. Every use site spelled by the
+    // alias is a reference to the aliased item, the alias itself is one too,
+    // and so is the path segment it renames — the segment always was.
+    //
+    // Rename therefore rewrites ALL FOUR, which is the only complete answer
+    // available while an alias is a spelling rather than a definition of its
+    // own: rewriting the uses and not the alias leaves the import binding a
+    // name nothing uses, and rewriting the alias and not the path segment
+    // leaves the import naming an item that no longer exists. The cost is that
+    // renaming through an alias collapses it (`greet as hello` becomes
+    // `greeting as greeting`), which is a compiling program and a redundant
+    // one. Making the alias its own definition — so the two names rename
+    // independently — needs an entity that forwards to the target through
+    // typing, and is recorded rather than built here.
+    //
+    // This is the one row class INVARIANT 1 above does not describe (a row
+    // whose text is not the definition's own name). The matrix fixture carries
+    // no alias, so that assertion stands as written; these pins carry their own
+    // fixture.
+
+    const ALIASED: &str = "\
+import pkg::helper::greet as hello;
+
+fun main(): i32 {
+\thello();
+\thello();
+\t0
+}
+";
+
+    fn aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[
+            ("main.vl", ALIASED),
+            ("helper.vl", "fun greet(): i32 {\n\t1\n}\n"),
+        ])
+    }
+
+    /// The spans a query at `offset` reports, rendered as the text each covers.
+    fn aliased_texts(document: &Document, spans: Vec<(SourceId, Span)>) -> Vec<&'static str> {
+        let _ = document;
+        let mut found: Vec<(usize, &str)> = spans
+            .into_iter()
+            .filter(|(source, _)| *source == SourceId(0))
+            .map(|(_, span)| {
+                let range = span.into_range();
+                (range.start, ALIASED.get(range).expect("inside the fixture"))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, text)| text).collect()
+    }
+
+    #[test]
+    fn e142_find_references_follows_an_import_alias() {
+        let (dir, document) = aliased();
+        // From a USE site spelled by the alias: the alias itself and both calls.
+        let offset = ALIASED.find("\thello();").expect("fixture") + 1;
+        assert_eq!(
+            aliased_texts(&document, document.references(offset)),
+            vec!["greet", "hello", "hello", "hello"],
+            "the path segment, the alias and both uses are one symbol",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e142_a_rename_through_an_alias_rewrites_every_spelling() {
+        let (dir, document) = aliased();
+        let offset = ALIASED.find("\thello();").expect("fixture") + 1;
+        let edits = document
+            .rename_edits(offset, "greeting")
+            .expect("a rename through an alias");
+        assert_eq!(
+            aliased_texts(&document, edits),
+            vec!["greet", "hello", "hello", "hello"],
+            "rename rewrites exactly what find-references reported",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e142_the_alias_is_an_indexed_occurrence_of_its_own() {
+        // The alias has a row: a caret ON it answers, and answers with the same
+        // symbol a caret on a use site does. Without the row the alias would be
+        // invisible — hover blank, go-to-definition dead, and rename silently
+        // incomplete.
+        let (dir, document) = aliased();
+        let on_alias = ALIASED.find("as hello").expect("fixture") + 3;
+        let on_use = ALIASED.find("\thello();").expect("fixture") + 1;
+        assert_eq!(
+            document
+                .reference_target(on_alias)
+                .map(|(target, _)| target),
+            document.reference_target(on_use).map(|(target, _)| target),
+            "the alias names the same definition its use sites do",
+        );
+        assert!(
+            document.reference_target(on_alias).is_some(),
+            "the alias must be an indexed occurrence",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

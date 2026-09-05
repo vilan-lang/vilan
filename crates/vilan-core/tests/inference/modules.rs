@@ -6420,3 +6420,70 @@ fn b212_a_name_declared_once_beside_an_import_of_the_same_name_is_not_a_duplicat
         "3\n",
     );
 }
+
+// --- E142: `import a::b::c as d` — the import alias ---------------------------
+//
+// The prerequisite the `::` line rule assumes: a path that is too long to sit on
+// one line is imported under a shorter NAME rather than wrapped. `as` renames
+// the leaf and changes nothing else — the path resolves exactly as it would
+// without one, and the item is the same item under a second spelling.
+
+#[test]
+fn e142_an_import_alias_binds_the_leaf_under_the_new_name() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print as say;
+        fun main() { say("aliased"); }
+        "#,
+        "aliased\n",
+    );
+}
+
+#[test]
+fn e142_an_import_alias_reaches_a_brace_set_and_a_self_leaf() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self as Maybe, Some, None };
+        fun main() {
+            let held: Maybe<i32> = Some(3);
+            match held {
+                Some(let n) => print(n),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn e142_an_import_alias_does_not_also_bind_the_original_name() {
+    // The control that says the alias is a RENAME and not a second binding: a
+    // rule that bound both would make every alias silently optional and hide
+    // the misspelling the alias is supposed to make impossible.
+    assert_fails_with(
+        r#"
+        import std::json::Json as Document;
+        fun main() {
+            let held: Json = Document::Bool(true);
+        }
+        "#,
+        "cannot find type 'Json'",
+    );
+}
+
+#[test]
+fn e142_an_aliased_import_resolves_to_the_item_it_renames() {
+    // Proof the alias is not a fresh, unrelated name: reaching a member the
+    // target does NOT have reports against the TARGET's own name.
+    assert_fails_with(
+        r#"
+        import std::json::Json as Document;
+        fun main() {
+            let held = Document::NotAVariant;
+        }
+        "#,
+        "cannot find 'NotAVariant' in Json",
+    );
+}

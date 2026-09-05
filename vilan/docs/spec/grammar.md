@@ -42,7 +42,8 @@ instead the block's **trailing expression** and supplies the block's value
 ```text
 import  = "import" path-branch ;
 use     = "use"    path-branch ;
-path-branch = NAME [ "::" ( path-branch | path-set ) ] ;
+path-branch = NAME [ "::" ( path-branch | path-set )
+                   | "as" NAME ] ;        (* alias, §4.3 *)
 path-set    = "{" path-branch { "," path-branch } [ "," ] "}" ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 ```
@@ -52,6 +53,24 @@ from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
 variants). Semantics: §4. `export statement` re-exports an import or
 exposes a declaration to importers of the module.
+
+`as` renames the LEAF a branch ends at — `import a::b::c as d;` binds
+`d`, and `import a::{ b as x, c }` binds `x` and `c`. It is an
+alternative to the `::` continuation, not something that may follow one
+(`a::b as c::d` does not parse), and it is **contextual**: `as` is an
+ordinary identifier everywhere else in the language, including as a
+module or item name, and reads as an alias only where a path segment has
+ended and a NAME follows it.
+
+A `::` path may **not cross a line break**: the segment after a `::`
+must begin on the same line the `::` is on. Without the rule `a::` at the
+end of a line joins whatever the next line starts with — `style::` then
+`print(…)` on the line below is the legal path `style::print`, and the
+next statement is silently swallowed. Import a long path under a shorter
+name instead. The rule binds the two productions that COMMIT to a
+separator, the expression path (§3.6) and the import path here; a type
+path and a struct-literal head read the `::` and the name that follows it
+together and leave a trailing separator where it was.
 
 ## 3.3 Items
 

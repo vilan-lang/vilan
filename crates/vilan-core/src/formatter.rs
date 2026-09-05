@@ -11,7 +11,7 @@ use std::cell::Cell;
 
 use crate::node::{
     BinaryOp, Convention, ExternBinding, Func, GenericArguments, GenericParameters, ImportBranch,
-    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    ImportTail, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -228,7 +228,10 @@ struct ImportSortKey {
 /// reduce to this shape, from which the shared key and the canonical token
 /// re-emission are derived.
 enum TokenBranch<'src> {
-    Path(&'src str, Option<Box<TokenBranch<'src>>>),
+    /// A segment: its name, an optional `::` continuation, and an optional
+    /// `as` alias (E142 — never both; the parser's tail type is what enforces
+    /// that, and this shape mirrors it flattened).
+    Path(&'src str, Option<Box<TokenBranch<'src>>>, Option<&'src str>),
     Set(Vec<TokenBranch<'src>>),
 }
 
@@ -236,10 +239,13 @@ enum TokenBranch<'src> {
 /// the shared key operates on.
 fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
     match branch {
-        ImportBranch::Path(name, _, child) => TokenBranch::Path(
-            name,
-            child.as_ref().map(|child| Box::new(branch_from_ast(child))),
-        ),
+        ImportBranch::Path(name, _, tail) => match tail {
+            ImportTail::Leaf => TokenBranch::Path(name, None, None),
+            ImportTail::Continue(child) => {
+                TokenBranch::Path(name, Some(Box::new(branch_from_ast(child))), None)
+            }
+            ImportTail::Alias(alias, _) => TokenBranch::Path(name, None, Some(alias)),
+        },
         ImportBranch::Set(branches) => {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
@@ -259,7 +265,7 @@ fn unwrap_singleton_set<'branch, 'src>(
     let mut current = branch;
     while let TokenBranch::Set(branches) = current {
         match branches.as_slice() {
-            [only @ TokenBranch::Path(name, _)] if *name != "self" => current = only,
+            [only @ TokenBranch::Path(name, ..)] if *name != "self" => current = only,
             _ => break,
         }
     }
@@ -271,10 +277,17 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, None) => {
-            BranchKey::Path((*name).to_string(), Box::new(BranchKey::End))
-        }
-        TokenBranch::Path(name, Some(child)) => {
+        // An alias keys as the segment it renames plus the alias itself, so
+        // `a::b as c` and `a::b as d` are two imports the run orders stably
+        // rather than two spellings of one key (E142).
+        TokenBranch::Path(name, None, alias) => BranchKey::Path(
+            match alias {
+                Some(alias) => format!("{name} as {alias}"),
+                None => (*name).to_string(),
+            },
+            Box::new(BranchKey::End),
+        ),
+        TokenBranch::Path(name, Some(child), _) => {
             BranchKey::Path((*name).to_string(), Box::new(branch_key(child)))
         }
         TokenBranch::Set(branches) => {
@@ -291,7 +304,7 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
 /// collapsed reprint `import a;` land in the same place.
 fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey {
     let (root, rest) = match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, child) => {
+        TokenBranch::Path(name, child, _) => {
             let root = match *name {
                 "std" => RootRank::Std,
                 "pkg" => RootRank::Pkg,
@@ -354,6 +367,19 @@ fn token_name<'src>(tokens: &[Token<'src>], index: usize) -> Option<&'src str> {
     }
 }
 
+/// The contextual `as <name>` alias at `*index`, advancing past it when there
+/// is one (E142). Mirrors the parser's own two-token probe: `as` is an
+/// ordinary identifier everywhere else, so it only reads as an alias when a
+/// NAME follows it.
+fn token_alias<'src>(tokens: &[Token<'src>], index: &mut usize) -> Option<&'src str> {
+    if tokens.get(*index) != Some(&Token::Ident("as")) {
+        return None;
+    }
+    let alias = token_name(tokens, *index + 1)?;
+    *index += 2;
+    Some(alias)
+}
+
 /// Parses the `::`-separated import path beginning at `index` (mirroring the
 /// parser's `parse_namespace_path`: a name-headed path is tried before a brace
 /// set), returning the branch and the index just past it, or `None` if the
@@ -364,14 +390,16 @@ fn parse_token_branch<'src>(
 ) -> Option<(TokenBranch<'src>, usize)> {
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
+        let mut alias = None;
         let continuation = if tokens.get(next) == Some(&Token::Op("::")) {
             let (child, after) = parse_token_branch(tokens, next + 1)?;
             next = after;
             Some(Box::new(child))
         } else {
+            alias = token_alias(tokens, &mut next);
             None
         };
-        Some((TokenBranch::Path(name, continuation), next))
+        Some((TokenBranch::Path(name, continuation, alias), next))
     } else if tokens.get(index) == Some(&Token::Ctrl('{')) {
         let mut branches = Vec::new();
         let mut next = index + 1;
@@ -380,14 +408,16 @@ fn parse_token_branch<'src>(
         while tokens.get(next) != Some(&Token::Ctrl('}')) {
             let name = token_name(tokens, next)?;
             let mut after = next + 1;
+            let mut alias = None;
             let continuation = if tokens.get(after) == Some(&Token::Op("::")) {
                 let (child, past) = parse_token_branch(tokens, after + 1)?;
                 after = past;
                 Some(Box::new(child))
             } else {
+                alias = token_alias(tokens, &mut after);
                 None
             };
-            branches.push(TokenBranch::Path(name, continuation));
+            branches.push(TokenBranch::Path(name, continuation, alias));
             next = after;
             match tokens.get(next) {
                 Some(Token::Ctrl(',')) => next += 1,
@@ -434,11 +464,15 @@ fn parse_import_statement<'src>(
 /// braced source and the collapsed reprint to the same canonical tokens.
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
     match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, child) => {
+        TokenBranch::Path(name, child, alias) => {
             out.push(Token::Ident(name));
             if let Some(child) = child {
                 out.push(Token::Op("::"));
                 emit_branch_tokens(child, out);
+            }
+            if let Some(alias) = alias {
+                out.push(Token::Ident("as"));
+                out.push(Token::Ident(alias));
             }
         }
         TokenBranch::Set(branches) => {
@@ -1249,11 +1283,24 @@ fn prune_import_branch<'src>(
     keep: &dyn Fn(Span) -> bool,
 ) -> Option<ImportBranch<'src>> {
     match branch {
-        ImportBranch::Path(name, span, None) => {
-            keep(*span).then_some(ImportBranch::Path(name, *span, None))
+        ImportBranch::Path(name, span, ImportTail::Leaf) => {
+            keep(*span).then_some(ImportBranch::Path(name, *span, ImportTail::Leaf))
         }
-        ImportBranch::Path(name, span, Some(child)) => prune_import_branch(child, keep)
-            .map(|pruned| ImportBranch::Path(name, *span, Some(Box::new(pruned)))),
+        // An aliased leaf is asked about at its ALIAS span, which is the name
+        // the file actually binds and therefore the one it can fail to use
+        // (E142); `collect_import_leaf_spans` offers the same span, so the
+        // organizer and the editor's fade go on asking one question.
+        ImportBranch::Path(name, span, ImportTail::Alias(alias, alias_span)) => keep(*alias_span)
+            .then_some(ImportBranch::Path(
+                name,
+                *span,
+                ImportTail::Alias(alias, *alias_span),
+            )),
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => {
+            prune_import_branch(child, keep).map(|pruned| {
+                ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(pruned)))
+            })
+        }
         ImportBranch::Set(branches) => {
             let kept: Vec<ImportBranch<'src>> = branches
                 .iter()
@@ -1318,8 +1365,11 @@ pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
 /// terminal `Path` IS the leaf.
 fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
     match branch {
-        ImportBranch::Path(_, span, None) => out.push(*span),
-        ImportBranch::Path(_, _, Some(child)) => collect_import_leaf_spans(child, out),
+        ImportBranch::Path(_, span, ImportTail::Leaf) => out.push(*span),
+        ImportBranch::Path(_, _, ImportTail::Alias(_, alias_span)) => out.push(*alias_span),
+        ImportBranch::Path(_, _, ImportTail::Continue(child)) => {
+            collect_import_leaf_spans(child, out)
+        }
         ImportBranch::Set(branches) => {
             for branch in branches {
                 collect_import_leaf_spans(branch, out);
@@ -1380,6 +1430,9 @@ enum ImportLeafShape<'ast, 'src> {
     Single(&'src str, Span),
     /// A brace-set of trailing names (`import std::json::{ A, B }`).
     Set(&'ast [ImportBranch<'src>]),
+    /// An ALIASED leaf (`import std::json::Json as J`) — a shape the
+    /// add-import quickfix declines to extend (E142).
+    Aliased,
 }
 
 /// Splits a parsed import path into the segments leading to its terminal
@@ -1391,8 +1444,15 @@ fn decompose_import_branch<'ast, 'src>(
     branch: &'ast ImportBranch<'src>,
 ) -> (Vec<&'src str>, ImportLeafShape<'ast, 'src>) {
     match branch {
-        ImportBranch::Path(name, span, None) => (Vec::new(), ImportLeafShape::Single(name, *span)),
-        ImportBranch::Path(name, _, Some(child)) => match child.as_ref() {
+        ImportBranch::Path(name, span, ImportTail::Leaf) => {
+            (Vec::new(), ImportLeafShape::Single(name, *span))
+        }
+        // An aliased leaf is not a name the add-import quickfix may fold into a
+        // brace set — `{ Json as J, Encode }` would have to keep the alias with
+        // its own member and there is no span arithmetic that does — so it
+        // decomposes to a shape nothing matches.
+        ImportBranch::Path(_, _, ImportTail::Alias(..)) => (Vec::new(), ImportLeafShape::Aliased),
+        ImportBranch::Path(name, _, ImportTail::Continue(child)) => match child.as_ref() {
             ImportBranch::Set(branches) => (vec![*name], ImportLeafShape::Set(branches)),
             ImportBranch::Path(..) => {
                 let (mut prefix, shape) = decompose_import_branch(child);
@@ -1434,6 +1494,7 @@ fn try_extend_import<'src>(
         return ExtendOutcome::NoMatch;
     }
     match shape {
+        ImportLeafShape::Aliased => ExtendOutcome::NoMatch,
         ImportLeafShape::Single(name, span) => {
             if name == leaf {
                 return ExtendOutcome::AlreadyImported;
@@ -1449,7 +1510,7 @@ fn try_extend_import<'src>(
             let mut members: Vec<(&str, Span)> = Vec::with_capacity(branches.len());
             for member in branches {
                 match member {
-                    ImportBranch::Path(name, span, None) => {
+                    ImportBranch::Path(name, span, ImportTail::Leaf) => {
                         if *name == leaf {
                             return ExtendOutcome::AlreadyImported;
                         }
@@ -1496,9 +1557,9 @@ fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node Im
 /// would have, for finding where it belongs among a run's existing entries —
 /// without constructing a throwaway AST node to feed [`node_import_key`].
 fn fresh_import_sort_key(module_path: &[&str], leaf: &str) -> ImportSortKey {
-    let mut branch = TokenBranch::Path(leaf, None);
+    let mut branch = TokenBranch::Path(leaf, None, None);
     for segment in module_path.iter().rev() {
-        branch = TokenBranch::Path(segment, Some(Box::new(branch)));
+        branch = TokenBranch::Path(segment, Some(Box::new(branch)), None);
     }
     import_sort_key(ImportKind::Import, &branch)
 }
@@ -2431,12 +2492,19 @@ impl<'src> Printer<'src> {
         // the `::` — and the set is what consumes it.
         let split = std::mem::take(&mut self.split);
         match branch {
-            ImportBranch::Path(name, _, child) => {
+            ImportBranch::Path(name, _, tail) => {
                 self.out.push_str(name);
-                if let Some(child) = child {
-                    self.out.push_str("::");
-                    self.split = split;
-                    self.print_import_branch(child, sort);
+                match tail {
+                    ImportTail::Leaf => {}
+                    ImportTail::Continue(child) => {
+                        self.out.push_str("::");
+                        self.split = split;
+                        self.print_import_branch(child, sort);
+                    }
+                    ImportTail::Alias(alias, _) => {
+                        self.out.push_str(" as ");
+                        self.out.push_str(alias);
+                    }
                 }
             }
             ImportBranch::Set(branches) => {
@@ -8909,6 +8977,61 @@ mod import_sorting {
             normalize(raw_tokens("fun f() {\nuse b::y;\nuse a::x;\n}\n")),
             normalize(raw_tokens("fun f() {\nuse a::x;\nuse b::y;\n}\n")),
             "normalize must not reorder block-scoped imports"
+        );
+    }
+
+    // --- E142: `as` aliases ride the sort ------------------------------------
+
+    // An alias is part of the statement the run orders, and part of the member
+    // a brace set orders: both survive the reprint verbatim, in the position
+    // the path (not the alias) puts them in.
+    #[test]
+    fn an_aliased_import_sorts_by_its_path_and_keeps_its_alias() {
+        assert_sorts(
+            "import pkg::z::thing as t;\nimport std::io::print as say;\n\
+             import std::json::Json as Doc;\n",
+            "import std::io::print as say;\nimport std::json::Json as Doc;\n\
+             import pkg::z::thing as t;\n",
+        );
+    }
+
+    #[test]
+    fn an_aliased_brace_member_sorts_and_keeps_its_alias() {
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None };\n",
+            "import std::option::Option::{ None, Some, self as Maybe };\n",
+        );
+    }
+
+    // A one-member set still collapses to its unbraced spelling with the alias
+    // attached — `a::{ b as c }` IS `a::b as c` — and the net reduces both to
+    // the same tokens, which is what lets the reprint through.
+    #[test]
+    fn a_one_member_aliased_set_collapses_and_the_net_agrees() {
+        assert_sorts(
+            "import std::json::{ Json as Doc };\n",
+            "import std::json::Json as Doc;\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::json::{ Json as Doc };\n")),
+            normalize(raw_tokens("import std::json::Json as Doc;\n")),
+            "the net must see the braced and collapsed spellings as one",
+        );
+    }
+
+    // The net is not blind to the alias itself: two imports differing only by
+    // the name they bind are different programs and must stay distinct.
+    #[test]
+    fn net_does_not_forgive_a_changed_alias() {
+        assert_ne!(
+            normalize(raw_tokens("import a::b as c;\n")),
+            normalize(raw_tokens("import a::b as d;\n")),
+            "an alias is part of what the net compares"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b as c;\n")),
+            normalize(raw_tokens("import a::b;\n")),
+            "dropping an alias is a token drift, not a canonicalization"
         );
     }
 }

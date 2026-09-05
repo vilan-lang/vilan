@@ -58,8 +58,8 @@ use crate::lexing;
 use crate::node::{
     BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration, CssItem, CssNested,
     CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExternBinding, Func,
-    GenericArguments, GenericParameter, GenericParameters, If, ImportBranch, MatchLeg, Node,
-    NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
+    GenericArguments, GenericParameter, GenericParameters, If, ImportBranch, ImportTail, MatchLeg,
+    Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -168,6 +168,24 @@ const TERMINATOR_EXPECTED: &str = "';'";
 /// — the path wanted one more name — and the "found X expected …" frame is what
 /// puts the token standing in the name's place into the message.
 const A_NAME_AFTER_PATH_SEPARATOR: &str = "a name after `::`";
+
+/// The expectation a `::` path that crosses a line break records (E142).
+///
+/// E135 fixed the case where NOTHING follows the `::`; it could not fix the
+/// worse one, where the next LINE follows it. `style::` ⏎ `print(..)` is the
+/// perfectly legal path `style::print`, so the parser read the next statement
+/// as the tail of this one and swallowed it, and no diagnostic could exist —
+/// there was no error to report. Only a rule that a path may not cross a line
+/// break turns that into something the parser can see, which is why this is a
+/// rule and not a recovery.
+///
+/// Spelled as an expectation, like its E135 sibling, so the "found X expected
+/// …" frame puts the name standing on the next line into the message; the
+/// steer names both cures, because the reason to write a path over two lines
+/// is that it is long, and a long path is what an alias is for.
+const A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE: &str = "a name after `::` on the same line: a `::` path does not cross a line break, because `a::` \
+     at the end of a line joins whatever the next line starts with — join the line, or import \
+     the path under a shorter name (`import a::b::c as d;`) and write `d`";
 
 /// The rule a program written before the `css` promotion breaks. Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
@@ -2521,6 +2539,53 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((arguments, self.span_from(start)))
     }
 
+    /// E142: the segment after a `::` must begin on the SAME line as the `::`.
+    /// Call with the separator just consumed; returns `Some(())` when the path
+    /// may continue, and `None` — with
+    /// [`A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE`] noted, so statement
+    /// recovery surfaces it once, located — when a newline sits between the
+    /// separator and the token after it.
+    ///
+    /// The rule lands on the two productions that COMMIT to a separator: the
+    /// expression path here and the `import`/`use` path. A type path and a
+    /// struct-literal head probe both tokens before consuming the `::` and
+    /// leave a trailing one exactly where it was, and they sit inside an
+    /// annotation or a literal head where there is no following STATEMENT to
+    /// swallow — which is the harm this rule exists to stop.
+    ///
+    /// The parser is otherwise entirely line-insensitive (`tokens_adjacent` is
+    /// byte adjacency, not line identity), so this reads the source text
+    /// directly: the gap between two tokens is trivia, and a newline in it is
+    /// the whole question.
+    fn separator_crosses_a_line(&self) -> bool {
+        let Some(separator) = self
+            .position
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+        else {
+            return false;
+        };
+        let from = separator.1.into_range().end;
+        let to = match self.tokens.get(self.position) {
+            Some((_, span)) => span.into_range().start,
+            None => self.eoi,
+        };
+        self.source
+            .get(from..to)
+            .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// [`Self::separator_crosses_a_line`] as the guard a path continuation
+    /// takes: notes the expectation and declines when the next segment is on
+    /// another line.
+    fn refuse_a_path_crossing_a_line(&mut self) -> Option<()> {
+        if self.separator_crosses_a_line() {
+            self.note_expected(A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE);
+            return None;
+        }
+        Some(())
+    }
+
     /// `head (:: member)*` — a `::` path. The head is a generic static head
     /// (`List<str>::…`) when a `::` follows generics, else the chain head atom.
     fn parse_static_accessor(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
@@ -2533,6 +2598,17 @@ impl<'a, 'src> Parser<'a, 'src> {
             let save = self.position;
             if !self.eat_op("::") {
                 break;
+            }
+            // E142: the next segment must start on this line. Declining here
+            // takes the same path the "nothing after the `::`" arm below takes
+            // — cursor rolled back, expectation noted, statement recovery
+            // reporting it once — because the two are one mistake seen from
+            // two sides: a path whose next name is not where a path's next name
+            // can be.
+            if self.separator_crosses_a_line() {
+                self.note_expected(A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE);
+                self.position = save;
+                return None;
             }
             match self.eat_ident() {
                 Some(member) => {
@@ -5192,19 +5268,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.parse_namespace_set()
     }
 
-    /// `name (:: branch)?` — one path in a namespace path (the chumsky `path`). The
-    /// name's `ImportBranch::Path` span is the name token only; the continuation is
-    /// a full [`Parser::parse_namespace_path`] (a further path or a set).
+    /// `name ( :: branch | as name )?` — one path in a namespace path (the
+    /// chumsky `path`). The name's `ImportBranch::Path` span is the name token
+    /// only; a `::` continuation is a full [`Parser::parse_namespace_path`] (a
+    /// further path or a set).
+    ///
+    /// `as` is CONTEXTUAL, not a keyword: it is recognized only here, where a
+    /// path segment has ended and the next two tokens are `as <name>`, so a
+    /// module or an item actually called `as` is unaffected and no existing
+    /// program's identifier is taken (E142). The alias renames the LEAF, so it
+    /// is an alternative to the `::` continuation rather than something that
+    /// can follow one — `a::b as c::d` does not parse, and the tail type says
+    /// so. It reaches a brace element by the same production: `{ a as b, c }`.
     fn parse_namespace_single_path(&mut self) -> Option<ImportBranch<'src>> {
         let start = self.position;
         let name = self.eat_name()?;
         let name_span = self.span_from(start);
-        let continuation = if self.eat_op("::") {
-            Some(Box::new(self.parse_namespace_path()?))
-        } else {
-            None
-        };
-        Some(ImportBranch::Path(name, name_span, continuation))
+        if self.eat_op("::") {
+            self.refuse_a_path_crossing_a_line()?;
+            let continuation = Box::new(self.parse_namespace_path()?);
+            return Some(ImportBranch::Path(
+                name,
+                name_span,
+                ImportTail::Continue(continuation),
+            ));
+        }
+        if self.peek() == Some(&Token::Ident("as"))
+            && matches!(self.peek_at(1), Some(Token::Ident(_)))
+        {
+            self.bump();
+            let alias_start = self.position;
+            let alias = self.eat_name().expect("peeked as an identifier");
+            return Some(ImportBranch::Path(
+                name,
+                name_span,
+                ImportTail::Alias(alias, self.span_from(alias_start)),
+            ));
+        }
+        Some(ImportBranch::Path(name, name_span, ImportTail::Leaf))
     }
 
     /// `{ path, ... }` — a brace-delimited set of paths (allow-trailing). Each
@@ -6596,13 +6697,16 @@ mod tests {
     fn import_recursive_path_and_brace_set() {
         // `std::collections::{ Map, Set }` — a `::` path ending in a set.
         match only_item("import std::collections::{ Map, Set };") {
-            Node::Import(ImportBranch::Path("std", _, Some(next))) => match &*next {
-                ImportBranch::Path("collections", _, Some(set)) => match &**set {
-                    ImportBranch::Set(members) => assert_eq!(members.len(), 2),
-                    other => panic!("expected a Set continuation, got {other:?}"),
-                },
-                other => panic!("expected a nested path, got {other:?}"),
-            },
+            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next))) => {
+                match &*next {
+                    ImportBranch::Path("collections", _, ImportTail::Continue(set)) => match &**set
+                    {
+                        ImportBranch::Set(members) => assert_eq!(members.len(), 2),
+                        other => panic!("expected a Set continuation, got {other:?}"),
+                    },
+                    other => panic!("expected a nested path, got {other:?}"),
+                }
+            }
             other => panic!("expected Import(Path), got {other:?}"),
         }
     }
@@ -6611,7 +6715,7 @@ mod tests {
     fn use_bare_path_and_export_reexport() {
         assert!(matches!(
             only_item("use option::Some;"),
-            Node::Use(ImportBranch::Path("option", _, Some(_)))
+            Node::Use(ImportBranch::Path("option", _, ImportTail::Continue(_)))
         ));
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).

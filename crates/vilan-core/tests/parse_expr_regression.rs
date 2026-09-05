@@ -332,13 +332,19 @@ fn an_unfinished_path_names_the_missing_name() {
 /// statement` on the `::` — the element on the next line read as a comparison
 /// once the `::` rolled back, and the whole statement degenerated. The second is
 /// the same mistake terminated on its own line.
+///
+/// E142 sharpened the FIRST of the two. Its `<` is on the line below the `::`,
+/// so the line rule now recognizes it before the missing-name arm does, and
+/// says the more specific thing: the name is not missing, it is on another
+/// line. The second pin — terminated on its own line — still carries E135's
+/// own message, which is the pair working exactly as intended.
 #[test]
 fn an_unfinished_path_before_an_element_reports_once_at_the_element() {
     let source = "fun panel(): View {\n\tlet x = style::\n\t<div class(\"panel\")></div>\n}\n";
     assert_eq!(
         diagnostics_at(source),
         vec![(
-            "found '<' expected a name after `::`".to_string(),
+            A_NAME_ON_THIS_LINE.replace("found 'print'", "found '<'"),
             "<".to_string()
         )],
     );
@@ -354,6 +360,73 @@ fn an_unfinished_path_reports_once_when_the_statement_is_terminated() {
             ";".to_string()
         )],
     );
+}
+
+/// E142. E135's UNFIXED face: `style::` at the end of a line and `print(..)` on
+/// the next is the perfectly legal path `style::print`, so the parser read the
+/// following statement as this one's tail and swallowed it — no diagnostic
+/// could exist, because nothing was wrong. A `::` path may not cross a line
+/// break, which is what turns the swallow into something the parser can see.
+///
+/// The census that made the rule free is in the lane report: zero lines end in
+/// `::` across the 228 `.vl` files of the tree, kolt's 25, and the book.
+const A_NAME_ON_THIS_LINE: &str = "found 'print' expected a name after `::` on the same line: \
+     a `::` path does not cross a line break, because `a::` at the end of a line joins whatever \
+     the next line starts with — join the line, or import the path under a shorter name \
+     (`import a::b::c as d;`) and write `d`";
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_an_expression() {
+    let source = "fun demo() {\n\tlet x = style::\n\tprint(\"swallowed\");\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(A_NAME_ON_THIS_LINE.to_string(), "print".to_string())],
+    );
+}
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_an_import() {
+    let source = "import std::io::\nprint;\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(A_NAME_ON_THIS_LINE.to_string(), "print".to_string())],
+    );
+}
+
+#[test]
+fn a_path_on_one_line_is_untouched_by_the_rule() {
+    // The control the rule must not eat: the same two paths, joined. Both parse
+    // clean, so the rule is about the LINE BREAK and nothing else.
+    assert!(
+        parse_clean("import std::io::print;\nfun demo() { let x = style::print; }\n").is_some()
+    );
+    // And a break INSIDE a brace set — which is not a `::` continuation — is
+    // still how a long import wraps.
+    assert!(parse_clean("import std::io::{\n\tprint,\n};\n").is_some());
+}
+
+/// E142's other half: `as` renames an import's leaf, and it is CONTEXTUAL — a
+/// module or item genuinely called `as` still parses, because the alias is only
+/// read where a segment has ended and a NAME follows.
+#[test]
+fn an_import_alias_parses_in_every_position_it_is_offered() {
+    for source in [
+        "import a::b::c as d;\n",
+        "import a as b;\n",
+        "import a::{ b as x, c };\n",
+        "import a::b::{ self as base, c as z };\n",
+        "use a::B::{ C as Alias };\n",
+        "export import a::b as c;\n",
+    ] {
+        assert!(parse_clean(source).is_some(), "{source:?} should parse");
+    }
+    // `as` is not a keyword: it is still an ordinary name.
+    assert!(parse_clean("import a::as;\n").is_some());
+    assert!(parse_clean("fun demo() { let as = 1; }\n").is_some());
+    // An alias renames the LEAF, so it cannot be followed by more path.
+    assert!(parse_clean("import a::b as c::d;\n").is_none());
+    // And `as` with nothing after it is not an alias.
+    assert!(parse_clean("import a::b as;\n").is_none());
 }
 
 /// E136. A multi-value attribute is one mistake with one message, and the
