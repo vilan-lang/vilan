@@ -1408,57 +1408,275 @@ fn checking_a_module_file_a_sibling_imports_is_clean() {
     );
 }
 
+// --- M34: `check` runs emission for its refusals, not for its text ---
+//
+// `vilan check` of an ENTRY used to call `transform` and drop the JavaScript,
+// so a check cost what a build cost. It now calls `transformer::diagnose`,
+// which runs the same `assemble` and skips only the scope rename and the
+// formatting. `transform` refuses four ways — the missing `main`, and the
+// never-silent B55/B68/B176 internal refusals, each of which is a fact about
+// what the WALK produced — so the walk cannot be skipped, and these pins hold
+// `check` to `build`'s answer rather than to a claim about the code.
+
+/// The one refusal an author can actually reach: emission's missing `main`.
+/// It is decided at the top of `assemble`, before any of the walk, and a
+/// `check` that stopped calling the transformer would go green here — which is
+/// exactly what makes this pin non-vacuous. Both verdicts and both renderings
+/// are compared, so it also holds `check` to the ENTRY-attribution E113's
+/// twin above asserts for `build`.
 #[test]
-fn checking_a_module_file_that_imports_a_declared_entry_agrees_with_the_package() {
-    // B240, end to end, and the other half of the fixture above. `views.vl`
-    // importing `pkg::client::helper` is not a module cycle: `client` is one of
-    // the package's PROGRAMS. `vilan check .` refuses it — its `client` leg
-    // compiles that very file as the entry, where a sibling resolves its
-    // imports before the entry walks — while `vilan check src/views.vl` was
-    // clean, because file mode could not see that a sibling was declared. Both
-    // verdicts are asserted here, in one fixture, for the reason the pin above
-    // asserts both: the whole complaint is that they disagreed.
+fn check_refuses_a_missing_main_exactly_as_build_does() {
     let dir = temp_files(
-        "open_module_imports_entry",
+        "m34_no_main",
         &[
+            ("vilan.toml", MANIFEST),
             (
-                "vilan.toml",
-                "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
-                 [entry.client]\n\n[entry.server]\n",
+                "src/main.vl",
+                "import pkg::alpha::value;\n\nfun helper(): str {\n\tvalue()\n}\n",
+            ),
+            ("src/alpha.vl", "fun value(): str {\n\t\"ok\"\n}\n"),
+        ],
+    );
+    let built = vilan(&dir, &["build", "."], true);
+    let built_stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "the check fails: {checked_stderr}"
+    );
+    assert!(
+        checked_stderr.contains("Cannot execute program without a main function"),
+        "and says why: {checked_stderr}"
+    );
+    assert_eq!(
+        checked_stderr, built_stderr,
+        "check and build render the same refusal, byte for byte"
+    );
+    assert!(
+        renders_in(&checked_stderr, "main.vl", "import pkg::alpha::value;"),
+        "in the entry, quoting its first line: {checked_stderr}"
+    );
+}
+
+/// The other half of the same claim: for a program the ANALYZER refuses, the
+/// two commands still say the same thing. A `check` that skipped emission
+/// would pass this one, which is why it is a control and not the pin — it
+/// guards the direction the change could break by accident (a diagnostic
+/// dropped, re-ordered, or rendered against the wrong text once the emission
+/// tail stopped running).
+#[test]
+fn check_and_build_render_an_analyzer_refusal_identically() {
+    let dir = temp_files(
+        "m34_module_error",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::alpha::value;\n\nfun main() {\n\tprint(value());\n}\n",
             ),
             (
-                "src/views.vl",
-                "import pkg::client::helper;\n\nfun render(): i32 { helper() }\n",
-            ),
-            (
-                "src/client.vl",
-                "import std::io::print;\nimport pkg::views::render;\n\n\
-                 fun helper(): i32 { 1 }\n\nfun main() {\n\tprint(render());\n}\n",
-            ),
-            (
-                "src/server.vl",
-                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+                "src/alpha.vl",
+                "fun value(): str {\n\tlet x: i32 = \"not an int\";\n\t\"ok\"\n}\n",
             ),
         ],
     );
-    let file = vilan(&dir, &["check", "src/views.vl"], true);
-    let file_stderr = String::from_utf8_lossy(&file.stderr).into_owned();
-    let package = vilan(&dir, &["check", "."], true);
-    let package_stderr = String::from_utf8_lossy(&package.stderr).into_owned();
+    let built = vilan(&dir, &["build", "."], true);
+    let built_stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!built.status.success(), "the build fails: {built_stderr}");
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "and so does the check: {checked_stderr}"
+    );
+    assert_eq!(
+        checked_stderr, built_stderr,
+        "with the same rendering, byte for byte"
+    );
+}
+
+/// The clean control. A program with a `main` that emits is green under both,
+/// and `check` still writes no artifact — the walk it now runs is for its
+/// refusals, and a `check` that started emitting would be a different bug.
+#[test]
+fn check_of_a_sound_entry_is_green_and_writes_nothing() {
+    let dir = temp_package(
+        "m34_clean",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let wrote_dist = dir.join("dist").exists();
+    let wrote_beside = dir.join("src/main.mjs").exists();
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        package_stderr.contains("`pkg::client` is this program's entry file"),
-        "the package refuses the import of a program: {package_stderr}"
+        checked.status.success(),
+        "the check passes: {checked_stderr}"
     );
     assert!(
-        file_stderr.contains("`pkg::client` is this program's entry file"),
-        "and so does the module the editor opens: {file_stderr}"
+        checked_stderr.is_empty(),
+        "with nothing on stderr: {checked_stderr}"
     );
-    // B236: one mistake, one report, in the surface that renders it.
+    assert!(!wrote_dist && !wrote_beside, "and no emitted artifact");
+}
+
+// --- M35: a multi-entry check compiles its entries in parallel -------------
+//
+// The members of a workspace are independent analyses that shared one thread.
+// They now share a process instead: the first runs alone (it fills the
+// process-global caches every later one hits), and the rest run one thread
+// each. Their diagnostics are captured rather than raced to stderr, and
+// replayed in MEMBER order with the B182 ledger applied there — so what a
+// reader sees is what a sequential round wrote, and nothing about the
+// scheduler reaches the terminal.
+
+/// A three-entry package with a mistake in the module all three reach AND one
+/// mistake of its own per entry — the shape that makes both halves of the
+/// ordering observable: the shared error is claimed by exactly one member, and
+/// the per-entry errors say which member reported when.
+fn three_entries_each_with_a_mistake() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "struct Store {\n\tname: str,\n}\n\nfun shared_oops(): i32 {\n\t\"shared\"\n}\n",
+        ),
+        (
+            "src/client.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun client_oops(): i32 {\n\t\"client\"\n}\n\n\
+             fun main() {\n\tprint(\"client\");\n}\n",
+        ),
+        (
+            "src/server.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun server_oops(): i32 {\n\t\"server\"\n}\n\n\
+             fun main() {\n\tprint(\"server\");\n}\n",
+        ),
+        (
+            "src/probe.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun probe_oops(): i32 {\n\t\"probe\"\n}\n\n\
+             fun main() {\n\tprint(\"probe\");\n}\n",
+        ),
+    ]
+}
+
+/// `vilan check .` with the members compiled one after another
+/// (`VILAN_SEQUENTIAL_CHECK=1`) — the reference a parallel round is held to.
+fn check_stderr_sequential(dir: &Path) -> (Output, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(dir)
+        .args(["check", "."])
+        .env("NO_COLOR", "1")
+        .env("VILAN_SEQUENTIAL_CHECK", "1")
+        .output()
+        .expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output, stderr)
+}
+
+/// Determinism, asserted the only way it can be: the same round, run again,
+/// writes the same bytes. Three runs, because two agreeing could be two runs
+/// the scheduler happened to order the same way.
+#[test]
+fn a_parallel_check_writes_the_same_bytes_every_run() {
+    let dir = temp_files("m35_determinism", &three_entries_each_with_a_mistake());
+    let runs: Vec<(Option<i32>, String)> = (0..3)
+        .map(|_| {
+            let (output, stderr) = check_stderr(&dir);
+            (output.status.code(), stderr)
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
     assert_eq!(
-        error_headers(&file_stderr).len(),
-        1,
-        "with no cascade over the name it did not bind: {file_stderr}"
+        error_headers(&runs[0].1).len(),
+        4,
+        "the fixture must actually produce several diagnostics from several \
+         members: {}",
+        runs[0].1
+    );
+    for (index, run) in runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            run, &runs[0],
+            "run {index} differs from the first — the round's output must not \
+             depend on which member finished when"
+        );
+    }
+}
+
+/// And the bytes are the SEQUENTIAL round's bytes, which is the stronger
+/// claim: a parallel round that were merely self-consistent could still have
+/// re-ordered or re-attributed what it printed.
+#[test]
+fn a_parallel_check_writes_what_a_sequential_one_writes() {
+    let dir = temp_files("m35_sequential_twin", &three_entries_each_with_a_mistake());
+    let (parallel, parallel_stderr) = check_stderr(&dir);
+    let (sequential, sequential_stderr) = check_stderr_sequential(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        parallel.status.code(),
+        sequential.status.code(),
+        "the verdict is the same"
+    );
+    assert_eq!(
+        parallel_stderr, sequential_stderr,
+        "and so is every byte of the report"
+    );
+}
+
+/// The order itself, named rather than inferred from the twin above: members
+/// arrive alphabetically (a `BTreeMap`), and the report follows them — so the
+/// shared module's one error is claimed by the FIRST member that reaches it,
+/// exactly as it was when the loop was a loop.
+#[test]
+fn a_parallel_check_reports_in_member_order() {
+    let dir = temp_files("m35_member_order", &three_entries_each_with_a_mistake());
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    // The file each diagnostic renders in, which is what the location header
+    // names — the function names are a line above the quoted one and never
+    // reach the report.
+    let positions: Vec<(&str, usize)> = ["client.vl", "probe.vl", "server.vl"]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                stderr
+                    .find(name)
+                    .unwrap_or_else(|| panic!("{name} must be reported: {stderr}")),
+            )
+        })
+        .collect();
+    assert!(
+        positions[0].1 < positions[1].1 && positions[1].1 < positions[2].1,
+        "client, probe, server — the members' own order: {positions:?}\n{stderr}"
+    );
+    // And the shared module's one report sits with the FIRST member that
+    // reached it, not wherever a thread happened to finish.
+    let shared_at = stderr.find("store.vl").expect("the shared error renders");
+    assert!(
+        positions[0].1 < shared_at && shared_at < positions[1].1,
+        "the shared error is the first member's: {stderr}"
+    );
+    let shared = error_headers(&stderr)
+        .iter()
+        .filter(|header| header.contains("Expected i32, but got str"))
+        .count();
+    assert_eq!(
+        shared, 4,
+        "three per-entry mistakes and the shared one, reported once: {stderr}"
     );
 }
