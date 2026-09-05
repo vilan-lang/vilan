@@ -6576,3 +6576,289 @@ fn b230_the_payload_check_holds_inside_an_async_body() {
         "Expected Result<i32, str>, but got Result<bool, str> instead.",
     );
 }
+
+// --- B233: an operator over two DIFFERENT rigid parameters ------------------
+//
+// The generic-bounded dispatch path — `x + y` where `x: T: Add`, recorded as
+// `GenericDispatch::OnConstraint` — checked the LEFT operand's bound (B174) and
+// then recorded the dispatch without ever asking about the RIGHT one. B180's
+// operand rule reaches only a NOMINAL left operand, so `fun sum<P: Add, Q>(a:
+// P, b: Q): P { a + b }` compiled and `sum(1, "two")` printed `1two`: a `str`
+// handed back through a signature declaring `P`, which that very call bound to
+// `i32`.
+//
+// The bound is where a parameterized operand IS declarable (`P: Add<Q>` says a
+// `P` adds a `Q`), and a bare `P: Add` means `Add<B = Self>` — the operand is a
+// `P`, and only a `P`. The rule fires only over parameters the ENCLOSING
+// declaration owns: `generic_is_rigid_here`, B219's shared predicate, asked
+// with the operator's own scope.
+//
+// CENSUS across std, the corpus, the docs fences, the examples, kolt and the
+// website: exactly ONE declaration takes two generic parameters as parameter
+// types and writes an operator — `std::reactive::reconcile<T, K: PartialEq>`,
+// whose `old_keys[index] == item_key` compares a `K` with a `K`. Zero programs
+// put two DIFFERENT parameters on one operator, so nothing in the estate stops
+// compiling.
+
+#[test]
+fn b233_two_different_parameters_on_an_operator_are_refused() {
+    // The filed shape. Pre-fix this compiled and `sum(1, "two")` ran, printing
+    // the host's `1 + "two"`.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun sum<P: Add, Q>(a: P, b: Q): P { a + b }
+        fun main() { print(sum(1, "two")); }
+        "#,
+        "`P`'s `add` accepts `P`, but the right operand is `Q`",
+    );
+}
+
+#[test]
+fn b233_the_refusal_steers_to_the_bound_not_to_an_impl() {
+    // B180's steer names an impl over the same parameter, which a PARAMETER
+    // left operand has no subject for (`impl P<type Q>` is not a declaration).
+    // The declaration that works here is the bound itself.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun sum<P: Add, Q>(a: P, b: Q): P { a + b }
+        fun main() { print(sum(1, "two")); }
+        "#,
+        "or say so in the bound (`<P: Add<Q>>`)",
+    );
+}
+
+#[test]
+fn b233_a_bound_on_the_right_operand_proves_nothing() {
+    // `Q: Add` is still not "Q is a P". A bound promises a trait's methods,
+    // never membership of the left operand's admitted set — B179's ruling, one
+    // level along.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun sum<P: Add, Q: Add>(a: P, b: Q): P { a + b }
+        fun main() { print(sum(1, "two")); }
+        "#,
+        "`P`'s `add` accepts `P`, but the right operand is `Q`",
+    );
+}
+
+#[test]
+fn b233_the_same_parameter_on_both_sides_still_adds() {
+    // The control: one parameter twice is exactly "same parameter", which the
+    // rigid comparison accepts. `std::reactive::reconcile`'s `==` is this
+    // shape, and it is the whole of the estate's use.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        fun twice<P: Add>(a: P, b: P): P { a + b }
+        fun main() { print(twice(1, 2)); }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b233_a_parameterized_bound_declares_the_other_parameter() {
+    // `P: Add<Q>` DOES say a `P` takes a `Q` there, and is accepted. The
+    // position is recovered by its written SPELLING (B216's rule): `Add<B =
+    // Self>`'s `b: B` interns as the default's type — the same type `Self`
+    // spells inside the trait — so neither the positional substitution nor
+    // `substitute_type` reaches it.
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+        fun sum<Q, P: Add<Q>>(a: P, b: Q): P { a + b }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b233_the_declaration_order_of_the_parameterized_bound_does_not_matter() {
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+        fun sum<P: Add<Q>, Q>(a: P, b: Q): P { a + b }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b233_the_rule_reaches_every_dispatched_operator_not_only_add() {
+    // One channel, every operator: `==` arrives at the same
+    // `GenericDispatch::OnConstraint` recording.
+    assert_fails_with(
+        r#"
+        import std::compare::PartialEq;
+        fun same<P: PartialEq, Q>(a: P, b: Q): bool { a == b }
+        fun main() {}
+        "#,
+        "`P`'s `eq` accepts `P`, but the right operand is `Q`",
+    );
+}
+
+#[test]
+fn b233_the_implicit_generic_sugar_is_held_to_the_same_rule() {
+    // B186's sugar declares the same two parameters, one per written trait, and
+    // reaches the same site.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        import std::display::Display;
+        fun sum(a: Add, b: Display) { let c = a + b; print("{c}"); }
+        fun main() { sum(1, "two"); }
+        "#,
+        "but the right operand is `Display`",
+    );
+}
+
+#[test]
+fn b233_a_concrete_right_operand_against_a_bounded_parameter_still_compiles() {
+    // The BOUNDARY, stated as a pin so a later tightening has to move it
+    // deliberately: this rule is about two parameters meeting. A concrete right
+    // operand against a bounded parameter is a wider question (an `impl Bag
+    // with Add` reached with an `i32` is its own defect) and is left exactly as
+    // it stands.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        fun bump<P: Add>(a: P): P { a + 1 }
+        fun main() { print(bump(1)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b233_a_nominal_left_operand_keeps_b180s_own_steer() {
+    // B180's site is untouched: a left operand with a subject to name still
+    // gets the impl advice, not the bound advice.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        struct Bag<T> { n: T }
+        impl Bag<type T> with Add<T> {
+            fun add(self, other: T): Bag<T> { self }
+        }
+        fun f<P, Q>(a: Bag<P>, b: Q): Bag<P> { a + b }
+        fun main() {}
+        "#,
+        "one impl written over that same parameter (`impl Bag<type Q> with Add<Q>`)",
+    );
+}
+
+// --- B234: a rigid parameter is not a condition -----------------------------
+//
+// The B28 condition check skipped `Type::Generic` outright, so `fun f<T>(x: T)
+// { if x { } }` compiled and every instantiation reached the host's truthiness
+// test — `f(1)` took the branch, `f(0)` did not, and `for x { }` over a truthy
+// value looped forever. Under B211 a parameter is a fixed, unknown type inside
+// its own body, and nothing can fix this at the declaration either: `bool`'s
+// admitted set is `bool` itself and no trait names it, which is `!`'s ruling
+// (B200) one position along. Refused through `generic_is_rigid_here`, so a
+// parameter the SITE is still inferring stays the call's business.
+//
+// CENSUS across std, the corpus, the docs fences, the examples, kolt and the
+// website: 67 bare-identifier `if`/`for` conditions, ZERO of them on a value
+// typed by a generic parameter (the one grep hit, `binary.vl`'s `if value`, is
+// a `value: bool`). Nothing in the estate stops compiling.
+
+#[test]
+fn b234_a_parameter_is_not_an_if_condition() {
+    assert_fails_with(
+        r#"
+        fun f<T>(x: T) { if x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "this `if` condition is `T`, and a condition must be `bool`",
+    );
+}
+
+#[test]
+fn b234_a_parameter_is_not_a_for_condition() {
+    // The same check, the other construct it guards — and the worse miscompile:
+    // a truthy instantiation never leaves the loop.
+    assert_fails_with(
+        r#"
+        fun f<T>(x: T) { for x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "this `for` condition is `T`, and a condition must be `bool`",
+    );
+}
+
+#[test]
+fn b234_a_bound_cannot_make_a_parameter_a_bool() {
+    // Bounding it changes nothing, and the message says why: no trait names
+    // `bool`'s set, so no bound can prove membership.
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        fun f<T: Display>(x: T) { if x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b234_an_impls_own_binder_is_refused_in_its_body() {
+    // The impl-binder half of the same rigidity (B77: an impl binder inherits
+    // the subject declaration's ids, so the method body owns it too).
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun show(self) { if self.value { print("y"); } }
+        }
+        fun main() { Cell { value = 1 }.show(); }
+        "#,
+        "and a condition must be `bool`",
+    );
+}
+
+#[test]
+fn b234_the_negation_keeps_b200s_own_refusal() {
+    // `!x` was already refused, by the unary operand rule, and keeps its own
+    // wording — the two rules are the same ruling at two sites, not one
+    // diagnostic wearing two hats.
+    assert_fails_with(
+        r#"
+        fun f<T>(x: T) { if !x { print("y"); } }
+        fun main() { f(1); }
+        "#,
+        "`!` negates a `bool`, and `T` is a type parameter",
+    );
+}
+
+#[test]
+fn b234_a_concrete_bool_condition_still_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun f(x: bool) { if x { print("y"); } }
+        fun main() { f(true); }
+        "#,
+        "y\n",
+    );
+}
+
+#[test]
+fn b234_a_parameter_the_call_site_binds_to_bool_still_compiles() {
+    // The other side of `generic_is_rigid_here`: the condition here is a CALL's
+    // return, whose parameter this site is inferring rather than owning, and the
+    // call binds it to `bool`. Nothing rigid meets the condition.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun pick<T>(a: T, b: T): T { a }
+        fun main() { if pick(true, false) { print("y"); } }
+        "#,
+        "y\n",
+    );
+}

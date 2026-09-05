@@ -1991,3 +1991,88 @@ fn b216_a_parameterized_supertrait_argument_of_the_wrong_type_is_still_refused()
         "Expected i32, but got str instead.",
     );
 }
+
+// --- B235: a `= Self` default is not a bound --------------------------------
+//
+// A defaulted trait parameter (`trait Mixer<A = Self, B = Self>`) interns as
+// its DEFAULT's type rather than as a binder, and `generic_bound_traits`'s
+// fallback — "an unlisted parameter's own type IS its single bound", which is
+// how `<T: Display>` recovers `Display` from the id — then read that default as
+// a requirement. Reached through a sub-trait's parameterized clause (`trait
+// Mixed with Mixer<i32, str>`) the clause argument substitutes the parameter
+// and is checked against it, so the declaring trait was demanded of its own
+// arguments: `'i32' does not implement trait 'Mixer'`, and the same for `str`.
+//
+// A default says what a position MEANS when no argument is supplied; it never
+// says what an argument must be. `Add<i32>` escaped only because `i32`
+// genuinely implements `Add`. A parameter's own bounds are untouched — they
+// live in `generic_bounds`, which the walk consults first.
+
+#[test]
+fn b235_a_self_defaulted_parameter_is_not_required_of_the_clause_argument() {
+    // The filed shape, and both defaulted parameters at once.
+    assert_compiles(
+        r#"
+        trait Mixer<A = Self, B = Self> {
+            fun mix(self, a: A, b: B): str;
+        }
+        trait Mixed with Mixer<i32, str> {
+            fun describe(self): str { self.mix(1, "two") }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b235_the_add_control_still_compiles() {
+    // `Add<B = Self>` under a parameterized clause was the shape that ESCAPED —
+    // `i32` implements `Add`, so demanding it of the argument happened to hold.
+    // It still compiles, for the right reason now.
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+        trait Adder with Add<i32> {
+            fun twice(self): Self { self.add(1) }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b235_a_genuinely_bounded_parameter_still_refuses_its_argument() {
+    // The counterweight: a WRITTEN bound is a requirement, and a clause
+    // argument that cannot meet it is refused exactly as before.
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        trait Shower<A: Display> {
+            fun show_it(self, a: A): str;
+        }
+        struct Opaque { n: i32 }
+        trait Shown with Shower<Opaque> {
+            fun go(self): str { self.show_it(Opaque { n = 1 }) }
+        }
+        fun main() {}
+        "#,
+        "'Opaque' does not implement trait 'Display', required by a generic bound of this call",
+    );
+}
+
+#[test]
+fn b235_a_defaulted_parameter_the_clause_left_out_is_still_no_bound() {
+    // The argument-less clause: the default MEANS the sub-trait, and still
+    // requires nothing of anybody (B216 pins what the position resolves TO).
+    assert_compiles(
+        r#"
+        trait Mixer<A = Self> {
+            fun mix(self, a: A): str;
+        }
+        trait Mixed with Mixer {
+            fun describe(self): str { self.mix(self) }
+        }
+        fun main() {}
+        "#,
+    );
+}

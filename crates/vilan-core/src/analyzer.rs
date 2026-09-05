@@ -3108,6 +3108,13 @@ pub struct Analyzer<'src> {
     // not during the walk); member resolution on a `T`-typed value searches every
     // bound.
     generic_bounds: HashMap<TypeId, Vec<TypeId>>,
+    // The type ids a DEFAULTED trait/declaration parameter (`trait Mixer<A =
+    // Self, B = Self>`) interns as — its default's type, not a binder (B235).
+    // A default is not a bound: it says what the position MEANS when no
+    // argument is supplied, never what an argument must implement. The ids are
+    // minted per spelling and never interned, so recording the occurrence is
+    // enough to tell `A = Self` apart from a genuine `T: Mixer`.
+    defaulted_parameter_types: HashSet<TypeId>,
     // The tuple bound of a generic parameter (`T: (2..)` / `(..: Display)` —
     // variadic-generics.md §"Arity & element bounds"), keyed by the parameter's
     // constraint id. Enforced wherever trait bounds are
@@ -4269,6 +4276,7 @@ impl<'src> Analyzer<'src> {
             generic_constraint_names: HashMap::default(),
             generic_dispatch: HashMap::default(),
             generic_bounds: HashMap::default(),
+            defaulted_parameter_types: HashSet::default(),
             tuple_bounds: HashMap::default(),
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
@@ -15589,7 +15597,21 @@ impl<'src> Analyzer<'src> {
             _ => None,
         }
         .unwrap_or_else(|| subject_label.clone());
-        let steer = if matches!(rhs_type, Type::Generic(_)) {
+        let steer = if matches!(rhs_type, Type::Generic(_)) && matches!(lhs_type, Type::Generic(_))
+        {
+            // B233: the left operand is a PARAMETER, so the impl advice above
+            // has no subject to name (`impl P<type Q>` is not a declaration).
+            // The declaration that works is the bound itself — a parameterized
+            // one says exactly "a `P` takes a `Q` here", which is the whole of
+            // what this refusal is missing.
+            format!(
+                "a parameter promises a trait's METHODS, never that it IS \
+                 `{declared_label}`, so no bound on `{rhs_label}` can prove membership. \
+                 Declare the operand `{declared_label}`, or say so in the bound \
+                 (`<{subject_label}: {trait_name}<{rhs_label}>>`), which every \
+                 instantiation must then satisfy"
+            )
+        } else if matches!(rhs_type, Type::Generic(_)) {
             format!(
                 "a parameter promises a trait's METHODS, never that it IS \
                  `{declared_label}`, so no bound on `{rhs_label}` can prove membership. \
@@ -15618,6 +15640,131 @@ impl<'src> Analyzer<'src> {
             binary_id,
         );
         true
+    }
+
+    /// The argument a parameterized use of `trait_id` supplies for the position
+    /// `declared_id` — matched by the position's WRITTEN spelling against the
+    /// trait's own parameter names, which is the only thing separating a
+    /// `= Self`-defaulted parameter from a `Self` spelled outright (B216, and
+    /// `supertrait_position_type`'s rule). `None` when the spelling cannot be
+    /// recovered, when it names no parameter of the trait, or when the use
+    /// supplied no argument in that position — and the caller then leaves the
+    /// position exactly as declared.
+    fn written_parameter_argument(
+        &self,
+        trait_id: Id,
+        arguments: &[TypeId],
+        declared_id: TypeId,
+    ) -> Option<TypeId> {
+        let written = self
+            .written_type_spellings
+            .iter()
+            .find(|(written_id, _)| *written_id == declared_id)
+            .map(|(_, name)| *name)?;
+        let index = self
+            .traits
+            .get(&trait_id)?
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written)?;
+        arguments.get(index).copied()
+    }
+
+    /// B233: the right operand of an operator dispatched through the left
+    /// operand's BOUND — `a + b` inside `fun sum<P: Add, Q>(a: P, b: Q)`.
+    /// Pushes the refusal and answers `true` when the operand does not belong
+    /// there.
+    ///
+    /// B180 ruled the operand roles for a NOMINAL left operand and B174 ruled
+    /// the bound the parameter needs, and between them the generic-bounded
+    /// dispatch path checked the LEFT operand and then recorded the dispatch
+    /// without ever looking at the right one. So `fun sum<P: Add, Q>(a: P, b:
+    /// Q): P { a + b }` compiled and `sum(1, "two")` printed `1two` — a `str`
+    /// returned through a signature declaring `P`, which the call bound to
+    /// `i32`. Every dispatched operator had it: `-`, `*`, the bitwise pair,
+    /// `==` and the orderings all reach the same `GenericDispatch::OnConstraint`
+    /// channel.
+    ///
+    /// The declared `B` comes from the bound, and the bound is where a
+    /// parameterized one supplies it: `P: Add<Q>` DOES declare that a `P` adds
+    /// a `Q`, and is accepted, while a bare `P: Add` means `Add<B = Self>` —
+    /// the operand is a `P`, and only a `P`. The trait that declares the
+    /// operator method may be a SUPERTRAIT of the bound (`P: Ord` reaching
+    /// `PartialOrd`'s `lt`), so the arguments are taken at the declaring trait
+    /// through `method_member_in_trait_at`, exactly as a method call on a
+    /// bounded receiver takes them.
+    ///
+    /// The rule fires only when the right operand is a parameter the ENCLOSING
+    /// declaration owns — `generic_is_rigid_here`, B219's shared predicate,
+    /// asked here with the operator's own scope in `rigid_binder_scope` (this
+    /// check runs in `finalize_build`, outside constraint resolution, where the
+    /// scope is otherwise `None`). A parameter the site is INFERRING is a hole
+    /// the call fills and the call site's own business; a CONCRETE right
+    /// operand against a bounded parameter (`fun bump<P: Add>(a: P) { a + 1 }`)
+    /// is a wider question than this one, left as it stands.
+    fn refuse_operator_right_operand_on_bound(
+        &mut self,
+        op: BinaryOp,
+        symbol: &str,
+        binary_id: Id,
+        rhs_id: Option<Id>,
+        constraint_id: TypeId,
+        lhs_type: &Type,
+    ) -> bool {
+        let (Some(rhs_id), Some((_, method_name))) = (rhs_id, operator_trait_method(op)) else {
+            return false;
+        };
+        let rhs_type = self.infer_type(rhs_id, lhs_type, &HashMap::default());
+        let Type::Generic(rhs_constraint_id) = rhs_type else {
+            return false;
+        };
+        let scope_id = self.expr_id_to_scope_id_map.get(&binary_id).copied();
+        let saved_scope = std::mem::replace(&mut self.rigid_binder_scope, scope_id);
+        let both_rigid = self.generic_is_rigid_here(constraint_id)
+            && self.generic_is_rigid_here(rhs_constraint_id);
+        self.rigid_binder_scope = saved_scope;
+        if !both_rigid {
+            return false;
+        }
+        let Some((member_id, declaring_trait_id, declaring_arguments)) = self
+            .generic_bound_traits(constraint_id)
+            .into_iter()
+            .find_map(|(trait_id, trait_arguments)| {
+                self.method_member_in_trait_at(trait_id, &trait_arguments, method_name)
+            })
+        else {
+            return false;
+        };
+        let mut bindings =
+            self.trait_parameter_substitution(declaring_trait_id, &declaring_arguments);
+        // The operand position's own id, bound to the argument the BOUND wrote
+        // for it. A defaulted parameter interns as its default rather than as a
+        // binder, so `Add<B = Self>`'s `b: B` is `Type::Trait(Add, [])` — the
+        // very type `Self` spells inside the same trait, and an id distinct
+        // from the one the trait recorded for the parameter, so neither the
+        // positional substitution above nor `substitute_type` reaches it. It is
+        // decided by its SPELLING instead, B216's rule at
+        // `supertrait_position_type` applied at the operand: a position spelled
+        // with one of the declaring trait's parameter names IS that parameter,
+        // and takes the matching argument.
+        if let Some(declared_id) = self.second_parameter_type_id(member_id)
+            && let Some(argument_id) = self.written_parameter_argument(
+                declaring_trait_id,
+                &declaring_arguments,
+                declared_id,
+            )
+        {
+            bindings.insert(declared_id, argument_id);
+        }
+        self.refuse_operator_right_operand(
+            op,
+            symbol,
+            binary_id,
+            Some(rhs_id),
+            member_id,
+            lhs_type,
+            &bindings,
+        )
     }
 
     /// Resolves a method `member_name` declared by `trait_id` — a default method
@@ -21711,6 +21858,11 @@ impl<'src> Analyzer<'src> {
                 if let Some(default) = &parameter.default {
                     let default_type_id = self.walk_type_node(default, scope_id);
                     self.register_defaulted_parameter(parameter.name, default_type_id, scope_id);
+                    // B235: and it is a DEFAULT, not a bound. Recorded here, at
+                    // the one place a default interns, so every reader of "what
+                    // does this parameter REQUIRE" gets the same answer:
+                    // nothing.
+                    self.defaulted_parameter_types.insert(default_type_id);
                     generic_parameter_constraint_ids.push(default_type_id);
                     continue;
                 }
@@ -22146,6 +22298,24 @@ impl<'src> Analyzer<'src> {
     /// (`F: Feed<T>` -> `[(feed_id, [T])]`), so a method call on the parameter can
     /// substitute the trait's parameters with the caller's concrete arguments.
     fn generic_bound_traits(&self, constraint_id: TypeId) -> Vec<(Id, Vec<TypeId>)> {
+        // B235: a DEFAULTED parameter (`trait Mixer<A = Self, B = Self>`)
+        // interns as its default's type rather than as a binder, so the
+        // fallback below — "an unlisted parameter's own type IS its single
+        // bound", which is how `<T: Display>` recovers `Display` from the id —
+        // read the DEFAULT as a requirement. Under a sub-trait's parameterized
+        // clause (`trait Mixed with Mixer<i32, str>`) the clause argument is
+        // substituted for the parameter and then checked against it, so the
+        // declaring trait was demanded of its own arguments: `'i32' does not
+        // implement trait 'Mixer'`. A default says what the position MEANS when
+        // no argument is supplied; it never says what an argument must be.
+        // (`Add<i32>` escaped only because `i32` genuinely implements `Add`.)
+        // A parameter's own bounds still apply to the argument — they live in
+        // `generic_bounds`, which this consults first, and are untouched here.
+        if self.defaulted_parameter_types.contains(&constraint_id)
+            && !self.generic_bounds.contains_key(&constraint_id)
+        {
+            return Vec::new();
+        }
         let bound_type_ids = self
             .generic_bounds
             .get(&constraint_id)
@@ -37819,10 +37989,51 @@ impl<'src> Analyzer<'src> {
             let bool_type = self.bool_type();
             for (condition_id, construct) in std::mem::take(&mut self.prepped_conditions) {
                 let condition = self.infer_type(condition_id, &bool_type, &HashMap::default());
-                if !matches!(
-                    condition,
-                    Type::Unknown | Type::Unresolved | Type::Generic(_)
-                ) && !self.compare_type(&bool_type, &condition, &HashMap::default())
+                // B234: a generic parameter skipped the check outright, and a
+                // parameter the ENCLOSING declaration owns is not a hole this
+                // site may fill — it is a fixed, unknown type inside its own
+                // body (B211), decided once by the caller. `fun f<T>(x: T) { if
+                // x { } }` compiled and every instantiation reached the host's
+                // truthiness test: `f(1)` took the branch, `f(0)` did not, and
+                // `for x { }` over a truthy value looped forever. Nothing can
+                // fix it at the declaration either — `bool`'s admitted set is
+                // `bool` itself and no trait names it, which is `!`'s ruling one
+                // position along (B200).
+                //
+                // The predicate is B219's shared `generic_is_rigid_here`, asked
+                // with the condition's own scope: this check runs after the
+                // fixpoint, where `rigid_binder_scope` is `None`, and a
+                // parameter the site is still INFERRING stays a hole the call
+                // fills.
+                if let Type::Generic(constraint_id) = condition {
+                    let scope_id = self.expr_id_to_scope_id_map.get(&condition_id).copied();
+                    let saved_scope = std::mem::replace(&mut self.rigid_binder_scope, scope_id);
+                    let rigid = self.generic_is_rigid_here(constraint_id);
+                    self.rigid_binder_scope = saved_scope;
+                    if rigid {
+                        let label = self.pretty_print_type(&condition, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "this {construct} is `{label}`, and a condition must be \
+                                     `bool`: `bool`'s set is `bool` itself and no trait names \
+                                     it, so no bound on `{label}` can prove membership — a \
+                                     bound promises a trait's methods, never that the parameter \
+                                     IS `bool`. Test the value and branch on the `bool` \
+                                     (`{label}: PartialEq` gives `==`), or declare this \
+                                     condition `bool`"
+                                ),
+                            },
+                            condition_id,
+                        );
+                    }
+                    continue;
+                }
+                if !matches!(condition, Type::Unknown | Type::Unresolved)
+                    && !self.compare_type(&bool_type, &condition, &HashMap::default())
                 {
                     let label = self.pretty_print_type(&condition, &HashMap::default());
                     self.push_anchored(
@@ -38735,6 +38946,21 @@ impl<'src> Analyzer<'src> {
                             .is_some()
                     });
                     if provides {
+                        // B233: the bound says WHAT the left operand can add —
+                        // it never says the right operand belongs there. This
+                        // path recorded the dispatch and asked nothing about
+                        // it, so two different rigid parameters met on an
+                        // operator.
+                        if self.refuse_operator_right_operand_on_bound(
+                            op,
+                            symbol,
+                            binary_id,
+                            rhs_id,
+                            constraint_id,
+                            &lhs_type,
+                        ) {
+                            continue;
+                        }
                         self.generic_dispatch.insert(
                             binary_id,
                             GenericDispatch::OnConstraint(constraint_id, method_name),
