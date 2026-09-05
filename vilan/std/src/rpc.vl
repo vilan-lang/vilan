@@ -656,20 +656,64 @@ fun route_socket_bytes(message: Bytes, pending_settle: |i32, Frame| void, dispat
 	}
 }
 
+/// The announcement a server sends a vilan client it has REFUSED (A47), the
+/// `__conn:<id>` handshake's negative twin: `__reject:401` / `__reject:403`.
+/// Named here and in `std::rpc_server` at the one shape.
+fun reject_announcement_prefix(): str {
+	"__reject:"
+}
+
+/// Why a dial did not open (A47). The distinction the host WebSocket API
+/// cannot make and the retry loop needs.
+///
+/// Both host implementations collapse every handshake failure into one
+/// indistinguishable event — measured on node 24, a 401, a 403, a 429, a
+/// mid-handshake destroy, a refused connection and a server with no upgrade
+/// handler all arrive as the same message and the same close code (1002), and
+/// the browser's `WebSocket` exposes strictly less. So the discrimination
+/// cannot be read off the failure; it has to be SENT, and the server sends it
+/// as one frame on an upgraded socket it then closes.
+[derive(PartialEq, Debug)]
+enum DialFailure {
+	/// The socket never opened, or opened and said nothing: an unreachable
+	/// server, a network error, a non-101 the host will not describe.
+	/// RETRYABLE — waiting is exactly what might fix it.
+	Unreachable(str),
+	/// The server upgraded this client and refused it, in the one frame it
+	/// sent before closing. The payload is the HTTP status the refusal would
+	/// have carried (`"401"`, `"403"`). TERMINAL: the credential is the
+	/// problem, and no amount of backoff improves a credential.
+	Refused(str),
+}
+
+impl DialFailure {
+	/// The human sentence — what `connect_socket`'s `Err(str)` carries, so the
+	/// untyped entry point keeps the shape it documented.
+	fun message(self): str {
+		match self {
+			DialFailure::Unreachable(let reason) => reason,
+			DialFailure::Refused(let status) => i"refused by the server ({status})",
+		}
+	}
+}
+
 /// One dial attempt: a fresh socket, fully wired for the steady state (the
 /// routing closures come from the duplex's shared cells, so replies and duplex
 /// frames land in the SAME places across reconnects). Resolves `Ok((socket,
 /// connection))` when the `__conn:<id>` announcement arrives, `Err` when the
-/// socket closes or errors first (an unreachable server).
+/// socket closes or errors first (an unreachable server) — or when the server
+/// upgrades this client only to refuse it in one `__reject:<status>` frame
+/// (A47), which is the one failure worth telling apart from the rest.
 fun dial(
 	url: str,
 	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
-): Result<(WebSocket, i32), str> {
+): Result<(WebSocket, i32), DialFailure> {
 	let socket = new_web_socket(url, protocols);
 	socket.set_binary_type("arraybuffer");
 	let connection: Shared<str> = Shared::new("");
+	let refused: Shared<str> = Shared::new("");
 	let opened = await dial_promise(|finish: |bool| void| {
 		socket.set_on_close(|| finish(false));
 		socket.set_on_error(|| finish(false));
@@ -682,6 +726,12 @@ fun dial(
 			if connection.read() == "" && frame.starts_with("__conn:") {
 				connection.write() = frame.substring(7, frame.len());
 				finish(true);
+			} else if connection.read() == "" && frame.starts_with(reject_announcement_prefix()) {
+				// The server has answered the handshake and is closing. Record
+				// the status BEFORE finishing, so the arm below reads it.
+				refused.write() = frame.substring(reject_announcement_prefix().len(), frame.len());
+				socket.close();
+				finish(false);
 			} else {
 				route_socket_frame(frame, settle, dispatch);
 			}
@@ -689,22 +739,30 @@ fun dial(
 	});
 	if opened {
 		Ok((socket, parse_announced(connection.read())))
+	} else if refused.read() != "" {
+		Err(DialFailure::Refused(refused.read()))
 	} else {
-		Err(i"could not reach {url}")
+		Err(DialFailure::Unreachable(i"could not reach {url}"))
 	}
 }
 
-/// Dial until it opens or the budget runs out (proposal/transport-robustness.md
-/// §2.3): 10 attempts, doubling from 250ms and capped at 4s — fast for the
-/// blip, capped pressure for the outage. Railway's attempt budget, better
-/// curve. The first attempt is immediate.
+/// Dial until it opens, the server REFUSES, or the budget runs out
+/// (proposal/transport-robustness.md §2.3): 10 attempts, doubling from 250ms
+/// and capped at 4s — fast for the blip, capped pressure for the outage.
+/// Railway's attempt budget, better curve. The first attempt is immediate.
+///
+/// A refusal ends the loop on the spot (A47). The budget exists to outlast a
+/// server that is briefly away; a server that is present and has read this
+/// client's credential is not away, and nine more attempts over ~24 seconds
+/// buy nothing but nine more refusals — which is precisely what a refused
+/// client used to pay before the refusal was a frame it could see.
 fun dial_with_backoff(
 	url: str,
 	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
-): Result<(WebSocket, i32), str> {
-	mut outcome: Result<(WebSocket, i32), str> = Err(i"could not reach {url}");
+): Result<(WebSocket, i32), DialFailure> {
+	mut outcome: Result<(WebSocket, i32), DialFailure> = Err(DialFailure::Unreachable(i"could not reach {url}"));
 	mut attempt = 0;
 	mut delay = 250i53;
 	for attempt < 10 {
@@ -718,6 +776,9 @@ fun dial_with_backoff(
 		}
 		outcome = dial(url, protocols, settle, dispatch);
 		if outcome is Ok(let _opened) {
+			jump break;
+		}
+		if outcome is Err(DialFailure::Refused(let _status)) {
 			jump break;
 		}
 		attempt += 1;
@@ -772,10 +833,12 @@ fun watch_socket(duplex: SocketDuplex) {
 /// The connection dropped: reject the in-flight calls, then redial with
 /// backoff. On success the duplex's cells swap to the fresh socket/connection,
 /// the state flips back to `Connected` (so the re-attach hooks can CALL), and
-/// the hooks run — awaited, in order. On a spent budget the duplex closes for
-/// good — the SAME terminal treatment, disposal included, that a refused
-/// re-attach takes: the reason a connection is over does not change what being
-/// over costs (A31). `error` then `close` (or a stale event from a replaced
+/// the hooks run — awaited, in order. A spent budget closes the duplex for
+/// good, and so does a REFUSAL, which ends the redial at its first attempt
+/// (A47: a credential that stopped being good mid-session does not get better
+/// with backoff). Either way it is the SAME terminal treatment, disposal
+/// included, that a refused re-attach takes: the reason a connection is over
+/// does not change what being over costs (A31). `error` then `close` (or a stale event from a replaced
 /// socket) finds the state already advanced and stops at the guard.
 fun handle_drop(duplex: SocketDuplex) {
 	if duplex.state.get() == ConnectionState::Connected {
@@ -819,6 +882,15 @@ fun connect_socket(url: str): Result<SocketDuplex, str> {
 /// `std::rpc::rpc_protocols(token)` writes the documented offer. The same list
 /// is re-presented on every reconnect.
 fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str> {
+	dial_socket(url, protocols).map_err(|failure: DialFailure| failure.message())
+}
+
+/// `connect_socket_with`, with the TYPED failure (A47) — the entry point the
+/// generated `Client::connect` reaches through `dial_for_service`, because it
+/// is the one that can tell a refusal from an unreachable server.
+/// `connect_socket`/`connect_socket_with` keep their `Err(str)` and are this
+/// with the failure flattened to its sentence.
+fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure> {
 	let inbound: Shared<Option<|Frame| void>> = Shared::new(None);
 	let early: Shared<List<Frame>> = Shared::new([]);
 	let pending: Shared<List<PendingCall>> = Shared::new([]);
@@ -1699,15 +1771,34 @@ impl RemoteSource<type T> {
 /// (rather than inline in the expansion) so the conversion types in std's own
 /// unit; see backlog B21 for the load-order sensitivity that pushed it out of
 /// the template.
+///
+/// It offers `vilan-rpc` and nothing else (A47). A credential-less `connect`
+/// against an authorized service is refused, and a server only sends the
+/// typed refusal frame to a client that named this protocol — so without the
+/// offer the commonest refusal of all (a client with no credential) would be
+/// the one case still indistinguishable from an outage. The offer is exactly
+/// what `rpc_protocols(credential)` already puts first, so `connect` and
+/// `connect_with` now differ only in the credential.
 fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
-	dial_for_service_with(url, [])
+	dial_for_service_with(url, [rpc_subprotocol()])
 }
 
 /// `dial_for_service`, offering `protocols` on the handshake — what the
 /// generated `Client::connect_with(url, codec, protocols)` opens with (A40).
 fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, RpcError> {
-	let dialed = connect_socket_with(url, protocols);
-	dialed.map_err(|reason: str| RpcError::Transport(reason))
+	dial_socket(url, protocols).map_err(|failure: DialFailure| match failure {
+		DialFailure::Unreachable(let reason) => RpcError::Transport(reason),
+		// 401 and 403 are one arm here because `RpcError` has one (A40 minted
+		// `Unauthorized` and nothing since has needed a second): the client's
+		// answer to both is the same — this credential will not open this
+		// connection — and the server's own status stays in the sentence for a
+		// log to carry.
+		DialFailure::Refused(let status) => if status == "401" || status == "403" {
+			RpcError::Unauthorized
+		} else {
+			RpcError::Transport(i"refused by the server ({status})")
+		},
+	})
 }
 
 /// Bind a client's fate to its connection's: when `socket` reaches the terminal

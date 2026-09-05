@@ -396,7 +396,7 @@ Service::factory(|connection: Connection| Store {
 	})
 ```
 
-`Err` answers the raw socket `401`/`403`/`429` and destroys it: no
+`Err` answers the socket `401`/`403`/`429` and destroys it: no
 connection id, no reactive session, no service instance — nothing of the
 service is built for a client it refused. `Ok(session)` becomes
 `Connection.session`, which the [factory](#one-instance-per-connected-client)
@@ -424,13 +424,51 @@ token, not a header value: no commas, no spaces — every JWT already
 qualifies. The same list is re-presented on each reconnect, so an
 authorized connection re-authorizes itself automatically.
 
-`Client::connect(url, codec)` is unchanged and offers nothing, which is
-right for a service with no gate.
+`Client::connect(url, codec)` carries no credential and offers only
+`vilan-rpc`, which is right for a service with no gate — and enough for
+one with a gate to tell it apart from a stranger, which is what the next
+section is about.
 
 An authorized service answers **only** the WebSocket upgrade: the
 connectionless SSE and POST legs carry no handshake to authorize, so they
 answer `401` rather than standing open as the way around the gate — the
 rpc leg with a typed `RpcError::Unauthorized` envelope.
+
+### A refused client is told, and stops
+
+`connect`/`connect_with` against a credential the server refuses returns
+`RpcError::Unauthorized`, on the first attempt.
+
+That reads like a triviality and is not one. **No host WebSocket shows a
+client the HTTP status of a failed handshake.** Measured on node 24
+(undici's global `WebSocket`, which is what `std::rpc` binds): a `401`, a
+`403`, a `429`, a socket destroyed mid-handshake, a refused TCP
+connection and a server with no upgrade handler all raise the identical
+error and the identical close code. The browser API exposes less still,
+deliberately. So a refused client could not tell "my token is wrong" from
+"the server is down", and did the only safe thing — ten redials over
+about 24 seconds of backoff, then `Transport("could not reach …")`, which
+is a false sentence about a server that answered immediately.
+
+The fix is that the refusal is **sent, not inferred**. A client that
+offered `vilan-rpc` — every vilan client — is upgraded and handed one
+frame naming the status before the socket closes. Everything else still
+gets the plain HTTP status line: a browser opening the URL, `curl`, a
+probe, a health check, a scanner. The HTTP semantics of a refused
+handshake are unchanged for everything that speaks HTTP and not this
+protocol.
+
+The cost is one 101 and one small frame per refused vilan client, on a
+socket destroyed in the same turn either way. It is bounded by which
+refusals are eligible: **`Reject::TooMany` is never one**, and `TooMany`
+is exactly what `max_connections`, `handshake_rate` and
+`authorize_timeout` produce — so the refusals a flood produces are the
+ones that never upgrade, and nobody can reach the upgrading path more
+often than the rate limiter admits.
+
+`401` and `403` both arrive as `RpcError::Unauthorized`; the client's
+answer to either is the same, and this credential will not open this
+connection.
 
 ### Cheap limits, with or without a gate
 

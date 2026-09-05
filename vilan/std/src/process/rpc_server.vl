@@ -198,11 +198,100 @@ fun reject_status(reject: Reject): str {
 	}
 }
 
-/// Refuse an upgrade on the raw socket: a minimal HTTP response, then destroy.
-fun refuse_upgrade(socket: NodeSocket, reject: Reject) {
+/// The frame a refused vilan client is told its refusal with (A47) — the
+/// `__conn:<id>` announcement's negative twin, carrying the status the socket
+/// API will not show it. `__reject:401` / `__reject:403`.
+fun reject_announcement(reject: Reject): str {
+	"__reject:" + reject_code(reject)
+}
+
+/// The status NUMBER, as text — the announcement's payload and the first token
+/// of the status line, named once so the two cannot drift.
+fun reject_code(reject: Reject): str {
+	match reject {
+		Reject::Unauthorized => "401",
+		Reject::Forbidden => "403",
+		Reject::TooMany => "429",
+	}
+}
+
+/// Whether this refusal is one the CLIENT can act on rather than wait out
+/// (A47): a judgement about the credential it presented. `TooMany` is not —
+/// it is a limit, it says nothing about the credential, and retrying after a
+/// backoff is the right answer to it.
+fun is_judgement(reject: Reject): bool {
+	match reject {
+		Reject::Unauthorized => true,
+		Reject::Forbidden => true,
+		Reject::TooMany => false,
+	}
+}
+
+/// Refuse an upgrade. Two shapes, and which one a client gets is decided by
+/// what it is and what it did (A47).
+///
+/// **The status line** — a minimal HTTP response, then destroy — is the
+/// default and stays exactly what A40 shipped. It is what a browser, a probe,
+/// `curl`, a load balancer's health check and a port scanner get, so the HTTP
+/// semantics of a refused handshake are unchanged for everything that speaks
+/// HTTP and not this protocol.
+///
+/// **The typed refusal frame** is for a vilan rpc client refused by JUDGEMENT:
+/// complete the upgrade, write one `__reject:<status>` frame, close, destroy.
+/// It exists because neither host WebSocket implementation shows a client the
+/// status of a failed handshake — measured on node 24 (undici's global
+/// `WebSocket`), a 401, a 403, a 429, a socket destroyed mid-handshake, a
+/// connection refused and a server with no upgrade handler at all produce the
+/// SAME error message and the same close code (1002), and the browser API
+/// exposes even less by design. A refused client therefore could not tell "my
+/// token is wrong" from "the server is down", so it did what an unreachable
+/// server deserves: ten redials over about 24 seconds of backoff, and then
+/// `Transport("could not reach …")`.
+///
+/// **The DoS trade, and why it is bounded.** A refusal that upgrades costs one
+/// 101, one small frame and a close where a status line costs one write — and
+/// the socket is destroyed in the same turn either way, so nothing is HELD.
+/// The bound is which refusals are eligible: `TooMany` never is, and `TooMany`
+/// is exactly what `max_connections` and `handshake_rate` produce. A flood is
+/// therefore refused by the cheap path by construction, and an attacker cannot
+/// reach the expensive one more often than the rate limit admits.
+///
+/// A refusal only upgrades when the client offered the `vilan-rpc`
+/// subprotocol — this protocol's own clients, and nothing else — and when the
+/// handshake carries the key an upgrade needs.
+fun refuse_upgrade(request: NodeRequest, socket: NodeSocket, reject: Reject) {
+	let headers = request.headers();
+	// "the client offered `vilan-rpc`", asked through the selection itself:
+	// the selection IS that name exactly when it was offered.
+	let speaks_rpc = selected_protocol(offered_protocols(headers)) == rpc_subprotocol();
+	if is_judgement(reject) && speaks_rpc && has_json_field(headers, "sec-websocket-key") {
+		write_upgrade_101(socket, headers);
+		socket.write_bytes(text_frame(reject_announcement(reject)));
+		socket.write_bytes(close_frame());
+		socket.destroy();
+		ret;
+	}
 	let status = reject_status(reject);
 	socket.write_text(i"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 	socket.destroy();
+}
+
+/// Write the 101, subprotocol selection echoed (RFC 6455 §4.2.2). Shared by
+/// the accepting path and the typed refusal, so a refused client's handshake
+/// is byte-identical to an accepted one up to the first frame — which is what
+/// makes the host WebSocket deliver that frame at all.
+///
+/// The caller has already checked `sec-websocket-key` is present; it is a
+/// string by the handshake, so `unwrap_or` keeps the read total.
+fun write_upgrade_101(socket: NodeSocket, headers: JsonValue) {
+	let key: str = str::from_json_value(headers.field("sec-websocket-key")).unwrap_or("");
+	let selected = selected_protocol(offered_protocols(headers));
+	let echo = if selected == "" {
+		""
+	} else {
+		"\r\nSec-WebSocket-Protocol: " + selected
+	};
+	socket.write_text("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws_accept_key(key) + echo + "\r\n\r\n");
 }
 
 /// The subprotocols the client offered, in order. One header, comma-separated
@@ -750,7 +839,7 @@ fun fold_service_upgrades(
 				// socket.
 				Some(let service) => match gate_upgrade(service, request, socket) {
 					Ok(let session) => accept_socket(request, socket, head, service, session),
-					Err(let reject) => refuse_upgrade(socket, reject),
+					Err(let reject) => refuse_upgrade(request, socket, reject),
 				},
 				None => match fallback {
 					Some(let handler) => handler(request, socket, head),
@@ -779,20 +868,11 @@ fun accept_socket(
 		socket.destroy();
 		ret;
 	}
-	// Present (checked above) and a string by the WS handshake, so a decode
-	// error is impossible; `unwrap_or` keeps the read total.
-	let key: str = str::from_json_value(headers.field("sec-websocket-key")).unwrap_or("");
 	// RFC 6455 §4.2.2: a client that offered subprotocols must hear the
 	// server's selection back, or it closes the connection — which is what a
 	// browser does, silently, and what this handshake gave every such client
 	// before A40 because it echoed nothing at all.
-	let selected = selected_protocol(offered_protocols(headers));
-	let echo = if selected == "" {
-		""
-	} else {
-		"\r\nSec-WebSocket-Protocol: " + selected
-	};
-	socket.write_text("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws_accept_key(key) + echo + "\r\n\r\n");
+	write_upgrade_101(socket, headers);
 	let id = fresh_connection();
 	// The connection's OWN protocol: under `Service::factory` this builds the
 	// instance that answers for this client and nothing else (A38), and every

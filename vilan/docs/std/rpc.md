@@ -168,10 +168,20 @@ per disconnect, through `drop_session`.
 
 ```vilan,fragment
 fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff)
+fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str>
+fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure>
+enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"
 impl SocketDuplex {
 	fun transport(self): SocketTransport
 }
 ```
+
+`dial_socket` is the typed dial the generated `Client::connect` reaches
+through: `Refused` is a server that upgraded this client and then declined it
+in one frame, which is the only way a refusal can be told from an unreachable
+server — no host WebSocket exposes a failed handshake's HTTP status. A refusal
+ends the retry budget at the first attempt.  `connect_socket` and
+`connect_socket_with` are this with the failure flattened to its sentence.
 
 ## Server plumbing (`std::rpc_server`, process layer)
 
