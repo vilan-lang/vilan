@@ -8112,6 +8112,120 @@ pub(crate) mod tests {
     }
 
     // A `mut` binding hovers with the `mut` keyword — it can be reassigned.
+    // --- E139: `entity_at` is end-inclusive too -----------------------------
+    //
+    // E133 gave the REFERENCE INDEX the end-inclusive convention, which fixed
+    // rename, find-references and hover on a DECLARATION. Hover on a bare USE
+    // does not go through the index at all: it goes through
+    // `vilan_ide::analysis::entity_at`, whose containment was separately
+    // end-exclusive — and, because entity spans NEST, the strict test did not
+    // fail there, it answered the enclosing function instead. `let _ = count|`
+    // showed `fun main()`.
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_bare_use_answers_the_use() {
+        let inside = hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = cou|nt;\n}\n")
+            .expect("hover inside the use");
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count|;\n}\n"),
+            Some(inside.clone()),
+            "the caret at `count|` on a USE is on `count`, not on `main`",
+        );
+        assert!(inside.contains("count: i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_called_functions_name_answers_the_function() {
+        // The other bare-use shape: the callee of a call, whose own span is
+        // nested inside the call's. `helper|(` used to answer the call's
+        // enclosing entity.
+        let inside = hover_at_cursor(
+            "fun helper(): i32 {\n\t1\n}\n\nfun main() {\n\tlet _ = hel|per();\n}\n",
+        )
+        .expect("hover inside the callee's name");
+        assert_eq!(
+            hover_at_cursor(
+                "fun helper(): i32 {\n\t1\n}\n\nfun main() {\n\tlet _ = helper|();\n}\n"
+            ),
+            Some(inside.clone()),
+        );
+        assert!(inside.contains("fun helper(): i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_field_read_answers_the_field() {
+        let inside = hover_at_cursor(
+            "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _ = p.|x;\n}\n",
+        )
+        .expect("hover inside the field name");
+        assert_eq!(
+            hover_at_cursor(
+                "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _ = p.x|;\n}\n",
+            ),
+            Some(inside.clone()),
+        );
+        assert!(inside.contains("x: i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_a_caret_past_the_name_is_not_on_it() {
+        // The convention's other edge: end-INCLUSIVE, not end-plus-one. A
+        // caret one byte further on has left the word, and whatever it
+        // answers, it is not the use.
+        let on_the_name =
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count| ;\n}\n");
+        let past_it = hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count |;\n}\n");
+        assert!(
+            on_the_name
+                .as_deref()
+                .is_some_and(|hover| hover.contains("count: i32")),
+            "{on_the_name:?}"
+        );
+        assert_ne!(on_the_name, past_it);
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_use_a_larger_expression_continues() {
+        // The shape that moved an existing pin: `xs|[0]` used to answer the
+        // INDEX expression, because the caret is not strictly inside the use
+        // and the index expression is the innermost entity that strictly
+        // contains it. A caret at the end of a word is on the word even when
+        // the expression goes on.
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+            .expect("the use hovers");
+        assert_eq!(hover, "```vilan\nlet xs: List<i32>\n```");
+    }
+
+    #[test]
+    fn e139_completions_receiver_is_unchanged_at_the_dot() {
+        // The other half of `entity_at`'s traffic. Completion resolves `x|.`
+        // by asking about the receiver's END, and the end-inclusive rule is
+        // what makes that literal — the probe used to ask one byte inside and
+        // lean on strict containment, which the widening would have handed the
+        // innermost entity closing there (`Some(1).` answered the literal `1`,
+        // and Option's members were lost). A bare name, a call and a
+        // constructor call, all three at the dot.
+        let bare = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tp.|\n}\n",
+        );
+        assert!(
+            bare.contains(&"x".to_string()) && bare.contains(&"y".to_string()),
+            "{bare:?}"
+        );
+        let call = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\nfun make(): Point {\n\tPoint { x = 1, y = 2 }\n}\n\nfun main() {\n\tmake().|\n}\n",
+        );
+        assert!(
+            call.contains(&"x".to_string()) && call.contains(&"y".to_string()),
+            "{call:?}"
+        );
+        let constructed = call_receiver_completions("\tSome(1).|\n");
+        assert!(
+            constructed.contains(&"unwrap_or".to_string()),
+            "{constructed:?}"
+        );
+    }
+
     #[test]
     fn hover_on_a_mut_binding_shows_mut() {
         let hover = hover_at_cursor("fun main() {\n\tmut tot|al = 0;\n\ttotal = 1;\n}\n")
@@ -8634,9 +8748,17 @@ pub(crate) mod tests {
 
     // "Anything else" keeps the bare rendered type but gains the fence: an
     // index expression's hover is its element type, as code.
+    //
+    // The caret moved one expression to the right when `entity_at` became
+    // end-inclusive (E139): it used to sit at `xs|[0]`, where the index
+    // expression was the innermost STRICTLY containing entity, and a caret
+    // there is now on `xs` — which is the whole point of that convention, and
+    // is pinned as such beside E139's other three. `xs[0]|` is the index
+    // expression's own end, so it is the index expression this asks about, as
+    // it always meant to be.
     #[test]
     fn a_bare_expression_type_hover_wears_the_fence() {
-        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs[0]|;\n}\n")
             .expect("the index expression hovers");
         assert_eq!(hover, "```vilan\ni32\n```");
     }

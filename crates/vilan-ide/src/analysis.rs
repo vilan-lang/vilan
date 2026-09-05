@@ -112,10 +112,33 @@ pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
 
 /// The innermost entry-file entity whose span contains `offset`, over an
 /// [`entity_spans`] table.
+///
+/// Containment is END-INCLUSIVE, the same convention
+/// the language server's `ReferenceIndex::at` gave the reference index
+/// in E133: a caret at `name|`, where the user just finished typing the word,
+/// is ON that word. The index could take the convention as a FALLBACK because
+/// its rows are identifier-exact and non-nesting, so the strict test simply
+/// answered nothing there. Entity spans nest, so the strict test did not fail
+/// at `let _ = count|` — it succeeded, with the enclosing FUNCTION, whose span
+/// runs well past the caret. A fallback would never have been consulted, which
+/// is why hover on a bare use went on answering `fun main()` after E133 landed
+/// (E139).
+///
+/// Widening the test itself is what closes it, and the innermost-wins rule is
+/// what keeps it honest: at `count|` the use (5 bytes) and the function (a
+/// whole body) both contain the offset and the narrower one wins, exactly as
+/// it does one byte to the left. The rule is end-INCLUSIVE, not end-plus-one:
+/// a caret past the word's last byte is outside it and the answer moves on,
+/// so the two adjacent identifiers of `a.b` still each own their own bytes.
+///
+/// Completion's receiver arm is unaffected by construction: it resolves
+/// `x|.` by asking about `receiver_end - 1`, an offset strictly INSIDE the
+/// receiver's last token, and no span can end there that did not already
+/// contain it.
 pub fn entity_at(entity_spans: &[(usize, usize, Id)], offset: usize) -> Option<Id> {
     entity_spans
         .iter()
-        .filter(|(start, end, _)| *start <= offset && offset < *end)
+        .filter(|(start, end, _)| *start <= offset && offset <= *end)
         .min_by_key(|(start, end, _)| end - start)
         .map(|(_, _, id)| *id)
 }
