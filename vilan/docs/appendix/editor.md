@@ -161,7 +161,7 @@ sees it.
 
 ## Quick fixes
 
-Seven, each attached to the diagnostic that earns it:
+Eight, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -171,6 +171,7 @@ Seven, each attached to the diagnostic that earns it:
 | ``Remove `;` `` | ``the `;` discards this body's last value`` — it finds the right `;` from the diagnostic's own bookkeeping, and declines rather than guess when a comment sits in the gap |
 | ``Wrap as `{Color::hex("#333")}` `` | a `#` in a `css` block. The character cannot lex at all, so the diagnostic is one column wide; the fix reads the whole colour off the line and routes it through `Color`, which carries its own `:root` line. Offered only when the run really is a colour (3, 4, 6 or 8 hex digits) |
 | ``Use `.md { … }` `` | ``@media (min-width: …)`` in a `css` block. The breakpoint is chosen by the query's own min-width, and an arbitrary one becomes `.media("900px")` rather than no fix. The other at-rules have no combinator spelling, so they get the explanation alone |
+| ``Declare the inferred contexts`` | ``…'s body reads context `b`, which this `context` clause does not declare`` — a `fun`'s declared `context` clause narrower than what its body reads. The refusal spells the clause the body needs and the fix writes exactly that, over the clause's own name list |
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
 
 and two source actions:

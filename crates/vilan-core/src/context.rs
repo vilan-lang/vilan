@@ -73,7 +73,24 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     let get_safe_fn = program.context_get_safe_fn_id;
 
     let graph = CallGraph::build(program);
-    let plan = match analyze(program, &graph, get_fn, get_safe_fn, run_fn, new_fn) {
+    let mut warnings: Vec<(Error, SourceId)> = Vec::new();
+    let outcome = analyze(
+        program,
+        &graph,
+        get_fn,
+        get_safe_fn,
+        run_fn,
+        new_fn,
+        &mut warnings,
+    );
+    for (warning, source) in warnings {
+        program
+            .warning_sources
+            .resize(program.warnings.len(), source);
+        program.warnings.push(warning);
+        program.warning_sources.push(source);
+    }
+    let plan = match outcome {
         Ok(plan) => plan,
         Err(errors) => {
             for (error, source) in errors {
@@ -222,6 +239,70 @@ fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
     )
 }
 
+/// [`anchored`] at a span the anchor does not own — a declaration's `context`
+/// clause, whose entity is the function but whose span is the clause.
+fn anchored_at(
+    program: &Program,
+    anchor: Id,
+    span: crate::span::Span,
+    msg: String,
+) -> (Error, SourceId) {
+    program.anchored(
+        Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        },
+        anchor,
+    )
+}
+
+/// Whether `id` names a `Context<T>` binding — the one thing a `context` clause
+/// may name, on a parameter's closure type (§8.5) or on a declaration (§8.6).
+fn is_context_binding(program: &Program, id: Id) -> bool {
+    program
+        .variables
+        .get(&id)
+        .and_then(|variable| program.type_id_to_type_map.get(&variable.type_id))
+        .is_some_and(|type_| {
+            matches!(
+                type_,
+                Type::Struct(struct_id, _)
+                    if program
+                        .structs
+                        .get(struct_id)
+                        .is_some_and(|struct_| struct_.name == "Context")
+            )
+        })
+}
+
+/// The span of a function's declared `context` clause, falling back to the
+/// function's own span for a clause the parser recorded without one.
+fn clause_span_of(program: &Program, function: Id) -> crate::span::Span {
+    program
+        .function_context_clause_spans
+        .get(&function)
+        .copied()
+        .unwrap_or_else(|| span_of(program, function))
+}
+
+/// The source spelling of a clause over `contexts`, in the given order —
+/// `context settings` / `context (a, b)`. What the editor's "declare the
+/// inferred contexts" fix writes, carried in the refusal's own message so the
+/// two can never disagree (E58c's rule).
+fn clause_spelling(program: &Program, contexts: &[Id]) -> String {
+    let names: Vec<&str> = contexts
+        .iter()
+        .map(|&context| context_name(program, context))
+        .collect();
+    if names.len() == 1 {
+        format!("context {}", names[0])
+    } else {
+        format!("context ({})", names.join(", "))
+    }
+}
+
 /// [`anchored`], carrying the E78 requirement trace (one label per uncovered
 /// user-written call, ordered entry → site) and, when the offending site sits
 /// in library code (std or a dependency package — C3a/E84), the C3 note that
@@ -337,6 +418,7 @@ fn context_name<'a>(program: &'a Program, context: Id) -> &'a str {
 
 /// Analyzes the program's contexts, producing the rewrite plan or the
 /// diagnostics that block it.
+#[allow(clippy::too_many_arguments)]
 fn analyze(
     program: &Program,
     graph: &CallGraph,
@@ -344,6 +426,7 @@ fn analyze(
     get_safe_fn: Option<Id>,
     run_fn: Id,
     new_fn: Id,
+    warnings: &mut Vec<(Error, SourceId)>,
 ) -> Result<Plan, Vec<(Error, SourceId)>> {
     let mut errors = Vec::new();
 
@@ -487,7 +570,10 @@ fn analyze(
         spawn_sites.sort_by_key(|(entity_id, _)| entity_id.0);
     }
 
-    if contexts.is_empty() && program.parameter_contexts.is_empty() {
+    if contexts.is_empty()
+        && program.parameter_contexts.is_empty()
+        && program.declared_function_contexts.is_empty()
+    {
         return if errors.is_empty() {
             // No reads, no runs — but `Context::new()` calls still lower to
             // their opaque value (previously they emitted a dangling call).
@@ -592,10 +678,22 @@ fn analyze(
         .filter(|(call_id, _)| !owned_call_ids.contains(call_id))
         .filter_map(|(_, call)| local_target(program, call.subject_id))
         .collect();
+    // Every entity that names a callee IN CALL POSITION. `function_calls`
+    // holds the calls the solver WIRED; an arity-invalid call is refused
+    // before wiring, and its subject would otherwise read as the callee taken
+    // as a value (B241) — the same "a written call the site scan cannot see"
+    // hole B229 found under `run`, with a different lid. A call written with
+    // the wrong number of arguments is still a CALL of the name it wrote.
     let call_subject_entities: HashSet<Id> = program
         .function_calls
         .values()
         .map(|call| call.subject_id)
+        .chain(
+            program
+                .arity_invalid_calls
+                .iter()
+                .map(|(_, subject_id)| *subject_id),
+        )
         .collect();
     let value_taken: HashSet<Id> = program
         .entity_map
@@ -736,26 +834,42 @@ fn analyze(
     // then `.on("click", add)`), exactly as if the literal were written
     // inline: its literal defers, and its direct calls become injected calls.
     let mut value_contexts: HashMap<Id, Vec<Id>> = program.parameter_contexts.clone();
+    // --- B242: the clauses functions DECLARE. Validated exactly like a
+    // parameter's (a clause names context bindings, nothing else) and admitted
+    // to the per-context loop, since a declared context may have no `get` or
+    // `run` anywhere in this program at all.
+    let mut declared_of_context: HashMap<Id, Vec<Id>> = HashMap::default();
+    {
+        let mut declaring: Vec<(&Id, &Vec<Id>)> =
+            program.declared_function_contexts.iter().collect();
+        declaring.sort_by_key(|(function, _)| function.0);
+        for (&function, clause) in declaring {
+            for &context in clause {
+                if is_context_binding(program, context) {
+                    contexts.insert(context);
+                    declared_of_context
+                        .entry(context)
+                        .or_default()
+                        .push(function);
+                } else {
+                    errors.push(anchored_at(
+                        program,
+                        function,
+                        clause_span_of(program, function),
+                        "this `context` clause names a value that is not a context".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let declared_functions: HashSet<Id> = declared_of_context.values().flatten().copied().collect();
+
     {
         // Validate each clause names actual contexts, and admit them to the
         // per-context loop (a clause context may have no direct get/run).
         for (&parameter, clause) in &program.parameter_contexts {
             for &context in clause {
-                let is_context = program
-                    .variables
-                    .get(&context)
-                    .and_then(|variable| program.type_id_to_type_map.get(&variable.type_id))
-                    .is_some_and(|type_| {
-                        matches!(
-                            type_,
-                            Type::Struct(id, _)
-                                if program
-                                    .structs
-                                    .get(id)
-                                    .is_some_and(|struct_| struct_.name == "Context")
-                        )
-                    });
-                if is_context {
+                if is_context_binding(program, context) {
                     contexts.insert(context);
                 } else {
                     errors.push(anchored(
@@ -912,23 +1026,29 @@ fn analyze(
     // question that can be answered about a program whose `run` sites are not
     // all on record, and the diagnostic explaining why is already in hand.
     //
-    // Narrow on purpose, in both directions. Only the contexts an unresolved
-    // `run` actually names are excused — every other context in the same
-    // program keeps its verdict. And nothing is excused in a program that
-    // carries no diagnostic: a suppression that could fire on a clean program
-    // would trade a confusing refusal for a silent miscompile, which is the
-    // one thing this check exists to prevent.
-    let unresolved_run_contexts: HashSet<Id> = if program.diagnostics.is_empty() {
-        HashSet::default()
-    } else {
-        program
-            .unresolved_method_calls
-            .iter()
-            .filter(|(_, _, member_name)| *member_name == "run")
-            .filter_map(|(_, subject_id, _)| local_target(program, *subject_id))
-            .filter(|context| contexts.contains(context))
-            .collect()
-    };
+    // Narrow on purpose: only the contexts an unresolved `run` actually names
+    // are excused — every other context in the same program keeps its verdict.
+    //
+    // The stand-down shipped with a second narrowing, a `program.diagnostics`
+    // non-empty guard, because a stalled `MethodCall` had no residual of its
+    // own: on an otherwise clean program the excuse would have turned a
+    // coverage fence into a silent miscompile, which is the one thing this
+    // check exists to prevent. B232 gave the stalled call its own residual, so
+    // an unresolved `run` IS a diagnostic and the guard asked a question that
+    // can no longer have the answer it was written for.
+    let unresolved_run_contexts: HashSet<Id> = program
+        .unresolved_method_calls
+        .iter()
+        .filter(|(_, _, member_name)| *member_name == "run")
+        .filter_map(|(_, subject_id, _)| local_target(program, *subject_id))
+        .filter(|context| contexts.contains(context))
+        .collect();
+
+    // B242: what each DECLARING function's body strictly reads, gathered as
+    // the per-context loop settles each context. The subset rule and the
+    // unused-clause warning are both about the whole clause against the whole
+    // body, so both are answered after the loop.
+    let mut inferred_of_function: HashMap<Id, HashSet<Id>> = HashMap::default();
 
     // --- Per-context effect inference + coverage. ---
     for &context in &plan.contexts {
@@ -978,24 +1098,33 @@ fn analyze(
         // provider's parameter, so the provider must hold one; a stored
         // notify closure created inside `map` makes `map` needy, and `map`
         // created under a turn then hands that turn to the closure).
-        while let Some(id) = worklist.pop() {
-            for caller in graph.callers_of(id) {
-                if needs.insert(caller.id()) {
-                    worklist.push(caller.id());
+        //
+        // One walk, run over `needs` and over `strict` alike and over each of
+        // them TWICE (B242): once from the reads the body performs, and again
+        // once the functions that DECLARE this context join the seeds. The
+        // first answer is the body's own — what the subset rule is about —
+        // and the second is the requirement callers are checked against.
+        let grow = |set: &mut HashSet<Id>, worklist: &mut Vec<Id>| {
+            while let Some(id) = worklist.pop() {
+                for caller in graph.callers_of(id) {
+                    if set.insert(caller.id()) {
+                        worklist.push(caller.id());
+                    }
+                }
+                for caller in dispatch_callers.get(&id).into_iter().flatten() {
+                    if set.insert(*caller) {
+                        worklist.push(*caller);
+                    }
+                }
+                if !own_param_closure(id)
+                    && let Some(parent) = graph.closure_parent_of(id)
+                    && set.insert(parent)
+                {
+                    worklist.push(parent);
                 }
             }
-            for caller in dispatch_callers.get(&id).into_iter().flatten() {
-                if needs.insert(*caller) {
-                    worklist.push(*caller);
-                }
-            }
-            if !own_param_closure(id)
-                && let Some(parent) = graph.closure_parent_of(id)
-                && needs.insert(parent)
-            {
-                worklist.push(parent);
-            }
-        }
+        };
+        grow(&mut needs, &mut worklist);
 
         // --- Flavor (reactive-turns.md §5.1): STRICT nodes hold the bare
         // value (a strict `get`, or a call through an injected closure,
@@ -1018,49 +1147,71 @@ fn analyze(
                 strict_worklist.push(owner.id());
             }
         }
-        loop {
-            while let Some(id) = strict_worklist.pop() {
-                for caller in graph.callers_of(id) {
-                    if strict.insert(caller.id()) {
-                        strict_worklist.push(caller.id());
+        let settle_strict =
+            |strict: &mut HashSet<Id>, strict_worklist: &mut Vec<Id>, needs: &HashSet<Id>| {
+                loop {
+                    grow(strict, strict_worklist);
+                    // A dispatch site whose needy candidates MIX flavors would need
+                    // two argument forms at one call — promote its safe candidates
+                    // to strict (they gain the fence) and re-propagate.
+                    let mut promoted = false;
+                    for (_caller, _call_id, candidates) in &dispatch_sites {
+                        let needy: Vec<Id> = candidates
+                            .iter()
+                            .copied()
+                            .filter(|candidate| needs.contains(candidate))
+                            .collect();
+                        if needy.is_empty() || needy.iter().all(|id| !strict.contains(id)) {
+                            continue;
+                        }
+                        for id in needy {
+                            if strict.insert(id) {
+                                strict_worklist.push(id);
+                                promoted = true;
+                            }
+                        }
+                    }
+                    if !promoted {
+                        break;
                     }
                 }
-                for caller in dispatch_callers.get(&id).into_iter().flatten() {
-                    if strict.insert(*caller) {
-                        strict_worklist.push(*caller);
-                    }
-                }
-                if !own_param_closure(id)
-                    && let Some(parent) = graph.closure_parent_of(id)
-                    && strict.insert(parent)
-                {
-                    strict_worklist.push(parent);
-                }
-            }
-            // A dispatch site whose needy candidates MIX flavors would need
-            // two argument forms at one call — promote its safe candidates
-            // to strict (they gain the fence) and re-propagate.
-            let mut promoted = false;
-            for (_caller, _call_id, candidates) in &dispatch_sites {
-                let needy: Vec<Id> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|candidate| needs.contains(candidate))
-                    .collect();
-                if needy.is_empty() || needy.iter().all(|id| !strict.contains(id)) {
-                    continue;
-                }
-                for id in needy {
-                    if strict.insert(id) {
-                        strict_worklist.push(id);
-                        promoted = true;
-                    }
-                }
-            }
-            if !promoted {
-                break;
+            };
+        settle_strict(&mut strict, &mut strict_worklist, &needs);
+
+        // --- B242: the declarations join in. What the body reads is now
+        // settled, so record it for the subset rule; then every function that
+        // DECLARES this context becomes a strict holder of it whether its body
+        // reads it or not, and the requirement propagates to ITS callers from
+        // the declaration rather than from anything inside.
+        //
+        // "What the body reads" is measured before ANY declaration joins, so a
+        // requirement a callee has only by declaring it — and not by reading
+        // anything — does not count as its caller's. That case is already a
+        // warning at the callee (a clause wider than its own body), so the
+        // caller's warning beside it names the same vacuous requirement rather
+        // than a second problem.
+        let declared_here: &[Id] = declared_of_context
+            .get(&context)
+            .map(|list| list.as_slice())
+            .unwrap_or(&[]);
+        for &function in &declared_functions {
+            if strict.contains(&function) {
+                inferred_of_function
+                    .entry(function)
+                    .or_default()
+                    .insert(context);
             }
         }
+        for &function in declared_here {
+            if needs.insert(function) {
+                worklist.push(function);
+            }
+            if strict.insert(function) {
+                strict_worklist.push(function);
+            }
+        }
+        grow(&mut needs, &mut worklist);
+        settle_strict(&mut strict, &mut strict_worklist, &needs);
 
         let run_closure_ids: HashSet<Id> = run_closures
             .iter()
@@ -1093,7 +1244,16 @@ fn analyze(
         loop {
             let mut removed = false;
             for &id in &strict {
-                if !bound.contains(&id) || run_closure_ids.contains(&id) {
+                // A `run` closure always receives the value from `run`; a
+                // function that DECLARES this context always receives it from
+                // its callers, whose job it now is to have one (B242). Both are
+                // covered by construction, and both are where the check stops:
+                // a declaring function's body is never the site of a coverage
+                // refusal, because the boundary its signature draws is.
+                if !bound.contains(&id)
+                    || run_closure_ids.contains(&id)
+                    || declared_here.contains(&id)
+                {
                     continue;
                 }
                 let covered = if is_function(id) {
@@ -1426,6 +1586,57 @@ fn analyze(
             }
         }
 
+        // --- B242: the boundary refusal. A function's DECLARED requirement is
+        // checked at its call sites and nowhere else: a caller that neither
+        // sits under a `run` nor declares the context itself has nothing to
+        // supply. This is the diagnostic that replaces the deep one — it names
+        // the clause and the callee, one hop, and says nothing about what the
+        // callee's body reads, because with a declaration nothing about the
+        // caller depends on that any more.
+        for &function in declared_here {
+            let name = program
+                .functions
+                .get(&function)
+                .map(|function| function.name)
+                .unwrap_or("function");
+            let message = format!(
+                "context `{}` is required by `{name}`'s `context` clause, but this code can be \
+                 reached without an enclosing `run` — call it under `{}.run(..)`, or declare \
+                 `context {}` here too",
+                context_name(program, context),
+                context_name(program, context),
+                context_name(program, context),
+            );
+            let mut sites: Vec<(Id, Option<Id>)> = incoming_calls
+                .get(&function)
+                .into_iter()
+                .flatten()
+                .filter(|(caller, _)| !bound.contains(caller))
+                .map(|(caller, call_id)| (*call_id, Some(*caller)))
+                .collect();
+            sites.extend(
+                top_level_incoming
+                    .get(&function)
+                    .into_iter()
+                    .flatten()
+                    .map(|call_id| (*call_id, None)),
+            );
+            sites.sort_by_key(|(call_id, _)| call_id.0);
+            sites.dedup_by_key(|(call_id, _)| *call_id);
+            for (call_id, caller) in sites {
+                let trace = caller
+                    .map(|caller| trace_of(caller, call_id))
+                    .unwrap_or_default();
+                errors.push(anchored_tracing(
+                    program,
+                    call_id,
+                    message.clone(),
+                    trace,
+                    None,
+                ));
+            }
+        }
+
         // A needs-context function used as a value could be called indirectly,
         // bypassing the threaded parameter — refuse rather than miscompile.
         let needs_functions: HashSet<Id> = needs
@@ -1433,15 +1644,10 @@ fn analyze(
             .copied()
             .filter(|&id| is_function(id))
             .collect();
-        let call_subjects: HashSet<Id> = program
-            .function_calls
-            .values()
-            .map(|call| call.subject_id)
-            .collect();
         for (&entity_id, expr) in &program.entity_map {
             if let Expr::Local(target) = expr
                 && needs_functions.contains(target)
-                && !call_subjects.contains(&entity_id)
+                && !call_subject_entities.contains(&entity_id)
             {
                 errors.push(anchored(
                     program,
@@ -1648,6 +1854,80 @@ fn analyze(
             if needs.contains(&target) && !strict.contains(&target) {
                 plan.thread_calls
                     .push((call_id, context, ThreadForm::NoneLiteral));
+            }
+        }
+    }
+
+    // --- B242: the clause against the body, once every context has settled.
+    // The subset rule is an error (a declaration that does not cover its own
+    // body is a lie the callers would be checked against); a clause WIDER than
+    // the body is a warning, because declaring a context the body does not yet
+    // read is a deliberate API surface — the signature is the promise, and
+    // adding the read later must not be a breaking change for callers.
+    {
+        let mut declaring: Vec<(&Id, &Vec<Id>)> =
+            program.declared_function_contexts.iter().collect();
+        declaring.sort_by_key(|(function, _)| function.0);
+        for (&function, clause) in declaring {
+            let name = program
+                .functions
+                .get(&function)
+                .map(|function| function.name)
+                .unwrap_or("function");
+            let inferred = inferred_of_function.get(&function);
+            let missing: Vec<Id> = plan
+                .contexts
+                .iter()
+                .copied()
+                .filter(|context| {
+                    inferred.is_some_and(|set| set.contains(context)) && !clause.contains(context)
+                })
+                .collect();
+            if !missing.is_empty() {
+                let named: Vec<String> = missing
+                    .iter()
+                    .map(|&context| format!("`{}`", context_name(program, context)))
+                    .collect();
+                let mut full = clause.clone();
+                full.extend(missing.iter().copied());
+                errors.push(anchored_at(
+                    program,
+                    function,
+                    clause_span_of(program, function),
+                    format!(
+                        "`{name}`'s body reads {} {}, which this `context` clause does not \
+                         declare — write `{}`",
+                        if named.len() == 1 {
+                            "context"
+                        } else {
+                            "contexts"
+                        },
+                        named.join(", "),
+                        clause_spelling(program, &full),
+                    ),
+                ));
+            }
+            for &context in clause {
+                if inferred.is_some_and(|set| set.contains(&context)) {
+                    continue;
+                }
+                // A context whose `run` the solver never selected (B229) had
+                // its whole verdict stood down, so "the body never reads it"
+                // is not something this pass knows here — and the program
+                // already carries the diagnostic that says why.
+                if unresolved_run_contexts.contains(&context) {
+                    continue;
+                }
+                warnings.push(anchored_at(
+                    program,
+                    function,
+                    clause_span_of(program, function),
+                    format!(
+                        "this `context` clause declares `{}`, which `{name}`'s body never \
+                         reads; callers must supply it anyway",
+                        context_name(program, context)
+                    ),
+                ));
             }
         }
     }

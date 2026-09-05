@@ -3046,6 +3046,461 @@ main();
     );
 }
 
+// --- B241: an arity-invalid call is still a CALL of its callee ---
+//
+// B229's hole, second lid. The context pass reads every call's subject out of
+// `function_calls`, which holds the calls the solver WIRED — and an arity
+// mismatch is refused before wiring. The written subject then appeared in
+// `entity_map` as an `Expr::Local` naming a function with no call in sight:
+// the callee read as taken AS A VALUE, which for a context reader is a
+// refusal of its own AND makes the callee permanently uncovered, so its whole
+// transitive read set fenced too (the owner's kolt report: one missing
+// argument, three value-use refusals and five coverage fences, four of them
+// inside std's `reactive.vl`). `Program::arity_invalid_calls` keeps the shape.
+
+/// The owner's shape (kolt views.vl:107, 2026-09-05): the call sits inside a
+/// closure handed to a method, under a component the `run` calls. ONE error,
+/// the arity one.
+#[test]
+fn b241_an_arity_invalid_call_is_not_a_value_use() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun channel_component(user: str, extra: str): str {
+    label() + user + extra
+}
+
+struct Holder {
+    value: str,
+}
+
+impl Holder {
+    fun swap(self, next: str, make: (|str| str)): str {
+        make(next)
+    }
+}
+
+fun shell(): str {
+    let holder = Holder { value = "a" };
+    holder.swap("route", |route| channel_component(route))
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(shell());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`channel_component` expects 2 arguments");
+    assert_fails_without(source, "so it can't be used as a value");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The isolated shape the report expected to be clean and is not: the closure
+/// argument was never the ingredient — ANY arity-invalid call to a
+/// context-reading function cascaded, straight inside the `run` body.
+#[test]
+fn b241_the_isolated_arity_shape_reports_the_arity_error_alone() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun f(x: i32): i32 {
+    settings.get() + x
+}
+
+fun main() {
+    settings.run(10, || {
+        print(f());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`f` expects 1 argument, but got 0 instead");
+    assert_fails_without(source, "so it can't be used as a value");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The refusal the stand-down may not swallow: a context reader written
+/// where a VALUE is wanted is still an indirect call that would bypass the
+/// hidden parameter.
+#[test]
+fn b241_a_real_value_use_of_a_context_reader_is_still_refused() {
+    assert_fails_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun f(x: i32): i32 {
+    settings.get() + x
+}
+
+fun apply(g: (|i32| i32)): i32 {
+    g(1)
+}
+
+fun main() {
+    settings.run(10, || {
+        print(apply(f));
+    });
+}
+main();
+        "#,
+        "`f` reads context `settings`, so it can't be used as a value",
+    );
+}
+
+/// And the stand-down is the invalid call's own, not the program's: a second
+/// context read outside every `run` keeps its fence in the same program.
+#[test]
+fn b241_a_genuinely_uncovered_read_beside_an_arity_error_still_fences() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun reads_a(x: i32): i32 {
+    a_ctx.get() + x
+}
+
+fun reads_b(): i32 {
+    b_ctx.get()
+}
+
+fun main() {
+    print(reads_b());
+    a_ctx.run(10, || {
+        print(reads_a());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `b_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "context `a_ctx` is read here");
+}
+
+// --- B232: a stalled method call speaks for itself ---
+//
+// The post-solve residual sweep reported StructInitializer / FieldAccessor /
+// Variable / CallSubject leftovers only, so a `MethodCall` the fixpoint never
+// selected was spoken about by whatever error stalled it — and, when nothing
+// else was wrong, by nothing at all. That silence is why B229's stand-down
+// asked first whether the program was clean: excusing a coverage verdict on a
+// program carrying no diagnostic would have turned a fence into a silent
+// miscompile. With the call reporting itself, the question is gone.
+
+/// The previously silent program: a method on a binder whose type is never
+/// determined compiled to nothing and said nothing. One diagnostic now.
+#[test]
+fn b232_a_stalled_method_call_on_a_clean_program_reports_once() {
+    assert_fails_once_with(
+        r#"
+fun main() {
+    let empty = [];
+    for item in empty {
+        item.len();
+    }
+}
+main();
+        "#,
+        "this call could not be resolved: the type of `len`'s receiver is never determined",
+    );
+}
+
+/// B229's dangerous case, made honest: a `run` the fixpoint never selected on
+/// an otherwise clean program. The guard used to keep the coverage fence here
+/// — a wall of "read here, but this code can be reached without an enclosing
+/// `run`" about a `run` the program plainly writes — because the alternative
+/// was saying nothing. The residual names the argument that stalled it, and
+/// the fence stands down.
+#[test]
+fn b232_a_stalled_run_reports_its_own_argument_instead_of_fencing() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let app_ctx: Context<i32> = Context::new();
+
+fun label(): i32 {
+    app_ctx.get()
+}
+
+fun main() {
+    let empty = [];
+    for item in empty {
+        app_ctx.run(item, || {
+            print(label());
+        });
+    }
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "this call could not be resolved: the type of argument 1 of `run` is never determined",
+    );
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+// --- B242: a DECLARED context requirement ---
+//
+// An inferred requirement is a fact about a body, so every diagnostic about it
+// is a fact about a body — and surfaces wherever inference breaks (B229,
+// B241), leaving the reader to walk back to the boundary themself. A clause on
+// the declaration makes it a fact about the SIGNATURE: the body's reads must
+// be a subset of it, callers are checked against it alone, and nothing a
+// caller is told depends on the callee's body any more.
+
+/// The accepted shape: the clause covers what the body reads, and a call under
+/// a `run` of that context compiles.
+#[test]
+fn b242_a_declared_clause_covering_the_body_compiles() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// The subset rule: a strict read the clause does not declare is refused AT
+/// the declaration, naming the clause the body needs — which is what the
+/// editor's fix writes.
+#[test]
+fn b242_a_clause_narrower_than_the_body_is_refused_at_the_declaration() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun both(): i32 {
+    a_ctx.get() + b_ctx.get()
+}
+
+fun render(): i32 context a_ctx {
+    both()
+}
+
+fun main() {
+    a_ctx.run(1, || {
+        b_ctx.run(2, || {
+            print(render());
+        });
+    });
+}
+main();
+        "#,
+        "`render`'s body reads context `b_ctx`, which this `context` clause does not declare \
+         — write `context (a_ctx, b_ctx)`",
+    );
+}
+
+/// The other direction is a WARNING, not an error: declaring a context the
+/// body does not yet read is a deliberate API surface — the signature is the
+/// promise, and adding the read later must not break callers.
+#[test]
+fn b242_a_clause_wider_than_the_body_warns_and_still_compiles() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun render(x: i32): i32 context settings {
+    x + 1
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#;
+    assert_compiles(source);
+    let warnings = warning_diagnostics(source);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| {
+            message.contains(
+                "this `context` clause declares `settings`, which `render`'s body never reads",
+            )
+        })
+        .collect();
+    assert_eq!(matching.len(), 1, "{warnings:#?}");
+    // Anchored on the clause's NAME LIST — the span the editor's fix rewrites.
+    assert_eq!(&source[matching[0].1.clone()], "settings");
+}
+
+/// Callers are checked against the DECLARATION: the refusal lands at the call,
+/// names the clause and the callee, and says nothing about what the body reads
+/// — one hop, not a walk down into `deep`.
+#[test]
+fn b242_an_undeclared_caller_is_refused_at_the_call_naming_the_clause() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun main() {
+    print(render(1));
+    settings.run(3, || {
+        print(render(2));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `settings` is required by `render`'s `context` clause, but this code can be \
+         reached without an enclosing `run`",
+    );
+    // The declaring function's own body is never the site of the refusal —
+    // that is the boundary the clause draws — and the covered call is clean.
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// A caller that declares the clause ITSELF is covered by its own signature,
+/// and the demand moves up one more hop.
+#[test]
+fn b242_a_declaring_caller_is_covered_by_its_own_clause() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun panel(): i32 context settings {
+    render(1)
+}
+
+fun main() {
+    settings.run(3, || {
+        print(panel());
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// B241's shape with the boundary drawn: an arity-invalid call to a declaring
+/// function reports the arity error and nothing else — no coverage fence, no
+/// value-use refusal, and nothing at all about the callee's body.
+#[test]
+fn b242_the_b241_shape_with_a_declared_clause_reports_at_the_boundary_only() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32, y: i32): i32 context settings {
+    deep() + x + y
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`render` expects 2 arguments, but got 1 instead");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+    assert_fails_without(source, "so it can't be used as a value");
+}
+
+/// Trait and `impl` methods are DEFERRED: a dispatched call selects its callee
+/// at the call site, so there is no single declaration to check against.
+#[test]
+fn b242_a_clause_on_a_method_is_refused_for_now() {
+    assert_fails_once_with(
+        r#"
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+struct Row {
+    id: i32,
+}
+
+impl Row {
+    fun render(self): i32 context settings {
+        settings.get() + self.id
+    }
+}
+
+fun main() {}
+main();
+        "#,
+        "a `context` clause on a trait or `impl` method is not supported yet",
+    );
+}
+
 // --- E84: the demotion/trace contract widens to any dependency package ---
 // (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
 // user did not write — std or ANY external/linked package — demotes and

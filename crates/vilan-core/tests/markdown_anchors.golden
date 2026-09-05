@@ -172,8 +172,9 @@ spec/contexts.md h2 82-reads-strict-and-safe
 spec/contexts.md h2 83-coverage
 spec/contexts.md h2 84-closures-capture-at-creation
 spec/contexts.md h2 85-injected-closures-the-context-clause
-spec/contexts.md h2 86-interactions
-spec/contexts.md h2 87-the-standard-librarys-ambient-values-informative
+spec/contexts.md h2 86-declared-requirements-the-context-clause-on-a-fun
+spec/contexts.md h2 87-interactions
+spec/contexts.md h2 88-the-standard-librarys-ambient-values-informative
 spec/execution.md h1 spec-7--execution--async
 spec/execution.md h2 71-program-start-and-termination
 spec/execution.md h2 72-evaluation-order

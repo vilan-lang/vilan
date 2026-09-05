@@ -2917,6 +2917,9 @@ pub struct Analyzer<'src> {
     /// entity, member name)` — filled once, after the fixpoint. See
     /// [`Program::unresolved_method_calls`] for why anyone wants them.
     unresolved_method_calls: Vec<(Id, Id, &'src str)>,
+    /// Calls refused on ARITY, before anything was wired, as `(call entity,
+    /// subject entity)`. See [`Program::arity_invalid_calls`].
+    arity_invalid_calls: Vec<(Id, Id)>,
     struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     /// E119: the platform this analysis runs under, and why (the latter already
     /// rendered) — copied off the call's arguments and the `Workspace` so the
@@ -3364,6 +3367,15 @@ pub struct Analyzer<'src> {
     // carried along are not (every sibling `prepped_*` list captures it for
     // the same reason).
     prepped_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
+    /// B242's clauses: the same shape, keyed by the FUNCTION's entity instead
+    /// of a parameter's, resolved by the same deferred pass into
+    /// [`Program::declared_function_contexts`].
+    prepped_function_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
+    declared_function_contexts: HashMap<Id, Vec<Id>>,
+    function_context_clause_spans: HashMap<Id, Span>,
+    /// Whether the walk is inside a trait or `impl` item list, so a `context`
+    /// clause on the declaration can be refused there (B242 defers members).
+    walking_member_body: bool,
     // Parameters and `let` bindings whose declared closure type carries the
     // `async` marker (J2): calls through them are implicitly awaited.
     async_values: HashSet<Id>,
@@ -4324,6 +4336,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
             unresolved_method_calls: Vec::new(),
+            arity_invalid_calls: Vec::new(),
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             or_operand_end: None,
@@ -4416,6 +4429,10 @@ impl<'src> Analyzer<'src> {
             prepped_number_literals: Vec::new(),
             parameter_contexts: HashMap::default(),
             prepped_context_clauses: Vec::new(),
+            prepped_function_context_clauses: Vec::new(),
+            declared_function_contexts: HashMap::default(),
+            function_context_clause_spans: HashMap::default(),
+            walking_member_body: false,
             async_values: HashSet::default(),
             sync_values: HashSet::default(),
             async_fields: HashSet::default(),
@@ -15402,8 +15419,29 @@ impl<'src> Analyzer<'src> {
         // `&mut self` mutator renders `bumps self`, a content-stable one renders
         // nothing beyond its `&mut`.
         let bumps_label = self.bumps_clause_label(&function.bumps, &function.parameters);
+        // B242: a DECLARED `context` clause closes the signature, exactly as it
+        // does in source. It is the last word of the contract — what a caller
+        // must supply — so it renders last, after `borrows` and `bumps`.
+        let context_label = match self
+            .declared_function_contexts
+            .get(&function.id)
+            .map(|contexts| {
+                contexts
+                    .iter()
+                    .filter_map(|context_id| {
+                        self.variables.get(context_id).map(|variable| variable.name)
+                    })
+                    .collect::<Vec<&str>>()
+            })
+            .unwrap_or_default()
+            .as_slice()
+        {
+            [] => String::new(),
+            [single] => format!(" context {single}"),
+            many => format!(" context ({})", many.join(", ")),
+        };
         format!(
-            "fun {}{generics}({}){return_label}{borrows_label}{bumps_label}",
+            "fun {}{generics}({}){return_label}{borrows_label}{bumps_label}{context_label}",
             function.name,
             parameters.join(", ")
         )
@@ -23665,6 +23703,34 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
+                // B242: the DECLARATION's `context` clause. Resolution is
+                // deferred past the import fixpoint exactly as a parameter
+                // clause's is (a clause may name an imported context), and the
+                // names resolve as VALUES in the declaring scope — not the body
+                // scope, whose parameters could shadow one.
+                if let Some((names, clause_span)) = &function.contexts {
+                    if self.walking_member_body {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *clause_span,
+                            msg: "a `context` clause on a trait or `impl` method is not \
+                                  supported yet: a dispatched call selects its callee at \
+                                  the call site, so the requirement cannot be checked \
+                                  against one declaration. Declare it on a free `fun` and \
+                                  call that from the method"
+                                .to_string(),
+                        });
+                    } else {
+                        self.prepped_function_context_clauses.push((
+                            id,
+                            names.iter().map(|(name, span)| (*name, *span)).collect(),
+                            scope_id,
+                            self.current_source_id,
+                        ));
+                        self.function_context_clause_spans.insert(id, *clause_span);
+                    }
+                }
                 // A tuple parameter (`fun f((a, b): T)`) desugars to a synthetic
                 // positional parameter plus a destructure run before the body.
                 let mut parameter_destructures = Vec::new();
@@ -24697,7 +24763,10 @@ impl<'src> Analyzer<'src> {
                         .insert(body_scope_id, (subject_type_id, argument_type_ids));
                 }
                 let subject = subject_type_id;
+                let was_walking_member_body = self.walking_member_body;
+                self.walking_member_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
+                self.walking_member_body = was_walking_member_body;
                 let declared_members = self.collect_declared_members(body_scope_id);
                 let declarations: IndexMap<&'src str, Id> =
                     declared_members.iter().copied().collect();
@@ -24789,9 +24858,12 @@ impl<'src> Analyzer<'src> {
                     .collect();
                 // Bodyless methods are legitimate requirements inside a trait.
                 let was_walking_trait_body = self.walking_trait_body;
+                let was_walking_member_body = self.walking_member_body;
                 self.walking_trait_body = true;
+                self.walking_member_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
                 self.walking_trait_body = was_walking_trait_body;
+                self.walking_member_body = was_walking_member_body;
                 let declared_members = self.collect_declared_members(body_scope_id);
                 let declarations: IndexMap<&'src str, Id> =
                     declared_members.iter().copied().collect();
@@ -31857,6 +31929,7 @@ impl<'src> Analyzer<'src> {
                             msg,
                         });
                         self.expr_id_to_expr_map.insert(call_id, Expr::Error);
+                        self.arity_invalid_calls.push((call_id, subject_id));
                         return Resolution::Failed;
                     }
                     // `...` is a call convention over an ordinary tuple
@@ -31894,6 +31967,10 @@ impl<'src> Analyzer<'src> {
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
                             msg,
                         });
+                        // B241: nothing is wired past here, so record the
+                        // SHAPE — this call names this callee — for the passes
+                        // that read `function_calls` to find call sites.
+                        self.arity_invalid_calls.push((call_id, subject_id));
                         return Resolution::Failed;
                     }
                     let mut substitution_context = HashMap::default();
@@ -40019,11 +40096,22 @@ impl<'src> Analyzer<'src> {
             }
         }
 
-        // --- Resolve `context` clauses (ambient-owner.md §5) --- after the
-        // import fixpoint, so a clause may name an imported context.
-        for (parameter_id, names, scope_id, source_id) in
+        // --- Resolve `context` clauses (ambient-owner.md §5, B242) --- after
+        // the import fixpoint, so a clause may name an imported context. The
+        // two kinds resolve identically and differ only in where the answer
+        // lands: a parameter's (or `let`'s) clause makes an INJECTED closure,
+        // a function's DECLARES what its body may read.
+        let function_clauses: Vec<Id> = self
+            .prepped_function_context_clauses
+            .iter()
+            .map(|(id, ..)| *id)
+            .collect();
+        let prepped: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)> =
             std::mem::take(&mut self.prepped_context_clauses)
-        {
+                .into_iter()
+                .chain(std::mem::take(&mut self.prepped_function_context_clauses))
+                .collect();
+        for (parameter_id, names, scope_id, source_id) in prepped {
             let mut context_ids: Vec<Id> = Vec::new();
             // Both the references and the diagnostics below carry spans into the
             // file that WROTE the clause, which in `build()` is not the ambient
@@ -40061,7 +40149,12 @@ impl<'src> Analyzer<'src> {
             }
             self.attribute_new_diagnostics(diagnostics_before, source_id);
             if !context_ids.is_empty() {
-                self.parameter_contexts.insert(parameter_id, context_ids);
+                if function_clauses.contains(&parameter_id) {
+                    self.declared_function_contexts
+                        .insert(parameter_id, context_ids);
+                } else {
+                    self.parameter_contexts.insert(parameter_id, context_ids);
+                }
             }
         }
 
@@ -40363,6 +40456,81 @@ impl<'src> Analyzer<'src> {
             for (error, anchor) in residuals {
                 self.push_anchored(error, anchor);
             }
+        }
+        // B232: a leftover `MethodCall` had no residual of its own — a stalled
+        // method call was spoken about only by whatever error stalled it, and
+        // when nothing else was wrong it was spoken about by nothing at all.
+        // That silence is what forced B229's stand-down to ask first whether
+        // the program was clean: a `run` the fixpoint never selected on an
+        // otherwise clean program would have turned a coverage fence into a
+        // silent miscompile. With the call speaking for itself the question
+        // goes away — an unselected method call means a diagnostic, always.
+        //
+        // Collected before the loop, because naming the operand needs `&mut
+        // self` (the same shape the subscript residual below uses).
+        let unresolved_method_calls: Vec<(Id, Id, &'src str, Vec<Id>, Span)> =
+            if residuals_are_cascade {
+                Vec::new()
+            } else {
+                self.constraints
+                    .iter()
+                    .filter_map(|constraint| match constraint {
+                        Constraint::MethodCall {
+                            id,
+                            subject_id,
+                            member_name,
+                            argument_ids,
+                            arguments_span,
+                            ..
+                        } => Some((
+                            *id,
+                            *subject_id,
+                            *member_name,
+                            argument_ids.clone(),
+                            *arguments_span,
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            };
+        for (call_id, subject_id, member_name, argument_ids, arguments_span) in
+            unresolved_method_calls
+        {
+            // The operand that stalled it, named — "this call could not be
+            // resolved" on its own says nothing a reader can act on. A method
+            // call defers on its RECEIVER (the member cannot be looked up
+            // until the receiver's type is known) or on an ARGUMENT that never
+            // landed, so those are the two answers; a slot that never got a
+            // type reads back as `any` here, because the post-fixpoint commits
+            // below have already run.
+            let undetermined =
+                |type_: &Type| matches!(type_, Type::Unresolved | Type::Unknown | Type::Any);
+            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+            let operand = if undetermined(&subject_type) {
+                format!("`{member_name}`'s receiver")
+            } else {
+                let mut stalled = None;
+                for (index, argument_id) in argument_ids.iter().enumerate() {
+                    let argument_type =
+                        self.infer_type(*argument_id, &Type::Unknown, &HashMap::default());
+                    if undetermined(&argument_type) {
+                        stalled = Some(format!("argument {} of `{member_name}`", index + 1));
+                        break;
+                    }
+                }
+                stalled.unwrap_or_else(|| format!("an operand of `{member_name}`"))
+            };
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&call_id).unwrap_or(&&arguments_span),
+                    msg: format!(
+                        "this call could not be resolved: the type of {operand} is never determined"
+                    ),
+                },
+                call_id,
+            );
         }
         // A subscript left deferred because its list's element slot never
         // grounded (one that DID ground resolved during the fixpoint): the
@@ -41500,6 +41668,20 @@ pub struct Program<'src> {
     /// `context`-typed closure parameters (proposal/ambient-owner.md §5):
     /// parameter entity -> the named context bindings, in clause order.
     pub parameter_contexts: HashMap<Id, Vec<Id>>,
+    /// B242: the contexts each `fun` DECLARES (`fun f(x: f64) context settings`),
+    /// keyed by the function's entity, in written order.
+    ///
+    /// An inferred requirement is a fact about a body, so every diagnostic
+    /// about it is a fact about a body — and surfaces wherever inference
+    /// breaks (B229, B241), leaving the reader to walk back to the boundary
+    /// themself. A DECLARED requirement is a fact about a signature: the body's
+    /// reads must be a subset of it (checked at the declaration), callers are
+    /// checked against it alone, and nothing about a caller depends on the
+    /// callee's body any more. An undeclared function keeps inference.
+    pub declared_function_contexts: HashMap<Id, Vec<Id>>,
+    /// The span of each declared clause — the anchor for the subset refusal and
+    /// the editor's "declare the inferred contexts" fix.
+    pub function_context_clause_spans: HashMap<Id, Span>,
     /// Functions and `run` closures that received a hidden context parameter —
     /// i.e. their body requires an ambient context (`context::thread_contexts`'
     /// `param_nodes`). Read by `check_context_drops` (destruction.md §8): a `drop`
@@ -41724,6 +41906,22 @@ pub struct Program<'src> {
     /// the shape the program stated, kept for a pass that needs to know a call
     /// WAS written even though nothing could be resolved about it.
     pub unresolved_method_calls: Vec<(Id, Id, &'src str)>,
+    /// The calls refused on ARITY — `(call entity, subject entity)` — recorded
+    /// because the refusal happens BEFORE `wire_call`, so the site never
+    /// reaches `function_calls` at all.
+    ///
+    /// B229's problem in its second shape (B241): a pass that finds its sites
+    /// by scanning `function_calls` cannot tell `f(1)` written one argument
+    /// short from `f` never being called. The context pass reads the subject
+    /// of every call that way, so an arity-invalid call to a context-reading
+    /// function looked like the function being taken AS A VALUE — three
+    /// "`f` reads context `X`, so it can't be used as a value" refusals at the
+    /// failed call — and, with the value-use entry making the callee
+    /// permanently uncovered, a wall of coverage fences for its whole
+    /// transitive read set (four of them inside std's `reactive.vl`). This is
+    /// the shape the program stated: the call WAS written, and it names its
+    /// callee, whatever the argument list got wrong.
+    pub arity_invalid_calls: Vec<(Id, Id)>,
     /// Use-site identifier spans for struct-initializer field KEYS: `(file, name
     /// span, owning struct id, field index)`, one per `x` in `Point { x = 1 }`.
     ///
@@ -48764,6 +48962,8 @@ fn analyze_over_world<'src>(
         integer_division: analyzer.integer_division,
         division_generic_lhs: analyzer.division_generic_lhs,
         parameter_contexts: analyzer.parameter_contexts,
+        declared_function_contexts: std::mem::take(&mut analyzer.declared_function_contexts),
+        function_context_clause_spans: std::mem::take(&mut analyzer.function_context_clause_spans),
         // Filled by `context::thread_contexts` from its `param_nodes`.
         context_dependent_functions: HashSet::default(),
         bitwise_generic_lhs: analyzer.bitwise_generic_lhs,
@@ -48819,6 +49019,7 @@ fn analyze_over_world<'src>(
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
         unresolved_method_calls: std::mem::take(&mut analyzer.unresolved_method_calls),
+        arity_invalid_calls: std::mem::take(&mut analyzer.arity_invalid_calls),
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,

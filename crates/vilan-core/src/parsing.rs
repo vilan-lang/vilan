@@ -4705,12 +4705,57 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
+        // The DECLARATION's `context` clause (B242): the contexts the body may
+        // read, stated on the signature. Two ways it arrives, because the type
+        // grammar carries the same suffix (§3.9) and takes it greedily:
+        //
+        //   `fun f(): i32 context settings`  — `parse_type` swallowed it as a
+        //     clause on the return type `i32`, where it means nothing and was
+        //     refused ("a `context` clause is only supported on a parameter's
+        //     closure type"). PEELED here: the clause binds to the FUNCTION and
+        //     `i32` is the return type, which is the reading anyone writing it
+        //     meant.
+        //   `fun f(x: i32) context settings` — no return type to swallow it, so
+        //     it is still on the token stream; parsed below, after `borrows`.
+        //
+        // Both record the NAME LIST's span, not the `context` word's: that is
+        // what the editor's "declare the inferred contexts" fix rewrites, and
+        // it is the same span whichever way the clause arrived. The formatter
+        // prints the clause where it was WRITTEN (after the return type when
+        // there is one, otherwise last), because `format` bails on a token
+        // reordering.
+        let mut return_type = return_type;
+        let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
+        if let Some(annotation) = return_type.take() {
+            match annotation.0 {
+                Node::TypeWithContexts(inner, names) => {
+                    let clause_start = names
+                        .first()
+                        .map(|(_, span)| span.start)
+                        .unwrap_or(annotation.1.start);
+                    contexts = Some((names, Span::from(clause_start..annotation.1.end)));
+                    return_type = Some(Box::new(*inner));
+                }
+                other => return_type = Some(Box::new((other, annotation.1))),
+            }
+        }
         // `borrows <param>` — the returned view is a projection of that parameter.
         let borrows = if self.eat(&Token::Borrows) {
             Some(self.eat_ident()?)
         } else {
             None
         };
+        if contexts.is_none() {
+            let clause_start = self.position;
+            if let Some(names) = self.parse_context_clause() {
+                let whole = self.span_from(clause_start);
+                let start = names
+                    .first()
+                    .map(|(_, span)| span.start)
+                    .unwrap_or(whole.start);
+                contexts = Some((names, Span::from(start..whole.end)));
+            }
+        }
         // A block body, or `;` for a signature-only declaration (a required trait
         // method or an `external` intrinsic). The block is tried first (chumsky
         // `block.map(Some).or(';'.map(|_| None))`), but the two lead on disjoint
@@ -4767,6 +4812,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parameters,
                 return_type,
                 borrows,
+                contexts,
                 body,
             }),
             self.span_from(start),
@@ -6411,6 +6457,46 @@ mod tests {
         match &type_("Foo context bar").0 {
             Node::TypeWithContexts(_, contexts) => assert_eq!(contexts.len(), 1),
             other => panic!("expected TypeWithContexts, got {other:?}"),
+        }
+    }
+
+    // B242: the DECLARATION's `context` clause, both ways it can arrive — with
+    // a return type written the type grammar takes it first and the
+    // declaration peels it back off, so the two spellings parse the same.
+    #[test]
+    fn function_context_clause_binds_to_the_declaration() {
+        for source in [
+            "fun render(x: i32): i32 context settings { x }",
+            "fun render(x: i32) context settings { x }",
+            "fun render(x: i32): i32 borrows x context settings { x }",
+        ] {
+            match only_item(source) {
+                Node::Func(function) => {
+                    let (names, _) = function.contexts.as_ref().expect("a declared clause");
+                    assert_eq!(names.len(), 1, "{source}");
+                    assert_eq!(names[0].0, "settings", "{source}");
+                    // The return type is the bare one: the clause is the
+                    // FUNCTION's, never a suffix on `i32`.
+                    assert!(
+                        function
+                            .return_type
+                            .as_ref()
+                            .is_none_or(|node| matches!(node.0, Node::Accessor("i32"))),
+                        "{source}"
+                    );
+                }
+                other => panic!("expected Func, got {other:?}"),
+            }
+        }
+        match only_item("fun render(): i32 context (a, b) { 1 }") {
+            Node::Func(function) => {
+                let (names, _) = function.contexts.as_ref().expect("a declared clause");
+                assert_eq!(
+                    names.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                    vec!["a", "b"]
+                );
+            }
+            other => panic!("expected Func, got {other:?}"),
         }
     }
 

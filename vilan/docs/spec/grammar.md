@@ -84,7 +84,7 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ "async" ] [ "external" ]
            "fun" IDENT [ generic-params ]
            "(" [ parameter { "," parameter } [ "," ] ] ")"
-           [ ":" type ] [ "borrows" IDENT ]
+           [ ":" type ] [ "borrows" IDENT ] [ context-clause ]
            ( block | ";" ) ;
 
 parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
@@ -544,8 +544,17 @@ closure-type   = ( "||" | "|" [ [IDENT ":"] type { "," [IDENT ":"] type } "|" )
 context-clause = "context" ( IDENT | "(" IDENT { "," IDENT } [ "," ] ")" ) ;
 ```
 
-`context` here is the contextual keyword (§2.2); the clause is only valid
-on closure types, checked semantically (§8.5). `sync` is likewise
+`context` here is the contextual keyword (§2.2); in TYPE position the
+clause is only valid on closure types, checked semantically (§8.5). The
+same production is the DECLARATION clause a `fun` may carry (§8.6). With a
+return type written, the type rule above takes it first — `fun f(): i32
+context settings` parses its clause here and the declaration peels it back
+off, so it binds to the FUNCTION and `i32` is the return type; with no
+return type the clause is read by the function production above instead.
+Written after the return type it precedes a `borrows` clause, and written
+without one it follows it; the formatter prints it where it was written.
+
+`sync` is likewise
 contextual (§7.4: the synchronous contract; parameters only). A closure
 type's parameters may carry documentation names (`|value: T| U`); only
 the types are significant.

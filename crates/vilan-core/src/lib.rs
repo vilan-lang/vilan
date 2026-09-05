@@ -580,6 +580,7 @@ fn analyze_source_unfenced(
                     parameters: (Vec::new(), head),
                     return_type: Some(Box::new((Node::Accessor("Source"), head))),
                     borrows: None,
+                    contexts: None,
                     body: Some(body),
                 });
             }

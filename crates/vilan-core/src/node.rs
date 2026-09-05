@@ -119,6 +119,13 @@ pub struct Func<'src> {
     // (`fun slot(&mut self): &mut i32 borrows self`): the returned view is a
     // projection of that parameter, so it may escape (rule 3's sanctioned case).
     pub borrows: Option<&'src str>,
+    // The `context` clause on the DECLARATION (`fun f(x: f64) context settings`
+    // / `fun f(): T context (a, b)`) — the contexts the body may read, stated
+    // rather than inferred (B242, spec §8.6): the names in written order, and
+    // the clause's whole span (the anchor for the subset refusal and the
+    // editor's fix). Distinct from a clause on a parameter's closure TYPE
+    // (§8.5), which defers a closure's binding to its call sites.
+    pub contexts: Option<(Vec<Spanned<&'src str>>, Span)>,
     // `None` for a function signature without a body: a required trait method
     // declaration (`fun default(): Self;`) or an `external` intrinsic.
     pub body: Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>>,

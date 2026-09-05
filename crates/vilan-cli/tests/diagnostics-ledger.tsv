@@ -421,3 +421,9 @@ row	flagship	key
 390	-	a name after `::` on the same line: a `::` path does not cross a line break, because `a::` at the end of a line joins whatever the next line starts with — join the line, or import the path under a shorter name (`import a::b::c as d;`) and write `d`
 391	-	`{name}` {reason}carries a hidden type parameter — and nothing here can supply one
 392	-	Expected {struct}, but got {rendered} instead. '{struct}' has a trait-typed field, so the annotation on
+393	-	this call could not be resolved: the type of {operand} is never determined
+394	-	a `context` clause on a trait or `impl` method is not supported yet: a dispatched call selects its callee at the call site, so the requirement cannot be checked against one declaration. Declare it on a free `fun` and call that from the method
+395	-	this `context` clause names a value that is not a context
+396	-	context `{context}` is required by `{name}`'s `context` clause, but this code can be reached without an enclosing `run` — call it under `{context}.run(..)`, or declare `context {context}` here too
+397	-	`{name}`'s body reads {contexts}, which this `context` clause does not declare — write `{spelling}`
+398	-	this `context` clause declares `{context}`, which `{name}`'s body never reads; callers must supply it anyway
