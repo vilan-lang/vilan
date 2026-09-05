@@ -6,15 +6,38 @@
 //! exactly. Programs outside the subset (async, host capabilities) are listed
 //! with the reason; everything else MUST pass, so a pure program regressing
 //! into "unsupported" fails the suite rather than silently skipping.
+//!
+//! # One test per corpus program (tracker N53)
+//!
+//! This gate was the last reader of `vilan/test/` still shaped the way N49 found
+//! its siblings: ONE `#[test]` looping the whole corpus behind an 8-way
+//! `thread::scope`, and a private `run_node` whose deadline was still the 30 s
+//! the differentials moved off (N46: these binaries were among the >120 s
+//! members of two sibling lanes' unions under ten-lane load, so a fixed 30 s
+//! clock around real work measures the runner and not the program).
+//!
+//! Both are now the shared [`corpus_harness`]'s — one declared roster for all
+//! three gates, one node runner, one deadline — so nextest schedules a process
+//! per program, a regression names its program in the test id rather than in a
+//! message, one bad program can be re-run on its own, and a per-program time
+//! becomes readable where a single clock over 124 programs hid it. The
+//! corpus-wide claim survives as the SUM of the parts, and
+//! [`every_corpus_program_has_a_test_of_its_own`] is what makes the sum whole: a
+//! `.vl` added to `vilan/test/` and not declared in the harness is red, by name,
+//! in all three binaries.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use vilan_core::interpreter::{self, FailureKind, Limits};
 use vilan_core::{
     BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform, transform_to_ast,
+};
+
+#[macro_use]
+mod corpus_harness;
+use corpus_harness::{
+    NODE_TIMEOUT, assert_the_declaration_is_the_corpus, corpus_dir, run_node_within,
 };
 
 fn std_spec() -> PackageSpec {
@@ -55,73 +78,15 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
 ];
 
-/// How long a corpus program gets under node before the run is declared hung.
-const NODE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Runs `node <path>` under a deadline, returning its `(stdout, exit code)`.
-///
-/// Replaces a `timeout 30 node …` shell-out: `timeout(1)` is a coreutils binary
-/// that does not exist on Windows, and this gate MUST run there
-/// (windows-support.md §4). Capture semantics are the ones `Command::output()`
-/// gives — both pipes drained to EOF, stdout returned lossily-decoded — with the
-/// drain done by two reader threads so a chatty program cannot deadlock against
-/// a full pipe buffer while the main thread polls for exit. A child still alive
-/// at the deadline is killed and reported as a timeout instead of silently
-/// comparing truncated output.
-fn run_node(path: &Path, limit: Duration) -> Result<(String, i32), String> {
-    let mut child = Command::new("node")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not run node: {error}"))?;
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let reading_stdout = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut bytes);
-        bytes
-    });
-    let reading_stderr = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut bytes);
-        bytes
-    });
-
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|error| format!("waiting on node: {error}"))?
-        {
-            Some(status) => break Some(status),
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    // Both threads end at EOF — which the kill guarantees on the timeout path.
-    let stdout = reading_stdout.join().unwrap_or_default();
-    let _ = reading_stderr.join();
-    match status {
-        Some(status) => Ok((
-            String::from_utf8_lossy(&stdout).into_owned(),
-            status.code().unwrap_or(-1),
-        )),
-        None => Err(format!(
-            "node did not exit within {}s (killed); it had printed {} bytes",
-            limit.as_secs(),
-            stdout.len()
-        )),
-    }
-}
-
 /// Runs `source` through the pipeline once, then both execution paths.
-/// Returns `(node stdout, node exit code, interpreter result)`.
+/// Returns `(node stdout, node stderr, node exit code, interpreter result)`.
+///
+/// node's stderr is kept OUT of the compared value and carried beside it:
+/// the interpreter has no stderr to answer with, so appending it the way the
+/// differentials do (they compare node against node) would make every
+/// nonzero-exit program — `resource_exit.vl` exits 7 — diverge on a string the
+/// other side cannot produce. It still rides into the failure message, where a
+/// `SyntaxError` out of a broken emission is the whole diagnosis.
 /// A corpus program's package root is the corpus DIRECTORY, not the process
 /// working directory. Every runner over the corpus has to say so: a corpus
 /// program may name a project file — `const asset::bundle` carries a resource
@@ -129,11 +94,14 @@ fn run_node(path: &Path, limit: Duration) -> Result<(String, i32), String> {
 /// read one — and the const channel resolves those against the package root.
 /// Compiled under `.`, such a program fails to find a file that is right there
 /// beside it.
-fn both_ways(
-    source: String,
-    root: PathBuf,
-    fuel: u64,
-) -> Result<(String, i32, Result<(String, i32), (FailureKind, String)>), String> {
+type BothWays = (
+    String,
+    String,
+    i32,
+    Result<(String, i32), (FailureKind, String)>,
+);
+
+fn both_ways(source: String, root: PathBuf, fuel: u64) -> Result<BothWays, String> {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
@@ -160,9 +128,9 @@ fn both_ways(
             let path = std::env::temp_dir()
                 .join(format!("vilan_equiv_{}_{unique}.mjs", std::process::id()));
             std::fs::write(&path, text).map_err(|error| error.to_string())?;
-            let run = run_node(&path, NODE_TIMEOUT);
+            let run = run_node_within(&path, NODE_TIMEOUT);
             let _ = std::fs::remove_file(&path);
-            let (node_stdout, node_exit) = run?;
+            let (node_stdout, node_stderr, node_exit) = run?;
 
             // Path 2: the interpreter over the transformer's own AST.
             let ast = transform_to_ast(&program, &options).map_err(|error| error.msg)?;
@@ -176,101 +144,131 @@ fn both_ways(
                 Ok(run) => Ok((run.stdout, run.exit_code)),
                 Err(failure) => Err((failure.kind, failure.message)),
             };
-            Ok((node_stdout, node_exit, interpreted))
+            Ok((node_stdout, node_stderr, node_exit, interpreted))
         })
         .expect("spawn worker")
         .join()
         .unwrap_or_else(|_| Err("worker thread aborted".to_string()))
 }
 
-#[test]
-fn every_admitted_corpus_program_is_equivalent_interpreted() {
-    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
-        .expect("corpus directory")
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension()? == "vl").then_some(path)
-        })
-        .collect();
-    paths.sort();
-    assert!(!paths.is_empty(), "no corpus programs found");
-
-    let admitted: Vec<(String, &PathBuf)> = paths
+/// The reason `program` is outside the interpreter's subset, if it is.
+fn excluded_reason(program: &str) -> Option<&'static str> {
+    EXCLUDED
         .iter()
-        .map(|path| {
-            (
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                path,
-            )
-        })
-        .filter(|(name, _)| !EXCLUDED.iter().any(|(excluded, _)| *excluded == name))
-        .collect();
+        .find(|(excluded, _)| *excluded == program)
+        .map(|(_, why)| *why)
+}
 
-    // Each admitted program is an independent compile-and-compare, so run
-    // them in parallel chunks (corpus.rs's shape). Chunks preserve the sorted
-    // order and workers join in spawn order, so the failure report reads the
-    // same as the serial loop's did.
-    let results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = admitted
-            .chunks(admitted.len().div_ceil(8).max(1))
-            .map(|chunk| {
-                let corpus = &corpus;
-                scope.spawn(move || {
-                    let mut failures = Vec::new();
-                    let mut checked = 0;
-                    for (name, path) in chunk {
-                        let source = std::fs::read_to_string(path).expect("read corpus file");
-                        match both_ways(source, corpus.clone(), 50_000_000) {
-                            Ok((node_stdout, node_exit, Ok((interp_stdout, interp_exit)))) => {
-                                checked += 1;
-                                if node_stdout != interp_stdout || node_exit != interp_exit {
-                                    let first_diff = node_stdout
-                                        .lines()
-                                        .zip(interp_stdout.lines())
-                                        .enumerate()
-                                        .find(|(_, (a, b))| a != b)
-                                        .map(|(line, (a, b))| format!("line {}: node {a:?} vs interp {b:?}", line + 1))
-                                        .unwrap_or_else(|| {
-                                            format!(
-                                                "lengths/exits differ (node {} lines exit {node_exit}, interp {} lines exit {interp_exit})",
-                                                node_stdout.lines().count(),
-                                                interp_stdout.lines().count()
-                                            )
-                                        });
-                                    failures.push(format!("{name}: {first_diff}"));
-                                }
-                            }
-                            Ok((_, _, Err((kind, message)))) => {
-                                failures.push(format!(
-                                    "{name}: interpreter failed ({kind:?}): {message}"
-                                ));
-                            }
-                            Err(error) => failures.push(format!("{name}: {error}")),
-                        }
-                    }
-                    (checked, failures)
+/// One corpus program, both ways. The body every generated test runs.
+fn the_interpreter_agrees_on(program: &str) {
+    if let Some(why) = excluded_reason(program) {
+        // Said out loud, because a skip nobody can see is a skip nobody rereads.
+        eprintln!("[interpreter] {program}: outside the interpreter's subset — {why}");
+        return;
+    }
+    let corpus = corpus_dir();
+    let path = corpus.join(program);
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    match both_ways(source, corpus, 50_000_000) {
+        Ok((node_stdout, node_stderr, node_exit, Ok((interp_stdout, interp_exit)))) => {
+            if node_stdout == interp_stdout && node_exit == interp_exit {
+                return;
+            }
+            let first_diff = node_stdout
+                .lines()
+                .zip(interp_stdout.lines())
+                .enumerate()
+                .find(|(_, (node, interp))| node != interp)
+                .map(|(line, (node, interp))| {
+                    format!("line {}: node {node:?} vs interp {interp:?}", line + 1)
                 })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .map(|worker| worker.join().expect("equivalence worker panicked"))
-            .collect()
-    });
-    let checked: usize = results.iter().map(|(checked, _)| checked).sum();
-    let failures: Vec<String> = results
-        .into_iter()
-        .flat_map(|(_, failures)| failures)
+                .unwrap_or_else(|| {
+                    format!(
+                        "lengths/exits differ (node {} lines exit {node_exit}, interp {} \
+                         lines exit {interp_exit})",
+                        node_stdout.lines().count(),
+                        interp_stdout.lines().count()
+                    )
+                });
+            let stderr = if node_stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n  node stderr: {node_stderr}")
+            };
+            panic!("{program}: {first_diff}{stderr}");
+        }
+        Ok((_, _, _, Err((kind, message)))) => {
+            panic!("{program}: interpreter failed ({kind:?}): {message}")
+        }
+        Err(error) => panic!("{program}: {error}"),
+    }
+}
+
+/// Writes one test per corpus program, and records the declaration the coverage
+/// gate below reads.
+///
+/// The module is named for the program, so the test id nextest prints is
+/// `interpreter list_sort::is_equivalent_interpreted` — the program's own name,
+/// in the place a runner shows it.
+macro_rules! corpus_programs {
+    ($($module:ident => $file:literal,)*) => {
+        /// Every corpus program with a test, as `(module name, file name)`.
+        const DECLARED: &[(&str, &str)] = &[$((stringify!($module), $file),)*];
+
+        $(
+            mod $module {
+                #[test]
+                fn is_equivalent_interpreted() {
+                    super::the_interpreter_agrees_on($file);
+                }
+            }
+        )*
+    };
+}
+
+corpus_manifest!(corpus_programs);
+
+#[test]
+fn every_corpus_program_has_a_test_of_its_own() {
+    assert_the_declaration_is_the_corpus(DECLARED);
+}
+
+#[test]
+fn every_excluded_program_is_still_a_corpus_program() {
+    // `EXCLUDED`'s inverse (N42's shape, N50's family). An exemption only ever
+    // subtracts work, so a name that has left the corpus goes on subtracting it
+    // from nothing, and the next program to take that name inherits a skip
+    // nobody chose.
+    let declared: std::collections::BTreeSet<&str> =
+        DECLARED.iter().map(|(_, file)| *file).collect();
+    let gone: Vec<&str> = EXCLUDED
+        .iter()
+        .map(|(file, _)| *file)
+        .filter(|file| !declared.contains(file))
         .collect();
     assert!(
-        failures.is_empty(),
-        "{} of {} corpus programs diverged:\n{}",
-        failures.len(),
-        checked + failures.len(),
-        failures.join("\n")
+        gone.is_empty(),
+        "`EXCLUDED` names {gone:?}, which is not a corpus program — the exclusion \
+         excludes nothing. Delete the entry."
     );
-    assert!(checked > 60, "suspiciously few programs checked: {checked}");
+
+    // Non-vacuity, the bound the whole-corpus loop asserted at the end of its own
+    // body: nearly all of the corpus is inside the interpreter's subset, and a
+    // gate whose subset has quietly emptied proves nothing.
+    let admitted = DECLARED.len() - EXCLUDED.len();
+    assert!(
+        admitted > 60,
+        "only {admitted} corpus program(s) are inside the interpreter's subset — \
+         the gate is close to vacuous. A pure program regressing into \
+         \"unsupported\" belongs in a red test, not in `EXCLUDED`."
+    );
+    eprintln!(
+        "[interpreter] {admitted} of {} corpus programs run both ways; {} are \
+         outside the subset",
+        DECLARED.len(),
+        EXCLUDED.len()
+    );
 }
 
 // --- Failure-mode pins -------------------------------------------------------
@@ -379,11 +377,13 @@ fn an_impure_capability_is_a_clean_unsupported_error() {
 
 // --- The portable node runner (windows-support.md §4) ------------------------
 //
-// `run_node` replaced a `timeout 30 node …` shell-out, so its contract is
-// pinned directly rather than only through the corpus sweep above: the capture
-// semantics the equivalence check compares against, and the two edges the
-// rewrite exists to get right — a program that never exits, and one that
-// outdruns the pipe buffer.
+// `corpus_harness::run_node_within` replaced a `timeout 30 node …` shell-out, so
+// its contract is pinned directly rather than only through the corpus sweep
+// above: the capture semantics the equivalence check compares against, and the
+// two edges the rewrite exists to get right — a program that never exits, and
+// one that outruns the pipe buffer. The pins live here because this is where the
+// runner was written; it is the shared one now, and all three corpus gates rest
+// on what they say.
 
 /// Writes a scratch `.js` file for the runner pins; returns its path.
 fn scratch_js(tag: &str, source: &str) -> PathBuf {
@@ -401,9 +401,9 @@ fn scratch_js(tag: &str, source: &str) -> PathBuf {
 #[test]
 fn the_node_runner_captures_stdout_and_a_zero_exit() {
     let path = scratch_js("ok", "console.log('one');\nconsole.log('two');\n");
-    let run = run_node(&path, NODE_TIMEOUT);
+    let run = run_node_within(&path, NODE_TIMEOUT);
     let _ = std::fs::remove_file(&path);
-    assert_eq!(run, Ok(("one\ntwo\n".to_string(), 0)));
+    assert_eq!(run, Ok(("one\ntwo\n".to_string(), String::new(), 0)));
 }
 
 #[test]
@@ -411,9 +411,9 @@ fn the_node_runner_reports_a_nonzero_exit_code() {
     // The equivalence check compares exit codes, so a wrong code is a silent
     // false pass: pin that the child's own code survives, stdout included.
     let path = scratch_js("exit", "console.log('bye');\nprocess.exit(3);\n");
-    let run = run_node(&path, NODE_TIMEOUT);
+    let run = run_node_within(&path, NODE_TIMEOUT);
     let _ = std::fs::remove_file(&path);
-    assert_eq!(run, Ok(("bye\n".to_string(), 3)));
+    assert_eq!(run, Ok(("bye\n".to_string(), String::new(), 3)));
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn the_node_runner_kills_a_program_that_never_exits() {
     // runner, not by the suite noticing a hang an hour later.
     let path = scratch_js("hang", "setInterval(() => {}, 1000);\n");
     let started = Instant::now();
-    let run = run_node(&path, Duration::from_millis(500));
+    let run = run_node_within(&path, Duration::from_millis(500));
     let _ = std::fs::remove_file(&path);
     let error = run.expect_err("a program that never exits must time out");
     assert!(
@@ -447,11 +447,29 @@ fn the_node_runner_survives_more_output_than_a_pipe_holds() {
         "chatty",
         "const line = 'x'.repeat(1023);\nfor (let i = 0; i < 1024; i += 1) console.log(line);\n",
     );
-    let run = run_node(&path, NODE_TIMEOUT);
+    let run = run_node_within(&path, NODE_TIMEOUT);
     let _ = std::fs::remove_file(&path);
-    let (stdout, exit) = run.expect("a chatty program must still run to completion");
+    let (stdout, _, exit) = run.expect("a chatty program must still run to completion");
     assert_eq!(exit, 0);
     assert_eq!(stdout.len(), 1024 * 1024, "every byte must be captured");
+}
+
+#[test]
+fn the_differentials_runner_carries_a_failing_program_s_stderr() {
+    // The other policy over the same capture, which the two differentials read
+    // and this gate deliberately does not (see `both_ways`): they compare node
+    // against node, so a failing build's stderr rides along with the exit code
+    // instead of leaving them to compare two empty stdouts. Pinned here because
+    // an empty-stdout failure is exactly the one that passes vacuously.
+    let path = scratch_js("stderr", "console.log('out');\nthrow new Error('boom');\n");
+    let run = corpus_harness::run_node(&path);
+    let _ = std::fs::remove_file(&path);
+    let (captured, exit) = run.expect("a throwing program still exits");
+    assert_ne!(exit, 0);
+    assert!(
+        captured.starts_with("out\n--- stderr ---\n") && captured.contains("boom"),
+        "unexpected capture: {captured:?}"
+    );
 }
 
 #[test]

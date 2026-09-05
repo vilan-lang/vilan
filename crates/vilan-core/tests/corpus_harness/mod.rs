@@ -1,9 +1,11 @@
 //! The corpus, declared ONCE, plus the node harness every corpus differential
 //! runs it through (tracker N52).
 //!
-//! Two gates read `vilan/test/` program by program — `release_differential.rs`
-//! (debug against the release preset) and `infer_differential.rs` (the
-//! inference sweep off against on) — and N49 gave the first of them the shape
+//! Three gates read `vilan/test/` program by program — `release_differential.rs`
+//! (debug against the release preset), `infer_differential.rs` (the inference
+//! sweep off against on) and `interpreter.rs` (the macro engine's fueled
+//! interpreter against node, tracker N53) — and N49 gave the first of them the
+//! shape
 //! that makes a regression nameable: the corpus is DECLARED, one line per
 //! program, and a macro writes a test per line, so nextest schedules one
 //! process each, a failure names its program in the test id, and one bad
@@ -21,10 +23,10 @@
 //! So there is ONE list here, and [`corpus_manifest!`] hands it to whatever
 //! macro a gate passes in — the gate writes the test body, this module writes
 //! the roster. The pin that they cannot come apart is
-//! [`assert_the_declaration_is_the_corpus`], which BOTH gates call on their own
+//! [`assert_the_declaration_is_the_corpus`], which EVERY gate calls on its own
 //! generated `DECLARED`: each is held to `vilan/test/` in both directions, so
-//! each equals the directory and therefore equals the other. A `.vl` added to
-//! the corpus and not declared here is red in both binaries, by name.
+//! each equals the directory and therefore equals the others. A `.vl` added to
+//! the corpus and not declared here is red in every one of them, by name.
 //!
 //! The node leg is shared for the same reason. It was two copies of one
 //! function with a divergence nobody chose: one deadline was 300 s (E39/E40's
@@ -32,6 +34,13 @@
 //! which is not too large for a healthy corpus program on a box carrying ten
 //! lanes — a fixed clock around real work, measuring the runner rather than the
 //! program. One copy, one number.
+
+//! Every declaring gate compiles the WHOLE module, so a helper only some of them
+//! reach is dead code in the rest — `interpreter.rs` takes the runner and the
+//! roster and has no use for the `NOT_RUN` split, which is the differentials'
+//! own — hence the module-wide allow. It is not covering unused code: nothing
+//! here is unused by the file as a set.
+#![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -248,11 +257,34 @@ pub fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test")
 }
 
-/// Runs `node <path>` under [`NODE_TIMEOUT`], returning `(stdout, exit code)`.
+/// Runs `node <path>` under [`NODE_TIMEOUT`], returning `(stdout, exit code)`
+/// with a failing run's stderr appended to its stdout.
+///
+/// The differentials' policy: they compare one node run against ANOTHER, so the
+/// append is symmetric, and a failing build's stderr (`SyntaxError: Identifier
+/// 'b' has already been declared`) is the whole diagnosis. A gate comparing node
+/// against something that is not node wants [`run_node_within`] instead.
+pub fn run_node(path: &Path) -> Result<(String, i32), String> {
+    let (stdout, stderr, code) = run_node_within(path, NODE_TIMEOUT)?;
+    // `code == 0` is `ExitStatus::success()` on every platform this runs on: a
+    // child killed by a signal reports no code at all and lands on -1 below.
+    if code == 0 {
+        Ok((stdout, code))
+    } else {
+        Ok((format!("{stdout}--- stderr ---\n{stderr}"), code))
+    }
+}
+
+/// Runs `node <path>` under `limit`, returning `(stdout, stderr, exit code)`
+/// separately — the raw capture every policy above is a choice about.
+///
 /// Both pipes are drained by reader threads so a chatty program cannot deadlock
 /// against a full pipe buffer (the shape `tests/interpreter.rs` established;
 /// `timeout(1)` is not available on Windows and these gates must run there).
-pub fn run_node(path: &Path) -> Result<(String, i32), String> {
+/// `limit` is a parameter rather than [`NODE_TIMEOUT`] outright so the runner's
+/// own timeout pin can ask for a deadline it is willing to WAIT for; every gate
+/// over the corpus passes the constant.
+pub fn run_node_within(path: &Path, limit: Duration) -> Result<(String, String, i32), String> {
     let mut child = Command::new("node")
         .arg(path)
         .stdin(Stdio::null())
@@ -272,7 +304,7 @@ pub fn run_node(path: &Path) -> Result<(String, i32), String> {
         let _ = stderr_pipe.read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + NODE_TIMEOUT;
+    let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait().map_err(|error| error.to_string())? {
             Some(status) => break Some(status),
@@ -287,17 +319,11 @@ pub fn run_node(path: &Path) -> Result<(String, i32), String> {
     let stdout = String::from_utf8_lossy(&reading_stdout.join().unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&reading_stderr.join().unwrap_or_default()).into_owned();
     match status {
-        // A failing build's stderr is the whole diagnosis (`SyntaxError:
-        // Identifier 'b' has already been declared`), so it rides along with the
-        // exit code rather than being dropped.
-        Some(status) if !status.success() => Ok((
-            format!("{stdout}--- stderr ---\n{stderr}"),
-            status.code().unwrap_or(-1),
-        )),
-        Some(status) => Ok((stdout, status.code().unwrap_or(-1))),
+        Some(status) => Ok((stdout, stderr, status.code().unwrap_or(-1))),
         None => Err(format!(
-            "node did not exit within {}s (killed)",
-            NODE_TIMEOUT.as_secs()
+            "node did not exit within {}s (killed); it had printed {} bytes",
+            limit.as_secs(),
+            stdout.len()
         )),
     }
 }
@@ -373,7 +399,7 @@ pub fn assert_the_declaration_is_the_corpus(declared_rows: &[(&str, &str)]) {
         "corpus program(s) {undeclared:?} have no test here, so they are \
          unobserved. Add a line to `corpus_manifest!` in \
          `tests/corpus_harness/mod.rs` — the module is the file's stem with `-` \
-         written `_`, and both differentials pick it up."
+         written `_`, and every gate over the corpus picks it up."
     );
     let gone: Vec<&&str> = declared
         .iter()
