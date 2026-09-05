@@ -34,11 +34,16 @@
 //!    that cannot be narrowed is dropped rather than emitted wrong, and the drop
 //!    is *counted*, so an incomplete answer can be refused instead of silently
 //!    returned.
-//! 2. **No two rows share a span.** The analyzer records some references more
-//!    than once (a struct's constructor name lands in both `type_references` and
-//!    `struct_initializer_to_def`; a match pattern's segments are re-recorded on
-//!    every type-check pass), so the table is deduplicated at build time. This
-//!    is what makes a rename's edit set applicable.
+//! 2. **No two rows share a span IN A FILE.** The analyzer records some
+//!    references more than once (a struct's constructor name lands in both
+//!    `type_references` and `struct_initializer_to_def`; a match pattern's
+//!    segments are re-recorded on every type-check pass), so the table is
+//!    deduplicated at build time. This is what makes a rename's edit set
+//!    applicable — and it is why the invariant stops at the file boundary.
+//!    Derive-generated rows index a TEMPLATE, and two expansions of one
+//!    template legitimately claim the same offsets (E144); no rename may touch
+//!    a generated span in the first place, so those rows are kept apart by
+//!    their definitions rather than collapsed onto one another.
 //!
 //!    One shape genuinely writes two DIFFERENT definitions at one span, and it
 //!    is not a duplicate to discard: the struct-init field shorthand
@@ -620,35 +625,59 @@ impl ReferenceIndex {
         //    (E134). Two different definitions, one identifier, and both are
         //    real: dropping either is the defect this arm exists to end. Keep
         //    one row and give it the other name as a co-reference.
-        //  - Anything else at one span, which today means only derive-generated
-        //    code: two expansions of one `[derive(..)]` template index the same
-        //    template offsets, so `Ordering` and `JsonKind` both claim
-        //    `DERIVED_SOURCE` 304..312. Those are unrelated definitions that
-        //    merely share an address in a text no file holds and no rename may
-        //    touch; linking them would make `occurrences_of` answer with the
-        //    other program's rows. Kept as it always was: one row, the rest
-        //    discarded.
+        //  - DERIVE-GENERATED code, where two expansions of one `[derive(..)]`
+        //    template index the same template offsets: `[derive(PartialEq)]` on
+        //    two three-letter enums generates two `fun eq` declarations that
+        //    both claim `DERIVED_SOURCE` 63..65. Those are unrelated
+        //    definitions that merely share an address in a text NO FILE HOLDS,
+        //    so invariant 2 does not reach them: it is a claim about a span in
+        //    a file, and it exists so a rename's edit set is applicable, which
+        //    a generated span never is (rename refuses on `DERIVED_SOURCE`
+        //    outright). Collapsing them to one row was a real loss (E144): the
+        //    survivor kept ITS definition, so every OTHER expansion's member
+        //    lost its declaration row — `occurrences_of` came back short, and
+        //    rename, which refuses precisely when it sees a `DERIVED_SOURCE`
+        //    span in the set, stopped seeing one. Renaming `Tab`'s derived `eq`
+        //    refused as generated; renaming the next enum's returned a
+        //    one-edit rewrite of the call site alone, leaving the generated
+        //    declaration behind. So generated rows dedup by DEFINITION as well
+        //    as by span — the (template, expansion) key, since a definition
+        //    belongs to exactly one expansion — and never carry a
+        //    co-reference: a template's bytes are nobody's identifier.
         rows.sort_by(|left, right| {
             (left.source.0, left.span.start, left.span.end)
                 .cmp(&(right.source.0, right.span.start, right.span.end))
-                .then(right.is_declaration.cmp(&left.is_declaration))
                 .then(left.definition.sort_key().cmp(&right.definition.sort_key()))
+                .then(right.is_declaration.cmp(&left.is_declaration))
         });
         let mut collapsed: Vec<Occurrence> = Vec::with_capacity(rows.len());
+        // The index in `collapsed` where the current `(source, span)` group
+        // starts. It is only ever longer than one row for generated code, and
+        // a group's rows are contiguous because the sort put them there.
+        let mut group_start = 0usize;
         for row in rows {
-            let Some(kept) = collapsed.last_mut() else {
-                collapsed.push(row);
-                continue;
-            };
-            if kept.source != row.source || kept.span != row.span {
+            let same_span = collapsed
+                .last()
+                .is_some_and(|kept| kept.source == row.source && kept.span == row.span);
+            if !same_span {
+                group_start = collapsed.len();
                 collapsed.push(row);
                 continue;
             }
+            if row.source == DERIVED_SOURCE {
+                if !collapsed[group_start..]
+                    .iter()
+                    .any(|kept| kept.definition == row.definition)
+                {
+                    collapsed.push(row);
+                }
+                continue;
+            }
+            let kept = &mut collapsed[group_start];
             if kept.definition != row.definition
                 && kept.co_definition.is_none()
                 && !kept.is_declaration
                 && !row.is_declaration
-                && row.source != DERIVED_SOURCE
                 && is_field_shorthand(program, kept.definition, row.definition)
             {
                 kept.co_definition = Some(row.definition);
@@ -1009,18 +1038,33 @@ fun main(): i32 {
     // segments are re-recorded on every type-check pass), and a duplicate span
     // reaches the client as an overlapping `TextEdit` — which is what made a
     // struct rename fail with "Rename failed to apply edits".
+    //
+    // The invariant is about a span IN A FILE, and E144 is where that boundary
+    // started to matter: derive-generated rows index a TEMPLATE no file holds,
+    // two expansions of one template legitimately claim the same offsets, and
+    // no rename may touch a generated span in the first place. `MATRIX`
+    // derives nothing itself, but the `std` it loads does, so the rows are
+    // filtered here rather than the claim being weakened —
+    // `generated_rows_share_template_offsets_but_never_a_definition` states
+    // what holds on the other side of the line.
     #[test]
     fn no_two_indexed_occurrences_share_a_span() {
         let (dir, document) = matrix();
         let mut seen = std::collections::HashSet::new();
+        let mut checked = 0;
         for row in document.reference_index().rows() {
+            if row.source == vilan_core::analyzer::DERIVED_SOURCE {
+                continue;
+            }
             assert!(
                 seen.insert((row.source.0, row.span)),
                 "{:?} at {:?} is recorded twice",
                 row.span,
                 row.source,
             );
+            checked += 1;
         }
+        assert!(checked > 20, "expected a broad sample, checked {checked}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1102,6 +1146,135 @@ fun main(): i32 {
                     .into_range()
             ),
             Some("sum"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E144: derive-template double claims -----------------------------
+    //
+    // A `[derive(..)]` expansion is walked with its spans indexing the
+    // GENERATED TEMPLATE, under the `DERIVED_SOURCE` sentinel. Two expansions
+    // of one template produce the same text at the same offsets whenever the
+    // deriving types' names are the same LENGTH — `Ordering` and `JsonKind`
+    // both claim 304..312 in the tree that found this — so the index built two
+    // rows at one `(source, span)` and the collapse kept whichever won the
+    // sort. The survivor keeps its OWN definition, so nothing renders as the
+    // wrong type; what happens instead is that every other expansion's member
+    // silently loses its declaration row. That is not cosmetic: rename refuses
+    // exactly when it sees a `DERIVED_SOURCE` span in a definition's set, so
+    // the first enum's derived `eq` refused as generated and the second one's
+    // returned a one-edit rewrite of the CALL SITE alone — a rename that
+    // leaves the generated declaration behind and breaks the program.
+
+    /// Two enums whose names are the same length, deriving the same trait —
+    /// the shape that makes two expansions land on identical template offsets.
+    /// The lengths matter, so they are asserted rather than assumed: a later
+    /// edit that renamed one of them would make the fixture stop exercising
+    /// anything, silently.
+    const TWIN_DERIVES: &str = "import std::io::print;\n\n[derive(PartialEq)]\nenum Tab { A, B }\n\n[derive(PartialEq)]\nenum Hue { X, Y }\n\nfun main() {\n\tprint(Tab::A.eq(Tab::B));\n\tprint(Hue::X.eq(Hue::Y));\n}\n\nmain();\n";
+
+    #[test]
+    fn each_derive_expansion_keeps_its_own_members_declaration() {
+        assert_eq!("Tab".len(), "Hue".len(), "the fixture's whole premise");
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture must analyze clean: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let index = document.reference_index();
+        let mut generated_declarations: Vec<Definition> = Vec::new();
+        for (label, needle) in [("Tab", "Tab::A.eq"), ("Hue", "Hue::X.eq")] {
+            let offset = TWIN_DERIVES.find(needle).expect("fixture") + needle.len() - 1;
+            let definition = index
+                .at(SourceId(0), offset)
+                .unwrap_or_else(|| panic!("{label}: the caret is on `eq`"))
+                .definition;
+            let rows: Vec<_> = index.occurrences_of(definition).collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "{label}: the call site and the derived declaration, not one of them: {rows:?}",
+            );
+            let declaration = rows
+                .iter()
+                .find(|row| row.is_declaration_of(definition))
+                .unwrap_or_else(|| {
+                    panic!("{label}: this expansion's own `eq` declaration is missing: {rows:?}")
+                });
+            assert_eq!(
+                declaration.source,
+                vilan_core::analyzer::DERIVED_SOURCE,
+                "{label}: a derived member is declared in the template",
+            );
+            generated_declarations.push(definition);
+        }
+        // The two enums' `eq` are DIFFERENT definitions that happen to share a
+        // template address — the point of the fix is that both survive, not
+        // that they were merged.
+        assert_ne!(generated_declarations[0], generated_declarations[1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E144's own pin, and the half a user could feel. Renaming a derived
+    /// member refuses because its declaration lives in generated text; before
+    /// the fix only the expansion that WON the collapse refused, and the other
+    /// one handed back a partial edit set.
+    #[test]
+    fn renaming_a_derived_member_refuses_from_either_expansion() {
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        for (label, needle) in [("Tab", "Tab::A.eq"), ("Hue", "Hue::X.eq")] {
+            let offset = TWIN_DERIVES.find(needle).expect("fixture") + needle.len() - 1;
+            assert!(
+                matches!(
+                    document.rename_edits(offset, "same"),
+                    Err(crate::document::RenameRefusal::Generated { .. })
+                ),
+                "{label}: renaming a derived member must refuse, not emit a partial edit set: \
+                 {:?}",
+                document.rename_edits(offset, "same"),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Invariant 2, at the boundary the fix draws: no two rows share a span in
+    /// a FILE, and generated rows that share a template address never share a
+    /// definition. Stated over the fixture that actually has colliding
+    /// expansions, since `MATRIX` derives nothing.
+    #[test]
+    fn generated_rows_share_template_offsets_but_never_a_definition() {
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        let index = document.reference_index();
+        let mut by_span = std::collections::HashSet::new();
+        let mut by_span_and_definition = std::collections::HashSet::new();
+        let mut shared_template_spans = 0;
+        for row in index.rows() {
+            if row.source == vilan_core::analyzer::DERIVED_SOURCE {
+                if !by_span.insert((row.source.0, row.span)) {
+                    shared_template_spans += 1;
+                }
+            } else {
+                assert!(
+                    by_span.insert((row.source.0, row.span)),
+                    "{:?} in source {:?} is recorded twice",
+                    row.span,
+                    row.source,
+                );
+            }
+            assert!(
+                by_span_and_definition.insert((row.source.0, row.span, row.definition)),
+                "{row:?} is recorded twice for one definition",
+            );
+        }
+        assert!(
+            shared_template_spans > 0,
+            "the fixture is supposed to make two expansions collide; if it stopped, this pin \
+             and its two siblings prove nothing",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
