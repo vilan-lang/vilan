@@ -9296,23 +9296,24 @@ impl<'src> Transformer<'src> {
     /// `List<Generic(T)>`) so the caller can bind the impl's generics from the
     /// concrete type's arguments.
     fn resolve_member_on_type(&self, type_id: TypeId, member: &str) -> Option<(Id, TypeId)> {
-        // Nominal receivers, and a TUPLE (the check below is on the receiver's
+        // Nominal receivers, and the two STRUCTURAL shapes a user may write an
+        // impl for — a tuple and an array (the check below is on the receiver's
         // type; impl subjects of every shape, blankets included, are admitted
         // past it by select_member). A re-dispatch with no trait to steer by
         // is the fallback path, so the receiver set is widened only where a
-        // bound asks — and B210 asks. A tuple is an impl subject like any
-        // other (spec §5.7), and once method resolution admits a tuple
-        // receiver, a call inside a trait DEFAULT specialized for one has to
-        // find the impl that provides it: `impl (i32, i32) with Tagged`
-        // reached the default `label`, whose body calls `self.tag()`, and this
-        // guard sent that inner call past the impl to the trait's bodyless
-        // requirement — which the emitter's never-silent check caught rather
-        // than shipping an empty function. Nothing existing changes body: a
-        // tuple receiver reached NO method call before B210, and the operator
-        // path that did reach a tuple impl records its member id directly.
+        // bound asks — and B210 asked for tuples, B220 for arrays. A tuple or
+        // an array is an impl subject like any other (spec §5.7), and once
+        // method resolution admits one as a receiver, a call inside a trait
+        // DEFAULT specialized for it has to find the impl that provides it:
+        // `impl (i32, i32) with Tagged` reached the default `label`, whose body
+        // calls `self.tag()`, and this guard sent that inner call past the impl
+        // to the trait's bodyless requirement — which the emitter's never-silent
+        // check caught rather than shipping an empty function. `impl [i32; 2]
+        // with PartialOrd` had the identical shape one level up, through the
+        // inherited `lt` that `a < b` dispatches to.
         if !matches!(
             self.program.type_id_to_type_map.get(&type_id),
-            Some(Type::Struct(..) | Type::Enum(..) | Type::Tuple(..))
+            Some(Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..))
         ) {
             return None;
         }

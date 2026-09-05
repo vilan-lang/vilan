@@ -6016,3 +6016,148 @@ fn b210_a_tuple_with_no_impl_at_all_still_has_no_methods() {
         "(i32, i32) has no method 'len'",
     );
 }
+
+// --- B220: an ARRAY receiver joins the nominal set for USER impls -----------
+//
+// B210 fixed this shape for tuples and deliberately did not widen to arrays,
+// because whether an array gets method resolution at all was a decision rather
+// than a fix: `[T; n]` is STRUCTURAL in `resolve_method_call`, with `len` as its
+// one member. The decision is B210's precedent — an array is an impl subject
+// like any other (spec §5.7), so a user impl on one is reachable by method call
+// exactly as it already was by operator. `len` stays structural: it is a
+// compile-time constant read off the type, no impl provides it, and the arm
+// that folds it runs ahead of the lookup.
+
+#[test]
+fn b220_an_inherited_operator_default_resolves_by_name_on_an_array() {
+    // The exhibit. `PartialOrd<B = Self>` declares `lt`'s operand as the
+    // trait's own parameter; the impl writes no argument, so the operand is the
+    // bare trait, and `a < b` dispatches to the inherited `lt` whose body calls
+    // `self.partial_compare(b)`. With the array outside the nominal receiver
+    // set that inner call could not find the impl's member, and the emitter's
+    // never-silent check fired with an `internal:` error.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialOrd, PartialEq, Ordering };
+        import std::option::{ Option, Some };
+
+        impl [i32; 2] with PartialEq {
+            fun eq(self, b: [i32; 2]): bool { self[0] == b[0] && self[1] == b[1] }
+        }
+
+        impl [i32; 2] with PartialOrd {
+            fun partial_compare(self, b: [i32; 2]): Option<Ordering> {
+                if self[0] < b[0] { Some(Ordering::Less) } else { Some(Ordering::Equal) }
+            }
+        }
+
+        fun main() {
+            let a: [i32; 2] = [1, 2];
+            let b: [i32; 2] = [3, 4];
+            print(a < b);
+            print(a.lt(b));
+            print(b.lt(a));
+        }
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b220_a_trait_default_specialized_for_an_array_reaches_the_impls_member() {
+    // The emission half, which is the site B220 names: the analyzer resolves
+    // `label` to the trait's default and records the concrete receiver for
+    // codegen to re-dispatch against, and the transformer's re-dispatch
+    // admitted nominal receivers only — so the default's own `self.tag()`
+    // walked past `impl [i32; 2] with Tagged` to the trait's BODYLESS
+    // requirement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        trait Tagged {
+            fun tag(self): str;
+            fun label(self): str { "<" + self.tag() + ">" }
+        }
+
+        impl [i32; 2] with Tagged {
+            fun tag(self): str { self[0].to_string() }
+        }
+
+        fun main() {
+            let pair: [i32; 2] = [7, 8];
+            print(pair.label());
+        }
+        "#,
+        "<7>\n",
+    );
+}
+
+#[test]
+fn b220_an_array_impls_inherent_method_is_reachable_by_name() {
+    // The lookup arm itself, with no trait in it: an inherent `impl [i32; 2]`
+    // is an impl like any other and its member resolves on the receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        impl [i32; 2] {
+            fun first(self): i32 { self[0] }
+        }
+
+        fun main() {
+            let pair: [i32; 2] = [4, 9];
+            print(pair.first());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b220_len_stays_structural_on_an_array() {
+    // The control the decision turns on. `len` is the array's ONE structural
+    // member — the compile-time length read off the type, folded to a constant
+    // (fixed-arrays.md §10) — and joining the nominal set must not route it
+    // through impl lookup, where no impl provides it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        impl [i32; 2] {
+            fun first(self): i32 { self[0] }
+        }
+
+        fun main() {
+            let pair: [i32; 2] = [4, 9];
+            print(pair.len());
+            print(pair.len() + pair.first());
+        }
+        "#,
+        "2\n6\n",
+    );
+}
+
+#[test]
+fn b220_an_array_impls_method_is_not_reachable_at_another_length() {
+    // The refusal that has to survive: an array's LENGTH is part of its type,
+    // so `impl [i32; 2]` says nothing about a 3-element array, and the message
+    // is the ordinary no-method one naming the receiver's spelling.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        impl [i32; 2] {
+            fun first(self): i32 { self[0] }
+        }
+
+        fun main() {
+            let triple: [i32; 3] = [1, 2, 3];
+            print(triple.first());
+        }
+        "#,
+        "[i32; 3] has no method 'first'",
+    );
+}

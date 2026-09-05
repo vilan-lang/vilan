@@ -28875,9 +28875,10 @@ impl<'src> Analyzer<'src> {
             // passed where a `Combine` is expected, including a `Self`-defaulted
             // generic that resolved to the trait.
             //
-            // A TUPLE is such a value (B210). `impl (i32, i32) with PartialOrd`
-            // makes one, `type_implements_trait` has always agreed (it compares
-            // impl subjects of every shape), and `smaller<T: PartialOrd>((1, 2),
+            // A TUPLE is such a value (B210), and so is an ARRAY (B220).
+            // `impl (i32, i32) with PartialOrd` makes one,
+            // `type_implements_trait` has always agreed (it compares impl
+            // subjects of every shape), and `smaller<T: PartialOrd>((1, 2),
             // (3, 4))` already ran — but the arm listed only the nominal shapes,
             // so the ONE place the tuple was rejected was a parameter typed by
             // the trait itself. That is exactly how `PartialOrd<B = Self>`'s
@@ -28887,7 +28888,7 @@ impl<'src> Analyzer<'src> {
             // method asymmetry this item exists to remove, surviving one level
             // below the method lookup.
             (
-                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
                 Type::Trait(trait_id, template_arguments),
             ) => {
                 if !self.type_implements_trait(a, *trait_id) {
@@ -31693,29 +31694,19 @@ impl<'src> Analyzer<'src> {
         {
             return Resolution::Deferred;
         }
-        // `[T; n]` is structural — there is no impl to look up. Its one method is
-        // `len()`, resolved directly to `Expr::ArrayLen` with the length read off
-        // the type (fixed-arrays.md §10); anything else keeps the standard
-        // no-method error.
-        if let Type::Array(_, length) = &subject_type {
+        // `[T; n].len()` is STRUCTURAL and stays so: the length is a compile-time
+        // constant read off the TYPE, resolved directly to `Expr::ArrayLen`
+        // (fixed-arrays.md §10). No impl can provide it and none is consulted —
+        // which is why this arm runs ahead of the lookup below rather than
+        // inside it. Every OTHER member falls through to the nominal dispatch:
+        // an array is an impl subject like any other (B220), so a user's
+        // `impl [i32; 2] with PartialOrd` answers there, and an array with no
+        // impl for the name gets the same `has no method` refusal from the
+        // lookup's own arm.
+        if let Type::Array(_, length) = &subject_type
+            && member_name == "len"
+        {
             let length = *length;
-            if member_name != "len" {
-                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    // The method NAME identifies the problem (A1/A4), not
-                    // the argument list.
-                    span: self
-                        .member_name_spans
-                        .get(&id)
-                        .copied()
-                        .unwrap_or(arguments_span),
-                    msg: format!("{} has no method '{}'", type_str, member_name),
-                });
-                self.expr_id_to_expr_map.insert(id, Expr::Error);
-                return Resolution::Failed;
-            }
             if !argument_ids.is_empty() || !generic_argument_ids.is_empty() {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -31739,6 +31730,20 @@ impl<'src> Analyzer<'src> {
         // competing traits, which override whatever the arm returns.
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
+            // B220: an ARRAY receiver belongs here too, for B210's reason and
+            // by B210's precedent. `len` is handled above and is the array's
+            // ONE structural member; everything else is a user impl's, and the
+            // lookup is shape-agnostic — `impl [i32; 2] with PartialOrd` is
+            // compared against the receiver by the same `compare_type` over the
+            // same table as every other subject. Without this arm an array fell
+            // to `_ => NotCallable`, so the inherited `lt` a specialized
+            // `PartialOrd` default dispatches `a < b` to could not find the
+            // impl's `partial_compare` and the emitter's never-silent check
+            // fired. Arrays stay STRUCTURAL for `len` and for everything the
+            // language itself gives them; joining this set only means a user
+            // impl on an array is reachable by method call, as it already was
+            // by operator.
+            //
             // B210: a TUPLE receiver belongs here, with the nominal ones. It
             // used to fall to `_ => NotCallable` at the bottom, so `(1, 2)`
             // resolved NO method at any arity — not an inherent impl, not a
@@ -31760,7 +31765,7 @@ impl<'src> Analyzer<'src> {
             // `impl (type T, T)` at `(i32, i32)`, and `list_element_slot`
             // answers `None` for a tuple, so the `push`/`run` slot branch is
             // inert here.
-            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) => {
+            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) | Type::Array(_, _) => {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.
