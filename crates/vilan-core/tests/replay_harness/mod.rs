@@ -13,6 +13,11 @@
 //! corpus sweep, which is the long one and the reason the two are separate
 //! binaries at all — tracker N57).
 
+// Two binaries read this harness — `replay_differential` (the corpus sweep) and
+// `check_scope_differential` (the fast T1/T1b pins, which keep their own five-field
+// observation helpers) — each a different subset; `support/mod.rs`'s precedent.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
