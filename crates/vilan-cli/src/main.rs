@@ -486,10 +486,9 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
             // A `none` package is a pure library — not buildable, but type-checkable
             // (against the base layer only).
             Ok(first) => {
-                let goal = if unit.entry_declared {
-                    CompileGoal::Check
-                } else {
-                    CompileGoal::CheckModule
+                let goal = match unit.entry_mode {
+                    vilan_core::EntryMode::Declared => CompileGoal::Check,
+                    vilan_core::EntryMode::OpenFile { .. } => CompileGoal::CheckModule,
                 };
                 let mut platforms = vec![first];
                 if platform.is_none() {
@@ -2360,16 +2359,21 @@ struct Unit {
     platform_reasons: Vec<(Platform, String)>,
     /// Whether this unit's `entry` is a program the package DECLARES — a
     /// package leg, the single `[package] entry`, a bare file — rather than one
-    /// of the package's MODULES addressed by path (E113's `is_package_module`).
+    /// of the package's MODULES addressed by path (E113's `is_package_module`),
+    /// and, when it is a module, which siblings ARE declared programs (B240).
     ///
     /// Two things read it, and they used to be one: `check` skips the `main`
     /// demand and the emission walk for a module (E113), and the analysis is
     /// told which kind of entry it has been handed, so a sibling that imports
-    /// the module can still import it (B239, `EntryMode`). It rides on the unit
-    /// beside `platform_reasons` because it is the same kind of fact — what the
+    /// the module can still import it (B239). It rides on the unit beside
+    /// `platform_reasons` because it is the same kind of fact — what the
     /// manifest says about the file the caller named — and because every
     /// compile of the unit needs it, not only `check`'s.
-    entry_declared: bool,
+    ///
+    /// It IS `vilan_core::EntryMode`, rather than a `bool` beside one: the two
+    /// were one fact spelled twice, and the declared-entry set B240 adds has
+    /// exactly the shape the analysis reads.
+    entry_mode: vilan_core::EntryMode,
 }
 
 /// The `[build] run` hooks of the addressed manifest (A9): external commands —
@@ -3315,7 +3319,7 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             // there is nothing about the file's own situation to explain.
             platform_reasons: Vec::new(),
             // A file with no `[package]` above it IS the program it names.
-            entry_declared: true,
+            entry_mode: vilan_core::EntryMode::Declared,
         },
         platform: None,
         shared_platforms: Vec::new(),
@@ -3352,7 +3356,14 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
     let mut platforms = choices.into_iter().map(|choice| choice.platform);
     let platform = platforms.next();
     let shared_platforms: Vec<Platform> = platforms.collect();
-    let entry_declared = !is_package_module(&pkg_root, &manifest, &entry);
+    // B239/B240: which situation this compile is in, and — in file mode — which
+    // of the package's files are programs a module may not import.
+    let entry_mode = match is_package_module(&pkg_root, &manifest, &entry) {
+        false => vilan_core::EntryMode::Declared,
+        true => vilan_core::EntryMode::OpenFile {
+            declared_entries: vilan_core::platform_color::declared_entry_module_names(&manifest),
+        },
+    };
     Ok(Project::Single {
         unit: Unit {
             name: String::new(),
@@ -3362,7 +3373,7 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             split: false,
             options,
             platform_reasons,
-            entry_declared,
+            entry_mode,
         },
         platform,
         shared_platforms,
@@ -3486,7 +3497,7 @@ fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions)
         // manifest says out loud — nothing for E119 to explain.
         platform_reasons: Vec::new(),
         // The `[package] entry` itself: the program the manifest declares.
-        entry_declared: true,
+        entry_mode: vilan_core::EntryMode::Declared,
     }
 }
 
@@ -3522,7 +3533,7 @@ fn package_units(
                     // explanation, and the author wrote it.
                     platform_reasons: Vec::new(),
                     // An `[entry.<name>]` path: declared, by name.
-                    entry_declared: true,
+                    entry_mode: vilan_core::EntryMode::Declared,
                 },
                 entry.resolved_target().unwrap_or_default(),
             )
@@ -3843,11 +3854,12 @@ fn compile_unit(
     // package declares, or one of its modules addressed by path. Threaded on
     // the same context and for the same reason as the line above — a fact about
     // THIS compile that only the front end, which read the manifest, can know.
-    workspace.entry_mode = if unit.entry_declared {
-        vilan_core::EntryMode::Declared
-    } else {
-        vilan_core::EntryMode::OpenFile
-    };
+    //
+    // B240: file mode carries the manifest's DECLARED-ENTRY set with it, so the
+    // analysis can see that a SIBLING is a program — `views.vl` importing
+    // `pkg::client` is refused here exactly as `vilan check .`'s `client` leg
+    // refuses it.
+    workspace.entry_mode = unit.entry_mode.clone();
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.
@@ -6901,7 +6913,7 @@ mod tests {
                 split: false,
                 options: BuildOptions::default(),
                 platform_reasons: Vec::new(),
-                entry_declared: true,
+                entry_mode: vilan_core::EntryMode::Declared,
             },
             platform,
         )

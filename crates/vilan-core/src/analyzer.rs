@@ -3598,6 +3598,21 @@ pub struct Analyzer<'src> {
     // same field, so it fails the same bound one pass later and says so in the
     // vocabulary of code the author never wrote.
     expose_refused_field_slots: HashSet<TypeId>,
+    // B236: what B226's entry-cycle refusal already accounts for — `(the file
+    // that wrote the import, a name that import would have brought in)`.
+    //
+    // The refusal is reported at the sibling's `import pkg::<entry>`, and the
+    // entry's scope is empty by construction when a sibling reads it, so the
+    // import binds NOTHING. Everything downstream then said so again in its
+    // own vocabulary: the import's own walk ("cannot find 'Tab' in the imported
+    // path"), and every use of the name it failed to bind ("cannot find type
+    // 'Tab'", "cannot find 'Tab' in this scope"). None of those is a second
+    // mistake. The stand-down is B189's — record what the one report covers and
+    // let the sites that would restate it ask ([`Self::entry_cycle_refusal_covers`]).
+    //
+    // Keyed by FILE as well as name: the sibling that wrote the refused import
+    // is the only file whose miss of that name this report accounts for.
+    entry_cycle_refused_imports: Vec<(SourceId, String)>,
     // The ELEMENT each of those refusals named, as the refusal RENDERED it. The
     // expansion writes two shapes per exposed field and only one of them is
     // handed the field: `session.expose(self.tasks)` carries it, while the
@@ -4356,6 +4371,7 @@ impl<'src> Analyzer<'src> {
             refused_annotation_slots: HashMap::default(),
             refused_annotation_traits: HashMap::default(),
             expose_refused_field_slots: HashSet::default(),
+            entry_cycle_refused_imports: Vec::new(),
             expose_refused_elements: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
@@ -16520,6 +16536,29 @@ impl<'src> Analyzer<'src> {
         self.annotation_slots_behind(expr_id)
             .into_iter()
             .any(|slot| self.expose_refused_field_slots.contains(&slot))
+    }
+
+    /// B236: is this miss of `name` in `source_id` one B226's entry-cycle
+    /// refusal has already reported?
+    ///
+    /// The refusal is filed at the `import pkg::<entry>` that cannot bind, and
+    /// what follows it is the same mistake read again — once by the import's
+    /// own walk, once by every use of the name that never arrived. Same idiom
+    /// as [`Self::expose_refusal_behind`]: the covered set is empty in every
+    /// program that has no such refusal, so the check costs nothing there and
+    /// the scan is over a handful of entries in the one program that does.
+    fn entry_cycle_refusal_covers(&self, source_id: Option<SourceId>, name: &str) -> bool {
+        if self.entry_cycle_refused_imports.is_empty() {
+            return false;
+        }
+        let Some(source_id) = source_id else {
+            return false;
+        };
+        self.entry_cycle_refused_imports
+            .iter()
+            .any(|(refused_source, refused_name)| {
+                *refused_source == source_id && refused_name == name
+            })
     }
 
     /// [`Self::expose_refusal_behind`] asked of a GENERATED call: was it handed
@@ -28836,9 +28875,10 @@ impl<'src> Analyzer<'src> {
             // passed where a `Combine` is expected, including a `Self`-defaulted
             // generic that resolved to the trait.
             //
-            // A TUPLE is such a value (B210). `impl (i32, i32) with PartialOrd`
-            // makes one, `type_implements_trait` has always agreed (it compares
-            // impl subjects of every shape), and `smaller<T: PartialOrd>((1, 2),
+            // A TUPLE is such a value (B210), and so is an ARRAY (B220).
+            // `impl (i32, i32) with PartialOrd` makes one,
+            // `type_implements_trait` has always agreed (it compares impl
+            // subjects of every shape), and `smaller<T: PartialOrd>((1, 2),
             // (3, 4))` already ran — but the arm listed only the nominal shapes,
             // so the ONE place the tuple was rejected was a parameter typed by
             // the trait itself. That is exactly how `PartialOrd<B = Self>`'s
@@ -28848,7 +28888,7 @@ impl<'src> Analyzer<'src> {
             // method asymmetry this item exists to remove, surviving one level
             // below the method lookup.
             (
-                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
                 Type::Trait(trait_id, template_arguments),
             ) => {
                 if !self.type_implements_trait(a, *trait_id) {
@@ -29661,7 +29701,11 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 None => {
-                    if report {
+                    // B236: the first thing B226's entry-cycle refusal covers.
+                    // `pkg::<entry>` resolves to the entry's own (still empty)
+                    // scope, so the walk into it can only miss — and saying so
+                    // sends the author looking for a name they can see declared.
+                    if report && !self.entry_cycle_refusal_covers(Some(source_id), part) {
                         let msg =
                             removed_std_alias(root, part, namespace_scope_id == root_scope_id)
                                 .unwrap_or_else(|| {
@@ -31650,29 +31694,19 @@ impl<'src> Analyzer<'src> {
         {
             return Resolution::Deferred;
         }
-        // `[T; n]` is structural — there is no impl to look up. Its one method is
-        // `len()`, resolved directly to `Expr::ArrayLen` with the length read off
-        // the type (fixed-arrays.md §10); anything else keeps the standard
-        // no-method error.
-        if let Type::Array(_, length) = &subject_type {
+        // `[T; n].len()` is STRUCTURAL and stays so: the length is a compile-time
+        // constant read off the TYPE, resolved directly to `Expr::ArrayLen`
+        // (fixed-arrays.md §10). No impl can provide it and none is consulted —
+        // which is why this arm runs ahead of the lookup below rather than
+        // inside it. Every OTHER member falls through to the nominal dispatch:
+        // an array is an impl subject like any other (B220), so a user's
+        // `impl [i32; 2] with PartialOrd` answers there, and an array with no
+        // impl for the name gets the same `has no method` refusal from the
+        // lookup's own arm.
+        if let Type::Array(_, length) = &subject_type
+            && member_name == "len"
+        {
             let length = *length;
-            if member_name != "len" {
-                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    // The method NAME identifies the problem (A1/A4), not
-                    // the argument list.
-                    span: self
-                        .member_name_spans
-                        .get(&id)
-                        .copied()
-                        .unwrap_or(arguments_span),
-                    msg: format!("{} has no method '{}'", type_str, member_name),
-                });
-                self.expr_id_to_expr_map.insert(id, Expr::Error);
-                return Resolution::Failed;
-            }
             if !argument_ids.is_empty() || !generic_argument_ids.is_empty() {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -31696,6 +31730,20 @@ impl<'src> Analyzer<'src> {
         // competing traits, which override whatever the arm returns.
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
+            // B220: an ARRAY receiver belongs here too, for B210's reason and
+            // by B210's precedent. `len` is handled above and is the array's
+            // ONE structural member; everything else is a user impl's, and the
+            // lookup is shape-agnostic — `impl [i32; 2] with PartialOrd` is
+            // compared against the receiver by the same `compare_type` over the
+            // same table as every other subject. Without this arm an array fell
+            // to `_ => NotCallable`, so the inherited `lt` a specialized
+            // `PartialOrd` default dispatches `a < b` to could not find the
+            // impl's `partial_compare` and the emitter's never-silent check
+            // fired. Arrays stay STRUCTURAL for `len` and for everything the
+            // language itself gives them; joining this set only means a user
+            // impl on an array is reachable by method call, as it already was
+            // by operator.
+            //
             // B210: a TUPLE receiver belongs here, with the nominal ones. It
             // used to fall to `_ => NotCallable` at the bottom, so `(1, 2)`
             // resolved NO method at any arity — not an inherent impl, not a
@@ -31717,7 +31765,7 @@ impl<'src> Analyzer<'src> {
             // `impl (type T, T)` at `(i32, i32)`, and `list_element_slot`
             // answers `None` for a tuple, so the `push`/`run` slot branch is
             // inert here.
-            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) => {
+            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) | Type::Array(_, _) => {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.
@@ -35782,17 +35830,69 @@ impl<'src> Analyzer<'src> {
                 let note = note
                     .or_else(|| self.element_view_import_note(id, name))
                     .or_else(|| self.css_style_import_note(id, name));
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note,
-                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot find '{}' in this scope{}", name, steer),
-                });
-                if let Some(source) = self.source_of_id(id) {
-                    self.attribute_new_diagnostics(diagnostics_before, source);
+                // B236: the name is not missing — the import that would have
+                // brought it in was refused, and that refusal is already filed
+                // at the import. The expression still becomes an `Expr::Error`,
+                // which is what keeps the rest of the walk quiet; only the
+                // second telling is dropped.
+                if !self.entry_cycle_refusal_covers(self.source_of_id(id), name) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note,
+                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!("cannot find '{}' in this scope{}", name, steer),
+                    });
+                    if let Some(source) = self.source_of_id(id) {
+                        self.attribute_new_diagnostics(diagnostics_before, source);
+                    }
                 }
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
             }
+        }
+    }
+
+    /// One queued assignment, wired to the variable its target resolved to.
+    ///
+    /// Lifted out of `resolve_world`'s drain (B237) for the reason
+    /// [`Self::resolve_prepped_local`] was (B222): the drain runs in TWO parts
+    /// around the guard-continuation pass, and an assignment whose TARGET is
+    /// one of the held-back names cannot be wired until that name has resolved.
+    /// Before, it was simply dropped — the target was not yet an `Expr::Local`,
+    /// so it fell past every arm below including the refusal.
+    fn wire_prepped_assignment(&mut self, target_id: Id, value_id: Id) {
+        let Some(Expr::Local(variable_id)) = self.expr_id_to_expr_map.get(&target_id) else {
+            return;
+        };
+        let variable_id = *variable_id;
+        // A parameter's assignability is governed by its convention in
+        // `check_readonly_mutation`: bare / `&` are readonly and rejected
+        // there, while `own` rebinds its owned copy and `&mut` writes
+        // *through* — both allowed. A view binding is likewise handled by
+        // `check_readonly_mutation` + the write-through rewrite, and its type
+        // is fixed by the view it was bound to, not by later assignments. So
+        // skip both here (don't reject, don't feed type inference).
+        if self.parameters.contains_key(&variable_id) || self.binding_or_param_is_view(variable_id)
+        {
+            return;
+        }
+        // Anything else that is not a variable cannot be assigned (e.g. a
+        // function name); a plain immutable local is rejected by
+        // `check_readonly_mutation`.
+        if self.variables.get(&variable_id).is_none() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                msg: "cannot assign to this expression".to_string(),
+            });
+            return;
+        }
+        if let Some(Constraint::Variable(constraint)) =
+            self.constraints.iter_mut().find(|constraint| {
+                matches!(constraint, Constraint::Variable(constraint) if constraint.variable_id == variable_id)
+            })
+        {
+            constraint.value_ids.push(value_id);
         }
     }
 
@@ -35968,42 +36068,20 @@ impl<'src> Analyzer<'src> {
         // joins the variable's constraint so reassignments are type checked
         // against the variable's type, and assigning to an immutable binding
         // is rejected.
+        //
+        // B237: "now resolved" is what the drain above just stopped being true
+        // of. A target held back for the guard pass is not an `Expr::Local`
+        // yet, so it fell to `_ => continue` and the wiring never saw it at
+        // all — `n = 5` beside a guard whose capture is also called `n`
+        // compiled CLEAN and emitted an assignment to a top-level function.
+        // Those go into the second part, at the seam the guard pass uses.
+        let mut guarded_assignments = Vec::new();
         for (target_id, value_id) in std::mem::take(&mut self.prepped_assignments) {
-            let variable_id = match self.expr_id_to_expr_map.get(&target_id) {
-                Some(Expr::Local(variable_id)) => *variable_id,
-                _ => continue,
-            };
-            // A parameter's assignability is governed by its convention in
-            // `check_readonly_mutation`: bare / `&` are readonly and rejected
-            // there, while `own` rebinds its owned copy and `&mut` writes
-            // *through* — both allowed. A view binding is likewise handled by
-            // `check_readonly_mutation` + the write-through rewrite, and its type
-            // is fixed by the view it was bound to, not by later assignments. So
-            // skip both here (don't reject, don't feed type inference).
-            if self.parameters.contains_key(&variable_id)
-                || self.binding_or_param_is_view(variable_id)
-            {
+            if guarded_locals.iter().any(|(id, _)| *id == target_id) {
+                guarded_assignments.push((target_id, value_id));
                 continue;
             }
-            // Anything else that is not a variable cannot be assigned (e.g. a
-            // function name); a plain immutable local is rejected by
-            // `check_readonly_mutation`.
-            if self.variables.get(&variable_id).is_none() {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: "cannot assign to this expression".to_string(),
-                });
-                continue;
-            }
-            if let Some(Constraint::Variable(constraint)) =
-                self.constraints.iter_mut().find(|constraint| {
-                    matches!(constraint, Constraint::Variable(constraint) if constraint.variable_id == variable_id)
-                })
-            {
-                constraint.value_ids.push(value_id);
-            }
+            self.wire_prepped_assignment(target_id, value_id);
         }
 
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
@@ -36322,16 +36400,23 @@ impl<'src> Analyzer<'src> {
                     // indexes a file the author never opened. `source_id` is
                     // the walk's own record, captured when the annotation was
                     // prepped.
-                    self.push_at_written_type(
-                        Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span,
-                            msg: message,
-                        },
-                        source_id,
-                        type_id,
-                    );
+                    // B236: unless the import that would have declared this name
+                    // was refused at the entry cycle. The slot below is still
+                    // recorded — this annotation IS a refused one, and every
+                    // later reader must stand down over it — only the second
+                    // telling of the one mistake is dropped.
+                    if !self.entry_cycle_refusal_covers(Some(source_id), name) {
+                        self.push_at_written_type(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                            type_id,
+                        );
+                    }
                     // B189's first sibling: a name that does not resolve is a
                     // REFUSED ANNOTATION like any other. B182 instrumented the
                     // arm above and left this one, so `struct Holder { inner:
@@ -37310,6 +37395,15 @@ impl<'src> Analyzer<'src> {
         // about.
         for (id, name) in guarded_locals {
             self.resolve_prepped_local(id, name);
+        }
+
+        // B237: and the assignments to those names, wired now that their
+        // targets have resolved. Same seam, same reason — the wiring reads the
+        // target's resolution, so it belongs on the side of the guard pass
+        // where that resolution exists. The constraints it feeds are queued,
+        // not solved, so this is still before the fixpoint below.
+        for (target_id, value_id) in guarded_assignments {
+            self.wire_prepped_assignment(target_id, value_id);
         }
 
         // --- Constraint solving loop ---
@@ -43304,6 +43398,58 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
     modules
 }
 
+/// [`collect_module_refs`] with the rest of each import kept: `(module, the
+/// module's span, the names the import walks or binds BELOW that module)`.
+///
+/// One record per import LEAF, so `import pkg::views::{ a, b }` is two records
+/// sharing one span — which is what lets a refusal at the module report once per
+/// import statement (B240) while still knowing every name that import failed to
+/// bring in (B236's covered set).
+///
+/// The names are the ones [`Analyzer::resolve_import`] would walk and finally
+/// bind: the path segments after the module, then the leaf — or, for a `self`
+/// leaf, the namespace it re-binds.
+fn collect_module_import_paths<'a>(
+    nodes: &'a NodeList<'a>,
+    root: &str,
+) -> Vec<(&'a str, Span, Vec<&'a str>)> {
+    fn walk<'a>(
+        node: &'a Spanned<Node<'a>>,
+        root: &str,
+        imports: &mut Vec<(&'a str, Span, Vec<&'a str>)>,
+    ) {
+        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+            let mut entries = Vec::new();
+            flatten_namespace_branch(branch, Vec::new(), &mut entries);
+            for (path, leaf, leaf_span) in entries {
+                if path.first().map(|(name, _)| *name) != Some(root) {
+                    continue;
+                }
+                // A bare `import pkg::views` names the module in its leaf and
+                // walks nothing below it; the name it binds is the module's.
+                let Some((module, module_span)) = path.get(1).copied() else {
+                    imports.push((leaf, leaf_span, vec![leaf]));
+                    continue;
+                };
+                let mut names: Vec<&str> = path[2..].iter().map(|(segment, _)| *segment).collect();
+                // `views::{ self }` binds the namespace under its own name.
+                names.push(match leaf {
+                    "self" => path.last().map(|(name, _)| *name).unwrap_or(leaf),
+                    _ => leaf,
+                });
+                imports.push((module, module_span, names));
+            }
+        }
+        node.0
+            .for_each_child(&mut |child| walk(child, root, imports));
+    }
+    let mut imports = Vec::new();
+    for node in nodes {
+        walk(node, root, &mut imports);
+    }
+    imports
+}
+
 /// Lists the module files directly under `root`: a flat `name.vl` or a directory
 /// `name/lib.vl` (the two forms an importer can't tell apart). Returns each
 /// `(module name, file path)` in a stable (sorted) order, so diagnostics built from
@@ -43725,7 +43871,7 @@ pub struct Workspace {
 /// siblings import it. The two situations disagree about exactly one thing —
 /// what `pkg::<that file>` means — so the fact is carried as its own flag rather
 /// than inferred from the shape of the world.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EntryMode {
     /// The analyzed file is a program: an entry the manifest declares (the
     /// single `[package] entry`, an `[entry.<name>]` path), or a bare file with
@@ -43743,7 +43889,25 @@ pub enum EntryMode {
     /// siblings import — `pkg::<file>` names the scope it walks into, and a
     /// cycle through it is an ordinary module cycle, not a re-entry into a
     /// program.
-    OpenFile,
+    OpenFile {
+        /// The module names of the package's DECLARED programs
+        /// ([`crate::platform_color::declared_entry_module_names`]) — the ones
+        /// `pkg::<name>` may NOT reach, for the reason [`Self::Declared`]
+        /// states (B240).
+        ///
+        /// It rides on the mode rather than beside it because it is only ever
+        /// a question in file mode: a declared entry knows which file it is,
+        /// and a sibling importing it is B226's refusal. An open MODULE knows
+        /// its own file is importable (B239) and nothing more — until the
+        /// front end, which read the manifest, hands over the set, `views.vl`
+        /// importing `pkg::client::helper` is clean in the editor and refused
+        /// by `vilan check .`, whose `client` leg compiles that very file as
+        /// the entry.
+        ///
+        /// Empty for a caller with no manifest to read, which is the answer
+        /// that keeps every existing file-mode analysis exactly as it was.
+        declared_entries: Vec<String>,
+    },
 }
 
 /// Where a program's ambient scope is SET, in the reader's terms — the web-set
@@ -45453,7 +45617,11 @@ fn analyze_inner<'src>(
     // world is constructed (and, on a miss, stored) — through
     // `expand_entry_over_world`, identically on hit and miss — so the stored
     // world never carries entry expansions. Pre-marking SourceId(0) makes
-    // the loop's entry arm skip it; the entry-as-module arm is unaffected.
+    // the loop's entry arm skip it. The entry-as-MODULE arm claimed to be
+    // unaffected and was not (B240): the hoist that redeems the mark runs only
+    // under `!entry_is_module`, so the arm takes the mark back itself when it
+    // discovers the entry is a module — which cannot be decided here, since it
+    // is the load loop that finds out.
     if base_cacheable {
         expanded_sources.insert(SourceId(0));
     }
@@ -45629,7 +45797,7 @@ fn analyze_inner<'src>(
                 // imports its own name is the silent no-op it has always been —
                 // `a_non_entry_self_import_stays_clean` is that control, and the
                 // editor must not invent a warning the build never prints.
-                if workspace.entry_mode == EntryMode::Declared
+                if matches!(workspace.entry_mode, EntryMode::Declared)
                     && let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
                         .into_iter()
                         .find(|(module, _)| *module == name)
@@ -45659,6 +45827,21 @@ fn analyze_inner<'src>(
             let (ast, module_text, module_source_id): (&Spanned<NodeList>, &'src str, SourceId) =
                 if is_entry_module {
                     entry_is_module = true;
+                    // B240: and the §6.13 hoist's pre-mark, undone. A cacheable
+                    // analysis marks `SourceId(0)` expanded up front so the
+                    // load loop's ENTRY arm skips it and
+                    // `expand_entry_over_world` can run the entry's expansion
+                    // after the world is built — but that hoist runs only under
+                    // `!entry_is_module`, and the mark was never taken back
+                    // when the entry turned out to BE a module. A dependency
+                    // file opened as the entry (the editor, `vilan check
+                    // <path>`) therefore expanded nowhere and lost every
+                    // `[derive]` it declares. Here the file is a module, and
+                    // the module arm below is what expands it, under its own
+                    // `ModuleKey`. (A std file opened this way never hit it:
+                    // `entry_is_inside_std` makes that analysis uncacheable, so
+                    // there was no mark to undo.)
+                    expanded_sources.remove(&SourceId(0));
                     (nodes, entry_source, SourceId(0))
                 } else {
                     let Some(loaded) = load_package_module(&module_path) else {
@@ -46049,46 +46232,83 @@ fn analyze_inner<'src>(
         }
     }
 
-    // An import CYCLE back into the entry (`client` -> `views` -> `client`).
+    // An import of a file this package declares as a PROGRAM.
+    //
+    // B226, the DECLARED entry's own case (`client` -> `views` -> `client`).
     // The alias above answers `pkg::<entry>` with the entry's own scope, which
     // the entry itself reads fine — but a sibling module resolves its imports
     // before the entry walks, so that scope is still empty when it looks, and
     // the honest answer is that the entry cannot be imported at all: it is the
     // program. Say that at the import rather than letting the name lookup fail
     // with "cannot find `X` in the imported path" over a name the user can see
-    // declared (B226).
+    // declared.
     //
-    // B239: for a DECLARED entry only. In file mode the entry is a module of
-    // its package that a front end opened as the entry, its siblings import it
-    // as they always did, and `entry_is_open_module` below buys them the order
-    // that makes those imports resolve. Refusing there was the regression: the
-    // owner's `views.vl` grew seven errors in the editor while `vilan check .`
-    // — which compiles the real entries, where `views` IS a module — stayed
-    // clean.
-    if let Some(entry_module) =
-        entry_alias_module.filter(|_| workspace.entry_mode == EntryMode::Declared)
-    {
-        for (_name, ast, _text, _scope_id, source_id, origin) in &loaded {
-            if *origin != Origin::Pkg {
-                continue;
-            }
-            for (module, span) in collect_module_refs(&ast.0, "pkg") {
-                if module != entry_module {
+    // B239 removed file mode from that rule, because the file mode entry is a
+    // MODULE its siblings have always imported and `entry_is_open_module` below
+    // buys them the order that resolves those imports. B240 puts back the half
+    // that is still true there: the package's OTHER declared programs. An open
+    // module could not see that a sibling is one — `views.vl` importing
+    // `pkg::client::helper` was clean in the editor and refused by `vilan check
+    // .`, whose `client` leg compiles that same file as the entry — until the
+    // front end, which read the manifest, handed the set over on `EntryMode`.
+    let refused_entry_modules: Vec<&str> = match &workspace.entry_mode {
+        EntryMode::Declared => entry_alias_module.into_iter().collect(),
+        EntryMode::OpenFile { declared_entries } => {
+            declared_entries.iter().map(String::as_str).collect()
+        }
+    };
+    if !refused_entry_modules.is_empty() {
+        // In file mode the OPEN FILE is one of the importers: it is a module of
+        // this package like any other, and its own `import pkg::client::…` is
+        // the shape the owner's `views.vl` carries. For a declared entry it is
+        // not — a self-import there is the WARNING above, not this refusal.
+        let importers = loaded
+            .iter()
+            .filter(|(_, _, _, _, _, origin)| *origin == Origin::Pkg)
+            .map(|(_, ast, _, _, source_id, _)| (*ast, *source_id))
+            .chain(
+                matches!(workspace.entry_mode, EntryMode::OpenFile { .. })
+                    .then_some((nodes as &Spanned<NodeList>, SourceId(0))),
+            );
+        for (ast, source_id) in importers {
+            // B240: the refusal is the IMPORT's, so it is pushed once per import
+            // statement. Every leaf of `import pkg::client::{ helper, other }`
+            // carries the module segment's own span, so one statement produced
+            // one error per name it listed, all at the same span — invisible in
+            // the CLI's rendering (which folds identical spans) and two
+            // squiggles on one word in the editor, whose raw diagnostics do not.
+            let mut reported: Vec<Span> = Vec::new();
+            for (module, span, names) in collect_module_import_paths(&ast.0, "pkg") {
+                let Some(entry_module) = refused_entry_modules
+                    .iter()
+                    .find(|declared| **declared == module)
+                else {
                     continue;
+                };
+                if !reported.contains(&span) {
+                    reported.push(span);
+                    let diagnostics_before = analyzer.diagnostics.len();
+                    analyzer.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`pkg::{entry_module}` is this program's entry file, which is the \
+                             program itself and not a module: it cannot be imported. Move the \
+                             declarations both files need into their own module and import that \
+                             from each"
+                        ),
+                    });
+                    analyzer.attribute_new_diagnostics(diagnostics_before, source_id);
                 }
-                let diagnostics_before = analyzer.diagnostics.len();
-                analyzer.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`pkg::{entry_module}` is this program's entry file, which is the \
-                         program itself and not a module: it cannot be imported. Move the \
-                         declarations both files need into their own module and import that \
-                         from each"
-                    ),
-                });
-                analyzer.attribute_new_diagnostics(diagnostics_before, *source_id);
+                // B236: and what that one report accounts for. The import binds
+                // nothing — the entry's scope is empty when a sibling reads it,
+                // which is the whole reason it is refused — so the import's own
+                // walk and every use of the names it did not bind would each say
+                // the same thing again.
+                analyzer
+                    .entry_cycle_refused_imports
+                    .extend(names.into_iter().map(|name| (source_id, name.to_string())));
             }
         }
     }
@@ -46533,7 +46753,7 @@ fn analyze_inner<'src>(
     // loaded this file, and `base_cache_lookup`'s `entry_is_a_loaded_module`
     // already refuses every world that did.
     let entry_is_open_module =
-        entry_alias_module.is_some() && workspace.entry_mode == EntryMode::OpenFile;
+        entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module && !entry_is_open_module {
         analyzer.resolve_world();

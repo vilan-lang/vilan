@@ -1407,3 +1407,58 @@ fn checking_a_module_file_a_sibling_imports_is_clean() {
         "with no refusal of the sibling's import: {file_stderr}"
     );
 }
+
+#[test]
+fn checking_a_module_file_that_imports_a_declared_entry_agrees_with_the_package() {
+    // B240, end to end, and the other half of the fixture above. `views.vl`
+    // importing `pkg::client::helper` is not a module cycle: `client` is one of
+    // the package's PROGRAMS. `vilan check .` refuses it — its `client` leg
+    // compiles that very file as the entry, where a sibling resolves its
+    // imports before the entry walks — while `vilan check src/views.vl` was
+    // clean, because file mode could not see that a sibling was declared. Both
+    // verdicts are asserted here, in one fixture, for the reason the pin above
+    // asserts both: the whole complaint is that they disagreed.
+    let dir = temp_files(
+        "open_module_imports_entry",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                 [entry.client]\n\n[entry.server]\n",
+            ),
+            (
+                "src/views.vl",
+                "import pkg::client::helper;\n\nfun render(): i32 { helper() }\n",
+            ),
+            (
+                "src/client.vl",
+                "import std::io::print;\nimport pkg::views::render;\n\n\
+                 fun helper(): i32 { 1 }\n\nfun main() {\n\tprint(render());\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ],
+    );
+    let file = vilan(&dir, &["check", "src/views.vl"], true);
+    let file_stderr = String::from_utf8_lossy(&file.stderr).into_owned();
+    let package = vilan(&dir, &["check", "."], true);
+    let package_stderr = String::from_utf8_lossy(&package.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        package_stderr.contains("`pkg::client` is this program's entry file"),
+        "the package refuses the import of a program: {package_stderr}"
+    );
+    assert!(
+        file_stderr.contains("`pkg::client` is this program's entry file"),
+        "and so does the module the editor opens: {file_stderr}"
+    );
+    // B236: one mistake, one report, in the surface that renders it.
+    assert_eq!(
+        error_headers(&file_stderr).len(),
+        1,
+        "with no cascade over the name it did not bind: {file_stderr}"
+    );
+}

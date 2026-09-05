@@ -2220,6 +2220,13 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
         "import common::greeting;\n\nfun main() {\n\tlet _x = greeting();\n}\n",
     )
     .unwrap();
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
+    )
+    .unwrap();
     let dep_root = root.join("common");
     std::fs::create_dir_all(&dep_root).unwrap();
     std::fs::write(
@@ -3208,6 +3215,13 @@ fn a_dependency_resolves_under_its_own_prelude_not_the_consumers() {
         "import common::greeting;\nfun main() { let s = Signal::new(0); print(\"app\"); }\n",
     )
     .unwrap();
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
+    )
+    .unwrap();
     let dep_root = root.join("common");
     std::fs::create_dir_all(&dep_root).unwrap();
     std::fs::write(
@@ -3778,6 +3792,18 @@ fn a_non_entry_self_import_stays_clean() {
 // monolithic order — everything resolves once, after the entry walk, so
 // `pkg::<open file>` names the scope the entry walked into.
 
+/// [`EntryMode::OpenFile`] carrying the package's declared-entry module names
+/// (B240). `&[]` is the answer for a caller with no manifest to read, and is
+/// what every B239 pin below wants: nothing in those packages is declared.
+fn open_file(declared_entries: &[&str]) -> EntryMode {
+    EntryMode::OpenFile {
+        declared_entries: declared_entries
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+    }
+}
+
 /// As [`analyze_package_raw`], but the analysis is told what KIND of entry it
 /// was handed (B239) and keeps the program's warnings beside its diagnostics.
 fn analyze_package_as(
@@ -3868,7 +3894,7 @@ fn b239_an_open_module_file_stays_importable_by_its_siblings() {
     // method declared in the open file is reachable through the cycle, and the
     // open file's own `[derive]` still expands (it is walked as the program,
     // which is what B226 bought and what this must not give back).
-    let (errors, warnings) = analyze_package_as(B239_FILES, "views.vl", EntryMode::OpenFile);
+    let (errors, warnings) = analyze_package_as(B239_FILES, "views.vl", open_file(&[]));
     assert!(
         errors.is_empty(),
         "an open module file is still the module its siblings import: {errors:#?}"
@@ -3935,7 +3961,7 @@ fn b239_an_open_module_files_self_import_says_nothing() {
              fun shown(): bool { Tab::Messages == Tab::Other }\n",
         )],
         "views.vl",
-        EntryMode::OpenFile,
+        open_file(&[]),
     );
     assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
     assert!(
@@ -3962,10 +3988,297 @@ fn b239_an_open_module_file_needs_no_main() {
             ),
         ],
         "views.vl",
-        EntryMode::OpenFile,
+        open_file(&[]),
     );
     assert!(
         errors.is_empty(),
         "no `main`, and none demanded: {errors:#?}"
     );
+}
+
+// ── B236: the entry-cycle refusal reports ONCE ───────────────────────────────
+
+#[test]
+fn b236_the_entry_cycle_refusal_reports_exactly_once() {
+    // B226 refuses the sibling's `import pkg::main::Tab` at the import, and
+    // that is the whole mistake. What followed it was the same mistake read
+    // three more ways: the import's own walk into the entry's (empty) scope
+    // ("cannot find 'Tab' in the imported path"), and then every use of the
+    // name the import never bound ("cannot find type 'Tab'", twice). Four
+    // reports over one edit, three of them naming a type the author can see
+    // declared in the file the refusal already pointed at.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::Tab;\n\nfun render(): bool { Tab::Messages == Tab::Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "one cycle, one report — no cascade over the names it did not bind: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "and the one report is the refusal at the import: {errors:#?}"
+    );
+}
+
+#[test]
+fn b236_a_value_use_of_a_refused_entry_import_stands_down_too() {
+    // The value-position twin of the same cascade: the sibling imports a
+    // FUNCTION from the entry, so the follow-on is "cannot find 'helper' in
+    // this scope" at the call rather than "cannot find type". One mistake,
+    // one report, whichever position the name is read in.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\n\nfun render(): i32 { helper() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(errors.len(), 1, "one cycle, one report: {errors:#?}");
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b236_the_stand_down_covers_only_what_the_refusal_accounts_for() {
+    // The control. The stand-down is keyed on the FILE that wrote the refused
+    // import and the NAMES that import would have brought in — nothing wider.
+    // A real miss in the same file, of a name no refused import mentions, is
+    // still the author's own mistake and is still reported.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\n\nfun render(): i32 { helper() + missing() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::main` is this program's entry file")),
+        "the refusal stands: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot find 'missing' in this scope")),
+        "and an unrelated miss in the same file is still reported: {errors:#?}"
+    );
+}
+
+// ── B240: file mode's residues after B239 ────────────────────────────────────
+
+#[test]
+fn b240_the_entry_refusal_is_pushed_once_per_import_statement() {
+    // (a) The refusal is the IMPORT's, and `import pkg::client::{ helper,
+    // other }` is one import. Every leaf of it carries the module segment's own
+    // span, so the loop pushed one error PER NAME, all at the same span — the
+    // CLI folds identical spans and showed one, the editor's raw diagnostics do
+    // not and showed two squiggles on one word.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\nfun other(): i32 { 4 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::{ helper, other };\n\n\
+                 fun render(): i32 { helper() + other() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "one import statement, one refusal (B236 covers the names it did not bind): {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b240_two_separate_imports_of_the_entry_are_two_refusals() {
+    // The control for that dedup, and the reason it is keyed on the SPAN rather
+    // than on the module name: two `import` statements are two mistakes, each
+    // written somewhere the reader has to look.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\nfun other(): i32 { 4 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\nimport pkg::main::other;\n\n\
+                 fun render(): i32 { helper() + other() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(errors.len(), 2, "one per import statement: {errors:#?}");
+}
+
+#[test]
+fn b240_file_mode_refuses_an_import_of_a_sibling_that_is_a_declared_entry() {
+    // (b) The open file is a MODULE and its own siblings may import it (B239) —
+    // but the package's OTHER declared programs are still programs, and file
+    // mode could not see which files those were. `views.vl` importing
+    // `pkg::client::helper` was clean in the editor while `vilan check .` —
+    // whose `client` leg compiles that same file as the entry — refused it.
+    // The manifest's declared-entry set rides on `EntryMode` now, so the two
+    // surfaces agree.
+    let files: &[(&str, &str)] = &[
+        (
+            "client.vl",
+            "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+             fun main() {\n\tlet shown = render();\n}\n",
+        ),
+        (
+            "views.vl",
+            "import pkg::client::helper;\n\nfun render(): i32 { helper() }\n",
+        ),
+    ];
+    let (file_mode, _) = analyze_package_as(files, "views.vl", open_file(&["client"]));
+    assert!(
+        file_mode
+            .iter()
+            .any(|error| error.contains("`pkg::client` is this program's entry file")),
+        "file mode refuses the import of a declared entry: {file_mode:#?}"
+    );
+    let (declared, _) = analyze_package_as(files, "client.vl", EntryMode::Declared);
+    assert!(
+        declared
+            .iter()
+            .any(|error| error.contains("`pkg::client` is this program's entry file")),
+        "exactly as the declared-entry analysis does: {declared:#?}"
+    );
+}
+
+#[test]
+fn b240_file_mode_still_lets_a_sibling_import_the_open_module() {
+    // The control B239 bought, unmoved: the OPEN file is not a declared entry,
+    // so `pkg::views` is an ordinary module import and the cycle through it is
+    // an ordinary module cycle. Only a file the manifest declares is refused.
+    let (errors, warnings) =
+        analyze_package_as(B239_FILES, "views.vl", open_file(&["client", "server"]));
+    assert!(
+        errors.is_empty(),
+        "an open module file is still the module its siblings import: {errors:#?}"
+    );
+    assert!(warnings.is_empty(), "silently: {warnings:#?}");
+}
+
+#[test]
+fn b240_a_dependency_file_opened_as_the_entry_keeps_its_own_derives() {
+    // (c) The latent third residue, and the only one nothing was pinning. A std
+    // or dependency file opened DIRECTLY (the editor, `vilan check <path>`) is
+    // analyzed as its own module from the buffer rather than loaded a second
+    // time from disk — `entry_is_module`. The derive/macro hoist (§6.13) marks
+    // `SourceId(0)` expanded up front so the load loop's ENTRY arm skips it and
+    // `expand_entry_over_world` can run the expansion after the world is built;
+    // that hoist runs only under `!entry_is_module`, and the mark was never
+    // taken back. So the file expanded NOWHERE and lost every `[derive]` it
+    // declares — B226's original complaint, one package over. (A std file
+    // escaped it only because `entry_is_inside_std` makes that analysis
+    // uncacheable, so there was no mark to undo.)
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_depentry_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
+    )
+    .unwrap();
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).unwrap();
+    // The dependency's public surface, which every dependent loads — and which
+    // reaches the module below through the dependency's own `pkg::`. That load
+    // is what hands the open buffer back as a `Dep` module at `SourceId(0)`.
+    std::fs::write(
+        dep_root.join("lib.vl"),
+        "import pkg::helper::shown;\n\nfun greeting(): bool { shown() }\n",
+    )
+    .unwrap();
+    // The dependency's own module, opened as the entry. Its `[derive]` is the
+    // whole subject: the file is walked as the program AND registered as the
+    // dependency's `helper` module, and the expansion must still happen.
+    let helper = dep_root.join("helper.vl");
+    std::fs::write(
+        &helper,
+        "[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+         fun shown(): bool { Tab::Messages == Tab::Other }\n",
+    )
+    .unwrap();
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root.clone(),
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        ..Workspace::default()
+    };
+    let source = std::fs::read_to_string(&helper).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &app_dir,
+        &helper,
+        Some(Platform::default()),
+        &workspace,
+    );
+    let errors: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("does not implement the `PartialEq` operator")),
+        "the opened dependency file's own `[derive]` must expand: {errors:#?}"
+    );
+    assert!(errors.is_empty(), "and nothing else is wrong: {errors:#?}");
 }

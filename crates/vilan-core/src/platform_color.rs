@@ -992,6 +992,51 @@ pub fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> b
         .any(|(name, declared)| same(pkg_root.join(declared.path(name))))
 }
 
+/// The module names `pkg::…` addresses the package's DECLARED PROGRAMS by: the
+/// single `[package] entry` (default `main.vl`) and every `[entry.<name>]` path.
+///
+/// [`is_package_module`] read from the other side, and the fact FILE MODE was
+/// missing (B240). An analysis in [`crate::EntryMode::OpenFile`] is looking at
+/// one of the package's modules, and it knows that its OWN file is importable
+/// (B239) — but it could not tell that a SIBLING is a program: `views.vl`
+/// importing `pkg::client::helper` was clean in the editor and refused by
+/// `vilan check .`, whose `client` leg compiles that very file as the entry.
+/// Only the front end reads the manifest, so only the front end can say.
+///
+/// Read LEXICALLY off the declared paths, never against the filesystem (which
+/// is why it takes no root): the name is the one the loader would resolve —
+/// `<name>.vl` or `<name>/lib.vl` directly under the source root. A declared
+/// entry deeper than that is not addressable as `pkg::<name>` at all, so it is
+/// not listed.
+pub fn declared_entry_module_names(manifest: &Manifest) -> Vec<String> {
+    /// `foo.vl` -> `foo`, `foo/lib.vl` -> `foo`, anything else -> `None`.
+    fn module_name(relative: &Path) -> Option<String> {
+        let mut segments = relative.iter();
+        let first = segments.next()?.to_str()?;
+        match segments.next() {
+            None => first.strip_suffix(".vl").map(str::to_string),
+            Some(second) if second == "lib.vl" && segments.next().is_none() => {
+                Some(first.to_string())
+            }
+            Some(_) => None,
+        }
+    }
+    let Some(package) = manifest.package.as_ref() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = match manifest.entries.is_empty() {
+        true => module_name(package.entry()).into_iter().collect(),
+        false => manifest
+            .entries
+            .iter()
+            .filter_map(|(name, declared)| module_name(&declared.path(name)))
+            .collect(),
+    };
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// One color a file is analyzed under, with the reason it was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformChoice {
