@@ -7480,6 +7480,98 @@ pub(crate) mod tests {
         );
     }
 
+    // --- E138: the comparison traits' members resolve as hover targets ------
+    //
+    // E128 pinned the `= Self` rendering on a USER trait shaped like
+    // `PartialEq` because hover on the std comparison traits' own members was
+    // seen to answer nothing through either route — read as a target-resolution
+    // gap. It is not one. `PartialEq`/`PartialOrd` live in `std::compare`, not
+    // `std::operators` where `Add`/`Sub`/`Mul` do, and the probe that found the
+    // silence imported them from the latter: the trait then does not exist, the
+    // member does not resolve, and no label is the honest answer. These four
+    // pin resolution through both routes on the RIGHT path; the fifth pins the
+    // misroute itself — the diagnostics that name the mistake and the fix — so
+    // the silence is never again read as a hover defect. Planting
+    // `std::operators` back into any of the four returns them to `None`, which
+    // is what the fifth records.
+
+    #[test]
+    fn e138_hover_on_partial_eq_eq_through_a_default_body() {
+        let hover = hover_at_cursor(
+            "import std::compare::PartialEq;\n\ntrait Same with PartialEq {\n\tfun alike(self): bool {\n\t\tself.e|q(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_eq_eq_through_a_bound() {
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialEq;\n\nfun alike<T: PartialEq>(a: T, b: T): bool {\n\ta.e|q(b)\n}\n\nfun main() {\n\tprint(alike(1, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_ord_lt_through_a_default_body() {
+        let hover = hover_at_cursor(
+            "import std::compare::PartialOrd;\n\ntrait Ranked with PartialOrd {\n\tfun below(self): bool {\n\t\tself.l|t(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `lt` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_ord_lt_through_a_bound() {
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialOrd;\n\nfun below<T: PartialOrd>(a: T, b: T): bool {\n\ta.l|t(b)\n}\n\nfun main() {\n\tprint(below(1, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `lt` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_importing_partial_eq_from_std_operators_is_diagnosed_and_hovers_nothing() {
+        // The probe's own shape, kept as the record: the import fails, the
+        // compiler names `std::compare` as the fix, the trait bound resolves to
+        // nothing, and hover on `eq` is correctly silent.
+        let source = "import std::operators::PartialEq;\n\ntrait Same with PartialEq {\n\tfun alike(self): bool {\n\t\tself.eq(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let diagnostics = document.published_diagnostics();
+        let published = messages(&diagnostics);
+        assert!(
+            published
+                .iter()
+                .any(|message| message.contains("cannot find 'PartialEq' in the imported path")),
+            "{published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .any(|message| message.contains("import std::compare::PartialEq;")),
+            "the diagnostic names the module the trait actually lives in: {published:?}"
+        );
+        let offset = source.find("self.eq").expect("exhibit has `self.eq`") + "self.e".len();
+        assert_eq!(
+            document.hover(offset),
+            None,
+            "a member of a trait that did not resolve has no declaration to show"
+        );
+    }
+
     // Hovering a function name appends its inferred platform requirement — the
     // coloring fixpoint surfaced in the editor, with the same via-chain
     // vocabulary the diagnostics use.
