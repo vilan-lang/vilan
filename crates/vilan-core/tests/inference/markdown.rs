@@ -1436,9 +1436,9 @@ fn a25_a_pending_unsubscribe_does_not_cross_a_rebind() {
          down {\"Update\":[0,0]}\n\
          sees 0\n\
          settled\n\
-         up   {\"Subscribe\":99}\n\
+         up   {\"Subscribe\":[99,null]}\n\
          sees 0\n\
-         up   {\"Unsubscribe\":99}\n",
+         up   {\"Unsubscribe\":[99,null]}\n",
     );
 }
 
