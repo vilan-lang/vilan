@@ -17,6 +17,17 @@ name: ci
 # would not run either. The filter has to move *into* the workflow, which is
 # what `changes` below is. The workflow now always triggers; the expensive legs
 # decide for themselves whether to run; `check` always reports.
+#
+# NOTE ALSO where the gate commands are: NOT here. Every leg job below runs
+# `scripts/ci-local.sh <leg>` and nothing else, so the local gate and this file
+# are ONE list of commands rather than two that agree until they don't (L19).
+# The workflow keeps what only a workflow can have — the runner, the toolchain,
+# the tool installs, the caches, the matrix — and the script keeps what a
+# person can run: `scripts/ci-local.sh` with no arguments is this file's union.
+# `crates/vilan-cli/tests/ci_local_script.rs` holds the two together in both
+# directions (every leg job calls the script; the script's leg list is the job
+# list), and `release_gate.rs` reads the CI side's commands out of the script
+# now that this is where they live.
 on:
   pull_request:
   push:
@@ -134,15 +145,21 @@ jobs:
       - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
           tool: cargo-nextest
-      # THE gate command. release.yml's `gate` job runs these same two legs,
-      # character for character, and they change together — see releases.md §7
-      # step 1 for what happened the one time they disagreed.
+      # THE gate command, and it is not written here: `scripts/ci-local.sh`
+      # holds it, this job calls the script, and `ci_local_script.rs` holds the
+      # two together. release.yml's `gate` job runs the same legs, character
+      # for character — see releases.md §7 step 1 for what happened the one
+      # time they disagreed, and `release_gate.rs` for the machine behind it.
+      # `shell: bash` because the windows leg's default is PowerShell and the
+      # script is POSIX shell; the runner ships git-bash for exactly this.
       - name: The suite is green
-        run: cargo nextest run --workspace
+        shell: bash
+        run: scripts/ci-local.sh test
       # nextest does not run doc-tests. Every doc-test set is empty today;
       # this leg exists so a future doc-test cannot silently stop running.
       - name: The doc-tests are green
-        run: cargo test --workspace --doc
+        shell: bash
+        run: scripts/ci-local.sh doctest
 
   # The playground's compiler (D11). Its BEHAVIOUR is covered by the workspace
   # suite above — `vilan-wasm` is an rlib as well as a cdylib precisely so its
@@ -171,22 +188,17 @@ jobs:
       # runtime, not here, which is the worst place to find out.
       - name: wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
-      # The same 64 MiB stack the playground ships with (release.yml, where
-      # the measured B138 rationale for the size lives): the compiler recurses
-      # over deep expression trees, and wasm's default stack is far smaller
-      # than a host thread's.
-      - name: The artifact builds
-        run: |
-          RUSTFLAGS="-C link-arg=-zstack-size=67108864" \
-            cargo build -p vilan-wasm --profile wasm-release \
-              --target wasm32-unknown-unknown
-      # Binding generation is part of "it builds": a signature wasm-bindgen
-      # cannot express fails here rather than on the page.
-      - name: The bindings generate
-        run: |
-          wasm-bindgen --target web --out-dir pkg \
-            target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
-          ls -l pkg/vilan_wasm_bg.wasm
+      # The build and the bindings, from the script. The same 64 MiB stack the
+      # playground ships with (release.yml, where the measured B138 rationale
+      # for the size lives): the compiler recurses over deep expression trees,
+      # and wasm's default stack is far smaller than a host thread's. Binding
+      # generation is part of "it builds" — a signature wasm-bindgen cannot
+      # express must fail here rather than on the page. The `--out-dir` is
+      # `target/wasm-pkg` rather than `pkg` because the script runs in a
+      # checkout somebody works in, and `target/` is the one directory this
+      # repository already ignores.
+      - name: The artifact builds and the bindings generate
+        run: scripts/ci-local.sh wasm
 
   # Formatting is a gate (backlog N21). `cargo fmt` after every Rust change is
   # CLAUDE.md's own rule, and the tree still drifted — four hunks that then
@@ -204,7 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: The tree is formatted
-        run: cargo fmt --all --check
+        run: scripts/ci-local.sh fmt
 
   # The second of backlog N21's three legs, and the `fmt` job's twin in every way
   # that matters. `--all-targets` so the tests, the build script and the benches are
@@ -230,7 +242,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: The tree is clippy-clean
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: scripts/ci-local.sh clippy
 
   # N21's last leg: the dependency tree against the RustSec advisory
   # database. The one leg here whose answer is not a property of the tree alone —
@@ -265,7 +277,7 @@ jobs:
         with:
           tool: cargo-audit
       - name: No advisory against the dependency tree
-        run: cargo audit --deny unsound
+        run: scripts/ci-local.sh audit
 
   # **This is the job to make a required status check** (process.md §2.5, where
   # it is called `ci`; the context reads `ci / check`). Everything above it can
