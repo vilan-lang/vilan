@@ -18,6 +18,18 @@
 
 use crate::support::*;
 
+/// A trait, two implementations, and a struct that names the trait at a field.
+/// The paper's R-programs are written against exactly this head.
+const HIDDEN: &str = r#"
+    import std::io::print;
+    trait X { fun who(self): str; }
+    struct A {}
+    impl A with X { fun who(self): str { "A" } }
+    struct B {}
+    impl B with X { fun who(self): str { "B" } }
+    struct C { x: X }
+"#;
+
 // --- B162: associated functions on a trait ---
 
 // The shape the feature was ruled for, one step from the reactive exhibit: the
