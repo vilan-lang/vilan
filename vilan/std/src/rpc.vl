@@ -18,9 +18,12 @@
 // protocols.
 
 import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer, new_text_decoder };
+import pkg::compare::PartialEq;
 import pkg::fetch::{ get, post, post_bytes };
+import pkg::hash::{ Hash, Hashable };
 import pkg::io::panic;
 import pkg::json::JsonValue;
+import pkg::map::Map;
 import pkg::option::Option::{ None, Some, self };
 import pkg::promise::Promise;
 import pkg::reactive::{
@@ -39,7 +42,7 @@ import pkg::result::Result::{ Err, Ok, self };
 import pkg::shared::Shared;
 import pkg::task::Task;
 import pkg::time::{ Duration, sleep_for };
-import pkg::wire::{ Codec, Deserializer, Frame, Serializer, Wire };
+import pkg::wire::{ Codec, Delta, Deserializer, Frame, Keyed, Serializer, Wire };
 
 // === Transport: request/response ============================================
 
@@ -1099,17 +1102,48 @@ trait RpcService {
 
 // === Reactive protocol ======================================================
 
-// The protocol's frames — `Subscribe(channel)` / `Unsubscribe(channel)` up,
-// `Update(channel, value)` down — are written *single-pass* over the codec,
-// like RPC's envelopes: an update's value describes itself straight into the
-// envelope's serializer, so the wire never sees an intermediate encoding
-// (proposal §8, the codec upgrade).
+// The protocol's frames — `Subscribe(channel, key?)` / `Unsubscribe(channel,
+// key?)` up, `Update(channel, value)` and `Patch(channel, ops)` down — are
+// written *single-pass* over the codec, like RPC's envelopes: an update's
+// value, a patch's deltas and a subscription's key each describe themselves
+// straight into the envelope's serializer, so the wire never sees an
+// intermediate encoding (proposal §8, the codec upgrade).
+//
+// The OPTIONAL key on the control frames is A39: per-key demand is a property
+// of the protocol, so a keyed channel can forward one message's changes to the
+// client watching that message and nothing to the rest. `Patch` is its
+// downward half — the delta vocabulary `Update` never had.
 
-/// One control frame: the client→server half.
+/// One control frame: the client→server half. `Subscribe`/`Unsubscribe` carry
+/// the channel AND the optional key whose changes are wanted, so per-key demand
+/// is a property of the PROTOCOL rather than of an application method handing
+/// out a channel per row (A39). `None` is the whole collection — what every
+/// non-keyed channel sends, and what a keyed one sends when a client wants all
+/// of it.
 fun encode_control(codec: Codec, kind: str, channel: i32): Frame {
 	let (serializer, finish) = (codec.writer)();
-	(serializer.begin_variant)(kind, 1);
+	(serializer.begin_variant)(kind, 2);
 	(serializer.i32_value)(channel);
+	(serializer.null_value)();
+	(serializer.end_variant)();
+	finish()
+}
+
+/// `encode_control` naming ONE key. The key describes itself inline at its own
+/// type, exactly like an update's payload, so the codec never sees a stringly
+/// encoded id and a keyed channel's key type is as typed end to end as its
+/// element type.
+fun encode_control_keyed(
+	codec: Codec,
+	kind: str,
+	channel: i32,
+	describe_key: |Serializer| void,
+): Frame {
+	let (serializer, finish) = (codec.writer)();
+	(serializer.begin_variant)(kind, 2);
+	(serializer.i32_value)(channel);
+	(serializer.some_value)();
+	describe_key(serializer);
 	(serializer.end_variant)();
 	finish()
 }
@@ -1120,6 +1154,19 @@ fun encode_update(codec: Codec, channel: i32, describe: |Serializer| void): Fram
 	(serializer.begin_variant)("Update", 2);
 	(serializer.i32_value)(channel);
 	describe(serializer);
+	(serializer.end_variant)();
+	finish()
+}
+
+/// One patch frame: the channel, then the ops described inline — `Update`'s
+/// keyed sibling (A39). An `Update` says "here is the whole value again"; a
+/// `Patch` says only what moved, which is what stops an edit inside a
+/// five-thousand-message channel from costing the channel.
+fun encode_patch(codec: Codec, channel: i32, describe_ops: |Serializer| void): Frame {
+	let (serializer, finish) = (codec.writer)();
+	(serializer.begin_variant)("Patch", 2);
+	(serializer.i32_value)(channel);
+	describe_ops(serializer);
 	(serializer.end_variant)();
 	finish()
 }
@@ -1177,19 +1224,66 @@ fun fresh_channel(): i32 {
 
 // --- Server side: the capability table --------------------------------------
 
+/// What one channel can start, and how. A PLAIN channel has only `start` — the
+/// whole-value forward `expose` mints. A KEYED channel has `resolve` too: it
+/// can read a subscribed key off an inbound frame *at its own key type* and
+/// start a forward carrying only that key's changes (A39).
+struct Capability {
+	/// The whole-collection forward (`Subscribe(channel, None)`).
+	start: || Subscription,
+	/// Pull the subscribed key at this channel's key type and answer with its
+	/// canonical `Hash` — the server-local identity the live table is keyed by,
+	/// which never crosses the wire — paired with the starter for that key's
+	/// forward. `None` on a plain channel: it has no key type to read one at,
+	/// so a keyed `Subscribe` there is a protocol error the server cannot
+	/// answer, and is dropped.
+	resolve: Option<|Deserializer| KeySubscription>,
+}
+
+/// A resolved per-key subscription: which key (canonically), and how to start
+/// its forward. The starter is LAZY — the `Unsubscribe` path resolves a key the
+/// same way and throws the starter away.
+struct KeySubscription {
+	key: Hash,
+	start: || Subscription,
+}
+
+/// One running forward: its channel, the key it carries (`None` = the whole
+/// collection) and the subscription that stops it. One entry per (channel,
+/// key), which is what makes `Subscribe` idempotent per key rather than per
+/// channel.
+struct LiveForward {
+	channel: i32,
+	key: Option<Hash>,
+	subscription: Subscription,
+}
+
+/// Two subscribed keys, or two absences, are the same demand.
+fun same_demand(left: Option<Hash>, right: Option<Hash>): bool {
+	match left {
+		None => match right {
+			None => true,
+			Some(let _present) => false,
+		},
+		Some(let a) => match right {
+			None => false,
+			Some(let b) => a.eq(b),
+		},
+	}
+}
+
 /// The reactive protocol's server half: a per-connection **capability table**
 /// mapping a channel id to a *starter* for the exposed source, plus the live
 /// forwards started by client subscriptions. A `Signal`/`Source` never crosses
 /// as a value — it is exported as an id, and its updates flow as `Update`
-/// frames (proposal §8).
+/// frames (proposal §8) or, on a keyed channel, as `Patch` frames (A39).
 struct ReactiveServer {
 	transport: DuplexEnd,
 	codec: Codec,
-	// Per channel, the starter that subs the typed source and forwards each
-	// value as an `Update` frame. Nothing subscribes — or is retained — until
-	// a client asks.
-	sources: Shared<List<(i32, || Subscription)>>,
-	live: Shared<List<(i32, Subscription)>>,
+	// Per channel, what a client's subscription starts. Nothing subscribes —
+	// or is retained — until a client asks.
+	sources: Shared<List<(i32, Capability)>>,
+	live: Shared<List<LiveForward>>,
 }
 
 impl ReactiveServer {
@@ -1221,32 +1315,148 @@ impl ReactiveServer {
 				value.describe(serializer);
 			}));
 		});
-		self.sources.write().push((channel, starter));
+		self.sources.write().push((channel, Capability { start = starter, resolve = None }));
 		channel
 	}
 
-	/// A client subscribed: start the channel's forward. `sub` fires immediately
-	/// with the current value, so a subscriber gets the present state before any
-	/// change. IDEMPOTENT: a `Subscribe` for a channel whose forward is already
-	/// live is a no-op — one channel, one forward, however many times a client
-	/// asks (`proposal/remote-sources.md` §3; a counted client never asks
-	/// twice, and the server does not rely on that for its own correctness).
-	fun start(self, channel: i32) {
-		for entry in self.live.read() {
-			let (id, _forward) = entry;
+	/// Export a KEYED `List<T>`: subscribers receive element-grained `Patch`
+	/// frames instead of the whole list on every change, and may subscribe to
+	/// ONE key (A39). `key_of` is what makes two snapshots comparable element by
+	/// element — `|message| message.key()` for a `T: Keyed<K>`, which is what
+	/// `[expose(keyed)]` generates. `T: PartialEq` is what says an element
+	/// *changed*, so `[derive(Wire, PartialEq)]` is the whole obligation on an
+	/// exposed element type.
+	///
+	/// The projection is a VALUE parameter rather than the `Keyed<K>` bound
+	/// alone because `K` would otherwise appear nowhere in the signature, and
+	/// vilan infers a type parameter from the call's types, not from its
+	/// bounds. The client half has no such problem — `KeyedSource<K, T>` names
+	/// `K` in the subject — so `Keyed` is a real bound there.
+	fun expose_keyed<K: Wire + Hashable, T: Wire + PartialEq, S: Source<List<T>>>(
+		self,
+		source: S,
+		key_of: sync |T| K,
+	): i32 {
+		self.expose_keyed_with(source, |value: List<T>| value, key_of)
+	}
+
+	/// The `Map` form. The map's VALUES are the collection, and `key_of` is the
+	/// authority on each one's key because it is what a delta carries — a map
+	/// whose key disagrees with its value's own would patch under the value's.
+	fun expose_keyed_map<K: Wire + Hashable, V: Wire + PartialEq, S: Source<Map<K, V>>>(
+		self,
+		source: S,
+		key_of: sync |V| K,
+	): i32 {
+		self.expose_keyed_with(source, |value: Map<K, V>| value.values(), key_of)
+	}
+
+	/// The general keyed exposure both forms bottom out in: any `Source<C>`
+	/// plus the projection that reads the keyed collection out of `C`. The
+	/// projections run inside the forward, not at exposure time, so a keyed
+	/// channel retains exactly as little as a plain one until a client asks.
+	fun expose_keyed_with<K: Wire + Hashable, T: Wire + PartialEq, C, S: Source<C>>(
+		self,
+		source: S,
+		elements: sync |C| List<T>,
+		key_of: sync |T| K,
+	): i32 {
+		let channel = fresh_channel();
+		let transport = self.transport;
+		let codec = self.codec;
+		let start = || keyed_forward(transport, codec, channel, source, elements, key_of);
+		let resolve = |deserializer: Deserializer| {
+			let key: K = K::rebuild(deserializer);
+			KeySubscription {
+				key = key.hash(),
+				start = || keyed_key_forward(transport, codec, channel, source, elements, key_of, key),
+			}
+		};
+		self.sources.write().push((channel, Capability { start, resolve = Some(resolve) }));
+		channel
+	}
+
+	/// The capability registered for a channel, if it still holds one.
+	fun capability_of(self, channel: i32): Option<Capability> {
+		for entry in self.sources.read() {
+			let (id, capability) = entry;
 			if id == channel {
-				ret;
+				ret Some(capability);
 			}
 		}
-		for entry in self.sources.read() {
-			let (id, starter) = entry;
-			if id == channel {
-				self.live.write().push((channel, starter()));
+		None
+	}
+
+	/// Whether a forward for exactly this demand is already running.
+	fun forwarding(self, channel: i32, key: Option<Hash>): bool {
+		for forward in self.live.read() {
+			if forward.channel == channel {
+				if same_demand(forward.key, key) {
+					ret true;
+				}
 			}
+		}
+		false
+	}
+
+	/// A client subscribed to the whole channel: start its forward. `sub` fires
+	/// immediately with the current value, so a subscriber gets the present
+	/// state before any change. IDEMPOTENT: a `Subscribe` for a demand whose
+	/// forward is already live is a no-op — one demand, one forward, however
+	/// many times a client asks (`proposal/remote-sources.md` §3; a counted
+	/// client never asks twice, and the server does not rely on that for its
+	/// own correctness).
+	fun start(self, channel: i32) {
+		if self.forwarding(channel, None) {
+			ret;
+		}
+		match self.capability_of(channel) {
+			Some(let capability) => {
+				let subscription = (capability.start)();
+				self.live.write().push(LiveForward { channel, key = None, subscription });
+			},
+			None => {},
 		}
 	}
 
-	/// A client unsubscribed: dispose the forward for that channel.
+	/// The keyed half of `start`: read the subscribed key off the frame at the
+	/// channel's own key type, then open — or re-use — that key's forward. A
+	/// keyed `Subscribe` on a channel that is not keyed has no key type to read
+	/// at, so it is dropped: the server cannot answer it, and answering it with
+	/// the whole collection would be a silent protocol lie.
+	fun start_key(self, channel: i32, deserializer: Deserializer) {
+		match self.resolve_key(channel, deserializer) {
+			None => {},
+			Some(let resolved) => {
+				if !self.forwarding(channel, Some(resolved.key)) {
+					let subscription = (resolved.start)();
+					self.live
+						.write()
+						.push(LiveForward { channel, key = Some(resolved.key), subscription });
+				}
+			},
+		}
+	}
+
+	/// Read a subscribed key at the channel's key type. `None` when the channel
+	/// is unknown, is not keyed, or the key did not decode.
+	fun resolve_key(self, channel: i32, deserializer: Deserializer): Option<KeySubscription> {
+		match self.capability_of(channel) {
+			None => None,
+			Some(let capability) => match capability.resolve {
+				None => None,
+				Some(let resolve) => {
+					let resolved = resolve(deserializer);
+					match (deserializer.failed)() {
+						Some(let _reason) => None,
+						None => Some(resolved),
+					}
+				},
+			},
+		}
+	}
+
+	/// A client unsubscribed from the whole channel: dispose that forward.
 	///
 	/// The CAPABILITY stays. An `Unsubscribe` is client-local demand reaching
 	/// zero — a view unmounting, a row scrolling out — and `RemoteSource`
@@ -1255,21 +1465,35 @@ impl ReactiveServer {
 	/// such remount silently dead, so revoking a channel is a separate,
 	/// deliberate act: `revoke` (A41).
 	fun stop(self, channel: i32) {
-		mut kept: List<(i32, Subscription)> = [];
-		for entry in self.live.read() {
-			let (id, subscription) = entry;
-			if id == channel {
-				subscription.dispose();
+		self.stop_forward(channel, None);
+	}
+
+	/// The keyed half of `stop` — the per-key lease reaching zero. Releases one
+	/// key's forward and leaves every other key on the channel running.
+	fun stop_key(self, channel: i32, deserializer: Deserializer) {
+		match self.resolve_key(channel, deserializer) {
+			None => {},
+			Some(let resolved) => self.stop_forward(channel, Some(resolved.key)),
+		}
+	}
+
+	/// Dispose the forward for exactly one demand.
+	fun stop_forward(self, channel: i32, key: Option<Hash>) {
+		mut kept: List<LiveForward> = [];
+		for forward in self.live.read() {
+			if forward.channel == channel && same_demand(forward.key, key) {
+				forward.subscription.dispose();
 			} else {
-				kept.push((id, subscription));
+				kept.push(forward);
 			}
 		}
 		self.live.write() = kept;
 	}
 
-	/// Withdraw a channel: stop its forward AND drop the capability, so a
-	/// later `Subscribe` for that id finds nothing and the starter closure —
-	/// with the source it captured — is released.
+	/// Withdraw a channel: stop EVERY forward on it — the whole-collection one
+	/// and each subscribed key — AND drop the capability, so a later
+	/// `Subscribe` for that id finds nothing and the starter closure, with the
+	/// source it captured, is released.
 	///
 	/// This is what a DYNAMIC exposure needs (A41). A channel minted by
 	/// `expose` at runtime — an rpc method handing out a per-row or per-thread
@@ -1280,36 +1504,258 @@ impl ReactiveServer {
 	/// needs this; the dynamic path must revoke what it minted when the app
 	/// knows the id is finished with.
 	fun revoke(self, channel: i32) {
-		self.stop(channel);
-		mut kept: List<(i32, || Subscription)> = [];
-		for entry in self.sources.read() {
-			let (id, starter) = entry;
-			if id != channel {
-				kept.push((id, starter));
+		mut kept: List<LiveForward> = [];
+		for forward in self.live.read() {
+			if forward.channel == channel {
+				forward.subscription.dispose();
+			} else {
+				kept.push(forward);
 			}
 		}
-		self.sources.write() = kept;
+		self.live.write() = kept;
+		mut remaining: List<(i32, Capability)> = [];
+		for entry in self.sources.read() {
+			let (id, capability) = entry;
+			if id != channel {
+				remaining.push((id, capability));
+			}
+		}
+		self.sources.write() = remaining;
 	}
 
 	/// One inbound control frame: `Subscribe`/`Unsubscribe` route to
-	/// `start`/`stop`. A malformed frame — or a stray `Update`, which only ever
-	/// flows server → client — is dropped.
+	/// `start`/`stop`, and their keyed forms to `start_key`/`stop_key`. The key
+	/// half is read by PEEKING (`is_null`) rather than by a second tag, so one
+	/// frame shape serves both demands. A malformed frame — or a stray `Update`
+	/// or `Patch`, which only ever flow server → client — is dropped.
 	fun receive(self, frame: Frame) {
 		let deserializer = (self.codec.reader)(frame);
 		let tag = (deserializer.variant_tag)();
-		(deserializer.begin_variant)(tag, 1);
+		(deserializer.begin_variant)(tag, 2);
 		let channel = (deserializer.i32_value)();
 		match (deserializer.failed)() {
 			Some(let _reason) => {},
 			None => {
-				match tag {
-					"Subscribe" => self.start(channel),
-					"Unsubscribe" => self.stop(channel),
-					_ => {},
+				if (deserializer.is_null)() {
+					(deserializer.null_value)();
+					match tag {
+						"Subscribe" => self.start(channel),
+						"Unsubscribe" => self.stop(channel),
+						_ => {},
+					}
+				} else {
+					match tag {
+						"Subscribe" => self.start_key(channel, deserializer),
+						"Unsubscribe" => self.stop_key(channel, deserializer),
+						_ => {},
+					}
 				}
 			},
 		}
 	}
+}
+
+/// Send one patch: the ops describe themselves straight into the envelope, so
+/// a delta never sees an intermediate encoding either.
+fun send_patch<K: Wire, T: Wire>(
+	transport: DuplexEnd,
+	codec: Codec,
+	channel: i32,
+	ops: List<Delta<K, T>>,
+) {
+	transport.send(encode_patch(codec, channel, |serializer: Serializer| {
+		// The list is narrated element by element rather than through
+		// `List<Delta<K, T>>`'s own `Wire` impl: a conditional impl reached
+		// through two generic parameters at once has no concrete receiver to
+		// dispatch from here, and the shape is the same either way.
+		(serializer.begin_list)(ops.len());
+		for op in ops {
+			op.describe(serializer);
+		}
+		(serializer.end_list)();
+	}));
+}
+
+/// The whole-collection forward: seed with `Reset`, then one `Patch` per change
+/// carrying only what moved. The previous snapshot is per FORWARD, not per
+/// channel — two connections watching the same signal each keep their own, so
+/// a client that subscribes late still gets a seed rather than someone else's
+/// delta.
+fun keyed_forward<K: Wire + Hashable, T: Wire + PartialEq, C, S: Source<C>>(
+	transport: DuplexEnd,
+	codec: Codec,
+	channel: i32,
+	source: S,
+	elements: sync |C| List<T>,
+	key_of: sync |T| K,
+): Subscription {
+	let seeded: Shared<bool> = Shared::new(false);
+	let previous: Shared<List<T>> = Shared::new([]);
+	source.sub(|published| {
+		let current = elements(published);
+		mut ops: List<Delta<K, T>> = [];
+		if seeded.read() {
+			ops = keyed_diff(previous.read(), current, key_of);
+		} else {
+			seeded.write() = true;
+			ops.push(Delta::Reset(current));
+		}
+		previous.write() = current;
+		if ops.len() > 0 {
+			send_patch(transport, codec, channel, ops);
+		}
+	})
+}
+
+/// The per-key forward: everything this subscriber is owed about ONE key, and
+/// nothing about any other. The seed is an `Insert` (never a `Reset`), because
+/// a mirror may hold several independently subscribed keys and a `Reset` would
+/// throw the others away.
+fun keyed_key_forward<K: Wire + Hashable, T: Wire + PartialEq, C, S: Source<C>>(
+	transport: DuplexEnd,
+	codec: Codec,
+	channel: i32,
+	source: S,
+	elements: sync |C| List<T>,
+	key_of: sync |T| K,
+	key: K,
+): Subscription {
+	let wanted = key.hash();
+	let seeded: Shared<bool> = Shared::new(false);
+	let held: Shared<Option<T>> = Shared::new(None);
+	source.sub(|published| {
+		let current = elements(published);
+		mut found: Option<T> = None;
+		mut at = 0;
+		mut index = 0;
+		for element in current {
+			if found is None && key_of(element).hash().eq(wanted) {
+				found = Some(element);
+				at = index;
+			}
+			index += 1;
+		}
+		mut ops: List<Delta<K, T>> = [];
+		match found {
+			Some(let element) => match held.read() {
+				Some(let before) => {
+					if !before.eq(element) {
+						ops.push(Delta::Update(key, element));
+					}
+				},
+				None => ops.push(Delta::Insert(key, element, at)),
+			},
+			None => match held.read() {
+				Some(let _before) => ops.push(Delta::Remove(key)),
+				None => {},
+			},
+		}
+		held.write() = found;
+		if seeded.read() {
+			if ops.len() > 0 {
+				send_patch(transport, codec, channel, ops);
+			}
+		} else {
+			// The seed goes even when the key is absent and the op list is
+			// empty: an empty `Patch` is what tells the mirror it is in sync
+			// (`status` leaves `Waiting`) without inventing an element.
+			seeded.write() = true;
+			send_patch(transport, codec, channel, ops);
+		}
+	})
+}
+
+/// The keyed diff: what a subscriber must apply to turn `previous` into
+/// `current`. Removals first, then insertions in ascending FINAL index, then
+/// updates — the order the ops must be applied in for the indices to name the
+/// positions they mean.
+///
+/// A REORDER has no op of its own, so it falls back to `Reset`: when the
+/// elements retained across the change are not in the same relative order on
+/// both sides, the whole collection goes again. Appending, editing and deleting
+/// — what a message platform does — never reorder, so the fallback is the rare
+/// case, and it is correct where a cleverer diff would be subtly wrong.
+///
+/// A duplicate key keeps the FIRST occurrence, matching `Keyed`'s contract; the
+/// later ones are invisible to the diff and to the mirror.
+fun keyed_diff<K: Wire + Hashable, T: Wire + PartialEq>(
+	previous: List<T>,
+	current: List<T>,
+	key_of: sync |T| K,
+): List<Delta<K, T>> {
+	mut previous_at: Map<Hash, i32> = Map::new();
+	mut index = 0;
+	for element in previous {
+		let key = key_of(element).hash();
+		if !previous_at.contains_key(key) {
+			previous_at.insert(key, index);
+		}
+		index += 1;
+	}
+	mut current_keys: Map<Hash, bool> = Map::new();
+	for element in current {
+		current_keys.insert(key_of(element).hash(), true);
+	}
+	mut ops: List<Delta<K, T>> = [];
+	mut retained_before: List<Hash> = [];
+	for element in previous {
+		let key = key_of(element).hash();
+		if current_keys.contains_key(key) {
+			retained_before.push(key);
+		} else {
+			ops.push(Delta::Remove(key_of(element)));
+		}
+	}
+	mut retained_after: List<Hash> = [];
+	for element in current {
+		let key = key_of(element).hash();
+		if previous_at.contains_key(key) {
+			retained_after.push(key);
+		}
+	}
+	if !same_sequence(retained_before, retained_after) {
+		mut reset: List<Delta<K, T>> = [];
+		reset.push(Delta::Reset(current));
+		ret reset;
+	}
+	index = 0;
+	for element in current {
+		if !previous_at.contains_key(key_of(element).hash()) {
+			ops.push(Delta::Insert(key_of(element), element, index));
+		}
+		index += 1;
+	}
+	for element in current {
+		match previous_at.get(key_of(element).hash()) {
+			None => {},
+			Some(let at) => match previous.get(at) {
+				None => {},
+				Some(let before) => {
+					if !before.eq(element) {
+						ops.push(Delta::Update(key_of(element), element));
+					}
+				},
+			},
+		}
+	}
+	ops
+}
+
+/// Whether two key sequences are identical, position by position — the
+/// reorder check `keyed_diff` falls back on.
+fun same_sequence(before: List<Hash>, after: List<Hash>): bool {
+	let length = before.len();
+	if length != after.len() {
+		ret false;
+	}
+	mut index = 0;
+	for index < length {
+		if !before[index].eq(after[index]) {
+			ret false;
+		}
+		index += 1;
+	}
+	true
 }
 
 impl ReactiveServer with Disposable {
@@ -1325,9 +1771,8 @@ impl ReactiveServer with Disposable {
 	/// `drop_session` is covered by the same line: it disposes the session it
 	/// drops.
 	fun dispose(self) {
-		for entry in self.live.read() {
-			let (_channel, subscription) = entry;
-			subscription.dispose();
+		for forward in self.live.read() {
+			forward.subscription.dispose();
 		}
 		self.live.write() = [];
 		self.sources.write() = [];
@@ -1437,6 +1882,72 @@ impl ReactiveClient {
 		}
 	}
 
+	/// A remote handle for a KEYED channel this connection's `__attach` reply
+	/// named: one local list mirror per channel, patched element by element, and
+	/// per-key demand on top of it. What `[expose(keyed)]`'s generated `connect`
+	/// mints (A39).
+	fun attached_keyed_source<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		channel: i32,
+	): KeyedSource<K, T> {
+		let channel_cell = Shared::new(channel);
+		let cache: SignalCell<Option<List<T>>> = SignalCell::new(None);
+		let fault: SignalCell<Option<str>> = SignalCell::new(None);
+		let mirror: KeyedSource<K, T> = KeyedSource {
+			channel = channel_cell,
+			codec = self.codec,
+			transport = self.transport,
+			cache,
+			fault,
+			count = Shared::new(0),
+			closing = Shared::new(false),
+			settle_id = fresh_id(),
+			leases = Shared::new([]),
+		};
+		let codec = self.codec;
+		// Deliver one routed `Patch`: re-open the frame (the envelope was only
+		// routed, not consumed) and rebuild the ops at this channel's key and
+		// element types. A malformed patch is dropped whole — a half-applied
+		// one would desync the mirror for good.
+		let deliver = |frame: Frame| {
+			let deserializer = (codec.reader)(frame);
+			let tag = (deserializer.variant_tag)();
+			(deserializer.begin_variant)(tag, 2);
+			let _channel = (deserializer.i32_value)();
+			let length = (deserializer.begin_list)();
+			mut ops: List<Delta<K, T>> = [];
+			mut index = 0;
+			for index < length {
+				ops.push(Delta<K, T>::rebuild(deserializer));
+				index += 1;
+			}
+			(deserializer.end_list)();
+			match (deserializer.failed)() {
+				Some(let _reason) => {},
+				None => mirror.apply(ops),
+			}
+		};
+		self.routes.write().push((channel_cell, deliver));
+		mirror
+	}
+
+	/// `attached_keyed_source` for a channel id the APP learned at runtime —
+	/// registered as DYNAMIC exactly like `source`, so `invalidate_dynamic`
+	/// points it at nothing when the connection is replaced.
+	fun keyed_source<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		channel: i32,
+	): KeyedSource<K, T> {
+		let mirror: KeyedSource<K, T> = self.attached_keyed_source(channel);
+		let cell = mirror.channel;
+		let cache = mirror.cache;
+		self.dynamic.write().push(|| {
+			cell.write() = 0 - 1;
+			cache.set(None);
+		});
+		mirror
+	}
+
 	/// Point every dynamically-minted mirror at nothing: its cache goes back
 	/// to `None` (so `status` reads `Waiting` again — the truth, since the
 	/// fresh session holds no such channel) and its route stops matching any
@@ -1453,14 +1964,17 @@ impl ReactiveClient {
 		self.dynamic.write() = [];
 	}
 
-	/// One inbound frame: an `Update` fans out to its channel's deliverers
-	/// (each re-opens the frame at its own type); anything else is ignored.
+	/// One inbound frame: an `Update` or a `Patch` fans out to its channel's
+	/// deliverers (each re-opens the frame at its own type); anything else is
+	/// ignored.
 	fun receive(self, frame: Frame) {
 		let deserializer = (self.codec.reader)(frame);
 		let tag = (deserializer.variant_tag)();
 		(deserializer.begin_variant)(tag, 2);
 		let channel = (deserializer.i32_value)();
-		if tag == "Update" {
+		// `Update` feeds a plain mirror, `Patch` a keyed one; both are routed by
+		// channel alone, and a channel is one or the other for its whole life.
+		if tag == "Update" || tag == "Patch" {
 			match (deserializer.failed)() {
 				Some(let _reason) => {},
 				None => {
@@ -1691,6 +2205,347 @@ impl RemoteSource<type T> {
 		if self.count.read() > 0 {
 			(self.transport).send(subscribe);
 		}
+	}
+}
+
+// --- Client side: the keyed mirror (A39) ------------------------------------
+
+/// One key's demand on a keyed mirror — `RemoteSource`'s count, closing cell
+/// and settle id, once per key. The `describe` closure is the key itself, held
+/// so the `Unsubscribe` (and a reconnect's re-`Subscribe`) can name it again at
+/// its own type.
+struct KeyLease {
+	key: Hash,
+	describe: |Serializer| void,
+	count: Shared<i32>,
+	closing: Shared<bool>,
+	settle_id: i32,
+}
+
+/// The client half of a KEYED channel: a local list mirror patched by
+/// element-grained deltas, with demand expressed per key.
+///
+/// ONE mirror per channel, holding exactly what this client asked for. A
+/// whole-collection lease (`sub`, `map`, `or`) seeds it with a `Reset` and
+/// tracks every change; a per-key lease (`sub_key`, `of`) adds one element to
+/// it and tracks only that element. The two compose: a view showing a channel's
+/// index plus the three messages on screen holds one whole-collection lease and
+/// three key leases, and the server forwards each independently.
+///
+/// The counted-lease rule is `RemoteSource`'s, per demand rather than per
+/// channel: 0→1 sends `Subscribe`, 1→0 defers an `Unsubscribe` to the turn's
+/// settle so a re-render churns no frames.
+struct KeyedSource<K, T> {
+	// A cell, shared with the `ReactiveClient` route, so a reconnect rebind
+	// moves routing and demand in one write.
+	channel: Shared<i32>,
+	codec: Codec,
+	transport: DuplexEnd,
+	/// The elements this client is subscribed to, in the server's order —
+	/// `None` until the first patch lands (the typed `Waiting`).
+	cache: SignalCell<Option<List<T>>>,
+	/// The first protocol fault this mirror saw: an op naming a key it does not
+	/// hold. STICKY — the first one is kept, because everything after it is a
+	/// consequence rather than a second fact.
+	fault: SignalCell<Option<str>>,
+	/// Whole-collection demand.
+	count: Shared<i32>,
+	closing: Shared<bool>,
+	settle_id: i32,
+	/// Per-key demand — one entry per key ever leased on this mirror.
+	leases: Shared<List<KeyLease>>,
+}
+
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
+	/// The mirror's current contents: `None` until the first patch lands.
+	/// Passive — no lease, no frame.
+	fun get(self): Option<List<T>> {
+		self.cache.get()
+	}
+
+	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>` —
+	/// `RemoteSource::status`'s sentence, unchanged: it reports, it does not
+	/// ask.
+	fun status(self): SignalCell<Status> {
+		self.cache.map(|value| match value {
+			Some(let _present) => Status::Ready,
+			None => Status::Waiting,
+		})
+	}
+
+	/// The first protocol fault this mirror saw, if any: an `Update` or
+	/// `Remove` naming a key it does not hold. That is a SERVER bug or a lost
+	/// frame, never something an application can cause, so it is reported here
+	/// rather than thrown — and the offending op is not applied, so the mirror
+	/// keeps the last state it could account for.
+	fun fault(self): Option<str> {
+		self.fault.get()
+	}
+
+	/// Observe the whole collection as it changes. COUNTED: the lease opens the
+	/// channel's whole-collection forward if nothing else holds it, and
+	/// disposing the subscription releases it.
+	[must_use]
+	fun sub(self, observer: |List<T>| void): Subscription {
+		self.lease(|value| match value {
+			Some(let present) => observer(present),
+			None => {},
+		})
+	}
+
+	/// The counted primitive under every whole-collection path.
+	fun lease(self, observer: |Option<List<T>>| void): Subscription {
+		self.acquire();
+		let subscription = self.cache.sub(observer);
+		subscription.release.write() = Some(|| self.release());
+		subscription
+	}
+
+	/// Observe through `transform`, as a plain `SignalCell<U>` — the seam into
+	/// the ordinary reactive world. Counted and owner-released exactly like
+	/// `RemoteSource::map`, and with the same static requirement: an enclosing
+	/// `owner_scope.run`.
+	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
+		get_owner().take(self.lease(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+
+	/// `map` for the same-type case: `initial` until the first patch.
+	fun or(self, initial: List<T>): SignalCell<List<T>> {
+		self.map(|value| match value {
+			Some(let present) => present,
+			None => initial,
+		})
+	}
+
+	/// Observe ONE key. COUNTED per key: the 0→1 sends `Subscribe(channel,
+	/// Some(key))` and the server starts forwarding that key's changes and
+	/// nothing else; the 1→0 releases the key alone, leaving every other lease
+	/// on the channel running.
+	///
+	/// The observer sees `None` while the key is absent from the mirror — before
+	/// the seed arrives, and after a `Remove`.
+	[must_use]
+	fun sub_key(self, key: K, observer: |Option<T>| void): Subscription {
+		let lease = self.lease_for(key);
+		self.acquire_key(lease);
+		let wanted = key.hash();
+		let subscription = self.cache.sub(|value| observer(self.pick(value, wanted)));
+		subscription.release.write() = Some(|| self.release_key(lease));
+		subscription
+	}
+
+	/// `sub_key` as a `SignalCell`, owner-released — the view seam, and the one
+	/// line a row component writes: `messages.of(id)`.
+	fun of(self, key: K): SignalCell<Option<T>> {
+		let wanted = key.hash();
+		let derived: SignalCell<Option<T>> = SignalCell::new(self.pick(self.get(), wanted));
+		get_owner().take(self.sub_key(key, |value| derived.set(value)));
+		derived
+	}
+
+	/// The lease record for a key, minted on first use and kept: a key leased,
+	/// released and leased again counts into the same cells, exactly as two
+	/// copies of a `RemoteSource` handle do.
+	fun lease_for(self, key: K): KeyLease {
+		let wanted = key.hash();
+		for lease in self.leases.read() {
+			if lease.key.eq(wanted) {
+				ret lease;
+			}
+		}
+		let fresh = KeyLease {
+			key = wanted,
+			describe = |serializer: Serializer| key.describe(serializer),
+			count = Shared::new(0),
+			closing = Shared::new(false),
+			settle_id = fresh_id(),
+		};
+		self.leases.write().push(fresh);
+		fresh
+	}
+
+	/// Take the whole-collection lease. 0→1 with no close pending subscribes.
+	fun acquire(self) {
+		let before = self.count.read();
+		self.count.write() = before + 1;
+		if before == 0 {
+			if self.closing.read() {
+				self.closing.write() = false;
+			} else {
+				(self.transport).send(encode_control(self.codec, "Subscribe", self.channel.read()));
+			}
+		}
+	}
+
+	/// Release the whole-collection lease; the `Unsubscribe` rides the settle.
+	fun release(self) {
+		let after = self.count.read() - 1;
+		self.count.write() = after;
+		if after == 0 {
+			self.closing.write() = true;
+			at_settle(self.settle_id, || self.flush_close());
+		}
+	}
+
+	fun flush_close(self) {
+		if self.closing.read() {
+			self.closing.write() = false;
+			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+		}
+	}
+
+	/// Take one key's lease — the same four-line rule, per key.
+	fun acquire_key(self, lease: KeyLease) {
+		let before = lease.count.read();
+		lease.count.write() = before + 1;
+		if before == 0 {
+			if lease.closing.read() {
+				lease.closing.write() = false;
+			} else {
+				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
+			}
+		}
+	}
+
+	/// Release one key's lease. The deferral is what makes a `bind_each` row
+	/// re-rendering inside one turn cost zero frames, per key.
+	fun release_key(self, lease: KeyLease) {
+		let after = lease.count.read() - 1;
+		lease.count.write() = after;
+		if after == 0 {
+			lease.closing.write() = true;
+			at_settle(lease.settle_id, || self.flush_key_close(lease));
+		}
+	}
+
+	fun flush_key_close(self, lease: KeyLease) {
+		if lease.closing.read() {
+			lease.closing.write() = false;
+			(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
+		}
+	}
+
+	/// The element under a key hash in the mirror's contents, if it holds one.
+	fun pick(self, value: Option<List<T>>, key: Hash): Option<T> {
+		match value {
+			None => None,
+			Some(let list) => {
+				for element in list {
+					if element.key().hash().eq(key) {
+						ret Some(element);
+					}
+				}
+				None
+			},
+		}
+	}
+
+	/// Where `key` sits in the mirror's list, if at all.
+	fun index_of(self, list: List<T>, key: K): Option<i32> {
+		let wanted = key.hash();
+		mut index = 0;
+		for element in list {
+			if element.key().hash().eq(wanted) {
+				ret Some(index);
+			}
+			index += 1;
+		}
+		None
+	}
+
+	/// Apply one patch's ops IN ORDER (`std::wire`'s `Delta` documents each
+	/// arm's semantics). The whole patch lands as one write to the cache, so a
+	/// multi-op change is one notification rather than one per op.
+	fun apply(self, ops: List<Delta<K, T>>) {
+		mut list: List<T> = [];
+		match self.cache.get() {
+			Some(let held) => list = held,
+			None => {},
+		}
+		mut fault: Option<str> = None;
+		for op in ops {
+			match op {
+				Delta::Reset(let items) => list = items,
+				Delta::Insert(let key, let value, let index) => {
+					match self.index_of(list, key) {
+						// A key already held is REPLACED, not duplicated: that
+						// is the re-seed a per-key subscription sends when
+						// demand returns to it.
+						Some(let at) => list[at] = value,
+						None => {
+							mut bounded = index;
+							if bounded < 0 {
+								bounded = 0;
+							}
+							if bounded > list.len() {
+								bounded = list.len();
+							}
+							list.insert(bounded, value);
+						},
+					}
+				},
+				Delta::Update(let key, let value) => {
+					match self.index_of(list, key) {
+						Some(let at) => list[at] = value,
+						None => fault = first_fault(fault, "an Update named a key the mirror does not hold"),
+					}
+				},
+				Delta::Remove(let key) => {
+					match self.index_of(list, key) {
+						Some(let at) => {
+							let _dropped = list.remove(at);
+						},
+						None => fault = first_fault(fault, "a Remove named a key the mirror does not hold"),
+					}
+				},
+			}
+		}
+		self.cache.set(Some(list));
+		match fault {
+			None => {},
+			Some(let reason) => match self.fault.get() {
+				None => self.fault.set(Some(reason)),
+				Some(let _kept) => {},
+			},
+		}
+	}
+
+	/// Point the mirror at a fresh channel after a reconnect and re-subscribe
+	/// everything this client still holds: the whole-collection lease if it is
+	/// counted, and every key whose lease is. Pending closes are dropped —
+	/// they name the OLD channel on a dead connection.
+	///
+	/// The cache goes back to `None` first, which is where a keyed mirror
+	/// differs from a plain one. `RemoteSource::rebind` may keep its last value
+	/// because the fresh subscription resends the WHOLE value; a keyed forward
+	/// reseeds only what it is asked for, so an element deleted while the
+	/// connection was down would otherwise survive as a ghost no later op would
+	/// ever name.
+	fun rebind(self, channel: i32) {
+		self.channel.write() = channel;
+		self.cache.set(None);
+		self.closing.write() = false;
+		if self.count.read() > 0 {
+			(self.transport).send(encode_control(self.codec, "Subscribe", channel));
+		}
+		for lease in self.leases.read() {
+			lease.closing.write() = false;
+			if lease.count.read() > 0 {
+				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", channel, lease.describe));
+			}
+		}
+	}
+}
+
+/// Keep the first fault a patch produced; later ones are its consequences.
+fun first_fault(held: Option<str>, reason: str): Option<str> {
+	match held {
+		Some(let kept) => Some(kept),
+		None => Some(reason),
 	}
 }
 
