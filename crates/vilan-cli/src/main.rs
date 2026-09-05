@@ -3783,6 +3783,16 @@ impl CompileGoal {
     fn emits(self) -> bool {
         !matches!(self, CompileGoal::CheckModule)
     }
+
+    /// Whether the emission walk's TEXT is wanted, as against its diagnostics
+    /// (backlog M34). Only `Emit` writes JavaScript; `Check` runs the same walk
+    /// through `transformer::diagnose`, which refuses in exactly the four
+    /// places `transform` does and skips the scope rename and the formatting —
+    /// 6.3% of a cold check's instructions spent producing names and text that
+    /// this goal drops on the floor.
+    fn emits_text(self) -> bool {
+        matches!(self, CompileGoal::Emit)
+    }
 }
 
 /// What one compile produced, for the caller that writes it out. A tuple grew
@@ -6030,6 +6040,15 @@ fn compile_to_js(
                 // `main` a module never had, and running the walk for it would
                 // be asking a file to be a program because someone named it.
                 _ if !goal.emits() => Ok(String::new()),
+                // A `check` of an ENTRY: the walk runs, its refusals are asked
+                // for, and its output is not (backlog M34). `transform` can
+                // refuse four ways and only the missing `main` is knowable
+                // before the walk, so skipping the transformer outright would
+                // let `check` go green over a program `build` will not ship —
+                // `diagnose` is the same `assemble` without the cosmetic tail.
+                _ if !goal.emits_text() => {
+                    vilan_core::diagnose(&program, options).map(|()| String::new())
+                }
                 Some((leg, sink)) => {
                     vilan_core::transform_split(&program, options, leg).map(|split_program| {
                         // Splitting is not free, and below a few KB of

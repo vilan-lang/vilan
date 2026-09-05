@@ -1407,3 +1407,123 @@ fn checking_a_module_file_a_sibling_imports_is_clean() {
         "with no refusal of the sibling's import: {file_stderr}"
     );
 }
+
+// --- M34: `check` runs emission for its refusals, not for its text ---
+//
+// `vilan check` of an ENTRY used to call `transform` and drop the JavaScript,
+// so a check cost what a build cost. It now calls `transformer::diagnose`,
+// which runs the same `assemble` and skips only the scope rename and the
+// formatting. `transform` refuses four ways — the missing `main`, and the
+// never-silent B55/B68/B176 internal refusals, each of which is a fact about
+// what the WALK produced — so the walk cannot be skipped, and these pins hold
+// `check` to `build`'s answer rather than to a claim about the code.
+
+/// The one refusal an author can actually reach: emission's missing `main`.
+/// It is decided at the top of `assemble`, before any of the walk, and a
+/// `check` that stopped calling the transformer would go green here — which is
+/// exactly what makes this pin non-vacuous. Both verdicts and both renderings
+/// are compared, so it also holds `check` to the ENTRY-attribution E113's
+/// twin above asserts for `build`.
+#[test]
+fn check_refuses_a_missing_main_exactly_as_build_does() {
+    let dir = temp_files(
+        "m34_no_main",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import pkg::alpha::value;\n\nfun helper(): str {\n\tvalue()\n}\n",
+            ),
+            ("src/alpha.vl", "fun value(): str {\n\t\"ok\"\n}\n"),
+        ],
+    );
+    let built = vilan(&dir, &["build", "."], true);
+    let built_stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "the check fails: {checked_stderr}"
+    );
+    assert!(
+        checked_stderr.contains("Cannot execute program without a main function"),
+        "and says why: {checked_stderr}"
+    );
+    assert_eq!(
+        checked_stderr, built_stderr,
+        "check and build render the same refusal, byte for byte"
+    );
+    assert!(
+        renders_in(&checked_stderr, "main.vl", "import pkg::alpha::value;"),
+        "in the entry, quoting its first line: {checked_stderr}"
+    );
+}
+
+/// The other half of the same claim: for a program the ANALYZER refuses, the
+/// two commands still say the same thing. A `check` that skipped emission
+/// would pass this one, which is why it is a control and not the pin — it
+/// guards the direction the change could break by accident (a diagnostic
+/// dropped, re-ordered, or rendered against the wrong text once the emission
+/// tail stopped running).
+#[test]
+fn check_and_build_render_an_analyzer_refusal_identically() {
+    let dir = temp_files(
+        "m34_module_error",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::alpha::value;\n\nfun main() {\n\tprint(value());\n}\n",
+            ),
+            (
+                "src/alpha.vl",
+                "fun value(): str {\n\tlet x: i32 = \"not an int\";\n\t\"ok\"\n}\n",
+            ),
+        ],
+    );
+    let built = vilan(&dir, &["build", "."], true);
+    let built_stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!built.status.success(), "the build fails: {built_stderr}");
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "and so does the check: {checked_stderr}"
+    );
+    assert_eq!(
+        checked_stderr, built_stderr,
+        "with the same rendering, byte for byte"
+    );
+}
+
+/// The clean control. A program with a `main` that emits is green under both,
+/// and `check` still writes no artifact — the walk it now runs is for its
+/// refusals, and a `check` that started emitting would be a different bug.
+#[test]
+fn check_of_a_sound_entry_is_green_and_writes_nothing() {
+    let dir = temp_package(
+        "m34_clean",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let wrote_dist = dir.join("dist").exists();
+    let wrote_beside = dir.join("src/main.mjs").exists();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        checked.status.success(),
+        "the check passes: {checked_stderr}"
+    );
+    assert!(
+        checked_stderr.is_empty(),
+        "with nothing on stderr: {checked_stderr}"
+    );
+    assert!(!wrote_dist && !wrote_beside, "and no emitted artifact");
+}

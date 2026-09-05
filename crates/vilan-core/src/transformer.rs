@@ -21,6 +21,31 @@ pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Resul
     Transformer::new(program, options).transform_entry()
 }
 
+/// Emission run for its DIAGNOSTICS alone — what `vilan check` of an ENTRY
+/// needs from the transformer, and nothing else (backlog M34).
+///
+/// `check` used to call [`transform`] and throw the JavaScript away, so a
+/// `vilan check .` cost what a `vilan build .` cost. Skipping the transformer
+/// outright was the other option on the table and is wrong: `transform` refuses
+/// FOUR ways, and only the first of them is knowable before the walk. The
+/// missing `main` is decided at the top of [`Transformer::assemble`]; B55's
+/// body-less emission, B68's unresolved `drop` sink and B176's unrendered
+/// concatenation are the never-silent refusals, and each is a fact about what
+/// the WALK produced. A `check` that skipped the walk would go green over a
+/// program `build` refuses to ship, which is the one thing `check` may never do.
+///
+/// So the walk runs, in full, through the same `assemble` an emitting build
+/// runs, and what is skipped is the part that has nothing to say: the scope
+/// rename (`rename_for_scopes`, whose return type is `()`) and the formatting
+/// of the node tree into text. Every `Err` [`transform`] can produce, this
+/// produces, at the same span with the same message — by construction, because
+/// it is the same function.
+pub fn diagnose<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<(), Error> {
+    let mut transformer = Transformer::new(program, options);
+    transformer.diagnose_only = true;
+    transformer.assemble().map(|_| ())
+}
+
 /// The transformed program one step before formatting: the whole JS AST plus
 /// the text prelude it needs. `transform` formats this into the final source;
 /// the macro engine's interpreter (`interpreter.rs`, macro-engine.md §5)
@@ -2168,6 +2193,11 @@ struct Transformer<'src> {
     // for every other transform — an entry build records nothing, and the field
     // is what keeps the emission path it shares with the const pass unchanged.
     recorder: Option<EmissionRecorder>,
+    // Set by [`diagnose`]: this walk is being run for its REFUSALS and its
+    // output will be dropped, so the cosmetic tail of `assemble` is skipped
+    // (backlog M34). `false` for every emitting transform, which is what keeps
+    // the emitted text byte-identical.
+    diagnose_only: bool,
 }
 
 /// One thing the shared const world declares: a concrete function, or a KEYED
@@ -2460,6 +2490,7 @@ impl<'src> Transformer<'src> {
             chunk_gate: None,
             gate_call_names: BTreeMap::new(),
             recorder: None,
+            diagnose_only: false,
         }
     }
 
@@ -2998,7 +3029,17 @@ impl<'src> Transformer<'src> {
         // Re-allocate names over the JS scope tree so disjoint scopes share them
         // (readable: both sibling `value`s stay `value`; release: reuse short
         // names per function).
-        rename_for_scopes(&self.ng, self.program, &mut nodes);
+        //
+        // Everything this function can REFUSE has already been decided above —
+        // the missing `main` at the top, then B55's body-less emission, B68's
+        // unresolved `drop` sink and B176's unrendered concatenation — and this
+        // pass returns `()`, so there is nothing left here for a `check` to
+        // learn. It is also 5.8% of a cold check's instructions (backlog M34),
+        // which is why a caller that is going to drop the text says so rather
+        // than paying for names nobody will read.
+        if !self.diagnose_only {
+            rename_for_scopes(&self.ng, self.program, &mut nodes);
+        }
         // Lift the chunk runs out, last first so the earlier ranges stay valid.
         let mut chunks: Vec<Vec<js::Node<'src>>> = Vec::with_capacity(chunk_ranges.len());
         for (start, end) in chunk_ranges.iter().rev() {
