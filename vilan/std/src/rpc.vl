@@ -2220,6 +2220,11 @@ struct KeyLease {
 	count: Shared<i32>,
 	closing: Shared<bool>,
 	settle_id: i32,
+	/// Whether this key is currently subscribed ON THE WIRE. Demand and wire
+	/// state part company here, and only here: whole-collection demand
+	/// SUBSUMES per-key demand (the channel is already forwarding every key),
+	/// so a key held while the whole collection is held asks for nothing.
+	on_wire: Shared<bool>,
 }
 
 /// The client half of a KEYED channel: a local list mirror patched by
@@ -2363,12 +2368,18 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 			count = Shared::new(0),
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
+			on_wire = Shared::new(false),
 		};
 		self.leases.write().push(fresh);
 		fresh
 	}
 
-	/// Take the whole-collection lease. 0→1 with no close pending subscribes.
+	/// Take the whole-collection lease. 0→1 with no close pending subscribes —
+	/// and releases every per-key subscription, because the whole-collection
+	/// forward already carries those keys and a second forward for one of them
+	/// would deliver its ops twice (a duplicate `Remove` would even read as a
+	/// protocol fault). The whole forward seeds with a `Reset`, so nothing is
+	/// lost in the swap.
 	fun acquire(self) {
 		let before = self.count.read();
 		self.count.write() = before + 1;
@@ -2377,6 +2388,12 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				self.closing.write() = false;
 			} else {
 				(self.transport).send(encode_control(self.codec, "Subscribe", self.channel.read()));
+			}
+			for lease in self.leases.read() {
+				if lease.on_wire.read() {
+					lease.on_wire.write() = false;
+					(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
+				}
 			}
 		}
 	}
@@ -2391,14 +2408,35 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		}
 	}
 
+	/// The deferred half of `release`. Whatever per-key demand outlives the
+	/// whole-collection lease takes the wire back: the mirror is emptied first
+	/// (it holds a whole collection it is about to stop being told about) and
+	/// each key's forward re-seeds it with an `Insert`.
 	fun flush_close(self) {
 		if self.closing.read() {
 			self.closing.write() = false;
 			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			mut resumed = false;
+			for lease in self.leases.read() {
+				if lease.count.read() > 0 && !lease.on_wire.read() {
+					resumed = true;
+				}
+			}
+			if resumed {
+				self.cache.set(Some([]));
+			}
+			for lease in self.leases.read() {
+				if lease.count.read() > 0 && !lease.on_wire.read() {
+					lease.on_wire.write() = true;
+					(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
+				}
+			}
 		}
 	}
 
-	/// Take one key's lease — the same four-line rule, per key.
+	/// Take one key's lease — the same four-line rule, per key, with the
+	/// subsumption above: while the whole collection is held, the key is
+	/// already arriving and nothing goes on the wire.
 	fun acquire_key(self, lease: KeyLease) {
 		let before = lease.count.read();
 		lease.count.write() = before + 1;
@@ -2406,7 +2444,10 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 			if lease.closing.read() {
 				lease.closing.write() = false;
 			} else {
-				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
+				if self.count.read() == 0 {
+					lease.on_wire.write() = true;
+					(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
+				}
 			}
 		}
 	}
@@ -2425,7 +2466,10 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun flush_key_close(self, lease: KeyLease) {
 		if lease.closing.read() {
 			lease.closing.write() = false;
-			(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
+			if lease.on_wire.read() {
+				lease.on_wire.write() = false;
+				(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
+			}
 		}
 	}
 
@@ -2534,7 +2578,10 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		}
 		for lease in self.leases.read() {
 			lease.closing.write() = false;
-			if lease.count.read() > 0 {
+			lease.on_wire.write() = false;
+			// Only what the whole-collection lease does not already cover.
+			if lease.count.read() > 0 && self.count.read() == 0 {
+				lease.on_wire.write() = true;
 				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", channel, lease.describe));
 			}
 		}
