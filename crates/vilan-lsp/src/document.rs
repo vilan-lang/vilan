@@ -209,9 +209,19 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         // the two surfaces cannot disagree about whether a sibling may import
         // it. `workspace_for` clones this workspace for the further legs, so
         // every leg of a shared module carries the same answer.
+        //
+        // B240: and, in file mode, WHICH of the package's files are programs.
+        // An open module knows its own file is importable; it could not see
+        // that a sibling is a declared entry, so `views.vl` importing
+        // `pkg::client::helper` was clean in the editor and refused by `vilan
+        // check .` — the same disagreement B239 closed, one file over.
         workspace.entry_mode =
             if vilan_core::platform_color::is_package_module(&pkg_root, &manifest, entry_path) {
-                vilan_core::EntryMode::OpenFile
+                vilan_core::EntryMode::OpenFile {
+                    declared_entries: vilan_core::platform_color::declared_entry_module_names(
+                        &manifest,
+                    ),
+                }
             } else {
                 vilan_core::EntryMode::Declared
             };
@@ -7331,6 +7341,58 @@ pub(crate) mod tests {
             views.published_diagnostics().is_empty(),
             "an open module file is still the module its siblings import: {:?}",
             messages(&views.published_diagnostics())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b240_an_open_module_importing_a_declared_entry_is_refused_once() {
+        // B240, in the editor. The open file is a MODULE and its own siblings
+        // may import it (B239) — but the package's OTHER declared programs are
+        // still programs, and file mode could not see which files those were:
+        // `views.vl` importing `pkg::client::helper` was clean here while
+        // `vilan check .`, whose `client` leg compiles that same file as the
+        // entry, refused it. The manifest's declared-entry set rides on
+        // `EntryMode` now.
+        //
+        // And ONCE. The refusal is the import's, and every leaf of `import
+        // pkg::client::{ helper, other }` carries the module segment's own
+        // span — so one statement pushed one error per name it listed, all on
+        // the same word. The CLI folds identical spans and showed one; raw LSP
+        // diagnostics do not, and showed two squiggles.
+        let (dir, views) = analyze_workspace(&[
+            (
+                "src/views.vl",
+                "import pkg::client::{ helper, other };\n\n\
+                 fun render(): i32 { helper() + other() }\n",
+            ),
+            ("vilan.toml", &fullstack_package("server")),
+            (
+                "src/client.vl",
+                "import std::io::print;\n\nfun helper(): i32 { 1 }\n\n\
+                 fun other(): i32 { 2 }\n\nfun main() {\n\tprint(\"client\");\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ]);
+        let published = views.published_diagnostics();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|item| item.message.contains("is this program's entry file"))
+                .count(),
+            1,
+            "one import statement, one squiggle: {:?}",
+            messages(&published)
+        );
+        // B236: and nothing about the names it did not bind.
+        assert_eq!(
+            published.len(),
+            1,
+            "the refusal stands alone: {:?}",
+            messages(&published)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

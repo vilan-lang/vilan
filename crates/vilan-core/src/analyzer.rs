@@ -43866,7 +43866,7 @@ pub struct Workspace {
 /// siblings import it. The two situations disagree about exactly one thing —
 /// what `pkg::<that file>` means — so the fact is carried as its own flag rather
 /// than inferred from the shape of the world.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EntryMode {
     /// The analyzed file is a program: an entry the manifest declares (the
     /// single `[package] entry`, an `[entry.<name>]` path), or a bare file with
@@ -43884,7 +43884,25 @@ pub enum EntryMode {
     /// siblings import — `pkg::<file>` names the scope it walks into, and a
     /// cycle through it is an ordinary module cycle, not a re-entry into a
     /// program.
-    OpenFile,
+    OpenFile {
+        /// The module names of the package's DECLARED programs
+        /// ([`crate::platform_color::declared_entry_module_names`]) — the ones
+        /// `pkg::<name>` may NOT reach, for the reason [`Self::Declared`]
+        /// states (B240).
+        ///
+        /// It rides on the mode rather than beside it because it is only ever
+        /// a question in file mode: a declared entry knows which file it is,
+        /// and a sibling importing it is B226's refusal. An open MODULE knows
+        /// its own file is importable (B239) and nothing more — until the
+        /// front end, which read the manifest, hands over the set, `views.vl`
+        /// importing `pkg::client::helper` is clean in the editor and refused
+        /// by `vilan check .`, whose `client` leg compiles that very file as
+        /// the entry.
+        ///
+        /// Empty for a caller with no manifest to read, which is the answer
+        /// that keeps every existing file-mode analysis exactly as it was.
+        declared_entries: Vec<String>,
+    },
 }
 
 /// Where a program's ambient scope is SET, in the reader's terms — the web-set
@@ -45594,7 +45612,11 @@ fn analyze_inner<'src>(
     // world is constructed (and, on a miss, stored) — through
     // `expand_entry_over_world`, identically on hit and miss — so the stored
     // world never carries entry expansions. Pre-marking SourceId(0) makes
-    // the loop's entry arm skip it; the entry-as-module arm is unaffected.
+    // the loop's entry arm skip it. The entry-as-MODULE arm claimed to be
+    // unaffected and was not (B240): the hoist that redeems the mark runs only
+    // under `!entry_is_module`, so the arm takes the mark back itself when it
+    // discovers the entry is a module — which cannot be decided here, since it
+    // is the load loop that finds out.
     if base_cacheable {
         expanded_sources.insert(SourceId(0));
     }
@@ -45770,7 +45792,7 @@ fn analyze_inner<'src>(
                 // imports its own name is the silent no-op it has always been —
                 // `a_non_entry_self_import_stays_clean` is that control, and the
                 // editor must not invent a warning the build never prints.
-                if workspace.entry_mode == EntryMode::Declared
+                if matches!(workspace.entry_mode, EntryMode::Declared)
                     && let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
                         .into_iter()
                         .find(|(module, _)| *module == name)
@@ -45800,6 +45822,21 @@ fn analyze_inner<'src>(
             let (ast, module_text, module_source_id): (&Spanned<NodeList>, &'src str, SourceId) =
                 if is_entry_module {
                     entry_is_module = true;
+                    // B240: and the §6.13 hoist's pre-mark, undone. A cacheable
+                    // analysis marks `SourceId(0)` expanded up front so the
+                    // load loop's ENTRY arm skips it and
+                    // `expand_entry_over_world` can run the entry's expansion
+                    // after the world is built — but that hoist runs only under
+                    // `!entry_is_module`, and the mark was never taken back
+                    // when the entry turned out to BE a module. A dependency
+                    // file opened as the entry (the editor, `vilan check
+                    // <path>`) therefore expanded nowhere and lost every
+                    // `[derive]` it declares. Here the file is a module, and
+                    // the module arm below is what expands it, under its own
+                    // `ModuleKey`. (A std file opened this way never hit it:
+                    // `entry_is_inside_std` makes that analysis uncacheable, so
+                    // there was no mark to undo.)
+                    expanded_sources.remove(&SourceId(0));
                     (nodes, entry_source, SourceId(0))
                 } else {
                     let Some(loaded) = load_package_module(&module_path) else {
@@ -46190,46 +46227,75 @@ fn analyze_inner<'src>(
         }
     }
 
-    // An import CYCLE back into the entry (`client` -> `views` -> `client`).
+    // An import of a file this package declares as a PROGRAM.
+    //
+    // B226, the DECLARED entry's own case (`client` -> `views` -> `client`).
     // The alias above answers `pkg::<entry>` with the entry's own scope, which
     // the entry itself reads fine — but a sibling module resolves its imports
     // before the entry walks, so that scope is still empty when it looks, and
     // the honest answer is that the entry cannot be imported at all: it is the
     // program. Say that at the import rather than letting the name lookup fail
     // with "cannot find `X` in the imported path" over a name the user can see
-    // declared (B226).
+    // declared.
     //
-    // B239: for a DECLARED entry only. In file mode the entry is a module of
-    // its package that a front end opened as the entry, its siblings import it
-    // as they always did, and `entry_is_open_module` below buys them the order
-    // that makes those imports resolve. Refusing there was the regression: the
-    // owner's `views.vl` grew seven errors in the editor while `vilan check .`
-    // — which compiles the real entries, where `views` IS a module — stayed
-    // clean.
-    if let Some(entry_module) =
-        entry_alias_module.filter(|_| workspace.entry_mode == EntryMode::Declared)
-    {
-        for (_name, ast, _text, _scope_id, source_id, origin) in &loaded {
-            if *origin != Origin::Pkg {
-                continue;
-            }
+    // B239 removed file mode from that rule, because the file mode entry is a
+    // MODULE its siblings have always imported and `entry_is_open_module` below
+    // buys them the order that resolves those imports. B240 puts back the half
+    // that is still true there: the package's OTHER declared programs. An open
+    // module could not see that a sibling is one — `views.vl` importing
+    // `pkg::client::helper` was clean in the editor and refused by `vilan check
+    // .`, whose `client` leg compiles that same file as the entry — until the
+    // front end, which read the manifest, handed the set over on `EntryMode`.
+    let refused_entry_modules: Vec<&str> = match &workspace.entry_mode {
+        EntryMode::Declared => entry_alias_module.into_iter().collect(),
+        EntryMode::OpenFile { declared_entries } => {
+            declared_entries.iter().map(String::as_str).collect()
+        }
+    };
+    if !refused_entry_modules.is_empty() {
+        // In file mode the OPEN FILE is one of the importers: it is a module of
+        // this package like any other, and its own `import pkg::client::…` is
+        // the shape the owner's `views.vl` carries. For a declared entry it is
+        // not — a self-import there is the WARNING above, not this refusal.
+        let importers = loaded
+            .iter()
+            .filter(|(_, _, _, _, _, origin)| *origin == Origin::Pkg)
+            .map(|(_, ast, _, _, source_id, _)| (*ast, *source_id))
+            .chain(
+                matches!(workspace.entry_mode, EntryMode::OpenFile { .. })
+                    .then_some((nodes as &Spanned<NodeList>, SourceId(0))),
+            );
+        for (ast, source_id) in importers {
+            // B240: the refusal is the IMPORT's, so it is pushed once per import
+            // statement. Every leaf of `import pkg::client::{ helper, other }`
+            // carries the module segment's own span, so one statement produced
+            // one error per name it listed, all at the same span — invisible in
+            // the CLI's rendering (which folds identical spans) and two
+            // squiggles on one word in the editor, whose raw diagnostics do not.
+            let mut reported: Vec<Span> = Vec::new();
             for (module, span, names) in collect_module_import_paths(&ast.0, "pkg") {
-                if module != entry_module {
+                let Some(entry_module) = refused_entry_modules
+                    .iter()
+                    .find(|declared| **declared == module)
+                else {
                     continue;
+                };
+                if !reported.contains(&span) {
+                    reported.push(span);
+                    let diagnostics_before = analyzer.diagnostics.len();
+                    analyzer.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`pkg::{entry_module}` is this program's entry file, which is the \
+                             program itself and not a module: it cannot be imported. Move the \
+                             declarations both files need into their own module and import that \
+                             from each"
+                        ),
+                    });
+                    analyzer.attribute_new_diagnostics(diagnostics_before, source_id);
                 }
-                let diagnostics_before = analyzer.diagnostics.len();
-                analyzer.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`pkg::{entry_module}` is this program's entry file, which is the \
-                         program itself and not a module: it cannot be imported. Move the \
-                         declarations both files need into their own module and import that \
-                         from each"
-                    ),
-                });
-                analyzer.attribute_new_diagnostics(diagnostics_before, *source_id);
                 // B236: and what that one report accounts for. The import binds
                 // nothing — the entry's scope is empty when a sibling reads it,
                 // which is the whole reason it is refused — so the import's own
@@ -46237,7 +46303,7 @@ fn analyze_inner<'src>(
                 // the same thing again.
                 analyzer
                     .entry_cycle_refused_imports
-                    .extend(names.into_iter().map(|name| (*source_id, name.to_string())));
+                    .extend(names.into_iter().map(|name| (source_id, name.to_string())));
             }
         }
     }
@@ -46682,7 +46748,7 @@ fn analyze_inner<'src>(
     // loaded this file, and `base_cache_lookup`'s `entry_is_a_loaded_module`
     // already refuses every world that did.
     let entry_is_open_module =
-        entry_alias_module.is_some() && workspace.entry_mode == EntryMode::OpenFile;
+        entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module && !entry_is_open_module {
         analyzer.resolve_world();
