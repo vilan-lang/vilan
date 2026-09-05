@@ -4830,26 +4830,49 @@ fn discover_tests(path: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The `std` package directory, resolved in order (proposal/releases.md §3):
-/// `$VILAN_STD`; the nearest ancestor of the entry file (then of the working
-/// directory) containing `vilan/std/vilan.toml` — a checkout, so a `vilan`
-/// built from this repo compiles against the working tree; else the binary's
-/// own embedded std, materialized once to `~/.vilan/std-cache/<hash>/` — what
-/// an installed binary uses, from any directory, with no checkout.
-/// `resolve_std` reads the resulting package's `[library]` manifest (or, if
-/// `$VILAN_STD` points at a bare source root with no manifest, uses it as the
-/// base layer).
+/// `$VILAN_STD`; the nearest ancestor of the entry file containing
+/// `vilan/std/vilan.toml` — a checkout, so a `vilan` built from this repo
+/// compiles against the working tree; else the binary's own embedded std,
+/// materialized once to `~/.vilan/std-cache/<hash>/` — what an installed binary
+/// uses, from any directory, with no checkout. `resolve_std` reads the resulting
+/// package's `[library]` manifest (or, if `$VILAN_STD` points at a bare source
+/// root with no manifest, uses it as the base layer).
+///
+/// # The working directory is not a toolchain (tracker N56)
+///
+/// The ancestor walk used to run a SECOND time from the process working
+/// directory, so a file addressed by absolute path was compiled against
+/// whichever checkout the shell happened to be standing in. That is not a
+/// fallback, it is a different toolchain: `vilan check ~/code/app/src/x.vl` from
+/// inside this repository expanded the application's derives against the working
+/// tree's `std`, and where the two versions differ every derive fails at once —
+/// 37 `macro PartialEq's definition did not compile` from the vilan tree, 0 from
+/// the application's own directory, on one unchanged file. `file_project` already
+/// resolves the PACKAGE from the file's own location (G20); the std it compiles
+/// against has to come from the same place.
+///
+/// The one thing the working directory legitimately answers for is a file that
+/// belongs to nothing — a bare `.vl` with no `vilan.toml` at or above it, which
+/// is a scratch program and not a package's module. `vilan check /tmp/probe.vl`
+/// run from a checkout means the checkout's std, because there is no other
+/// toolchain in the question; a file INSIDE a package has one, and it is the
+/// package's. (An entry that does not exist yet keeps the working directory too:
+/// there is no location to ask, and the read error is reported either way.)
 fn std_dir(entry: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("VILAN_STD") {
         return Ok(PathBuf::from(path));
     }
-    let starts = [
-        entry
-            .canonicalize()
-            .ok()
-            .and_then(|file| file.parent().map(Path::to_path_buf)),
-        env::current_dir().ok(),
-    ];
-    for start in starts.iter().flatten() {
+    let entry_dir = entry
+        .canonicalize()
+        .ok()
+        .and_then(|file| file.parent().map(Path::to_path_buf));
+    let in_a_package = entry_dir.as_deref().and_then(find_project_root).is_some();
+    let working_dir = if in_a_package {
+        None
+    } else {
+        env::current_dir().ok()
+    };
+    for start in [entry_dir, working_dir].into_iter().flatten() {
         let mut directory = Some(start.as_path());
         while let Some(current) = directory {
             let candidate = current.join("vilan").join("std");
@@ -5726,13 +5749,14 @@ fn compile_to_js(
         return Err(ExitCode::FAILURE);
     }
     let filename = file.to_string_lossy().into_owned();
-    let std = match std_dir(file) {
-        Ok(directory) => vilan_core::manifest::resolve_std(&directory),
+    let std_directory = match std_dir(file) {
+        Ok(directory) => directory,
         Err(error) => {
             eprintln!("{} {error}", paint::error_prefix());
             return Err(ExitCode::FAILURE);
         }
     };
+    let std = vilan_core::manifest::resolve_std(&std_directory);
     let mut output = None;
 
     // Fast path: a clean entry file reuses the shared content-addressed parse
@@ -6136,9 +6160,28 @@ fn compile_to_js(
         }
         *sink = hmr::render_overlay(&filename, &overlay_diagnostics, hmr::OVERLAY_DIAGNOSTIC_CAP);
     }
+    // A CASCADE of "…'s definition did not compile" is almost never several
+    // broken macros (tracker N56). It is one `std` that does not match the
+    // program: every derive is expanded against the world that std defines, so a
+    // mismatched one fails all of them at once, and the screen fills with a
+    // repeated message about the user's own `#[derive]`s. The path is the fact
+    // that answers it and nothing else printed carries it — std resolution is
+    // silent by design — so it is stated once, beneath the diagnostics.
+    let cascade = analyzer_errors
+        .iter()
+        .filter(|(_, _, message)| message.ends_with("'s definition did not compile"))
+        .count();
     // The entry's parse errors belong to the entry; the analyzer's carry their
     // own source.
     report(&diagnostic_files, analyzer_errors, parse_errors);
+    if cascade > 1 {
+        eprintln!(
+            "{} {cascade} macro definitions failed to compile; this compile \
+             resolved `std` from {}",
+            paint::err(paint::Style::BOLD, "note:"),
+            std_directory.display()
+        );
+    }
 
     match output {
         Some(compiled) if clean => Ok(compiled),
