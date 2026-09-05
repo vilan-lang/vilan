@@ -6235,7 +6235,7 @@ const A_USER_SOURCE: &str = r#"
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Stored<type T> {
@@ -6243,6 +6243,81 @@ const A_USER_SOURCE: &str = r#"
             fun set(self, value: T) { self.inner.set(value); }
         }
 "#;
+
+/// A49 inverted the trait: `on_change` — the attach that does NOT call its
+/// observer — is the requirement, and `sub` is the default built over it. So
+/// the impl above is the migrated shape, and the shape it replaced is now a
+/// refusal. This is the one thing an implementor has to do, and the diagnostic
+/// is the whole instruction: the member that is missing, and the signature to
+/// declare.
+///
+/// Non-vacuous by construction — with the pre-A49 trait this exact program is
+/// the one every implementor in the estate was written against, and it compiled.
+#[test]
+fn a49_a_source_that_provides_only_sub_is_refused_and_names_on_change() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+
+        fun main() {}
+        "#,
+        "does not implement trait 'Source': missing 'on_change'",
+    );
+}
+
+/// The refusal spells the declaration to write — for a GENERIC impl, which is
+/// the shape most of the estate's implementors are, the line is copy-pasteable
+/// and the migration is that line with `sub`'s body moved under it.
+#[test]
+fn a49_the_refusal_spells_the_declaration_to_write() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+
+        fun main() {}
+        "#,
+        "declare `fun on_change(self, observer: |T| void): Subscription`",
+    );
+}
+
+/// The control that keeps the two above from being a claim about `Source`
+/// having any required member at all: `get` alone is still not enough either,
+/// and an impl that writes BOTH requirements and no eager member compiles and
+/// drives a binding — `A_USER_SOURCE` above is that impl, and every pin in this
+/// block runs on it.
+#[test]
+fn a49_an_on_change_only_source_satisfies_the_trait() {
+    assert_compiles(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_USER_SOURCE}
+        fun consume<T, S: Source<T>>(source: S) {{
+            let _first: T = source.get();
+            let _live = source.sub(|_value| {{}});
+            let _lazy = source.on_change(|_value| {{}});
+        }}
+        fun main() {{
+            consume(Stored::new(1));
+        }}
+        "#,
+    ));
+}
 
 /// Every widened binding on the BROWSER twin, driven by a user `Source`. Before
 /// A33 each of these was a type error naming `Signal`.
@@ -6703,7 +6778,7 @@ const A_CLAMPING_SIGNAL: &str = r#"
         impl Clamped with Source<i32> {
             fun get(self): i32 { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |i32| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |i32| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Clamped with Signal<i32> {
@@ -6939,7 +7014,7 @@ fn a32_a_custom_signal_impl_drives_bind_value() {
         impl Shouted with Source<str> {
             fun get(self): str { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |str| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |str| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Shouted with Signal<str> {
@@ -6973,7 +7048,7 @@ fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
         impl Upper with Source<str> {
             fun get(self): str { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |str| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |str| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Upper with Signal<str> {

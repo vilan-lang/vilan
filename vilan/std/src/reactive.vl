@@ -460,53 +460,75 @@ fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
 
 /// The read-only view of a reactive value: read the current value and subscribe to its
 /// changes. `SignalCell<T>` implements it (and adds `set`/`set_with`); a *remote* handle
-/// implements it too (its `sub` flows over a transport), so code that only observes can't
-/// tell a local signal from a remote one — the split the reactive north star needs
+/// implements it too (its `on_change` flows over a transport), so code that only observes
+/// can't tell a local signal from a remote one — the split the reactive north star needs
 /// (`proposal/transport-rpc.md` §8).
+///
+/// **`on_change` is the primitive and `sub` is derived from it** (backlog A49).
+/// An implementation writes `get` and the LAZY attach — the one that adds an
+/// observer and does not call it — and the eager pair (`sub`, `effect`) plus
+/// `effect_on_change` and `map` all come free. The inverse arrangement, which
+/// this trait carried until A49, cannot work: `sub`'s contract is "one
+/// immediate call, then one per change", so a lazy default over an eager
+/// requirement can only ATTACH and then SWALLOW the call it did not want — a
+/// wrapper allocation, an extra branch on every notification for the life of
+/// the subscription, and a first change that is silently indistinguishable
+/// from the seeding call. Building the eager form over the lazy one is pure
+/// addition: attach, then make the call. Nothing is swallowed anywhere.
 trait Source<T> {
 	fun get(self): T;
-	[must_use]
-	fun sub(self, observer: |T| void): Subscription;
 
-	/// Subscribe and register with the ambient owner (backlog A5): the
-	/// scope-tied `sub` — nothing to hold, nothing to drop by hand. Requires
-	/// an enclosing `owner_scope.run`, statically. A trait DEFAULT, so every
-	/// `Source` gets it (B14 wired the dispatch edges that make a default
-	/// body's context read coverable).
-	fun effect(self, observer: |T| void) {
-		get_owner().take(self.sub(observer));
-	}
-
-	/// Subscribe WITHOUT the immediate first call (backlog A43): `observer`
-	/// runs on every CHANGE from here on, and never for the value the source
-	/// already holds. `sub` is exactly this plus that call, so the pair is the
-	/// eager/lazy opt-out Solid spells `on(deps, fn, { defer: true })` — vilan
-	/// has neither overloading nor optional parameters, so the opt-out is a
-	/// NAME.
+	/// Subscribe WITHOUT the immediate first call (backlog A43, made the
+	/// requirement by A49): `observer` runs on every CHANGE from here on, and
+	/// never for the value the source already holds.
+	///
+	/// This is the trait's subscription primitive. `sub` is exactly this plus
+	/// one call with the current value, so the pair is the eager/lazy opt-out
+	/// Solid spells `on(deps, fn, { defer: true })` — vilan has neither
+	/// overloading nor optional parameters, so the opt-out is a NAME.
 	///
 	/// Reach for it when the first value is already accounted for: a
 	/// derivation that seeded its own initial value (`map`, `combine`), a
 	/// side effect that must not fire on the state the program starts in — a
 	/// "you have unsaved changes" prompt, an analytics ping. Every UI binding
 	/// wants the opposite (the immediate call IS the initial paint), which is
-	/// why `sub`/`effect` keep it.
-	///
-	/// The DEFAULT body wraps `sub` and swallows that first call, which is
-	/// honest against `sub`'s documented contract — one immediate call with
-	/// the current value, then one per change. An impl whose `sub` does not
-	/// fire immediately is already outside that contract and must override
-	/// this. `SignalCell` does override it, with a direct attach that never
-	/// makes the call at all (`observe`).
+	/// why `sub`/`effect` exist beside it.
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		let seeded: Shared<bool> = Shared::new(false);
-		self.sub(|value| {
-			if seeded.read() {
-				observer(value);
-			} else {
-				seeded.write() = true;
-			}
-		})
+	fun on_change(self, observer: |T| void): Subscription;
+
+	/// Subscribe: `observer` fires ONCE NOW with the value the source already
+	/// holds, then once per change. The eager form, derived — attach lazily,
+	/// then make that one call.
+	///
+	/// A trait DEFAULT since A49. An implementation only overrides it to skip
+	/// the indirection (`SignalCell` does); one that overrides it to change
+	/// the number of immediate calls is outside the contract every binding in
+	/// `std::ui` reads.
+	[must_use]
+	fun sub(self, observer: |T| void): Subscription {
+		let subscription = self.on_change(observer);
+		observer(self.get());
+		subscription
+	}
+
+	/// `on_change` registered with the ambient owner — the scope-tied lazy
+	/// attach, and a static requirement of an enclosing `owner_scope.run`.
+	fun effect_on_change(self, observer: |T| void) {
+		get_owner().take(self.on_change(observer));
+	}
+
+	/// Subscribe and register with the ambient owner (backlog A5): the
+	/// scope-tied `sub` — nothing to hold, nothing to drop by hand. Requires
+	/// an enclosing `owner_scope.run`, statically. A trait DEFAULT, so every
+	/// `Source` gets it (B14 wired the dispatch edges that make a default
+	/// body's context read coverable).
+	///
+	/// Built over `effect_on_change` exactly as `sub` is built over
+	/// `on_change`: register the lazy attach, then make the one immediate
+	/// call.
+	fun effect(self, observer: |T| void) {
+		self.effect_on_change(observer);
+		observer(self.get());
 	}
 
 	/// A derived signal: `transform` of this one's value, recomputed on every
@@ -523,12 +545,6 @@ trait Source<T> {
 			derived.set(transform(value));
 		}));
 		derived
-	}
-
-	/// `on_change` registered with the ambient owner — `effect`'s lazy twin,
-	/// and the same static requirement: an enclosing `owner_scope.run`.
-	fun effect_on_change(self, observer: |T| void) {
-		get_owner().take(self.on_change(observer));
 	}
 }
 
@@ -587,19 +603,22 @@ impl SignalCell<type T> with Source<T> {
 		self.value.read()
 	}
 
+	/// The trait's requirement, and for the canonical cell it is `observe`
+	/// itself — attach to the subscriber list, hand back the handle that
+	/// detaches it.
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription {
+		observe(self, observer)
+	}
+
+	/// The trait's default body, specialized: identical in effect, one call
+	/// shallower. Every UI binding in the program lands here, so the cell
+	/// reaches `observe` directly rather than through the trait's `on_change`.
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
 		let subscription = observe(self, observer);
 		observer(self.get());
 		subscription
-	}
-
-	/// The direct attach — `observe` itself (A43). The trait's default body
-	/// would reach this through `sub` and drop the immediate call on the
-	/// floor; the cell can simply not make it.
-	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		observe(self, observer)
 	}
 }
 

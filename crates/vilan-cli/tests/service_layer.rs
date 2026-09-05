@@ -1062,11 +1062,22 @@ fn the_handshake_echoes_the_subprotocol_it_selected() {
 
 #[test]
 fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
-    // A40: `authorize` runs on the upgrade REQUEST. A refusal writes a status
-    // line on the raw socket and destroys it — no 101, no connection id, no
-    // reactive session, no service instance — which is the whole reason the
-    // gate is here and not inside a method. The three answers are distinct
-    // because the app's three answers are.
+    // A40: `authorize` runs on the upgrade REQUEST, and a refusal answers the
+    // raw socket and destroys it — no connection id, no reactive session, no
+    // service instance — which is the whole reason the gate is here and not
+    // inside a method. The three answers are distinct because the app's three
+    // answers are.
+    //
+    // A47 split the ANSWER in two without moving the gate. Everything that
+    // is not a vilan rpc client still gets the HTTP status line — a browser
+    // typing the URL, a probe, `curl`, a scanner — so the HTTP semantics of a
+    // refused handshake are unchanged for everything that speaks HTTP and not
+    // this protocol. A client that offered `vilan-rpc` gets the same refusal
+    // as one frame on an upgraded socket instead, because neither host
+    // WebSocket API shows a client the status of a failed handshake and the
+    // one that used to be lost was the one it needed most.
+    // `a_refused_vilan_client_is_told_its_refusal_in_one_frame` below is that
+    // half; here is the half that did not move.
     let (server, port) = spawn_service_server("authorize", AUTHORIZED_SERVER);
 
     let missing = raw_upgrade(port, "/", "");
@@ -1074,11 +1085,9 @@ fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
         missing.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
         "a handshake with no credential must be refused 401: {missing}"
     );
-    let forbidden = raw_upgrade(
-        port,
-        "/",
-        "Sec-WebSocket-Protocol: vilan-rpc, token.bad\r\n",
-    );
+    // A credential this app rejects, from something that is not a vilan client
+    // (no `vilan-rpc` in the offer): the status line, as before.
+    let forbidden = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: token.bad\r\n");
     assert!(
         forbidden.starts_with("HTTP/1.1 403 Forbidden\r\n"),
         "a credential the app rejects must be refused 403: {forbidden}"
@@ -1086,7 +1095,7 @@ fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
     for refusal in [&missing, &forbidden] {
         assert!(
             !refusal.contains("101 Switching Protocols"),
-            "a refused handshake must never be upgraded: {refusal}"
+            "a refusal to a non-vilan client must never be upgraded: {refusal}"
         );
     }
 
@@ -1336,4 +1345,284 @@ fn the_greeting_bound_destroys_a_silent_socket_and_spares_a_speaking_one() {
     );
 
     drop(server);
+}
+
+// --- A47: a refused client learns it was refused, and stops -------------------
+
+/// The refusal a vilan rpc client can act on, on the wire: the server upgrades
+/// it and writes ONE `__reject:<status>` frame before closing.
+///
+/// The reason this shape exists rather than the obvious one — read the HTTP
+/// status off the failed handshake — is that neither host WebSocket
+/// implementation will show it. Measured on node v24.2.0 (undici's global
+/// `WebSocket`, which is what `std::rpc` binds): a 401, a 403, a 429, a socket
+/// destroyed mid-handshake, a refused TCP connection and a server with no
+/// upgrade handler at all produce byte-for-byte the same error event
+/// ("Received network error or non-101 status code.") and the same close
+/// (code 1002, `wasClean: false`). A47's option (a) — node's `ws` package and
+/// its `unexpected-response` event — is not available here at all: std binds
+/// the host global on every platform and adds no client dependency, and the
+/// browser API exposes strictly less by design.
+///
+/// The DoS trade this pays is bounded by which refusals are eligible.
+/// `Reject::TooMany` never is, and `TooMany` is what `max_connections` and
+/// `handshake_rate` produce — so the refusals a FLOOD produces are exactly the
+/// ones that never upgrade, and an attacker cannot reach the upgrading path
+/// more often than the rate limiter admits. The socket is destroyed in the
+/// same turn either way, so nothing is held open by either shape;
+/// `the_connection_ceiling_refuses_the_handshake_over_it` above is the pin
+/// that the cheap path is still the cheap path.
+#[test]
+fn a_refused_vilan_client_is_told_its_refusal_in_one_frame() {
+    let (server, port) = spawn_service_server("refusal_frame", AUTHORIZED_SERVER);
+
+    let refused = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.bad\r\n",
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a vilan client must be upgraded so the refusal can be a frame: {refused}"
+    );
+    assert!(
+        refused.contains("Sec-WebSocket-Protocol: vilan-rpc\r\n"),
+        "the refusing handshake is a normal one up to the first frame: {refused}"
+    );
+    assert!(
+        refused.contains("__reject:403"),
+        "the refusal frame must carry the status the socket API will not show: {refused}"
+    );
+    // One frame and then the close — not a connection that lingers.
+    assert!(
+        !refused.contains("__conn:"),
+        "a refused client must never be announced a connection id: {refused}"
+    );
+
+    // …and the same client offering nothing this server accepts is still
+    // refused, with the status that names WHY it is not a judgement about a
+    // credential this server ever saw.
+    let missing = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: vilan-rpc\r\n");
+    assert!(
+        missing.starts_with("HTTP/1.1 101 Switching Protocols\r\n")
+            && missing.contains("__reject:401"),
+        "a vilan client with no credential must hear 401 as a frame: {missing}"
+    );
+
+    drop(server);
+}
+
+/// The whole of A47 from the client's side: `connect_with` on a credential the
+/// server refuses comes back `RpcError::Unauthorized`, AT ONCE.
+///
+/// Both halves are the claim. Before this the client could not tell a refusal
+/// from an unreachable server, so it did what an unreachable server deserves —
+/// ten redials over about 24 seconds of backoff — and then reported
+/// `Transport("could not reach …")`, which is a false statement about a server
+/// that answered. The elapsed bound is the observable half of "stops
+/// retrying": one attempt costs no backoff at all, and the budget it used to
+/// burn is 250+500+1000+2000+4000×6 ms ≈ 27.75 s of sleeping alone, so five
+/// seconds separates the two behaviours by a factor the machine's load cannot
+/// close.
+///
+/// Proven red first by planting the pre-A47 server (no refusal ever takes the
+/// frame path), which is the exact behaviour this item was filed against: the
+/// same program answers
+/// `refused:Transport("could not reach ws://localhost:44659/")`, and the run
+/// takes 34.0 s where the fixed one takes 11.2 s — both figures including the
+/// build.
+#[test]
+fn a_refused_client_reports_unauthorized_without_burning_the_retry_budget() {
+    let dir = temp_project("refused_client");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(AUTHORIZED_SERVER
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::rpc_protocols;\nimport std::result::Result::{ Ok, Err };",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect_with(i"ws://localhost:{port}/", json_codec(), rpc_protocols("bad")) {
+		Ok(let _client) => print("connected:unexpected"),
+		Err(let error) => print(i"refused:{error.debug()}"),
+	}
+	exit(0);
+}
+"#),
+    );
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("run")
+        .arg(".")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the refused-client program");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("refused:Unauthorized"),
+        "a refused connect must report RpcError::Unauthorized; stdout was:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // A build is in this measurement, so the bound is on the whole command and
+    // still an order of magnitude under the ~27.75 s of backoff a burned
+    // budget sleeps through.
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "the refusal must not wait out the retry budget; the whole run took {elapsed:?}"
+    );
+
+    drop(dir);
+}
+
+// --- A48: bounding the verifier, and the address a limit is keyed on ---------
+
+/// `authorize_timeout`: a verifier that does not answer is refused and the
+/// socket destroyed, rather than held for as long as the verifier hangs — one
+/// held socket per client trying to connect, which is a denial of service the
+/// server inflicts on itself without a single malformed byte from anyone.
+///
+/// The refusal is 429 (`Reject::TooMany`), deliberately: the `Reject` enum
+/// draws judgement (401/403) against LIMIT (429), and a verifier that ran out
+/// of time says nothing about the credential — it is the one refusal a client
+/// SHOULD retry. It is answered on the timeout's own turn, not when the hook
+/// eventually returns, which is the whole point.
+///
+/// Proven red first by planting `authorize_timeout(0)` (the default, and what
+/// every service had before A48): the same handshake reads back EMPTY — the
+/// socket held, unanswered, past the reader's own 1500 ms bound while the
+/// verifier is still sleeping, which is the shape of the item.
+#[test]
+fn a_verifier_that_does_not_answer_in_time_is_refused_and_the_socket_destroyed() {
+    let source = AUTHORIZED_SERVER
+        .replace(
+            "import std::io::print;",
+            "import std::io::print;\nimport std::time::{ Duration, sleep_for };",
+        )
+        .replace(
+            "			.authorize(|handshake: Handshake| match handshake.token() {",
+            "			.authorize_timeout(300)\n			.authorize(|handshake: Handshake| {\n				sleep_for(Duration::millis(3000));\n				match handshake.token() {",
+        )
+        .replace(
+            "				None => Result::Err(Reject::Unauthorized),\n			}))",
+            "				None => Result::Err(Reject::Unauthorized),\n				}\n			}))",
+        );
+    assert!(
+        source.contains("authorize_timeout(300)")
+            && source.contains("sleep_for(Duration::millis(3000))"),
+        "the bound and the slow verifier must both be spliced into the server source:\n{source}"
+    );
+    let (server, port) = spawn_service_server("verifier_bound", &source);
+
+    let started = Instant::now();
+    let refused = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        refused.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "a verifier over its bound must be refused 429: {refused}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the refusal must land on the bound, not when the hook finally answers ({elapsed:?})"
+    );
+    assert!(
+        !refused.contains("101 Switching Protocols") && !refused.contains("__reject:"),
+        "a timed-out verification is a limit, not a judgement, so it takes the cheap path: {refused}"
+    );
+
+    drop(server);
+}
+
+/// `trust_forwarded_for`: behind a proxy every client shares the proxy's
+/// socket address, so a per-address `handshake_rate` degenerates into a global
+/// one that refuses everybody as soon as one client is noisy. With the switch
+/// on, the key is the first entry of `X-Forwarded-For`.
+///
+/// The control is the load-bearing half and it is the DEFAULT: with the switch
+/// OFF the header is not read at all, so a client cannot pick its own bucket
+/// by writing one line — which is exactly what a directly-exposed server that
+/// trusted the header would let anybody do.
+///
+/// Proven red first by planting the old key (`socket.remote_address()`
+/// unconditionally): "client 1 attempt 0 is inside its own budget: HTTP/1.1
+/// 429 Too Many Requests" — the third handshake overall, from the one socket
+/// peer they all share, which is the degeneration the switch exists to undo.
+#[test]
+fn a_trusted_forwarded_header_is_what_the_handshake_rate_keys_on() {
+    let trusting = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_rate(2, 10000.0).trust_forwarded_for(true))",
+    );
+    assert!(trusting.contains("trust_forwarded_for(true)"));
+    let (server, port) = spawn_service_server("forwarded_trusted", &trusting);
+
+    // Three handshakes, three claimed clients: each has its own budget of two.
+    for client in 0..3 {
+        for attempt in 0..2 {
+            let reply = raw_upgrade(
+                port,
+                "/",
+                &format!("X-Forwarded-For: 203.0.113.{client}\r\n"),
+            );
+            assert!(
+                reply.starts_with("HTTP/1.1 101 "),
+                "client {client} attempt {attempt} is inside its own budget: {reply}"
+            );
+        }
+    }
+    // The third from one of them is over that client's budget, and nobody
+    // else's.
+    let over = raw_upgrade(port, "/", "X-Forwarded-For: 203.0.113.1\r\n");
+    assert!(
+        over.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "the third handshake from one forwarded client must be refused: {over}"
+    );
+    let neighbour = raw_upgrade(port, "/", "X-Forwarded-For: 203.0.113.9\r\n");
+    assert!(
+        neighbour.starts_with("HTTP/1.1 101 "),
+        "a different forwarded client must be unaffected by its neighbour: {neighbour}"
+    );
+    drop(server);
+
+    // The control: with the switch off — the default — the header is ignored
+    // and every one of these shares the socket peer's single budget.
+    let plain = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_rate(2, 10000.0))",
+    );
+    let (untrusting, plain_port) = spawn_service_server("forwarded_untrusted", &plain);
+    for client in 0..2 {
+        let reply = raw_upgrade(
+            plain_port,
+            "/",
+            &format!("X-Forwarded-For: 203.0.113.{client}\r\n"),
+        );
+        assert!(
+            reply.starts_with("HTTP/1.1 101 "),
+            "the first two share one budget and are inside it: {reply}"
+        );
+    }
+    let spoofed = raw_upgrade(plain_port, "/", "X-Forwarded-For: 203.0.113.77\r\n");
+    assert!(
+        spoofed.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "an untrusting server must not let a header buy a fresh budget: {spoofed}"
+    );
+
+    drop(untrusting);
 }

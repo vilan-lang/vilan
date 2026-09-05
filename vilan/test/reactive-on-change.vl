@@ -1,21 +1,21 @@
-// `Source::on_change` / `Source::effect_on_change` (backlog A43) — the LAZY
-// half of the subscribe pair: attach an observer and do NOT call it with the
-// value the source already holds. `sub`/`effect` keep their immediate first
-// call (every UI binding is the initial paint), so the opt-out is a NAME.
+// `Source::on_change` / `Source::effect_on_change` (backlog A43) and the A49
+// INVERSION: `on_change` is the trait's subscription REQUIREMENT and `sub` is
+// the eager form derived from it — attach lazily, then make one call with the
+// value the source already holds. Nothing is swallowed anywhere.
 //
 // Four claims:
 //   1. `on_change` skips the first call and fires on every change after it;
 //      `sub` beside it still fires immediately (they observe one signal).
 //   2. `effect_on_change` is the owner-registered form: it dies with the scope.
-//   3. The trait's DEFAULT body serves a custom `Source` that implements only
-//      `get`/`sub` — it wraps `sub` and swallows the one immediate call.
+//   3. The trait's DEFAULT `sub` serves a custom `Source` that implements only
+//      `get`/`on_change` — it attaches and then makes EXACTLY ONE call.
 //   4. `map` is a `Source` member now (reactive-traits.md Q5's widening rode
 //      in on `on_change`), so a custom source derives like a cell does.
 import std::io::print;
 import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscription, comp, owner_scope };
 
-/// A `Source` of one's own: `get` and `sub`, nothing else. `on_change`,
-/// `effect_on_change` and `map` all arrive as trait defaults.
+/// A `Source` of one's own: `get` and `on_change`, nothing else. `sub`,
+/// `effect`, `effect_on_change` and `map` all arrive as trait defaults.
 struct Stored<T> {
 	inner: SignalCell<T>,
 }
@@ -26,8 +26,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
-		self.inner.sub(observer)
+	fun on_change(self, observer: |T| void): Subscription {
+		self.inner.on_change(observer)
 	}
 }
 
@@ -53,12 +53,19 @@ fun main() {
 	count.set(5);
 
 	// The trait default over a custom `Source`: `Stored` writes only `get` and
-	// `sub`, and the default body swallows `sub`'s immediate call — the emitted
-	// wrapper drops the first value on the floor and forwards every one after.
-	// witness: if (seeded.v) { observer(value); } else { seeded.v = true; }
+	// `on_change`, and the default `sub` is that attach PLUS one call with the
+	// current value — the eager contract, built by addition. The emitted body
+	// is the whole of it: no wrapper cell, no swallowed call, no branch riding
+	// every later notification.
+	// witness: const subscription = $F(self, observer); observer($G(self)); return subscription;
+	// witness-absent: seeded
 	let stored = Stored { inner = Signal::new(10) };
-	let watched = stored.on_change(|value| print(i"stored {value}"));
+	let eagerly = stored.sub(|value| print(i"eager {value}"));
 	stored.inner.set(11);
+	eagerly.dispose();
+
+	// And the lazy one on the same custom source: the impl's own member.
+	let watched = stored.on_change(|value| print(i"stored {value}"));
 	stored.inner.set(12);
 	watched.dispose();
 

@@ -184,7 +184,7 @@ struct Stored<T> { inner: SignalCell<T> }
 impl Stored<type T> with Source<T> {
 	fun get(self): T { self.inner.get() }
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+	fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
 }
 ```
 
@@ -196,7 +196,7 @@ impl Stored<type T> with Source<T> {
 Two things deliberately still ask for the concrete type:
 
 - **`bind_value` and `bind_draft`**, because they WRITE BACK. `Source`
-  declares `get` and `sub` and no `set`, so there is nothing to widen to
+  declares `get` and `on_change` and no `set`, so there is nothing to widen to
   yet — the write side is its own design question.
 - **`attr` and `child`**, whose reactive arms are the `AttrValue` and
   `Slot` traits — so `<div href(source)>` and `<p>{source}</p>` still want

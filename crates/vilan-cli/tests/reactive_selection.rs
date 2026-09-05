@@ -115,8 +115,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
-		self.inner.sub(observer)
+	fun on_change(self, observer: |T| void): Subscription {
+		self.inner.on_change(observer)
 	}
 }
 
@@ -139,15 +139,81 @@ fun main() {
 main();
 "#;
 
-/// A `Source` that implements only `get`/`sub` gets `on_change` from the trait
-/// default — which must swallow `sub`'s one immediate call and nothing else —
-/// and `map`, which reactive-traits Q5's widening put on the trait.
+/// A `Source` that implements only `get`/`on_change` — the two A49 made the
+/// trait's requirements — gets `map` (reactive-traits Q5's widening) and the
+/// whole eager family from the trait defaults. Here the LAZY member is the
+/// impl's own; `an_on_change_only_source_gets_a_working_eager_sub` below is the
+/// derived half.
 #[test]
 fn the_trait_defaults_serve_a_hand_written_source() {
     let stdout = build_and_run("hand_written_source", HAND_WRITTEN_SOURCE);
     assert_eq!(
         stdout, "attached\nstored 11\nstored 12\nn=13\nlabel n=13\nlabel n=14\n",
         "the trait defaults did not serve a hand-written Source as documented"
+    );
+}
+
+// --- A49: `on_change` is the requirement, `sub` the derived eager form -------
+
+const ON_CHANGE_ONLY_SOURCE: &str = r#"import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscription, comp };
+
+struct Stored<T> {
+	inner: SignalCell<T>,
+}
+
+impl Stored<type T> with Source<T> {
+	fun get(self): T {
+		self.inner.get()
+	}
+
+	[must_use]
+	fun on_change(self, observer: |T| void): Subscription {
+		self.inner.on_change(observer)
+	}
+}
+
+fun main() {
+	let stored = Stored { inner = Signal::new(10) };
+	// The trait's DEFAULT `sub`, over an impl that never wrote one.
+	let eager = stored.sub(|value| print(i"eager {value}"));
+	print("attached");
+	stored.inner.set(11);
+	eager.dispose();
+	stored.inner.set(12);
+	// And the owner-registered eager form, built the same way.
+	let (_built, scope) = comp(|| {
+		stored.effect(|value| print(i"effect {value}"));
+	});
+	stored.inner.set(13);
+	scope.dispose();
+	stored.inner.set(14);
+}
+
+main();
+"#;
+
+/// The A49 inversion, from the outside: an implementation that writes `get` and
+/// `on_change` and NOTHING else gets a working eager `sub` and a working eager
+/// `effect`, each firing exactly once with the value the source already holds
+/// and then once per change.
+///
+/// `eager 10` before `attached` is the immediate call; that it appears ONCE is
+/// the claim the old arrangement could not make — a default built the other way
+/// round subscribes eagerly and then discards a call, so the number of
+/// immediate calls is decided by the impl rather than by the trait. `effect 13`
+/// with no `effect 14` after it is the owner registration, which rides
+/// `effect_on_change`.
+///
+/// Proven red first by planting a default `sub` that only forwards to
+/// `on_change` and drops the immediate call: the run comes back
+/// `attached\neager 11\n…` — the `eager 10` before `attached` is gone, which is
+/// the whole of what "derived" has to mean here.
+#[test]
+fn an_on_change_only_source_gets_a_working_eager_sub() {
+    let stdout = build_and_run("on_change_only_source", ON_CHANGE_ONLY_SOURCE);
+    assert_eq!(
+        stdout, "eager 10\nattached\neager 11\neffect 12\neffect 13\n",
+        "the derived eager members did not serve an on_change-only Source"
     );
 }
 

@@ -168,10 +168,20 @@ per disconnect, through `drop_session`.
 
 ```vilan,fragment
 fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff)
+fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str>
+fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure>
+enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"
 impl SocketDuplex {
 	fun transport(self): SocketTransport
 }
 ```
+
+`dial_socket` is the typed dial the generated `Client::connect` reaches
+through: `Refused` is a server that upgraded this client and then declined it
+in one frame, which is the only way a refusal can be told from an unreachable
+server — no host WebSocket exposes a failed handshake's HTTP status. A refusal
+ends the retry budget at the first attempt.  `connect_socket` and
+`connect_socket_with` are this with the failure flattened to its sentence.
 
 ## Server plumbing (`std::rpc_server`, process layer)
 
@@ -181,6 +191,13 @@ impl Service {
 	fun at(own self, prefix: str): Service    // mount elsewhere, e.g. "/admin/"
 	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service
 	fun on_disconnect(own self, handler: |i32| void): Service
+	// the handshake gate and its limits
+	fun authorize(own self, check: async |Handshake| Result<Session, Reject>): Service
+	fun authorize_timeout(own self, millis: i32): Service   // 429 if the hook does not answer
+	fun max_connections(own self, limit: i32): Service      // upgraded sockets on this mount only
+	fun handshake_rate(own self, attempts: i32, window_millis: f64): Service
+	fun handshake_timeout(own self, millis: i32): Service   // bounds the greeting, not idleness
+	fun trust_forwarded_for(own self, trusted: bool): Service   // key on X-Forwarded-For
 }
 impl ServerBuilder {
 	fun with_service(own self, service: Service): ServerBuilder   // repeatable

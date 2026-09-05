@@ -102,6 +102,13 @@ impl NodeSocket {
 	[extern(method, "destroy")]
 	external fun destroy(self);
 
+	/// Whether `destroy` has already run (`net.Socket.destroyed`). A write to
+	/// a destroyed socket is not an error in node — it is silently dropped —
+	/// so this exists for the paths that must know they have nothing left to
+	/// say, not to make a write safe.
+	[extern(get, "destroyed")]
+	external fun destroyed(self): bool;
+
 	/// `remote_address_raw` as text, with the absent case flattened to `""`.
 	fun remote_address(self): str {
 		let raw = self.remote_address_raw();

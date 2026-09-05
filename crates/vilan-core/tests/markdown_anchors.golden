@@ -104,6 +104,7 @@ guide/services.md h3 reading-a-mirror
 guide/services.md h2 connection-state-and-reconnection
 guide/services.md h2 authentication
 guide/services.md h3 authorizing-the-connection
+guide/services.md h3 a-refused-client-is-told-and-stops
 guide/services.md h3 cheap-limits-with-or-without-a-gate
 guide/services.md h2 where-the-service-lives
 guide/services.md h2 the-server-side
