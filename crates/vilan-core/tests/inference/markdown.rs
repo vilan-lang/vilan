@@ -1231,10 +1231,10 @@ fn a25_disposing_the_last_remote_subscription_sends_unsubscribe() {
             counter.set(2);
         }
         "#,
-        "up   {\"Subscribe\":0}\n\
+        "up   {\"Subscribe\":[0,null]}\n\
          down {\"Update\":[0,0]}\n\
          down {\"Update\":[0,1]}\n\
-         up   {\"Unsubscribe\":0}\n",
+         up   {\"Unsubscribe\":[0,null]}\n",
     );
 }
 
@@ -1371,7 +1371,7 @@ fn a25_a_same_turn_resubscribe_cancels_the_pending_unsubscribe() {
             counter.set(1);
         }
         "#,
-        "up   {\"Subscribe\":0}\n\
+        "up   {\"Subscribe\":[0,null]}\n\
          down {\"Update\":[0,0]}\n\
          A sees 0\n\
          B sees 0\n\
@@ -1432,7 +1432,7 @@ fn a25_a_pending_unsubscribe_does_not_cross_a_rebind() {
             again.dispose();
         }
         "#,
-        "up   {\"Subscribe\":0}\n\
+        "up   {\"Subscribe\":[0,null]}\n\
          down {\"Update\":[0,0]}\n\
          sees 0\n\
          settled\n\
@@ -1488,10 +1488,10 @@ fn a25_a_counted_subscription_releases_its_lease_once() {
             print("second disposed");
         }
         "#,
-        "up   {\"Subscribe\":0}\n\
+        "up   {\"Subscribe\":[0,null]}\n\
          first disposed by hand\n\
          owner disposed\n\
-         up   {\"Unsubscribe\":0}\n\
+         up   {\"Unsubscribe\":[0,null]}\n\
          second disposed\n",
     );
 }
@@ -1565,12 +1565,12 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
         }
         "#,
         "status = Waiting\n\
-         up   {\"Subscribe\":0}\n\
+         up   {\"Subscribe\":[0,null]}\n\
          down {\"Update\":[0,7]}\n\
          text = 7\n\
          down {\"Update\":[0,8]}\n\
          text = 8\n\
-         up   {\"Unsubscribe\":0}\n\
+         up   {\"Unsubscribe\":[0,null]}\n\
          text = 8\n",
     );
 }
@@ -1745,13 +1745,13 @@ fn a25_or_reads_the_initial_before_the_first_frame_and_the_value_after() {
             scope.dispose();
         }
         "#,
-        "up   {\"Subscribe\":0} (held)\n\
+        "up   {\"Subscribe\":[0,null]} (held)\n\
          before the first frame: (pending)\n\
          down {\"Update\":[0,\"hello\"]}\n\
          after the first frame: hello\n\
          down {\"Update\":[0,\"hello again\"]}\n\
          after a change: hello again\n\
-         up   {\"Unsubscribe\":0} (held)\n",
+         up   {\"Unsubscribe\":[0,null]} (held)\n",
     );
 }
 
@@ -1813,12 +1813,12 @@ fn a25_two_maps_under_one_owner_take_one_subscribe() {
             print(i"{doubled.get()} {label.get()}");
         }
         "#,
-        "up   {\"Subscribe\":0}\n\
+        "up   {\"Subscribe\":[0,null]}\n\
          down {\"Update\":[0,1]}\n\
          2 n=1\n\
          down {\"Update\":[0,2]}\n\
          4 n=2\n\
-         up   {\"Unsubscribe\":0}\n\
+         up   {\"Unsubscribe\":[0,null]}\n\
          4 n=2\n",
     );
 }
@@ -1878,11 +1878,11 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
         "#,
         "status: Waiting\n\
          after a change: Waiting\n\
-         up   {\"Subscribe\":0}\n\
+         up   {\"Subscribe\":[0,null]}\n\
          down {\"Update\":[0,2]}\n\
          status: Ready\n\
          sees 2\n\
-         up   {\"Unsubscribe\":0}\n",
+         up   {\"Unsubscribe\":[0,null]}\n",
     );
 }
 
