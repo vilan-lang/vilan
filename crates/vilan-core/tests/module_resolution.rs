@@ -3969,3 +3969,103 @@ fn b239_an_open_module_file_needs_no_main() {
         "no `main`, and none demanded: {errors:#?}"
     );
 }
+
+// ── B236: the entry-cycle refusal reports ONCE ───────────────────────────────
+
+#[test]
+fn b236_the_entry_cycle_refusal_reports_exactly_once() {
+    // B226 refuses the sibling's `import pkg::main::Tab` at the import, and
+    // that is the whole mistake. What followed it was the same mistake read
+    // three more ways: the import's own walk into the entry's (empty) scope
+    // ("cannot find 'Tab' in the imported path"), and then every use of the
+    // name the import never bound ("cannot find type 'Tab'", twice). Four
+    // reports over one edit, three of them naming a type the author can see
+    // declared in the file the refusal already pointed at.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::Tab;\n\nfun render(): bool { Tab::Messages == Tab::Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "one cycle, one report — no cascade over the names it did not bind: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "and the one report is the refusal at the import: {errors:#?}"
+    );
+}
+
+#[test]
+fn b236_a_value_use_of_a_refused_entry_import_stands_down_too() {
+    // The value-position twin of the same cascade: the sibling imports a
+    // FUNCTION from the entry, so the follow-on is "cannot find 'helper' in
+    // this scope" at the call rather than "cannot find type". One mistake,
+    // one report, whichever position the name is read in.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\n\nfun render(): i32 { helper() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(errors.len(), 1, "one cycle, one report: {errors:#?}");
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b236_the_stand_down_covers_only_what_the_refusal_accounts_for() {
+    // The control. The stand-down is keyed on the FILE that wrote the refused
+    // import and the NAMES that import would have brought in — nothing wider.
+    // A real miss in the same file, of a name no refused import mentions, is
+    // still the author's own mistake and is still reported.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\n\nfun render(): i32 { helper() + missing() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::main` is this program's entry file")),
+        "the refusal stands: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot find 'missing' in this scope")),
+        "and an unrelated miss in the same file is still reported: {errors:#?}"
+    );
+}

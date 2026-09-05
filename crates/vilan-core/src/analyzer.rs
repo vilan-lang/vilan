@@ -3598,6 +3598,21 @@ pub struct Analyzer<'src> {
     // same field, so it fails the same bound one pass later and says so in the
     // vocabulary of code the author never wrote.
     expose_refused_field_slots: HashSet<TypeId>,
+    // B236: what B226's entry-cycle refusal already accounts for — `(the file
+    // that wrote the import, a name that import would have brought in)`.
+    //
+    // The refusal is reported at the sibling's `import pkg::<entry>`, and the
+    // entry's scope is empty by construction when a sibling reads it, so the
+    // import binds NOTHING. Everything downstream then said so again in its
+    // own vocabulary: the import's own walk ("cannot find 'Tab' in the imported
+    // path"), and every use of the name it failed to bind ("cannot find type
+    // 'Tab'", "cannot find 'Tab' in this scope"). None of those is a second
+    // mistake. The stand-down is B189's — record what the one report covers and
+    // let the sites that would restate it ask ([`Self::entry_cycle_refusal_covers`]).
+    //
+    // Keyed by FILE as well as name: the sibling that wrote the refused import
+    // is the only file whose miss of that name this report accounts for.
+    entry_cycle_refused_imports: Vec<(SourceId, String)>,
     // The ELEMENT each of those refusals named, as the refusal RENDERED it. The
     // expansion writes two shapes per exposed field and only one of them is
     // handed the field: `session.expose(self.tasks)` carries it, while the
@@ -4356,6 +4371,7 @@ impl<'src> Analyzer<'src> {
             refused_annotation_slots: HashMap::default(),
             refused_annotation_traits: HashMap::default(),
             expose_refused_field_slots: HashSet::default(),
+            entry_cycle_refused_imports: Vec::new(),
             expose_refused_elements: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
@@ -16520,6 +16536,29 @@ impl<'src> Analyzer<'src> {
         self.annotation_slots_behind(expr_id)
             .into_iter()
             .any(|slot| self.expose_refused_field_slots.contains(&slot))
+    }
+
+    /// B236: is this miss of `name` in `source_id` one B226's entry-cycle
+    /// refusal has already reported?
+    ///
+    /// The refusal is filed at the `import pkg::<entry>` that cannot bind, and
+    /// what follows it is the same mistake read again — once by the import's
+    /// own walk, once by every use of the name that never arrived. Same idiom
+    /// as [`Self::expose_refusal_behind`]: the covered set is empty in every
+    /// program that has no such refusal, so the check costs nothing there and
+    /// the scan is over a handful of entries in the one program that does.
+    fn entry_cycle_refusal_covers(&self, source_id: Option<SourceId>, name: &str) -> bool {
+        if self.entry_cycle_refused_imports.is_empty() {
+            return false;
+        }
+        let Some(source_id) = source_id else {
+            return false;
+        };
+        self.entry_cycle_refused_imports
+            .iter()
+            .any(|(refused_source, refused_name)| {
+                *refused_source == source_id && refused_name == name
+            })
     }
 
     /// [`Self::expose_refusal_behind`] asked of a GENERATED call: was it handed
@@ -29661,7 +29700,11 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 None => {
-                    if report {
+                    // B236: the first thing B226's entry-cycle refusal covers.
+                    // `pkg::<entry>` resolves to the entry's own (still empty)
+                    // scope, so the walk into it can only miss — and saying so
+                    // sends the author looking for a name they can see declared.
+                    if report && !self.entry_cycle_refusal_covers(Some(source_id), part) {
                         let msg =
                             removed_std_alias(root, part, namespace_scope_id == root_scope_id)
                                 .unwrap_or_else(|| {
@@ -35782,14 +35825,21 @@ impl<'src> Analyzer<'src> {
                 let note = note
                     .or_else(|| self.element_view_import_note(id, name))
                     .or_else(|| self.css_style_import_note(id, name));
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note,
-                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot find '{}' in this scope{}", name, steer),
-                });
-                if let Some(source) = self.source_of_id(id) {
-                    self.attribute_new_diagnostics(diagnostics_before, source);
+                // B236: the name is not missing — the import that would have
+                // brought it in was refused, and that refusal is already filed
+                // at the import. The expression still becomes an `Expr::Error`,
+                // which is what keeps the rest of the walk quiet; only the
+                // second telling is dropped.
+                if !self.entry_cycle_refusal_covers(self.source_of_id(id), name) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note,
+                        span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!("cannot find '{}' in this scope{}", name, steer),
+                    });
+                    if let Some(source) = self.source_of_id(id) {
+                        self.attribute_new_diagnostics(diagnostics_before, source);
+                    }
                 }
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
             }
@@ -36322,16 +36372,23 @@ impl<'src> Analyzer<'src> {
                     // indexes a file the author never opened. `source_id` is
                     // the walk's own record, captured when the annotation was
                     // prepped.
-                    self.push_at_written_type(
-                        Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span,
-                            msg: message,
-                        },
-                        source_id,
-                        type_id,
-                    );
+                    // B236: unless the import that would have declared this name
+                    // was refused at the entry cycle. The slot below is still
+                    // recorded — this annotation IS a refused one, and every
+                    // later reader must stand down over it — only the second
+                    // telling of the one mistake is dropped.
+                    if !self.entry_cycle_refusal_covers(Some(source_id), name) {
+                        self.push_at_written_type(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                            type_id,
+                        );
+                    }
                     // B189's first sibling: a name that does not resolve is a
                     // REFUSED ANNOTATION like any other. B182 instrumented the
                     // arm above and left this one, so `struct Holder { inner:
@@ -43304,6 +43361,58 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
     modules
 }
 
+/// [`collect_module_refs`] with the rest of each import kept: `(module, the
+/// module's span, the names the import walks or binds BELOW that module)`.
+///
+/// One record per import LEAF, so `import pkg::views::{ a, b }` is two records
+/// sharing one span — which is what lets a refusal at the module report once per
+/// import statement (B240) while still knowing every name that import failed to
+/// bring in (B236's covered set).
+///
+/// The names are the ones [`Analyzer::resolve_import`] would walk and finally
+/// bind: the path segments after the module, then the leaf — or, for a `self`
+/// leaf, the namespace it re-binds.
+fn collect_module_import_paths<'a>(
+    nodes: &'a NodeList<'a>,
+    root: &str,
+) -> Vec<(&'a str, Span, Vec<&'a str>)> {
+    fn walk<'a>(
+        node: &'a Spanned<Node<'a>>,
+        root: &str,
+        imports: &mut Vec<(&'a str, Span, Vec<&'a str>)>,
+    ) {
+        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+            let mut entries = Vec::new();
+            flatten_namespace_branch(branch, Vec::new(), &mut entries);
+            for (path, leaf, leaf_span) in entries {
+                if path.first().map(|(name, _)| *name) != Some(root) {
+                    continue;
+                }
+                // A bare `import pkg::views` names the module in its leaf and
+                // walks nothing below it; the name it binds is the module's.
+                let Some((module, module_span)) = path.get(1).copied() else {
+                    imports.push((leaf, leaf_span, vec![leaf]));
+                    continue;
+                };
+                let mut names: Vec<&str> = path[2..].iter().map(|(segment, _)| *segment).collect();
+                // `views::{ self }` binds the namespace under its own name.
+                names.push(match leaf {
+                    "self" => path.last().map(|(name, _)| *name).unwrap_or(leaf),
+                    _ => leaf,
+                });
+                imports.push((module, module_span, names));
+            }
+        }
+        node.0
+            .for_each_child(&mut |child| walk(child, root, imports));
+    }
+    let mut imports = Vec::new();
+    for node in nodes {
+        walk(node, root, &mut imports);
+    }
+    imports
+}
+
 /// Lists the module files directly under `root`: a flat `name.vl` or a directory
 /// `name/lib.vl` (the two forms an importer can't tell apart). Returns each
 /// `(module name, file path)` in a stable (sorted) order, so diagnostics built from
@@ -46072,7 +46181,7 @@ fn analyze_inner<'src>(
             if *origin != Origin::Pkg {
                 continue;
             }
-            for (module, span) in collect_module_refs(&ast.0, "pkg") {
+            for (module, span, names) in collect_module_import_paths(&ast.0, "pkg") {
                 if module != entry_module {
                     continue;
                 }
@@ -46089,6 +46198,14 @@ fn analyze_inner<'src>(
                     ),
                 });
                 analyzer.attribute_new_diagnostics(diagnostics_before, *source_id);
+                // B236: and what that one report accounts for. The import binds
+                // nothing — the entry's scope is empty when a sibling reads it,
+                // which is the whole reason it is refused — so the import's own
+                // walk and every use of the names it did not bind would each say
+                // the same thing again.
+                analyzer
+                    .entry_cycle_refused_imports
+                    .extend(names.into_iter().map(|name| (*source_id, name.to_string())));
             }
         }
     }
