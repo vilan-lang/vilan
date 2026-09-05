@@ -1303,10 +1303,8 @@ fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
         impl Doubled with Source<i32> {
             fun get(self): i32 { self.inner.get() * 2 }
             [must_use]
-            fun sub(self, observer: |i32| void): Subscription {
-                let subscription = observe(self.inner, |value| { observer(value * 2); });
-                observer(self.get());
-                subscription
+            fun on_change(self, observer: |i32| void): Subscription {
+                observe(self.inner, |value| { observer(value * 2); })
             }
         }
 
@@ -1593,7 +1591,7 @@ fn an_exposed_source_whose_element_is_not_a_written_argument_is_refused() {
         }
         impl Feed with Source<Note> {
             fun get(self): Note { self.inner.get() }
-            fun sub(self, observer: |Note| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |Note| void): Subscription { self.inner.on_change(observer) }
         }
         [service(FeedClient)]
         struct Store {
@@ -1626,7 +1624,7 @@ fn a_user_source_written_with_its_element_still_exposes() {
         }
         impl Feed<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
         }
         [service(FeedClient)]
         struct Store {

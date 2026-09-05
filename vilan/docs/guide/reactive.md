@@ -43,7 +43,7 @@ signal.update(mutate: sync |&mut T| void) // mutate in place + notify once
 ```
 
 Two names, one idea. **`Signal<T>` is a trait** — the writable half of the
-reactive contract, `set` and `notify` over `Source`'s `get` and `sub` — and
+reactive contract, `set` and `notify` over `Source`'s `get` and `on_change` — and
 **`SignalCell<T>` is the canonical type that implements it**, the cell
 `Signal::new` hands back. Day to day you write `Signal::new(0)` and never
 think about it. The split matters in two places: when a *component* wants to

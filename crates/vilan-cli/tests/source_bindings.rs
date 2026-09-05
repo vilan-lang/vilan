@@ -37,8 +37,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
-		self.inner.sub(observer)
+	fun on_change(self, observer: |T| void): Subscription {
+		self.inner.on_change(observer)
 	}
 }
 

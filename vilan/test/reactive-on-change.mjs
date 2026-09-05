@@ -194,21 +194,15 @@ function $C(body) {
 	return [ result, scope2 ];
 }
 function $F(self, observer) {
-	return $c(self[0], observer);
+	return $f(self[0], observer);
+}
+function $G(self) {
+	return $e(self[0]);
 }
 function $E(self, observer) {
-	const seeded = __shared_new(false);
-	return $F(self, (value) => {
-		if (seeded.v) {
-			observer(value);
-		} else {
-			seeded.v = true;
-		}
-		return;
-	});
-}
-function $J(self) {
-	return $e(self[0]);
+	const subscription = $F(self, observer);
+	observer($G(self));
+	return subscription;
 }
 function $M(self, $j) {
 	const $N = $j;
@@ -236,12 +230,12 @@ function $L(self, value, $h) {
 	self[0].v = value;
 	$M(self, $h);
 }
-function $G(self, transform, $H, $I) {
-	const derived = $b(transform($J(self)));
-	register_with_owner($E(self, (value) => {
-		$L(derived, transform(value), $H);
+function $H(self, transform, $I, $J) {
+	const derived = $b(transform($G(self)));
+	register_with_owner($F(self, (value) => {
+		$L(derived, transform(value), $I);
 		return;
-	}), $H, $I);
+	}), $I, $J);
 	return derived;
 }
 function $W(self, observer) {
@@ -275,13 +269,17 @@ $g(count, 4, [ 1 ]);
 dispose2(scope);
 $g(count, 5, [ 1 ]);
 const stored = [ $a(10) ];
-const watched = $E(stored, (value) => {
-	return console.log("stored " + value);
+const eagerly = $E(stored, (value) => {
+	return console.log("eager " + value);
 });
 $g(stored[0], 11, [ 1 ]);
+dispose(eagerly, [ 1 ]);
+const watched = $F(stored, (value) => {
+	return console.log("stored " + value);
+});
 $g(stored[0], 12, [ 1 ]);
 dispose(watched, [ 1 ]);
-const labelled = $G(stored, (value) => {
+const labelled = $H(stored, (value) => {
 	return "n=" + value;
 }, [ 1 ], [ 1 ]);
 console.log($e(labelled));

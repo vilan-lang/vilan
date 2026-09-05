@@ -2624,7 +2624,7 @@ fn expose_accepts_a_users_own_source_impl() {
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
         }
         struct Session {
             [expose] status: Stored<str>,
@@ -2646,7 +2646,7 @@ fn expose_rejects_a_users_source_over_a_non_wire_element() {
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
         }
         struct Session {
             [expose] secret: Stored<Password>,
