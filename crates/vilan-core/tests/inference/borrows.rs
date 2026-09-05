@@ -9002,4 +9002,3 @@ fn b231_the_parenthesized_control_is_unchanged() {
         "yes\n",
     );
 }
-

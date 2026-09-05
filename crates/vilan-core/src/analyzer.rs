@@ -43716,22 +43716,25 @@ fn collect_module_import_paths<'a>(
         if let Node::Import(branch) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
-            for (path, leaf, leaf_span) in entries {
+            for (path, leaf, leaf_span, alias) in entries {
                 if path.first().map(|(name, _)| *name) != Some(root) {
                     continue;
                 }
+                // An aliased import (`… as name`, E142) binds the alias, not
+                // the leaf; the covered set carries the name actually bound.
+                let bound = alias.map(|(name, _)| name);
                 // A bare `import pkg::views` names the module in its leaf and
                 // walks nothing below it; the name it binds is the module's.
                 let Some((module, module_span)) = path.get(1).copied() else {
-                    imports.push((leaf, leaf_span, vec![leaf]));
+                    imports.push((leaf, leaf_span, vec![bound.unwrap_or(leaf)]));
                     continue;
                 };
                 let mut names: Vec<&str> = path[2..].iter().map(|(segment, _)| *segment).collect();
                 // `views::{ self }` binds the namespace under its own name.
-                names.push(match leaf {
+                names.push(bound.unwrap_or(match leaf {
                     "self" => path.last().map(|(name, _)| *name).unwrap_or(leaf),
                     _ => leaf,
-                });
+                }));
                 imports.push((module, module_span, names));
             }
         }
