@@ -202,6 +202,19 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
                 .find(|(colored, _)| *colored == platform)
                 .map(|(_, reason)| reason.clone())
         });
+        // B239: the editor analyzes the OPEN file as the entry, because a
+        // buffer is all it has — and that file is usually one of the package's
+        // modules, not one of its programs. Say which, from the same rule
+        // `vilan check <file>` reads (`platform_color::is_package_module`), so
+        // the two surfaces cannot disagree about whether a sibling may import
+        // it. `workspace_for` clones this workspace for the further legs, so
+        // every leg of a shared module carries the same answer.
+        workspace.entry_mode =
+            if vilan_core::platform_color::is_package_module(&pkg_root, &manifest, entry_path) {
+                vilan_core::EntryMode::OpenFile
+            } else {
+                vilan_core::EntryMode::Declared
+            };
         return ProjectContext {
             platform,
             shared_platforms,
@@ -7266,6 +7279,58 @@ pub(crate) mod tests {
             1,
             "deduplicated across legs: {:?}",
             messages(&shared.published_diagnostics())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b239_an_open_module_file_a_sibling_imports_publishes_nothing() {
+        // B239, in the editor. The language server analyzes the OPEN file as
+        // the entry, because a buffer is all it has — and `views.vl` is one of
+        // the package's modules, which `channel.vl` imports back. B226 refused
+        // that import (correctly, for a declared entry: the entry is the
+        // program, not a module) and everything `channel` took from `views`
+        // missed after it, so the owner's editor showed seven errors over a
+        // package `vilan check .` compiled clean. The editor must publish what
+        // the build says, which here is nothing.
+        //
+        // The open file carries a `[derive]` and an inherent `impl` the sibling
+        // reaches through the cycle: the derive proves the file is still walked
+        // as the program, the method that the cycle really resolves.
+        let (dir, views) = analyze_workspace(&[
+            (
+                "src/views.vl",
+                "import pkg::channel::render;\n\n\
+                 [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 struct Style { padding: i32 }\n\n\
+                 impl Style {\n\tfun flex_row(self): Style {\n\t\t\
+                 Style { padding = self.padding + 1 }\n\t}\n}\n\n\
+                 fun button_style(): Style { Style { padding = 1 } }\n\n\
+                 fun icon(name: str): str { name }\n\n\
+                 fun shown(): bool { Tab::Messages == Tab::Other }\n\n\
+                 fun total(): i32 { render() }\n",
+            ),
+            ("vilan.toml", &fullstack_package("server")),
+            (
+                "src/channel.vl",
+                "import pkg::views::{ Style, button_style, icon };\n\n\
+                 fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
+                 let label = icon(\"x\");\n\tbase.padding\n}\n",
+            ),
+            (
+                "src/client.vl",
+                "import pkg::views::{ shown, total };\n\n\
+                 fun main() {\n\tlet reported = shown();\n\tlet count = total();\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ]);
+        assert!(
+            views.published_diagnostics().is_empty(),
+            "an open module file is still the module its siblings import: {:?}",
+            messages(&views.published_diagnostics())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

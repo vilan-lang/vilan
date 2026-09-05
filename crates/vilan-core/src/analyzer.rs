@@ -43697,6 +43697,53 @@ pub struct Workspace {
     /// out of the base cache key for the same reason: it changes what one
     /// diagnostic says, never what loads or resolves.
     pub prelude_repair: PreludeRepair,
+    /// WHETHER the file being analyzed is one the package DECLARES as a program
+    /// (B239). Only the front end knows: it read the manifest, and the same walk
+    /// that answers E119's `platform_reason` — "no entry reaches it
+    /// (default-entry is `server`)" — runs exactly when the addressed file is
+    /// not an entry.
+    ///
+    /// It rides here, on the resolved project context, for the same reason
+    /// `platform_reason` does, and it is out of the base cache key for a reason
+    /// worth stating: for a DECLARED entry it changes nothing at all — the load
+    /// is byte-for-byte the one it always was, so every world stored before this
+    /// field existed is still the world its key describes. For an OPEN FILE it
+    /// changes the treatment of the ENTRY's own file and nothing else, and the
+    /// analysis it changes anything for stores no world at all (see
+    /// `entry_is_open_module` in `analyze_inner`): a world whose `pkg::<entry>`
+    /// name aliases the entry's own scope is not a world any other entry may be
+    /// served, so it is never offered.
+    pub entry_mode: EntryMode,
+}
+
+/// Whether the analysis is looking at a program its package declares, or at a
+/// MODULE opened as if it were one (B239).
+///
+/// `vilan check src/views.vl` and the language server both analyze the file in
+/// front of them AS the entry, because that file is all they were given. That
+/// file is usually not a program: it is one of the package's modules, and its
+/// siblings import it. The two situations disagree about exactly one thing —
+/// what `pkg::<that file>` means — so the fact is carried as its own flag rather
+/// than inferred from the shape of the world.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EntryMode {
+    /// The analyzed file is a program: an entry the manifest declares (the
+    /// single `[package] entry`, an `[entry.<name>]` path), or a bare file with
+    /// no package above it. It is the program and not a module of its package,
+    /// so a sibling cannot import it — B226's refusal.
+    ///
+    /// The default, and the answer for every caller with no project to ask: a
+    /// test harness, a macro world, a compile of the file it was handed.
+    #[default]
+    Declared,
+    /// FILE MODE: the analyzed file is a MODULE of its package that a front end
+    /// handed to the analysis as the entry, because a file is all it had. It is
+    /// walked as the program (it needs no `main`, its derives expand, its own
+    /// diagnostics are the point of the analysis) AND it stays the module its
+    /// siblings import — `pkg::<file>` names the scope it walks into, and a
+    /// cycle through it is an ordinary module cycle, not a re-entry into a
+    /// program.
+    OpenFile,
 }
 
 /// Where a program's ambient scope is SET, in the reader's terms — the web-set
@@ -44573,6 +44620,13 @@ struct World<'src> {
     sources: Vec<PathBuf>,
     source_hashes: Vec<u64>,
     entry_is_module: bool,
+    /// B239: this world's entry is a MODULE its siblings import (file mode,
+    /// and something in the load referenced `pkg::<entry>`), so the pre-entry
+    /// `resolve_world` was DEFERRED — nothing here has resolved yet, and the
+    /// post-entry `build()` is the one pass that resolves it all. Such a world
+    /// is never stored, so a world served from the cache always answers
+    /// `false`.
+    entry_is_open_module: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
     /// The ENTRY package's own modules this world loaded, by name — `pkg::`
@@ -45569,9 +45623,16 @@ fn analyze_inner<'src>(
                 // write: the entry's own declarations are already in scope. Say
                 // so, at the import. A cycle that merely comes back through the
                 // entry has no such import to point at and passes silently.
-                if let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
-                    .into_iter()
-                    .find(|(module, _)| *module == name)
+                //
+                // Only for a DECLARED entry (B239). In file mode this file is a
+                // MODULE the front end handed us as the entry, and a module that
+                // imports its own name is the silent no-op it has always been —
+                // `a_non_entry_self_import_stays_clean` is that control, and the
+                // editor must not invent a warning the build never prints.
+                if workspace.entry_mode == EntryMode::Declared
+                    && let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
+                        .into_iter()
+                        .find(|(module, _)| *module == name)
                 {
                     analyzer.warnings.push(Error {
                         trace: Vec::new(),
@@ -45996,7 +46057,17 @@ fn analyze_inner<'src>(
     // program. Say that at the import rather than letting the name lookup fail
     // with "cannot find `X` in the imported path" over a name the user can see
     // declared (B226).
-    if let Some(entry_module) = entry_alias_module {
+    //
+    // B239: for a DECLARED entry only. In file mode the entry is a module of
+    // its package that a front end opened as the entry, its siblings import it
+    // as they always did, and `entry_is_open_module` below buys them the order
+    // that makes those imports resolve. Refusing there was the regression: the
+    // owner's `views.vl` grew seven errors in the editor while `vilan check .`
+    // — which compiles the real entries, where `views` IS a module — stayed
+    // clean.
+    if let Some(entry_module) =
+        entry_alias_module.filter(|_| workspace.entry_mode == EntryMode::Declared)
+    {
         for (_name, ast, _text, _scope_id, source_id, origin) in &loaded {
             if *origin != Origin::Pkg {
                 continue;
@@ -46447,8 +46518,24 @@ fn analyze_inner<'src>(
     // vote (S3b's acceptance); this resolved pre-entry world is exactly what
     // the base cache will snapshot. A std file open as the entry keeps the
     // monolithic order — its world IS the entry.
+    //
+    // B239: the file-mode entry a sibling imports takes the SAME monolithic
+    // order, for the same reason. `pkg::<entry>` aliases the entry's own
+    // (global) scope, and that scope is empty until the entry walks — so a
+    // sibling's `import pkg::views::icon` resolved pre-entry could only fail.
+    // Deferring the whole pre-entry resolution is what makes the cycle an
+    // ordinary module cycle again: imports, preludes, `use`s and bare names all
+    // resolve once, in the post-entry `build()`, with the entry's declarations
+    // in the scope the alias points at. The world this analysis builds is
+    // therefore an ENTRY-SHAPED world and is not stored (below): a world whose
+    // `pkg::views` means "the entry" is not one an analysis of `client.vl` may
+    // ever be handed. It can still HIT a stored world — but only one that never
+    // loaded this file, and `base_cache_lookup`'s `entry_is_a_loaded_module`
+    // already refuses every world that did.
+    let entry_is_open_module =
+        entry_alias_module.is_some() && workspace.entry_mode == EntryMode::OpenFile;
     let phase_base_start = crate::PhaseClock::now();
-    if !entry_is_module {
+    if !entry_is_module && !entry_is_open_module {
         analyzer.resolve_world();
     }
     let phase_base = phase_base_start.elapsed();
@@ -46458,6 +46545,7 @@ fn analyze_inner<'src>(
         sources,
         source_hashes,
         entry_is_module,
+        entry_is_open_module,
         global_scope_id,
         module_scopes,
         pkg_module_names,
@@ -46474,7 +46562,7 @@ fn analyze_inner<'src>(
             base: phase_base,
         },
     };
-    if base_cacheable && !entry_is_module {
+    if base_cacheable && !entry_is_module && !entry_is_open_module {
         base_cache_store(base_cache_key.clone(), &world);
     }
     // After the store, so the world the cache holds is the pre-entry one it
@@ -46507,7 +46595,10 @@ fn analyze_inner<'src>(
         pkg_root,
         platform,
         workspace,
-        (base_cacheable && !entry_is_module).then_some(base_cache_key),
+        // No key when the world was not stored (B239): M19's per-module check
+        // records are filed under the world's key, and an entry-shaped world's
+        // checks are not another entry's to replay.
+        (base_cacheable && !entry_is_module && !entry_is_open_module).then_some(base_cache_key),
         false,
     )
 }
@@ -46538,6 +46629,7 @@ fn analyze_over_world<'src>(
         sources,
         source_hashes,
         entry_is_module,
+        entry_is_open_module,
         global_scope_id,
         module_scopes,
         pkg_module_names: _,
@@ -46580,7 +46672,19 @@ fn analyze_over_world<'src>(
             analyzer
                 .prelude_seeds
                 .push((global_scope_id, path.to_string(), SourceId(0)));
-            analyzer.seed_preludes();
+            // B239: only when the pre-entry `resolve_world` actually ran.
+            // `seed_preludes` drains the queue, the modules' seeds included, and
+            // in the open-file order those modules have not resolved their
+            // imports yet — a prelude module's own re-exports would still point
+            // at nothing, which is precisely the order `resolve_world` says the
+            // prelude must never bind in. The seed waits for `build()`'s
+            // `resolve_world`, which binds every scope's in the right order at
+            // once; the entry's set reaching the modules through their parent
+            // scope costs nothing, because in file mode the entry and its
+            // siblings are the same package and take the same prelude.
+            if !entry_is_open_module {
+                analyzer.seed_preludes();
+            }
         }
         let entry_walk_start = analyzer.entity_id;
         analyzer.walk_expr_nodes(&nodes.0, global_scope_id);

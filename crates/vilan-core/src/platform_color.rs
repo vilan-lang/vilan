@@ -33,7 +33,7 @@
 //! every function gets a shortest witness chain to the layer it requires.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::analyzer::{GenericDispatch, Program, SourceId};
 use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
@@ -953,6 +953,43 @@ impl PlatformReason {
             PlatformReason::Flag => "`--platform` was passed".into(),
         }
     }
+}
+
+/// Whether `file` is a MODULE of the package rather than one of its declared
+/// programs: under the source root, and not the single `[package] entry`
+/// (default `main.vl`) nor any `[entry.<name>]` path.
+///
+/// The question every path-addressed analysis has to answer about the file it
+/// was handed, and — like [`file_platform_choices`] — it must get ONE answer
+/// from both surfaces, because both hand it to the same analysis. `vilan check
+/// <file>` reads it to skip the `main` demand and the emission walk (E113); the
+/// editor and the CLI both read it to say whether the analyzed entry is
+/// [`crate::EntryMode::Declared`] or an open module (B239).
+///
+/// A file OUTSIDE the source root is not the package's module — it is a program
+/// that happens to sit in the directory — and neither is a file under a
+/// manifest with no `[package]` at all. Both answer `false`, which is what keeps
+/// a bare file the program it has always been.
+///
+/// Compared canonically on both sides, never textually: `./src/main.vl` and
+/// `src/main.vl` name one file and must get one answer, and — the symlink
+/// doctrine, `spec/const.md` §9.2 — so must a file reached through a link.
+pub fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> bool {
+    let Some(package) = manifest.package.as_ref() else {
+        return false;
+    };
+    let file = crate::util::canonical_path(file);
+    if !file.starts_with(crate::util::canonical_path(pkg_root)) {
+        return false;
+    }
+    let same = |candidate: PathBuf| crate::util::canonical_path(candidate) == file;
+    if manifest.entries.is_empty() {
+        return !same(pkg_root.join(package.entry()));
+    }
+    !manifest
+        .entries
+        .iter()
+        .any(|(name, declared)| same(pkg_root.join(declared.path(name))))
 }
 
 /// One color a file is analyzed under, with the reason it was chosen.

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::manifest::PreludeSpec;
 use vilan_core::{
-    Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair, Workspace,
-    analyze_source,
+    EntryMode, Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair,
+    Workspace, analyze_source,
 };
 
 fn std_spec() -> PackageSpec {
@@ -3759,5 +3759,213 @@ fn a_non_entry_self_import_stays_clean() {
     assert!(
         warnings.is_empty(),
         "a non-entry self-import says nothing: {warnings:#?}"
+    );
+}
+
+// ── B239: an OPEN MODULE FILE analyzed as the entry ─────────────────────────
+//
+// The editor, and `vilan check src/views.vl`, analyze the file in front of them
+// AS the entry, because a file is all they were given. That file is usually one
+// of the package's MODULES, and its siblings import it — the owner's kolt shape:
+// `views.vl` imports `channel.vl`, `channel.vl` imports `pkg::views::{
+// button_style, icon }`, a legitimate module cycle under the real entries.
+//
+// B226 refused that cycle, because for a DECLARED entry it is one: the entry is
+// the program, not a module, and a sibling resolves its imports before the entry
+// walks. In file mode neither half holds, and the refusal cost the owner seven
+// errors in the editor over code `vilan check .` compiled clean. The front end
+// now says which situation it is ([`EntryMode`]), and file mode takes the
+// monolithic order — everything resolves once, after the entry walk, so
+// `pkg::<open file>` names the scope the entry walked into.
+
+/// As [`analyze_package_raw`], but the analysis is told what KIND of entry it
+/// was handed (B239) and keeps the program's warnings beside its diagnostics.
+fn analyze_package_as(
+    files: &[(&str, &str)],
+    entry: &str,
+    entry_mode: EntryMode,
+) -> (Vec<String>, Vec<String>) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_openfile_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let workspace = Workspace {
+        entry_mode,
+        ..Workspace::default()
+    };
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &workspace,
+    );
+    let warnings = program
+        .map(|program| {
+            program
+                .warnings
+                .into_iter()
+                .map(|warning| warning.msg)
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        errors.into_iter().map(|error| error.msg).collect(),
+        warnings,
+    )
+}
+
+/// The kolt shape, as three files: the open module `views.vl` and the sibling
+/// `channel.vl` that imports it back, plus the declared entry `client.vl` that
+/// reaches them both. `views.vl` carries a `[derive]` (so the entry's own
+/// expansion is on the line) and an inherent `impl` the sibling reaches through
+/// the cycle (so method resolution across it is too).
+const B239_FILES: &[(&str, &str)] = &[
+    (
+        "views.vl",
+        "import pkg::channel::render;\n\n\
+         [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+         struct Style { padding: i32 }\n\n\
+         impl Style {\n\tfun flex_row(self): Style {\n\t\t\
+         Style { padding = self.padding + 1 }\n\t}\n}\n\n\
+         fun button_style(): Style { Style { padding = 1 } }\n\n\
+         fun icon(name: str): str { name }\n\n\
+         fun shown(): bool { Tab::Messages == Tab::Other }\n\n\
+         fun total(): i32 { render() }\n",
+    ),
+    (
+        "channel.vl",
+        "import pkg::views::{ Style, button_style, icon };\n\n\
+         fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
+         let label = icon(\"x\");\n\tbase.padding\n}\n",
+    ),
+    (
+        "client.vl",
+        "import pkg::views::{ shown, total };\n\n\
+         fun main() {\n\tlet reported = shown();\n\tlet count = total();\n}\n",
+    ),
+];
+
+#[test]
+fn b239_an_open_module_file_stays_importable_by_its_siblings() {
+    // The regression, in one analysis: `views.vl` opened as the entry while its
+    // sibling `channel.vl` imports `pkg::views`. Before, that import hit B226's
+    // "is this program's entry file … it cannot be imported", `channel` lost
+    // every name it took from `views`, and the misses cascaded — seven of them
+    // in the owner's app, over a package `vilan check .` compiled clean.
+    //
+    // It must be an ordinary module cycle: the imports resolve, the inherent
+    // method declared in the open file is reachable through the cycle, and the
+    // open file's own `[derive]` still expands (it is walked as the program,
+    // which is what B226 bought and what this must not give back).
+    let (errors, warnings) = analyze_package_as(B239_FILES, "views.vl", EntryMode::OpenFile);
+    assert!(
+        errors.is_empty(),
+        "an open module file is still the module its siblings import: {errors:#?}"
+    );
+    assert!(
+        warnings.is_empty(),
+        "and nothing about the situation is worth a telling: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b239_the_same_package_from_its_declared_entry_is_clean_too() {
+    // The control that the shape itself is legal: analyzed from `client.vl`,
+    // the entry a manifest would declare, `views` and `channel` are two modules
+    // in a cycle and nothing is special about either. If this ever reddens, the
+    // pin above is measuring the wrong thing.
+    let (errors, warnings) = analyze_package_as(B239_FILES, "client.vl", EntryMode::Declared);
+    assert!(
+        errors.is_empty(),
+        "the declared entry compiles the same package: {errors:#?}"
+    );
+    assert!(warnings.is_empty(), "silently: {warnings:#?}");
+}
+
+#[test]
+fn b239_a_cycle_back_into_a_declared_entry_is_still_refused() {
+    // B226 stands where it was written. A DECLARED entry is the program, not a
+    // module: a sibling resolves its imports before the entry walks, so there is
+    // nothing there to import, and the refusal must still say so at the import.
+    let (errors, _warnings) = analyze_package_as(
+        &[
+            (
+                "client.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::client::helper;\n\nfun render(): i32 { helper() }\n",
+            ),
+        ],
+        "client.vl",
+        EntryMode::Declared,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::client` is this program's entry file")),
+        "the declared-entry cycle keeps B226's refusal: {errors:#?}"
+    );
+}
+
+#[test]
+fn b239_an_open_module_files_self_import_says_nothing() {
+    // The self-import telling is the entry's, and only the entry's. B226 warns
+    // that `import pkg::main::..` inside the ENTRY brings the file into itself;
+    // a MODULE that imports its own name has always been a silent no-op
+    // (`a_non_entry_self_import_stays_clean`), and an open module file is one —
+    // the editor must not invent a warning `vilan check .` never prints.
+    let (errors, warnings) = analyze_package_as(
+        &[(
+            "views.vl",
+            "import pkg::views::Tab;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+             fun shown(): bool { Tab::Messages == Tab::Other }\n",
+        )],
+        "views.vl",
+        EntryMode::OpenFile,
+    );
+    assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+    assert!(
+        warnings.is_empty(),
+        "a module that imports its own name says nothing: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b239_an_open_module_file_needs_no_main() {
+    // A module has no `main` and nothing may ask it for one (E113's rule, which
+    // file mode already keeps). Stated here because the fix walks the open file
+    // as the PROGRAM, and a program walk is exactly what used to demand one.
+    let (errors, _warnings) = analyze_package_as(
+        &[
+            (
+                "views.vl",
+                "import pkg::channel::render;\n\nfun label(): i32 { render() }\n",
+            ),
+            (
+                "channel.vl",
+                "import pkg::views::label;\n\nfun render(): i32 { 7 }\n\n\
+                 fun twice(): i32 { label() + label() }\n",
+            ),
+        ],
+        "views.vl",
+        EntryMode::OpenFile,
+    );
+    assert!(
+        errors.is_empty(),
+        "no `main`, and none demanded: {errors:#?}"
     );
 }
