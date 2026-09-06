@@ -3238,6 +3238,17 @@ fun main() {
             );
             return;
         };
+        if cfg!(windows) {
+            // Windows thread times have a ~16 ms granularity: a claim about a
+            // 0.014 ms table is noise there. The shape claims above hold on
+            // every host; the cost claim is a Linux measurement, declined here
+            // as the budget gates decline under the wrong profile.
+            eprintln!(
+                "the cost claim is not asserted on Windows (thread-clock granularity); \
+                 cpu was {small_cpu:.3} ms and {large_cpu:.3} ms"
+            );
+            return;
+        }
         // (3) Flat across the two exhibits...
         assert!(
             large_cpu < small_cpu * 3.0,
