@@ -3134,6 +3134,72 @@ fn const_eval_agrees_with_the_runtime_on_an_in_bounds_list_splice() {
     );
 }
 
+// --- M43: the const-eval interpreter's environment maps hash with `fx`, ---
+// --- not SipHash. `Scope::vars` is never iterated (pinned in            ---
+// --- `interpreter.rs`), so the swap moves nothing — these two say so    ---
+// --- from the outside: the same answers, and the same ORDER for the one ---
+// --- thing a const evaluation genuinely walks.                          ---
+
+#[test]
+fn const_eval_resolves_shadowed_bindings_across_nested_scopes() {
+    // Every read and write here is a `Scope::vars` hash on a short `&str`,
+    // which is what M43 rehashed. Names that shadow across three depths, in an
+    // order no lexical sort would agree with, so a table that lost or crossed
+    // an entry answers differently rather than merely more slowly.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun layered(): i32 {
+            mut total = 0;
+            mut alpha = 1;
+            let beta = 2;
+            mut index = 0;
+            for index < 4 {
+                let alpha = index * 10;
+                mut beta = alpha + 1;
+                if beta > 10 {
+                    let gamma = beta * 2;
+                    beta = gamma - alpha;
+                }
+                total = total + alpha + beta;
+                index += 1;
+            }
+            total + alpha + beta
+        }
+        let FOLDED: i32 = const layered();
+        fun main() { print(FOLDED); print(layered()); }
+        "#,
+        "130\n130\n",
+    );
+}
+
+#[test]
+fn const_eval_keeps_a_maps_insertion_order() {
+    // The interpreter's Map/Set/object values stay `indexmap::IndexMap` on
+    // std's hasher — they are HOST containers whose walk order is visible to
+    // the program. Keys chosen so neither ascending nor descending order is
+    // the insertion order, which is what makes this a pin rather than a
+    // coincidence.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        import std::map::Map;
+        fun ordered(): str {
+            mut table: Map<str, i32> = Map::new();
+            table.insert("zeta", 1);
+            table.insert("alpha", 2);
+            table.insert("mu", 3);
+            table.insert("beta", 4);
+            table.keys().join(",")
+        }
+        let FOLDED: str = const ordered();
+        fun main() { print(FOLDED); print(ordered()); }
+        "#,
+        "zeta,alpha,mu,beta\nzeta,alpha,mu,beta\n",
+    );
+}
+
 #[test]
 fn an_empty_list_subscript_panics() {
     // view-invalidation.md §1's P1 case: the empty list, subscripted.

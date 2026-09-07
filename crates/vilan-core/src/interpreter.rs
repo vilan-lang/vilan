@@ -23,11 +23,11 @@
 //! - String ops use UTF-16 code-unit semantics like JS; lone surrogates from
 //!   slicing are replaced (`from_utf16_lossy`) rather than preserved.
 
+use crate::fx::FxHashMap as HashMap;
 use crate::node::BinaryOp;
 use crate::transformer::{ConstSite, JsProgram, js};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::{Rc, Weak};
 
@@ -793,7 +793,7 @@ impl<'a> Interpreter<'a> {
     /// reopen the leak.
     fn root_scope(&mut self) -> Env<'a> {
         self.register(Scope {
-            vars: HashMap::new(),
+            vars: HashMap::default(),
             parent: None,
         })
     }
@@ -801,7 +801,7 @@ impl<'a> Interpreter<'a> {
     /// A child scope over `parent`: a block, a loop iteration, a call frame.
     fn child_scope(&mut self, parent: &Env<'a>) -> Env<'a> {
         self.register(Scope {
-            vars: HashMap::new(),
+            vars: HashMap::default(),
             parent: Some(parent.clone()),
         })
     }
@@ -3383,4 +3383,53 @@ fn json_parse_string(text: &str, bytes: &[u8], position: &mut usize) -> Result<S
         }
     }
     Err("Unterminated JSON string".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    /// M43's order pin, and the reason `Scope::vars` can be a plain
+    /// [`crate::fx::FxHashMap`] rather than an `IndexMap`.
+    ///
+    /// The environment map moved off SipHash because 83M of the 85M Ir left in
+    /// `sip.rs` after M31 was `lookup`/`assign` hashing short `&str` names —
+    /// but a hasher swap is only invisible while nothing WALKS the table, and
+    /// `fx.rs` seeds every table from one constant, so an iteration that
+    /// appeared later would be stably ordered by the hash and nobody would
+    /// notice until the constant changed. There is no runtime assertion that
+    /// can catch that; the shape is the claim, so the shape is what is pinned.
+    ///
+    /// What a const evaluation genuinely iterates — a JS `Map`, `Set` or object
+    /// literal it builds — is an `indexmap::IndexMap` and is untouched by M43.
+    #[test]
+    fn the_scope_map_is_never_iterated() {
+        let source = include_str!("interpreter.rs");
+        // Every use of the field, minus this test's own text.
+        let body = source
+            .split_once("mod tests {")
+            .expect("this test's own module opens the tail")
+            .0;
+        for (number, line) in body.lines().enumerate() {
+            let Some(rest) = line.split_once(".vars").map(|(_, rest)| rest) else {
+                continue;
+            };
+            let walker = ["iter", "keys", "values", "drain", "into_iter", "retain"]
+                .into_iter()
+                .find(|walk| rest.trim_start_matches('.').starts_with(walk));
+            assert!(
+                walker.is_none(),
+                "line {} walks `Scope::vars` ({}): the environment map is hashed by \
+                 `fx`'s CONSTANT-seeded hasher, so an iteration order taken from it is a \
+                 stable function of the hash rather than of the program. Give the table \
+                 an `IndexMap` (as the interpreter's Map/Set/object values have) before \
+                 walking it — see `fx.rs`'s header.",
+                number + 1,
+                line.trim()
+            );
+        }
+        // Non-vacuity: the field IS used, so the scan has something to read.
+        assert!(
+            body.matches(".vars").count() >= 5,
+            "the scan found almost no uses of `Scope::vars` — has the field been renamed?"
+        );
+    }
 }
