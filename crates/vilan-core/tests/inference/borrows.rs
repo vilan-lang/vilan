@@ -9255,6 +9255,14 @@ fn b257_a_bare_parameter_stored_by_an_assignment_copies() {
     assert_compiles_and_runs(source, "2\n");
 }
 
+#[test]
+#[ignore = "B256 held on cost: implemented and measured this cycle — +20% node \
+            process CPU on a 500-row `bind_each` under 200 in-place updates, \
+            +25% on a 200-subscriber batch drain, +12% on A44's 1000-row \
+            selector, +344% on `SignalCell::get()` of a 1000-element list \
+            (medians of nine alternating runs at loadavg 101-104); and \
+            `bind_each` copies `row_views`/`row_owners` per notify, which the \
+            landing bar forbade. Awaiting the owner's ruling."]
 fn b256_a_binding_fed_by_a_shared_read_copies() {
     // `Shared.read(self): T` is declared a value return, and §6.1 says a
     // signature that hands back a value hands back a value. The intrinsic

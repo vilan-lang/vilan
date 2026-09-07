@@ -2327,7 +2327,7 @@ fn a_one_byte_checked_cache_budget_still_keeps_the_record_just_written() {
 ///     -E 'test(checked_cache_bytes)' --no-capture
 /// ```
 #[test]
-#[ignore = "a measurement, not a gate: run deliberately (proposal/perf-baseline.md §3)"]
+#[ignore = "M46: a measurement of the checked cache's bytes per world, not a gate: run deliberately (proposal/perf-baseline.md §3)"]
 fn checked_cache_bytes_per_world() {
     let _guard = CACHE_LOCK
         .lock()
