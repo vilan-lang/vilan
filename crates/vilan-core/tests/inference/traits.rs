@@ -2574,3 +2574,215 @@ fn b184_the_sugar_emits_exactly_what_the_written_generic_emits() {
         "one consumer body per hidden argument:\n{sugared}"
     );
 }
+
+// --- B245: a defaulted trait parameter has an IDENTITY -----------------------
+//
+// `trait Add<B = Self>` interns `B` as its DEFAULT's type — `Type::Trait(Add,
+// [])`, the very type `Self` spells in the same trait — and every written type
+// mints its own slot, so a mention of `B` (`fun add(self, b: B)`) shared a
+// MEANING with the parameter and not an ID. `substitute_type` rewrites
+// `Type::Generic` and nothing else, so neither the positional substitution nor
+// a lookup on the mention's id could reach the position, and two sites read it
+// as `Self`:
+//
+//   * B180's operand rule. `impl Meters with PartialOrd<Feet>` reaches `lt`
+//     through `PartialOrd`'s default, whose `b: B` the clause declares to be a
+//     `Feet` — the lookup missed and the `Self` fallback took the position for
+//     the subject, so `Meters < Feet` was refused as though `lt` accepted a
+//     `Meters`. B216's workaround recovered the argument from the written
+//     SPELLING (`written_parameter_argument`); the identity retires it.
+//   * impl CONFORMANCE, one level up. A supertrait's arguments were not
+//     recovered at all, so `trait Mixed with Blender<i32, str>` gave `Blender`
+//     an empty context and `impl Cup with Mixed` was told `mix`'s `a: A` had to
+//     be a `Cup`. `trait_with_supertraits_at` already carries a sub-trait's
+//     arguments into a supertrait's written ones (B164); the conformance checks
+//     read it now, and a clause argument that is itself one of the sub-trait's
+//     defaulted parameters (`trait PartialOrd<B = Self> with PartialEq<B>`)
+//     resolves by that same identity.
+//
+// An argument that is STILL an unsupplied `= Self` default means the subject,
+// which is what keeps `trait Ord with Eq + PartialOrd` reading `eq`'s operand
+// as `Self`.
+
+#[test]
+fn b245_the_full_mixer_program_compiles_end_to_end() {
+    // rigid-28's find, whole: B235 fixed the trait-side read of the `= Self`
+    // default and left `impl Cup with Mixed` refusing with `parameter 1 of
+    // `Cup`'s `mix` is `i32`, but `Mixed` declares `Cup`` — twice, once per
+    // defaulted parameter.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Blender<A = Self, B = Self> {
+            fun mix(self, a: A, b: B): str;
+        }
+        trait Mixed with Blender<i32, str> {
+            fun describe(self): str { self.mix(1, "two") }
+        }
+        struct Cup {}
+        impl Cup with Mixed {
+            fun mix(self, a: i32, b: str): str { b }
+        }
+        fun main() { print(Cup {}.describe()); }
+        main();
+        "#,
+        "two\n",
+    );
+}
+
+#[test]
+fn b245_the_conformance_site_still_refuses_a_signature_the_clause_denies() {
+    // The counterweight to the pin above: recovering the supertrait's arguments
+    // must not make conformance accept anything — an impl whose `mix` takes a
+    // `str` where the clause wrote `i32` is still wrong, and now says so
+    // against the ARGUMENT rather than against the subject.
+    assert_fails_with(
+        r#"
+        trait Blender<A = Self, B = Self> {
+            fun mix(self, a: A, b: B): str;
+        }
+        trait Mixed with Blender<i32, str> {
+            fun describe(self): str { self.mix(1, "two") }
+        }
+        struct Cup {}
+        impl Cup with Mixed {
+            fun mix(self, a: str, b: str): str { b }
+        }
+        fun main() {}
+        "#,
+        "parameter 1 of `Cup`'s `mix` is `str`, but `Mixed` declares `i32`",
+    );
+}
+
+#[test]
+fn b245_b180s_impl_path_reads_the_clause_argument_not_self() {
+    // The operand half, through an INHERITED default: `lt` is `PartialOrd`'s
+    // own body and its `b: B` is the `Feet` the clause wrote. Pre-fix this was
+    // refused with "`Meters`'s `lt` accepts `Meters`, but the right operand is
+    // `Feet`" — the `Self` fallback, over a clause that said otherwise.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::Option;
+        struct Meters { n: i32 }
+        struct Feet { n: i32 }
+        impl Meters with PartialEq<Feet> {
+            fun eq(self, b: Feet): bool { self.n == b.n }
+        }
+        impl Meters with PartialOrd<Feet> {
+            fun partial_compare(self, b: Feet): Option<Ordering> {
+                Option::Some(Ordering::Less)
+            }
+        }
+        fun main() { print(Meters { n = 1 } < Feet { n = 5 }); }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b245_an_unsupplied_default_still_means_self_at_the_operand() {
+    // The control that keeps the `Self` fallback honest, and the shape the
+    // corpus has: `impl Num with Ord` supplies no argument anywhere in the
+    // chain, so `PartialOrd`'s `B` — and `PartialEq`'s, which `PartialOrd`'s
+    // own clause passes it — is the subject.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ Eq, Ord, PartialEq, PartialOrd, Ordering };
+        import std::option::Option;
+        struct Num { n: i32 }
+        impl Num with PartialEq { fun eq(self, b: Num): bool { self.n == b.n } }
+        impl Num with Eq {}
+        impl Num with PartialOrd {
+            fun partial_compare(self, b: Num): Option<Ordering> {
+                Option::Some(self.compare(b))
+            }
+        }
+        impl Num with Ord {
+            fun compare(self, b: Num): Ordering {
+                if self.n < b.n { Ordering::Less }
+                else if self.n > b.n { Ordering::Greater }
+                else { Ordering::Equal }
+            }
+        }
+        fun main() { print(Num { n = 1 } < Num { n = 2 }); }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b245_a_wrong_operand_is_still_refused_on_the_clause_argument() {
+    // The refusal B180 exists for, now measured against the argument the clause
+    // wrote: `Meters < Meters` is wrong where the clause says the operand is a
+    // `Feet`, and the report names `Feet`.
+    assert_fails_with(
+        r#"
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::Option;
+        struct Meters { n: i32 }
+        struct Feet { n: i32 }
+        impl Meters with PartialEq<Feet> {
+            fun eq(self, b: Feet): bool { self.n == b.n }
+        }
+        impl Meters with PartialOrd<Feet> {
+            fun partial_compare(self, b: Feet): Option<Ordering> {
+                Option::Some(Ordering::Less)
+            }
+        }
+        fun main() { let _ = Meters { n = 1 } < Meters { n = 2 }; }
+        "#,
+        "`Meters`'s `lt` accepts `Feet`, but the right operand is `Meters`",
+    );
+}
+
+#[test]
+fn b245_the_add_operand_rule_still_reads_a_written_argument() {
+    // B180's own shape, unmoved: an impl that declares its `add` outright never
+    // went through the defaulted position, and still does not.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        struct Meters { n: i32 }
+        struct Feet { n: i32 }
+        impl Meters with Add<Feet> {
+            fun add(self, b: Feet): Meters { Meters { n = self.n + b.n } }
+        }
+        fun main() { print((Meters { n = 1 } + Feet { n = 2 }).n); }
+        main();
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b245_a_defaulted_parameter_the_clause_argument_grounds_reaches_a_supertrait() {
+    // The chain link the identity buys: `PartialOrd<B = Self> with
+    // PartialEq<B>` passes its OWN defaulted parameter to its supertrait, so
+    // `impl Meters with PartialOrd<Feet>` must reach `PartialEq` at `Feet` —
+    // which is what makes the `eq` impl above conform rather than being told it
+    // owes a `Meters`.
+    assert_fails_with(
+        r#"
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::Option;
+        struct Meters { n: i32 }
+        struct Feet { n: i32 }
+        impl Meters with PartialEq<Feet> {
+            fun eq(self, b: Meters): bool { true }
+        }
+        impl Meters with PartialOrd<Feet> {
+            fun partial_compare(self, b: Feet): Option<Ordering> {
+                Option::Some(Ordering::Less)
+            }
+        }
+        fun main() {}
+        "#,
+        "parameter 1 of `Meters`'s `eq` is `Meters`, but `PartialEq` declares `Feet`",
+    );
+}
