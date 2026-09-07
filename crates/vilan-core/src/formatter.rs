@@ -89,8 +89,108 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_import_runs(
-        &collapse_field_shorthands(drop_trailing_commas(tokens)),
+        &drop_redundant_import_aliases(canonicalize_declaration_clauses(
+            collapse_field_shorthands(drop_trailing_commas(tokens)),
+        )),
     )))
+}
+
+/// Drops an import alias that renames a name to ITSELF — `import a::b as b;` is
+/// `import a::b;` — so the safety check accepts the formatter canonicalizing one
+/// into the other (E145's formatter third).
+///
+/// Recognized by shape, inside an import statement only: the three-token run
+/// `IDENT "as" IDENT` with both names equal, between an `import`/`use` head and
+/// its `;`. `as` reaches the lexer as a plain identifier and appears in exactly
+/// one production, so the statement bound is belt and braces rather than
+/// necessity — but it is what makes the pass unable to touch anything else.
+///
+/// An alias that renames to a DIFFERENT name is untouched, at every depth: it
+/// binds a name the module does not otherwise have, and dropping it would be a
+/// program change, not a canonicalization.
+fn drop_redundant_import_aliases(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut in_import = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        match &tokens[index] {
+            Token::Import | Token::Use => in_import = true,
+            Token::Ctrl(';') => in_import = false,
+            _ => {}
+        }
+        if in_import
+            && let (Some(Token::Ident(name)), Some(Token::Ident("as")), Some(Token::Ident(alias))) = (
+                tokens.get(index),
+                tokens.get(index + 1),
+                tokens.get(index + 2),
+            )
+            && name == alias
+        {
+            result.push(tokens[index].clone());
+            index += 3;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Puts a declaration's two trailing clauses into the canonical order —
+/// `borrows p context c`, never `context c borrows p` — so the safety check
+/// accepts the formatter moving the clause across `borrows` (E146 rule 3).
+///
+/// Recognized by SHAPE, since a token stream has no tree to ask: the contextual
+/// keyword `context`, its clause (a bare name, or a parenthesised name list),
+/// and then `borrows` and its parameter name. `borrows` appears in exactly one
+/// production — a `fun` declaration's suffix — so a `context` clause followed
+/// immediately by it can only be that declaration's own pair. The closure-type
+/// clause a PARAMETER carries (`cb: (|| T) context c`) is followed by a `,` or
+/// a `)` and is never touched.
+///
+/// Like [`drop_trailing_commas`] and [`collapse_field_shorthands`], this runs
+/// over BOTH streams, so a form neither side produces reduces identically on
+/// both and the net still catches every other reordering.
+fn canonicalize_declaration_clauses(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Ident("context")
+            && let Some(after_clause) = context_clause_end(&tokens, index)
+            && tokens.get(after_clause) == Some(&Token::Borrows)
+            && matches!(tokens.get(after_clause + 1), Some(Token::Ident(_)))
+        {
+            result.push(Token::Borrows);
+            result.push(tokens[after_clause + 1].clone());
+            result.extend(tokens[index..after_clause].iter().cloned());
+            index = after_clause + 2;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// The index just past the `context` clause beginning at `index` (which the
+/// caller has checked holds the `context` word) — `context name` or
+/// `context (a, b)`. `None` if what follows is not a clause at all.
+fn context_clause_end(tokens: &[Token<'_>], index: usize) -> Option<usize> {
+    match tokens.get(index + 1) {
+        Some(Token::Ident(_)) => Some(index + 2),
+        Some(Token::Ctrl('(')) => {
+            let mut at = index + 2;
+            loop {
+                match tokens.get(at)? {
+                    Token::Ident(_) => at += 1,
+                    Token::Ctrl(',') => at += 1,
+                    Token::Ctrl(')') => return Some(at + 1),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
@@ -206,8 +306,17 @@ enum RootRank {
 /// compare case-sensitively segment by segment, a shorter path sorts before a
 /// longer one extending it (`a` before `a::b`, via `End` < `Path`), and a brace
 /// set's branches are pre-sorted so the whole set compares canonically.
+///
+/// `SelfLeaf` is declared FIRST so a bare `self` member sorts ahead of every
+/// name in its group (E146). ASCII order put it last — `Option::{ self, None,
+/// Some }` reprinted as `Option::{ None, Some, self }` in 37 groups under N55's
+/// reformat, std's `prelude.vl` and `web.vl` among them — and `self` first is
+/// what a reader arrives with: it names the group's own namespace, so it reads
+/// as the head of the list rather than one more member of it. Only a bare
+/// `self` ranks: `self as name` is a rename and keys as one.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum BranchKey {
+    SelfLeaf,
     End,
     Path(String, Box<BranchKey>),
     Set(Vec<BranchKey>),
@@ -244,6 +353,10 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
             ImportTail::Continue(child) => {
                 TokenBranch::Path(name, Some(Box::new(branch_from_ast(child))), None)
             }
+            // An alias that renames a name to itself is no alias at all, and
+            // reduces to the plain path here so the shared key cannot order the
+            // two spellings apart (E145).
+            ImportTail::Alias(alias, _) if alias == name => TokenBranch::Path(name, None, None),
             ImportTail::Alias(alias, _) => TokenBranch::Path(name, None, Some(alias)),
         },
         ImportBranch::Set(branches) => {
@@ -277,6 +390,8 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
+        // A bare `self` is the group's own namespace and sorts first (E146).
+        TokenBranch::Path("self", None, None) => BranchKey::SelfLeaf,
         // An alias keys as the segment it renames plus the alias itself, so
         // `a::b as c` and `a::b as d` are two imports the run orders stably
         // rather than two spellings of one key (E142).
@@ -2514,6 +2629,12 @@ impl<'src> Printer<'src> {
                         self.split = split;
                         self.print_import_branch(child, sort);
                     }
+                    // `import a::b as b;` renames `b` to `b` — it binds
+                    // exactly what the plain import binds, so the plain import
+                    // is the canonical spelling and the alias is dropped
+                    // (E145). `as c` binds a name the module does not otherwise
+                    // have and is a program, not a spelling: untouched.
+                    ImportTail::Alias(alias, _) if alias == name => {}
                     ImportTail::Alias(alias, _) => {
                         self.out.push_str(" as ");
                         self.out.push_str(alias);
@@ -2909,22 +3030,21 @@ impl<'src> Printer<'src> {
             self.out.push_str(": ");
             self.print_type(&return_type.0);
         }
-        // B242's clause: written right after the return type when there is one
-        // (the type grammar's own `context` suffix, §3.9, takes it there and
-        // the declaration peels it back off), and otherwise closing the
-        // signature. Printed where it was written, because `format` bails on
-        // any token REORDERING — so a canonical position that moved the clause
-        // across `borrows` would leave the file untouched instead.
-        if func.return_type.is_some() {
-            self.print_context_clause(func);
-        }
+        // B242's clause has ONE canonical position: last, after `borrows`
+        // (E146 rule 3). The grammar admits two — the type grammar's own
+        // `context` suffix (§3.9) puts it right after the return type and the
+        // declaration peels it back off, and the declaration's own clause puts
+        // it after `borrows` — and until this rule the printer reprinted
+        // whichever was written, because `format` bails on a token REORDERING
+        // and a canonical position would have left every such file untouched.
+        // `canonicalize_declaration_clauses` folds that one reordering into the
+        // safety net, the way the import order and the style-chain order are
+        // folded in, so the printer can have an answer.
         if let Some(borrows) = func.borrows {
             self.out.push_str(" borrows ");
             self.out.push_str(borrows);
         }
-        if func.return_type.is_none() {
-            self.print_context_clause(func);
-        }
+        self.print_context_clause(func);
         match &func.body {
             Some(body) => {
                 self.out.push(' ');
@@ -4086,10 +4206,17 @@ impl<'src> Printer<'src> {
         self.out.push_str(" {");
         self.indent += 1;
         let mut prev_end = open;
-        for ((field_name, value), span) in fields {
+        for (field @ (field_name, value), span) in fields {
             let field_start = self.out.len();
             let comment_cursor = self.cursor;
-            self.flush_element_comments(span.into_range().start, prev_end);
+            // Up to the field's VALUE, not to the field: a comment written
+            // between the name and the value (`name = // why ⏎ value`) sits
+            // INSIDE the field span, and flushing only to the span's start
+            // would leave it for whatever flushes next — which is how it ended
+            // up below the whole statement, orphaned from the field it
+            // explains (E146 rule 4). Above the field is where it stays.
+            let anchor = Self::field_comment_anchor(field, *span);
+            self.flush_element_comments(anchor, prev_end);
             prev_end = span.into_range().end;
             self.line();
             let line_start = self.out.len();
@@ -4098,7 +4225,7 @@ impl<'src> Printer<'src> {
             if self.over_line_budget(line_start) {
                 self.out.truncate(field_start);
                 self.cursor = comment_cursor;
-                self.flush_element_comments(span.into_range().start, prev_end);
+                self.flush_element_comments(anchor, prev_end);
                 self.line();
                 self.split = Split::Tail;
                 self.print_struct_field(field_name, value);
@@ -4126,12 +4253,12 @@ impl<'src> Printer<'src> {
     ///
     /// A comment written between the name and the value (`x = // why⏎ x`) is
     /// NOT a reason to keep the long form. The printer has no inline slot for
-    /// one there — such a comment already flushed out below the statement
-    /// before this rule existed, since it sits INSIDE a field span and so does
-    /// not force the split the way a comment between fields does — and
-    /// suppressing the collapse for it would make the reprint non-idempotent:
-    /// the first pass would keep `x = x` and relocate the comment, and the
-    /// second, with the comment now outside the field, would collapse anyway.
+    /// one there, and suppressing the collapse for it would make the reprint
+    /// non-idempotent: the first pass would keep `x = x` and move the comment,
+    /// and the second, with the comment now outside the field, would collapse
+    /// anyway. Where the comment GOES is E146 rule 4's answer — onto its own
+    /// line above the field, in the literal's split form, rather than out
+    /// below the whole statement.
     fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
         let split = std::mem::take(&mut self.split);
         self.out.push_str(field_name);
@@ -4144,6 +4271,32 @@ impl<'src> Printer<'src> {
         self.out.push_str(" = ");
         self.split = split;
         self.print_expr(value);
+    }
+
+    /// The offset a split literal flushes a field's leading comments up to: the
+    /// field's VALUE when it has one, and otherwise the field itself.
+    ///
+    /// A comment between the name and the value is inside the field's own span,
+    /// so a flush bounded by that span's start would step over it. Bounded by
+    /// the value instead, it is emitted on its own line above the field — which
+    /// is where it belongs and, on the next pass, where it already is.
+    fn field_comment_anchor(field: &StructInitializerField<'src>, span: Span) -> usize {
+        let (_, value) = field;
+        value.as_ref().map_or_else(
+            || span.into_range().start,
+            |value| value.1.into_range().start,
+        )
+    }
+
+    /// Whether a standalone comment sits between one of `fields`' names and its
+    /// value — the trigger for forcing a struct literal into its split form
+    /// (E146 rule 4). Inline there is no line to hold such a comment, so it
+    /// fell out below the whole statement.
+    fn comment_inside_a_field(&self, fields: &[Spanned<StructInitializerField<'src>>]) -> bool {
+        fields.iter().any(|(field, span)| {
+            let anchor = Self::field_comment_anchor(field, *span);
+            self.has_comment_in(span.into_range().start, anchor)
+        })
     }
 
     /// Whether a standalone comment sits in one of the GAPS between the source
@@ -4333,6 +4486,87 @@ impl<'src> Printer<'src> {
     /// continuation line. This is the single way the split reaches past a
     /// statement's prefix (`let x = const …`, `ret …`, `await …`) and into the
     /// left operand of a binary.
+    /// The operands of a binary chain, flattened at ONE precedence level:
+    /// `expr`'s left spine is walked while it keeps binding at `precedence`,
+    /// and each step contributes the operator that joins it to what came
+    /// before. The first entry carries no operator — it is the chain's head.
+    ///
+    /// One level, because the root of a binary tree is its LOWEST-precedence
+    /// operator (that is what "binds loosest" means), and the lowest-precedence
+    /// operator is where a reader expects the break. `a || b && c` flattens to
+    /// `a` and `|| b && c`, never to three lines: the `&&` binds tighter and
+    /// belongs on one of them. Operators of the SAME precedence flatten
+    /// together (`a + b - c` is three lines), since a tier is one chain however
+    /// many spellings it mixes.
+    fn flatten_binary_chain<'ast>(
+        expr: &'ast Spanned<Node<'src>>,
+        precedence: u8,
+        out: &mut Vec<(Option<BinaryOp>, &'ast Spanned<Node<'src>>)>,
+    ) {
+        if let Node::Binary(operator, left, right) = &expr.0
+            && Self::binary_precedence(*operator) == precedence
+        {
+            Self::flatten_binary_chain(left, precedence, out);
+            out.push((Some(*operator), right));
+            return;
+        }
+        out.push((None, expr));
+    }
+
+    /// Prints a binary chain one operand per line, OPERATOR-LEADING and one
+    /// indentation level in — rustfmt's shape, and the shape the hand-wrapped
+    /// conditions in this tree were already written in before N55's reformat
+    /// joined them (E147):
+    ///
+    /// ```text
+    /// if text.contains(" ")
+    ///     || text.contains("\"")
+    ///     || text.contains("(")
+    /// {
+    /// ```
+    ///
+    /// The operator leads its line because that is what makes the chain
+    /// scannable: every continuation line answers "and how does this join?"
+    /// before it says anything else, and the operands line up under each other.
+    ///
+    /// Each operand's line is then measured in turn, exactly as a split list's
+    /// element is: over budget, the operand rolls back and reprints with
+    /// [`Split::Tail`] armed, so an operand that is itself a chain breaks with
+    /// its own lines one level past this one.
+    ///
+    /// The operand minimums are the inline form's: `precedence` for the head
+    /// (a left operand may re-bind at the same level) and `precedence + 1` for
+    /// every operand after it, so the reprint reparses to the same tree —
+    /// `a - (b - c)` keeps its parentheses.
+    fn print_split_binary_chain(
+        &mut self,
+        operands: &[(Option<BinaryOp>, &Spanned<Node<'src>>)],
+        precedence: u8,
+    ) {
+        self.indent += 1;
+        for (index, (operator, operand)) in operands.iter().enumerate() {
+            if let Some(operator) = operator {
+                self.line();
+                self.out.push_str(binary_operator_symbol(*operator));
+                self.out.push(' ');
+            }
+            let minimum = if index == 0 {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let operand_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_operand(operand, minimum);
+            if self.current_line_over_budget() {
+                self.out.truncate(operand_start);
+                self.cursor = comment_cursor;
+                self.print_split_operand(operand, minimum, Split::Tail);
+            }
+        }
+        self.indent -= 1;
+    }
+
     fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: Split) {
         self.split = if Self::expression_precedence(&expr.0) >= minimum {
             split
@@ -4633,6 +4867,8 @@ impl<'src> Printer<'src> {
             }
             Node::Binary(operator, left, right) => {
                 let precedence = Self::binary_precedence(*operator);
+                let chain_start = self.out.len();
+                let chain_cursor = self.cursor;
                 let left_start = self.out.len();
                 self.print_split_operand(left, precedence, split);
                 // A split that broke the left operand across lines continues
@@ -4654,6 +4890,27 @@ impl<'src> Printer<'src> {
                 self.print_split_right(right, precedence + 1, split);
                 if continued {
                     self.indent -= 1;
+                }
+                // E147: the chain itself is the last thing that can break. The
+                // operand splits above got first refusal — a chain or a literal
+                // to one side of the operator breaks where it stands, and that
+                // is usually the better layout — and only when the line is
+                // STILL over budget does the chain break at its own operator.
+                //
+                // Two operators is the threshold, E137's rule one construct
+                // over: one link is not a chain, and neither is one operator.
+                // `base + s.aa("<90 columns>")` has nowhere useful to go —
+                // breaking it buys a line and leaves the operand just as wide —
+                // while `a || b || c` is a list of conditions and reads as one.
+                if split != Split::Off && !self.probing && self.first_line_over_budget(chain_start)
+                {
+                    let mut operands = Vec::new();
+                    Self::flatten_binary_chain(expr, precedence, &mut operands);
+                    if operands.len() >= 3 {
+                        self.out.truncate(chain_start);
+                        self.cursor = chain_cursor;
+                        self.print_split_binary_chain(&operands, precedence);
+                    }
                 }
             }
             // A prefix operator (`-x`, `!x`, `&x`, `*x`, `await x`) binds tighter
@@ -4777,7 +5034,7 @@ impl<'src> Printer<'src> {
                 self.out.push_str("= ");
                 self.print_split_operand(value, 0, split);
             }
-            Node::If(branch) => self.print_if_branch(branch),
+            Node::If(branch) => self.print_if_branch(branch, split),
             Node::Match(subject, legs) => {
                 self.out.push_str("match ");
                 self.print_expr(subject);
@@ -4795,13 +5052,29 @@ impl<'src> Printer<'src> {
                         self.blank_line();
                     }
                     self.line();
-                    self.print_match_leg(leg);
                     // The arm separator comma is optional and not kept in the AST
                     // (the corpus mixes `=> { .. },` and `=> { .. }`), so preserve
                     // whatever the source had to round-trip either style faithfully.
                     let body_end = body.1.into_range().end;
-                    if self.source_has_comma_at(body_end) {
+                    let comma = self.source_has_comma_at(body_end);
+                    let leg_start = self.out.len();
+                    let leg_cursor = self.cursor;
+                    self.print_match_leg(leg, Split::Off);
+                    if comma {
                         self.out.push(',');
+                    }
+                    // A leg's line is a measured line, exactly as a split list's
+                    // element is: over budget, the leg rolls back and reprints
+                    // with the split armed, so its BODY has somewhere to break.
+                    // The patterns and the guard are not layout sites — the
+                    // permission reaches the body and nothing else.
+                    if self.over_line_budget(leg_start) {
+                        self.out.truncate(leg_start);
+                        self.cursor = leg_cursor;
+                        self.print_match_leg(leg, Split::Tail);
+                        if comma {
+                            self.out.push(',');
+                        }
                     }
                     self.flush_trailing_comment(body_end);
                     prev_end = body_end;
@@ -4886,6 +5159,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {}");
                 } else if split != Split::Off
                     || self.comment_outside_elements(fields.1, &field_spans)
+                    || self.comment_inside_a_field(&fields.0)
                     || self.any_field_spans_lines(&fields.0)
                 {
                     self.print_split_struct(&fields.0, fields.1.into_range().start);
@@ -4994,27 +5268,121 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints an `if`/`else if`/`else` chain.
-    fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>) {
+    /// Prints an `if`/`else` chain, choosing ONCE for the whole chain between
+    /// the block form (every arm on its own lines) and the inline arm form
+    /// `if c { a } else { b }` (E146 rule 2).
+    ///
+    /// An `if` that begins its own line is a STATEMENT or a block's tail: it
+    /// owns those lines, and its arms take the block form, which is what the
+    /// tree has always been written in. An `if` reached mid-line is an operand
+    /// of something larger — a closure body inside a builder ladder, a match
+    /// leg's `=> `, the right of a `let` — and there expanding an arm whose
+    /// body is a single expression buys nothing and costs the ladder its shape:
+    /// `.bind_text(pending().map(|busy| if busy { "..." } else { "" }))` became
+    /// five lines mid-ladder under N55's reformat, and the enclosing chain then
+    /// measured a first line that fit and never broke, which is the layout that
+    /// should have happened instead.
+    ///
+    /// The `split` permission is the escape hatch: armed, the arms expand as
+    /// before, so an `if` too wide for its line still has somewhere to go. The
+    /// decision is made once at the head of the chain and threaded down, so an
+    /// `else if` never disagrees with the `if` it hangs off.
+    fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>, split: Split) {
+        let inline =
+            split == Split::Off && !self.at_line_start() && self.arms_are_expressions(branch);
+        self.print_if_chain(branch, inline, split);
+    }
+
+    fn print_if_chain(&mut self, branch: &NodeIfBranch<'src>, inline: bool, split: Split) {
         match branch {
             NodeIfBranch::If(if_) => {
                 self.out.push_str("if ");
+                // The condition CONTINUES the measured line — `if <cond> {` is
+                // one line, and the condition is the only thing on it with a
+                // layout of its own — so it takes the split permission, the way
+                // a binary's operand and a call's last argument do. Without
+                // this an over-budget `if` had nowhere to break at all (E147).
+                self.split = split;
                 self.print_expr(&if_.condition);
                 self.out.push(' ');
-                self.print_block(&if_.then);
+                self.print_arm_body(&if_.then, inline);
                 if let Some((else_branch, _)) = &if_.else_ {
                     self.out.push_str(" else ");
                     match else_branch {
-                        NodeIfBranch::If(_) => self.print_if_branch(else_branch),
-                        NodeIfBranch::Else(block) => self.print_block(block),
+                        NodeIfBranch::If(_) => self.print_if_chain(else_branch, inline, split),
+                        NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
                     }
                 }
             }
-            NodeIfBranch::Else(block) => self.print_block(block),
+            NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
         }
     }
 
+    /// Whether everything emitted since the last newline is indentation — i.e.
+    /// the printer is at the head of a line it has not written anything onto.
+    fn at_line_start(&self) -> bool {
+        let line_start = self.out.rfind('\n').map_or(0, |newline| newline + 1);
+        self.out[line_start..].bytes().all(|byte| byte == b'\t')
+    }
+
+    /// Whether EVERY arm of an `if`/`else` chain is a single expression the
+    /// inline form can hold ([`Self::arm_is_an_expression`]). One arm that is
+    /// legitimately a block keeps the whole chain in the block form: an `if`
+    /// with one inline arm and one expanded one reads worse than either.
+    fn arms_are_expressions(&mut self, branch: &NodeIfBranch<'src>) -> bool {
+        match branch {
+            NodeIfBranch::If(if_) => {
+                self.arm_is_an_expression(&if_.then)
+                    && match &if_.else_ {
+                        None => true,
+                        Some((else_branch, _)) => self.arms_are_expressions(else_branch),
+                    }
+            }
+            NodeIfBranch::Else(block) => self.arm_is_an_expression(block),
+        }
+    }
+
+    /// Whether one arm's block is an expression wearing braces: no statements,
+    /// a tail that is not `Void`, no comment anywhere inside it (a comment has
+    /// no slot on the inline line and would be relocated), and a tail that
+    /// renders on ONE line — a tail that is itself a `match` or an element tree
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not an inline arm.
+    fn arm_is_an_expression(
+        &mut self,
+        block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+    ) -> bool {
+        let range = block.1.into_range();
+        let (statements, tail) = &block.0;
+        statements.is_empty()
+            && !matches!(tail.0, Node::Void)
+            && !self.has_comment_in(range.start, range.end)
+            && !self.expr_spans_lines(tail)
+    }
+
+    /// One arm, in whichever form the chain chose.
+    fn print_arm_body(
+        &mut self,
+        block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+        inline: bool,
+    ) {
+        if !inline {
+            self.print_block(block);
+            return;
+        }
+        // No statements and no comments, by construction — so nothing here has
+        // to flush a comment or advance the cursor; the tail IS the arm.
+        let (_, tail) = &block.0;
+        self.out.push_str("{ ");
+        self.print_expr(tail);
+        self.out.push_str(" }");
+    }
+
     /// Prints one `match` leg: `pattern[, pattern][ if guard] => body`.
-    fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>) {
+    ///
+    /// `split` is handed to the BODY and to nothing else: a pattern and a guard
+    /// have no layout of their own, so a leg whose line is over budget can only
+    /// break in its body.
+    fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>, split: Split) {
         let (patterns, guard, body) = leg;
         for (index, pattern) in patterns.iter().enumerate() {
             if index > 0 {
@@ -5027,6 +5395,7 @@ impl<'src> Printer<'src> {
             self.print_expr(guard);
         }
         self.out.push_str(" => ");
+        self.split = split;
         self.print_expr(body);
     }
 
@@ -5204,12 +5573,13 @@ mod reformats {
         assert_eq!(format(expected), expected, "output is not idempotent");
     }
 
-    // B242: a DECLARED `context` clause round-trips byte-exactly. It is
-    // printed where it was written — after the return type when there is one
-    // (where the type grammar's own suffix puts it), otherwise last — because
-    // `format` bails on a token REORDERING, so a canonical position that moved
-    // the clause across `borrows` would leave the file untouched instead of
-    // formatting it.
+    // B242: a DECLARED `context` clause CLOSES the signature — it is the last
+    // thing on it, after `borrows` (E146 rule 3). The grammar admits two
+    // positions (the type grammar's own suffix takes it right after the return
+    // type; the declaration's own clause takes it after `borrows`) and the
+    // printer used to reprint whichever was written, because `format` bails on
+    // a token reordering. `normalize` folds that ONE reordering in now, so
+    // there is a canonical answer.
     #[test]
     fn a_declared_context_clause_closes_the_signature() {
         assert_formats(
@@ -5220,15 +5590,55 @@ mod reformats {
             "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
             "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
         );
-        // With a return type the clause follows it; with none it closes the
-        // signature, after `borrows`. Both are byte-exact round trips.
+        // With `borrows` on the signature, BOTH written orders reprint as the
+        // one canonical order: `borrows` first, the clause last.
         assert_formats(
             "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
-            "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
+            "fun slot(x: i32): i32 borrows x context turn {\n\tx\n}\n",
         );
         assert_formats(
             "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
             "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+        );
+    }
+
+    // E146 rule 3, in full: both written orders in, ONE order out, for a
+    // declaration with a return type and for one without, for a single-name
+    // clause and for a list, and for a bodyless declaration (a trait
+    // requirement or an `external` intrinsic) as well as one with a body.
+    #[test]
+    fn the_context_clause_normalizes_after_borrows() {
+        let canonical = "fun slot(x: i32): i32 borrows x context (turn, log) {\n\tx\n}\n";
+        assert_formats(
+            "fun slot(x: i32): i32 context (turn, log) borrows x {\n\tx\n}\n",
+            canonical,
+        );
+        assert_formats(canonical, canonical);
+        let bodyless = "fun slot(x: i32): i32 borrows x context turn;\n";
+        assert_formats("fun slot(x: i32): i32 context turn borrows x;\n", bodyless);
+        assert_formats(bodyless, bodyless);
+        // No `borrows`: the clause is already last, and stays exactly where the
+        // return type leaves it.
+        assert_formats(
+            "fun render(x: i32): i32 context settings;\n",
+            "fun render(x: i32): i32 context settings;\n",
+        );
+    }
+
+    // The clause a PARAMETER's closure type carries (`transport.md` §3.9) is a
+    // different clause on a different production, and is untouched — including
+    // beside a declaration clause that IS reordered.
+    #[test]
+    fn a_closure_types_context_clause_is_untouched() {
+        assert_formats(
+            "fun run(cb: (|| i32) context turn): i32 {\n\tcb()\n}\n",
+            "fun run(cb: (|| i32) context turn): i32 {\n\tcb()\n}\n",
+        );
+        // The parameter's clause stays inside the parameter list; only the
+        // declaration's own pair reorders around it.
+        assert_formats(
+            "fun run(cb: (|| i32) context turn, x: i32): i32 context log borrows x {\n\tcb()\n}\n",
+            "fun run(cb: (|| i32) context turn, x: i32): i32 borrows x context log {\n\tcb()\n}\n",
         );
     }
 
@@ -7511,12 +7921,12 @@ mod struct_field_shorthand {
     #[test]
     fn a_comment_inside_a_collapsing_field_is_kept_and_the_reprint_is_idempotent() {
         // A comment written between the name and the value has no inline slot
-        // in either spelling — it sat inside a field span, so it never forced
-        // the split the way a comment BETWEEN fields does, and it already
-        // relocated below the statement before this rule existed. It must still
-        // survive, and the reprint must settle in one pass: suppressing the
-        // collapse for it would collapse on the SECOND pass instead, with the
-        // comment then outside the field.
+        // in either spelling. It must still survive, and the reprint must
+        // settle in one pass: suppressing the collapse for it would collapse on
+        // the SECOND pass instead, with the comment then outside the field.
+        // Since E146 rule 4 it forces the literal's split form and lands on its
+        // own line ABOVE the field it explains, rather than below the whole
+        // statement — so the field collapses AND the comment stays put.
         let source = "fun demo() {\n\
                       \tlet point = Point {\n\
                       \t\tx = // deliberately the same name\n\
@@ -7530,8 +7940,8 @@ mod struct_field_shorthand {
             "the comment was dropped:\n{formatted}"
         );
         assert!(
-            formatted.contains("Point { x, y }"),
-            "the fields did not collapse:\n{formatted}"
+            formatted.contains("\t\t// deliberately the same name\n\t\tx,\n\t\ty,\n"),
+            "the comment left its field, or the fields did not collapse:\n{formatted}"
         );
         assert_eq!(
             super::format(&formatted),
@@ -7735,8 +8145,8 @@ mod import_set_layout {
     #[test]
     fn an_import_that_fits_stays_inline_without_a_trailing_comma() {
         assert_construct(
-            "import std::option::Option::{ self, Some, None };\n",
-            "import std::option::Option::{ None, Some, self };\n",
+            "import std::option::Option::{ Some, self, None };\n",
+            "import std::option::Option::{ self, None, Some };\n",
         );
         assert_construct(
             "import std::x::{ alpha, beta, };\n",
@@ -8076,6 +8486,71 @@ mod split_comment_attachment {
     //! a comment inside a closure body a link carries belongs to that body and
     //! already prints where it was written.
     use super::bailing_constructs::assert_construct;
+
+    // --- E146 rule 4: the gap INSIDE a field ---------------------------------
+    //
+    // The one interior the rule above did not reach. A comment between a
+    // field's name and its value sits inside the field's own span, so it forced
+    // no split and no flush claimed it — it fell out below the whole statement,
+    // exactly the orphaning backlog 41 closed everywhere else. The field's
+    // VALUE, not the field, is the boundary a split literal flushes up to now.
+
+    /// The comment stays with the field it explains, on its own line above it,
+    /// and the literal splits to make room. The fixture fits the budget, so
+    /// only the comment can be splitting it.
+    #[test]
+    fn a_comment_between_a_field_name_and_its_value_stays_with_the_field() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet t = Task { id = 1, name = // the row's label, not the display name\n\
+             \t\t\"x\", flag = true };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet t = Task {\n\
+             \t\tid = 1,\n\
+             \t\t// the row's label, not the display name\n\
+             \t\tname = \"x\",\n\
+             \t\tflag = true,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The FIRST field's gap too — nothing before it in the literal but the
+    /// `{`, so the flush has to reach the value from the opening brace.
+    #[test]
+    fn a_comment_inside_the_first_field_attaches_to_it() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet t = Task { id = // always the row id\n\
+             \t\t1, flag = true };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet t = Task {\n\
+             \t\t// always the row id\n\
+             \t\tid = 1,\n\
+             \t\tflag = true,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// And the canonical form is where it settles: one pass, then nothing —
+    /// `assert_construct` asserts the idempotence the fmt gate depends on, and
+    /// the second pass sees a comment that is now BETWEEN fields, which rule A
+    /// splits on for its own reason. The two rules have to agree, and this is
+    /// where that is checked.
+    #[test]
+    fn the_moved_comment_is_a_fixed_point() {
+        let canonical = "fun demo() {\n\
+                         \tlet t = Task {\n\
+                         \t\tid = 1,\n\
+                         \t\t// the row's label, not the display name\n\
+                         \t\tname = \"x\",\n\
+                         \t};\n\
+                         }\n";
+        assert_construct(canonical, canonical);
+    }
 
     /// A comment before the FIRST element, which no between-elements gap covers —
     /// the case that needs the construct's own opening boundary. Fixture fits the
@@ -8943,8 +9418,58 @@ mod import_sorting {
         );
         // Case-sensitive: capitalized names sort before lowercase (ASCII).
         assert_sorts(
-            "import std::option::Option::{ self, Some, None };\n",
-            "import std::option::Option::{ None, Some, self };\n",
+            "import std::x::{ beta, Alpha, Delta };\n",
+            "import std::x::{ Alpha, Delta, beta };\n",
+        );
+    }
+
+    // E146 rule 1: a bare `self` is the group's OWN namespace, not one more
+    // member of it, so it heads the group rather than landing wherever ASCII
+    // puts a lowercase four-letter word. Before this rule the sort was plain
+    // ASCII and `Option::{ self, Some, None }` reprinted as
+    // `{ None, Some, self }` — the shape N55's reformat wrote into 37 groups,
+    // `std/src/prelude.vl` and `web.vl` among them.
+    #[test]
+    fn self_sorts_first_in_its_group() {
+        assert_sorts(
+            "import std::option::Option::{ Some, None, self };\n",
+            "import std::option::Option::{ self, None, Some };\n",
+        );
+        assert_sorts(
+            "import std::result::Result::{ Err, Ok, self };\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+        );
+        // Already-first is a fixed point, and the net accepts the reordering:
+        // both spellings of the same group reduce to the same tokens.
+        assert_sorts(
+            "import std::option::Option::{ self, None, Some };\n",
+            "import std::option::Option::{ self, None, Some };\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens(
+                "import std::option::Option::{ Some, None, self };\n"
+            )),
+            normalize(raw_tokens(
+                "import std::option::Option::{ self, None, Some };\n"
+            )),
+            "the net must see the two orders of one group as one",
+        );
+    }
+
+    // Only a BARE `self` heads the group. `self as name` renames the namespace
+    // — a binding of its own — and keys by the text it writes, so it stays where
+    // the alias sorts it (E142's rule, unchanged).
+    #[test]
+    fn an_aliased_self_does_not_head_the_group() {
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None };\n",
+            "import std::option::Option::{ None, Some, self as Maybe };\n",
+        );
+        // A group carrying BOTH: the bare `self` heads it, the rename sorts by
+        // its own text.
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None, self };\n",
+            "import std::option::Option::{ self, None, Some, self as Maybe };\n",
         );
     }
 
@@ -9090,6 +9615,67 @@ mod import_sorting {
             normalize(raw_tokens("import std::json::{ Json as Doc };\n")),
             normalize(raw_tokens("import std::json::Json as Doc;\n")),
             "the net must see the braced and collapsed spellings as one",
+        );
+    }
+
+    // --- E145: a redundant alias collapses -----------------------------------
+
+    // `import a::b as b;` binds exactly what `import a::b;` binds — the alias
+    // renames a name to itself — so the plain import is the canonical spelling
+    // and the `as` is dropped. The net reduces both to the same tokens, which
+    // is what lets the reprint through.
+    #[test]
+    fn a_redundant_alias_collapses() {
+        assert_sorts(
+            "import std::json::Json as Json;\n",
+            "import std::json::Json;\n",
+        );
+        assert_sorts("use pkg::app::state as state;\n", "use pkg::app::state;\n");
+        // Inside a brace set, and beside a member that keeps its own alias.
+        assert_sorts(
+            "import std::json::{ Json as Json, Value as V };\n",
+            "import std::json::{ Json, Value as V };\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::json::Json as Json;\n")),
+            normalize(raw_tokens("import std::json::Json;\n")),
+            "the net must see the aliased and plain spellings as one",
+        );
+    }
+
+    // An alias that renames to a DIFFERENT name binds a name the module does
+    // not otherwise have. It is a program, not a spelling, and is untouched —
+    // including one that differs only in case.
+    #[test]
+    fn a_real_alias_is_untouched() {
+        assert_sorts(
+            "import std::json::Json as Doc;\n",
+            "import std::json::Json as Doc;\n",
+        );
+        assert_sorts(
+            "import std::json::Json as json;\n",
+            "import std::json::Json as json;\n",
+        );
+        assert_ne!(
+            normalize(raw_tokens("import std::json::Json as Doc;\n")),
+            normalize(raw_tokens("import std::json::Json;\n")),
+            "a real alias is part of what the net compares",
+        );
+    }
+
+    // A BLOCK-SCOPED import is left as written in every other respect (its
+    // brace set is not even sorted — a deliberate placement), but a redundant
+    // alias is not a placement, and the net's pass reaches every depth, so the
+    // collapse holds there too rather than falling the whole file back.
+    #[test]
+    fn a_redundant_alias_collapses_inside_a_block() {
+        assert_sorts(
+            "fun demo() {\n\timport std::json::Json as Json;\n\tJson::parse(\"1\");\n}\n",
+            "fun demo() {\n\timport std::json::Json;\n\tJson::parse(\"1\");\n}\n",
+        );
+        assert_sorts(
+            "fun demo() {\n\timport std::json::Json as Doc;\n\tDoc::parse(\"1\");\n}\n",
+            "fun demo() {\n\timport std::json::Json as Doc;\n\tDoc::parse(\"1\");\n}\n",
         );
     }
 
@@ -10104,6 +10690,413 @@ mod style_chain_order {
                 "{} names no property",
                 method.name
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod if_arm_layout {
+    //! E146 rule 2 — an `if` reached MID-LINE keeps arms that are single
+    //! expressions on that line: `if busy { "..." } else { "" }`.
+    //!
+    //! Before this rule every arm expanded, whatever it held and wherever the
+    //! `if` sat, so N55's reformat turned a one-line closure body inside a
+    //! `.bind_text(…)` into five lines in the middle of a builder ladder — and
+    //! the enclosing chain, measuring a first line that now fit, never broke.
+    //! The arm was the wrong thing to spend the lines on: the CHAIN was.
+    //!
+    //! An `if` that begins its own line is a statement or a block's tail and is
+    //! untouched, which is what keeps the rule off every ordinary `if` in the
+    //! tree.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+
+    /// The item's own shape, from `crates/vilan-cli/tests/split/app.vl`. Before:
+    /// the arm expanded to five lines mid-ladder and `view("p")…` stayed one
+    /// link. After: the arm stays an expression and the ladder breaks, which is
+    /// the layout the budget was asking for all along.
+    #[test]
+    fn an_expression_arm_stays_one_mid_builder_ladder() {
+        let line = "\t\t.child(view(\"p\").class(\"pending\")\
+                    .bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))";
+        assert_over_budget(line);
+        assert_construct(
+            "fun app(): Element {\n\
+             \tview(\"main\")\n\
+             \t\t.child(link(\"Home\", Route::Home))\n\
+             \t\t.child(view(\"p\").class(\"pending\")\
+             .bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))\n\
+             }\n",
+            "fun app(): Element {\n\
+             \tview(\"main\")\n\
+             \t\t.child(link(\"Home\", Route::Home))\n\
+             \t\t.child(view(\"p\")\n\
+             \t\t\t.class(\"pending\")\n\
+             \t\t\t.bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))\n\
+             }\n",
+        );
+    }
+
+    /// A `match` leg's `=> ` puts its body mid-line too, so an `if` there keeps
+    /// its arms — the second shape N55's reformat expanded, in the same file.
+    #[test]
+    fn an_if_in_a_match_leg_keeps_its_arms() {
+        assert_construct(
+            "fun label(reason: Option<str>): str {\n\
+             \tmatch reason {\n\
+             \t\tSome(let text) => if text.len() > 0 {\n\
+             \t\t\t\"!\"\n\
+             \t\t} else {\n\
+             \t\t\t\"?\"\n\
+             \t\t},\n\
+             \t\tNone => \"\",\n\
+             \t}\n\
+             }\n",
+            "fun label(reason: Option<str>): str {\n\
+             \tmatch reason {\n\
+             \t\tSome(let text) => if text.len() > 0 { \"!\" } else { \"?\" },\n\
+             \t\tNone => \"\",\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The right of a `let` is mid-line as well.
+    #[test]
+    fn an_if_in_value_position_keeps_its_arms() {
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 { \"positive\" } else { \"other\" };\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+
+    /// A body that is legitimately a block STAYS one: an arm holding a
+    /// statement is not an expression wearing braces, and one arm that must
+    /// expand expands the whole chain — an `if` with one inline arm and one
+    /// block arm reads worse than either form on its own.
+    #[test]
+    fn a_body_that_is_a_block_stays_a_block() {
+        // A statement in one arm keeps BOTH arms in the block form.
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tlog(\"positive\");\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tlog(\"positive\");\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+        // A comment inside an arm has no slot on the inline line, so the block
+        // form is what keeps it where it was written.
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t// the only interesting case\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t// the only interesting case\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+
+    /// An `if` that BEGINS its own line owns those lines — a statement, or a
+    /// block's tail expression — and is untouched by the rule.
+    #[test]
+    fn an_if_at_the_head_of_a_line_keeps_the_block_form() {
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tif n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tif n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The width rule still applies. A `match` leg's line is a measured line
+    /// like a split list's element, so a leg whose inline `if` puts it over the
+    /// budget rolls back and reprints with the split armed — and the arms
+    /// expand, because an armed split is what the inline form yields to. Found
+    /// in `vilan/std/src/rpc.vl`, where the inline arm made a 175-column leg.
+    #[test]
+    fn a_leg_over_the_budget_expands_its_arms_again() {
+        let inline = "\t\tDialFailure::Refused(let status) => if status == \"401\"                       || status == \"403\" { RpcError::Unauthorized }                       else { RpcError::Transport(i\"refused by the server ({status})\") },";
+        assert_over_budget(inline);
+        assert_construct(
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\"              { RpcError::Unauthorized }              else { RpcError::Transport(i\"refused by the server ({status})\") },\n\
+             \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
+             \t}\n\
+             }\n",
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" {\n\
+             \t\t\tRpcError::Unauthorized\n\
+             \t\t} else {\n\
+             \t\t\tRpcError::Transport(i\"refused by the server ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// An arm whose own rendering spans lines is not an inline arm: the tail
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not one expression on
+    /// one line.
+    #[test]
+    fn an_arm_whose_tail_spans_lines_expands() {
+        assert_construct(
+            "fun pick(n: i32, k: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tmatch k {\n\
+             \t\t\t0 => \"zero\",\n\
+             \t\t\t_ => \"more\",\n\
+             \t\t}\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun pick(n: i32, k: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tmatch k {\n\
+             \t\t\t0 => \"zero\",\n\
+             \t\t\t_ => \"more\",\n\
+             \t\t}\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+}
+
+#[cfg(test)]
+mod binary_chain_layout {
+    //! E147 — a binary-operator chain over the budget breaks one operand per
+    //! line, at the LOWEST-precedence operator, operator-leading, one
+    //! indentation level in.
+    //!
+    //! Before this rule a chain had no break rule at all, so the formatter
+    //! JOINED hand-wrapped conditions without a width bound: `macro_std`'s
+    //! three-line `text.contains(" ") || …` came out of N55's reformat as one
+    //! line of 182 characters, and four lines that reformat ADDED exceed 100 in
+    //! a tree whose own reflow target is 100.
+    //!
+    //! The lowest-precedence operator is the root of the tree — that is what
+    //! "binds loosest" means — so `a || b && c` is two lines and not three: the
+    //! `&&` binds tighter and belongs on one of them.
+    //!
+    //! Two operators is the threshold, E137's rule one construct over. One link
+    //! is not a chain; neither is one operator.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// `vilan/macro_std/src/meta.vl`'s condition, the line the item names: 182
+    /// columns joined onto one line by the reformat, and hand-wrapped over three
+    /// before it.
+    #[test]
+    fn the_meta_vl_condition_breaks_one_operand_per_line() {
+        let joined = "\t\t\t\tif text.contains(\" \") || text.contains(\"\\\"\") \
+                      || text.contains(\"(\") || text.contains(\".\") \
+                      || text.contains(\"+\") || text.contains(\"-\") \
+                      || text.contains(\"|\") || text.contains(\":\") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun classify(text: str): Option<str> {\n\
+             \tif text.contains(\" \") || text.contains(\"\\\"\") || text.contains(\"(\") \
+             || text.contains(\".\") || text.contains(\"+\") || text.contains(\"-\") \
+             || text.contains(\"|\") || text.contains(\":\") {\n\
+             \t\tret None;\n\
+             \t}\n\
+             \tSome(text)\n\
+             }\n",
+            "fun classify(text: str): Option<str> {\n\
+             \tif text.contains(\" \")\n\
+             \t\t|| text.contains(\"\\\"\")\n\
+             \t\t|| text.contains(\"(\")\n\
+             \t\t|| text.contains(\".\")\n\
+             \t\t|| text.contains(\"+\")\n\
+             \t\t|| text.contains(\"-\")\n\
+             \t\t|| text.contains(\"|\")\n\
+             \t\t|| text.contains(\":\") {\n\
+             \t\tret None;\n\
+             \t}\n\
+             \tSome(text)\n\
+             }\n",
+        );
+    }
+
+    /// The same file's other over-budget line, in the other position a chain
+    /// reaches the width rule from: a block's TAIL expression.
+    #[test]
+    fn a_chain_in_tail_position_breaks_too() {
+        let joined = "\tname.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+                      || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+                      || name.contains(\"*\")";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun opaque_type_text(name: str): bool {\n\
+             \tname.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+             || name.contains(\"*\")\n\
+             }\n",
+            "fun opaque_type_text(name: str): bool {\n\
+             \tname.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\")\n\
+             \t\t|| name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \")\n\
+             \t\t|| name.contains(\"*\")\n\
+             }\n",
+        );
+    }
+
+    /// A short chain stays inline — the entry is width and nothing else.
+    #[test]
+    fn a_short_chain_stays_inline() {
+        let source = "fun demo(a: bool, b: bool, c: bool): bool {\n\ta || b || c\n}\n";
+        assert!(columns("\ta || b || c") <= LINE_BUDGET);
+        assert_construct(source, source);
+        // And the collapse direction: a hand-broken chain that fits joins back.
+        assert_construct(
+            "fun demo(a: bool, b: bool, c: bool): bool {\n\ta\n\t\t|| b\n\t\t|| c\n}\n",
+            source,
+        );
+    }
+
+    /// The break is at the LOWEST-precedence operator, so a tighter operator
+    /// inside an operand stays on that operand's line.
+    #[test]
+    fn the_break_is_at_the_lowest_precedence_operator() {
+        assert_construct(
+            "fun demo(name: str): bool {\n\
+             \tname.contains(\"(\") || name.contains(\"[\") && name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+             || name.contains(\"*\")\n\
+             }\n",
+            "fun demo(name: str): bool {\n\
+             \tname.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\") && name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \")\n\
+             \t\t|| name.contains(\"*\")\n\
+             }\n",
+        );
+    }
+
+    /// Operators of the SAME precedence are ONE chain however many spellings
+    /// they mix, and an operand that had parentheses keeps them — the reprint
+    /// reparses to the same tree, which is what the safety net checks.
+    #[test]
+    fn one_precedence_tier_is_one_chain_and_parentheses_survive() {
+        let joined = "\tlet nested = x + 1000000000 - (y - 2000000000) + 3000000000 - z \
+                      + 4000000000 - y + 5000000000 + z + 60000000;";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun demo(x: i32, y: i32, z: i32) {\n\
+             \tlet nested = x + 1000000000 - (y - 2000000000) + 3000000000 - z \
+             + 4000000000 - y + 5000000000 + z + 60000000;\n\
+             }\n",
+            "fun demo(x: i32, y: i32, z: i32) {\n\
+             \tlet nested = x\n\
+             \t\t+ 1000000000\n\
+             \t\t- (y - 2000000000)\n\
+             \t\t+ 3000000000\n\
+             \t\t- z\n\
+             \t\t+ 4000000000\n\
+             \t\t- y\n\
+             \t\t+ 5000000000\n\
+             \t\t+ z\n\
+             \t\t+ 60000000;\n\
+             }\n",
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check` and depends on exactly this. `assert_construct`
+    /// asserts it per pin; this asserts it over the whole set at once, from the
+    /// UNFORMATTED side, which is where a two-pass rule would show.
+    #[test]
+    fn every_chain_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(n: str): bool {\n\tn.contains(\"(\") || n.contains(\"[\") \
+                 || n.contains(\"|\") || n.contains(\"&\") || n.contains(\",\") \
+                 || n.contains(\" \") || n.contains(\"*\")\n}\n",
+                true,
+            ),
+            (
+                "fun b(a: bool, b: bool, c: bool): bool {\n\ta || b || c\n}\n",
+                false,
+            ),
+            (
+                "fun c(x: i32, y: i32, z: i32) {\n\tlet n = x + 1000000000 \
+                 - (y - 2000000000) + 3000000000 - z + 4000000000 - y + 5000000000 \
+                 + z + 60000000;\n}\n",
+                true,
+            ),
+            (
+                "fun d(t: str): bool {\n\tif t.contains(\" \") || t.contains(\"\\\"\") \
+                 || t.contains(\"(\") || t.contains(\".\") || t.contains(\"+\") \
+                 || t.contains(\"-\") || t.contains(\"|\") || t.contains(\":\") \
+                 {\n\t\ttrue\n\t} else {\n\t\tfalse\n\t}\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
         }
     }
 }
