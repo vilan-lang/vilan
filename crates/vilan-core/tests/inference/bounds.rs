@@ -7596,3 +7596,189 @@ fn b212_a_trait_bound_still_binds_and_dispatches() {
         "cat\n",
     );
 }
+
+// --- B251: a parameter reachable only through another's bound, and the -------
+// --- bounds a WRITTEN type application owes ---------------------------------
+//
+// Two halves of one hole in the struct-parameter path.
+//
+// A parameter no field mentions DIRECTLY — `struct Held<T, S: Signal<List<T>>>
+// { list: S }`, where every field names `S` — had nothing to ground it: the
+// literal bound `S` from the value and left `T` abstract, so
+// `Held { list = SignalCell::new([1, 2]) }` typed as
+// `Held<any, SignalCell<List<i32>>>` and that `any` satisfied anything
+// downstream. B186 built the recovery for CALLS (`derive_generics_from_bounds`
+// — once `S` is concrete, read `T` back out of the `Signal` impl); a struct
+// literal binds the same shape through a different door and never reached it.
+//
+// And a WRITTEN application (`Held<i32, SignalCell<List<str>>>`) binds those
+// same parameters while recording nothing a bound check reads: the call check
+// walks `method_call_substitution` and the construction check walks literals,
+// so an annotation's arguments were never asked. The bound the second argument
+// owes is `Signal<List<i32>>` — the first argument grounds it — and nothing
+// checked it, so the annotation carried a `str` list out through a declared
+// `i32` one.
+//
+// CENSUS of written struct arguments the new check refuses, across std, the
+// 128 corpus programs, the eleven examples, the benchmarks, macro_std and the
+// CLI templates: ZERO. Four structs in the estate declare a bounded parameter
+// (`Map<K: Hashable, V>`, `Set<T: Hashable>`, `Optimistic<T, S: Signal<T>>`,
+// the rpc example's `AccountsClient<T: Transport>`) and every written
+// application of them satisfies its bound.
+
+const HELD_WRITTEN: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    struct Held<T, S: Signal<List<T>>> { list: S }
+    "#;
+
+const HELD_HIDDEN: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    struct Held<T> { list: Signal<List<T>> }
+    "#;
+
+#[test]
+fn b251_a_parameter_reachable_only_through_a_bound_grounds_at_the_literal() {
+    // The filed shape, read off the literal's own type: pre-fix the report said
+    // `Held<any, SignalCell<List<i32>>>`.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32, SignalCell<List<i32>>> instead.",
+    );
+}
+
+#[test]
+fn b251_the_hidden_parameter_form_grounds_it_too() {
+    // B184's sugar spells the same struct — `Signal<List<T>>` in field position
+    // is a hidden parameter bounded by it — so `T` is reachable only through
+    // that hidden parameter's bound, and it is the shape the estate actually
+    // has. Same recovery, same answer.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_HIDDEN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32, SignalCell<List<i32>>> instead.",
+    );
+}
+
+#[test]
+fn b251_the_grounded_parameter_is_what_a_consumer_is_checked_against() {
+    // The consequence, not just the label: with `T` abstract the argument read
+    // as `Held<any, ..>` and `any` answers to anything. The report now names
+    // the element the literal actually built, which is what makes the mismatch
+    // visible at all.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_HIDDEN}
+            fun count(h: Held<i32>): i32 {{ h.list.get().len() }}
+            fun main() {{ print(count(Held {{ list = SignalCell::new(["a"]) }})); }}
+            "#
+        ),
+        "but got Held<str, SignalCell<List<str>>> instead.",
+    );
+}
+
+#[test]
+fn b251_the_matching_element_still_compiles_and_runs() {
+    // The control for the half above: grounding `T` must not refuse the
+    // program that agrees.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_HIDDEN}
+            fun count(h: Held<i32>): i32 {{ h.list.get().len() }}
+            fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2, 3]) }})); }}
+            main();
+            "#
+        ),
+        "3\n",
+    );
+}
+
+#[test]
+fn b251_a_written_argument_is_checked_against_the_parameters_bound() {
+    // The second half, at the annotation, where the fix goes. The message names
+    // the BOUND (grounded by the sibling argument) and both types.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b251_the_refusal_notes_the_declaration_the_bound_is_written_on() {
+    // The bound is written on the struct, not here, so the report points at it.
+    assert_fails_noting(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "required by the bound on parameter 'S' of 'Held'",
+        "Held",
+        "'Held' is declared here",
+    );
+}
+
+#[test]
+fn b251_a_bounded_and_satisfied_written_argument_compiles() {
+    // The control: the same annotation with an argument that MEETS the bound is
+    // exactly as it was, and the program runs.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun show(h: Held<i32, SignalCell<List<i32>>>): i32 {{ h.list.get().len() }}
+            fun main() {{ print(show(Held {{ list = SignalCell::new([1, 2]) }})); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b251_a_written_argument_that_is_a_parameter_answers_through_its_own_bound() {
+    // Bound-to-bound flow at an annotation: `S` here is the caller's parameter,
+    // and its own declared bound is what satisfies the struct's — the rule
+    // `satisfies_trait_bound` already applies at a call, now reached at a
+    // written application too.
+    assert_compiles(&format!(
+        r#"{HELD_WRITTEN}
+            fun count<T, S: Signal<List<T>>>(h: Held<T, S>): i32 {{ h.list.get().len() }}
+            fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2]) }})); }}
+            "#
+    ));
+}
+
+#[test]
+fn b251_an_unbounded_parameters_written_argument_is_still_free() {
+    // The counterweight: a parameter with no bound requires nothing of its
+    // argument, and the new check must not invent a requirement for it.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        struct Pair<A, B> { a: A, b: B }
+        fun show(p: Pair<i32, str>): i32 { p.a }
+        fun main() { print(show(Pair { a = 1, b = "x" })); }
+        "#,
+    );
+}

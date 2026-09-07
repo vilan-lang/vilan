@@ -429,3 +429,5 @@ row	flagship	key
 398	-	this `context` clause declares `{context}`, which `{name}`'s body never reads; callers must supply it anyway
 399	-	{label} is `[expose(keyed)]`d, but its element is not written as a `Map<K, V>`: a keyed mirror is a `KeyedSource<K, T>`, and the `[service]` expansion reads BOTH types off the annotation (there are no associated types to read the key from). Write the field as `SignalCell<Map<K, V>>`, or drop `keyed` for a channel that resends the whole value on every change
 400	-	this file is being checked as a module of `{package}` — it lives inside that package, so its siblings are `pkg::` here, not `{package}::`. Write `import pkg::…` for a module of `{package}` itself
+401	-	'{type}' does not implement trait '{trait}', required by the bound on parameter
+402	-	a bound promises a trait's METHODS, never that `{name}` ADMITS an

@@ -3194,6 +3194,23 @@ pub struct Analyzer<'src> {
     // minted per spelling and never interned, so recording the occurrence is
     // enough to tell `A = Self` apart from a genuine `T: Mixer`.
     defaulted_parameter_types: HashSet<TypeId>,
+    // B245: a WRITTEN mention of such a parameter (`fun add(self, b: B)` inside
+    // `trait Add<B = Self>`) -> the parameter's own constraint id. Every written
+    // type mints its own slot, and a defaulted parameter's slot resolves to the
+    // DEFAULT's type — `Type::Trait(Add, [])`, the very type `Self` spells in
+    // the same trait — so the mention lost the one thing that says which
+    // parameter it is. `substitute_type` rewrites `Type::Generic` and nothing
+    // else, so neither the positional substitution nor a lookup on the
+    // mention's id reached the position: `impl Meters with PartialOrd<Feet>`
+    // read `lt`'s operand as `Meters`, and impl conformance read `mix`'s
+    // parameters as the subject rather than as the clause's arguments.
+    //
+    // Recorded where the mention RESOLVES to the declaration (the
+    // `prepped_type_locals` drain), which is the one place both ids are in
+    // hand. It retires `written_parameter_argument`, which recovered the same
+    // fact from the written NAME and could only ever answer for a spelling that
+    // matched a parameter name exactly.
+    defaulted_parameter_mentions: HashMap<TypeId, TypeId>,
     // The tuple bound of a generic parameter (`T: (2..)` / `(..: Display)` —
     // variadic-generics.md §"Arity & element bounds"), keyed by the parameter's
     // constraint id. Enforced wherever trait bounds are
@@ -3713,6 +3730,13 @@ pub struct Analyzer<'src> {
     // grounds, checked once that type has settled — rather than as a type the
     // binding is forced to.
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
+    // B251: every WRITTEN application of a struct that declared bounded
+    // parameters — `(struct id, written arguments, span, source, type id)` —
+    // asked after `build()` by `check_written_nominal_bounds`. A type
+    // application binds a declaration's parameters exactly as a call does, but
+    // records nothing into `method_call_substitution`, so the bound check every
+    // call gets never reached it.
+    written_nominal_bound_sites: Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId)>,
     // B182: the annotation slots a REFUSED bare trait resolved to `Unknown`,
     // each with the site its one report was filed at. B161 resolves a refused
     // annotation to `Unknown` "so the one report stands alone instead of
@@ -4525,6 +4549,7 @@ impl<'src> Analyzer<'src> {
             generic_dispatch: HashMap::default(),
             generic_bounds: HashMap::default(),
             defaulted_parameter_types: HashSet::default(),
+            defaulted_parameter_mentions: HashMap::default(),
             tuple_bounds: HashMap::default(),
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
@@ -4633,6 +4658,7 @@ impl<'src> Analyzer<'src> {
             bound_position_type_ids: HashSet::default(),
             path_head_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
+            written_nominal_bound_sites: Vec::new(),
             binding_trait_constraints: Vec::new(),
             refused_annotation_slots: HashMap::default(),
             refused_annotation_traits: HashMap::default(),
@@ -5743,6 +5769,131 @@ impl<'src> Analyzer<'src> {
                 },
                 variable_id,
             );
+        }
+    }
+
+    /// B251: a WRITTEN type application binds a declaration's parameters, so
+    /// its arguments owe the same bounds every other binding owes.
+    ///
+    /// [`Self::check_generic_bound_satisfaction`] asks this of a call (through
+    /// `method_call_substitution`) and of a construction (a struct literal, an
+    /// enum-variant call); a type application records into neither, so
+    /// `struct Held<T, S: Signal<List<T>>> { list: S }` accepted
+    /// `Held<i32, SignalCell<List<str>>>` in any annotation. The bound the
+    /// second argument had to meet is `Signal<List<i32>>` — the first argument
+    /// grounds it — and nothing checked it, so the annotation carried a `str`
+    /// list out through a declared `i32` one.
+    ///
+    /// The sites are recorded at the annotation (the drain over
+    /// `prepped_type_locals`) and asked here, after `build()`, for the reason
+    /// every bound check runs late: impls and argument types are final only
+    /// then. An application already refused on its ARITY records nothing —
+    /// one report per written spelling (B188) — and neither does a path head,
+    /// which applies nothing.
+    fn check_written_nominal_bounds(&mut self) {
+        for (struct_id, written_arguments, span, source_id, type_id) in
+            std::mem::take(&mut self.written_nominal_bound_sites)
+        {
+            let Some(struct_) = self.structs.get(&struct_id) else {
+                continue;
+            };
+            let owner_name = struct_.name;
+            let declared = struct_.generic_parameter_constraint_ids.clone();
+            let parameter_names: Vec<&str> = self
+                .declared_generic_parameters
+                .get(&struct_id)
+                .map(|declared| declared.iter().map(|parameter| parameter.name).collect())
+                .unwrap_or_default();
+            // A declared bound's arguments may name SIBLING parameters
+            // (`S: Signal<List<T>>`) — ground them in this application's own
+            // arguments, exactly as the construction sites do.
+            let declared_bindings: SubstitutionContext = declared
+                .iter()
+                .copied()
+                .zip(written_arguments.iter().copied())
+                .collect();
+            for (index, (constraint_id, argument_type_id)) in
+                declared.iter().zip(&written_arguments).enumerate()
+            {
+                let bound_traits = self.generic_bound_traits(*constraint_id);
+                if bound_traits.is_empty() {
+                    continue;
+                }
+                let argument_type = argument_type_id.get_type(self);
+                // Indeterminate arguments are other diagnostics' business, and
+                // a bare trait in an argument position is the trait-object
+                // error's — the same skip list the call-site check uses.
+                if matches!(
+                    argument_type,
+                    Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
+                ) {
+                    continue;
+                }
+                for (required_trait_id, required_arguments) in &bound_traits {
+                    let required_arguments: Vec<TypeId> = required_arguments
+                        .iter()
+                        .map(|argument| {
+                            let argument = argument.get_type(self);
+                            self.substitute_type(&argument, &declared_bindings)
+                                .get_type_id(self)
+                        })
+                        .collect();
+                    if self.satisfies_trait_bound(
+                        &argument_type,
+                        *required_trait_id,
+                        &required_arguments,
+                        0,
+                    ) {
+                        continue;
+                    }
+                    let Some(trait_label) =
+                        self.bound_trait_label(*required_trait_id, &required_arguments)
+                    else {
+                        continue;
+                    };
+                    let type_label = self.pretty_print_type(&argument_type, &HashMap::default());
+                    let parameter_label = match parameter_names.get(index) {
+                        Some(name) => format!("'{name}'"),
+                        None => format!("{}", index + 1),
+                    };
+                    // A generic argument fails by MISSING the bound on its own
+                    // declaration — name that fix; a concrete one by missing
+                    // the impl. The wording follows the call-site pair, with
+                    // the OWNER and the position it wrote naming where the
+                    // requirement comes from: the bound is written on the
+                    // declaration, not here, so the message has to carry it.
+                    let msg = match matches!(argument_type, Type::Generic(_)) {
+                        true => format!(
+                            "generic parameter '{type_label}' is missing the bound \
+                             ': {trait_label}' required by parameter {parameter_label} of \
+                             '{owner_name}'"
+                        ),
+                        false => format!(
+                            "'{type_label}' does not implement trait '{trait_label}', \
+                             required by the bound on parameter {parameter_label} of \
+                             '{owner_name}'"
+                        ),
+                    };
+                    let note = self
+                        .structs
+                        .get(&struct_id)
+                        .map(|struct_| crate::error::Note {
+                            span: struct_.name_span,
+                            msg: format!("'{owner_name}' is declared here"),
+                            source: self.source_of_id(struct_id),
+                        });
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note,
+                            span,
+                            msg,
+                        },
+                        source_id,
+                        type_id,
+                    );
+                }
+            }
         }
     }
 
@@ -7133,22 +7284,48 @@ impl<'src> Analyzer<'src> {
     /// default (the only shape reaching here) and is why the fallback is safe.
     fn ambiguous_position_expectation(
         &self,
+        position_id: TypeId,
         written_name: Option<&str>,
         self_trait: Id,
         subject: TypeId,
         context: &SubstitutionContext,
     ) -> Option<TypeId> {
-        let written_name = written_name?;
-        if written_name == "Self" {
-            return Some(subject);
+        // B245: a mention of a defaulted parameter now CARRIES the parameter's
+        // own id, so the position answers for itself — no spelling to match, no
+        // parameter list to search, and it answers for a mention the name-based
+        // lookup below cannot reach. `Self` records no such mention and falls
+        // through to the written rule, which is where it belongs.
+        if let Some(constraint_id) = self.defaulted_parameter_mentions.get(&position_id) {
+            let Some(argument) = context.get(constraint_id).copied() else {
+                return Some(subject);
+            };
+            // An argument that is ITSELF an unsupplied `= Self` default means
+            // the subject, one link along: `trait Ord with Eq + PartialOrd`
+            // reaches `PartialEq` through `PartialOrd<B = Self> with
+            // PartialEq<B>`, so `eq`'s position is `PartialOrd`'s `B` — and
+            // with no argument anywhere in the chain that is exactly `Self`.
+            let canonical = self
+                .defaulted_parameter_mentions
+                .get(&argument)
+                .copied()
+                .unwrap_or(argument);
+            match self.defaulted_parameter_types.contains(&canonical) {
+                true => Some(subject),
+                false => Some(argument),
+            }
+        } else {
+            let written_name = written_name?;
+            if written_name == "Self" {
+                return Some(subject);
+            }
+            let trait_ = self.traits.get(&self_trait)?;
+            let index = trait_
+                .generic_parameter_names
+                .iter()
+                .position(|name| *name == written_name)?;
+            let constraint_id = *trait_.generic_parameter_constraint_ids.get(index)?;
+            Some(context.get(&constraint_id).copied().unwrap_or(subject))
         }
-        let trait_ = self.traits.get(&self_trait)?;
-        let index = trait_
-            .generic_parameter_names
-            .iter()
-            .position(|name| *name == written_name)?;
-        let constraint_id = *trait_.generic_parameter_constraint_ids.get(index)?;
-        Some(context.get(&constraint_id).copied().unwrap_or(subject))
     }
 
     fn check_one_conformance(
@@ -7347,7 +7524,13 @@ impl<'src> Analyzer<'src> {
                 let written = written_type_names
                     .get(&trait_shape.types[position])
                     .copied();
-                match self.ambiguous_position_expectation(written, self_trait, subject, &context) {
+                match self.ambiguous_position_expectation(
+                    trait_shape.types[position],
+                    written,
+                    self_trait,
+                    subject,
+                    &context,
+                ) {
                     Some(expected) => expected.get_type(self),
                     None => continue,
                 }
@@ -7396,7 +7579,14 @@ impl<'src> Analyzer<'src> {
             let written = trait_shape
                 .return_type_id
                 .and_then(|type_id| written_type_names.get(&type_id).copied());
-            match self.ambiguous_position_expectation(written, self_trait, subject, &context) {
+            let position_id = trait_shape.return_type_id.unwrap_or(subject);
+            match self.ambiguous_position_expectation(
+                position_id,
+                written,
+                self_trait,
+                subject,
+                &context,
+            ) {
                 Some(expected) => expected.get_type(self),
                 None => return,
             }
@@ -16093,11 +16283,35 @@ impl<'src> Analyzer<'src> {
         let Some(declared_id) = self.second_parameter_type_id(member_id) else {
             return false;
         };
+        // B245: a mention of a DEFAULTED parameter IS that parameter, so the
+        // position's own id answers for it. Without this identity the lookup
+        // below missed (`impl Meters with PartialOrd<Feet>` reaching `lt`'s
+        // declared `b: B`) and the `Self` fallback further down took the
+        // position for the subject — `Meters < Feet` was refused as though
+        // `lt` accepted a `Meters`, which is exactly what the clause said it
+        // does not. The fallback stays for what it is actually for: a clause
+        // that supplied NO argument, where the default really does mean `Self`.
+        let declared_id = self
+            .defaulted_parameter_mentions
+            .get(&declared_id)
+            .copied()
+            .unwrap_or(declared_id);
         let raw_declared = declared_id.get_type(self);
         let mut free_binders: Vec<TypeId> = Vec::new();
         self.collect_generics(&raw_declared, 0, &mut free_binders);
         free_binders.retain(|constraint_id| !bindings.contains_key(constraint_id));
-        let declared = match bindings.get(&declared_id).copied() {
+        let bound_argument = bindings.get(&declared_id).copied().filter(|argument| {
+            // B245: an argument that is ITSELF an unsupplied `= Self` default
+            // (`trait PartialOrd<B = Self> with PartialEq<B>` reached with no
+            // argument) says nothing; the `Self` reading below is the answer.
+            let canonical = self
+                .defaulted_parameter_mentions
+                .get(argument)
+                .copied()
+                .unwrap_or(*argument);
+            !self.defaulted_parameter_types.contains(&canonical)
+        });
+        let declared = match bound_argument {
             // The TRAIT's own `B`, bound by the argument the impl's `with`
             // clause wrote (`impl Meters with PartialOrd<Feet>`). A defaulted
             // parameter interns as its default rather than as a fresh generic,
@@ -16171,6 +16385,38 @@ impl<'src> Analyzer<'src> {
                  that same parameter (`impl {subject_name}<type {rhs_label}> with \
                  {trait_name}<{rhs_label}>`)"
             )
+        } else if let Type::Generic(constraint_id) = lhs_type {
+            // B246: a CONCRETE right operand against a bounded PARAMETER. The
+            // steer above has an impl to name because the subject is nominal;
+            // here the subject is a parameter, so — as in B233 — the bound is
+            // the only declaration that can say a `{subject_label}` takes an
+            // `{rhs_label}` there, and it must say so for EVERY instantiation.
+            //
+            // An IMPLICIT binder (B186's `fun bump(a: Add)`) has no name to put
+            // in a bound: it displays as its trait, which is the trait's name
+            // and not the parameter's (B218's face). So the steer does not
+            // pretend it has one — it names the rewrite that gives it one,
+            // which is the written form of the very sugar the author used.
+            let named = self.generic_constraint_names.get(constraint_id).copied();
+            let implicit = self.implicit_generic_scopes.contains_key(constraint_id);
+            match (named, implicit) {
+                (Some(name), false) => format!(
+                    "a bound promises a trait's METHODS, never that `{name}` ADMITS an \
+                     `{rhs_label}` — every instantiation of `{name}` decides that for \
+                     itself, and one whose `{trait_name}` declares `B = Self` refuses it. \
+                     Say so in the bound (`<{name}: {trait_name}<{rhs_label}>>`), which \
+                     every instantiation must then satisfy, or make the operand a \
+                     `{declared_label}`"
+                ),
+                _ => format!(
+                    "a bound promises a trait's METHODS, never that the parameter ADMITS an \
+                     `{rhs_label}` — every instantiation decides that for itself, and one \
+                     whose `{trait_name}` declares `B = Self` refuses it. This parameter was \
+                     written as a trait annotation, so it has no name to bind: write it out \
+                     (`fun …<P: {trait_name}<{rhs_label}>>(…: P, …)`), or make the operand \
+                     that same parameter"
+                ),
+            }
         } else {
             format!(
                 "`{symbol}` dispatches to that impl, which reads the value as \
@@ -16191,34 +16437,6 @@ impl<'src> Analyzer<'src> {
             binary_id,
         );
         true
-    }
-
-    /// The argument a parameterized use of `trait_id` supplies for the position
-    /// `declared_id` — matched by the position's WRITTEN spelling against the
-    /// trait's own parameter names, which is the only thing separating a
-    /// `= Self`-defaulted parameter from a `Self` spelled outright (B216, and
-    /// `supertrait_position_type`'s rule). `None` when the spelling cannot be
-    /// recovered, when it names no parameter of the trait, or when the use
-    /// supplied no argument in that position — and the caller then leaves the
-    /// position exactly as declared.
-    fn written_parameter_argument(
-        &self,
-        trait_id: Id,
-        arguments: &[TypeId],
-        declared_id: TypeId,
-    ) -> Option<TypeId> {
-        let written = self
-            .written_type_spellings
-            .iter()
-            .find(|(written_id, _)| *written_id == declared_id)
-            .map(|(_, name)| *name)?;
-        let index = self
-            .traits
-            .get(&trait_id)?
-            .generic_parameter_names
-            .iter()
-            .position(|name| *name == written)?;
-        arguments.get(index).copied()
     }
 
     /// B233: the right operand of an operator dispatched through the left
@@ -16245,14 +16463,22 @@ impl<'src> Analyzer<'src> {
     /// through `method_member_in_trait_at`, exactly as a method call on a
     /// bounded receiver takes them.
     ///
-    /// The rule fires only when the right operand is a parameter the ENCLOSING
-    /// declaration owns — `generic_is_rigid_here`, B219's shared predicate,
-    /// asked here with the operator's own scope in `rigid_binder_scope` (this
-    /// check runs in `finalize_build`, outside constraint resolution, where the
-    /// scope is otherwise `None`). A parameter the site is INFERRING is a hole
-    /// the call fills and the call site's own business; a CONCRETE right
-    /// operand against a bounded parameter (`fun bump<P: Add>(a: P) { a + 1 }`)
-    /// is a wider question than this one, left as it stands.
+    /// The LEFT operand must be a parameter the ENCLOSING declaration owns —
+    /// `generic_is_rigid_here`, B219's shared predicate, asked here with the
+    /// operator's own scope in `rigid_binder_scope` (this check runs in
+    /// `finalize_build`, outside constraint resolution, where the scope is
+    /// otherwise `None`). A parameter the site is INFERRING is a hole the call
+    /// fills and the call site's own business.
+    ///
+    /// B246 closed the other half: a CONCRETE right operand
+    /// (`fun bump<P: Add>(a: P) { a + 1 }`), which B233 left as the stated
+    /// boundary. It is the same defect one step along — the bound says what a
+    /// `P` adds, and a bare `P: Add` means `Add<B = Self>`, so an `i32` there
+    /// belongs only if some instantiation's `Add` declares `B = i32`, which
+    /// nothing in the signature promises and `impl Bag with Add<Bag>` flatly
+    /// denies. Census across std, the corpus, the docs fences, the examples,
+    /// the benchmarks, macro_std, the CLI templates, kolt and the website:
+    /// ZERO sites, so nothing in the estate stops compiling.
     fn refuse_operator_right_operand_on_bound(
         &mut self,
         op: BinaryOp,
@@ -16266,15 +16492,26 @@ impl<'src> Analyzer<'src> {
             return false;
         };
         let rhs_type = self.infer_type(rhs_id, lhs_type, &HashMap::default());
-        let Type::Generic(rhs_constraint_id) = rhs_type else {
+        // An operand with no type yet is nobody's verdict.
+        if matches!(rhs_type, Type::Unknown | Type::Unresolved) {
             return false;
+        }
+        let rhs_constraint_id = match rhs_type {
+            Type::Generic(rhs_constraint_id) => Some(rhs_constraint_id),
+            _ => None,
         };
         let scope_id = self.expr_id_to_scope_id_map.get(&binary_id).copied();
         let saved_scope = std::mem::replace(&mut self.rigid_binder_scope, scope_id);
-        let both_rigid = self.generic_is_rigid_here(constraint_id)
-            && self.generic_is_rigid_here(rhs_constraint_id);
+        let left_rigid = self.generic_is_rigid_here(constraint_id);
+        // A right operand that is a parameter must be rigid too (B233); one
+        // that is CONCRETE is checked on the left operand's rigidity alone
+        // (B246) — there is no second declaration to ask about.
+        let right_admissible = match rhs_constraint_id {
+            Some(rhs_constraint_id) => self.generic_is_rigid_here(rhs_constraint_id),
+            None => true,
+        };
         self.rigid_binder_scope = saved_scope;
-        if !both_rigid {
+        if !left_rigid || !right_admissible {
             return false;
         }
         let Some((member_id, declaring_trait_id, declaring_arguments)) = self
@@ -16286,27 +16523,14 @@ impl<'src> Analyzer<'src> {
         else {
             return false;
         };
-        let mut bindings =
-            self.trait_parameter_substitution(declaring_trait_id, &declaring_arguments);
-        // The operand position's own id, bound to the argument the BOUND wrote
-        // for it. A defaulted parameter interns as its default rather than as a
-        // binder, so `Add<B = Self>`'s `b: B` is `Type::Trait(Add, [])` — the
-        // very type `Self` spells inside the same trait, and an id distinct
-        // from the one the trait recorded for the parameter, so neither the
-        // positional substitution above nor `substitute_type` reaches it. It is
-        // decided by its SPELLING instead, B216's rule at
-        // `supertrait_position_type` applied at the operand: a position spelled
-        // with one of the declaring trait's parameter names IS that parameter,
-        // and takes the matching argument.
-        if let Some(declared_id) = self.second_parameter_type_id(member_id)
-            && let Some(argument_id) = self.written_parameter_argument(
-                declaring_trait_id,
-                &declaring_arguments,
-                declared_id,
-            )
-        {
-            bindings.insert(declared_id, argument_id);
-        }
+        let bindings = self.trait_parameter_substitution(declaring_trait_id, &declaring_arguments);
+        // The operand position needs no separate entry: B245 gave a mention of
+        // a defaulted parameter the parameter's own id, so the positional
+        // substitution above already keys on it (`refuse_operator_right_operand`
+        // canonicalizes the position before it looks). Until then the mention
+        // had a distinct id and the argument had to be recovered from the
+        // written SPELLING — `written_parameter_argument`, retired with the
+        // identity it stood in for.
         self.refuse_operator_right_operand(
             op,
             symbol,
@@ -16506,6 +16730,24 @@ impl<'src> Analyzer<'src> {
             let substitution = self.trait_parameter_substitution(id, &arguments);
             for supertrait_type_id in supertraits {
                 if let Type::Trait(super_id, super_arguments) = supertrait_type_id.get_type(self) {
+                    // B245: a clause argument that IS one of this trait's own
+                    // defaulted parameters (`trait PartialOrd<B = Self> with
+                    // PartialEq<B>`) is not a `Type::Generic`, so
+                    // `substitute_argument_types` walks past it. The mention
+                    // carries the parameter's id, so the position is resolved
+                    // by that id first and the ordinary substitution runs over
+                    // what is left.
+                    let super_arguments: Vec<TypeId> = super_arguments
+                        .iter()
+                        .map(|argument| {
+                            let canonical = self
+                                .defaulted_parameter_mentions
+                                .get(argument)
+                                .copied()
+                                .unwrap_or(*argument);
+                            substitution.get(&canonical).copied().unwrap_or(*argument)
+                        })
+                        .collect();
                     let super_arguments = match substitution.is_empty() {
                         true => super_arguments,
                         false => self.substitute_argument_types(&super_arguments, &substitution),
@@ -36890,6 +37132,22 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // B251: a parameter reachable ONLY through another parameter's BOUND
+        // (`struct Held<T, S: Signal<List<T>>> { list: S }`) has no field to
+        // ground it — every field names `S` — so both loops above leave it
+        // unbound and the literal typed as `Held<any, SignalCell<List<i32>>>`,
+        // an `any` that then satisfied anything downstream. B186 built the
+        // recovery for CALLS (`derive_generics_from_bounds`: once `S` is
+        // concrete, read `T` back out of `SignalCell<List<i32>>`'s `Signal`
+        // impl); a struct literal binds the same shape through a different
+        // door and never reached it. Same set both ways, exactly as the call
+        // path passes it: the literal's own parameters are what it may bind
+        // and what it must record.
+        self.derive_generics_from_bounds(
+            &literal_param_ids,
+            &literal_param_ids,
+            &mut substitution_context,
+        );
         // Fill the struct's type arguments from the bindings inferred above
         // (`Box { value = 5 }` -> `Box<i32>`), so methods called on the value
         // monomorphize against the concrete element type. A parameter no field
@@ -37662,6 +37920,24 @@ impl<'src> Analyzer<'src> {
                 Some(subject_id) => {
                     let subject_type =
                         self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+                    // B245: a mention of a DEFAULTED parameter keeps the
+                    // parameter's identity. Every written type mints its own
+                    // slot, and this one resolves to the DEFAULT's type — for
+                    // `trait Add<B = Self>`, `Type::Trait(Add, [])`, the very
+                    // type `Self` spells in the same trait — so the mention and
+                    // the parameter shared a meaning and not an id, and no
+                    // reader keyed on ids could tell `b: B` from `b: Self`.
+                    // Recorded here, where the mention has just resolved to the
+                    // declaration and both ids are in hand.
+                    if let Some(Expr::Generic(constraint_id)) =
+                        self.expr_id_to_expr_map.get(&subject_id)
+                        && let constraint_id = *constraint_id
+                        && self.defaulted_parameter_types.contains(&constraint_id)
+                        && argument_type_ids.is_empty()
+                    {
+                        self.defaulted_parameter_mentions
+                            .insert(type_id, constraint_id);
+                    }
                     // B188: a written application must supply the arity its
                     // declaration DECLARES. Under-supply was the live
                     // miscompile: the arm below only attaches arguments when
@@ -37762,6 +38038,38 @@ impl<'src> Analyzer<'src> {
                             source_id,
                             type_id,
                         );
+                    }
+                    // B251: the written arguments of a STRUCT application are
+                    // checked against that struct's declared bounds — the same
+                    // question `check_generic_bound_satisfaction` asks of every
+                    // binding a CALL records, which a written type application
+                    // never reaches (nothing records into
+                    // `method_call_substitution` here). Without it
+                    // `struct Held<T, S: Signal<List<T>>>` accepted
+                    // `Held<i32, SignalCell<List<str>>>`: the bound the second
+                    // argument had to meet is `Signal<List<i32>>`, and the
+                    // annotation then handed a `str` list out through a
+                    // declared `i32` one. Recorded here and asked after
+                    // `build()`, where impls and arguments are final; an
+                    // application already refused on its arity has nothing left
+                    // to check (one report per written spelling, B188), and a
+                    // path head applies nothing.
+                    if !refused_arity
+                        && !is_path_head
+                        && !argument_type_ids.is_empty()
+                        && let Type::Struct(struct_id, _) = subject_type
+                        && matches!(
+                            self.expr_id_to_expr_map.get(&subject_id),
+                            Some(Expr::Struct(_))
+                        )
+                    {
+                        self.written_nominal_bound_sites.push((
+                            struct_id,
+                            argument_type_ids.clone(),
+                            span,
+                            source_id,
+                            type_id,
+                        ));
                     }
                     // Attach the written generic arguments to the nominal type
                     // (`Option<i32>` -> `Enum(option_id, [i32])`). A bare name
@@ -38869,18 +39177,32 @@ impl<'src> Analyzer<'src> {
             // override would otherwise go unchecked). The comparison runs
             // post-build in `check_trait_conformance`, when declared types have
             // resolved.
-            let all_members: Vec<(&'src str, Id)> = self
-                .trait_with_supertraits(trait_id)
+            //
+            // B245: each declaring trait comes with the ARGUMENTS it is reached
+            // with. `trait_with_supertraits_at` already substitutes a
+            // sub-trait's arguments into the supertrait's written ones (B164),
+            // so `trait Mixed with Blender<i32, str>` reaches `Blender` at
+            // `[i32, str]` — which is what a member declared by `Blender` and
+            // implemented under `Mixed` has to be checked against. Before this
+            // the supertrait's context was empty and every `= Self`-defaulted
+            // position took the subject fallback: `impl Cup with Mixed` was
+            // told `mix`'s `a: A` had to be a `Cup`.
+            let reached: Vec<(Id, Vec<TypeId>)> =
+                self.trait_with_supertraits_at(trait_id, &check.trait_arguments);
+            let all_members: Vec<(&'src str, Id, Vec<TypeId>)> = reached
                 .into_iter()
-                .filter_map(|id| self.traits.get(&id).map(|trait_| (id, trait_)))
-                .flat_map(|(declaring_trait_id, trait_)| {
-                    trait_
-                        .declarations
-                        .keys()
-                        .map(move |name| (*name, declaring_trait_id))
+                .filter_map(|(id, arguments)| {
+                    self.traits.get(&id).map(|trait_| {
+                        trait_
+                            .declarations
+                            .keys()
+                            .map(|name| (*name, id, arguments.clone()))
+                            .collect::<Vec<_>>()
+                    })
                 })
+                .flatten()
                 .collect();
-            for (member_name, declaring_trait_id) in all_members {
+            for (member_name, declaring_trait_id, declaring_arguments) in all_members {
                 let Some(impl_member_id) = check.declarations.get(member_name).copied() else {
                     continue;
                 };
@@ -38893,26 +39215,23 @@ impl<'src> Analyzer<'src> {
                 };
                 let impl_function_id = self.resolve_member_function_id(impl_member_id);
                 let trait_function_id = self.resolve_member_function_id(trait_member_id);
-                // Map the DECLARING trait's generic parameters to the impl's
-                // `with`-clause arguments — available for the directly-implemented
-                // trait (`check.trait_arguments`); a generic supertrait's
-                // arguments are not recovered in v1, so its context stays empty
-                // (Self substitution still applies).
-                let generic_context: SubstitutionContext = if declaring_trait_id == trait_id {
-                    self.traits
-                        .get(&trait_id)
-                        .map(|trait_| {
-                            trait_
-                                .generic_parameter_constraint_ids
-                                .iter()
-                                .copied()
-                                .zip(check.trait_arguments.iter().copied())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    SubstitutionContext::default()
-                };
+                // Map the DECLARING trait's generic parameters to the
+                // arguments it is REACHED with — the impl's `with`-clause
+                // arguments for the trait implemented directly, and (B245) a
+                // supertrait's own written arguments carried down through the
+                // clause for anything above it.
+                let generic_context: SubstitutionContext = self
+                    .traits
+                    .get(&declaring_trait_id)
+                    .map(|trait_| {
+                        trait_
+                            .generic_parameter_constraint_ids
+                            .iter()
+                            .copied()
+                            .zip(declaring_arguments.iter().copied())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 self.conformance_signature_checks
                     .push(ConformanceSignatureCheck {
                         impl_function_id,
@@ -49580,6 +49899,9 @@ fn analyze_over_world<'src>(
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
         analyzer.check_binding_hidden_nominal_constraints();
+        // B251's twin of the bound check above, at the third binding channel:
+        // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
+        analyzer.check_written_nominal_bounds();
         analyzer.check_tuple_spreads();
     }
     unless_cancelled! {
