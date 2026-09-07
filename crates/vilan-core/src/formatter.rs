@@ -89,8 +89,65 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_import_runs(
-        &collapse_field_shorthands(drop_trailing_commas(tokens)),
+        &canonicalize_declaration_clauses(collapse_field_shorthands(drop_trailing_commas(tokens))),
     )))
+}
+
+/// Puts a declaration's two trailing clauses into the canonical order —
+/// `borrows p context c`, never `context c borrows p` — so the safety check
+/// accepts the formatter moving the clause across `borrows` (E146 rule 3).
+///
+/// Recognized by SHAPE, since a token stream has no tree to ask: the contextual
+/// keyword `context`, its clause (a bare name, or a parenthesised name list),
+/// and then `borrows` and its parameter name. `borrows` appears in exactly one
+/// production — a `fun` declaration's suffix — so a `context` clause followed
+/// immediately by it can only be that declaration's own pair. The closure-type
+/// clause a PARAMETER carries (`cb: (|| T) context c`) is followed by a `,` or
+/// a `)` and is never touched.
+///
+/// Like [`drop_trailing_commas`] and [`collapse_field_shorthands`], this runs
+/// over BOTH streams, so a form neither side produces reduces identically on
+/// both and the net still catches every other reordering.
+fn canonicalize_declaration_clauses(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Ident("context")
+            && let Some(after_clause) = context_clause_end(&tokens, index)
+            && tokens.get(after_clause) == Some(&Token::Borrows)
+            && matches!(tokens.get(after_clause + 1), Some(Token::Ident(_)))
+        {
+            result.push(Token::Borrows);
+            result.push(tokens[after_clause + 1].clone());
+            result.extend(tokens[index..after_clause].iter().cloned());
+            index = after_clause + 2;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// The index just past the `context` clause beginning at `index` (which the
+/// caller has checked holds the `context` word) — `context name` or
+/// `context (a, b)`. `None` if what follows is not a clause at all.
+fn context_clause_end(tokens: &[Token<'_>], index: usize) -> Option<usize> {
+    match tokens.get(index + 1) {
+        Some(Token::Ident(_)) => Some(index + 2),
+        Some(Token::Ctrl('(')) => {
+            let mut at = index + 2;
+            loop {
+                match tokens.get(at)? {
+                    Token::Ident(_) => at += 1,
+                    Token::Ctrl(',') => at += 1,
+                    Token::Ctrl(')') => return Some(at + 1),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
@@ -2909,22 +2966,21 @@ impl<'src> Printer<'src> {
             self.out.push_str(": ");
             self.print_type(&return_type.0);
         }
-        // B242's clause: written right after the return type when there is one
-        // (the type grammar's own `context` suffix, §3.9, takes it there and
-        // the declaration peels it back off), and otherwise closing the
-        // signature. Printed where it was written, because `format` bails on
-        // any token REORDERING — so a canonical position that moved the clause
-        // across `borrows` would leave the file untouched instead.
-        if func.return_type.is_some() {
-            self.print_context_clause(func);
-        }
+        // B242's clause has ONE canonical position: last, after `borrows`
+        // (E146 rule 3). The grammar admits two — the type grammar's own
+        // `context` suffix (§3.9) puts it right after the return type and the
+        // declaration peels it back off, and the declaration's own clause puts
+        // it after `borrows` — and until this rule the printer reprinted
+        // whichever was written, because `format` bails on a token REORDERING
+        // and a canonical position would have left every such file untouched.
+        // `canonicalize_declaration_clauses` folds that one reordering into the
+        // safety net, the way the import order and the style-chain order are
+        // folded in, so the printer can have an answer.
         if let Some(borrows) = func.borrows {
             self.out.push_str(" borrows ");
             self.out.push_str(borrows);
         }
-        if func.return_type.is_none() {
-            self.print_context_clause(func);
-        }
+        self.print_context_clause(func);
         match &func.body {
             Some(body) => {
                 self.out.push(' ');
@@ -5289,12 +5345,13 @@ mod reformats {
         assert_eq!(format(expected), expected, "output is not idempotent");
     }
 
-    // B242: a DECLARED `context` clause round-trips byte-exactly. It is
-    // printed where it was written — after the return type when there is one
-    // (where the type grammar's own suffix puts it), otherwise last — because
-    // `format` bails on a token REORDERING, so a canonical position that moved
-    // the clause across `borrows` would leave the file untouched instead of
-    // formatting it.
+    // B242: a DECLARED `context` clause CLOSES the signature — it is the last
+    // thing on it, after `borrows` (E146 rule 3). The grammar admits two
+    // positions (the type grammar's own suffix takes it right after the return
+    // type; the declaration's own clause takes it after `borrows`) and the
+    // printer used to reprint whichever was written, because `format` bails on
+    // a token reordering. `normalize` folds that ONE reordering in now, so
+    // there is a canonical answer.
     #[test]
     fn a_declared_context_clause_closes_the_signature() {
         assert_formats(
@@ -5305,15 +5362,55 @@ mod reformats {
             "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
             "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
         );
-        // With a return type the clause follows it; with none it closes the
-        // signature, after `borrows`. Both are byte-exact round trips.
+        // With `borrows` on the signature, BOTH written orders reprint as the
+        // one canonical order: `borrows` first, the clause last.
         assert_formats(
             "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
-            "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
+            "fun slot(x: i32): i32 borrows x context turn {\n\tx\n}\n",
         );
         assert_formats(
             "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
             "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+        );
+    }
+
+    // E146 rule 3, in full: both written orders in, ONE order out, for a
+    // declaration with a return type and for one without, for a single-name
+    // clause and for a list, and for a bodyless declaration (a trait
+    // requirement or an `external` intrinsic) as well as one with a body.
+    #[test]
+    fn the_context_clause_normalizes_after_borrows() {
+        let canonical = "fun slot(x: i32): i32 borrows x context (turn, log) {\n\tx\n}\n";
+        assert_formats(
+            "fun slot(x: i32): i32 context (turn, log) borrows x {\n\tx\n}\n",
+            canonical,
+        );
+        assert_formats(canonical, canonical);
+        let bodyless = "fun slot(x: i32): i32 borrows x context turn;\n";
+        assert_formats("fun slot(x: i32): i32 context turn borrows x;\n", bodyless);
+        assert_formats(bodyless, bodyless);
+        // No `borrows`: the clause is already last, and stays exactly where the
+        // return type leaves it.
+        assert_formats(
+            "fun render(x: i32): i32 context settings;\n",
+            "fun render(x: i32): i32 context settings;\n",
+        );
+    }
+
+    // The clause a PARAMETER's closure type carries (`transport.md` §3.9) is a
+    // different clause on a different production, and is untouched — including
+    // beside a declaration clause that IS reordered.
+    #[test]
+    fn a_closure_types_context_clause_is_untouched() {
+        assert_formats(
+            "fun run(cb: (|| i32) context turn): i32 {\n\tcb()\n}\n",
+            "fun run(cb: (|| i32) context turn): i32 {\n\tcb()\n}\n",
+        );
+        // The parameter's clause stays inside the parameter list; only the
+        // declaration's own pair reorders around it.
+        assert_formats(
+            "fun run(cb: (|| i32) context turn, x: i32): i32 context log borrows x {\n\tcb()\n}\n",
+            "fun run(cb: (|| i32) context turn, x: i32): i32 borrows x context log {\n\tcb()\n}\n",
         );
     }
 

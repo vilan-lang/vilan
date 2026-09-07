@@ -4722,9 +4722,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         // Both record the NAME LIST's span, not the `context` word's: that is
         // what the editor's "declare the inferred contexts" fix rewrites, and
         // it is the same span whichever way the clause arrived. The formatter
-        // prints the clause where it was WRITTEN (after the return type when
-        // there is one, otherwise last), because `format` bails on a token
-        // reordering.
+        // normalizes the two arrivals into ONE printed position — last, after
+        // `borrows` (E146 rule 3) — through a token canonicalization its
+        // safety net shares, so either way in is the same way out.
         let mut return_type = return_type;
         let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
         if let Some(annotation) = return_type.take() {
