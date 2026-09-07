@@ -7642,7 +7642,7 @@ pub(crate) mod tests {
         // The other control: an IMPL is not a declaration, and its signature was
         // never ambiguous — it says the concrete type on both sides.
         let hover = hover_at_cursor(
-            "import std::io::print;\nimport std::operators::PartialEq;\n\nstruct Tag { n: i32 }\nimpl Tag with PartialEq {\n\tfun e|q(self, other: Tag): bool { self.n == other.n }\n}\n\nfun main() {\n\tprint(Tag { n = 1 }.eq(Tag { n = 1 }));\n}\n\nmain();\n",
+            "import std::io::print;\nimport std::compare::PartialEq;\n\nstruct Tag { n: i32 }\nimpl Tag with PartialEq {\n\tfun e|q(self, other: Tag): bool { self.n == other.n }\n}\n\nfun main() {\n\tprint(Tag { n = 1 }.eq(Tag { n = 1 }));\n}\n\nmain();\n",
         )
         .expect("hover on the impl's `eq` should produce a label");
         assert!(
