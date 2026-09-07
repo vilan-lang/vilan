@@ -37,13 +37,14 @@
 //! tracked listing, and `digest`'s fingerprint.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod support;
+use support::port::free_port;
 
 /// The resource the client bundles. An `.svg` deliberately: it is not a `.js`,
 /// a `.css` or a `.json`, so nothing about it can be confused with an artifact
@@ -77,14 +78,6 @@ fn vilan(args: &[&str]) -> Output {
         .env("NO_COLOR", "1")
         .output()
         .expect("run vilan")
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
 }
 
 /// A two-entry project: a browser client that bundles `static/icon.svg`, and a

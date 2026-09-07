@@ -11,7 +11,7 @@
 //! identifier.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -21,6 +21,7 @@ use vilan_core::manifest::Manifest;
 
 mod support;
 use support::ladder::documented_legs;
+use support::port::free_port;
 
 /// A fresh temp directory for one test to scaffold into.
 fn temp_dir(tag: &str) -> PathBuf {
@@ -582,16 +583,6 @@ fn a_directory_name_that_is_not_an_identifier_is_sanitized() {
 }
 
 // --- process helpers (the ssr_fullstack shape) -----------------------------
-
-/// Bind an ephemeral port, then release it (see the retry in the full-stack
-/// test for the race this leaves).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// Poll until the server accepts a connection (or the deadline passes).
 fn wait_for_port(port: u16, deadline: Duration) -> bool {

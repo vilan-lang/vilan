@@ -19,3 +19,20 @@ vilan/docs/book/
 # The union-suite log every integration writes beside the tree (three
 # tracked-by-accident incidents in one day; the hygiene gate caught two).
 suite.log
+
+# The corpus filesystem program's scratch tree, left behind by a run that DIED.
+# `vilan/test/file.vl` makes `file-corpus-<random>/` relative to the working
+# directory and removes it at the end; the corpus differentials in
+# `crates/vilan-core` spawn node with the crate directory inherited (N52's
+# `corpus_harness::run_node_within` passes no `current_dir`), so a panic, a
+# timeout kill or a Ctrl-C between the `create_dir_all` and the `remove_dir_all`
+# strands one there. Ungitignored it shows up as an untracked directory in the
+# next `git status` of whichever lane happens to look.
+#
+# An ignore line and NOT a harness `Drop` guard, deliberately: the harness never
+# learns the random suffix (only the basename `data.txt` reaches stdout, by
+# N54's design), so a guard could only glob `file-corpus-*` in the working
+# directory — and that directory is shared by every concurrent run of the
+# program, which is precisely N54's hazard. A cleanup that deletes a sibling
+# process's live scratch tree is worse than a stray directory.
+file-corpus-*/

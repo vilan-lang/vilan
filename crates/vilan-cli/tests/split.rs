@@ -24,12 +24,13 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod support;
+use support::port::free_port;
 
 /// The emitted artifacts, in the order the golden directory holds them.
 const ARTIFACTS: &[&str] = &[
@@ -892,16 +893,6 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
         "a watch round emits the leg whole, so the previous build's chunks must go \
          and its manifest must say so: {left:?}\n{manifest}"
     );
-}
-
-/// Bind an ephemeral port and release it — a free port for the served pin (the
-/// standard small TOCTOU window this suite's server tests all take).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
 }
 
 fn wait_for_port(port: u16, deadline: Duration) -> bool {
