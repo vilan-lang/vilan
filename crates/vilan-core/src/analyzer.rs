@@ -16407,6 +16407,22 @@ impl<'src> Analyzer<'src> {
     ///
     /// Shared by `receiver.member()` and by `for x in receiver`, which drive the
     /// same defaults through the same `GenericDispatch::OnType` channel.
+    ///
+    /// The second half runs over the whole SUPERTRAIT CHAIN, not just the trait
+    /// the `with` clause names (B243). An impl written in ONE block —
+    /// `impl Cell<type T> with Signal<T>` — reaches `Source`'s defaults
+    /// (`map`, `effect_on_change`) through `Signal`'s own `with Source<T>`, and
+    /// those bodies are written in `Source`'s parameters, which are different
+    /// constraint ids from `Signal`'s. Binding only the clause's trait left
+    /// every one of them abstract, so `x.map(|v| v * 2)` typed `v` as the
+    /// TRAIT's `T` and steered the author to `add it where T is declared on
+    /// trait Source` — a std file. Splitting the impl into `with Source<T>` +
+    /// `with Signal<T>` worked only because it made `Source` a clause trait,
+    /// which is A49's recipe for kolt's `StorageSignalCell` and is no longer
+    /// required. `trait_with_supertraits_at` already carries each trait's
+    /// arguments through the chain (B164's substitution), so the walk is the
+    /// same one the bound and default-body paths take; the clause's own trait
+    /// is its first element, so this subsumes what was here.
     fn inherited_default_bindings(
         &mut self,
         subject_type: &Type,
@@ -16419,14 +16435,18 @@ impl<'src> Analyzer<'src> {
             .reconcile_declaration(&impl_subject, subject_type, &impl_subject)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
-        let trait_parameter_ids = self
-            .traits
-            .get(&trait_id)
-            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-            .unwrap_or_default();
-        for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(trait_arguments) {
-            let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
-            bindings.insert(*parameter_id, resolved.get_type_id(self));
+        for (chain_trait_id, chain_arguments) in
+            self.trait_with_supertraits_at(trait_id, trait_arguments)
+        {
+            let trait_parameter_ids = self
+                .traits
+                .get(&chain_trait_id)
+                .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+                .unwrap_or_default();
+            for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(&chain_arguments) {
+                let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
+                bindings.insert(*parameter_id, resolved.get_type_id(self));
+            }
         }
         bindings
     }
