@@ -215,15 +215,16 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         // that a sibling is a declared entry, so `views.vl` importing
         // `pkg::client::helper` was clean in the editor and refused by `vilan
         // check .` — the same disagreement B239 closed, one file over.
+        //
+        // B250: and the set is read on BOTH legs now. Which leg this is decides
+        // only what `pkg::<the open file>` means; a file the manifest declares is
+        // a program whichever file the editor happens to be showing.
+        let declared_entries = vilan_core::platform_color::declared_entry_module_names(&manifest);
         workspace.entry_mode =
             if vilan_core::platform_color::is_package_module(&pkg_root, &manifest, entry_path) {
-                vilan_core::EntryMode::OpenFile {
-                    declared_entries: vilan_core::platform_color::declared_entry_module_names(
-                        &manifest,
-                    ),
-                }
+                vilan_core::EntryMode::OpenFile { declared_entries }
             } else {
-                vilan_core::EntryMode::Declared
+                vilan_core::EntryMode::Declared { declared_entries }
             };
         return ProjectContext {
             platform,

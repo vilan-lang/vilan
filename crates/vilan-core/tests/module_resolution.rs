@@ -360,7 +360,19 @@ fn analyze_workspace_files(
         &workspace,
     );
     let _ = std::fs::remove_dir_all(&root);
-    errors.into_iter().map(|error| error.msg).collect()
+    errors
+        .into_iter()
+        .map(|error| {
+            format!(
+                "{}{}",
+                error.msg,
+                error
+                    .note
+                    .map(|note| format!(" || NOTE: {}", note.msg))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -693,7 +705,19 @@ fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
         &workspace,
     );
     let _ = std::fs::remove_dir_all(&root);
-    errors.into_iter().map(|error| error.msg).collect()
+    errors
+        .into_iter()
+        .map(|error| {
+            format!(
+                "{}{}",
+                error.msg,
+                error
+                    .note
+                    .map(|note| format!(" || NOTE: {}", note.msg))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -3804,6 +3828,17 @@ fn open_file(declared_entries: &[&str]) -> EntryMode {
     }
 }
 
+/// [`EntryMode::Declared`] carrying the same set (B250): the package's declared
+/// programs are refused on this leg too, so both surfaces read one fact.
+fn declared(declared_entries: &[&str]) -> EntryMode {
+    EntryMode::Declared {
+        declared_entries: declared_entries
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+    }
+}
+
 /// As [`analyze_package_raw`], but the analysis is told what KIND of entry it
 /// was handed (B239) and keeps the program's warnings beside its diagnostics.
 fn analyze_package_as(
@@ -3911,7 +3946,7 @@ fn b239_the_same_package_from_its_declared_entry_is_clean_too() {
     // the entry a manifest would declare, `views` and `channel` are two modules
     // in a cycle and nothing is special about either. If this ever reddens, the
     // pin above is measuring the wrong thing.
-    let (errors, warnings) = analyze_package_as(B239_FILES, "client.vl", EntryMode::Declared);
+    let (errors, warnings) = analyze_package_as(B239_FILES, "client.vl", EntryMode::default());
     assert!(
         errors.is_empty(),
         "the declared entry compiles the same package: {errors:#?}"
@@ -3937,7 +3972,7 @@ fn b239_a_cycle_back_into_a_declared_entry_is_still_refused() {
             ),
         ],
         "client.vl",
-        EntryMode::Declared,
+        EntryMode::default(),
     );
     assert!(
         errors
@@ -4183,7 +4218,7 @@ fn b240_file_mode_refuses_an_import_of_a_sibling_that_is_a_declared_entry() {
             .any(|error| error.contains("`pkg::client` is this program's entry file")),
         "file mode refuses the import of a declared entry: {file_mode:#?}"
     );
-    let (declared, _) = analyze_package_as(files, "client.vl", EntryMode::Declared);
+    let (declared, _) = analyze_package_as(files, "client.vl", declared(&["client"]));
     assert!(
         declared
             .iter()
@@ -4281,4 +4316,176 @@ fn b240_a_dependency_file_opened_as_the_entry_keeps_its_own_derives() {
         "the opened dependency file's own `[derive]` must expand: {errors:#?}"
     );
     assert!(errors.is_empty(), "and nothing else is wrong: {errors:#?}");
+}
+
+fn analyze_dependency_file_as_entry(helper_src: &str) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_b250_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
+    )
+    .unwrap();
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).unwrap();
+    std::fs::write(
+        dep_root.join("lib.vl"),
+        "import pkg::helper::shown;\n\nfun greeting(): bool { shown() }\n",
+    )
+    .unwrap();
+    std::fs::write(dep_root.join("util.vl"), "fun thing(): i32 { 4 }\n").unwrap();
+    let helper = dep_root.join("helper.vl");
+    std::fs::write(&helper, helper_src).unwrap();
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root.clone(),
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        ..Workspace::default()
+    };
+    let source = std::fs::read_to_string(&helper).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &app_dir,
+        &helper,
+        Some(Platform::default()),
+        &workspace,
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    errors
+        .into_iter()
+        .map(|error| {
+            format!(
+                "{}{}",
+                error.msg,
+                error
+                    .note
+                    .map(|note| format!(" || NOTE: {}", note.msg))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
+}
+#[test]
+fn b250_a_dependency_entrys_own_name_says_which_package_it_is_in() {
+    // Leg 1. B240's fix made a dependency file opened as the entry keep its
+    // derives, and moved `package_of_source[SourceId(0)]` onto the dependency to
+    // do it. That remap is right — inside `common`, its siblings are `pkg::` —
+    // and it was SILENT: the one root it takes away is `common` itself, which is
+    // how every file outside the package addresses it, so an import that
+    // resolved before the file was opened this way stops after.
+    //
+    // The refusal stands; the note says why, and names the spelling that works.
+    let errors = analyze_dependency_file_as_entry(
+        "import common::util::thing;\n\nfun shown(): bool { thing() > 1 }\n",
+    );
+    let root_miss = errors
+        .iter()
+        .find(|error| error.starts_with("cannot find module 'common' to import"))
+        .unwrap_or_else(|| panic!("the remapped root is still refused: {errors:#?}"));
+    assert!(
+        root_miss.contains("being checked as a module of `common`"),
+        "and says which package it is being checked as part of: {root_miss}"
+    );
+    assert!(
+        root_miss.contains("`pkg::"),
+        "and names the spelling that works here: {root_miss}"
+    );
+}
+
+#[test]
+fn b250_the_pkg_spelling_inside_the_dependency_entry_is_clean() {
+    // The control the note steers to: the same file, the same analysis, the
+    // sanctioned spelling — and nothing to report. A note that named a fix which
+    // does not work would be worse than the silence it replaces.
+    let errors = analyze_dependency_file_as_entry(
+        "import pkg::util::thing;\n\nfun shown(): bool { thing() > 1 }\n",
+    );
+    assert!(
+        errors.is_empty(),
+        "`pkg::` is the spelling here: {errors:#?}"
+    );
+}
+
+#[test]
+fn b250_an_unrelated_missing_root_gets_no_note() {
+    // The scope. Only the dependency's OWN name is the one the remap took away;
+    // any other unresolved root in the same file is an ordinary miss.
+    let errors =
+        analyze_dependency_file_as_entry("import nowhere::thing;\n\nfun shown(): bool { true }\n");
+    let root_miss = errors
+        .iter()
+        .find(|error| error.starts_with("cannot find module 'nowhere' to import"))
+        .unwrap_or_else(|| panic!("an unknown root is still refused: {errors:#?}"));
+    assert!(
+        !root_miss.contains("being checked as a module of"),
+        "and reads as the ordinary miss it is: {root_miss}"
+    );
+}
+
+/// Leg 2's package: two DECLARED programs and a module that imports one of them.
+/// `views.vl` is the module both legs look at the same shape through.
+const B250_FILES: &[(&str, &str)] = &[
+    (
+        "client.vl",
+        "import pkg::views::render;\n\nfun main() {\n\tlet shown = render();\n}\n",
+    ),
+    (
+        "server.vl",
+        "fun helper(): i32 { 3 }\n\nfun main() {\n\tlet _ = helper();\n}\n",
+    ),
+    (
+        "views.vl",
+        "import pkg::server::helper;\n\nfun render(): i32 { helper() }\n",
+    ),
+];
+
+#[test]
+fn b250_the_declared_leg_refuses_a_siblings_import_of_another_declared_entry() {
+    // Leg 2, and the whole of B250's ruling in one assertion: the two legs are
+    // the same package, so they answer the same question the same way.
+    //
+    // Before, the DECLARED leg read only the entry's own alias (B226), so with
+    // `client.vl` as the entry a sibling's `import pkg::server::helper` loaded
+    // `server.vl` as an ordinary module and the analysis was clean — while file
+    // mode, holding the same manifest, refused it (B240). Agreement is per
+    // PACKAGE, not per leg: a file the manifest declares is a program on every
+    // surface that looks at it.
+    let (declared_errors, _) =
+        analyze_package_as(B250_FILES, "client.vl", declared(&["client", "server"]));
+    let refusal = "`pkg::server` is this program's entry file";
+    assert!(
+        declared_errors.iter().any(|error| error.contains(refusal)),
+        "the declared leg refuses it too: {declared_errors:#?}"
+    );
+    let (file_mode, _) =
+        analyze_package_as(B250_FILES, "views.vl", open_file(&["client", "server"]));
+    assert!(
+        file_mode.iter().any(|error| error.contains(refusal)),
+        "with B226's own message, exactly as file mode already did: {file_mode:#?}"
+    );
+}
+
+#[test]
+fn b250_a_declared_leg_with_no_manifest_is_unchanged() {
+    // The control for every caller that has no manifest to read — a test
+    // harness, a macro world, `vilan check <a bare file>`. The declared set is
+    // empty there, so B226's own alias is still the whole rule and its refusal
+    // is unmoved.
+    let (errors, _) = analyze_package_as(B239_FILES, "client.vl", EntryMode::default());
+    assert!(
+        errors.is_empty(),
+        "an ordinary module cycle under a declared entry: {errors:#?}"
+    );
 }
