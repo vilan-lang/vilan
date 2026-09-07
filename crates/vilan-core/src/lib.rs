@@ -47,7 +47,14 @@ pub use analyzer::{EntryMode, Layer, PackageSpec, PreludeRepair, Program, Worksp
 pub use error::Error;
 pub use macros::MacroLimits;
 #[doc(hidden)]
+pub use macros::macro_expansion_cache_clear;
 pub use macros::macro_world_cache_clear;
+/// How many macro WORLDS the last top-level analysis on this thread compiled
+/// (M33) — the `macro-worlds` phase row's count, readable without parsing
+/// stderr. Re-exported rather than left inside the private `macros` module for
+/// the same reason `macro_world_cache_clear` is: it is a fact about the
+/// compiler's own work that a gate has to be able to assert.
+pub use macros::macro_worlds_compiled;
 pub use manifest::Manifest;
 pub use options::{BuildOptions, Preset};
 pub use owned_modules::OwnedModules;
@@ -564,7 +571,7 @@ fn analyze_source_unfenced(
                 block_ordinal += 1;
                 let start = node.1.into_range().start;
                 let head: Span = (start..start).into();
-                node.0 = Node::Func(Func {
+                node.0 = Node::Func(Box::new(Func {
                     name: (name, head),
                     is_async: false,
                     external: false,
@@ -583,7 +590,7 @@ fn analyze_source_unfenced(
                     contexts: None,
                     signature_end: None,
                     body: Some(body),
-                });
+                }));
             }
         }
         let mut defined = std::collections::HashSet::new();
@@ -856,8 +863,12 @@ pub fn post_analysis_passes(
     // diagnostic-order normalization) — and `const-lower`/`const-interp` are a
     // SUB-split of `const-pass`: the shared world's lowering + per-site
     // assembly against the interpreter's evaluation, the two thirds/one third
-    // `const-eval.md` §10.2 had to hand-measure. Printed for macro worlds too,
-    // exactly as the aggregate line this extends was.
+    // `const-eval.md` §10.2 had to hand-measure. A macro WORLD's post-passes no
+    // longer print a line of their own (M33): four unheaded `post-passes` lines
+    // ahead of the outer entry's read as the compiler having run the passes
+    // five times, when what they are is the worlds' share — so they are tallied
+    // into `macro-worlds`' `post-passes` field instead, on the row that says
+    // how many worlds there were.
     //
     // N43 — TWO buckets are named after what they TIME, not after the pass a
     // reader assumed. `contexts+graph` is `context::thread_contexts` (which
@@ -872,7 +883,10 @@ pub fn post_analysis_passes(
     // reads the split off the line instead of a profiler. It is deliberately
     // NOT disjoint from the two buckets it explains — it is a slice through
     // them, and the comment above already says the buckets do not sum.
-    if phase_timing_enabled() {
+    if phase_timing_enabled() && macros::in_macro_world() {
+        macros::world_phases_record_post(phase_post_start.elapsed());
+    }
+    if phase_timing_enabled() && !macros::in_macro_world() {
         let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
         let (const_lower, const_interp) = const_eval::phase_split();
         eprintln!(

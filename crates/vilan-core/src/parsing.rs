@@ -4918,7 +4918,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         };
         Some((
-            Node::Func(Func {
+            Node::Func(Box::new(Func {
                 name,
                 is_async,
                 external,
@@ -4937,7 +4937,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 contexts,
                 signature_end,
                 body,
-            }),
+            })),
             self.span_from(start),
         ))
     }

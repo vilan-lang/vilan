@@ -9,7 +9,8 @@
 //!    the same seam `VILAN_PHASE_TIMING` marks. Each corpus is measured **cold**
 //!    and **warm**, and the difference is *forced*, never assumed: a cold
 //!    iteration clears the process-global caches first
-//!    (`analyzer::base_cache_clear`, `macro_world_cache_clear`, and — since
+//!    (`analyzer::base_cache_clear`, `macro_world_cache_clear`,
+//!    `macro_expansion_cache_clear`, and — since
 //!    backlog M6, 2026-08-19 — `parse_clean_cache_clear`). Leaving that to
 //!    chance is the exact drift `suite-speed.md` §2.1/E26 recorded — a number
 //!    attributed to a mechanism that the accounting never confirmed.
@@ -345,6 +346,13 @@ fn measure_phases(
     if cold {
         vilan_core::analyzer::base_cache_clear();
         vilan_core::macro_world_cache_clear();
+        // The macro worlds' EXPANSIONS now outlive the process, in the
+        // package's on-disk table (M33): a cold row that read a warm table
+        // would be measuring a compile that did not happen, which is exactly
+        // the drift the forced-cold discipline above exists to prevent. This
+        // harness names no build directory, so the table is empty here — the
+        // clear is what keeps that true if one is ever named.
+        vilan_core::macro_expansion_cache_clear();
         vilan_core::parse_clean_cache_clear();
     }
 

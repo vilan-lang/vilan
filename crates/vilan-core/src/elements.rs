@@ -364,11 +364,13 @@ fn descend_if<'src>(branch: NodeIfBranch<'src>, source: &'src str) -> NodeIfBran
     }
 }
 
+// In place, in the box the tree already owns — see `css::desugar_boxed`.
 fn desugar_boxed<'src>(
-    node: Box<Spanned<Node<'src>>>,
+    mut node: Box<Spanned<Node<'src>>>,
     source: &'src str,
 ) -> Box<Spanned<Node<'src>>> {
-    Box::new(desugar(*node, source))
+    take_and_desugar(&mut node, source);
+    node
 }
 
 fn desugar_opt<'src>(

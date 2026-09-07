@@ -485,7 +485,12 @@ pub enum Node<'src> {
         Box<Spanned<Self>>,
         Spanned<(NodeList<'src>, Box<Spanned<Self>>)>,
     ),
-    Func(Func<'src>),
+    // BOXED (M32): `Func` is 312 bytes — inlined here it made `Node` 320 and
+    // `Spanned<Node>` 336, and the parser moves that whole value up through
+    // every precedence level on every `Option<Spanned<Node>>` return. The box
+    // costs one allocation per function DECLARATION (rare) to take the enum's
+    // ceiling — and with it every expression memcpy — down by a factor.
+    Func(Box<Func<'src>>),
     // `ret <expr>` / bare `ret` (an early return of void).
     FuncReturn(Option<Box<Spanned<Self>>>),
     // `expr!` — assert-or-return (proposal/try-and-lift.md): the good half of a
@@ -548,7 +553,7 @@ pub enum Node<'src> {
     // Its body is HERMETIC: never walked in the program world, compiled in the
     // per-file macro world instead (its imports resolve against `macro_std`
     // only), and executed by the expansion interpreter.
-    MacroFun(Func<'src>),
+    MacroFun(Box<Func<'src>>),
     // `[name(args)] <item>` — a user macro attribute on a struct/enum/function:
     // the macro's name (with its span), the argument SPANS (their source text
     // is what `Arguments` carries — arguments are syntax), and the annotated
