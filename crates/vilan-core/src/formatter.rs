@@ -5041,13 +5041,29 @@ impl<'src> Printer<'src> {
                         self.blank_line();
                     }
                     self.line();
-                    self.print_match_leg(leg);
                     // The arm separator comma is optional and not kept in the AST
                     // (the corpus mixes `=> { .. },` and `=> { .. }`), so preserve
                     // whatever the source had to round-trip either style faithfully.
                     let body_end = body.1.into_range().end;
-                    if self.source_has_comma_at(body_end) {
+                    let comma = self.source_has_comma_at(body_end);
+                    let leg_start = self.out.len();
+                    let leg_cursor = self.cursor;
+                    self.print_match_leg(leg, Split::Off);
+                    if comma {
                         self.out.push(',');
+                    }
+                    // A leg's line is a measured line, exactly as a split list's
+                    // element is: over budget, the leg rolls back and reprints
+                    // with the split armed, so its BODY has somewhere to break.
+                    // The patterns and the guard are not layout sites — the
+                    // permission reaches the body and nothing else.
+                    if self.over_line_budget(leg_start) {
+                        self.out.truncate(leg_start);
+                        self.cursor = leg_cursor;
+                        self.print_match_leg(leg, Split::Tail);
+                        if comma {
+                            self.out.push(',');
+                        }
                     }
                     self.flush_trailing_comment(body_end);
                     prev_end = body_end;
@@ -5351,7 +5367,11 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints one `match` leg: `pattern[, pattern][ if guard] => body`.
-    fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>) {
+    ///
+    /// `split` is handed to the BODY and to nothing else: a pattern and a guard
+    /// have no layout of their own, so a leg whose line is over budget can only
+    /// break in its body.
+    fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>, split: Split) {
         let (patterns, guard, body) = leg;
         for (index, pattern) in patterns.iter().enumerate() {
             if index > 0 {
@@ -5364,6 +5384,7 @@ impl<'src> Printer<'src> {
             self.print_expr(guard);
         }
         self.out.push_str(" => ");
+        self.split = split;
         self.print_expr(body);
     }
 
@@ -10816,6 +10837,35 @@ mod if_arm_layout {
              \t\t\"positive\"\n\
              \t} else {\n\
              \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The width rule still applies. A `match` leg's line is a measured line
+    /// like a split list's element, so a leg whose inline `if` puts it over the
+    /// budget rolls back and reprints with the split armed — and the arms
+    /// expand, because an armed split is what the inline form yields to. Found
+    /// in `vilan/std/src/rpc.vl`, where the inline arm made a 175-column leg.
+    #[test]
+    fn a_leg_over_the_budget_expands_its_arms_again() {
+        let inline = "\t\tDialFailure::Refused(let status) => if status == \"401\"                       || status == \"403\" { RpcError::Unauthorized }                       else { RpcError::Transport(i\"refused by the server ({status})\") },";
+        assert_over_budget(inline);
+        assert_construct(
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\"              { RpcError::Unauthorized }              else { RpcError::Transport(i\"refused by the server ({status})\") },\n\
+             \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
+             \t}\n\
+             }\n",
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" {\n\
+             \t\t\tRpcError::Unauthorized\n\
+             \t\t} else {\n\
+             \t\t\tRpcError::Transport(i\"refused by the server ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
              \t}\n\
              }\n",
         );
