@@ -126,6 +126,15 @@ pub struct Func<'src> {
     // editor's fix). Distinct from a clause on a parameter's closure TYPE
     // (§8.5), which defers a closure's binding to its call sites.
     pub contexts: Option<(Vec<Spanned<&'src str>>, Span)>,
+    // Where a `context` clause would be INSERTED: the zero-width point after
+    // everything the signature already carries — the parameter list, the
+    // return type, a `borrows` clause — and before the body's `{` or the
+    // bodyless `;` (E148). The parser is the only thing that knows this
+    // position: nothing in the analyzed program records where a signature
+    // ENDS, only where its pieces are, so the editor's "declare the inferred
+    // contexts" fix had no span to insert at on a function that declares no
+    // clause at all. `None` for a synthesized function with no source text.
+    pub signature_end: Option<Span>,
     // `None` for a function signature without a body: a required trait method
     // declaration (`fun default(): Self;`) or an `external` intrinsic.
     pub body: Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>>,

@@ -581,6 +581,7 @@ fn analyze_source_unfenced(
                     return_type: Some(Box::new((Node::Accessor("Source"), head))),
                     borrows: None,
                     contexts: None,
+                    signature_end: None,
                     body: Some(body),
                 });
             }

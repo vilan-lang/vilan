@@ -4799,6 +4799,20 @@ impl<'a, 'src> Parser<'a, 'src> {
                 contexts = Some((names, Span::from(start..whole.end)));
             }
         }
+        // E148: where a `context` clause would be inserted — after the return
+        // type and after a `borrows` clause, before the body. Taken here,
+        // because this is the one moment the position exists: the analyzed
+        // program records where a signature's PIECES are and never where the
+        // signature ends, so the editor's fix had nowhere to write on a
+        // function carrying no clause.
+        let signature_end = self
+            .position
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+            .map(|(_, span)| {
+                let end = span.into_range().end;
+                Span::from(end..end)
+            });
         // A block body, or `;` for a signature-only declaration (a required trait
         // method or an `external` intrinsic). The block is tried first (chumsky
         // `block.map(Some).or(';'.map(|_| None))`), but the two lead on disjoint
@@ -4856,6 +4870,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return_type,
                 borrows,
                 contexts,
+                signature_end,
                 body,
             }),
             self.span_from(start),

@@ -3470,6 +3470,9 @@ pub struct Analyzer<'src> {
     prepped_function_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
     declared_function_contexts: HashMap<Id, Vec<Id>>,
     function_context_clause_spans: HashMap<Id, Span>,
+    /// Where a `context` clause would be inserted on each function, by
+    /// function id (E148) — the parser's [`crate::node::Func::signature_end`].
+    function_signature_end_spans: HashMap<Id, Span>,
     /// Whether the walk is inside a trait or `impl` item list, so a `context`
     /// clause on the declaration can be refused there (B242 defers members).
     walking_member_body: bool,
@@ -4565,6 +4568,7 @@ impl<'src> Analyzer<'src> {
             prepped_function_context_clauses: Vec::new(),
             declared_function_contexts: HashMap::default(),
             function_context_clause_spans: HashMap::default(),
+            function_signature_end_spans: HashMap::default(),
             walking_member_body: false,
             async_values: HashSet::default(),
             sync_values: HashSet::default(),
@@ -24013,6 +24017,12 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
+                // E148: where a `context` clause would be inserted on this
+                // function — the parser's own record, carried through so the
+                // editor's fix has a span on a function that declares none.
+                if let Some(signature_end) = function.signature_end {
+                    self.function_signature_end_spans.insert(id, signature_end);
+                }
                 // B242: the DECLARATION's `context` clause. Resolution is
                 // deferred past the import fixpoint exactly as a parameter
                 // clause's is (a clause may name an imported context), and the
@@ -42237,6 +42247,13 @@ pub struct Program<'src> {
     /// The span of each declared clause — the anchor for the subset refusal and
     /// the editor's "declare the inferred contexts" fix.
     pub function_context_clause_spans: HashMap<Id, Span>,
+    /// Where a `context` clause would be INSERTED on each function, by
+    /// function id (E148): the zero-width point after the parameter list, the
+    /// return type and a `borrows` clause, before the body's `{`. Nothing else
+    /// in the analyzed program says where a signature ends, and the editor's
+    /// "declare the inferred contexts" fix needs exactly that point to offer
+    /// itself on a function that declares no clause at all.
+    pub function_signature_end_spans: HashMap<Id, Span>,
     /// Functions and `run` closures that received a hidden context parameter —
     /// i.e. their body requires an ambient context (`context::thread_contexts`'
     /// `param_nodes`). Read by `check_context_drops` (destruction.md §8): a `drop`
@@ -49957,6 +49974,7 @@ fn analyze_over_world<'src>(
         parameter_contexts: analyzer.parameter_contexts,
         declared_function_contexts: std::mem::take(&mut analyzer.declared_function_contexts),
         function_context_clause_spans: std::mem::take(&mut analyzer.function_context_clause_spans),
+        function_signature_end_spans: std::mem::take(&mut analyzer.function_signature_end_spans),
         // Filled by `context::thread_contexts` from its `param_nodes`.
         context_dependent_functions: HashSet::default(),
         bitwise_generic_lhs: analyzer.bitwise_generic_lhs,
