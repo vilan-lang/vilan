@@ -59,6 +59,31 @@ leg_fmt() {
 # std, macro_std, the benchmarks, the examples, the templates and the `.vl`
 # fixtures under `crates/`. Products under a declared `generated` root are
 # excluded by `fmt` itself (build-hooks.md §12.4), not by an argument here.
+#
+# STATED EXCLUSION - the ```vilan fences of `vilan/docs` (and README.md) are
+# NOT held to the formatter, and this is a ruling rather than an oversight
+# (tracker N58). `.vl` FILES are the gate's subject; a fence is prose that
+# happens to compile, and `crates/vilan-core/tests/docs.rs` already holds all
+# 208 of them to the compiler, which is the claim that matters about a doc
+# example. Two reasons the fmt half is declined:
+#
+#   1. The formatter would rewrite 152 of the 208 - 1,062 lines - and 91 of
+#      those reflows are the same one: an ALIGNED TRAILING COMMENT moved onto a
+#      line of its own. `for i in Range::new(0, 3) {   // the end is exclusive`
+#      becomes two lines with the comment above the code it annotates. That
+#      alignment is how these pages teach; a gate that deletes it every time
+#      makes the docs worse to read in exchange for a consistency nobody reading
+#      them can see. E147's missing binary-operator break rule (N55's own find,
+#      still open) would join it on the conditions.
+#   2. There is no extractor to reuse from here. The fence rules live in a TEST
+#      target (`docs.rs`, already copied into `parse_differential.rs` because
+#      test targets cannot import one another) and `vilan fmt` is a vilan-cli
+#      BINARY, so extending this leg means lifting fence extraction into
+#      `vilan-core`'s library and teaching `fmt` markdown - a change with its own
+#      proposal, not a line in a shell script.
+#
+# If the exclusion is ever lifted, the reflow is its own commit (N55's shape):
+# reformat first, gate second, so the diff is readable as one thing.
 leg_vilan_fmt() {
     cargo run --quiet -p vilan-cli -- fmt --check .
 }
