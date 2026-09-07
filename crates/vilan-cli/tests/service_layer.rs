@@ -2014,3 +2014,120 @@ fun run(port: i32) {
 
     drop(dir);
 }
+
+/// A52's steer: bare `connect_socket(url)` offers `vilan-rpc`, so the refusal
+/// frame reaches it. The observable is the one A47 built the frame for — a
+/// refused connect answers AT ONCE with the server's status in the sentence,
+/// where an offer-nothing client cannot be told and pays the whole retry
+/// budget for `could not reach …`.
+///
+/// This is the call a first program writes: `connect_socket` + a hand-built
+/// `Client { transport = socket.transport(), … }` is the WebSocket fence in
+/// `guide/services.md` and the shape three pins in this file already use, so
+/// the bare spelling being the blind one was the wrong default. The explicit
+/// list is untouched, which the second half asserts: `connect_socket_with(url,
+/// ["chat.v1"])` offers `chat.v1` and NOT `vilan-rpc`, read back off the
+/// server's own `Handshake::protocols`.
+///
+/// Red first: with `connect_socket_with(url, [])` restored, the refused leg
+/// reads `refused:could not reach ws://localhost:<port>/` after ~24 s of
+/// backoff instead of naming the 401.
+#[test]
+fn a_bare_connect_socket_offers_vilan_rpc_and_an_explicit_list_is_untouched() {
+    let dir = temp_project("bare_offer");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ connect_socket, connect_socket_with };
+import std::rpc_server::{ Handshake, Reject, Service, Session };
+
+[service(NotesClient)]
+struct Notes {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun ping(self): i32 {
+		1
+	}
+}
+
+let notes: Notes = Notes { count = Signal::new(0) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec()))
+			.authorize(|handshake: Handshake| {
+				print(i"offered:{join(handshake.protocols)}");
+				Result::Err(Reject::Unauthorized)
+			}))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun join(names: List<str>): str {
+	mut out = "";
+	for name in names {
+		out = out + name + "|";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match connect_socket(i"ws://localhost:{port}/") {
+		Ok(let _socket) => print("bare:connected-unexpected"),
+		Err(let reason) => print(i"bare:{reason}"),
+	}
+	match connect_socket_with(i"ws://localhost:{port}/", ["chat.v1"]) {
+		Ok(let _socket) => print("explicit:connected-unexpected"),
+		Err(let reason) => print(i"explicit:{reason}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let started = Instant::now();
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let elapsed = started.elapsed();
+    // The bare call offered the protocol, so the server's typed refusal frame
+    // reached it and the status is in the sentence.
+    assert!(
+        stdout.contains("offered:vilan-rpc|"),
+        "a bare connect_socket must offer `vilan-rpc`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("bare:refused by the server (401)"),
+        "a bare connect_socket must be TOLD the refusal:\n{stdout}"
+    );
+    // The explicit list is offered exactly as written — no `vilan-rpc` smuggled
+    // in — so that client is refused the old, blind way.
+    assert!(
+        stdout.contains("offered:chat.v1|"),
+        "an explicit protocol list must be offered verbatim:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("explicit:could not reach"),
+        "a client that did not name the protocol is not told the status:\n{stdout}"
+    );
+    // One burned budget (the explicit leg's) is in this figure, not two.
+    assert!(
+        elapsed < Duration::from_secs(80),
+        "the bare leg must not wait out a retry budget of its own; the run took {elapsed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

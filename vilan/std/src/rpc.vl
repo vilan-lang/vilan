@@ -876,8 +876,23 @@ fun handle_drop(duplex: SocketDuplex) {
 /// socket is open — sends are safe after this returns). Dials with the same
 /// backoff as a reconnect, so a briefly-unavailable server delays the start
 /// instead of failing it; a server that stays away returns `Err`.
+///
+/// It offers `vilan-rpc` (tracker A52) — the same offer `dial_for_service`
+/// makes, and for the same reason A47 gave it to the generated `connect`: the
+/// server's typed refusal frame is only ever sent to a client that named this
+/// protocol, so a bare connect that did NOT offer it could not tell a 401 from
+/// an outage and paid ~24 s of backoff to learn nothing. This is the call a
+/// first program writes — the one in `guide/services.md`'s WebSocket fence and
+/// in every hand-built `Client { transport = socket.transport(), .. }` — so the
+/// bare spelling being the blind one was the wrong default.
+///
+/// `connect_socket_with(url, protocols)` is untouched and remains the escape:
+/// a list written by hand is offered exactly as written, `vilan-rpc` included
+/// only if the caller writes it. A server that speaks something else selects
+/// the client's first non-credential offer, which is what makes an explicit
+/// list the right seam for a non-vilan peer.
 fun connect_socket(url: str): Result<SocketDuplex, str> {
-	connect_socket_with(url, [])
+	connect_socket_with(url, [rpc_subprotocol()])
 }
 
 /// `connect_socket`, offering `protocols` on the handshake (A40) — the seam a

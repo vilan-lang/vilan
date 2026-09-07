@@ -229,7 +229,7 @@ a closed connection stayed reachable from its transport; the server half runs
 per disconnect, through `drop_session`.
 
 ```vilan,fragment
-fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff)
+fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff); offers `vilan-rpc`
 fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str>
 fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure>
 enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"/"503"
@@ -244,6 +244,12 @@ in one frame, which is the only way a refusal can be told from an unreachable
 server — no host WebSocket exposes a failed handshake's HTTP status. A refusal
 ends the retry budget at the first attempt.  `connect_socket` and
 `connect_socket_with` are this with the failure flattened to its sentence.
+
+`connect_socket` offers `vilan-rpc` (tracker A52), because the refusal frame is
+only sent to a client that named the protocol — a bare connect that offered
+nothing could not tell a 401 from an outage and paid the whole backoff to learn
+nothing. `connect_socket_with` offers exactly the list it is given, which is the
+seam for a peer that speaks something else.
 
 ## Server plumbing (`std::rpc_server`, process layer)
 
