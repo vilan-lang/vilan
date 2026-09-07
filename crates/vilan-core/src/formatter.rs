@@ -89,8 +89,51 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_import_runs(
-        &canonicalize_declaration_clauses(collapse_field_shorthands(drop_trailing_commas(tokens))),
+        &drop_redundant_import_aliases(canonicalize_declaration_clauses(
+            collapse_field_shorthands(drop_trailing_commas(tokens)),
+        )),
     )))
+}
+
+/// Drops an import alias that renames a name to ITSELF — `import a::b as b;` is
+/// `import a::b;` — so the safety check accepts the formatter canonicalizing one
+/// into the other (E145's formatter third).
+///
+/// Recognized by shape, inside an import statement only: the three-token run
+/// `IDENT "as" IDENT` with both names equal, between an `import`/`use` head and
+/// its `;`. `as` reaches the lexer as a plain identifier and appears in exactly
+/// one production, so the statement bound is belt and braces rather than
+/// necessity — but it is what makes the pass unable to touch anything else.
+///
+/// An alias that renames to a DIFFERENT name is untouched, at every depth: it
+/// binds a name the module does not otherwise have, and dropping it would be a
+/// program change, not a canonicalization.
+fn drop_redundant_import_aliases(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut in_import = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        match &tokens[index] {
+            Token::Import | Token::Use => in_import = true,
+            Token::Ctrl(';') => in_import = false,
+            _ => {}
+        }
+        if in_import
+            && let (Some(Token::Ident(name)), Some(Token::Ident("as")), Some(Token::Ident(alias))) = (
+                tokens.get(index),
+                tokens.get(index + 1),
+                tokens.get(index + 2),
+            )
+            && name == alias
+        {
+            result.push(tokens[index].clone());
+            index += 3;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
 }
 
 /// Puts a declaration's two trailing clauses into the canonical order —
@@ -310,6 +353,10 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
             ImportTail::Continue(child) => {
                 TokenBranch::Path(name, Some(Box::new(branch_from_ast(child))), None)
             }
+            // An alias that renames a name to itself is no alias at all, and
+            // reduces to the plain path here so the shared key cannot order the
+            // two spellings apart (E145).
+            ImportTail::Alias(alias, _) if alias == name => TokenBranch::Path(name, None, None),
             ImportTail::Alias(alias, _) => TokenBranch::Path(name, None, Some(alias)),
         },
         ImportBranch::Set(branches) => {
@@ -2571,6 +2618,12 @@ impl<'src> Printer<'src> {
                         self.split = split;
                         self.print_import_branch(child, sort);
                     }
+                    // `import a::b as b;` renames `b` to `b` — it binds
+                    // exactly what the plain import binds, so the plain import
+                    // is the canonical spelling and the alias is dropped
+                    // (E145). `as c` binds a name the module does not otherwise
+                    // have and is a program, not a spelling: untouched.
+                    ImportTail::Alias(alias, _) if alias == name => {}
                     ImportTail::Alias(alias, _) => {
                         self.out.push_str(" as ");
                         self.out.push_str(alias);
@@ -9530,6 +9583,67 @@ mod import_sorting {
             normalize(raw_tokens("import std::json::{ Json as Doc };\n")),
             normalize(raw_tokens("import std::json::Json as Doc;\n")),
             "the net must see the braced and collapsed spellings as one",
+        );
+    }
+
+    // --- E145: a redundant alias collapses -----------------------------------
+
+    // `import a::b as b;` binds exactly what `import a::b;` binds — the alias
+    // renames a name to itself — so the plain import is the canonical spelling
+    // and the `as` is dropped. The net reduces both to the same tokens, which
+    // is what lets the reprint through.
+    #[test]
+    fn a_redundant_alias_collapses() {
+        assert_sorts(
+            "import std::json::Json as Json;\n",
+            "import std::json::Json;\n",
+        );
+        assert_sorts("use pkg::app::state as state;\n", "use pkg::app::state;\n");
+        // Inside a brace set, and beside a member that keeps its own alias.
+        assert_sorts(
+            "import std::json::{ Json as Json, Value as V };\n",
+            "import std::json::{ Json, Value as V };\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::json::Json as Json;\n")),
+            normalize(raw_tokens("import std::json::Json;\n")),
+            "the net must see the aliased and plain spellings as one",
+        );
+    }
+
+    // An alias that renames to a DIFFERENT name binds a name the module does
+    // not otherwise have. It is a program, not a spelling, and is untouched —
+    // including one that differs only in case.
+    #[test]
+    fn a_real_alias_is_untouched() {
+        assert_sorts(
+            "import std::json::Json as Doc;\n",
+            "import std::json::Json as Doc;\n",
+        );
+        assert_sorts(
+            "import std::json::Json as json;\n",
+            "import std::json::Json as json;\n",
+        );
+        assert_ne!(
+            normalize(raw_tokens("import std::json::Json as Doc;\n")),
+            normalize(raw_tokens("import std::json::Json;\n")),
+            "a real alias is part of what the net compares",
+        );
+    }
+
+    // A BLOCK-SCOPED import is left as written in every other respect (its
+    // brace set is not even sorted — a deliberate placement), but a redundant
+    // alias is not a placement, and the net's pass reaches every depth, so the
+    // collapse holds there too rather than falling the whole file back.
+    #[test]
+    fn a_redundant_alias_collapses_inside_a_block() {
+        assert_sorts(
+            "fun demo() {\n\timport std::json::Json as Json;\n\tJson::parse(\"1\");\n}\n",
+            "fun demo() {\n\timport std::json::Json;\n\tJson::parse(\"1\");\n}\n",
+        );
+        assert_sorts(
+            "fun demo() {\n\timport std::json::Json as Doc;\n\tDoc::parse(\"1\");\n}\n",
+            "fun demo() {\n\timport std::json::Json as Doc;\n\tDoc::parse(\"1\");\n}\n",
         );
     }
 
