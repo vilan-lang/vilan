@@ -1629,6 +1629,27 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
              }"
         }
+        // `List.remove(i): T` — the checked splice read. `splice` is the native
+        // `memmove`, but it reads a NEGATIVE index from the END and clamps one
+        // past it, so a bare `list.splice(index, 1)[0]` would silently answer
+        // exactly the indices `[]` panics on. The guard is `__at`'s, word for
+        // word, so a caller cannot tell which of the two refused.
+        "__remove_at" => {
+            "function __remove_at(list, index) {\n\
+             \tif (index >= 0 && index < list.length) return list.splice(index, 1)[0];\n\
+             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             }"
+        }
+        // `List.insert(i, v)` — the checked splice write. `index == length`
+        // appends (a `push`, which is what the vilan shift loop did); anything
+        // outside `0..=length` panics in `__at`'s words.
+        "__insert_at" => {
+            "function __insert_at(list, index, value) {\n\
+             \tif (index >= 0 && index < list.length) return void list.splice(index, 0, value);\n\
+             \tif (index === list.length) return void list.push(value);\n\
+             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             }"
+        }
         // `list[i] = v` — the checked subscript write: writing never creates a
         // slot (growth is `push`), so out of bounds panics.
         "__at_put" => {
@@ -6911,6 +6932,23 @@ impl<'src> Transformer<'src> {
                 self.used_helpers.insert("__list_pop");
                 js::Node::Call(
                     Box::new(js::Node::Local("__list_pop".to_string())),
+                    args.collect(),
+                )
+            }
+            // NOT `native_method`: `splice` clamps and reads from the end, so
+            // the bounds panic `remove`/`insert` document has to be a helper's
+            // (the same reason `substring` is not the native method).
+            Intrinsic::ListRemove => {
+                self.used_helpers.insert("__remove_at");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__remove_at".to_string())),
+                    args.collect(),
+                )
+            }
+            Intrinsic::ListInsert => {
+                self.used_helpers.insert("__insert_at");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__insert_at".to_string())),
                     args.collect(),
                 )
             }

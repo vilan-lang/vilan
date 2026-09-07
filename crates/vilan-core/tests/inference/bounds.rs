@@ -2940,6 +2940,266 @@ fn an_out_of_bounds_view_mint_panics() {
     );
 }
 
+// --- M47: `List::remove`/`List::insert` lowered over the native `splice`. ---
+// --- `splice` CLAMPS an index past the end and reads a NEGATIVE one from  ---
+// --- the end, so the emitted helpers keep `__at`'s guard and its wording:  ---
+// --- a bare splice would answer exactly the indices the docs say a caller  ---
+// --- must be punished for, and answer them with a plausible element.       ---
+
+#[test]
+fn list_remove_and_insert_emit_the_splice_helpers_not_a_shift_loop() {
+    // The claim is about the EMITTED program, not the source: before M47 both
+    // were vilan bodies that walked the tail through `__at`/`__at_put` (and
+    // `__clone`d every moved element). One `memmove` each now.
+    let js = compile(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(1);
+            xs.push(3);
+            xs.insert(1, 2);
+            print(xs.remove(0));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        js.contains("list.splice(index, 1)[0]") && js.contains("list.splice(index, 0, value)"),
+        "the splice helpers are not emitted:\n{js}"
+    );
+    assert!(
+        !js.contains("__at_put"),
+        "a shift loop's checked store survives — the lowering is still the vilan body:\n{js}"
+    );
+}
+
+#[test]
+fn a_list_remove_past_the_end_panics_rather_than_clamping() {
+    // `[3].splice(3, 1)` is `[]` — a bare splice would return `undefined` here
+    // and carry on.
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.push(30);
+            print(xs.remove(3));
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is 3",
+    );
+}
+
+#[test]
+fn a_negative_list_remove_panics_rather_than_counting_from_the_end() {
+    // `[10,20,30].splice(-1, 1)` is `[30]` — a bare splice would hand back the
+    // LAST element, a plausible answer to a question nobody asked.
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.push(30);
+            let i = 0 - 1;
+            print(xs.remove(i));
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is -1",
+    );
+}
+
+#[test]
+fn a_list_insert_past_the_end_panics_rather_than_appending() {
+    // `len + 1`: `splice` clamps it to the end and appends, which is exactly
+    // the index `insert`'s doc says is a caller bug (`len` itself appends).
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.push(30);
+            xs.insert(4, 40);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is 4",
+    );
+}
+
+#[test]
+fn a_negative_list_insert_panics_rather_than_counting_from_the_end() {
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            let i = 0 - 1;
+            xs.insert(i, 40);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 1 but the index is -1",
+    );
+}
+
+#[test]
+fn a_list_insert_at_the_length_appends() {
+    // The one index at the boundary that is NOT a bug: `index == len` is the
+    // documented append, and the helper takes the `push` arm for it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.insert(2, 30);
+            print(xs.len());
+            print(xs[2]);
+            print(xs.remove(2));
+            print(xs.len());
+        }
+        main();
+        "#,
+        "3\n30\n30\n2\n",
+    );
+}
+
+#[test]
+fn const_eval_refuses_the_same_list_remove_the_runtime_refuses() {
+    // The interpreter's twin of the helper. If const eval clamped where the
+    // runtime panics, a macro could compute an answer the program cannot.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun pick(): i32 {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.remove(1)
+        }
+        let BAD: i32 = const pick();
+        fun main() { print(BAD); }
+        "#,
+        "index out of bounds: the length is 1 but the index is 1",
+    );
+}
+
+#[test]
+fn const_eval_refuses_the_same_list_insert_the_runtime_refuses() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun grow(): i32 {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.insert(3, 20);
+            xs.len()
+        }
+        let BAD: i32 = const grow();
+        fun main() { print(BAD); }
+        "#,
+        "index out of bounds: the length is 1 but the index is 3",
+    );
+}
+
+#[test]
+fn const_eval_agrees_with_the_runtime_on_an_in_bounds_list_splice() {
+    // Both legs of the same program: the const site folds to a literal and the
+    // runtime leg recomputes it. A disagreement here is the silent kind.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun rearranged(): i32 {
+            mut xs: List<i32> = List::new();
+            xs.push(1);
+            xs.push(3);
+            xs.push(4);
+            xs.insert(1, 2);
+            xs.insert(4, 5);
+            let head = xs.remove(0);
+            head * 100 + xs.remove(1) * 10 + xs.len()
+        }
+        let FOLDED: i32 = const rearranged();
+        fun main() { print(FOLDED); print(rearranged()); }
+        "#,
+        "133\n133\n",
+    );
+}
+
+// --- M43: the const-eval interpreter's environment maps hash with `fx`, ---
+// --- not SipHash. `Scope::vars` is never iterated (pinned in            ---
+// --- `interpreter.rs`), so the swap moves nothing — these two say so    ---
+// --- from the outside: the same answers, and the same ORDER for the one ---
+// --- thing a const evaluation genuinely walks.                          ---
+
+#[test]
+fn const_eval_resolves_shadowed_bindings_across_nested_scopes() {
+    // Every read and write here is a `Scope::vars` hash on a short `&str`,
+    // which is what M43 rehashed. Names that shadow across three depths, in an
+    // order no lexical sort would agree with, so a table that lost or crossed
+    // an entry answers differently rather than merely more slowly.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun layered(): i32 {
+            mut total = 0;
+            mut alpha = 1;
+            let beta = 2;
+            mut index = 0;
+            for index < 4 {
+                let alpha = index * 10;
+                mut beta = alpha + 1;
+                if beta > 10 {
+                    let gamma = beta * 2;
+                    beta = gamma - alpha;
+                }
+                total = total + alpha + beta;
+                index += 1;
+            }
+            total + alpha + beta
+        }
+        let FOLDED: i32 = const layered();
+        fun main() { print(FOLDED); print(layered()); }
+        "#,
+        "130\n130\n",
+    );
+}
+
+#[test]
+fn const_eval_keeps_a_maps_insertion_order() {
+    // The interpreter's Map/Set/object values stay `indexmap::IndexMap` on
+    // std's hasher — they are HOST containers whose walk order is visible to
+    // the program. Keys chosen so neither ascending nor descending order is
+    // the insertion order, which is what makes this a pin rather than a
+    // coincidence.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        import std::map::Map;
+        fun ordered(): str {
+            mut table: Map<str, i32> = Map::new();
+            table.insert("zeta", 1);
+            table.insert("alpha", 2);
+            table.insert("mu", 3);
+            table.insert("beta", 4);
+            table.keys().join(",")
+        }
+        let FOLDED: str = const ordered();
+        fun main() { print(FOLDED); print(ordered()); }
+        "#,
+        "zeta,alpha,mu,beta\nzeta,alpha,mu,beta\n",
+    );
+}
+
 #[test]
 fn an_empty_list_subscript_panics() {
     // view-invalidation.md §1's P1 case: the empty list, subscripted.

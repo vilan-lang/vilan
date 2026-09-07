@@ -56,9 +56,28 @@
 //!
 //! **Where it is applied.** The id-keyed modules: `analyzer`, `async_infer`,
 //! `context`, `const_eval`, `init_order`, `call_graph`, `chunks`, `type_`,
-//! `platform_color`, `transformer`, `macros`. The string-keyed modules —
-//! `bindgen`, `manifest`, `interpreter` — keep `std`'s default hasher, since
-//! they are not in the cold-analysis hot path and have nothing to win.
+//! `platform_color`, `transformer`, `macros` — and, since backlog M43, the
+//! *string*-keyed environment maps of the const-evaluation `interpreter`.
+//!
+//! That last one is the correction of a claim this file used to make. E48 left
+//! `bindgen`, `manifest` and `interpreter` on `std`'s hasher "since they are not
+//! in the cold-analysis hot path and have nothing to win", and M31's profile
+//! falsified the interpreter half of it in the only way that settles such a
+//! question: after the analyzer's 35 `IndexMap`s moved here, **83M of the 85M
+//! Ir still in `sip.rs` was `interpreter::lookup`/`assign`** — 1.3% of a cold
+//! kolt client check, spent hashing short `&str` names in `Scope::vars` on
+//! every variable read and write a `const` evaluation performs. A const site is
+//! cold-path *code* and hot-path *work*: it runs a whole program at analysis
+//! time. `bindgen` and `manifest` do stay on `std`'s hasher — they are consulted
+//! a few hundred times per build, and no profile has ever named them.
+//!
+//! `Scope::vars` is a plain `FxHashMap`, never `IndexMap`: it is read by
+//! `get`/`get_mut` and written by `insert`/`clear`, and is **never iterated**,
+//! so no iteration order exists for a hasher to move (`the_scope_map_is_never_
+//! iterated` in `interpreter.rs` holds that shape). What a const evaluation DOES
+//! iterate — a JS `Map`, `Set` or object literal it builds — stays an
+//! `indexmap::IndexMap` on `std`'s hasher, because those are host containers
+//! whose insertion order is program-visible and whose keys are values, not ids.
 //!
 //! **The collision-resistance question, answered rather than waved at.** This
 //! hasher is fast, not adversarial-proof: an attacker who can choose keys can

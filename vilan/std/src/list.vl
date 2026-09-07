@@ -2,7 +2,6 @@
 // intrinsic): a `List` value is a native JS array, `List::new()` is `[]`, and
 // `push` is the native `.push`. Iterating a `List` uses a native `for...of`.
 import pkg::default::Default;
-import pkg::io::panic;
 import pkg::iterator::ListIterator;
 import pkg::operators::{ Add, Mul };
 import pkg::option::Option;
@@ -89,43 +88,23 @@ impl List<type T> {
 	/// index is a caller bug, the class `[]` already punishes. (`get`'s
 	/// `Option` is for callers who don't know whether an index is live; an
 	/// arbitrary bad index passed to a splice is not that.)
-	fun insert(&mut self, index: i32, value: T): void {
-		let length = self.len();
-		if index < 0 || index > length {
-			panic(i"index out of bounds: the length is {length} but the index is {index}");
-		}
-		if index == length {
-			self.push(value);
-		} else {
-			// Grow by one (duplicating the last element), then shift the tail
-			// right into the new slot and overwrite the hole.
-			self.push(self[length - 1]);
-			mut cursor = length - 1;
-			for cursor > index {
-				self[cursor] = self[cursor - 1];
-				cursor -= 1;
-			}
-			self[index] = value;
-		}
-	}
+	///
+	/// An intrinsic, like `pop`: the compiler lowers it over the native
+	/// `.splice`, one `memmove` instead of a checked load and store per moved
+	/// element. The emitted helper keeps the panic, because `splice` CLAMPS an
+	/// index past the end — it would silently accept exactly the index this
+	/// doc says a caller must be punished for.
+	external fun insert(&mut self, index: i32, own value: T): void;
 
 	/// Removes and returns the element at `index`, shifting the tail left.
 	/// PANICS out of bounds — see `insert`. (`pop` returns an `Option` because
 	/// "the list was empty" is a normal condition; a bad index is not.)
-	fun remove(&mut self, index: i32): T {
-		let length = self.len();
-		if index < 0 || index >= length {
-			panic(i"index out of bounds: the length is {length} but the index is {index}");
-		}
-		let removed = self[index];
-		mut cursor = index;
-		for cursor < length - 1 {
-			self[cursor] = self[cursor + 1];
-			cursor += 1;
-		}
-		self.pop();
-		removed
-	}
+	///
+	/// An intrinsic over the native `.splice`, like `insert`. The emitted
+	/// helper keeps the panic: `splice` reads a NEGATIVE index from the END,
+	/// so a bare `splice(index, 1)[0]` would answer `xs.remove(-1)` with the
+	/// last element instead of refusing.
+	external fun remove(&mut self, index: i32): T;
 }
 
 // `sum`/`product` seed with the first element and fall back to `T::default()`
