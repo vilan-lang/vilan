@@ -1871,3 +1871,146 @@ fun main() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A52: the 503 arm — an infrastructure refusal an app can give -----------
+
+/// A service that is up, reads the token fine, and still says no: the
+/// infrastructure behind it is not ready. `AUTHORIZED_SERVER` with its whole
+/// `authorize` body replaced, so the two differ in exactly the refusal.
+fn draining_server() -> String {
+    let refused = AUTHORIZED_SERVER.replace(
+        r#"			.authorize(|handshake: Handshake| match handshake.token() {
+				Some(let token) => if token == "good" {
+					Result::Ok(Session::of("ada").with_credential(token))
+				} else {
+					Result::Err(Reject::Forbidden)
+				},
+				None => Result::Err(Reject::Unauthorized),
+			}))"#,
+        r#"			.authorize(|_handshake: Handshake| Result::Err(Reject::Unavailable)))"#,
+    );
+    assert!(
+        refused.contains("Reject::Unavailable"),
+        "the authorize body to replace moved"
+    );
+    refused
+}
+
+/// The wire half of A52's arm: 503 both ways out of `refuse_upgrade`. A vilan
+/// client (one that offered `vilan-rpc`) is upgraded and told
+/// `__reject:503` as a frame; anything else — a browser, a probe, a health
+/// check — gets the plain status line, `503 Service Unavailable`.
+///
+/// `Unavailable` is eligible for the frame path where `TooMany` is not, and the
+/// DoS bound A47 argued is untouched: eligibility is "the APP decided this",
+/// and the app's `authorize` runs behind `handshake_rate` and
+/// `max_connections`, which produce `TooMany` and nothing else.
+///
+/// Red first: with the arm absent the program does not compile
+/// (`Reject::Unavailable` is not a variant); with the arm present but left out
+/// of `tells_the_client`, the frame leg reads back `HTTP/1.1 503 Service
+/// Unavailable` instead of the 101 and the client cannot see it at all.
+#[test]
+fn an_unavailable_service_refuses_with_503_as_a_frame_and_as_a_status_line() {
+    let (server, port) = spawn_service_server("unavailable", &draining_server());
+
+    let told = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    assert!(
+        told.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a vilan client must be upgraded so the 503 can be a frame: {told}"
+    );
+    assert!(
+        told.contains("__reject:503"),
+        "the refusal frame must carry 503: {told}"
+    );
+    assert!(
+        !told.contains("__conn:"),
+        "a refused client must never be announced a connection id: {told}"
+    );
+
+    // Everything that does not speak this protocol keeps plain HTTP semantics.
+    let plain = raw_upgrade(port, "/", "");
+    assert!(
+        plain.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "a non-rpc handshake must get the status line: {plain}"
+    );
+
+    drop(server);
+}
+
+/// The client half, end to end: `connect` against a service whose `authorize`
+/// answers `Reject::Unavailable` comes back `RpcError::Unavailable` — not
+/// `Unauthorized` (the credential is fine), not `Transport` (the server
+/// answered) — and it comes back AT ONCE, because a refusal ends the dial loop
+/// exactly as A47's does.
+///
+/// The comparison is written with `==` rather than a `match`, which is A52's
+/// other half working: the derive and the arm are one surface for an app.
+#[test]
+fn a_client_refused_by_infrastructure_reports_unavailable_and_compares_equal() {
+    let dir = temp_project("unavailable_client");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(draining_server()
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::RpcError;\nimport std::result::Result::{ Ok, Err };",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let _client) => print("connected:unexpected"),
+		Err(let error) => {
+			print(i"refused:{error.debug()}");
+			print(i"is-unavailable:{error == RpcError::Unavailable}");
+			print(i"is-unauthorized:{error == RpcError::Unauthorized}");
+		},
+	}
+	exit(0);
+}
+"#),
+    );
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("run")
+        .arg(".")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the unavailable-client program");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    for expected in [
+        "refused:Unavailable",
+        "is-unavailable:true",
+        "is-unauthorized:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing; stdout was:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The same bound A47's pin carries, and for the same reason: the burned
+    // budget is ~27.75 s of sleeping alone, and a build is inside this figure.
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "the refusal must not wait out the retry budget; the whole run took {elapsed:?}"
+    );
+
+    drop(dir);
+}

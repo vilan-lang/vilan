@@ -967,6 +967,13 @@ enum RpcError {
 	// sides were built against different service surfaces.
 	Contract(str),
 	Unauthorized,
+	/// The server refused this connection with a 503 (tracker A52): a
+	/// judgement about NEITHER the credential nor the rate — the infrastructure
+	/// behind the service is not ready to serve this client. The client's
+	/// answer is "not now", where `Unauthorized`'s is "not with this
+	/// credential": retrying later is the right thing, retrying immediately is
+	/// not, and re-authenticating is beside the point.
+	Unavailable,
 }
 
 // --- Envelope encode/decode (shared by `call`, the protocol, and benchmarks) --
@@ -2785,6 +2792,12 @@ fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, 
 		// log to carry.
 		DialFailure::Refused(let status) => if status == "401" || status == "403" {
 			RpcError::Unauthorized
+		} else if status == "503" {
+			// A52's arm. Distinct from `Unauthorized` because the app's answer
+			// differs — a sign-in prompt is the wrong response to a draining
+			// node — and distinct from `Transport` because the server ANSWERED:
+			// it is not unreachable, it declined.
+			RpcError::Unavailable
 		} else {
 			RpcError::Transport(i"refused by the server ({status})")
 		},
