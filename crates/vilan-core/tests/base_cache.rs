@@ -2001,3 +2001,132 @@ fn the_cold_std_analysis_is_the_per_process_floor_an_on_disk_world_would_remove(
         cold - warm,
     );
 }
+
+// --- M44: the base cache's "under construction" claim -----------------------
+
+/// PROGRAM_C's import set with two different bodies: two members of one
+/// workspace, one base world. Deliberately the set this file already chose
+/// for reaching NO macro-defining std module — a nested macro world consults
+/// the cache on its own account, so a fixture that drags one makes the miss
+/// delta count two things at once and this pin's whole subject is the delta.
+const PROGRAM_D: &str =
+    "import std::io::print;\nimport std::math::PI;\nfun main() { print(PI); }\n";
+const PROGRAM_E: &str =
+    "import std::io::print;\nimport std::math::PI;\nfun main() { print(PI + 1.0); }\n";
+
+/// M35 put a workspace's members on their own threads and measured the price
+/// it did not pay for: every member starts cold, so N members build the SAME
+/// pre-entry world N times — 1.13× one entry's wall at +63% CPU. The world is
+/// not member-specific, so the second member should be waiting for the first's
+/// rather than racing it.
+///
+/// The window is OBSERVED rather than slept through:
+/// `base_cache_building()` reads the claim table, so the second analysis
+/// provably starts while the first is still inside its build. Without the
+/// claim this is two misses and no hit, which is what M35 measured.
+#[test]
+fn a_second_thread_waits_for_the_world_the_first_is_building() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    let waits_before = vilan_core::analyzer::base_cache_build_waits();
+
+    let first = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| observe(PROGRAM_D))
+        .expect("spawn the first member");
+
+    // Wait for the claim to exist, not for a duration: a sleep here would be
+    // a guess about how long a cold std analysis takes on a loaded box.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while vilan_core::analyzer::base_cache_building() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first analysis never claimed its key — the construction window \
+             this pin needs was never open"
+        );
+        std::thread::yield_now();
+    }
+
+    let second = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| observe(PROGRAM_E))
+        .expect("spawn the second member");
+
+    let first = first.join().expect("the first member panicked");
+    let second = second.join().expect("the second member panicked");
+
+    let (hits_after, misses_after) = stats();
+    let waits_after = vilan_core::analyzer::base_cache_build_waits();
+    assert_eq!(
+        misses_after - misses_before,
+        1,
+        "two cold members built two worlds: the second did not wait for the first's \
+         (hits +{}, misses +{}, waits +{})",
+        hits_after - hits_before,
+        misses_after - misses_before,
+        waits_after - waits_before
+    );
+    assert_eq!(
+        hits_after - hits_before,
+        1,
+        "the waiter was not served the world it waited for"
+    );
+    assert_eq!(
+        waits_after - waits_before,
+        1,
+        "nothing waited — this pin raced instead of measuring"
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_building(),
+        0,
+        "a claim outlived the analysis that took it"
+    );
+
+    // The waiter's answers are the answers, not just its timing.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh_first = observe(PROGRAM_D);
+    let fresh_second = observe(PROGRAM_E);
+    assert_eq!(first, fresh_first, "the builder's observations moved");
+    assert_eq!(second, fresh_second, "the waiter's observations moved");
+}
+
+/// The claim is released by a `Drop`, so an analysis that PANICS on its way
+/// out cannot leave a key claimed for the 120 s deadline — a waiter behind it
+/// would otherwise stall a whole `check`.
+#[test]
+fn a_panicking_analysis_releases_its_construction_claim() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let spec_for_worker = spec.clone();
+    let worker = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (program, _errors) = analyze_source(
+                    PROGRAM_D,
+                    &spec_for_worker,
+                    Path::new("."),
+                    Path::new("cache_probe.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                drop(program);
+                panic!("a deliberate unwind past the construction claim");
+            }));
+        })
+        .expect("spawn the unwinding analysis");
+    worker.join().expect("the worker itself must not abort");
+    assert_eq!(
+        vilan_core::analyzer::base_cache_building(),
+        0,
+        "the claim survived an unwind: every waiter behind it now sleeps to the deadline"
+    );
+    // And the cache still works afterwards.
+    let _ = observe(PROGRAM_E);
+}

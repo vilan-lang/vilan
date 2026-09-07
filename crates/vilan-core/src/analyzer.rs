@@ -45678,6 +45678,41 @@ static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<BaseCacheState>> =
 static BASE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BASE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// M44: signalled whenever a key leaves [`BaseCacheState::building`] — a
+/// world was stored under it, or the thread that claimed it gave up. Paired
+/// with [`BASE_CACHE`]'s own mutex, so a waiter is woken holding the state it
+/// is about to re-read.
+static BASE_CACHE_BUILT: std::sync::Condvar = std::sync::Condvar::new();
+
+/// How many times a thread WAITED for another thread's world instead of
+/// building a second copy of it (M44) — the probe the parallel-check pins
+/// read, since the saving is invisible in the hit/miss counters (a waiter is
+/// served a hit, exactly as if it had arrived second).
+static BASE_CACHE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The longest a waiter sleeps before deciding the claim-holder is never
+/// coming back and building the world itself.
+///
+/// A deadline rather than an untimed wait, even though the claim is released
+/// by a `Drop` that an unwind also runs: a cache is not a place to learn that
+/// a liveness argument had a hole. Generous, because the thing being waited
+/// for is a whole cold analysis of a package's std and dependency surface —
+/// the point is that a wait cannot become a HANG, not that it is short.
+const BASE_CACHE_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+thread_local! {
+    /// Base-cache construction claims this thread is holding (M44).
+    ///
+    /// A thread waits only when it holds NONE, which is what makes waiting
+    /// cycle-free and therefore deadlock-free by construction: a waiter owns
+    /// nothing another waiter could be waiting on. It matters in two real
+    /// shapes — a macro-world compile nested inside an analysis, which can
+    /// mint the SAME key as the analysis around it (the key carries no entry
+    /// path), and `expand_entry_over_world`'s rebuild — where an untracked
+    /// wait would be a thread waiting on itself.
+    static BASE_CACHE_CLAIMS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The default retained-world byte budget (M24): generous, because the point
 /// is a BOUND, not a diet — a session that meets a handful of key shapes must
 /// never notice it, and one that walks a large workspace must not grow
@@ -45700,6 +45735,12 @@ struct BaseCacheState {
     worlds: HashMap<BaseCacheKey, StoredWorld>,
     retained_bytes: usize,
     tick: u64,
+    /// M44: keys whose world some thread is BUILDING right now, and which
+    /// thread claimed each. A second thread that misses the same key waits
+    /// for the first's world instead of recomputing it; the thread id is what
+    /// lets a nested analysis on the CLAIMING thread recognise its own claim
+    /// and build unclaimed rather than wait on itself.
+    building: HashMap<BaseCacheKey, std::thread::ThreadId>,
 }
 
 impl BaseCacheState {
@@ -46325,11 +46366,14 @@ fn checked_cache_clear() {
 /// A validated, entry-patched clone of the cached world for this key, or
 /// `None` (a miss, counted). Validation re-reads every recorded source and
 /// compares content hashes; a stale world is evicted, not repaired.
-fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'static>> {
-    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
-    let mut state = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+/// Does NOT count: [`base_cache_admit`] owns the hit/miss counters, because a
+/// waiter looks twice (once to find the key absent, once after the builder
+/// releases it) and one analysis must contribute exactly one observation.
+fn base_cache_lookup_locked(
+    state: &mut BaseCacheState,
+    key: &BaseCacheKey,
+    entry_path: &Path,
+) -> BaseCacheLookup {
     let stale = if let Some(stored) = state.worlds.get(key) {
         let world = &stored.world;
         let entry_canonical = crate::util::canonical_path(entry_path);
@@ -46368,7 +46412,6 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
                             .collect(),
                     ));
             if claimable {
-                BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let clone = world.clone();
                 // M24: a hit refreshes the world's recency, so the LRU keeps
                 // what a session keeps coming back to.
@@ -46376,12 +46419,13 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
                 if let Some(stored) = state.worlds.get_mut(key) {
                     stored.last_hit = tick;
                 }
-                return Some(clone);
+                return BaseCacheLookup::Hit(clone);
             }
             // Not stale — just not servable to THIS caller. Leave it stored
             // for the analyses that can claim it.
-            BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return None;
+            // M44: waiting would be pointless — the world already exists and
+            // this caller still could not hold it — so this miss never sleeps.
+            return BaseCacheLookup::Unservable;
         }
         true
     } else {
@@ -46398,8 +46442,148 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
             unsafe { release_stored_world(evicted) };
         }
     }
-    BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    None
+    BaseCacheLookup::Absent
+}
+
+/// What a base-cache lookup found, which M44 needs to tell apart: `Absent` is
+/// the only miss worth WAITING on, because it is the only one another
+/// thread's build can turn into a hit.
+enum BaseCacheLookup {
+    Hit(World<'static>),
+    /// No world under this key. Either build it, or wait for the thread that
+    /// already claimed it.
+    Absent,
+    /// A world exists but cannot be served to this caller (M23: it holds
+    /// overlay claims and this analysis has nowhere to keep one) — or it was
+    /// stale and has just been evicted. Building is the only way forward.
+    Unservable,
+}
+
+/// A base-cache key this thread has claimed and is building a world for
+/// (M44). Releasing is the `Drop`, so every way out of an analysis — the
+/// store, an early return, a panic unwinding through it — wakes the waiters
+/// rather than leaving them on the 120 s deadline.
+struct BaseCacheBuild {
+    key: BaseCacheKey,
+}
+
+impl Drop for BaseCacheBuild {
+    fn drop(&mut self) {
+        BASE_CACHE_CLAIMS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+        {
+            let mut state = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.building.remove(&self.key);
+        }
+        // Every waiter, not one: the waiters are keyed by different keys on
+        // one condvar, so each has to re-read the state to see whether the
+        // wake was theirs.
+        BASE_CACHE_BUILT.notify_all();
+    }
+}
+
+/// The base cache's admission (M44): a validated world for this key, or the
+/// claim that says THIS thread is the one building it.
+///
+/// M35 put a workspace's members on their own threads and measured the price:
+/// every member starts cold, so N members recompute one base world N times —
+/// 1.13× a single entry's wall at **+63% CPU** when nothing is warm, and
+/// slower in both under load. The world is not member-specific; the second
+/// member wants exactly the bytes the first is in the middle of producing.
+///
+/// So a miss on an unclaimed key CLAIMS it, and a miss on a claimed key
+/// SLEEPS until the claim is released, then looks again — arriving at a hit
+/// the first member paid for. The wait is bounded ([`BASE_CACHE_BUILD_WAIT`])
+/// and is only ever taken by a thread holding no claim of its own, so it
+/// cannot close a cycle. Returning `(None, None)` means "build, but do not
+/// claim": someone else owns the key, or this thread already does.
+fn base_cache_admit(
+    key: &BaseCacheKey,
+    entry_path: &Path,
+) -> (Option<World<'static>>, Option<BaseCacheBuild>) {
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let deadline = std::time::Instant::now() + BASE_CACHE_BUILD_WAIT;
+    let mut waited = false;
+    loop {
+        match base_cache_lookup_locked(&mut state, key, entry_path) {
+            BaseCacheLookup::Hit(world) => {
+                BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if waited {
+                    BASE_CACHE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                return (Some(world), None);
+            }
+            BaseCacheLookup::Unservable => {
+                BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (None, None);
+            }
+            BaseCacheLookup::Absent => {}
+        }
+        match state.building.get(key) {
+            None => {
+                state
+                    .building
+                    .insert(key.clone(), std::thread::current().id());
+                BASE_CACHE_CLAIMS_HELD.with(|held| held.set(held.get() + 1));
+                BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (None, Some(BaseCacheBuild { key: key.clone() }));
+            }
+            // This thread's own claim, re-entered (a nested macro-world
+            // compile). Build unclaimed rather than wait on ourselves.
+            Some(owner) if *owner == std::thread::current().id() => {
+                BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (None, None);
+            }
+            Some(_) => {}
+        }
+        // Someone else is building it. Only a thread holding no claim may
+        // wait; one that holds a claim builds its own copy, so waiting can
+        // never form a cycle.
+        if BASE_CACHE_CLAIMS_HELD.with(std::cell::Cell::get) > 0 {
+            BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return (None, None);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return (None, None);
+        }
+        let (guard, _) = BASE_CACHE_BUILT
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state = guard;
+        waited = true;
+    }
+}
+
+/// How many analyses were served a world another thread was already building
+/// (M44) — zero on a sequential run, and the whole claim of a parallel one.
+#[doc(hidden)]
+pub fn base_cache_build_waits() -> u64 {
+    BASE_CACHE_WAITS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// How many keys are being BUILT right now (M44). The test surface that lets
+/// a pin observe the window it is about to race into rather than sleeping and
+/// hoping: a second analysis started while this reads 1 is provably a second
+/// analysis of a key someone else already claimed.
+#[doc(hidden)]
+pub fn base_cache_building() -> usize {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .building
+                .len()
+        })
+        .unwrap_or(0)
 }
 
 /// Drops one retained world and gives back everything it was retaining: the
@@ -46945,7 +47129,18 @@ fn analyze_inner<'src>(
     // does not cover is an overlay MINTING a std module that exists nowhere
     // else mid-process after a world was stored — not a flow any front-end
     // has; boot registers before the first analysis.
-    if base_cacheable && let Some(mut world) = base_cache_lookup(&base_cache_key, entry_path) {
+    // M44: a MISS here also claims the key, so a sibling member of the same
+    // workspace — M35 puts them on their own threads, all starting cold —
+    // waits for this world instead of building a second copy of it. The claim
+    // is held for the rest of this analysis and released by its `Drop`, which
+    // is after the store below, so a waiter wakes to a hit.
+    let (cached_world, build_claim) = if base_cacheable {
+        base_cache_admit(&base_cache_key, entry_path)
+    } else {
+        (None, None)
+    };
+    let _build_claim = build_claim;
+    if let Some(mut world) = cached_world {
         world.sources[0] = entry_path.to_path_buf();
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
