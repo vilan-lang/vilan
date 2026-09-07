@@ -951,7 +951,14 @@ enum RpcOutcome {
 
 /// An infrastructure-level failure — distinct from an application error, which is part of
 /// a procedure's own return type (e.g. `Option<User>` for "might not exist").
-[derive(Wire, Debug)]
+///
+/// `PartialEq` because the commonest thing an app does with one is COMPARE it
+/// (tracker A52): `if error == RpcError::Unauthorized { sign_in() }` is the
+/// whole point of a typed error, and without the derive a caller had to reach
+/// for a `match` with an arm per variant or read `debug()` back as text. The
+/// payload arms compare their sentences, which is what a `Transport(reason)`
+/// against a literal means.
+[derive(Wire, Debug, PartialEq)]
 enum RpcError {
 	Transport(str),
 	Decode(str),

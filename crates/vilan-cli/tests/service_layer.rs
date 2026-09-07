@@ -1816,3 +1816,58 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `RpcError` compares (tracker A52). The commonest thing an application does
+/// with a typed error is ask WHICH one it is, and until the derive landed
+/// `error == RpcError::Unauthorized` was a compile error — the answer was a
+/// `match` with an arm per variant, or `debug()` read back as text. No server
+/// here: the claim is about the type, not about a wire.
+///
+/// Red first: with the derive off `vilan run` refuses with "type 'RpcError'
+/// does not implement the `PartialEq` operator" on every one of these lines.
+#[test]
+fn an_rpc_error_compares_by_arm_and_by_payload() {
+    let dir = temp_project("rpc_error_eq");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::rpc::RpcError;
+
+fun main() {
+	let held: RpcError = RpcError::Unauthorized;
+	print(i"same-unit:{held == RpcError::Unauthorized}");
+	print(i"same-payload:{RpcError::Transport("gone") == RpcError::Transport("gone")}");
+	print(i"other-payload:{RpcError::Transport("gone") == RpcError::Transport("here")}");
+	print(i"other-arm:{RpcError::Decode("gone") == RpcError::Transport("gone")}");
+	print(i"unit-vs-payload:{held == RpcError::Contract("drift")}");
+	print(i"ne:{held != RpcError::Unauthorized}");
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "same-unit:true",
+        // A payload arm compares its SENTENCE, which is what a `Transport`
+        // against a literal means.
+        "same-payload:true",
+        "other-payload:false",
+        // Same payload, different arm — the discriminant is part of it.
+        "other-arm:false",
+        "unit-vs-payload:false",
+        "ne:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the comparison run:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
