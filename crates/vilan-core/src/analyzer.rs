@@ -41551,6 +41551,15 @@ pub enum Intrinsic {
     ListGet,
     // `List.pop(): Option<T>` -> a runtime helper that removes the last element.
     ListPop,
+    // `List.remove(i): T` -> a runtime helper over the native `.splice`, which
+    // moves the tail with one `memmove` instead of a checked load and store per
+    // element. The helper KEEPS `[]`'s bounds panic: `splice` reads a negative
+    // index from the END and clamps one past it, so a bare splice would answer
+    // exactly the indices `remove`'s doc says a caller must be punished for.
+    ListRemove,
+    // `List.insert(i, v): void` -> the same helper shape for the insert side;
+    // `index == len` appends, anything outside `0..=len` panics.
+    ListInsert,
     // `List.sort_by(cmp): List<T>` -> a runtime helper over the host's STABLE
     // `Array.prototype.sort` (stable since ES2019), on a copy. `Ordering` is a
     // numeric enum lowering to -1/0/1, which is already `sort`'s contract, so
@@ -49241,6 +49250,8 @@ fn analyze_over_world<'src>(
                     ("len", Intrinsic::ListLen),
                     ("get", Intrinsic::ListGet),
                     ("pop", Intrinsic::ListPop),
+                    ("remove", Intrinsic::ListRemove),
+                    ("insert", Intrinsic::ListInsert),
                     ("sort_by", Intrinsic::ListSortBy),
                 ] {
                     if let Some(id) = implementation.declarations.get(name).copied() {

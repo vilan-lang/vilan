@@ -1805,6 +1805,33 @@ impl<'a> Interpreter<'a> {
                     Err(index_out_of_bounds(list.len(), index))
                 }
             }
+            // `List.remove(i)`/`List.insert(i, v)` over the native `.splice`,
+            // with the SAME guard the emitted helpers carry: `splice` reads a
+            // negative index from the end and clamps one past it, so const eval
+            // has to refuse the same indices the runtime refuses or a macro
+            // could compute an answer the program cannot.
+            "__remove_at" => {
+                let list = expect_array(&take(0))?;
+                let index = expect_number(&take(1))?;
+                let mut list = list.borrow_mut();
+                if index >= 0.0 && (index as usize) < list.len() && index.fract() == 0.0 {
+                    Ok(list.remove(index as usize))
+                } else {
+                    Err(index_out_of_bounds(list.len(), index))
+                }
+            }
+            "__insert_at" => {
+                let list = expect_array(&take(0))?;
+                let index = expect_number(&take(1))?;
+                let value = take(2);
+                let mut list = list.borrow_mut();
+                if index >= 0.0 && (index as usize) <= list.len() && index.fract() == 0.0 {
+                    list.insert(index as usize, value);
+                    Ok(Value::Undefined)
+                } else {
+                    Err(index_out_of_bounds(list.len(), index))
+                }
+            }
             "__at_put" => {
                 let list = expect_array(&take(0))?;
                 let index = expect_number(&take(1))?;
