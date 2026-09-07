@@ -11138,6 +11138,16 @@ impl<'src> Analyzer<'src> {
     }
 
     fn build_drop_glue(&mut self) {
+        // M19 T1c leaves this live and takes its INPUTS free. The glue map is
+        // keyed by `TypeId` across the whole program and the transformer looks
+        // an entry up by the id on the expression it is emitting
+        // (`binding_drops_nontrivially`, `ensure_drop_helper`), so the keys
+        // have to be the ids the world minted — which is precisely the key
+        // space a record may not carry (`editor-latency.md` §3.6). What T1c
+        // gives it instead is a restored plan: `dropped_bindings`,
+        // `overwrite_drops` and `resource_temporaries` are already in hand, so
+        // the seeding below reads them and the walk is over the resource types
+        // alone (24–125 ms of a 5.7 s debug checks phase on kolt's client leg).
         let mut worklist: Vec<TypeId> = Vec::new();
         for binding in &self.dropped_bindings {
             if let Some(type_id) = self.dropped_binding_type_id(*binding) {
@@ -21697,6 +21707,26 @@ impl<'src> Analyzer<'src> {
     /// B81's materialized ones. `shared` is not codegen's business — it is what
     /// rule 2's move elision must refuse to move out of, so this pass runs
     /// BEFORE `compute_clone_sites`.
+    /// **M19 T1c: the foreign-touch rule, and why this pass is the tranche's
+    /// residue** (`editor-latency.md` §3.6). Phase 2 below classifies each
+    /// capture against `collect_written_roots()`, which is a WHOLE-PROGRAM set:
+    /// a write in the entry to a root the module declares — a module-level
+    /// binding is exactly such a root — flips `share_subject_is_stable` and
+    /// `subject_is_mutated_in_place` for a capture the module owns. A pass
+    /// that reads another file's state cannot be restored from this module's
+    /// record alone, and recording the row anyway would serve one entry's
+    /// grounding to the next.
+    ///
+    /// Two ways out and this tranche takes neither. SPLIT THE READ: partition
+    /// the written roots by their writing source and refuse to record a row
+    /// whose subject root was written from outside the module — the shape
+    /// `liveness::LastUse`'s `foreign_touched` already has. Or LEAVE IT LIVE
+    /// and say so. It is left live because the split does not buy the walk:
+    /// `collect_written_roots` has to run either way (a foreign write must be
+    /// visible to be excluded), so what a record could remove is the
+    /// classification, 158–342 ms of a 5.7 s debug checks phase on kolt's
+    /// client leg against the drop planner's gate at 950–1230 ms in the same
+    /// phase. It is named residue rather than left unmentioned.
     fn compute_capture_clone_sites(&mut self) -> CapturePlan {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
@@ -49146,6 +49176,17 @@ fn analyze_over_world<'src>(
         // possibly a slot write — so skipping a module's sites moves state a
         // later pass reads, which is not what "module-local" is allowed to
         // mean. Freezing it needs the mint frozen with it.
+        //
+        // M19 T1c RE-RUNS IT, deliberately, and the reason is the sentence
+        // above plus a number. A record for this pass would have to carry both
+        // the module's refusals AND the mint each `stash` site made, because
+        // the mint is what a later pass reads — which is to say it would have
+        // to carry a `TypeId`, the one thing the record may not carry
+        // (`editor-latency.md` §3.6). What that buys is 100–165 ms of a 5.7 s
+        // debug checks phase on kolt's client leg, ~2%, against the drop
+        // planner's gate at 950–1230 ms in the same phase. The pass is also
+        // INERT unless `std::dev` is loaded, so most programs pay nothing for
+        // it at all. It stays live and stays honest.
         analyzer.check_hmr_transfer_bounds();
         // The observable half of C4 resource classification (destruction.md §4):
         // R10 (container/external-generic resource arguments) and R12 (no coercion
