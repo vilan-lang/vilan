@@ -45438,6 +45438,15 @@ pub fn module_importables(path: &Path) -> Vec<Importable<'static>> {
 /// loader path, byte-for-byte unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct Workspace {
+    /// Where this package's on-disk macro expansion table lives — its BUILD
+    /// directory, `dist/` (tracker M33). `None` means the process's in-memory
+    /// table only, which is the right answer for the language server, the wasm
+    /// playground and any embedder: a keystroke path gains nothing from a file
+    /// it would have to rewrite on every edit, and writing into a user's `dist/`
+    /// from an editor is a surprise. Filled by the FRONT END, like
+    /// `entry_mode` and `platform_reason` beside it — resolving a manifest says
+    /// nothing about whether the caller is a build.
+    pub macro_expansion_cache: Option<PathBuf>,
     /// Every dependency package reachable from the entry (edges are indices here).
     pub packages: Vec<PackageSpec>,
     /// The entry package's direct dependencies: `(import name, index into
@@ -46568,6 +46577,7 @@ fn expand_entry_over_world<'src>(
         entry_source,
         &mut world.analyzer.diagnostics,
         &mut macro_site_counter,
+        workspace.macro_expansion_cache.as_deref(),
         0,
     );
     world
@@ -46771,6 +46781,17 @@ pub fn analyze_cancellable<'src>(
     for refusal in refusals {
         program.diagnostics.push(refusal);
         program.diagnostic_sources.push(SourceId(0));
+    }
+    // Write the package's expansion table back, once per top-level analysis and
+    // only when this run produced something the file does not already hold
+    // (M33). Here rather than at the flush's own call depth for the same reason
+    // the tally resets here: this is the one door, and a macro world's nested
+    // analysis must not write a table of its own. Every IO failure inside is
+    // ignored — a cache that cannot be written must not fail a build.
+    if !crate::macros::in_macro_world()
+        && let Some(build_dir) = workspace.macro_expansion_cache.as_deref()
+    {
+        crate::macros::flush_expansion_cache(build_dir);
     }
     Some(program)
 }
@@ -48011,6 +48032,7 @@ fn analyze_inner<'src>(
                         text,
                         &mut analyzer.diagnostics,
                         &mut macro_site_counter,
+                        workspace.macro_expansion_cache.as_deref(),
                         0,
                     );
                     analyzer.attribute_new_diagnostics(before, source);

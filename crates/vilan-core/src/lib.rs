@@ -47,6 +47,7 @@ pub use analyzer::{EntryMode, Layer, PackageSpec, PreludeRepair, Program, Worksp
 pub use error::Error;
 pub use macros::MacroLimits;
 #[doc(hidden)]
+pub use macros::macro_expansion_cache_clear;
 pub use macros::macro_world_cache_clear;
 /// How many macro WORLDS the last top-level analysis on this thread compiled
 /// (M33) — the `macro-worlds` phase row's count, readable without parsing

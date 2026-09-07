@@ -14,6 +14,14 @@ vilan/examples/**/*.chunks.json
 
 # The benchmark bundle (`vilan run vilan/benchmarks` writes it beside the source).
 vilan/benchmarks/src/main.mjs
+
+# Every package's BUILD directory, wherever one is checked in beside sources.
+# `dist/` holds emitted artifacts, the build hooks' stamp file, and — since M33
+# — the macro expansion table a `check` writes, so any `vilan check` run inside
+# the tree creates one. The examples' own `dist/` is already ignored above; this
+# covers the packages the suite itself compiles in place.
+vilan/benchmarks/dist/
+vilan/test/dist/
 vilan/docs/book/
 
 # The union-suite log every integration writes beside the tree (three

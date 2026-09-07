@@ -3875,6 +3875,23 @@ fn compile_unit(
     // `pkg::client` is refused here exactly as `vilan check .`'s `client` leg
     // refuses it.
     workspace.entry_mode = unit.entry_mode.clone();
+    // M33: the package's build directory, where the cross-process macro
+    // expansion table lives. Set HERE and nowhere else, which is what makes the
+    // table a build-tool feature: the language server and the wasm playground
+    // build their own workspaces and leave it `None`, so an editor never writes
+    // into a user's `dist/` and a keystroke keeps the in-memory table it
+    // already had. `dist/` for the same reason the build hooks' stamp file is
+    // there — `rm -rf dist` means recompile everything, macro worlds included.
+    //
+    // The MANIFEST's directory, not `pkg_root`: `pkg_root` is the package's
+    // SOURCE root (`src/`), and `dist/` is a sibling of `vilan.toml`, which is
+    // where `build` writes and where a user goes to delete it. A bare file with
+    // no manifest has no build directory and gets none — it has no `dist/` for
+    // the same reason it has no package.
+    workspace.macro_expansion_cache = unit
+        .package_dir
+        .as_ref()
+        .map(|directory| directory.join("dist"));
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.

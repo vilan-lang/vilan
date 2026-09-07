@@ -102,7 +102,13 @@ fn the_world_census_counts_compiles_and_a_warm_analysis_compiles_none() {
 
             // Cleared: the cold path is reachable again, which is the only
             // thing that makes the warm reading above a claim about the CACHE
-            // rather than about the second analysis.
+            // rather than about the second analysis. `macro_world_cache_clear`
+            // drops the in-memory EXPANSION table along with the compiled
+            // worlds, and it has to: the expansion key is reachable without the
+            // world (M33), so a surviving expansion would answer before the
+            // world was ever asked for and this analysis would compile nothing
+            // — an emptier cache producing a smaller number, which is the
+            // opposite of what the clear is for.
             vilan_core::macro_world_cache_clear();
             vilan_core::analyzer::base_cache_clear();
             analyze(DERIVING, "deriving-cold.vl");

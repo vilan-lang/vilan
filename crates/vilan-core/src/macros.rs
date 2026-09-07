@@ -65,6 +65,18 @@ impl Default for MacroLimits {
 pub(crate) struct World {
     /// The `world_key` it was compiled under — `cached_run` keys expansions
     /// by it, so cached expansions too survive edits outside the macro spans.
+    /// The definition set's content hash this world was compiled under. Kept
+    /// beside the compiled program as the world's identity even though the
+    /// expansion key is now built from `MacroDef::world_key` instead (M33: the
+    /// key has to be reachable BEFORE the world exists, or a cache hit could
+    /// never skip the compile) — a compiled world with no name for what it was
+    /// compiled from is a thing no debugger and no future cache can address.
+    #[allow(
+        dead_code,
+        reason = "the world's identity, kept for debugging and for the next \
+                  cache layer; the expansion key reads `MacroDef::world_key` \
+                  because it must answer before the world is compiled"
+    )]
     key: u64,
     program: JsProgram<'static>,
     /// macro name → its emitted function name.
@@ -878,6 +890,23 @@ fn record_cached_failure(errors: &[Error], displaced: Option<Arc<Vec<Error>>>) {
 
 #[doc(hidden)]
 pub fn macro_world_cache_clear() {
+    // The in-memory EXPANSION table goes with them (M33), and this is not a
+    // convenience: since the expansion key became reachable without the world
+    // (it is built from `MacroDef::world_key`, the blanked file's content
+    // hash), a cached expansion answers BEFORE `def.world(..)` is called — so
+    // dropping the compiled worlds alone no longer makes a world compile
+    // happen. It would make the world unreachable instead, which is the
+    // opposite of what this function is for, and it would quietly turn every
+    // "cold" measurement that calls it into a warm one.
+    if let Some(expansions) = EXPANSIONS.get() {
+        // No tally release: an expansion's text is genuinely `Box::leak`ed
+        // (`MacroExpansion`), so dropping the map gives back none of it — the
+        // same reason the worlds below release nothing.
+        expansions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
     if let Some(worlds) = WORLDS.get() {
         // No tally release: what a compiled world retains is genuinely
         // `Box::leak`ed (`MacroWorldText`/`MacroWorldProgram`/`MacroWorldAst`),
@@ -1080,6 +1109,273 @@ fn compile_world(
     Ok(world)
 }
 
+// --- The cross-process expansion table (macro-engine.md §6.5, tracker M33) ---
+
+/// §6's expansion table, on disk under the package's build directory.
+///
+/// §6 settled the unit of caching — the expansion's SOURCE TEXT, id-free,
+/// span-free, analysis-independent, keyed by the macro's reachable definition
+/// set × the invocation's input source — and then made the store "in-memory per
+/// process, an on-disk cache a later, optional layer with the same key, safe
+/// because the key already covers everything". This is that layer.
+///
+/// What it buys is not a faster expansion: it is the WORLD the expansion would
+/// have needed. A cold `vilan check` of kolt's client compiles four macro
+/// worlds, 18.2% of that entry's instructions, for std files and a toolchain
+/// that do not change between runs — and every `check`, every `build` and every
+/// cold benchmark row paid all four again, because the world cache is
+/// process-global and a CLI process is born cold. An expansion served from
+/// here is served without compiling the world at all, since the key is built
+/// from `MacroDef::world_key` — the blanked file's content hash, computed at
+/// REGISTRATION — and never from the compiled world's identity.
+///
+/// **Why the unit is the expansion and not the world.** What a compiled world
+/// retains is `Box::leak`ed text, program and AST wired to this process's id
+/// counters and leaked buffers; serializing it is the incremental-analysis
+/// problem (§6's cached-OUTPUT problem, roadmap #12). The expansion text is
+/// exactly what §6 proved cacheable, and it is what the world exists to
+/// produce.
+///
+/// **Soundness.** The key covers the macro's definition set (`world_key`), the
+/// macro's name, the annotated item's source and the argument sources. The
+/// FILE covers what the key cannot see: the toolchain version and a hash of
+/// `macro_std`'s own sources, both stamped in a header. A mismatch on either
+/// discards the whole file rather than serving a single entry from it — the
+/// key does not name them, so no entry under an old stamp can be trusted, and a
+/// stale expansion is a miscompile, the worst outcome §6 names. `macro_std` is
+/// hashed rather than versioned because a toolchain built from a checkout can
+/// change it without changing a version number, and that is the tree everyone
+/// developing the compiler is standing in.
+///
+/// **A corrupt file is ignored, never fatal.** Every read failure — a truncated
+/// write, a half-written entry, bytes that are not UTF-8, a directory where a
+/// file should be — produces an EMPTY table, which recompiles exactly as a
+/// cold run does. A build must not fail because a cache did.
+struct DiskTable {
+    /// The file itself, canonical, resolved ONCE when the table is loaded.
+    /// Every read and write of the table goes through this path, so the
+    /// canonicalization the house rule asks for happens where the path is used
+    /// — and it happens once per package per process rather than once per
+    /// macro expansion, which is what it cost when the file was re-derived on
+    /// each lookup (63M instructions on a cold kolt client check, a fifth of
+    /// what the cache saves).
+    path: PathBuf,
+    /// The header the file was written under, and must be read back under.
+    stamp: String,
+    entries: HashMap<u64, &'static str>,
+    /// Whether this process added anything the file does not hold.
+    dirty: bool,
+}
+
+/// The file's first line. Bumping it is how a format change invalidates every
+/// cache in existence without needing to parse the old one.
+const DISK_FORMAT: &str = "vilan-macro-expansions 1";
+/// The most entries one package's table keeps. The table is rewritten whole on
+/// each flush, so this is a hard bound on the file rather than a policy about
+/// eviction — and the entries kept are the numerically smallest keys, which
+/// makes the file a deterministic function of its contents rather than of the
+/// order a build happened to visit macros in.
+const DISK_ENTRY_CAP: usize = 4096;
+
+static DISK_TABLES: OnceLock<Mutex<HashMap<PathBuf, DiskTable>>> = OnceLock::new();
+
+fn disk_tables() -> &'static Mutex<HashMap<PathBuf, DiskTable>> {
+    DISK_TABLES.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// The cache file inside a package's build directory. `dist/` and not
+/// `~/.vilan/`, for the reason the build hooks' stamp file is there: a
+/// machine-global cache keyed on a project path is the thing nobody can reason
+/// about from a fresh clone, and a stale one is unreachable to `rm -rf`. Here
+/// `rm -rf dist` means *recompile everything, macro worlds included*, which is
+/// a sentence a user already believes.
+///
+/// Canonical at the source (the house rule for a path that will be compared):
+/// the file does not exist yet on a first run, so it goes through
+/// `canonical_path_of_unwritten`, and two spellings of one package share one
+/// table instead of racing two.
+pub(crate) fn expansion_cache_file(build_dir: &Path) -> PathBuf {
+    crate::util::canonical_path_of_unwritten(build_dir.join(".macro-expansions"))
+}
+
+/// The header this compiler writes and will read back: the format line, the
+/// toolchain version, and a hash of `macro_std`'s own sources.
+fn disk_stamp(std: &PackageSpec) -> String {
+    static STAMP: OnceLock<String> = OnceLock::new();
+    // One `PackageSpec` per process in every real front end, and a wrong-but-
+    // conservative stamp in the pathological case would only over-invalidate.
+    STAMP
+        .get_or_init(|| {
+            let mut hasher = DefaultHasher::new();
+            if let Some(macro_std) = resolve_macro_std(std) {
+                let mut sources: Vec<PathBuf> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(macro_std.base_root.join("src")) {
+                    for entry in entries.flatten() {
+                        sources.push(entry.path());
+                    }
+                }
+                // Sorted: `read_dir` order is the filesystem's, and a stamp that
+                // depended on it would invalidate for no reason.
+                sources.sort();
+                for source in sources {
+                    if let Some(name) = source.file_name() {
+                        name.hash(&mut hasher);
+                    }
+                    if let Ok(text) = std::fs::read_to_string(&source) {
+                        text.hash(&mut hasher);
+                    }
+                }
+            }
+            format!(
+                "{DISK_FORMAT}\ntoolchain {}\nmacro_std {:016x}",
+                env!("CARGO_PKG_VERSION"),
+                hasher.finish(),
+            )
+        })
+        .clone()
+}
+
+/// Parse a written table. `None` for anything that is not exactly what this
+/// compiler wrote — a stale stamp, a truncated entry, non-UTF-8 bytes.
+fn parse_disk_table(text: &str, stamp: &str) -> Option<HashMap<u64, &'static str>> {
+    let body = text.strip_prefix(stamp)?.strip_prefix('\n')?;
+    let mut entries: HashMap<u64, &'static str> = HashMap::default();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (header, after) = rest.split_once('\n')?;
+        let (key, length) = header.split_once(' ')?;
+        let key = u64::from_str_radix(key, 16).ok()?;
+        let length: usize = length.parse().ok()?;
+        if after.len() < length + 1 {
+            return None;
+        }
+        let expansion = after.get(..length)?;
+        if after.as_bytes()[length] != b'\n' {
+            return None;
+        }
+        // Leaked like every other expansion: `ExpansionOutput` hands out
+        // `&'static str`, and the tally records it at the same site a freshly
+        // run expansion does, so a served-from-disk run reports what it retains.
+        let leaked: &'static str = Box::leak(expansion.to_string().into_boxed_str());
+        crate::leak_tally::record(crate::leak_tally::LeakSite::MacroExpansion, leaked.len());
+        entries.insert(key, leaked);
+        rest = &after[length + 1..];
+    }
+    Some(entries)
+}
+
+fn render_disk_table(stamp: &str, entries: &HashMap<u64, &'static str>) -> String {
+    let mut keys: Vec<u64> = entries.keys().copied().collect();
+    keys.sort_unstable();
+    keys.truncate(DISK_ENTRY_CAP);
+    let mut text = String::with_capacity(stamp.len() + 1);
+    text.push_str(stamp);
+    text.push('\n');
+    for key in keys {
+        let expansion = entries[&key];
+        text.push_str(&format!("{key:016x} {}\n", expansion.len()));
+        text.push_str(expansion);
+        text.push('\n');
+    }
+    text
+}
+
+/// Read this package's table, loading it from disk once per process.
+///
+/// Keyed by the build directory AS THE FRONT END SPELLED IT, which is an
+/// in-process memo and not a path comparison that decides anything: the file
+/// each table reads and writes is the canonical one it resolved on load, so two
+/// spellings of one package in one process would keep two tables over the same
+/// file and each would hold correct entries (they are content-keyed) — a
+/// redundancy, not a stale read. What the canonical path buys is the case that
+/// matters, which is the NEXT process finding what this one wrote.
+fn with_disk_table<T>(
+    build_dir: &Path,
+    std: &PackageSpec,
+    read: impl FnOnce(&mut DiskTable) -> T,
+) -> T {
+    let mut tables = disk_tables()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !tables.contains_key(build_dir) {
+        let path = expansion_cache_file(build_dir);
+        let stamp = disk_stamp(std);
+        let entries = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| parse_disk_table(&text, &stamp))
+            .unwrap_or_default();
+        tables.insert(
+            build_dir.to_path_buf(),
+            DiskTable {
+                path,
+                stamp,
+                entries,
+                dirty: false,
+            },
+        );
+    }
+    read(tables.get_mut(build_dir).expect("just inserted"))
+}
+
+/// Write this package's table back, if this process added to it. Called once
+/// per top-level analysis; a whole-file rewrite through a temporary and a
+/// rename, so a reader never sees a half-written table (and a failed write
+/// leaves the previous one intact). Every IO failure is ignored: a read-only
+/// checkout, a full disk and a missing directory must all mean "no cache",
+/// never "no build".
+pub(crate) fn flush_expansion_cache(build_dir: &Path) {
+    // The common case is an analysis that expanded no macro at all, and it must
+    // not pay for the path resolution to find that out: no table was ever
+    // loaded, so there is nothing to write.
+    let Some(tables) = DISK_TABLES.get() else {
+        return;
+    };
+    let (path, rendered) = {
+        let mut tables = tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(table) = tables.get_mut(build_dir) else {
+            return;
+        };
+        if !table.dirty {
+            return;
+        }
+        table.dirty = false;
+        (
+            table.path.clone(),
+            render_disk_table(&table.stamp, &table.entries),
+        )
+    };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temporary = parent.join(format!(".macro-expansions.{}.tmp", std::process::id()));
+    if std::fs::write(&temporary, rendered).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if std::fs::rename(&temporary, &path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+/// Drop every loaded table, so the next expansion re-reads its file — the test
+/// surface that makes a second PROCESS's behaviour reachable inside one.
+///
+/// `macro_world_cache_clear`'s sibling, and to be used WITH it: this one
+/// forgets what was read from disk, that one forgets what this process
+/// computed, and only both together put a process back where it started.
+#[doc(hidden)]
+pub fn macro_expansion_cache_clear() {
+    if let Some(tables) = DISK_TABLES.get() {
+        tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 // --- Expansion ---
 
 /// One generated item list, walked after the originating file's items.
@@ -1157,6 +1453,12 @@ struct Expander<'r, 'd> {
     /// The per-splice-site counter that stamps `__m<N>` gensym placeholders
     /// unique (§7): deterministic — sites are visited in file/node order.
     site_counter: &'d mut u32,
+    /// Where this package's on-disk expansion table lives, when the front end
+    /// named one (M33). `None` — the language server, the wasm playground, an
+    /// embedder, a macro world's own nested expansion — means the process
+    /// table only: a keystroke path has nothing to gain from a file it would
+    /// have to write on every edit, and the in-memory layer already serves it.
+    expansion_cache: Option<&'r Path>,
     output: ExpansionOutput,
 }
 
@@ -1165,6 +1467,10 @@ struct Expander<'r, 'd> {
 /// items; expression-position invocations (found at ANY depth, except inside
 /// macro definitions) record their spliced replacement. Nested uses in
 /// generated code are chased to the depth cap.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the expander's inputs are each a distinct fact about the file being               expanded (its scope, its std, its budgets, its tree, its text) plus the               two out-parameters the walk threads and the package's cache directory;               bundling them into a struct would name the same seven things one level               further from the two call sites that build them"
+)]
 pub(crate) fn expand_source(
     scope: &MacroScope,
     std: &PackageSpec,
@@ -1173,6 +1479,7 @@ pub(crate) fn expand_source(
     text: &str,
     diagnostics: &mut Vec<Error>,
     site_counter: &mut u32,
+    expansion_cache: Option<&Path>,
     depth: u32,
 ) -> ExpansionOutput {
     let mut expander = Expander {
@@ -1183,6 +1490,7 @@ pub(crate) fn expand_source(
         module_path: Vec::new(),
         diagnostics,
         site_counter,
+        expansion_cache,
         output: ExpansionOutput::default(),
     };
     expander.collect_backed_enum_impls(nodes);
@@ -1768,49 +2076,64 @@ impl Expander<'_, '_> {
             return;
         }
 
-        // The RAW output is cached by (world, macro, item source, argument
-        // sources) — §6; sound because the interpreter is deterministic.
-        // Gensym stamping is per SITE, so it applies after the cache.
-        // Lazy world compile — errors carry the DEFINING file's spans.
-        let (world, entry) = match def.world(self.std) {
-            Ok(resolved) => resolved,
-            Err(errors) => {
-                self.output
-                    .world_errors
-                    .extend(errors.into_iter().map(|error| (def.source, error)));
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: site,
-                    msg: format!("{label}'s definition did not compile"),
-                });
-                if let Some(site_key) = expression_site {
-                    self.output.failed_sites.push(site_key);
+        // The RAW output is cached by (definition set, macro, item source,
+        // argument sources) — §6; sound because the interpreter is
+        // deterministic. Gensym stamping is per SITE, so it applies after the
+        // cache.
+        //
+        // The KEY IS ASKED FIRST, before the world (M33). `world_key` is the
+        // blanked file's content hash, computed at registration, so a hit —
+        // from this process's table or from the package's table on disk — is
+        // answered without compiling the world at all. That is the whole
+        // saving: a cold CLI process used to compile four of kolt's worlds for
+        // std files that had not changed since the last build.
+        let key = expansion_key(def.world_key, name, item_text, arguments);
+        let raw: &'static str = match cached_expansion(key, self.expansion_cache, self.std) {
+            Some(raw) => raw,
+            None => {
+                // A miss: the world is compiled now, and its errors carry the
+                // DEFINING file's spans.
+                let (world, entry) = match def.world(self.std) {
+                    Ok(resolved) => resolved,
+                    Err(errors) => {
+                        self.output
+                            .world_errors
+                            .extend(errors.into_iter().map(|error| (def.source, error)));
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: site,
+                            msg: format!("{label}'s definition did not compile"),
+                        });
+                        if let Some(site_key) = expression_site {
+                            self.output.failed_sites.push(site_key);
+                        }
+                        return;
+                    }
+                };
+                match run_and_record(
+                    key,
+                    &world,
+                    &entry,
+                    &call_arguments,
+                    self.limits.fuel,
+                    self.expansion_cache,
+                    self.std,
+                ) {
+                    Ok(raw) => raw,
+                    Err(message) => {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: site,
+                            msg: format!("{label} failed at expansion time: {message}"),
+                        });
+                        if let Some(site_key) = expression_site {
+                            self.output.failed_sites.push(site_key);
+                        }
+                        return;
+                    }
                 }
-                return;
-            }
-        };
-        let raw: &'static str = match cached_run(
-            &world,
-            &entry,
-            name,
-            item_text,
-            arguments,
-            &call_arguments,
-            self.limits.fuel,
-        ) {
-            Ok(raw) => raw,
-            Err(message) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: site,
-                    msg: format!("{label} failed at expansion time: {message}"),
-                });
-                if let Some(site_key) = expression_site {
-                    self.output.failed_sites.push(site_key);
-                }
-                return;
             }
         };
 
@@ -1934,38 +2257,67 @@ impl Expander<'_, '_> {
     }
 }
 
-/// Runs one macro through the process-global expansion cache: key = (world,
-/// macro, item source, argument sources) — §6, sound because the interpreter
-/// is deterministic by construction.
-fn cached_run(
-    world: &World,
-    entry: &str,
-    name: &str,
-    item_text: &str,
-    arguments: &[Cow<'_, str>],
-    call_arguments: &[js::Node<'static>],
-    fuel: u64,
-) -> Result<&'static str, String> {
-    static EXPANSIONS: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
-    let key = {
-        let mut hasher = DefaultHasher::new();
-        world.key.hash(&mut hasher);
-        name.hash(&mut hasher);
-        item_text.hash(&mut hasher);
-        arguments.hash(&mut hasher);
-        hasher.finish()
-    };
-    let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()));
+/// §6's expansion key: (the macro's definition set, the macro's name, the
+/// annotated item's source, the argument sources) — sound because the
+/// interpreter is deterministic by construction.
+///
+/// It is built from `world_key` and never from a compiled `World`, and that is
+/// the whole point (M33): the definition set's content hash is computed at
+/// REGISTRATION, so a cache hit is reachable without compiling the world the
+/// expansion would otherwise have needed.
+fn expansion_key(world_key: u64, name: &str, item_text: &str, arguments: &[Cow<'_, str>]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    world_key.hash(&mut hasher);
+    name.hash(&mut hasher);
+    item_text.hash(&mut hasher);
+    arguments.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The process-global expansion table (§6.5's in-memory layer).
+static EXPANSIONS: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
+
+fn expansions() -> &'static Mutex<HashMap<u64, &'static str>> {
+    EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// A cached expansion for `key`, from this process's table or — when the front
+/// end named a build directory — from the package's table on disk.
+///
+/// Answering here is what makes a warm `vilan check` compile ZERO macro worlds:
+/// the caller reaches `def.world(..)` only on a miss.
+fn cached_expansion(key: u64, build_dir: Option<&Path>, std: &PackageSpec) -> Option<&'static str> {
     // Recovering (E97): a poisoned expansion cache must not wedge the session,
     // and the values are `&'static str`s leaked before the lock is taken.
-    if let Some(raw) = expansions
+    if let Some(raw) = expansions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .copied()
     {
-        return Ok(raw);
+        return Some(raw);
     }
+    let raw = with_disk_table(build_dir?, std, |table| table.entries.get(&key).copied())?;
+    // Promoted into memory, so the second use in this process costs a hash
+    // lookup rather than a lock on the disk table.
+    expansions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, raw);
+    Some(raw)
+}
+
+/// Runs one macro and records its output in both layers — §6, sound because
+/// the interpreter is deterministic by construction.
+fn run_and_record(
+    key: u64,
+    world: &World,
+    entry: &str,
+    call_arguments: &[js::Node<'static>],
+    fuel: u64,
+    build_dir: Option<&Path>,
+    std: &PackageSpec,
+) -> Result<&'static str, String> {
     let source = interpreter::run_entry(
         &world.program,
         entry,
@@ -1980,10 +2332,16 @@ fn cached_run(
     crate::leak_tally::record(crate::leak_tally::LeakSite::MacroExpansion, leaked.len());
     // Recovering (E97): the text is leaked before the lock, so the entry is
     // whole or absent.
-    expansions
+    expansions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, leaked);
+    if let Some(build_dir) = build_dir {
+        with_disk_table(build_dir, std, |table| {
+            table.entries.insert(key, leaked);
+            table.dirty = true;
+        });
+    }
     Ok(leaked)
 }
 
