@@ -2467,6 +2467,10 @@ impl Document {
         if !self.offset_touches_a_token(offset) {
             return None;
         }
+        // An OPERATOR token: the method the operator dispatches to (E149).
+        if let Some(rendered) = self.operator_hover(program, offset) {
+            return Some(rendered);
+        }
         let id = self.entity_at(offset)?;
         // A function (or requirement-carrying binding): the full signature.
         if let Some(target) = self.analysis(program).function_target(id) {
@@ -2539,6 +2543,56 @@ impl Document {
             out.push_str(&requirement);
         }
         out
+    }
+
+    /// The hover for a binary OPERATOR token under `offset`: the declaration
+    /// of the method that operator dispatches to (E149).
+    ///
+    /// `a == b` is a call, and the editor said nothing about it — an operator
+    /// is the one call spelled without a name, so every path that answers "what
+    /// is under the cursor" by resolving an IDENTIFIER answered nothing here,
+    /// including hover, and a reader asking which `eq` runs got a blank.
+    ///
+    /// The answer is not recomputed: B180 already recorded which method each
+    /// binary expression selected (`Program::binary_op_dispatch`), because the
+    /// emitter needs it, so the hover is that record rendered — the editor and
+    /// the emission cannot disagree about which `eq` this `==` is.
+    ///
+    /// `None` where there is no record, which is exactly the native operators:
+    /// native JS IS `1 + 2`'s semantics, nothing dispatches, and there is no
+    /// declaration to show. The gap test is what makes this an OPERATOR hover
+    /// rather than an expression one — the cursor must sit between the two
+    /// operands, not on either of them, so hovering `a` in `a == b` still
+    /// hovers `a`.
+    fn operator_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let entry = SourceId(0);
+        let mut best: Option<(Id, usize)> = None;
+        for (id, expr) in &program.entity_map {
+            let Expr::Binary(_, left, right) = expr else {
+                continue;
+            };
+            if program.source_of(*id) != Some(entry) {
+                continue;
+            }
+            let (Some(left), Some(right)) = (
+                vilan_ide::analysis::span_of(program, *left),
+                vilan_ide::analysis::span_of(program, *right),
+            ) else {
+                continue;
+            };
+            // The operator token is what lies between the operands. A caret on
+            // either operand is that operand's hover, not this one.
+            if !(left.end <= offset && offset < right.start) {
+                continue;
+            }
+            let width = right.start - left.end;
+            if best.is_none_or(|(_, best_width)| width < best_width) {
+                best = Some((*id, width));
+            }
+        }
+        let method = *program.binary_op_dispatch.get(&best?.0)?;
+        let declaration = program.declaration_labels.get(&method)?;
+        Some(self.compose_hover(program, method, declaration, None))
     }
 
     /// The hover for a keyword under `offset`: a one-line meaning and a deep
@@ -3418,6 +3472,14 @@ impl Document {
         };
         self.reference_index
             .occurrences_of(definition)
+            // E149: a generated row indexes a TEMPLATE no file holds, so its
+            // offsets are nobody's text and it cannot become a client
+            // location. `references_across` dropped these as a side effect of
+            // going through `canonical_sources`, which has no entry for
+            // `DERIVED_SOURCE`; this face returned them, so the two disagreed
+            // about what a symbol's references are — the very thing the one
+            // index exists to prevent.
+            .filter(|occurrence| occurrence.source != DERIVED_SOURCE)
             .map(|occurrence| (occurrence.source, occurrence.span))
             .collect()
     }
@@ -3545,8 +3607,31 @@ impl Document {
     pub fn reference_target(&self, offset: usize) -> Option<(Definition, DefinitionKind)> {
         let program = self.program.as_ref()?;
         let occurrence = self.reference_index.at(SourceId(0), offset)?;
-        let kind = crate::references::kind_of(program, occurrence.definition)?;
-        Some((occurrence.definition, kind))
+        // E149: a struct-init shorthand `A { x }` is ONE identifier naming two
+        // definitions (E134), and the row carries whichever of them
+        // `Definition::sort_key` put first — declaration order. So a caret
+        // there answered for the field in one file and for the local in
+        // another, and E143's rename expanded to `renamed = x` or to
+        // `x = renamed` depending on which was declared first. Both are
+        // correct readings of the site; neither is a reason for the editor to
+        // decide by accident. Ruled 2026-09-07: the caret means the LOCAL —
+        // the binding is one hop away by name (`A { x }` reads `x`), where the
+        // field is reached only through the type, and a user who means the
+        // field has its declaration and `a.x` to start from.
+        let definition = match occurrence.co_definition {
+            Some(other) => [occurrence.definition, other]
+                .into_iter()
+                .find(|candidate| {
+                    matches!(
+                        crate::references::kind_of(program, *candidate),
+                        Some(DefinitionKind::Binding)
+                    )
+                })
+                .unwrap_or(occurrence.definition),
+            None => occurrence.definition,
+        };
+        let kind = crate::references::kind_of(program, definition)?;
+        Some((definition, kind))
     }
 
     /// The spans a rename of the symbol under `offset` must rewrite, or the
@@ -5886,6 +5971,82 @@ pub(crate) mod tests {
                 "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
             );
         }
+    }
+
+    // E149: hovering an operator answers with the method it dispatches to.
+    //
+    // An operator is the one call spelled without a name, so every path that
+    // answers "what is under the cursor" by resolving an IDENTIFIER answered
+    // nothing at a `==` — a reader asking which `eq` runs got a blank. The
+    // answer is B180's own dispatch record rendered, not a second resolution,
+    // so the editor and the emission cannot disagree about which `eq` this is.
+
+    /// The hover at the offset `needle` locates (plus `at`) in `source`.
+    fn operator_hover_at(source: &str, needle: &str, at: usize) -> Option<String> {
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture must analyze clean: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let hover = document.hover(source.find(needle).expect("the needle") + at);
+        let _ = std::fs::remove_dir_all(&dir);
+        hover
+    }
+
+    /// A user `impl Point with Add` / `with PartialEq`, and a native `+` in the
+    /// impl body as the control.
+    const OPERATOR_IMPLS: &str = "import std::operators::Add;\nimport std::compare::PartialEq;\nimport std::io::print;\n\nstruct Point {\n\tx: i32,\n}\n\nimpl Point with Add {\n\tfun add(self, other: Point): Point {\n\t\tPoint { x = self.x + other.x }\n\t}\n}\n\nimpl Point with PartialEq {\n\tfun eq(self, other: Point): bool {\n\t\tself.x == other.x\n\t}\n}\n\nfun main() {\n\tlet a = Point { x = 1 };\n\tlet b = Point { x = 2 };\n\tlet c = a + b;\n\tif a == b {\n\t\tprint(c.x);\n\t}\n}\n";
+
+    #[test]
+    fn e149_hovering_an_equality_operator_answers_with_its_eq() {
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "if a == b", 5),
+            Some("```vilan\nfun eq(self, other: Point): bool\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_hovering_a_plus_answers_with_its_add() {
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "a + b", 2),
+            Some("```vilan\nfun add(self, other: Point): Point\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_hovering_a_derived_equality_answers_with_the_generated_eq() {
+        // The `==` a user never wrote a method for: `[derive(PartialEq)]`
+        // generates one, the dispatch record names it, and the hover shows it
+        // — which is the answer to "what does this `==` actually run".
+        let source = "import std::compare::PartialEq;\nimport std::io::print;\n\n[derive(PartialEq)]\nstruct Tag {\n\tn: i32,\n}\n\nfun main() {\n\tlet a = Tag { n = 1 };\n\tlet b = Tag { n = 2 };\n\tif a == b {\n\t\tprint(1);\n\t}\n}\n";
+        assert_eq!(
+            operator_hover_at(source, "if a == b", 5),
+            Some("```vilan\nfun eq(self, other: Tag): bool\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_a_native_operator_and_an_operand_are_untouched() {
+        // The two controls that make the pins above claims about DISPATCH
+        // rather than about operator tokens. A native `+` dispatches to
+        // nothing — native JS is its semantics — so there is no declaration to
+        // show and the hover stays empty; and a caret on an OPERAND is still
+        // that operand's hover, because the operator arm asks for a cursor in
+        // the gap BETWEEN the two.
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "self.x + other.x", 7),
+            None,
+        );
+        let on_operand = operator_hover_at(OPERATOR_IMPLS, "a + b", 0);
+        assert!(
+            on_operand.is_some_and(|hover| hover.contains("Point")),
+            "a caret on `a` still hovers the binding",
+        );
     }
 
     // E148: B242's BOUNDARY refusal gets the fix too.

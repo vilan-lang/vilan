@@ -2208,6 +2208,84 @@ fun main(): i32 {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// E149. `Document::references` handed back DERIVED_SOURCE rows, and
+    /// `references_across` did not — it goes through `canonical_sources`,
+    /// which has no entry for the template, so the drop was a side effect
+    /// rather than a decision. Two faces of one index disagreeing about what a
+    /// symbol's references ARE is the class the index exists to close, and a
+    /// generated row cannot become a client location in any case: its offsets
+    /// index a text no file holds.
+    #[test]
+    fn e149_references_never_hands_back_a_generated_row() {
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        let needle = "Tab::A.eq";
+        let offset = TWIN_DERIVES.find(needle).expect("fixture") + needle.len() - 1;
+        // The premise: this symbol HAS a generated row (its declaration is the
+        // derive template's), so the filter is doing work rather than passing.
+        assert!(
+            document
+                .reference_index()
+                .occurrences_of(
+                    document
+                        .reference_target(offset)
+                        .expect("the caret is on `eq`")
+                        .0,
+                )
+                .any(|row| row.source == vilan_core::analyzer::DERIVED_SOURCE),
+            "the fixture must carry a generated row",
+        );
+        let answered = document.references(offset);
+        assert!(
+            !answered.is_empty(),
+            "the call site is still reported: {answered:?}",
+        );
+        assert!(
+            answered
+                .iter()
+                .all(|(source, _)| *source != vilan_core::analyzer::DERIVED_SOURCE),
+            "a generated row reached the client: {answered:?}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E149. A caret ON a struct-init shorthand renamed whichever side
+    /// declaration order gave — the row carries one of its two definitions as
+    /// its own and the other as a co-reference, and `Definition::sort_key`
+    /// breaks the tie by entity id. So `A { x }` expanded to `x = renamed` in
+    /// one file and to `renamed = x` in another, for the same keystroke on the
+    /// same shape. Ruled 2026-09-07: the caret means the LOCAL. The binding is
+    /// one hop away by name — `A { x }` READS `x` — where the field is reached
+    /// only through the type, and a user who means the field has the field's
+    /// own declaration and every `a.x` to start from.
+    #[test]
+    fn e149_a_caret_on_a_shorthand_renames_the_local_in_either_declaration_order() {
+        for (label, source) in [
+            ("the struct declared first", SHORTHAND_STRUCT_FIRST),
+            ("the struct declared after", SHORTHAND_STRUCT_LAST),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            let shorthand = source.find("A { x }").expect("fixture") + 4;
+            assert_eq!(
+                document.reference_target(shorthand).map(|(_, kind)| kind),
+                Some(DefinitionKind::Binding),
+                "{label}: the caret means the local",
+            );
+            let edits = document
+                .rename_edits(shorthand, "renamed")
+                .unwrap_or_else(|refusal| panic!("{label}: {}", refusal.message()));
+            let at_shorthand = &edits
+                .iter()
+                .find(|(_, span, _)| span.start == shorthand)
+                .unwrap_or_else(|| panic!("{label}: the shorthand is its own rename site"))
+                .2;
+            assert_eq!(
+                at_shorthand, "x = renamed",
+                "{label}: the LOCAL moves and the field keeps its spelling",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     // --- E145: an `as` alias is a NAME OF ITS OWN ---------------------------
     //
     // E142 built the alias as a second SPELLING of one definition: the scope

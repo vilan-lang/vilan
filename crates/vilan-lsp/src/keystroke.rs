@@ -2790,7 +2790,7 @@ fun main() {
     /// minutes of work in a debug suite. Both gates are run deliberately,
     /// together, by the command in this module's doc.
     #[test]
-    #[ignore = "E121/E126: the diagnostics gate — RED and honest. One warm keystroke costs 1,053 ms of process CPU on the view-shaped exhibit against a 500 ms mandate (E126, 2026-09-04, release, loadavg 121); M19 tranche 1's per-module reuse is the path to green. Minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
+    #[ignore = "E121/E126: the diagnostics gate — RED and honest. One warm keystroke costs 1,053 ms of process CPU on the view-shaped exhibit against a 500 ms mandate (E126, 2026-09-04, release, loadavg 121); M19 tranche 1's per-module reuse is the path to green. The number is LOAD-DEPENDENT and a green run here is not evidence the work is gone: 690–831 ms at loadavg ~100 (E149, editor-28, 2026-09-05), and a quiet box passes the mandate outright. Minutes of analysis; run deliberately (proposal/editor-latency.md §6)"]
     fn diagnostics_budget() {
         let (directory, _document, _) = land_view(GATE_FUNCTIONS);
         let entry = directory.join("src").join("main.vl");
