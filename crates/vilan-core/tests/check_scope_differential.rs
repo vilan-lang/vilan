@@ -879,3 +879,165 @@ fn an_edited_module_is_not_served_its_old_tables() {
         "the analysis after the edit published different diagnostics"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M19 T1c — the drop scan's ENROLMENT, restored per reused module (tracker M42)
+
+/// A module that declares a resource and three bodies: one that constructs it,
+/// one that reaches it through a call, and one that reaches nothing. The gate
+/// M19 T1c restores ([`Analyzer::resource_reaching_roots`]) has to answer all
+/// three, and it answers by walking each body's whole subtree — which is what
+/// a restored answer replaces.
+const M19_T1C_DROP_MODULE: &str = r#"
+resource struct M19T1cHandle {
+	tag: i32,
+}
+
+fun m19_t1c_open(tag: i32): M19T1cHandle {
+	M19T1cHandle { tag = tag }
+}
+
+fun m19_t1c_hold(): i32 {
+	let handle = m19_t1c_open(7);
+	handle.tag
+}
+
+fun m19_t1c_plain(value: i32): i32 {
+	value + 1
+}
+"#;
+
+/// The entry the enrolment leg uses — it REACHES the module's bodies, so they
+/// survive emission and the JavaScript comparison has something in it.
+fn m19_t1c_entry(revision: u32) -> String {
+    format!(
+        "import pkg::module::{{ m19_t1c_hold, m19_t1c_plain }};\n\n\
+         fun main() {{\n\tlet revision = {revision};\n\
+         \tprint(\"{{m19_t1c_hold()}} {{m19_t1c_plain(revision)}}\");\n}}\n"
+    )
+}
+
+/// What the drop planner's enrolment leg observes: M28's counter (how many
+/// roots the planner walked), T1c's counter (how many bodies the GATE walked to
+/// decide that), the denominator, and the emitted JavaScript.
+///
+/// Read on the analysis thread — all three counters are thread-local, like the
+/// reuse census.
+fn observe_drop_gate(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+) -> (usize, usize, usize, Option<String>) {
+    let pkg_root = pkg_root.to_path_buf();
+    let entry_path = entry_path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (
+                vilan_core::drop_plan_stats::planned_roots(),
+                vilan_core::drop_plan_stats::offered_roots(),
+                vilan_core::drop_plan_stats::asked_roots(),
+                javascript,
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// **M19 T1c's pin (tracker M42).** A reused module's drop-scan enrolment is
+/// SERVED, not re-walked — and serving it changes the work without changing
+/// the answer.
+///
+/// The gate is the drop planner's whole price. M28 made the planner per-body,
+/// but the predicate that decides which bodies it runs on walks every bodied
+/// function's entire subtree looking for the first piece of resource evidence
+/// — and on a program where almost nothing reaches a resource, that walk runs
+/// to EXHAUSTION in nearly every body. Measured on kolt's client leg the gate
+/// is ~90% of `plan_resource_drops`.
+///
+/// Three claims, and the middle one is the red-first half: the enrolment
+/// (M28's number) is identical with the restore and without it; the gate's own
+/// walk collapses with the restore and covers every body without it; and the
+/// emitted JavaScript — which is what a wrong enrolment would move, since an
+/// unenrolled body emits no teardown — is byte-identical.
+#[test]
+fn a_reused_modules_drop_scan_enrolment_is_restored_not_rewalked() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (directory, entry) = write_module_package("t1c_drop", M19_T1C_DROP_MODULE);
+    let warm = |directory: &Path, entry: &Path| -> (usize, usize, usize, Option<String>) {
+        let _ = observe_drop_gate(directory, entry, m19_t1c_entry(1));
+        observe_drop_gate(directory, entry, m19_t1c_entry(2))
+    };
+
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::set_world_table_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+    let restored = warm(&directory, &entry);
+
+    vilan_core::analyzer::set_world_table_reuse(false);
+    vilan_core::analyzer::base_cache_clear();
+    let rewalked = warm(&directory, &entry);
+    vilan_core::analyzer::set_world_table_reuse(true);
+
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+
+    assert!(
+        rewalked.0 > 0 && rewalked.1 > rewalked.0,
+        "the fixture must enrol some bodies and not all of them, or neither \
+         number below says anything: planned {} of {}",
+        rewalked.0,
+        rewalked.1
+    );
+    assert_eq!(
+        restored.0, rewalked.0,
+        "the restored enrolment must be the SAME enrolment: M28's counter says \
+         {} roots with the record and {} without it, so the record is serving a \
+         different program",
+        restored.0, rewalked.0
+    );
+    assert_eq!(
+        rewalked.2, rewalked.1,
+        "without the record the gate must walk every body it is offered — if it \
+         does not, this pin's red half is measuring something else: asked {} of \
+         offered {}",
+        rewalked.2, rewalked.1
+    );
+    assert!(
+        restored.2 < rewalked.2,
+        "with the record the gate must walk FEWER bodies — the whole tranche is \
+         that walk not happening for a reused module: asked {} restored vs {} \
+         re-walked",
+        restored.2,
+        rewalked.2
+    );
+    assert!(
+        restored.3.is_some(),
+        "the fixture must emit JavaScript for the comparison below to mean \
+         anything"
+    );
+    assert_eq!(
+        restored.3, rewalked.3,
+        "restored and re-walked enrolments emitted different JavaScript — an \
+         unenrolled resource body emits no teardown, so this is a dropped \
+         destructor and not a formatting difference"
+    );
+}
