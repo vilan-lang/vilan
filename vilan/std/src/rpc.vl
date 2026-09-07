@@ -24,7 +24,7 @@ import pkg::hash::{ Hash, Hashable };
 import pkg::io::panic;
 import pkg::json::JsonValue;
 import pkg::map::Map;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::promise::Promise;
 import pkg::reactive::{
 	Disposable,
@@ -38,7 +38,7 @@ import pkg::reactive::{
 	get_owner,
 	turn,
 };
-import pkg::result::Result::{ Err, Ok, self };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::Shared;
 import pkg::task::Task;
 import pkg::time::{ Duration, sleep_for };
@@ -500,7 +500,9 @@ impl SocketDuplex with DuplexTransport {
 		if self.state.get() == ConnectionState::Connected {
 			match frame {
 				Frame::Text(let body) => self.socket.read().transmit("d:" + body),
-				Frame::Binary(let bytes) => self.socket.read().transmit_bytes(tag_duplex_bytes(bytes)),
+				Frame::Binary(let bytes) => self.socket
+					.read()
+					.transmit_bytes(tag_duplex_bytes(bytes)),
 			}
 		}
 	}
@@ -580,8 +582,12 @@ impl SocketTransport with Transport {
 				await reply_promise(|complete: |Result<Frame, str>| void| {
 					self.duplex.pending.write().push(PendingCall { request = id, complete });
 					match request {
-						Frame::Text(let body) => self.duplex.socket.read().transmit(i"r:{id}:{body}"),
-						Frame::Binary(let bytes) => self.duplex.socket.read().transmit_bytes(tag_rpc_bytes(id, bytes)),
+						Frame::Text(let body) => self.duplex.socket
+							.read()
+							.transmit(i"r:{id}:{body}"),
+						Frame::Binary(let bytes) => self.duplex.socket
+							.read()
+							.transmit_bytes(tag_rpc_bytes(id, bytes)),
 					}
 				})
 			} else {
@@ -652,7 +658,10 @@ fun route_socket_bytes(message: Bytes, pending_settle: |i32, Frame| void, dispat
 	}
 	let tag = message.get(0);
 	if tag == 0x72 && message.len() >= 5 {
-		let request = message.get(1) | message.get(2) << 8 | message.get(3) << 16 | message.get(4) << 24;
+		let request = message.get(1)
+			| message.get(2) << 8
+			| message.get(3) << 16
+			| message.get(4) << 24;
 		pending_settle(request, Frame::Binary(message.slice(5, message.len())));
 	} else if tag == 0x64 {
 		dispatch(Frame::Binary(message.slice(1, message.len())));
@@ -771,11 +780,7 @@ fun dial_with_backoff(
 	for attempt < 10 {
 		if attempt > 0 {
 			sleep_for(Duration::millis(delay));
-			delay = if delay * 2i53 > 4000i53 {
-				4000i53
-			} else {
-				delay * 2i53
-			};
+			delay = if delay * 2i53 > 4000i53 { 4000i53 } else { delay * 2i53 };
 		}
 		outcome = dial(url, protocols, settle, dispatch);
 		if outcome is Ok(let _opened) {
@@ -3215,11 +3220,7 @@ macro fun service(item: Item): Source {
 			// the same call one layer down — `expose_keyed` is
 			// `expose_keyed_map` without the `values()` projection — which is
 			// what makes the two forms one channel shape.
-			let exposer = if is_map {
-				"expose_keyed_map"
-			} else {
-				"expose_keyed"
-			};
+			let exposer = if is_map { "expose_keyed_map" } else { "expose_keyed" };
 			exposures.push(i"session.{exposer}(self.{field_name}, |element: {element}| element.key())");
 		}
 		exposure_index = exposure_index + 1;
@@ -3230,7 +3231,9 @@ macro fun service(item: Item): Source {
 			i"let channels: List<i32> = [{exposure_list}];",
 			"reply(channels)",
 		])
-		.arm("Option::None", "RpcOutcome::Failure(RpcError::Remote(" + quote("unknown connection") + "))")
+		.arm("Option::None", "RpcOutcome::Failure(RpcError::Remote("
+			+ quote("unknown connection")
+			+ "))")
 		.render();
 	mut attach_statements: List<str> = [];
 	attach_statements.push("let connection: i32 = arg(request, 0);");
@@ -3303,7 +3306,9 @@ macro fun service(item: Item): Source {
 	let verify = fun_of("verify")
 		.parameter("self")
 		.returns("Result<bool, RpcError>")
-		.line("let remote: Result<str, RpcError> = call(self.transport, self.codec, " + quote("__contract") + ", []);")
+		.line("let remote: Result<str, RpcError> = call(self.transport, self.codec, "
+			+ quote("__contract")
+			+ ", []);")
 		.expr("Result::Ok(remote! == self.contract_hash())");
 	client_impl = client_impl.method(verify).method(contract_hash);
 
@@ -3315,10 +3320,18 @@ macro fun service(item: Item): Source {
 	// only difference is the handshake offer it dials with).
 	mut body: List<str> = [];
 	body.push("let transport = socket.transport();");
-	body.push("let remote: Result<str, RpcError> = call(transport, codec, " + quote("__contract") + ", []);");
-	body.push("if remote! != " + quote(hash) + " {\n" + indent(i"ret Result::Err(RpcError::Contract({complaint}));", 1) + "\n}");
+	body.push("let remote: Result<str, RpcError> = call(transport, codec, "
+		+ quote("__contract")
+		+ ", []);");
+	body.push("if remote! != "
+		+ quote(hash)
+		+ " {\n"
+		+ indent(i"ret Result::Err(RpcError::Contract({complaint}));", 1)
+		+ "\n}");
 	body.push("let connection = socket.connection.read();");
-	body.push("let attached: Result<List<i32>, RpcError> = call(transport, codec, " + quote("__attach") + ", [|serializer: Serializer| connection.describe(serializer)]);");
+	body.push("let attached: Result<List<i32>, RpcError> = call(transport, codec, "
+		+ quote("__attach")
+		+ ", [|serializer: Serializer| connection.describe(serializer)]);");
 	body.push("let channels = attached!;");
 	body.push("let reactive = ReactiveClient::new(bridge(socket), codec);");
 	// Registered where the client is born, so no terminal arm has to carry
@@ -3360,7 +3373,9 @@ macro fun service(item: Item): Source {
 		"[]"
 	};
 	body.push(i"let rebinds: List<|i32, Frame| void> = {rebind_list};");
-	body.push("socket.on_reconnect.write().push(|| {\n" + indent("reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds);", 1) + "\n});");
+	body.push("socket.on_reconnect.write().push(|| {\n"
+		+ indent("reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds);", 1)
+		+ "\n});");
 	let field_lines = join(ok_fields, ",\n");
 	let client_value = i"Result::Ok({target.client_name} \{\n" + indent(field_lines, 1) + "\n})";
 	let connect_type = i"Result<{target.client_name}<SocketTransport>, RpcError>";
@@ -3390,6 +3405,15 @@ macro fun service(item: Item): Source {
 		.method(connect_with.expr(client_value))
 		.render();
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n" + "import std::wire::{ Codec, Serializer, Frame, Keyed };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::reactive::{ turn, FlushPolicy };\n";
-	source(imports + service_impl + service_trait_impl + client_struct.render() + client_impl.render() + connect_impl)
+	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n"
+		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
+		+ "import std::result::Result;\n"
+		+ "import std::option::Option;\n"
+		+ "import std::reactive::{ turn, FlushPolicy };\n";
+	source(imports
+		+ service_impl
+		+ service_trait_impl
+		+ client_struct.render()
+		+ client_impl.render()
+		+ connect_impl)
 }

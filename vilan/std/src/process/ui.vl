@@ -29,7 +29,7 @@
 // Only available when building for a process platform (node).
 
 import pkg::compare::PartialEq;
-import pkg::option::Option::{ None, self };
+import pkg::option::Option::{ self, None };
 import pkg::reactive::{
 	Draft,
 	Owner,
@@ -140,11 +140,7 @@ impl View {
 			}
 		}
 		let declaration = name + ":" + source.get();
-		let next = if current == "" {
-			declaration
-		} else {
-			current + ";" + declaration
-		};
+		let next = if current == "" { declaration } else { current + ";" + declaration };
 		set_attribute(self.attributes, "style", next);
 		self
 	}

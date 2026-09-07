@@ -53,7 +53,11 @@ macro fun Debug(item: Item): Source {
 			for field in target.fields {
 				parts.push(quote(i"{field.name} = ") + i" + self.{field.name}.debug()");
 			}
-			body = quote(i"{target.name} \{ ") + " + " + join(parts, glued_comma) + " + " + quote(" }");
+			body = quote(i"{target.name} \{ ")
+				+ " + "
+				+ join(parts, glued_comma)
+				+ " + "
+				+ quote(" }");
 		}
 		let printer = fun_of("debug").parameter("self").returns("str").expr(body);
 		ret source("import std::debug::Debug;\n" + impl_of(target.name)
@@ -80,7 +84,11 @@ macro fun Debug(item: Item): Source {
 					index = index + 1;
 				}
 				let bind_pattern = join(binds, ", ");
-				let rendering = quote(i"{variant.name}(") + " + " + join(parts, glued_comma) + " + " + quote(")");
+				let rendering = quote(i"{variant.name}(")
+					+ " + "
+					+ join(parts, glued_comma)
+					+ " + "
+					+ quote(")");
 				arms = arms.arm(i"{target.name}::{variant.name}({bind_pattern})", rendering);
 			}
 		}

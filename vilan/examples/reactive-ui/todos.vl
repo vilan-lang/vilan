@@ -48,7 +48,9 @@ fun todos(): View {
 	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, filter)| {
 		mut shown: List<Todo> = [];
 		for todo in list {
-			let keep = filter == "all" || (filter == "active" && !todo.done) || (filter == "done" && todo.done);
+			let keep = filter == "all"
+				|| (filter == "active" && !todo.done)
+				|| (filter == "done" && todo.done);
 			if keep {
 				shown.push(todo);
 			}
@@ -115,11 +117,7 @@ fun count_done(list: List<Todo>): i32 {
 fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 	view("button")
 		.text(label)
-		.bind_class(filter.map(|current| if current == value {
-			"active"
-		} else {
-			""
-		}))
+		.bind_class(filter.map(|current| if current == value { "active" } else { "" }))
 		.on("click", || filter.set(value))
 }
 
@@ -129,11 +127,7 @@ fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 // the list everyone reads from.
 fun todo_row(items: SignalCell<List<Todo>>, todo: Todo): View {
 	view("li")
-		.class(if todo.done {
-			"done"
-		} else {
-			""
-		})
+		.class(if todo.done { "done" } else { "" })
 		.child(view("input").attr("type", "checkbox").on("change", || toggle(items, todo.id)))
 		.child(view("span").text(todo.label))
 		.child(view("button").class("remove").text("✕").on("click", || remove(items, todo.id)))

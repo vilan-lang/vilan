@@ -51,7 +51,7 @@
 // made the shared half unreachable from half the program. It is pure vilan,
 // so it is also available under `const`.
 
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 
 // --- the shape of a path ------------------------------------------------------
 
@@ -223,11 +223,7 @@ fun dirname(path: str): str {
 	if end == 0 {
 		// Empty, or nothing but separators — the two cases with no last
 		// component to remove, and they answer differently.
-		ret if path.is_empty() {
-			"."
-		} else {
-			"/"
-		};
+		ret if path.is_empty() { "." } else { "/" };
 	}
 	mut cut = end;
 	for cut > 0 && path.substring(cut - 1, cut) != "/" {

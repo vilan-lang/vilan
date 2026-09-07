@@ -7,8 +7,8 @@
 // sticky (`unexpected end of frame`) — validating decode, same as JSON's.
 
 import pkg::bytes::{ Bytes, data_view, decode_utf8, encode_utf8 };
-import pkg::option::Option::{ None, Some, self };
-import pkg::result::Result::{ Err, Ok, self };
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::Shared;
 import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializer, Wire };
 
@@ -166,11 +166,7 @@ impl BinaryWriter with Serialize {
 	}
 
 	fun bool_value(self, value: bool) {
-		self.write_byte(if value {
-			1
-		} else {
-			0
-		});
+		self.write_byte(if value { 1 } else { 0 });
 	}
 }
 
@@ -231,7 +227,10 @@ impl BinaryReader {
 			ret 0;
 		}
 		let at = self.cursor.read();
-		let value = self.bytes.get(at) | self.bytes.get(at + 1) << 8 | self.bytes.get(at + 2) << 16 | self.bytes.get(at + 3) << 24;
+		let value = self.bytes.get(at)
+			| self.bytes.get(at + 1) << 8
+			| self.bytes.get(at + 2) << 16
+			| self.bytes.get(at + 3) << 24;
 		self.cursor.write() = at + 4;
 		value
 	}
@@ -241,7 +240,10 @@ impl BinaryReader {
 			ret 0;
 		}
 		let at = self.cursor.read();
-		let value = self.bytes.get_u32(at) | self.bytes.get_u32(at + 1) << 8 | self.bytes.get_u32(at + 2) << 16 | self.bytes.get_u32(at + 3) << 24;
+		let value = self.bytes.get_u32(at)
+			| self.bytes.get_u32(at + 1) << 8
+			| self.bytes.get_u32(at + 2) << 16
+			| self.bytes.get_u32(at + 3) << 24;
 		self.cursor.write() = at + 4;
 		value
 	}

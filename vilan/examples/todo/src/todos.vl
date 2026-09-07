@@ -81,7 +81,9 @@ fun todos(client: TodoClient<SocketTransport>): View {
 	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, current)| {
 		mut shown: List<Todo> = [];
 		for todo in list {
-			let keep = current == "all" || (current == "active" && !todo.done) || (current == "done" && todo.done);
+			let keep = current == "all"
+				|| (current == "active" && !todo.done)
+				|| (current == "done" && todo.done);
 			if keep {
 				shown.push(todo);
 			}
@@ -149,11 +151,7 @@ fun todo_row(client: TodoClient<SocketTransport>, todo: Todo): View {
 	view("li")
 		.styled(item)
 		.child(checkbox(client, todo))
-		.child(if todo.done {
-			label.styled(done_label)
-		} else {
-			label
-		})
+		.child(if todo.done { label.styled(done_label) } else { label })
 		.child(view("button")
 			.styled(remove_button)
 			.text("✕")

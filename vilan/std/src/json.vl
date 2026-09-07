@@ -8,8 +8,8 @@
 // to the host `JSON.stringify`/`JSON.parse` and the host coercions.
 
 import pkg::bytes::decode_utf8;
-import pkg::option::Option::{ None, Some, self };
-import pkg::result::Result::{ Err, Ok, self };
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::Shared;
 import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializer, Wire };
 
@@ -916,7 +916,9 @@ macro fun enum_json_impls(target: EnumItem): str {
 			to_arms = to_arms.arm(i"{target.name}::{variant.name}", quote(i"\"{variant.name}\""));
 		} else if arity == 1 {
 			let opener = quote(i"\{\"{variant.name}\":");
-			to_arms = to_arms.arm(i"{target.name}::{variant.name}(let p0)", opener + " + p0.to_json() + " + quote("}"));
+			to_arms = to_arms.arm(i"{target.name}::{variant.name}(let p0)", opener
+				+ " + p0.to_json() + "
+				+ quote("}"));
 		} else {
 			mut binds: List<str> = [];
 			mut parts: List<str> = [];
@@ -929,7 +931,11 @@ macro fun enum_json_impls(target: EnumItem): str {
 			let bind_pattern = join(binds, ", ");
 			let separator = " + " + quote(",") + " + ";
 			let opener = quote(i"\{\"{variant.name}\":[");
-			to_arms = to_arms.arm(i"{target.name}::{variant.name}({bind_pattern})", opener + " + " + join(parts, separator) + " + " + quote("]}"));
+			to_arms = to_arms.arm(i"{target.name}::{variant.name}({bind_pattern})", opener
+				+ " + "
+				+ join(parts, separator)
+				+ " + "
+				+ quote("]}"));
 		}
 	}
 	// Decoding validates the tag (an unknown one is a decode error, not a panic)
@@ -1124,10 +1130,15 @@ macro fun Json(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	if item.as_struct() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + struct_json_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue };\n"
+			+ "import std::result::Result;\n"
+			+ struct_json_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + enum_json_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n"
+			+ "import std::result::Result;\n"
+			+ "import std::option::Option;\n"
+			+ enum_json_impls(target));
 	}
 	source("")
 }
@@ -1136,10 +1147,19 @@ macro fun Wire(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	if item.as_struct() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + struct_json_impls(target) + struct_wire_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue };\n"
+			+ "import std::result::Result;\n"
+			+ "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n"
+			+ struct_json_impls(target)
+			+ struct_wire_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + enum_json_impls(target) + enum_wire_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n"
+			+ "import std::result::Result;\n"
+			+ "import std::option::Option;\n"
+			+ "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n"
+			+ enum_json_impls(target)
+			+ enum_wire_impls(target));
 	}
 	source("")
 }

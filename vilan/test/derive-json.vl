@@ -1,5 +1,5 @@
 import std::io::print;
-import std::result::Result::{ Err, Ok, self };
+import std::result::Result::{ self, Err, Ok };
 
 // `[derive(Json)]` synthesizes both directions — `to_json` (a faithful JSON object
 // with real field names, which a bare `JSON.stringify` of a vilan struct can't
@@ -38,7 +38,10 @@ fun main() {
 	// `from_json` parses and validates it back into a `Person`; the nested
 	// `Point` and every scalar survive, so re-serializing reproduces the
 	// original document.
-	print(Person::from_json(text) is Ok(let back) && back.to_json() == text && back.home.y == 4 && back.name == "Ada \"A\"");
+	print(Person::from_json(text) is Ok(let back)
+		&& back.to_json() == text
+		&& back.home.y == 4
+		&& back.name == "Ada \"A\"");
 	// re-serializes identically
 	// nested field survives
 	// escaped string survives

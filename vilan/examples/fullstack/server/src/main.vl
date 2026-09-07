@@ -22,8 +22,14 @@ async fun main() {
 			match request.path() {
 				// An API route the client calls with `fetch`. Its body uses the
 				// same shared `greeting` the client does.
-				"/api/hello" => Response::builder().set_header("Content-Type", "text/plain").body(greeting("the API")).build(),
-				_ => Response::builder().set_header("Content-Type", "text/html").body(page()).build(),
+				"/api/hello" => Response::builder()
+					.set_header("Content-Type", "text/plain")
+					.body(greeting("the API"))
+					.build(),
+				_ => Response::builder()
+					.set_header("Content-Type", "text/html")
+					.body(page())
+					.build(),
 			}
 		})
 		.on_start(|server| {

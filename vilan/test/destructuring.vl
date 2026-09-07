@@ -1,6 +1,6 @@
 import std::display::Display;
 import std::io::print;
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 
 // Tuple destructuring as a first-class binder in every binding position: `let`,
 // function and closure parameters, and `match` patterns (bare and nested in a

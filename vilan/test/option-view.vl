@@ -1,5 +1,5 @@
 import std::io::print;
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 
 // Phase 5: a view may be returned wrapped in an enum payload — `Option<&mut T>`
 // — when it projects a parameter. The caller unwraps it with `match`, binding

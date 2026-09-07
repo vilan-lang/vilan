@@ -1,6 +1,6 @@
 import std::io::print;
 import std::iterator::Iterator;
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 
 // `for x in iterable` over a custom iterator (a type with
 // `next(&mut self): Option<T>`) lowers to a loop that calls `next()` until it

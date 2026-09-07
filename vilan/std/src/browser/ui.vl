@@ -38,7 +38,7 @@ import pkg::dom::{
 	get_element_by_id,
 };
 import pkg::io::panic;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Disposable,
 	Draft,

@@ -15,7 +15,7 @@
 // process.
 //
 import pkg::fetch::post;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::process::env;
 
 /// Whether this process is the child of a `vilan run --watch` session — the dev

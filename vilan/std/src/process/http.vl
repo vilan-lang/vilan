@@ -10,7 +10,7 @@ import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::crypto::sha256;
 import pkg::json::{ JsonKind, JsonValue, coerce_str };
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
 // --- Raw node:http bindings ---
@@ -595,7 +595,9 @@ impl Server {
 				ResponseBody::Bytes(let bytes) => node_response.end_bytes(bytes),
 				// The stream response: status and headers are written; hand
 				// the live stream to the app and leave the response open.
-				ResponseBody::Stream(let on_open) => on_open(ResponseStream { node = node_response }),
+				ResponseBody::Stream(let on_open) => on_open(ResponseStream {
+					node = node_response,
+				}),
 			}
 		});
 		match upgrade_handler {

@@ -2,7 +2,7 @@ import pkg::compare::{ Eq, Ord, Ordering, PartialEq, PartialOrd };
 import pkg::default::Default;
 import pkg::math::PI;
 import pkg::operators::{ Add, BitAnd, BitOr, BitXor, Div, Mul, Shl, Shr, Sub };
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 
 external struct u32;
 

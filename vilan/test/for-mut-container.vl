@@ -1,5 +1,5 @@
 import std::io::print;
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 
 // Phase 5: mutable iteration over a *user* container. `for e in &mut c` drives a
 // `next_mut(&mut self): Option<&mut T>` iterator — the view-returning Option

@@ -9,7 +9,7 @@
 // to them are implicitly awaited.
 
 import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer };
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::task::{ CancelSignal, ambient_signal };
 
 external struct Response;

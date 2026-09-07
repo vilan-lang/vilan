@@ -99,7 +99,10 @@ fun link<R: Routable>(label: str, route: R): View {
 /// A main-button click with no modifier keys — the only click `link`
 /// intercepts; anything else keeps the anchor's native behavior.
 fun plain_left_click(event: Event): bool {
-	let no_modifiers = !event.meta_key() && !event.ctrl_key() && !event.shift_key() && !event.alt_key();
+	let no_modifiers = !event.meta_key()
+		&& !event.ctrl_key()
+		&& !event.shift_key()
+		&& !event.alt_key();
 	event.button() == 0 && no_modifiers
 }
 

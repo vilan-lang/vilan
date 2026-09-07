@@ -2,7 +2,7 @@ import pkg::compare::PartialEq;
 import pkg::default::Default;
 import pkg::io::panic;
 import pkg::operators::{ Lift, Try, Verdict };
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 
 enum Result<T, E> {
 	Ok(T),

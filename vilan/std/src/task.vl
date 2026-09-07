@@ -13,7 +13,7 @@
 
 import pkg::context::Context;
 import pkg::drop::Drop;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 
 external struct Task<T>;
 

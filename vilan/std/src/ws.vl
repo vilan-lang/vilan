@@ -123,31 +123,30 @@ impl WsParser {
 					} else {
 						// The high 5 bytes must be zero AND the low 31 bits
 						// must not carry the sign — anything larger is hostile.
-						let oversized = buffer.get(2) != 0 || buffer.get(3) != 0 || buffer.get(4) != 0 || buffer.get(5) != 0 || buffer.get(6) & 0x80 != 0;
+						let oversized = buffer.get(2) != 0
+							|| buffer.get(3) != 0
+							|| buffer.get(4) != 0
+							|| buffer.get(5) != 0
+							|| buffer.get(6) & 0x80 != 0;
 						if oversized {
 							self.violated.write() = true;
 							events.push(WsEvent::Closed);
 							ret events;
 						}
-						length = buffer.get(6) << 24 | buffer.get(7) << 16 | buffer.get(8) << 8 | buffer.get(9);
+						length = buffer.get(6) << 24
+							| buffer.get(7) << 16
+							| buffer.get(8) << 8
+							| buffer.get(9);
 						header = 10;
 					}
 				}
 				if valid {
 					let mask_at = header;
-					let total = if masked {
-						header + 4 + length
-					} else {
-						header + length
-					};
+					let total = if masked { header + 4 + length } else { header + length };
 					if available < total {
 						scanning = false;
 					} else {
-						let payload_at = if masked {
-							mask_at + 4
-						} else {
-							mask_at
-						};
+						let payload_at = if masked { mask_at + 4 } else { mask_at };
 						let payload = buffer.slice(payload_at, payload_at + length);
 						if masked {
 							mut index = 0;

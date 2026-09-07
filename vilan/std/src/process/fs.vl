@@ -33,7 +33,7 @@
 import pkg::bytes::Bytes;
 import pkg::crypto::random_uuid;
 import pkg::drop::Drop;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::shared::Shared;
 import pkg::task::{ CancelSignal, ambient_signal };
 
@@ -437,7 +437,11 @@ async external fun raw_stat(path: str): Option<RawStat>;
 /// Probes `path`: `None` if nothing exists there yet, `Some(stat)` otherwise.
 fun stat(path: str): Option<Stat> {
 	match raw_stat(path) {
-		Some(let raw) => Some(Stat { size = raw.size(), modified_at_ms = raw.mtime_ms(), is_directory = raw.is_directory() }),
+		Some(let raw) => Some(Stat {
+			size = raw.size(),
+			modified_at_ms = raw.mtime_ms(),
+			is_directory = raw.is_directory(),
+		}),
 		None => None,
 	}
 }

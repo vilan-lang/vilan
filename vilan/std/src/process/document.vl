@@ -36,9 +36,9 @@
 import pkg::build::LegBuild;
 import pkg::fs;
 import pkg::io::panic;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::path;
-import pkg::result::Result::{ Err, Ok, self };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::ui;
 import pkg::ui::{ View, escape_attribute, escape_text };
 
@@ -275,7 +275,19 @@ impl Document {
 	/// precisely so that dropping a rung never drops the check.
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
 		match check_shell(shell, build, default_mount) {
-			Ok(let _checked) => Ok(Document { build, shell = Some(shell), source = "this supplied shell", title = "", description = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
+			Ok(let _checked) => Ok(Document {
+				build,
+				shell = Some(shell),
+				source = "this supplied shell",
+				title = "",
+				description = "",
+				lang = "en",
+				mount = default_mount,
+				head = "",
+				body = "",
+				rendered = "",
+				splice = splice_point(shell, default_mount),
+			}),
 			Err(let faults) => Err(faults),
 		}
 	}
@@ -493,11 +505,7 @@ impl Document {
 		if !missing.is_empty() {
 			mut report = "";
 			for problem in missing {
-				report = if report == "" {
-					problem
-				} else {
-					report + "\n" + problem
-				};
+				report = if report == "" { problem } else { report + "\n" + problem };
 			}
 			panic(report);
 		}
@@ -835,19 +843,11 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 		// have to admit that, now that an `end` past the length is refused.
 		if index < length && markup.substring(index, index + 1) == "=" {
 			index = skip_spaces(markup, index + 1);
-			let quote = if index < length {
-				markup.substring(index, index + 1)
-			} else {
-				""
-			};
+			let quote = if index < length { markup.substring(index, index + 1) } else { "" };
 			if quote == "\"" || quote == "'" {
 				let close = past(index_of(markup, quote, index + 1), 0, length);
 				value = markup.substring(index + 1, close);
-				index = if close < length {
-					close + 1
-				} else {
-					length
-				};
+				index = if close < length { close + 1 } else { length };
 			} else {
 				mut end = index;
 				for end < length && !is_space(markup.substring(end, end + 1)) && markup.substring(end, end + 1) != ">" {
@@ -880,11 +880,7 @@ fun skip_raw_text(markup: str, from: i32, name: str): i32 {
 	let length = markup.len();
 	let closing = "</" + name;
 	let closing_length = closing.len();
-	mut index = if from < 0 {
-		0
-	} else {
-		from
-	};
+	mut index = if from < 0 { 0 } else { from };
 	for index + closing_length <= length {
 		if matches_ascii_insensitive(markup, index, closing) {
 			ret index;
@@ -936,11 +932,7 @@ fun skip_spaces(markup: str, from: i32): i32 {
 /// answer whether it `contains` something, but not where.)
 fun index_of(text: str, needle: str, from: i32): Option<i32> {
 	let limit = text.len() - needle.len();
-	mut index = if from < 0 {
-		0
-	} else {
-		from
-	};
+	mut index = if from < 0 { 0 } else { from };
 	for index <= limit {
 		if text.substring(index, index + needle.len()) == needle {
 			ret Some(index);
@@ -960,7 +952,10 @@ fun is_name_start(character: str): bool {
 
 /// Whether `character` can continue a tag name (`h1`, `font-face`, `svg:use`).
 fun is_name_char(character: str): bool {
-	is_name_start(character) || (character >= "0" && character <= "9") || character == "-" || character == ":"
+	is_name_start(character)
+		|| (character >= "0" && character <= "9")
+		|| character == "-"
+		|| character == ":"
 }
 
 /// Whether `character` ends an attribute name.

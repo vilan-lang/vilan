@@ -1,6 +1,6 @@
 import std::compare::{ Ord, Ordering, PartialEq, PartialOrd };
 import std::io::print;
-import std::option::Option::{ Some, self };
+import std::option::Option::{ self, Some };
 
 // A concrete type implementing `Ord` supplies only the required members
 // (`compare` from Ord, `eq` from PartialEq, `partial_compare` from PartialOrd);

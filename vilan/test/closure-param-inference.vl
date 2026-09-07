@@ -1,4 +1,4 @@
-import std::{ io::print, option::Option::{ None, Some, self } };
+import std::{ io::print, option::Option::{ self, None, Some } };
 
 struct Point {
 	x: i32,

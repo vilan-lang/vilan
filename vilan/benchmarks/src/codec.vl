@@ -6,7 +6,7 @@ import std::binary::{ binary_codec, decode_binary, encode_binary };
 import std::io::print;
 import std::json::{ Json, decode_json, encode_json, json_codec };
 import std::option::Option::{ None, Some };
-import std::result::Result::{ Err, Ok, self };
+import std::result::Result::{ self, Err, Ok };
 import std::time::now_millis;
 import std::wire::{ Codec, Frame, Wire, decode, encode };
 import pkg::payload::{ BenchTodo, sample_list };

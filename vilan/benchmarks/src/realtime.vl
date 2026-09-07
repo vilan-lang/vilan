@@ -6,9 +6,9 @@
 import std::http::{ Response, Server };
 import std::io::print;
 import std::json::{ FromJson, Json, json_codec };
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell, Subscription };
-import std::result::Result::{ Err, Ok, self };
+import std::result::Result::{ self, Err, Ok };
 import std::rpc::{
 	DuplexEnd,
 	DuplexTransport,

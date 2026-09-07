@@ -9,7 +9,7 @@ import std::io::panic;
 import std::io::print;
 import std::json::{ Json, json_codec };
 import std::option::Option::{ None, Some };
-import std::result::Result::{ Err, Ok, self };
+import std::result::Result::{ self, Err, Ok };
 import std::rpc::{
 	Dispatcher,
 	HttpTransport,

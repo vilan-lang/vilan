@@ -43,7 +43,7 @@
 // Again only the return type separates them.
 import std::compare::Ordering;
 import std::io::print;
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 
 struct Holder {
 	items: List<i32>,

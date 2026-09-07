@@ -8,7 +8,7 @@ import std::binary::binary_codec;
 import std::bytes::encode_utf8;
 import std::io::print;
 import std::json::{ Json, json_codec };
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 import std::rpc::{ encode_reply, encode_request, reply };
 import std::wire::{ Codec, Frame, Serializer, Wire, encode };
 import pkg::report::section;
@@ -29,11 +29,7 @@ fun sample_list(count: i32): List<BenchTodo> {
 			id = index,
 			label = i"todo item number {index}",
 			done = index & 1 == 1,
-			notes = if index & 3 == 0 {
-				Some("with a note attached")
-			} else {
-				None
-			},
+			notes = if index & 3 == 0 { Some("with a note attached") } else { None },
 		});
 		index += 1;
 	}

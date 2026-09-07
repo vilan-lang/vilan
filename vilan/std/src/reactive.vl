@@ -2,8 +2,8 @@ import pkg::compare::PartialEq;
 import pkg::context::Context;
 import pkg::hash::Hashable;
 import pkg::native_map::NativeMap;
-import pkg::option::Option::{ None, Some, self };
-import pkg::result::Result::{ Err, Ok, self };
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::Shared;
 import pkg::time::Timer;
 

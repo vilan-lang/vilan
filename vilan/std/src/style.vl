@@ -44,7 +44,7 @@ import pkg::asset::emit;
 import pkg::io::panic;
 import pkg::map::Map;
 import pkg::operators::Add;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
 
 // --- values -------------------------------------------------------------------
@@ -419,11 +419,7 @@ impl Gradient {
 		Gradient {
 			function = self.function,
 			geometry = self.geometry,
-			stops = if self.stops == "" {
-				rendered
-			} else {
-				self.stops + ", " + rendered
-			},
+			stops = if self.stops == "" { rendered } else { self.stops + ", " + rendered },
 			stop_count = self.stop_count + 1,
 			roots,
 		}
@@ -766,11 +762,7 @@ fun condition_pseudo(condition: str): str {
 /// universal selector contributes nothing), so the condition axis — which is
 /// also specificity — is exactly as it was.
 fun render_rule(media: str, condition: str, property: str, class: str, declaration: str): str {
-	mut selector = if family_longhands(property) == "" {
-		"." + class
-	} else {
-		"*." + class
-	};
+	mut selector = if family_longhands(property) == "" { "." + class } else { "*." + class };
 	let relation = condition_relation(condition);
 	if relation.starts_with("^") {
 		// The ancestor guard: the token minus its `^` marker is the ancestor's
@@ -1265,11 +1257,7 @@ impl Style {
 						panic("within cannot wrap an already relation-conditioned style — one within, children or divide per slot");
 					}
 					let token = i"^[{name}=\"{value}\"]";
-					let condition = if parts[1] == "" {
-						token
-					} else {
-						token + " " + parts[1]
-					};
+					let condition = if parts[1] == "" { token } else { token + " " + parts[1] };
 					out = out.rule("", condition, parts[2], declaration);
 				}
 				None => {}
@@ -1362,11 +1350,7 @@ impl Style {
 						panic("attribute cannot wrap an already attribute-conditioned style");
 					}
 					let token = i"[{name}=\"{value}\"]";
-					let condition = if parts[1] == "" {
-						token
-					} else {
-						token + " " + parts[1]
-					};
+					let condition = if parts[1] == "" { token } else { token + " " + parts[1] };
 					out = out.rule("", condition, parts[2], declaration);
 				}
 				None => {}
@@ -1566,14 +1550,7 @@ impl Declarations {
 			roots.push(root);
 		}
 		let pair = property + ":" + text;
-		Declarations {
-			text = if self.text == "" {
-				pair
-			} else {
-				self.text + ";" + pair
-			},
-			roots,
-		}
+		Declarations { text = if self.text == "" { pair } else { self.text + ";" + pair }, roots }
 	}
 
 	/// A `Color`-valued declaration. Exactly `raw` at that instantiation,
