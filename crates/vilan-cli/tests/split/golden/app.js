@@ -384,11 +384,11 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $cg = $q([ 1 ], ($cd) => {
-		return $ce(body);
+	const $cc = $q([ 1 ], ($bZ) => {
+		return $ca(body);
 	});
-	const built = $cg[0];
-	const root = $cg[1];
+	const built = $cc[0];
+	const root = $cc[1];
 	mount(id, built);
 	if (__hmr_active()) {
 		const element = document.getElementById(id);
@@ -537,7 +537,7 @@ function $h(self, $i) {
 	return $k;
 }
 function $f(self, value, $g) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$h(self, $g);
 }
 function $q(policy, body) {
@@ -573,7 +573,7 @@ function $A(self, $i) {
 	return $C;
 }
 function $z(self, value, $g) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$A(self, $g);
 }
 function $G(signal, observer) {
@@ -681,7 +681,7 @@ function $bc(self, $i) {
 	return $be;
 }
 function $bb(self, value, $g) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$bc(self, $g);
 }
 function $bv(owner, body) {
@@ -774,7 +774,7 @@ function $bF(self, $i) {
 	return $bH;
 }
 function $bE(self, value, $g) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$bF(self, $g);
 }
 function $bM(self, $i) {
@@ -800,7 +800,7 @@ function $bM(self, $i) {
 	return $bO;
 }
 function $bL(self, value, $g) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$bM(self, $g);
 }
 function $bU(self, $i) {
@@ -826,12 +826,8 @@ function $bU(self, $i) {
 	return $bW;
 }
 function $bT(self, value, $g) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$bU(self, $g);
-}
-function $bZ(self, observer, $av, $aw) {
-	$bx(self, observer, $av, $aw);
-	observer($x(self));
 }
 function $aX(self, source, render, $aY, $aZ) {
 	const gated = $a($x(source));
@@ -845,7 +841,7 @@ function $aX(self, source, render, $aY, $aZ) {
 		}
 		return;
 	};
-	$bZ(source, (value) => {
+	$bw(source, (value) => {
 		const mine = generation.v + 1;
 		generation.v = mine;
 		clear_chunk_error($aY);
@@ -877,7 +873,7 @@ function $aX(self, source, render, $aY, $aZ) {
 	}, $aY, $aZ);
 	return __clone(self);
 }
-function $ce(body) {
+function $ca(body) {
 	const scope = new3();
 	const result = body(scope);
 	return [ result, scope ];
