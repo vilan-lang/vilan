@@ -206,8 +206,17 @@ enum RootRank {
 /// compare case-sensitively segment by segment, a shorter path sorts before a
 /// longer one extending it (`a` before `a::b`, via `End` < `Path`), and a brace
 /// set's branches are pre-sorted so the whole set compares canonically.
+///
+/// `SelfLeaf` is declared FIRST so a bare `self` member sorts ahead of every
+/// name in its group (E146). ASCII order put it last — `Option::{ self, None,
+/// Some }` reprinted as `Option::{ None, Some, self }` in 37 groups under N55's
+/// reformat, std's `prelude.vl` and `web.vl` among them — and `self` first is
+/// what a reader arrives with: it names the group's own namespace, so it reads
+/// as the head of the list rather than one more member of it. Only a bare
+/// `self` ranks: `self as name` is a rename and keys as one.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum BranchKey {
+    SelfLeaf,
     End,
     Path(String, Box<BranchKey>),
     Set(Vec<BranchKey>),
@@ -277,6 +286,8 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
+        // A bare `self` is the group's own namespace and sorts first (E146).
+        TokenBranch::Path("self", None, None) => BranchKey::SelfLeaf,
         // An alias keys as the segment it renames plus the alias itself, so
         // `a::b as c` and `a::b as d` are two imports the run orders stably
         // rather than two spellings of one key (E142).
@@ -7724,8 +7735,8 @@ mod import_set_layout {
     #[test]
     fn an_import_that_fits_stays_inline_without_a_trailing_comma() {
         assert_construct(
-            "import std::option::Option::{ self, Some, None };\n",
-            "import std::option::Option::{ None, Some, self };\n",
+            "import std::option::Option::{ Some, self, None };\n",
+            "import std::option::Option::{ self, None, Some };\n",
         );
         assert_construct(
             "import std::x::{ alpha, beta, };\n",
@@ -8932,8 +8943,54 @@ mod import_sorting {
         );
         // Case-sensitive: capitalized names sort before lowercase (ASCII).
         assert_sorts(
-            "import std::option::Option::{ self, Some, None };\n",
-            "import std::option::Option::{ None, Some, self };\n",
+            "import std::x::{ beta, Alpha, Delta };\n",
+            "import std::x::{ Alpha, Delta, beta };\n",
+        );
+    }
+
+    // E146 rule 1: a bare `self` is the group's OWN namespace, not one more
+    // member of it, so it heads the group rather than landing wherever ASCII
+    // puts a lowercase four-letter word. Before this rule the sort was plain
+    // ASCII and `Option::{ self, Some, None }` reprinted as
+    // `{ None, Some, self }` — the shape N55's reformat wrote into 37 groups,
+    // `std/src/prelude.vl` and `web.vl` among them.
+    #[test]
+    fn self_sorts_first_in_its_group() {
+        assert_sorts(
+            "import std::option::Option::{ Some, None, self };\n",
+            "import std::option::Option::{ self, None, Some };\n",
+        );
+        assert_sorts(
+            "import std::result::Result::{ Err, Ok, self };\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+        );
+        // Already-first is a fixed point, and the net accepts the reordering:
+        // both spellings of the same group reduce to the same tokens.
+        assert_sorts(
+            "import std::option::Option::{ self, None, Some };\n",
+            "import std::option::Option::{ self, None, Some };\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::option::Option::{ Some, None, self };\n")),
+            normalize(raw_tokens("import std::option::Option::{ self, None, Some };\n")),
+            "the net must see the two orders of one group as one",
+        );
+    }
+
+    // Only a BARE `self` heads the group. `self as name` renames the namespace
+    // — a binding of its own — and keys by the text it writes, so it stays where
+    // the alias sorts it (E142's rule, unchanged).
+    #[test]
+    fn an_aliased_self_does_not_head_the_group() {
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None };\n",
+            "import std::option::Option::{ None, Some, self as Maybe };\n",
+        );
+        // A group carrying BOTH: the bare `self` heads it, the rename sorts by
+        // its own text.
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None, self };\n",
+            "import std::option::Option::{ self, None, Some, self as Maybe };\n",
         );
     }
 
