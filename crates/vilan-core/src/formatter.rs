@@ -4422,6 +4422,87 @@ impl<'src> Printer<'src> {
     /// continuation line. This is the single way the split reaches past a
     /// statement's prefix (`let x = const …`, `ret …`, `await …`) and into the
     /// left operand of a binary.
+    /// The operands of a binary chain, flattened at ONE precedence level:
+    /// `expr`'s left spine is walked while it keeps binding at `precedence`,
+    /// and each step contributes the operator that joins it to what came
+    /// before. The first entry carries no operator — it is the chain's head.
+    ///
+    /// One level, because the root of a binary tree is its LOWEST-precedence
+    /// operator (that is what "binds loosest" means), and the lowest-precedence
+    /// operator is where a reader expects the break. `a || b && c` flattens to
+    /// `a` and `|| b && c`, never to three lines: the `&&` binds tighter and
+    /// belongs on one of them. Operators of the SAME precedence flatten
+    /// together (`a + b - c` is three lines), since a tier is one chain however
+    /// many spellings it mixes.
+    fn flatten_binary_chain<'ast>(
+        expr: &'ast Spanned<Node<'src>>,
+        precedence: u8,
+        out: &mut Vec<(Option<BinaryOp>, &'ast Spanned<Node<'src>>)>,
+    ) {
+        if let Node::Binary(operator, left, right) = &expr.0
+            && Self::binary_precedence(*operator) == precedence
+        {
+            Self::flatten_binary_chain(left, precedence, out);
+            out.push((Some(*operator), right));
+            return;
+        }
+        out.push((None, expr));
+    }
+
+    /// Prints a binary chain one operand per line, OPERATOR-LEADING and one
+    /// indentation level in — rustfmt's shape, and the shape the hand-wrapped
+    /// conditions in this tree were already written in before N55's reformat
+    /// joined them (E147):
+    ///
+    /// ```text
+    /// if text.contains(" ")
+    ///     || text.contains("\"")
+    ///     || text.contains("(")
+    /// {
+    /// ```
+    ///
+    /// The operator leads its line because that is what makes the chain
+    /// scannable: every continuation line answers "and how does this join?"
+    /// before it says anything else, and the operands line up under each other.
+    ///
+    /// Each operand's line is then measured in turn, exactly as a split list's
+    /// element is: over budget, the operand rolls back and reprints with
+    /// [`Split::Tail`] armed, so an operand that is itself a chain breaks with
+    /// its own lines one level past this one.
+    ///
+    /// The operand minimums are the inline form's: `precedence` for the head
+    /// (a left operand may re-bind at the same level) and `precedence + 1` for
+    /// every operand after it, so the reprint reparses to the same tree —
+    /// `a - (b - c)` keeps its parentheses.
+    fn print_split_binary_chain(
+        &mut self,
+        operands: &[(Option<BinaryOp>, &Spanned<Node<'src>>)],
+        precedence: u8,
+    ) {
+        self.indent += 1;
+        for (index, (operator, operand)) in operands.iter().enumerate() {
+            if let Some(operator) = operator {
+                self.line();
+                self.out.push_str(binary_operator_symbol(*operator));
+                self.out.push(' ');
+            }
+            let minimum = if index == 0 {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let operand_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_operand(operand, minimum);
+            if self.current_line_over_budget() {
+                self.out.truncate(operand_start);
+                self.cursor = comment_cursor;
+                self.print_split_operand(operand, minimum, Split::Tail);
+            }
+        }
+        self.indent -= 1;
+    }
+
     fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: Split) {
         self.split = if Self::expression_precedence(&expr.0) >= minimum {
             split
@@ -4722,6 +4803,8 @@ impl<'src> Printer<'src> {
             }
             Node::Binary(operator, left, right) => {
                 let precedence = Self::binary_precedence(*operator);
+                let chain_start = self.out.len();
+                let chain_cursor = self.cursor;
                 let left_start = self.out.len();
                 self.print_split_operand(left, precedence, split);
                 // A split that broke the left operand across lines continues
@@ -4743,6 +4826,27 @@ impl<'src> Printer<'src> {
                 self.print_split_right(right, precedence + 1, split);
                 if continued {
                     self.indent -= 1;
+                }
+                // E147: the chain itself is the last thing that can break. The
+                // operand splits above got first refusal — a chain or a literal
+                // to one side of the operator breaks where it stands, and that
+                // is usually the better layout — and only when the line is
+                // STILL over budget does the chain break at its own operator.
+                //
+                // Two operators is the threshold, E137's rule one construct
+                // over: one link is not a chain, and neither is one operator.
+                // `base + s.aa("<90 columns>")` has nowhere useful to go —
+                // breaking it buys a line and leaves the operand just as wide —
+                // while `a || b || c` is a list of conditions and reads as one.
+                if split != Split::Off && !self.probing && self.first_line_over_budget(chain_start)
+                {
+                    let mut operands = Vec::new();
+                    Self::flatten_binary_chain(expr, precedence, &mut operands);
+                    if operands.len() >= 3 {
+                        self.out.truncate(chain_start);
+                        self.cursor = chain_cursor;
+                        self.print_split_binary_chain(&operands, precedence);
+                    }
                 }
             }
             // A prefix operator (`-x`, `!x`, `&x`, `*x`, `await x`) binds tighter
@@ -5106,20 +5210,26 @@ impl<'src> Printer<'src> {
     fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>, split: Split) {
         let inline =
             split == Split::Off && !self.at_line_start() && self.arms_are_expressions(branch);
-        self.print_if_chain(branch, inline);
+        self.print_if_chain(branch, inline, split);
     }
 
-    fn print_if_chain(&mut self, branch: &NodeIfBranch<'src>, inline: bool) {
+    fn print_if_chain(&mut self, branch: &NodeIfBranch<'src>, inline: bool, split: Split) {
         match branch {
             NodeIfBranch::If(if_) => {
                 self.out.push_str("if ");
+                // The condition CONTINUES the measured line — `if <cond> {` is
+                // one line, and the condition is the only thing on it with a
+                // layout of its own — so it takes the split permission, the way
+                // a binary's operand and a call's last argument do. Without
+                // this an over-budget `if` had nowhere to break at all (E147).
+                self.split = split;
                 self.print_expr(&if_.condition);
                 self.out.push(' ');
                 self.print_arm_body(&if_.then, inline);
                 if let Some((else_branch, _)) = &if_.else_ {
                     self.out.push_str(" else ");
                     match else_branch {
-                        NodeIfBranch::If(_) => self.print_if_chain(else_branch, inline),
+                        NodeIfBranch::If(_) => self.print_if_chain(else_branch, inline, split),
                         NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
                     }
                 }
@@ -10626,5 +10736,192 @@ mod if_arm_layout {
              \tlabel\n\
              }\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod binary_chain_layout {
+    //! E147 — a binary-operator chain over the budget breaks one operand per
+    //! line, at the LOWEST-precedence operator, operator-leading, one
+    //! indentation level in.
+    //!
+    //! Before this rule a chain had no break rule at all, so the formatter
+    //! JOINED hand-wrapped conditions without a width bound: `macro_std`'s
+    //! three-line `text.contains(" ") || …` came out of N55's reformat as one
+    //! line of 182 characters, and four lines that reformat ADDED exceed 100 in
+    //! a tree whose own reflow target is 100.
+    //!
+    //! The lowest-precedence operator is the root of the tree — that is what
+    //! "binds loosest" means — so `a || b && c` is two lines and not three: the
+    //! `&&` binds tighter and belongs on one of them.
+    //!
+    //! Two operators is the threshold, E137's rule one construct over. One link
+    //! is not a chain; neither is one operator.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// `vilan/macro_std/src/meta.vl`'s condition, the line the item names: 182
+    /// columns joined onto one line by the reformat, and hand-wrapped over three
+    /// before it.
+    #[test]
+    fn the_meta_vl_condition_breaks_one_operand_per_line() {
+        let joined = "\t\t\t\tif text.contains(\" \") || text.contains(\"\\\"\") \
+                      || text.contains(\"(\") || text.contains(\".\") \
+                      || text.contains(\"+\") || text.contains(\"-\") \
+                      || text.contains(\"|\") || text.contains(\":\") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun classify(text: str): Option<str> {\n\
+             \tif text.contains(\" \") || text.contains(\"\\\"\") || text.contains(\"(\") \
+             || text.contains(\".\") || text.contains(\"+\") || text.contains(\"-\") \
+             || text.contains(\"|\") || text.contains(\":\") {\n\
+             \t\tret None;\n\
+             \t}\n\
+             \tSome(text)\n\
+             }\n",
+            "fun classify(text: str): Option<str> {\n\
+             \tif text.contains(\" \")\n\
+             \t\t|| text.contains(\"\\\"\")\n\
+             \t\t|| text.contains(\"(\")\n\
+             \t\t|| text.contains(\".\")\n\
+             \t\t|| text.contains(\"+\")\n\
+             \t\t|| text.contains(\"-\")\n\
+             \t\t|| text.contains(\"|\")\n\
+             \t\t|| text.contains(\":\") {\n\
+             \t\tret None;\n\
+             \t}\n\
+             \tSome(text)\n\
+             }\n",
+        );
+    }
+
+    /// The same file's other over-budget line, in the other position a chain
+    /// reaches the width rule from: a block's TAIL expression.
+    #[test]
+    fn a_chain_in_tail_position_breaks_too() {
+        let joined = "\tname.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+                      || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+                      || name.contains(\"*\")";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun opaque_type_text(name: str): bool {\n\
+             \tname.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+             || name.contains(\"*\")\n\
+             }\n",
+            "fun opaque_type_text(name: str): bool {\n\
+             \tname.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\")\n\
+             \t\t|| name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \")\n\
+             \t\t|| name.contains(\"*\")\n\
+             }\n",
+        );
+    }
+
+    /// A short chain stays inline — the entry is width and nothing else.
+    #[test]
+    fn a_short_chain_stays_inline() {
+        let source = "fun demo(a: bool, b: bool, c: bool): bool {\n\ta || b || c\n}\n";
+        assert!(columns("\ta || b || c") <= LINE_BUDGET);
+        assert_construct(source, source);
+        // And the collapse direction: a hand-broken chain that fits joins back.
+        assert_construct(
+            "fun demo(a: bool, b: bool, c: bool): bool {\n\ta\n\t\t|| b\n\t\t|| c\n}\n",
+            source,
+        );
+    }
+
+    /// The break is at the LOWEST-precedence operator, so a tighter operator
+    /// inside an operand stays on that operand's line.
+    #[test]
+    fn the_break_is_at_the_lowest_precedence_operator() {
+        assert_construct(
+            "fun demo(name: str): bool {\n\
+             \tname.contains(\"(\") || name.contains(\"[\") && name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+             || name.contains(\"*\")\n\
+             }\n",
+            "fun demo(name: str): bool {\n\
+             \tname.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\") && name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \")\n\
+             \t\t|| name.contains(\"*\")\n\
+             }\n",
+        );
+    }
+
+    /// Operators of the SAME precedence are ONE chain however many spellings
+    /// they mix, and an operand that had parentheses keeps them — the reprint
+    /// reparses to the same tree, which is what the safety net checks.
+    #[test]
+    fn one_precedence_tier_is_one_chain_and_parentheses_survive() {
+        let joined = "\tlet nested = x + 1000000000 - (y - 2000000000) + 3000000000 - z \
+                      + 4000000000 - y + 5000000000 + z + 60000000;";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun demo(x: i32, y: i32, z: i32) {\n\
+             \tlet nested = x + 1000000000 - (y - 2000000000) + 3000000000 - z \
+             + 4000000000 - y + 5000000000 + z + 60000000;\n\
+             }\n",
+            "fun demo(x: i32, y: i32, z: i32) {\n\
+             \tlet nested = x\n\
+             \t\t+ 1000000000\n\
+             \t\t- (y - 2000000000)\n\
+             \t\t+ 3000000000\n\
+             \t\t- z\n\
+             \t\t+ 4000000000\n\
+             \t\t- y\n\
+             \t\t+ 5000000000\n\
+             \t\t+ z\n\
+             \t\t+ 60000000;\n\
+             }\n",
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check` and depends on exactly this. `assert_construct`
+    /// asserts it per pin; this asserts it over the whole set at once, from the
+    /// UNFORMATTED side, which is where a two-pass rule would show.
+    #[test]
+    fn every_chain_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(n: str): bool {\n\tn.contains(\"(\") || n.contains(\"[\") \
+                 || n.contains(\"|\") || n.contains(\"&\") || n.contains(\",\") \
+                 || n.contains(\" \") || n.contains(\"*\")\n}\n",
+                true,
+            ),
+            (
+                "fun b(a: bool, b: bool, c: bool): bool {\n\ta || b || c\n}\n",
+                false,
+            ),
+            (
+                "fun c(x: i32, y: i32, z: i32) {\n\tlet n = x + 1000000000 \
+                 - (y - 2000000000) + 3000000000 - z + 4000000000 - y + 5000000000 \
+                 + z + 60000000;\n}\n",
+                true,
+            ),
+            (
+                "fun d(t: str): bool {\n\tif t.contains(\" \") || t.contains(\"\\\"\") \
+                 || t.contains(\"(\") || t.contains(\".\") || t.contains(\"+\") \
+                 || t.contains(\"-\") || t.contains(\"|\") || t.contains(\":\") \
+                 {\n\t\ttrue\n\t} else {\n\t\tfalse\n\t}\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
     }
 }
