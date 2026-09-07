@@ -489,3 +489,277 @@ fn the_ssr_twins_of_the_mount_hook_render_the_same_markup_and_run_nothing() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- B255: an in-place `update` beside a `bind_each` -------------------------
+
+/// Six keyed rows, then a `remove(0)` performed IN PLACE through
+/// `SignalCell::update`. `bind_each` keeps the effect's list as `row_items`,
+/// and before B257 that store aliased the cell's own storage — so the next
+/// pass handed `reconcile` an `old_items` that WAS the new array, one shorter
+/// than the `old_keys` beside it, and `same(old_items[5], item)` read past the
+/// end (`index out of bounds: the length is 5 but the index is 5`, kolt
+/// channel.vl:54). The build now copies at the assignment, so `old_items` is
+/// the snapshot the keys were taken from.
+const IN_PLACE_REMOVE: &str = r#"import std::compare::PartialEq;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+struct Row {
+	id: i32,
+	text: str,
+}
+
+// Hand-written, and narrower than the struct: `bind_each`'s key here is the
+// ITEM, so identity is the id and a surviving row is one whose id survived.
+impl Row with PartialEq {
+	fun eq(self, b: Row): bool {
+		self.id == b.id
+	}
+}
+
+fun main() {
+	let rows: SignalCell<List<Row>> = Signal::new([
+		Row { id = 1, text = "a" },
+		Row { id = 2, text = "b" },
+		Row { id = 3, text = "c" },
+		Row { id = 4, text = "d" },
+		Row { id = 5, text = "e" },
+		Row { id = 6, text = "f" },
+	]);
+	let _root = mount_root("app", || {
+		view("ul").bind_each(rows, |row| row, |row| {
+			print(i"render {row.id}");
+			view("li").text(row.text)
+		})
+	});
+	print(i"before={tree()}");
+	print("--- remove ---");
+	rows.update(|&mut xs| {
+		xs.remove(0);
+	});
+	print(i"after={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// The rows a flattened tree line names, as `li#identity'text'` tokens.
+fn row_tokens(line: &str) -> Vec<&str> {
+    line.split(' ')
+        .filter(|token| token.starts_with("li#"))
+        .collect()
+}
+
+#[test]
+fn b255_an_in_place_remove_under_bind_each_keeps_the_surviving_rows() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("in_place_remove", IN_PLACE_REMOVE, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let before = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("before="))
+        .expect("the before line");
+    let after = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("after="))
+        .expect("the after line");
+    let marker = lines
+        .iter()
+        .position(|line| line.contains("--- remove ---"))
+        .expect("the edit marker");
+
+    let before_rows = row_tokens(before);
+    let after_rows = row_tokens(after);
+    assert_eq!(
+        before_rows.len(),
+        6,
+        "the list must build six rows; got:\n{stdout}"
+    );
+    // The survivors are the LAST five, unchanged and in order — same element
+    // identities, so every one of them was moved rather than rebuilt.
+    assert_eq!(
+        after_rows,
+        before_rows[1..].to_vec(),
+        "an in-place `remove(0)` must drop the first row and KEEP the other \
+         five, element identity included; got:\n{stdout}"
+    );
+    // And nothing re-rendered: every surviving key's item is unchanged.
+    let rebuilt: Vec<&&str> = lines[marker + 1..]
+        .iter()
+        .filter(|line| line.starts_with("render "))
+        .collect();
+    assert!(
+        rebuilt.is_empty(),
+        "a removal must rebuild no surviving row; got:\n{stdout}"
+    );
+}
+
+/// The second symptom of the same alias: an in-place ELEMENT write. The key
+/// (the id) survives, so the row is a candidate for reuse and `same` decides —
+/// and `same` was being asked to compare the mutated array with itself, which
+/// always says Keep. The row then kept an element rendered from the OLD item.
+const IN_PLACE_EDIT: &str = r#"import std::compare::PartialEq;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+struct Row {
+	id: i32,
+	text: str,
+}
+
+// The whole struct decides "changed"; the key below decides "the same row".
+impl Row with PartialEq {
+	fun eq(self, b: Row): bool {
+		self.id == b.id && self.text == b.text
+	}
+}
+
+fun main() {
+	let rows: SignalCell<List<Row>> = Signal::new([
+		Row { id = 1, text = "a" },
+		Row { id = 2, text = "b" },
+	]);
+	let _root = mount_root("app", || {
+		view("ul").bind_each(rows, |row| row.id, |row| {
+			print(i"render {row.id}");
+			view("li").text(row.text)
+		})
+	});
+	print("--- edit ---");
+	rows.update(|&mut xs| {
+		xs[0] = Row { id = 1, text = "EDITED" };
+	});
+	print(i"after={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn b255_an_in_place_element_write_under_bind_each_refreshes_that_row() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("in_place_edit", IN_PLACE_EDIT, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let marker = lines
+        .iter()
+        .position(|line| line.contains("--- edit ---"))
+        .expect("the edit marker");
+    let after = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("after="))
+        .expect("the after line");
+
+    let rebuilt: Vec<&&str> = lines[marker + 1..]
+        .iter()
+        .filter(|line| line.starts_with("render "))
+        .collect();
+    assert_eq!(
+        rebuilt,
+        vec![&"render 1"],
+        "the edited row, and only it, must rebuild; got:\n{stdout}"
+    );
+    assert!(
+        after.contains("'EDITED'") && !after.contains("'a'"),
+        "the edited row must show its new text; got:\n{stdout}"
+    );
+    assert!(
+        after.contains("'b'"),
+        "the untouched row must still be there; got:\n{stdout}"
+    );
+}
+
+/// `bind_each_by` holds `row_items` exactly as `bind_each` does, so the
+/// out-of-bounds half is its too — its `same` is constantly true, so it never
+/// showed the stale-row half. `T` here carries a closure and so cannot compare
+/// at all, which is the shape this form exists for.
+const IN_PLACE_REMOVE_BY: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+struct Handle {
+	id: i32,
+	text: str,
+	act: || str,
+}
+
+fun main() {
+	let rows: SignalCell<List<Handle>> = Signal::new([
+		Handle { id = 1, text = "a", act = || "act" },
+		Handle { id = 2, text = "b", act = || "act" },
+		Handle { id = 3, text = "c", act = || "act" },
+		Handle { id = 4, text = "d", act = || "act" },
+		Handle { id = 5, text = "e", act = || "act" },
+		Handle { id = 6, text = "f", act = || "act" },
+	]);
+	let _root = mount_root("app", || {
+		view("ul").bind_each_by(rows, |row| row.id, |row| {
+			view("li").bind_text(row.map(|current| current.text))
+		})
+	});
+	print(i"before={tree()}");
+	rows.update(|&mut xs| {
+		xs.remove(0);
+	});
+	print(i"after={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn b255_an_in_place_remove_under_bind_each_by_keeps_the_surviving_rows() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("in_place_remove_by", IN_PLACE_REMOVE_BY, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let before = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("before="))
+        .expect("the before line");
+    let after = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("after="))
+        .expect("the after line");
+    let before_rows = row_tokens(before);
+    let after_rows = row_tokens(after);
+    assert_eq!(
+        before_rows.len(),
+        6,
+        "the list must build six rows; got:\n{stdout}"
+    );
+    assert_eq!(
+        after_rows.len(),
+        5,
+        "an in-place `remove(0)` must leave five rows; got:\n{stdout}"
+    );
+    // Identity is the whole claim here: every surviving row keeps its element
+    // and its cell, so the text it shows is the one its own binding wrote.
+    let identities: Vec<&str> = after_rows
+        .iter()
+        .map(|token| token.split('\'').next().expect("li#identity"))
+        .collect();
+    let expected: Vec<&str> = before_rows[1..]
+        .iter()
+        .map(|token| token.split('\'').next().expect("li#identity"))
+        .collect();
+    assert_eq!(
+        identities, expected,
+        "the surviving rows must keep their elements, in order; got:\n{stdout}"
+    );
+}

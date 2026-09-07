@@ -175,7 +175,7 @@ function $i(self, $j) {
 	return $l;
 }
 function $g(self, value, $h) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$i(self, $h);
 }
 function $A(self, item, $B) {
@@ -227,7 +227,7 @@ function $M(self, $j) {
 	return $O;
 }
 function $L(self, value, $h) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$M(self, $h);
 }
 function $H(self, transform, $I, $J) {

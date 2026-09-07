@@ -21520,7 +21520,17 @@ impl<'src> Analyzer<'src> {
         // Phase 1 — the candidate positions, collected before any classifying
         // so the (`&mut`, memoizing) resource query can run over them.
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
-        let mut consider = |analyzer: &Self, value_id: Id, type_id: Option<TypeId>| {
+        // `declared_type` is the type the POSITION names when it has one of its
+        // own — a binding's `variable.type_id`. Every other position reads the
+        // type off the PLACE instead, which is what `place_value_type_id` is
+        // for: `type_id_of_expr` alone answers `None` for a bare `Expr::Local`,
+        // because a variable READ interns no type of its own (only its
+        // declaration does). B257: the Assignment arm asked with that weaker
+        // accessor, so `b = a` — a plain local on the right of `=`, the very
+        // first position §6.1 names — declined here for want of a type and
+        // aliased its source, while `b = a[0]` (an `Index`, which does intern)
+        // copied one line away.
+        let mut consider = |analyzer: &Self, value_id: Id, declared_type: Option<TypeId>| {
             if analyzer.is_place_expr(value_id)
                 // Rule 3: a VIEW is an alias on purpose. A `&mut` parameter
                 // forwarded into a construction (`Some(p)`) must stay the same
@@ -21531,7 +21541,8 @@ impl<'src> Analyzer<'src> {
                 && !analyzer.assignment_target_is_view(value_id)
                 && !analyzer.resource_value_places.contains(&value_id)
                 && !analyzer.is_elidable_copy(value_id, shared_captures)
-                && let Some(type_id) = type_id
+                && let Some(type_id) =
+                    declared_type.or_else(|| analyzer.place_value_type_id(value_id))
             {
                 candidates.push((value_id, type_id));
             }
@@ -21555,20 +21566,25 @@ impl<'src> Analyzer<'src> {
                         consider(self, value_id, Some(variable.type_id));
                     }
                 }
+                // Rule 1 names ASSIGNMENT beside binding: `b = a` installs a
+                // second owner of `a`'s storage exactly as `mut b = a` does,
+                // and so does a write THROUGH a view (`h.write() = c`, which
+                // `rewrite_view_assignment_targets` has already turned into a
+                // `Dereference` target). The value's own place answers the type.
                 Expr::Assignment(_target_id, value_id) => {
-                    consider(self, *value_id, self.type_id_of_expr(*value_id));
+                    consider(self, *value_id, None);
                 }
                 // A construction's slots are field initializations (rule 1 names
                 // them outright): each one installs its value in a new aggregate
                 // that outlives the literal, so a place read there copies.
                 Expr::List(element_ids) | Expr::Tuple(element_ids) => {
                     for element_id in element_ids {
-                        consider(self, *element_id, self.place_value_type_id(*element_id));
+                        consider(self, *element_id, None);
                     }
                 }
                 Expr::StructInitializer(_struct_id, assignments) => {
                     for value_id in assignments.values() {
-                        consider(self, *value_id, self.place_value_type_id(*value_id));
+                        consider(self, *value_id, None);
                     }
                 }
                 Expr::Call(call_id) => {
@@ -21589,7 +21605,7 @@ impl<'src> Analyzer<'src> {
                         Some(Expr::EnumVariant(_, _))
                     ) {
                         for argument_id in &function_call.argument_ids {
-                            consider(self, *argument_id, self.place_value_type_id(*argument_id));
+                            consider(self, *argument_id, None);
                         }
                         continue;
                     }
@@ -21619,7 +21635,7 @@ impl<'src> Analyzer<'src> {
                             .get(parameter_id)
                             .is_some_and(|parameter| parameter.convention == Convention::Own);
                         if is_own {
-                            consider(self, *argument_id, self.place_value_type_id(*argument_id));
+                            consider(self, *argument_id, None);
                         }
                     }
                 }

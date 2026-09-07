@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function add_ten(x) {
 	x[0][x[1]] = x[0][x[1]] + 10;
 }
@@ -8,7 +14,7 @@ function slot(self) {
 	return [ 0, [ self, 0 ] ];
 }
 function $j(v3, x) {
-	v3[0][v3[1]] = x;
+	v3[0][v3[1]] = __clone(x);
 }
 let a = [ 10 ];
 const b = [ a, 0 ];

@@ -149,7 +149,7 @@ function $j(self, $k) {
 	return $m;
 }
 function $h(self, value, $i) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$j(self, $i);
 }
 function $s(signal, observer) {
@@ -207,7 +207,7 @@ function $G(self, $k) {
 	return $I;
 }
 function $F(self, value, $i) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$G(self, $i);
 }
 function $L(self, transform, $M) {

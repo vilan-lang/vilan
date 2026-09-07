@@ -34,7 +34,7 @@ function $b(self, value) {
 	let $d = null;
 	if ($c[0] === 0) {
 		const index = $c[1];
-		__at(self[0], index)[1] = value;
+		__at(self[0], index)[1] = __clone(value);
 		$d = [ index, __at(self[0], index)[0] ];
 	} else {
 		const index2 = self[0].length;
@@ -72,7 +72,7 @@ function $i(self, fallback) {
 function $l(self, handle, value) {
 	let $m = null;
 	if ($g(self, handle)) {
-		__at(self[0], handle[0])[1] = value;
+		__at(self[0], handle[0])[1] = __clone(value);
 		$m = true;
 	} else {
 		$m = false;
@@ -100,7 +100,7 @@ function $s(self, value) {
 	let $u = null;
 	if ($t[0] === 0) {
 		const index = $t[1];
-		__at(self[0], index)[1] = value;
+		__at(self[0], index)[1] = __clone(value);
 		$u = [ index, __at(self[0], index)[0] ];
 	} else {
 		const index2 = self[0].length;

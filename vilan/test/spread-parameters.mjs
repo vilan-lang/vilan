@@ -121,7 +121,7 @@ function $p(self, $q) {
 	return $s;
 }
 function $n(self, value, $o) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$p(self, $o);
 }
 function $y(signal, observer) {
@@ -176,7 +176,7 @@ function $B(self, $q) {
 	return $D;
 }
 function $A(self, value, $o) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$B(self, $o);
 }
 const next_subscriber_id = __shared_new(0);
