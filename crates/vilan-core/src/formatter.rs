@@ -4777,7 +4777,7 @@ impl<'src> Printer<'src> {
                 self.out.push_str("= ");
                 self.print_split_operand(value, 0, split);
             }
-            Node::If(branch) => self.print_if_branch(branch),
+            Node::If(branch) => self.print_if_branch(branch, split),
             Node::Match(subject, legs) => {
                 self.out.push_str("match ");
                 self.print_expr(subject);
@@ -4994,23 +4994,108 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints an `if`/`else if`/`else` chain.
-    fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>) {
+    /// Prints an `if`/`else` chain, choosing ONCE for the whole chain between
+    /// the block form (every arm on its own lines) and the inline arm form
+    /// `if c { a } else { b }` (E146 rule 2).
+    ///
+    /// An `if` that begins its own line is a STATEMENT or a block's tail: it
+    /// owns those lines, and its arms take the block form, which is what the
+    /// tree has always been written in. An `if` reached mid-line is an operand
+    /// of something larger — a closure body inside a builder ladder, a match
+    /// leg's `=> `, the right of a `let` — and there expanding an arm whose
+    /// body is a single expression buys nothing and costs the ladder its shape:
+    /// `.bind_text(pending().map(|busy| if busy { "..." } else { "" }))` became
+    /// five lines mid-ladder under N55's reformat, and the enclosing chain then
+    /// measured a first line that fit and never broke, which is the layout that
+    /// should have happened instead.
+    ///
+    /// The `split` permission is the escape hatch: armed, the arms expand as
+    /// before, so an `if` too wide for its line still has somewhere to go. The
+    /// decision is made once at the head of the chain and threaded down, so an
+    /// `else if` never disagrees with the `if` it hangs off.
+    fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>, split: Split) {
+        let inline = split == Split::Off
+            && !self.at_line_start()
+            && self.arms_are_expressions(branch);
+        self.print_if_chain(branch, inline);
+    }
+
+    fn print_if_chain(&mut self, branch: &NodeIfBranch<'src>, inline: bool) {
         match branch {
             NodeIfBranch::If(if_) => {
                 self.out.push_str("if ");
                 self.print_expr(&if_.condition);
                 self.out.push(' ');
-                self.print_block(&if_.then);
+                self.print_arm_body(&if_.then, inline);
                 if let Some((else_branch, _)) = &if_.else_ {
                     self.out.push_str(" else ");
                     match else_branch {
-                        NodeIfBranch::If(_) => self.print_if_branch(else_branch),
-                        NodeIfBranch::Else(block) => self.print_block(block),
+                        NodeIfBranch::If(_) => self.print_if_chain(else_branch, inline),
+                        NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
                     }
                 }
             }
-            NodeIfBranch::Else(block) => self.print_block(block),
+            NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
         }
+    }
+
+    /// Whether everything emitted since the last newline is indentation — i.e.
+    /// the printer is at the head of a line it has not written anything onto.
+    fn at_line_start(&self) -> bool {
+        let line_start = self.out.rfind('\n').map_or(0, |newline| newline + 1);
+        self.out[line_start..].bytes().all(|byte| byte == b'\t')
+    }
+
+    /// Whether EVERY arm of an `if`/`else` chain is a single expression the
+    /// inline form can hold ([`Self::arm_is_an_expression`]). One arm that is
+    /// legitimately a block keeps the whole chain in the block form: an `if`
+    /// with one inline arm and one expanded one reads worse than either.
+    fn arms_are_expressions(&mut self, branch: &NodeIfBranch<'src>) -> bool {
+        match branch {
+            NodeIfBranch::If(if_) => {
+                self.arm_is_an_expression(&if_.then)
+                    && match &if_.else_ {
+                        None => true,
+                        Some((else_branch, _)) => self.arms_are_expressions(else_branch),
+                    }
+            }
+            NodeIfBranch::Else(block) => self.arm_is_an_expression(block),
+        }
+    }
+
+    /// Whether one arm's block is an expression wearing braces: no statements,
+    /// a tail that is not `Void`, no comment anywhere inside it (a comment has
+    /// no slot on the inline line and would be relocated), and a tail that
+    /// renders on ONE line — a tail that is itself a `match` or an element tree
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not an inline arm.
+    fn arm_is_an_expression(
+        &mut self,
+        block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+    ) -> bool {
+        let range = block.1.into_range();
+        let (statements, tail) = &block.0;
+        statements.is_empty()
+            && !matches!(tail.0, Node::Void)
+            && !self.has_comment_in(range.start, range.end)
+            && !self.expr_spans_lines(tail)
+    }
+
+    /// One arm, in whichever form the chain chose.
+    fn print_arm_body(
+        &mut self,
+        block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+        inline: bool,
+    ) {
+        if !inline {
+            self.print_block(block);
+            return;
+        }
+        // No statements and no comments, by construction — so nothing here has
+        // to flush a comment or advance the cursor; the tail IS the arm.
+        let (_, tail) = &block.0;
+        self.out.push_str("{ ");
+        self.print_expr(tail);
+        self.out.push_str(" }");
     }
 
     /// Prints one `match` leg: `pattern[, pattern][ if guard] => body`.
@@ -10151,5 +10236,196 @@ mod style_chain_order {
                 method.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod if_arm_layout {
+    //! E146 rule 2 — an `if` reached MID-LINE keeps arms that are single
+    //! expressions on that line: `if busy { "..." } else { "" }`.
+    //!
+    //! Before this rule every arm expanded, whatever it held and wherever the
+    //! `if` sat, so N55's reformat turned a one-line closure body inside a
+    //! `.bind_text(…)` into five lines in the middle of a builder ladder — and
+    //! the enclosing chain, measuring a first line that now fit, never broke.
+    //! The arm was the wrong thing to spend the lines on: the CHAIN was.
+    //!
+    //! An `if` that begins its own line is a statement or a block's tail and is
+    //! untouched, which is what keeps the rule off every ordinary `if` in the
+    //! tree.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+
+    /// The item's own shape, from `crates/vilan-cli/tests/split/app.vl`. Before:
+    /// the arm expanded to five lines mid-ladder and `view("p")…` stayed one
+    /// link. After: the arm stays an expression and the ladder breaks, which is
+    /// the layout the budget was asking for all along.
+    #[test]
+    fn an_expression_arm_stays_one_mid_builder_ladder() {
+        let line = "\t\t.child(view(\"p\").class(\"pending\")\
+                    .bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))";
+        assert_over_budget(line);
+        assert_construct(
+            "fun app(): Element {\n\
+             \tview(\"main\")\n\
+             \t\t.child(link(\"Home\", Route::Home))\n\
+             \t\t.child(view(\"p\").class(\"pending\")\
+             .bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))\n\
+             }\n",
+            "fun app(): Element {\n\
+             \tview(\"main\")\n\
+             \t\t.child(link(\"Home\", Route::Home))\n\
+             \t\t.child(view(\"p\")\n\
+             \t\t\t.class(\"pending\")\n\
+             \t\t\t.bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))\n\
+             }\n",
+        );
+    }
+
+    /// A `match` leg's `=> ` puts its body mid-line too, so an `if` there keeps
+    /// its arms — the second shape N55's reformat expanded, in the same file.
+    #[test]
+    fn an_if_in_a_match_leg_keeps_its_arms() {
+        assert_construct(
+            "fun label(reason: Option<str>): str {\n\
+             \tmatch reason {\n\
+             \t\tSome(let text) => if text.len() > 0 {\n\
+             \t\t\t\"!\"\n\
+             \t\t} else {\n\
+             \t\t\t\"?\"\n\
+             \t\t},\n\
+             \t\tNone => \"\",\n\
+             \t}\n\
+             }\n",
+            "fun label(reason: Option<str>): str {\n\
+             \tmatch reason {\n\
+             \t\tSome(let text) => if text.len() > 0 { \"!\" } else { \"?\" },\n\
+             \t\tNone => \"\",\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The right of a `let` is mid-line as well.
+    #[test]
+    fn an_if_in_value_position_keeps_its_arms() {
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 { \"positive\" } else { \"other\" };\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+
+    /// A body that is legitimately a block STAYS one: an arm holding a
+    /// statement is not an expression wearing braces, and one arm that must
+    /// expand expands the whole chain — an `if` with one inline arm and one
+    /// block arm reads worse than either form on its own.
+    #[test]
+    fn a_body_that_is_a_block_stays_a_block() {
+        // A statement in one arm keeps BOTH arms in the block form.
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tlog(\"positive\");\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tlog(\"positive\");\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+        // A comment inside an arm has no slot on the inline line, so the block
+        // form is what keeps it where it was written.
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t// the only interesting case\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t// the only interesting case\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+
+    /// An `if` that BEGINS its own line owns those lines — a statement, or a
+    /// block's tail expression — and is untouched by the rule.
+    #[test]
+    fn an_if_at_the_head_of_a_line_keeps_the_block_form() {
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tif n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tif n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// An arm whose own rendering spans lines is not an inline arm: the tail
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not one expression on
+    /// one line.
+    #[test]
+    fn an_arm_whose_tail_spans_lines_expands() {
+        assert_construct(
+            "fun pick(n: i32, k: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tmatch k {\n\
+             \t\t\t0 => \"zero\",\n\
+             \t\t\t_ => \"more\",\n\
+             \t\t}\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun pick(n: i32, k: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tmatch k {\n\
+             \t\t\t0 => \"zero\",\n\
+             \t\t\t_ => \"more\",\n\
+             \t\t}\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
     }
 }
