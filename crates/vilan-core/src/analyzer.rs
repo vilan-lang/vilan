@@ -7705,74 +7705,90 @@ impl<'src> Analyzer<'src> {
         memo: &mut HashMap<TypeId, bool>,
         visiting: &mut HashSet<TypeId>,
     ) -> (bool, bool) {
-        match type_id.get_type(self) {
-            Type::Struct(id, arguments) => {
-                if self
-                    .structs
-                    .get(&id)
-                    .is_some_and(|struct_| struct_.resource)
-                {
-                    return (true, true);
+        // BORROWED, not cloned (M32): the classifier reads its subject and then
+        // recurses through `&mut self`, so the owning read was a deep clone of
+        // whatever `Vec<TypeId>` the type carried — 153,503 of the 1.1M `Type`
+        // clones a cold kolt client check pays, and every one of them dropped
+        // its vector inside this function. What the recursion actually needs is
+        // the member list and the substitution context, so those are built
+        // under ONE immutable borrow (`self.structs` / `self.enums` are reads
+        // too, which is why the whole arm fits inside it) and the `&mut self`
+        // call is made after it ends. The non-aggregate arms need nothing at
+        // all and answer inside the borrow.
+        enum Members {
+            Walk(Vec<TypeId>, SubstitutionContext),
+            Answer(bool, bool),
+        }
+        let plan = {
+            match self.borrow_type_by_type_id(type_id) {
+                Type::Struct(id, arguments) => {
+                    let Some(struct_) = self.structs.get(id) else {
+                        return (false, true);
+                    };
+                    if struct_.resource {
+                        return (true, true);
+                    }
+                    let members: Vec<TypeId> =
+                        struct_.fields.iter().map(|field| field.type_id).collect();
+                    let context = Self::instantiation_context(
+                        &struct_.generic_parameter_constraint_ids,
+                        arguments,
+                    );
+                    Members::Walk(members, context)
                 }
-                let Some(struct_) = self.structs.get(&id) else {
-                    return (false, true);
-                };
-                let parameters = struct_.generic_parameter_constraint_ids.clone();
-                let members: Vec<TypeId> =
-                    struct_.fields.iter().map(|field| field.type_id).collect();
-                let context = Self::instantiation_context(&parameters, &arguments);
+                Type::Enum(id, arguments) => {
+                    let Some(enum_) = self.enums.get(id) else {
+                        return (false, true);
+                    };
+                    if enum_.resource {
+                        return (true, true);
+                    }
+                    let members: Vec<TypeId> = enum_
+                        .variants
+                        .iter()
+                        .flat_map(|variant| variant.data_type_ids.iter().copied())
+                        .collect();
+                    let context = Self::instantiation_context(
+                        &enum_.generic_parameter_constraint_ids,
+                        arguments,
+                    );
+                    Members::Walk(members, context)
+                }
+                // A tuple / fixed-array is a value aggregate: any resource element
+                // marks the whole (destruction.md §3, "element type").
+                Type::Tuple(elements) => {
+                    Members::Walk(elements.clone(), SubstitutionContext::default())
+                }
+                Type::Array(element, _length) => {
+                    Members::Walk(vec![*element], SubstitutionContext::default())
+                }
+                // A generic parameter is a resource iff THIS instantiation designates
+                // it one (R11): base classification passes an empty set, so an
+                // abstract `T` is never a resource there — resource-ness is
+                // per-instantiation, and substitution replaces the parameter with its
+                // concrete argument before the base query reaches this point.
+                Type::Generic(constraint) => {
+                    Members::Answer(resource_constraints.contains(constraint), true)
+                }
+                // Everything else is a non-value or a scalar: never a resource by
+                // containment.
+                Type::Any
+                | Type::Never
+                | Type::Void
+                | Type::Unknown
+                | Type::Unresolved
+                | Type::Closure(_, _)
+                | Type::Function(_)
+                | Type::Module(_)
+                | Type::Trait(_, _)
+                | Type::Mapped(_, _, _) => Members::Answer(false, true),
+            }
+        };
+        match plan {
+            Members::Answer(found, complete) => (found, complete),
+            Members::Walk(members, context) => {
                 self.any_member_resource(&members, &context, resource_constraints, memo, visiting)
             }
-            Type::Enum(id, arguments) => {
-                if self.enums.get(&id).is_some_and(|enum_| enum_.resource) {
-                    return (true, true);
-                }
-                let Some(enum_) = self.enums.get(&id) else {
-                    return (false, true);
-                };
-                let parameters = enum_.generic_parameter_constraint_ids.clone();
-                let members: Vec<TypeId> = enum_
-                    .variants
-                    .iter()
-                    .flat_map(|variant| variant.data_type_ids.clone())
-                    .collect();
-                let context = Self::instantiation_context(&parameters, &arguments);
-                self.any_member_resource(&members, &context, resource_constraints, memo, visiting)
-            }
-            // A tuple / fixed-array is a value aggregate: any resource element
-            // marks the whole (destruction.md §3, "element type").
-            Type::Tuple(elements) => self.any_member_resource(
-                &elements,
-                &SubstitutionContext::default(),
-                resource_constraints,
-                memo,
-                visiting,
-            ),
-            Type::Array(element, _length) => self.any_member_resource(
-                &[element],
-                &SubstitutionContext::default(),
-                resource_constraints,
-                memo,
-                visiting,
-            ),
-            // A generic parameter is a resource iff THIS instantiation designates
-            // it one (R11): base classification passes an empty set, so an
-            // abstract `T` is never a resource there — resource-ness is
-            // per-instantiation, and substitution replaces the parameter with its
-            // concrete argument before the base query reaches this point.
-            Type::Generic(constraint) => (resource_constraints.contains(&constraint), true),
-            // Everything else is a non-value or a scalar: never a resource by
-            // containment.
-            Type::Any
-            | Type::Never
-            | Type::Void
-            | Type::Unknown
-            | Type::Unresolved
-            | Type::Closure(_, _)
-            | Type::Function(_)
-            | Type::Module(_)
-            | Type::Trait(_, _)
-            | Type::Mapped(_, _, _) => (false, true),
         }
     }
 
@@ -26927,7 +26943,7 @@ impl<'src> Analyzer<'src> {
         match type_ {
             Type::Struct(id, arguments) if self.is_slot_container(*id) && arguments.len() == 1 => {
                 let slot = arguments[0];
-                matches!(slot.get_type(self), Type::Unknown).then_some(slot)
+                matches!(slot.borrow_type(self), Type::Unknown).then_some(slot)
             }
             _ => None,
         }
@@ -27293,7 +27309,7 @@ impl<'src> Analyzer<'src> {
         for (constraint_id, type_id) in bindings {
             if open.contains(&constraint_id)
                 && !self.generic_is_enclosing_binder(constraint_id, call_id)
-                && type_id.get_type(self) != Type::Generic(constraint_id)
+                && *type_id.borrow_type(self) != Type::Generic(constraint_id)
                 && !self.type_has_hole(type_id)
             {
                 substitution.insert(constraint_id, type_id);
@@ -27956,7 +27972,7 @@ impl<'src> Analyzer<'src> {
                             // directing a NON-empty literal's elements by the
                             // expectation is deliberately avoided (see the
                             // `expected_element` comment below).
-                            if matches!(slot.get_type(self), Type::Unknown)
+                            if matches!(slot.borrow_type(self), Type::Unknown)
                                 && let Type::Struct(expected_struct_id, expected_arguments) =
                                     &constraint
                                 && *expected_struct_id == list_id
@@ -28355,7 +28371,8 @@ impl<'src> Analyzer<'src> {
                                     // it.
                                     if return_generics.contains(&constraint_id)
                                         && !self.generic_is_enclosing_binder(constraint_id, id)
-                                        && type_id.get_type(self) != Type::Generic(constraint_id)
+                                        && *type_id.borrow_type(self)
+                                            != Type::Generic(constraint_id)
                                     {
                                         self.method_call_substitution
                                             .entry(id)
@@ -28734,7 +28751,7 @@ impl<'src> Analyzer<'src> {
                         let is_unknown = self
                             .parameters
                             .get(parameter_id)
-                            .is_some_and(|p| matches!(p.type_id.get_type(self), Type::Unknown));
+                            .is_some_and(|p| matches!(p.type_id.borrow_type(self), Type::Unknown));
                         let expected_known = !matches!(
                             expected_type_id.get_type(self),
                             Type::Unknown | Type::Unresolved
@@ -49512,10 +49529,15 @@ fn analyze_over_world<'src>(
         .iter()
         .chain(analyzer.expr_id_to_type_id_map.iter())
     {
-        let type_ = type_id.get_type(&analyzer);
+        // BORROWED, not cloned (M32): `pretty_print_type` reads the type and
+        // the analyzer is immutable for the whole loop, so the owning read here
+        // was a deep clone of a `Vec<TypeId>` per typed expression, dropped one
+        // line later. This loop and the two below it run once per expression,
+        // variable and parameter in the program.
+        let type_ = type_id.borrow_type(&analyzer);
         expr_types.insert(
             *expr_id,
-            analyzer.pretty_print_type(&type_, &empty_substitution),
+            analyzer.pretty_print_type(type_, &empty_substitution),
         );
         expr_type_ids.insert(*expr_id, *type_id);
     }
@@ -49523,17 +49545,17 @@ fn analyze_over_world<'src>(
     // (an `Expr::Local`/`Expr::Parameter`) carries no type on its own expr id, so
     // hover resolves through the binding.
     for (binding_id, variable) in &analyzer.variables {
-        let type_ = variable.type_id.get_type(&analyzer);
+        let type_ = variable.type_id.borrow_type(&analyzer);
         expr_types.insert(
             *binding_id,
-            analyzer.pretty_print_type(&type_, &empty_substitution),
+            analyzer.pretty_print_type(type_, &empty_substitution),
         );
     }
     for (binding_id, parameter) in &analyzer.parameters {
-        let type_ = parameter.type_id.get_type(&analyzer);
+        let type_ = parameter.type_id.borrow_type(&analyzer);
         expr_types.insert(
             *binding_id,
-            analyzer.pretty_print_type(&type_, &empty_substitution),
+            analyzer.pretty_print_type(type_, &empty_substitution),
         );
     }
     // Label declarations themselves, so hover works on a function/type at its
@@ -49644,8 +49666,8 @@ fn analyze_over_world<'src>(
             {
                 return (*source, *span, *definition, signature.clone());
             }
-            let type_ = type_id.get_type(&analyzer);
-            let label = analyzer.pretty_print_type(&type_, &empty_substitution);
+            let type_ = type_id.borrow_type(&analyzer);
+            let label = analyzer.pretty_print_type(type_, &empty_substitution);
             (*source, *span, *definition, label)
         })
         .collect::<Vec<_>>();
@@ -50347,6 +50369,53 @@ mod walk_type_node_fence_tests {
     use super::Analyzer;
     use crate::node::Node;
     use crate::type_::Type;
+
+    /// M32 slice B migrated the resource classifier, the hover-label tail and
+    /// the discriminant tests from `get_type_by_type_id` to its borrowing twin
+    /// `borrow_type_by_type_id`, on the premise that the two are the SAME read
+    /// and only their ownership differs. That premise is a two-line
+    /// implementation today (`get` is `borrow(..).clone()`), which is exactly
+    /// why it is worth pinning: the accessors' doc comment calls them "a
+    /// permanent pair", so the next lane that gives one of them a fallback,
+    /// a memo, or a substitution the other does not have breaks every migrated
+    /// site silently — a wrong TYPE, not a crash. The pin is cheap and the
+    /// failure it guards is not.
+    ///
+    /// Every slot is checked rather than one: the two could agree on a scalar
+    /// and disagree on the aggregate variants, which are the ones carrying the
+    /// `Vec<TypeId>` the clone exists for and the ones the classifier reads.
+    #[test]
+    fn the_owning_and_borrowing_type_reads_answer_identically_for_every_slot() {
+        let mut analyzer = Analyzer::new();
+        let scope_id = analyzer.create_owned_scope(None).id;
+        // A slot per shape the classifier and the label tail actually meet:
+        // an unresolved hole, a scalar, and the parameterized aggregates whose
+        // argument vectors are what the owning read deep-copies.
+        let unresolved = analyzer.walk_type_node(&(Node::Error, (0..0).into()), scope_id);
+        let void = analyzer.type_id_for_type(Type::Void);
+        let generic = analyzer.type_id_for_type(Type::Generic(unresolved));
+        let tuple = analyzer.type_id_for_type(Type::Tuple(vec![void, unresolved, generic]));
+        let closure = analyzer.type_id_for_type(Type::Closure(vec![tuple, void], generic));
+        let array = analyzer.type_id_for_type(Type::Array(tuple, 3));
+        let slots = [unresolved, void, generic, tuple, closure, array];
+        assert!(
+            slots.iter().any(|slot| !matches!(
+                analyzer.borrow_type_by_type_id(*slot),
+                Type::Void | Type::Unresolved | Type::Unknown
+            )),
+            "the pin would be vacuous if every planted slot were a scalar"
+        );
+        for slot in slots {
+            let owned = analyzer.get_type_by_type_id(slot);
+            let borrowed = analyzer.borrow_type_by_type_id(slot);
+            assert_eq!(
+                &owned, borrowed,
+                "`get_type_by_type_id` and `borrow_type_by_type_id` disagree on \
+                 {slot:?}: they are one read with two ownerships, and M32's \
+                 migrated call sites take the borrow on that basis"
+            );
+        }
+    }
 
     #[test]
     fn a_non_type_node_in_type_position_is_a_diagnostic_not_a_panic() {
