@@ -46747,6 +46747,15 @@ pub fn analyze_cancellable<'src>(
     platform: Platform,
     workspace: &Workspace,
 ) -> Option<Program<'src>> {
+    // The macro-world tally (M33) is per TOP-LEVEL analysis, and this is the
+    // door every one of them comes through — `analyze` fronts it for the CLI,
+    // and a front end holding a cancellation token calls it directly. It is
+    // reset here rather than in `analyze_inner` because that function re-enters
+    // itself (the base-cache retry, the world rebuild) inside one analysis, and
+    // a reset there would forget worlds the same run had already compiled.
+    if !crate::macros::in_macro_world() {
+        crate::macros::world_phases_reset();
+    }
     let (sanitized, refusals) = drop_reserved_dependency_edges(workspace);
     let workspace = sanitized.as_ref().unwrap_or(workspace);
     let mut program = analyze_inner(
@@ -49772,17 +49781,47 @@ fn analyze_over_world<'src>(
         TABLE_REUSE_CENSUS.with(|census| census.set(table_census));
     }
 
-    // The phase split, one line per top-level analysis (macro worlds are
-    // nested analyses; their line would be noise inside the outer one).
-    // Stderr for the same reason the leak line is: `build --stdout`'s
-    // JavaScript must stay clean.
+    // The phase split, one line per top-level analysis. A macro world is a
+    // nested analysis whose own line would read as noise inside the outer one —
+    // but its numbers are not noise, so instead of being dropped they are
+    // TALLIED and printed once, as the worlds' own row below (M33). Stderr for
+    // the same reason the leak line is: `build --stdout`'s JavaScript must stay
+    // clean.
+    let phase_checks = phase_checks_start.elapsed();
+    if crate::phase_timing_enabled() && crate::macros::in_macro_world() {
+        crate::macros::world_phases_record_analysis(
+            phase_load_walk - phase_marks.base,
+            phase_marks.base,
+            phase_build,
+            phase_checks,
+        );
+    }
     if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
         eprintln!(
             "[vilan phase] load+walk {:.1}ms base {:.1}ms build {:.1}ms checks {:.1}ms",
             (phase_load_walk - phase_marks.base).as_secs_f64() * 1000.0,
             phase_marks.base.as_secs_f64() * 1000.0,
             phase_build.as_secs_f64() * 1000.0,
-            phase_checks_start.elapsed().as_secs_f64() * 1000.0,
+            phase_checks.as_secs_f64() * 1000.0,
+        );
+        // The macro worlds' row (M33). It is printed WHATEVER the count, zero
+        // included: "this analysis compiled no macro worlds" is the fact a warm
+        // run exists to state, and a row that appears only when there is
+        // something to report cannot say it. The numbers are a SLICE through
+        // the line above rather than a disjoint bucket — a world's cost is
+        // inside the outer entry's `load+walk`, because that is when the
+        // expansion that needs it runs — so the two do not sum, exactly as
+        // `dispatch-refine` does not sum with the buckets it explains.
+        let worlds = crate::macros::world_phases();
+        eprintln!(
+            "[vilan phase] macro-worlds {} load+walk {:.1}ms base {:.1}ms build {:.1}ms \
+             checks {:.1}ms post-passes {:.1}ms",
+            worlds.compiled,
+            worlds.load_walk.as_secs_f64() * 1000.0,
+            worlds.base.as_secs_f64() * 1000.0,
+            worlds.build.as_secs_f64() * 1000.0,
+            worlds.checks.as_secs_f64() * 1000.0,
+            worlds.post.as_secs_f64() * 1000.0,
         );
         // A second line rather than more fields on the first: N43 made those
         // labels honest and a reader parses them positionally. `reused` is how

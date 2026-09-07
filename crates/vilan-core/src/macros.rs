@@ -660,6 +660,114 @@ pub(crate) fn in_macro_world() -> bool {
     IN_MACRO_WORLD.with(|flag| flag.get())
 }
 
+/// What the macro worlds of ONE top-level analysis cost, for the phase line
+/// (tracker M33).
+///
+/// A macro world is a nested analysis (macro-engine.md §3): the blanked copy of
+/// one macro-defining file, compiled against `macro_std`. Four of them run
+/// inside a cold `vilan check` of kolt's client — 18.2% of that entry's
+/// instructions, comparable to its own whole-program checks — and the phase
+/// line could not see them. A world's `load+walk`/`base`/`build`/`checks` are
+/// timed inside the same `analyze_over_world` the outer entry runs, but its
+/// line is suppressed (its own numbers inside the outer's would read as noise),
+/// so the four folded INTO the outer entry's `load+walk` with nothing saying
+/// so; the only trace they left was four bare `post-passes` lines with no
+/// heading, which reads as the compiler having run the post-passes five times.
+///
+/// So the worlds get a row of their own. It is a SLICE through the outer
+/// line, not a disjoint bucket — the same relationship `dispatch-refine` has to
+/// `const-pass`, and stated here for the same reason: subtracting the worlds
+/// out of `load+walk` would make the outer number stop being the wall the
+/// analysis took, which is what a reader uses it for.
+///
+/// Thread-local because a multi-entry `check` compiles its entries on their own
+/// threads (M35) and each prints its own phase line; a world compiled while
+/// serving entry A must not appear on entry B's row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MacroWorldPhases {
+    /// How many worlds this analysis COMPILED. Zero is the interesting value:
+    /// a world served from the process cache (or, since M33's second half, from
+    /// the package's on-disk expansion table) compiles nothing and adds
+    /// nothing, so a warm run's row reads 0 and says exactly that.
+    pub(crate) compiled: usize,
+    pub(crate) load_walk: std::time::Duration,
+    pub(crate) base: std::time::Duration,
+    pub(crate) build: std::time::Duration,
+    pub(crate) checks: std::time::Duration,
+    pub(crate) post: std::time::Duration,
+}
+
+thread_local! {
+    static WORLD_PHASES: std::cell::Cell<MacroWorldPhases> =
+        const { std::cell::Cell::new(MacroWorldPhases {
+            compiled: 0,
+            load_walk: std::time::Duration::ZERO,
+            base: std::time::Duration::ZERO,
+            build: std::time::Duration::ZERO,
+            checks: std::time::Duration::ZERO,
+            post: std::time::Duration::ZERO,
+        }) };
+}
+
+/// Start a top-level analysis's tally. Called where the outer analysis begins,
+/// never inside a world.
+pub(crate) fn world_phases_reset() {
+    WORLD_PHASES.with(|phases| phases.set(MacroWorldPhases::default()));
+}
+
+/// One world COMPILED, counted where the compile happens rather than where its
+/// timings are read: the durations are only collected when `VILAN_PHASE_TIMING`
+/// asks, and the COUNT has to be true whether the instrument is on or not — it
+/// is what M33's warm-run pin asserts, and a pin that needs an environment
+/// variable to be meaningful is a pin on the instrument.
+pub(crate) fn world_phases_record_compiled() {
+    WORLD_PHASES.with(|cell| {
+        let mut phases = cell.get();
+        phases.compiled += 1;
+        cell.set(phases);
+    });
+}
+
+/// One world's analysis phases, added to this thread's tally. Called from the
+/// site that would have PRINTED the world's own line.
+pub(crate) fn world_phases_record_analysis(
+    load_walk: std::time::Duration,
+    base: std::time::Duration,
+    build: std::time::Duration,
+    checks: std::time::Duration,
+) {
+    WORLD_PHASES.with(|cell| {
+        let mut phases = cell.get();
+        phases.load_walk += load_walk;
+        phases.base += base;
+        phases.build += build;
+        phases.checks += checks;
+        cell.set(phases);
+    });
+}
+
+/// One world's post-passes, added to this thread's tally.
+pub(crate) fn world_phases_record_post(post: std::time::Duration) {
+    WORLD_PHASES.with(|cell| {
+        let mut phases = cell.get();
+        phases.post += post;
+        cell.set(phases);
+    });
+}
+
+pub(crate) fn world_phases() -> MacroWorldPhases {
+    WORLD_PHASES.with(|phases| phases.get())
+}
+
+/// How many macro worlds the last top-level analysis on THIS thread compiled —
+/// the phase row's count, readable without parsing stderr (the `bindable_set_cost`
+/// probe shape, M30). The pin M33's second half needs: a warm `check` of an
+/// unchanged package must answer 0.
+#[doc(hidden)]
+pub fn macro_worlds_compiled() -> usize {
+    world_phases().compiled
+}
+
 /// The macro world's AMBIENT prelude vocabulary (macro-engine.md §3/§10): the
 /// compiler-interaction surface — the `meta` reflection types plus
 /// `source`/`fresh` — is in scope in every macro body without imports, the
@@ -873,6 +981,10 @@ fn compile_world(
         &workspace,
     );
     IN_MACRO_WORLD.with(|flag| flag.set(previously_in_world));
+    // Counted here, at the one place a world's analysis actually runs: the two
+    // cache hits above returned before it, so a warm process — and, since the
+    // on-disk expansion table, a warm PROCESS — adds nothing (M33).
+    world_phases_record_compiled();
     if !errors.is_empty() {
         // The text above is already leaked; caching the failure bounds that to
         // one leak per distinct (definition set, layout) instead of one per
