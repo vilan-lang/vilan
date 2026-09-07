@@ -9155,3 +9155,154 @@ fn b257_a_bare_parameter_stored_by_an_assignment_copies() {
         "#;
     assert_compiles_and_runs(source, "2\n");
 }
+
+// --- B256: `Shared::read()` hands out the cell's STORAGE ---------------------
+//
+// MEASURED AND HELD (Order 29). The ruling asked for is (b): a `SharedValue`
+// result is a PLACE for the clone pass, so a binding, an assignment, a
+// construction slot or an `own` argument fed by it copies while a temporary
+// (`for x in cell.read()`, `cell.read().len()`) stays free, and rule 2 cannot
+// elide it because the source is not a local. It was implemented and measured
+// on this branch, and the numbers say the cost lands in the wrong places, so
+// the change is not here — these pins are, red, with what they cost.
+//
+// The implementation is four seams: `is_shared_read` beside `is_place_expr`
+// (`Shared::read`'s declaration id, taken from the same block that fills the
+// intrinsic table), `compute_clone_sites`' `consider` admitting it, the
+// extern's declared return type answering the type filter, and
+// `returned_value_places` reading a `SharedValue` leaf THROUGH to its
+// receiver — which is what makes `fun get(self): T { self.value.read() }`
+// copy at its return and a cell built inside the body still donate.
+//
+// What that emits in std, per NOTIFY rather than per program:
+//
+//   `bind_each`'s effect:  const previous_views = __clone(row_views.v);
+//                          const previous_owners = __clone(row_owners.v);
+//   `drain`'s wave:        const wave = __clone(turn[0].v);
+//   `SignalCell::get`:     return __clone(self[0].v);
+//
+// Node process CPU (user+sys, `process.cpuUsage`), nine alternating runs each,
+// median, this host at loadavg 101-104:
+//
+//   `bind_each` over 500 rows, 200 in-place `update`s under the DOM stub
+//                                      0.798 s -> 0.957 s  (+20%)
+//   A44's selector, 1000 rows, 20k sets  0.066 s -> 0.074 s  (+12%)
+//   `batch` drain, 200 subscribers x 2000 batches
+//                                        0.118 s -> 0.148 s  (+25%)
+//   `SignalCell::get()` of a 1000-element list, 2000 times
+//                                        0.009 s -> 0.040 s  (+344%)
+//
+// Emitted size is not the problem: kolt's client leg moves 136,205 -> 136,331
+// bytes (+0.09%, 158 -> 172 `__clone` sites) and its server leg 96,959 ->
+// 97,022 (73 -> 80). The corpus census moves 311 -> 340 over 128 programs.
+//
+// So the owner decides between this and the other half of B256's fix —
+// `SharedValue` emitting `__clone(self.v)` at every read, which is strictly
+// more expensive — or a third thing: the two std sites above are both a read
+// whose source dies on the next line (`turn.pending.write() = []`) or is only
+// walked (`previous_views`), which rule 2 would elide for a local and cannot
+// for a cell.
+
+#[test]
+#[ignore = "B256 held on cost: implemented and measured this cycle — +20% node \
+            process CPU on a 500-row `bind_each` under 200 in-place updates, \
+            +25% on a 200-subscriber batch drain, +12% on A44's 1000-row \
+            selector, +344% on `SignalCell::get()` of a 1000-element list \
+            (medians of nine alternating runs at loadavg 101-104); and \
+            `bind_each` copies `row_views`/`row_owners` per notify, which the \
+            landing bar forbade. Awaiting the owner's ruling."]
+fn b256_a_binding_fed_by_a_shared_read_copies() {
+    // `Shared.read(self): T` is declared a value return, and §6.1 says a
+    // signature that hands back a value hands back a value. The intrinsic
+    // lowers to the bare slot `self.v`, so `let b = h.read()` binds the cell's
+    // own storage and a later write through the cell shows in `b`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3, 4, 5]);
+            let b = h.read();
+            h.write().push(9);
+            print(b.len());
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+#[ignore = "B256 held on cost — see `b256_a_binding_fed_by_a_shared_read_copies`."]
+fn b256_a_mutable_binding_fed_by_a_shared_read_does_not_grow_the_cell() {
+    // The other direction of the same alias: `mut c = h.read(); c.push(10)`
+    // pushed into the CELL, so the cell read 6.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3, 4, 5]);
+            mut c = h.read();
+            c.push(10);
+            print(h.read().len());
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+#[ignore = "B256 held on cost — see `b256_a_binding_fed_by_a_shared_read_copies`."]
+fn b256_a_value_returning_body_copies_the_shared_read_it_hands_back() {
+    // `SignalCell::get`'s shape: a by-value signature whose tail is a shared
+    // read. The frame does not own the cell — it reached it through a bare
+    // parameter — so the return owes rule 1's copy, and without it every
+    // `signal.get()` in the estate hands out the signal's own storage.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Cell<T> { value: Shared<T> }
+        impl Cell<type T> {
+            fun get(self): T { self.value.read() }
+        }
+        fun main() {
+            let cell = Cell { value = Shared::new([1, 2, 3]) };
+            mut got = cell.get();
+            got.push(4);
+            print(cell.get().len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b256_a_shared_read_in_temporary_position_stays_free() {
+    // The half of the ruling that is NOT a cost: a read that feeds no store is
+    // no position at all, so `for x in cell.read()` and `cell.read().len()`
+    // copy nothing — and must go on copying nothing when B256 lands. Green
+    // today, and the control that says which half the ignored pins above are
+    // about.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3]);
+            print(h.read().len());
+            mut total = 0;
+            for x in h.read() {
+                total += x;
+            }
+            print(total);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a shared read in temporary position copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n6\n");
+}
