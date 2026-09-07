@@ -20,6 +20,7 @@ use std::cell::Cell;
 thread_local! {
     static PLANNED: Cell<usize> = const { Cell::new(0) };
     static OFFERED: Cell<usize> = const { Cell::new(0) };
+    static ASKED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Record one analysis's enrolment: `planned` roots walked out of `offered`
@@ -38,4 +39,23 @@ pub fn planned_roots() -> usize {
 /// closure in the loaded world.
 pub fn offered_roots() -> usize {
     OFFERED.with(Cell::get)
+}
+
+/// M19 T1c: how many bodies the ENROLMENT GATE actually walked.
+///
+/// [`planned_roots`] is M28's number — how much of the program the planner
+/// walked once it had been told which bodies to walk. This is the number the
+/// gate itself costs, and it is the drop planner's whole price on a program
+/// that reaches almost no resource: the gate runs a subtree walk to
+/// EXHAUSTION in every body that has no resource evidence in it, which is
+/// nearly all of them. A reused module serves its answer from the record
+/// instead (M19 T1c), so on a warm analysis this collapses to the bodies the
+/// entry brought.
+pub(crate) fn record_gate(asked: usize) {
+    ASKED.with(|cell| cell.set(asked));
+}
+
+/// The bodies the enrolment gate walked in the last analysis on this thread.
+pub fn asked_roots() -> usize {
+    ASKED.with(Cell::get)
 }

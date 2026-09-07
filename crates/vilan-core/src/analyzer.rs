@@ -3074,6 +3074,13 @@ pub struct Analyzer<'src> {
     // M19 T1b: the restored rows themselves, merged across every source in
     // `world_table_ranges`. Per-analysis scratch, empty in every stored world.
     restored_tables: RestoredTables,
+    /// M19 T1c: the drop scan's enrolment for THIS analysis — what
+    /// [`Analyzer::resource_reaching_roots`] answered, restored rows included.
+    /// Kept so the class D store can partition it per module.
+    drop_scan_roots: HashSet<Id>,
+    /// M19 T1c: the digest of the resource-reaching nominal set that enrolment
+    /// was decided against ([`ModuleTables::drop_nominals`]).
+    drop_nominals_digest: u64,
     // M19 T1b / T0's free fix: `source_ranges` sorted by start, for a binary
     // search instead of `source_of_id`'s linear scan. Sealed beside
     // `frozen_ranges`, from the same ranges, and empty until then — the scan
@@ -4446,6 +4453,8 @@ impl<'src> Analyzer<'src> {
             world_table_ranges: Vec::new(),
             reused_table_sources: Vec::new(),
             restored_tables: RestoredTables::default(),
+            drop_scan_roots: HashSet::default(),
+            drop_nominals_digest: 0,
             sorted_source_ranges: Vec::new(),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
@@ -9630,17 +9639,37 @@ impl<'src> Analyzer<'src> {
     /// An unresolved callee is selected outright: "this signature reaches no
     /// resource" is a claim about a signature, and one nobody could read is not
     /// a claim this predicate is allowed to make.
-    fn resource_reaching_roots(&self) -> HashSet<Id> {
+    fn resource_reaching_roots(&self) -> (HashSet<Id>, u64) {
         let mut roots: HashSet<Id> = HashSet::default();
         let nominals = self.resource_reaching_nominals();
+        let digest = Self::drop_nominals_fingerprint(&nominals);
         if nominals.is_empty() {
-            return roots;
+            crate::drop_plan_stats::record_gate(0);
+            return (roots, digest);
         }
+        // M19 T1c: a reused module's enrolment is RESTORED rather than
+        // re-derived. This gate is the drop planner's whole price — it walks
+        // every bodied function's entire subtree looking for the first piece of
+        // resource evidence, so in a body that reaches none (nearly all of them,
+        // on an application) the walk runs to exhaustion. The rows are pure
+        // `Id`s: the gate's answer is one bit per body, so nothing here has to
+        // cross the TypeId boundary.
+        let restored_enrolment = self.restored_tables.drop_nominals_agree
+            && self.restored_tables.drop_nominals == Some(digest);
+        if restored_enrolment {
+            roots.extend(self.restored_tables.drop_roots.iter().copied());
+        }
+        let skip = |analyzer: &Self, id: Id| restored_enrolment && analyzer.table_entity(id);
+        let mut asked = 0usize;
         let mut memo: HashMap<TypeId, bool> = HashMap::default();
         for function in self.functions.values() {
             if !function.has_body {
                 continue;
             }
+            if skip(self, function.id) {
+                continue;
+            }
+            asked += 1;
             let mut signature: Vec<TypeId> = function
                 .parameters
                 .iter()
@@ -9658,6 +9687,10 @@ impl<'src> Analyzer<'src> {
             }
         }
         for closure in self.closures.values() {
+            if skip(self, closure.id) {
+                continue;
+            }
+            asked += 1;
             let signature: Vec<TypeId> = closure.return_type_id.into_iter().collect();
             let mut seeds: Vec<Id> = closure.parameter_destructures.clone();
             seeds.push(closure.return_);
@@ -9676,7 +9709,22 @@ impl<'src> Analyzer<'src> {
                 roots.insert(closure.id);
             }
         }
-        roots
+        crate::drop_plan_stats::record_gate(asked);
+        (roots, digest)
+    }
+
+    /// [`ModuleTables::drop_nominals`]: the resource-reaching nominal set,
+    /// hashed. Sorted first — the set is a `HashSet`, and two analyses have to
+    /// agree on the digest of the same MEMBERSHIP, never on an iteration order.
+    fn drop_nominals_fingerprint(nominals: &HashSet<Id>) -> u64 {
+        let mut ids: Vec<u32> = nominals.iter().map(|id| id.0).collect();
+        ids.sort_unstable();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for id in ids {
+            hash ^= u64::from(id);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
 
     /// One root's answer: a signature that reaches a resource, or a body
@@ -9962,7 +10010,10 @@ impl<'src> Analyzer<'src> {
         // nothing and calls no sink, and is exactly the program whose temporary
         // must be found.
         if !self.declares_a_resource() {
+            self.drop_scan_roots = HashSet::default();
+            self.drop_nominals_digest = Self::drop_nominals_fingerprint(&HashSet::default());
             crate::drop_plan_stats::record(0, self.offered_drop_scan_roots());
+            crate::drop_plan_stats::record_gate(0);
             return;
         }
         self.explicit_drop_bindings = resources.explicitly_dropped.clone();
@@ -9970,7 +10021,12 @@ impl<'src> Analyzer<'src> {
         // true for every program that loads a std module declaring one, so it
         // enrolled EVERY body; this asks the same question of each body's own
         // types and enrolls the ones that can reach a resource.
-        let roots = self.resource_reaching_roots();
+        let (roots, nominals_digest) = self.resource_reaching_roots();
+        // M19 T1c: kept for the record the class D store writes at the end of
+        // the analysis — the gate's answer per body is what a reused module
+        // serves instead of having every one of them re-walked.
+        self.drop_scan_roots = roots.clone();
+        self.drop_nominals_digest = nominals_digest;
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
         // reachability (it lowers transformer-side to the `__drop` helper), so its
@@ -11082,6 +11138,16 @@ impl<'src> Analyzer<'src> {
     }
 
     fn build_drop_glue(&mut self) {
+        // M19 T1c leaves this live and takes its INPUTS free. The glue map is
+        // keyed by `TypeId` across the whole program and the transformer looks
+        // an entry up by the id on the expression it is emitting
+        // (`binding_drops_nontrivially`, `ensure_drop_helper`), so the keys
+        // have to be the ids the world minted — which is precisely the key
+        // space a record may not carry (`editor-latency.md` §3.6). What T1c
+        // gives it instead is a restored plan: `dropped_bindings`,
+        // `overwrite_drops` and `resource_temporaries` are already in hand, so
+        // the seeding below reads them and the walk is over the resource types
+        // alone (24–125 ms of a 5.7 s debug checks phase on kolt's client leg).
         let mut worklist: Vec<TypeId> = Vec::new();
         for binding in &self.dropped_bindings {
             if let Some(type_id) = self.dropped_binding_type_id(*binding) {
@@ -21692,6 +21758,26 @@ impl<'src> Analyzer<'src> {
     /// B81's materialized ones. `shared` is not codegen's business — it is what
     /// rule 2's move elision must refuse to move out of, so this pass runs
     /// BEFORE `compute_clone_sites`.
+    /// **M19 T1c: the foreign-touch rule, and why this pass is the tranche's
+    /// residue** (`editor-latency.md` §3.6). Phase 2 below classifies each
+    /// capture against `collect_written_roots()`, which is a WHOLE-PROGRAM set:
+    /// a write in the entry to a root the module declares — a module-level
+    /// binding is exactly such a root — flips `share_subject_is_stable` and
+    /// `subject_is_mutated_in_place` for a capture the module owns. A pass
+    /// that reads another file's state cannot be restored from this module's
+    /// record alone, and recording the row anyway would serve one entry's
+    /// grounding to the next.
+    ///
+    /// Two ways out and this tranche takes neither. SPLIT THE READ: partition
+    /// the written roots by their writing source and refuse to record a row
+    /// whose subject root was written from outside the module — the shape
+    /// `liveness::LastUse`'s `foreign_touched` already has. Or LEAVE IT LIVE
+    /// and say so. It is left live because the split does not buy the walk:
+    /// `collect_written_roots` has to run either way (a foreign write must be
+    /// visible to be excluded), so what a record could remove is the
+    /// classification, 158–342 ms of a 5.7 s debug checks phase on kolt's
+    /// client leg against the drop planner's gate at 950–1230 ms in the same
+    /// phase. It is named residue rather than left unmentioned.
     fn compute_capture_clone_sites(&mut self) -> CapturePlan {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
@@ -21883,6 +21969,21 @@ impl<'src> Analyzer<'src> {
     /// interned table is classified once here rather than exposing the
     /// (`&mut`, memoizing) classifier. Linear in the table: every query is
     /// memoized and structural.
+    /// **M19 T1c: not restorable, and the reason is worth stating here.** Its
+    /// key space is the INTERNED TYPE TABLE, and an interned id is nobody's to
+    /// own — a module does not have "its" type ids in any sense a record could
+    /// address, because ids are minted per OCCURRENCE and the entry's buffer
+    /// mints its own for the same meanings (`editor-latency.md` §3.1/§3.6). A
+    /// record could not carry one and a restore could not name one.
+    ///
+    /// So it is residue, at 605-843 ms of a 5.7 s debug checks phase on kolt's
+    /// client leg. The instrument that WOULD apply is tranche 1's rather than
+    /// tranche 1c's — `resource_classification` is keyed by `TypeId`, and an
+    /// id-keyed memo memoizes nothing (editor-perf's finding), so a memo on the
+    /// resolved `Type` would collapse the table the way the impl-selection memo
+    /// collapsed its own. That is a change to the classifier and not to the
+    /// record, it was measured here and did not clear the noise floor at
+    /// loadavg 110+, and it is left unshipped rather than shipped unmeasured.
     fn compute_resource_types(&mut self) -> HashSet<TypeId> {
         let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().copied().collect();
         type_ids
@@ -31065,8 +31166,20 @@ impl<'src> Analyzer<'src> {
         self.reused_table_sources.sort_unstable();
         // The plant: keep the skip, throw the rows away. See
         // [`STALE_TABLE_PLANT`].
+        //
+        // M19 T1c's enrolment rows ride it too, and its restore CONDITION has to
+        // survive the plant for them to: clearing `drop_nominals` would make the
+        // gate stand down and re-derive, which is the one thing a plant must not
+        // cause — a pass that quietly recomputes can never be caught serving a
+        // stale row.
         if stale_table_planted() {
-            self.restored_tables = RestoredTables::default();
+            let nominals = self.restored_tables.drop_nominals;
+            let agree = self.restored_tables.drop_nominals_agree;
+            self.restored_tables = RestoredTables {
+                drop_nominals: nominals,
+                drop_nominals_agree: agree,
+                ..RestoredTables::default()
+            };
         }
     }
 
@@ -46068,6 +46181,26 @@ struct ModuleTables {
     return_view_reads: Vec<Id>,
     scalar_view_calls: Vec<Id>,
     scalar_view_refs: Vec<Id>,
+    /// M19 T1c: the drop scan's ENROLMENT for this module — the bodied
+    /// functions and closures M28's per-body gate
+    /// ([`Analyzer::resource_reaching_roots`]) admitted. Ids the module minted
+    /// and nothing else: the gate's answer is one bit per body, and the types
+    /// it asked about are re-read from the module's own slots rather than
+    /// recorded (the T1b/T1c section of `editor-latency.md`).
+    drop_roots: Vec<Id>,
+    /// M19 T1c's restore condition, and the reason the enrolment is allowed to
+    /// be a module's own answer at all.
+    ///
+    /// The gate asks each body whether it reaches one of the program's
+    /// resource-reaching NOMINALS, and that set is whole-program: it is closed
+    /// over every declaration's field types, so a declaration made outside this
+    /// module is in principle able to move the answer. It cannot in practice —
+    /// a module declares no field of an entry type, and a `Generic` names
+    /// nothing ([`Analyzer::type_mentions_nominal`]) — but "cannot in practice"
+    /// is exactly what a belt-and-braces condition is for, and this one costs a
+    /// `u64` compare per analysis. A record whose fingerprint disagrees with the
+    /// world it is replayed into recomputes the gate.
+    drop_nominals: u64,
 }
 
 impl ModuleTables {
@@ -46085,6 +46218,7 @@ impl ModuleTables {
             + self.return_view_reads.len()
             + self.scalar_view_calls.len()
             + self.scalar_view_refs.len()
+            + self.drop_roots.len()
     }
 }
 
@@ -46096,7 +46230,7 @@ impl ModuleTables {
 /// never a wrong answer. The reverse mistake — a pass that SKIPS a reused
 /// module's entities without restoring its rows — is the one that loses a
 /// table, and the differential's emitted-JS leg is what catches it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct RestoredTables {
     last_uses: HashSet<Id>,
     last_use_opaque: HashSet<Id>,
@@ -46109,6 +46243,37 @@ struct RestoredTables {
     return_view_reads: HashSet<Id>,
     scalar_view_calls: HashSet<Id>,
     scalar_view_refs: HashSet<Id>,
+    /// M19 T1c: the restored drop-scan enrolment, merged across every module
+    /// whose record carries one.
+    drop_roots: HashSet<Id>,
+    /// The fingerprint every restored module agreed on
+    /// ([`ModuleTables::drop_nominals`]); `None` when nothing was restored.
+    drop_nominals: Option<u64>,
+    /// Whether the records seen so far agreed on that fingerprint.
+    drop_nominals_agree: bool,
+}
+
+impl Default for RestoredTables {
+    /// `drop_nominals_agree` starts TRUE — "nothing has disagreed yet" — which
+    /// is the one field whose empty value is not its zero.
+    fn default() -> Self {
+        RestoredTables {
+            last_uses: HashSet::default(),
+            last_use_opaque: HashSet::default(),
+            last_use_unreached: HashSet::default(),
+            last_use_statements: HashMap::default(),
+            declaration_statements: HashMap::default(),
+            bumps: HashMap::default(),
+            clone_sites: HashMap::default(),
+            return_clone_sites: HashMap::default(),
+            return_view_reads: HashSet::default(),
+            scalar_view_calls: HashSet::default(),
+            scalar_view_refs: HashSet::default(),
+            drop_roots: HashSet::default(),
+            drop_nominals: None,
+            drop_nominals_agree: true,
+        }
+    }
 }
 
 impl RestoredTables {
@@ -46132,6 +46297,14 @@ impl RestoredTables {
             .extend(tables.scalar_view_calls.iter().copied());
         self.scalar_view_refs
             .extend(tables.scalar_view_refs.iter().copied());
+        self.drop_roots.extend(tables.drop_roots.iter().copied());
+        // Two records under one world key disagreeing about the world's own
+        // nominal set is not a shape this can reach; if it ever does, the whole
+        // enrolment restore stands down rather than serving half an answer.
+        match self.drop_nominals {
+            None => self.drop_nominals = Some(tables.drop_nominals),
+            Some(existing) => self.drop_nominals_agree &= existing == tables.drop_nominals,
+        }
     }
 }
 
@@ -49069,6 +49242,17 @@ fn analyze_over_world<'src>(
         // possibly a slot write — so skipping a module's sites moves state a
         // later pass reads, which is not what "module-local" is allowed to
         // mean. Freezing it needs the mint frozen with it.
+        //
+        // M19 T1c RE-RUNS IT, deliberately, and the reason is the sentence
+        // above plus a number. A record for this pass would have to carry both
+        // the module's refusals AND the mint each `stash` site made, because
+        // the mint is what a later pass reads — which is to say it would have
+        // to carry a `TypeId`, the one thing the record may not carry
+        // (`editor-latency.md` §3.6). What that buys is 100–165 ms of a 5.7 s
+        // debug checks phase on kolt's client leg, ~2%, against the drop
+        // planner's gate at 950–1230 ms in the same phase. The pass is also
+        // INERT unless `std::dev` is loaded, so most programs pay nothing for
+        // it at all. It stays live and stays honest.
         analyzer.check_hmr_transfer_bounds();
         // The observable half of C4 resource classification (destruction.md §4):
         // R10 (container/external-generic resource arguments) and R12 (no coercion
@@ -49533,6 +49717,16 @@ fn analyze_over_world<'src>(
                     .push(*ref_id);
             }
         }
+        // M19 T1c: the drop scan's enrolment, per module. Every enrolled root is
+        // a bodied function or a closure, so `source_of_id` files it under the
+        // module that wrote it and the row is one `Id`.
+        let mut drop_roots: Vec<Id> = analyzer.drop_scan_roots.iter().copied().collect();
+        drop_roots.sort_unstable_by_key(|id| id.0);
+        for root in drop_roots {
+            if let Some(source) = file(root) {
+                tables.entry(source).or_default().drop_roots.push(root);
+            }
+        }
         // Every source this analysis re-derived gets a slice, including the
         // ones with nothing in any table: "I computed this module and it
         // contributed no rows" is the answer for most of a program's files, and
@@ -49541,6 +49735,12 @@ fn analyze_over_world<'src>(
             if !skip(SourceId(index)) {
                 tables.entry(index).or_default();
             }
+        }
+        // The enrolment's restore condition rides every slice this analysis
+        // writes, the empty ones included — a module that enrolled nothing is
+        // exactly the module whose gate cost the most to answer.
+        for slice in tables.values_mut() {
+            slice.drop_nominals = analyzer.drop_nominals_digest;
         }
         checked_cache_store_tables(key, &source_hashes, tables);
     }
