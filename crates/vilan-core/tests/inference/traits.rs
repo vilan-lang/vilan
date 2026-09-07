@@ -2679,3 +2679,114 @@ fn a52_an_expose_of_a_user_source_type_is_accepted() {
         "#,
     );
 }
+
+// --- A51: `[expose(keyed = K)]` — the key type as an attribute argument -----
+//
+// A39 shipped the keyed channel and refused the `List<T>` spelling of it: a
+// keyed mirror is a `KeyedSource<K, T>`, the expansion reads both types off the
+// annotation because vilan has no associated types, and a `List<T>` names only
+// the element. The steer was "write `Map<K, V>`, or hand-wire `expose_keyed`".
+// A51's ruling puts the key in the ATTRIBUTE, which is the one place the author
+// can write it and the expansion can read it before any type resolves.
+
+/// The bare `[expose(keyed)]` over a `List<T>` — A39's refused shape, still
+/// refused, with the sentence that now names the way out.
+#[test]
+fn an_expose_keyed_list_without_a_key_type_names_the_attribute_argument() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] tasks: SignalCell<List<Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "nothing names its KEY type",
+    );
+}
+
+/// The key is named, and the collection is one the keyed exposure cannot read.
+/// `expose_keyed` takes a `Source<List<T>>` and `expose_keyed_map` a
+/// `Source<Map<K, V>>`; those two are what the expansion picks between, off the
+/// annotation, before any type resolves — so a third collection has to be told
+/// so here or it would simply not be exposed and nothing would say why (B202).
+#[test]
+fn an_expose_keyed_with_a_key_type_still_needs_a_list_or_a_map() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = str)] tasks: SignalCell<Task>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "its collection is not written as a `List<T>` or a `Map<K, V>`",
+    );
+}
+
+/// The argument is a TYPE, and the parser says so where it stands rather than
+/// backtracking the whole attribute and reporting it as a missing field name.
+/// This is the one attribute argument in the language that is a type rather
+/// than a word, so the refusal has to say what shape is wanted.
+#[test]
+fn an_expose_keyed_argument_that_is_not_a_type_is_refused_where_it_stands() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = 3)] tasks: SignalCell<List<Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "`[expose(keyed = …)]`'s argument is a TYPE",
+    );
+}
+
+/// Both accepted forms, in one program: the `Map` element that names its own
+/// key and takes the bare attribute (A39, unchanged), and the `List` element
+/// that names its key in the attribute (A51). The control for the three
+/// refusals above.
+#[test]
+fn both_keyed_expose_spellings_compile_side_by_side() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] by_map: SignalCell<Map<str, Task>>,
+            [expose(keyed = str)] by_list: SignalCell<List<Task>>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { self.by_list.get().len() }
+        }
+        fun main() {
+            print(Store { by_map = Signal::new(Map::new()), by_list = Signal::new([]) }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}

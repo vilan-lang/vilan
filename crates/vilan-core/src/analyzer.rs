@@ -2775,7 +2775,14 @@ type RpcSignatureCheck<'src> = (&'src str, Id, Vec<(String, Option<&'src Node<'s
 /// field's WRITTEN type node (for rendering), the field's RESOLVED type id (what
 /// the `std::Source` reconciliation runs against), the annotation's span, and
 /// the declaring struct.
-type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, TypeId, Span, Id, Exposure);
+type ExposeFieldCheck<'src> = (
+    String,
+    Option<&'src Node<'src>>,
+    TypeId,
+    Span,
+    Id,
+    Exposure<'src>,
+);
 
 #[derive(Clone, Debug)]
 pub struct Analyzer<'src> {
@@ -14349,11 +14356,18 @@ impl<'src> Analyzer<'src> {
                 // The KEYED form (A39) reads TWO written types off the
                 // annotation where the whole-value form reads one: the mirror
                 // is a `KeyedSource<K, T>`, and vilan has no associated types,
-                // so `K` has nowhere to come from but the field's own type.
-                // `Map<K, V>` names both; a `List<T>` names only the element.
-                // Said here for the arm above's reason — the expansion skips
-                // such a field, so without this nothing would say why.
-                Some(_) if exposure.is_keyed() && !sole_argument_is_map(type_node) => {
+                // so `K` has nowhere to come from but what the author wrote.
+                // `Map<K, V>` names both in the collection; every other keyed
+                // collection names only its element, and A51's attribute
+                // argument is where the key goes for those — `[expose(keyed =
+                // str)] SignalCell<List<T>>`. Said here for the arm above's
+                // reason: the expansion skips such a field, so without this
+                // nothing would say why.
+                Some(_)
+                    if exposure.is_keyed()
+                        && exposure.key_type().is_empty()
+                        && !sole_argument_is_map(type_node) =>
+                {
                     self.expose_refused_field_slots.insert(field_type_id);
                     self.push_anchored(
                         Error {
@@ -14361,12 +14375,40 @@ impl<'src> Analyzer<'src> {
                             note: None,
                             span,
                             msg: format!(
-                                "{label} is `[expose(keyed)]`d, but its element is not written \
-                             as a `Map<K, V>`: a keyed mirror is a `KeyedSource<K, T>`, and \
-                             the `[service]` expansion reads BOTH types off the annotation \
-                             (there are no associated types to read the key from). Write the \
-                             field as `SignalCell<Map<K, V>>`, or drop `keyed` for a channel \
-                             that resends the whole value on every change"
+                                "{label} is `[expose(keyed)]`d, but nothing names its KEY type: \
+                             a keyed mirror is a `KeyedSource<K, T>`, and the `[service]` \
+                             expansion reads both types off the annotation (there are no \
+                             associated types to read the key from). A `Map<K, V>` element \
+                             names both and takes the bare form; anything else names the key \
+                             in the attribute — write `[expose(keyed = K)]`, or drop `keyed` \
+                             for a channel that resends the whole value on every change"
+                            ),
+                        },
+                        declaration_id,
+                    );
+                }
+                // The key was named, and the collection has to be one the
+                // exposure can read: `expose_keyed` takes a `Source<List<T>>`.
+                // A `Map<K, V>` with an argument beside it is fine — the
+                // argument simply wins as the written key type.
+                Some(_)
+                    if exposure.is_keyed()
+                        && !exposure.key_type().is_empty()
+                        && !sole_argument_is_map(type_node)
+                        && !sole_argument_is_list(type_node) =>
+                {
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "{label} names a key with `[expose(keyed = …)]`, but its \
+                             collection is not written as a `List<T>` or a `Map<K, V>`: those \
+                             are the two the keyed exposure can read, and the `[service]` \
+                             expansion picks between them off the annotation before any type \
+                             resolves. Write the field as `SignalCell<List<T>>`"
                             ),
                         },
                         declaration_id,
@@ -43849,6 +43891,22 @@ fn derive_enum_impls(
 
 /// Whether an exposed field's SOLE written type argument is a `Map<K, V>` — the
 /// one shape `[expose(keyed)]` can read both a key and an element from.
+/// [`sole_argument_is_map`]'s sibling for A51's `List<T>` keyed form: the
+/// source's sole type argument is a `List` of exactly one thing.
+fn sole_argument_is_list(type_node: Option<&Node<'_>>) -> bool {
+    let Some(Node::AccessorWithGenerics(_, arguments)) = type_node else {
+        return false;
+    };
+    let [element] = arguments.0.as_slice() else {
+        return false;
+    };
+    matches!(
+        &element.0,
+        Node::AccessorWithGenerics(head, item)
+            if *head == "List" && item.0.len() == 1
+    )
+}
+
 fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
     let Some(Node::AccessorWithGenerics(_, arguments)) = type_node else {
         return false;

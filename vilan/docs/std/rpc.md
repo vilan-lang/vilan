@@ -90,9 +90,10 @@ takes its element type from the mirror
 
 ## Keyed mirrors: `KeyedSource<K, T>`
 
-The mirror an `[expose(keyed)]` field produces. Where a `RemoteSource<T>`
-receives the whole value on every change, this one receives a `Patch` of
-`Delta` ops and applies them in order — and it can lease **one key**.
+The mirror an `[expose(keyed)]` / `[expose(keyed = K)]` field produces.
+Where a `RemoteSource<T>` receives the whole value on every change, this one
+receives a `Patch` of `Delta` ops and applies them in order — and it can lease
+**one key**.
 
 ```vilan,fragment
 struct KeyedSource<K, T> { … }
@@ -132,6 +133,14 @@ Hand-wired exposures use `ReactiveServer::expose_keyed(source, key_of)`
 a `Keyed<K>` bound alone because `K` appears nowhere else in the
 signature, and vilan infers a type parameter from a call's types, not from
 its bounds.
+
+The attribute generates whichever of the two the field's collection calls for,
+and the key type comes from wherever it is written (tracker A51): a `Map<K, V>`
+element names it and takes the bare `[expose(keyed)]`, and every other
+collection names it in the attribute — `[expose(keyed = str)] items:
+SignalCell<List<Task>>`. The generated wiring is the hand-written call, frame
+for frame, and the two spellings are one contract: same `Patch` frames, same
+`KeyedSource<K, T>`, same contract hash.
 
 ## Errors
 

@@ -5488,8 +5488,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `[ marker ]` — a bare marker attribute (`[must_use]`, `[rpc]`, `[trait_only]`,
     /// `[expose]`). Consumes it and returns `true` when the exact `[ marker ]` is
     /// next; leaves the cursor untouched and returns `false` otherwise.
-    /// `[expose]` or `[expose(keyed)]` — a struct field's exposure, or
-    /// [`Exposure::None`] when no expose attribute leads.
+    /// `[expose]`, `[expose(keyed)]` or `[expose(keyed = K)]` — a struct
+    /// field's exposure, or [`Exposure::None`] when no expose attribute leads.
     ///
     /// The argument form is parsed rather than matched as a marker so that an
     /// unrecognized one is REFUSED by name instead of silently reading as a
@@ -5497,7 +5497,15 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// whole-value channel where the author asked for a keyed one). The
     /// attribute is still consumed on that path, so the field itself parses and
     /// the file keeps going.
-    fn eat_expose_attribute(&mut self) -> Exposure {
+    ///
+    /// `= K` (tracker A51) names the KEY TYPE, and it is the one attribute
+    /// argument in the language that is a type rather than a word: a keyed
+    /// mirror is a `KeyedSource<K, T>`, the `[service]` expansion reads both
+    /// types off the annotation because vilan has no associated types, and a
+    /// `List<T>` names only the element. It is parsed with the ordinary type
+    /// grammar and kept as the SOURCE TEXT it spans — the macro engine takes it
+    /// as a string and the formatter reprints it, and nothing here resolves it.
+    fn eat_expose_attribute(&mut self) -> Exposure<'src> {
         let form = self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("expose")) {
@@ -5508,8 +5516,31 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let name_start = parser.position;
                 let name = parser.eat_ident()?;
                 let name_span = parser.span_from(name_start);
+                // `= K`: the key type, as written. A malformed one is refused
+                // where it stands rather than backtracking the whole attribute,
+                // which would report it as "expected a field name".
+                let key = if parser.eat_op("=") {
+                    let key_start = parser.position;
+                    match parser.parse_type() {
+                        Some((_node, span)) => Some(Ok(&parser.source[span.start..span.end])),
+                        None => {
+                            // Skip to the closing paren so the attribute still
+                            // CONSUMES, and the refusal below is what the
+                            // author reads. Without this the `attempt` fails at
+                            // `expect_ctrl(')')`, rolls the whole attribute
+                            // back — errors included — and the field is
+                            // reported as a missing name.
+                            while parser.peek().is_some() && !parser.peek_is_ctrl(')') {
+                                parser.bump();
+                            }
+                            Some(Err(parser.span_from(key_start)))
+                        }
+                    }
+                } else {
+                    None
+                };
                 parser.expect_ctrl(')')?;
-                Some((name, name_span))
+                Some((name, name_span, key))
             } else {
                 None
             };
@@ -5519,14 +5550,32 @@ impl<'a, 'src> Parser<'a, 'src> {
         match form {
             None => Exposure::None,
             Some(None) => Exposure::Whole,
-            Some(Some(("keyed", _span))) => Exposure::Keyed,
-            Some(Some((_other, span))) => {
+            Some(Some(("keyed", _span, key))) => match key {
+                None => Exposure::Keyed(None),
+                Some(Ok(written)) => Exposure::Keyed(Some(written)),
+                Some(Err(span)) => {
+                    self.errors.push(ParseError {
+                        span,
+                        reason: ParseErrorReason::Rule(
+                            "`[expose(keyed = …)]`'s argument is a TYPE — the key type the \
+                             mirror is keyed by, as in `[expose(keyed = str)]`. It is written \
+                             here because a keyed mirror is a `KeyedSource<K, T>` and a \
+                             `List<T>` names only the element; a `Map<K, V>` element names both, \
+                             and takes the bare `[expose(keyed)]`",
+                        ),
+                        context: Vec::new(),
+                        hint: None,
+                    });
+                    Exposure::Keyed(None)
+                }
+            },
+            Some(Some((_other, span, _key))) => {
                 self.errors.push(ParseError {
                     span,
                     reason: ParseErrorReason::Rule(
                         "the only argument `[expose]` takes is `keyed` — write `[expose]` for a \
-                         whole-value channel, `[expose(keyed)]` for a keyed collection patched \
-                         element by element",
+                         whole-value channel, `[expose(keyed)]` for a keyed `Map<K, V>`, and \
+                         `[expose(keyed = K)]` for any other keyed collection",
                     ),
                     context: Vec::new(),
                     hint: None,

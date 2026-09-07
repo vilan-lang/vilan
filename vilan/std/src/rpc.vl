@@ -3064,16 +3064,23 @@ macro fun service(item: Item): Source {
 	//
 	// A KEYED field (`[expose(keyed)]`, A39) reads TWO types off the annotation
 	// rather than one — the mirror is a `KeyedSource<K, T>` — and vilan has no
-	// associated types, so `K` can only come from the field's written type.
-	// `SignalCell<Map<K, V>>` names both; the refusal for anything else is the
-	// analyzer's, said in the vocabulary of the field (`check_expose_fields`),
-	// for B202's reason: a field this loop skips would otherwise be silently
-	// unexposed.
+	// associated types, so `K` can only come from what the author wrote.
+	// `SignalCell<Map<K, V>>` names both in the collection itself; every other
+	// keyed collection names only its element, and A51 gives it the attribute
+	// ARGUMENT to name the key with: `[expose(keyed = str)] SignalCell<List<T>>`.
+	// The refusal for anything else is the analyzer's, said in the vocabulary of
+	// the field (`check_expose_fields`), for B202's reason: a field this loop
+	// skips would otherwise be silently unexposed.
 	mut exposed_names: List<str> = [];
 	mut exposed_elements: List<str> = [];
 	// The key type per exposed field, or `""` for the whole-value form — the
 	// discriminator every later loop reads.
 	mut exposed_keys: List<str> = [];
+	// Whether the keyed collection is a `Map` (the values are the elements) or
+	// a `List` (the collection IS the elements). Only the server-side exposure
+	// call differs; the wire, the mirror and the contract entry do not, which
+	// is why the two forms hash identically and patch identically.
+	mut exposed_maps: List<bool> = [];
 	for field in target.fields {
 		if field.exposed {
 			if field.type_.arguments.len() == 1 {
@@ -3086,9 +3093,26 @@ macro fun service(item: Item): Source {
 										Some(let value) => {
 											exposed_names.push(field.name);
 											exposed_elements.push(value.render());
-											exposed_keys.push(key.render());
+											// A written argument wins: it is
+											// what the author said the key is.
+											exposed_keys.push(if field.key == "" {
+												key.render()
+											} else {
+												field.key
+											});
+											exposed_maps.push(true);
 										},
 										None => {},
+									},
+									None => {},
+								}
+							} else if field.key != "" && element.name == "List" && element.arguments.len() == 1 {
+								match element.arguments.get(0) {
+									Some(let value) => {
+										exposed_names.push(field.name);
+										exposed_elements.push(value.render());
+										exposed_keys.push(field.key);
+										exposed_maps.push(false);
 									},
 									None => {},
 								}
@@ -3097,6 +3121,7 @@ macro fun service(item: Item): Source {
 							exposed_names.push(field.name);
 							exposed_elements.push(element.render());
 							exposed_keys.push("");
+							exposed_maps.push(false);
 						}
 					},
 					None => {},
@@ -3188,10 +3213,22 @@ macro fun service(item: Item): Source {
 				Some(let found) => found,
 				None => "_",
 			};
+			let is_map = match exposed_maps.get(exposure_index) {
+				Some(let found) => found,
+				None => true,
+			};
 			// The key projection is a value parameter (`std::rpc`'s
 			// `expose_keyed_map` documents why); `Keyed` is what makes
-			// `element.key()` resolve on the element type.
-			exposures.push(i"session.expose_keyed_map(self.{field_name}, |element: {element}| element.key())");
+			// `element.key()` resolve on the element type. The `List` form is
+			// the same call one layer down — `expose_keyed` is
+			// `expose_keyed_map` without the `values()` projection — which is
+			// what makes the two forms one channel shape.
+			let exposer = if is_map {
+				"expose_keyed_map"
+			} else {
+				"expose_keyed"
+			};
+			exposures.push(i"session.{exposer}(self.{field_name}, |element: {element}| element.key())");
 		}
 		exposure_index = exposure_index + 1;
 	}

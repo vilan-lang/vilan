@@ -2131,3 +2131,225 @@ fun run(port: i32) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A51: `[expose(keyed = K)]` over a `List<T>`, end to end ----------------
+
+/// The `List` keyed service and its `Map` twin in one program, so the contract
+/// hashes can be compared: the two forms differ only in what the SERVER stores,
+/// and the wire, the mirror and the surface entry are the same, so they must
+/// hash the same. `PlainChat` is the control that keeps that from being
+/// vacuous — the same surface with a whole-value exposure hashes differently.
+const KEYED_LIST_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::rpc_server::Service;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// A51's shape: the collection names only its element, and the KEY comes from
+// the attribute argument.
+[service(ListChatClient)]
+struct ListChat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed = str)] messages: SignalCell<List<Message>>,
+}
+
+impl ListChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		self.messages.update(|&mut list| {
+			list.push(Message { id, channel, body });
+		});
+		self.messages.get().len()
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		mut found = false;
+		mut next: List<Message> = [];
+		for message in self.messages.get() {
+			if message.id == id {
+				found = true;
+				next.push(Message { id, channel = message.channel, body });
+			} else {
+				next.push(message);
+			}
+		}
+		self.messages.set(next);
+		found
+	}
+}
+
+// A39's shape, unchanged: the `Map` names both types and takes the bare form.
+[service(MapChatClient)]
+struct MapChat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl MapChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+// The whole-value control.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+	[expose] messages: SignalCell<Map<str, Message>>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: ListChat = ListChat { topic = Signal::new("general"), messages = Signal::new([]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun render(list: List<Message>): str {
+	mut out = "";
+	for message in list {
+		out = out + message.id + "=" + message.body + " ";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match ListChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// The generated mirror is a `KeyedSource<str, Message>` — the key
+			// type came off the attribute, the element off the `List`.
+			let topic = client.topic.sub(|value| print(i"topic:{value}"));
+			let watch = client.messages.sub_key("m2", |value| match value {
+				Some(let message) => print(i"m2:{message.body}"),
+				None => print("m2:absent"),
+			});
+			print(i"post:{client.post("m1", 0, "hello").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", 0, "world").unwrap_or(0 - 1)}");
+			print(i"edit:{client.edit("m1", "hello again").unwrap_or(false)}");
+			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
+			print(i"held:{render(client.messages.get().unwrap_or([]))}");
+			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
+			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			print(i"list-hash:{client.contract_hash()}");
+			print(i"map-hash:{map_twin.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"fault:{client.messages.fault().is_some()}");
+			watch.dispose();
+			topic.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// A51's macro form, end to end over a real WebSocket: `[expose(keyed = str)]`
+/// over a `SignalCell<List<Message>>` mints the keyed channel, the generated
+/// client carries a `KeyedSource<str, Message>`, and a per-key subscription
+/// through it holds ITS message and no other — the same claims A39's `Map`
+/// twin makes, on the collection A39 refused.
+///
+/// The hashes are the other half. The two keyed forms hash IDENTICALLY, and
+/// that is the point rather than a coincidence: they differ only in what the
+/// server stores, and a client built against one can connect to the other
+/// because the frames, the mirror and the surface entry are the same. The
+/// whole-value control hashes differently, which keeps the equality from being
+/// a claim that the hash ignores exposure.
+///
+/// Red first: `[expose(keyed = str)]` did not parse before A51 (`expected a
+/// field name`), and with the argument dropped the field is refused —
+/// "nothing names its KEY type".
+#[test]
+fn a_keyed_list_field_mirrors_as_a_keyed_source_and_hashes_as_its_map_twin() {
+    let dir = temp_project("keyed_list_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_LIST_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "m2:absent",
+        "m2:world",
+        "m2:world again",
+        "topic:general",
+        "topic-held:general",
+        "post:1",
+        "post:2",
+        "edit:true",
+        "held:m2=world again",
+        "fault:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the keyed-list service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("held:m1="),
+        "a per-key subscription received a message it never asked for:\n{stdout}"
+    );
+    let hash_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    let list_hash = hash_of("list-hash:");
+    let map_hash = hash_of("map-hash:");
+    let plain_hash = hash_of("plain-hash:");
+    assert_eq!(
+        list_hash, map_hash,
+        "the two keyed forms are one contract — same frames, same mirror, same \
+         surface entry — so they must hash the same:\n{stdout}"
+    );
+    assert_ne!(
+        list_hash, plain_hash,
+        "a whole-value exposure is a different contract:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2312,7 +2312,18 @@ impl<'src> Printer<'src> {
                             match exposed {
                                 Exposure::None => {}
                                 Exposure::Whole => self.out.push_str("[expose] "),
-                                Exposure::Keyed => self.out.push_str("[expose(keyed)] "),
+                                Exposure::Keyed(None) => {
+                                    self.out.push_str("[expose(keyed)] ");
+                                }
+                                // The key type is reprinted exactly as written
+                                // — it is source text, and normalizing it here
+                                // would be the formatter deciding a type's
+                                // spelling from a string it never parsed.
+                                Exposure::Keyed(Some(key)) => {
+                                    self.out.push_str("[expose(keyed = ");
+                                    self.out.push_str(key);
+                                    self.out.push_str(")] ");
+                                }
                             }
                             self.out.push_str(field_name.0);
                             if let Some(field_type) = field_type {
