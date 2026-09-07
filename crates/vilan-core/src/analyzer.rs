@@ -21918,6 +21918,21 @@ impl<'src> Analyzer<'src> {
     /// interned table is classified once here rather than exposing the
     /// (`&mut`, memoizing) classifier. Linear in the table: every query is
     /// memoized and structural.
+    /// **M19 T1c: not restorable, and the reason is worth stating here.** Its
+    /// key space is the INTERNED TYPE TABLE, and an interned id is nobody's to
+    /// own — a module does not have "its" type ids in any sense a record could
+    /// address, because ids are minted per OCCURRENCE and the entry's buffer
+    /// mints its own for the same meanings (`editor-latency.md` §3.1/§3.6). A
+    /// record could not carry one and a restore could not name one.
+    ///
+    /// So it is residue, at 605-843 ms of a 5.7 s debug checks phase on kolt's
+    /// client leg. The instrument that WOULD apply is tranche 1's rather than
+    /// tranche 1c's — `resource_classification` is keyed by `TypeId`, and an
+    /// id-keyed memo memoizes nothing (editor-perf's finding), so a memo on the
+    /// resolved `Type` would collapse the table the way the impl-selection memo
+    /// collapsed its own. That is a change to the classifier and not to the
+    /// record, it was measured here and did not clear the noise floor at
+    /// loadavg 110+, and it is left unshipped rather than shipped unmeasured.
     fn compute_resource_types(&mut self) -> HashSet<TypeId> {
         let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().copied().collect();
         type_ids
