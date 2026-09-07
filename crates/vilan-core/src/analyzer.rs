@@ -17044,6 +17044,37 @@ impl<'src> Analyzer<'src> {
                         .map(|field| field.type_id),
                 );
             }
+            // B252: a CALL reads its callee's declared return type, and that
+            // annotation is a slot like any other. The call's own result type is
+            // not it — the result is a fresh id the solver grounds from the
+            // signature — so every fallback above missed, and a refused return
+            // annotation cascaded (`cannot call method 'who' on unknown` after
+            // `'Greet' is a trait, not a type`) where the same trait refused at a
+            // closure PARAMETER stood its uses down. The callee's slot is what
+            // the two have in common, exactly as the field's is for a field read.
+            Some(Expr::Call(function_call_id)) => {
+                let callee_id = self
+                    .function_calls
+                    .get(function_call_id)
+                    .map(|call| call.subject_id)
+                    .and_then(
+                        |subject_id| match self.expr_id_to_expr_map.get(&subject_id) {
+                            // A named function reaches its call site as a LOCAL
+                            // reference to the entity (functions are bound in scope
+                            // like any other name), so the binding id is the
+                            // function id; `Expr::Function` is the declaration form.
+                            Some(Expr::Function(id) | Expr::Local(id) | Expr::Variable(id)) => {
+                                Some(*id)
+                            }
+                            _ => None,
+                        },
+                    );
+                slots.extend(
+                    callee_id
+                        .and_then(|function_id| self.functions.get(&function_id))
+                        .and_then(|function| function.return_type_id),
+                );
+            }
             _ => {}
         }
         slots

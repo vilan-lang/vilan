@@ -2574,3 +2574,105 @@ fn b184_the_sugar_emits_exactly_what_the_written_generic_emits() {
         "one consumer body per hidden argument:\n{sugared}"
     );
 }
+
+// --- B252: a refused RETURN annotation stands its uses down too --------------
+//
+// B182's stand-down is keyed on the annotation's SLOT — the type id the
+// refusal resolved to `Unknown` — and every consumer reaches it through the
+// expression that reads it: a binding, a parameter, a field. A CALL reads its
+// callee's return annotation, but the call's own result type is a fresh id the
+// solver grounds from the signature, not the annotation's slot, so the covered
+// set missed it and a refused return cascaded (`cannot call method 'who' on
+// unknown`) where the same trait refused at a closure PARAMETER stood down.
+// The callee's declared return type id is what the two have in common.
+
+#[test]
+fn b252_a_refused_return_annotation_does_not_cascade_through_its_uses() {
+    // The exhibit: one mistake, one report. `Greet` in return position is
+    // refused (with the steer to a generic return), and the call's use is that
+    // refusal restated in the vocabulary of a type the author never wrote.
+    let source = format!(
+        r#"{GREET}
+        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().greet());
+        }}
+        main();
+        "#
+    );
+    assert_fails_once_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_without(&source, "on unknown");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused annotation is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b252_a_field_read_through_a_refused_return_stands_down_as_well() {
+    // The second of B182's three consumers, reached the same way: the field
+    // access asks the same covered set of the same slot, so widening the set
+    // answers for both halves at once.
+    let source = format!(
+        r#"{GREET}
+        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().name);
+        }}
+        main();
+        "#
+    );
+    assert_fails_once_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_without(&source, "cannot access field");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused annotation is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b252_an_unrelated_unknown_still_reports_beside_a_refused_return() {
+    // E104's lesson at this grain, the same control B182's own pin carries: the
+    // stand-down is asked PER CALL, of the slot that call's callee declares —
+    // never of "is this type unknown". B188's arity refusal resolves `Holder`
+    // to `Unknown` under a rule this family knows nothing about, and a call on
+    // THAT still refuses, in the same program whose `pick()` stands down.
+    let source = format!(
+        r#"{GREET}
+        struct Holder<T> {{ v: T }}
+        struct Other {{ held: Holder }}
+        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().greet());
+            let other = Other {{ held = 1 }};
+            print(other.held.length());
+        }}
+        main();
+        "#
+    );
+    assert_fails_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_with(&source, "`Holder` takes 1 type argument, 0 given");
+    assert_fails_with(&source, "cannot call method 'length' on unknown");
+    assert_fails_without(&source, "'greet' on unknown");
+}
+
+#[test]
+fn b252_a_missing_method_on_a_well_typed_return_still_reports() {
+    // The non-vacuity control: the widening must not silence a call whose
+    // callee's return annotation is perfectly good. `Dog` has no `bark`, and
+    // that is a mistake nobody has been told about.
+    let source = format!(
+        r#"{GREET}
+        fun pick(): Dog {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().bark());
+        }}
+        main();
+        "#
+    );
+    assert_fails_with(&source, "no method 'bark'");
+}
