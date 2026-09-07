@@ -6979,3 +6979,186 @@ fn the_bindable_set_still_binds_an_impl_binder_and_a_trait_parameter() {
         "two\n3\n",
     );
 }
+
+// --- B244: a conditional impl reached through a NESTED generic argument -------
+//
+// The exhibit is rpc's `send_patch`: `ops.describe(serializer)` on a
+// `List<Delta<K, T>>` inside a doubly-generic function compiled and then failed
+// at EMISSION with the never-silent `internal: a call resolved to `Wire`'s
+// requirement `describe`, which has no body`. `Delta<K, T>::rebuild` at the
+// same site was fine, because that receiver IS the bound parameter.
+//
+// The transformer reads an immutable `Program` and cannot mint a type, so
+// `resolve_type_id` grounds a bound type only when it is a bare `Generic`: a
+// CONSTRUCTOR-HEADED one with a generic inside (`Delta<K, T>`, `Option<T>`,
+// `Map<K, V>` — whatever the outer conditional impl binds its parameter to)
+// passes through abstract. `emit_instance` then REPLACED the enclosing
+// substitution with that binding, stranding the inner parameter: the nested
+// dispatch bound the inner impl's own parameter to a generic with nothing
+// behind it, and the innermost call fell through to the trait's bodyless
+// requirement. Composing instead of replacing leaves the chain walkable.
+//
+// The second half is the instance KEY: an unresolved nested generic spelled as
+// its binder id, so every instantiation of the outer function shared one
+// instance — a silent MISCOMPILE (`Delta<str, str>` narrated through the
+// `Delta<str, i32>` emission writes `z` where JSON needs `"z"`), which the
+// third pin below is written against.
+
+#[test]
+fn b244_a_conditional_impl_through_two_generic_parameters_reaches_its_member() {
+    // The exhibit, in `send_patch`'s own shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::wire::{ Wire, Delta, Serializer, Frame };
+        import std::json::json_codec;
+
+        fun narrate<K: Wire, T: Wire>(ops: List<Delta<K, T>>, serializer: Serializer) {
+            ops.describe(serializer);
+        }
+
+        fun main() {
+            let codec = json_codec();
+            let (serializer, finish) = (codec.writer)();
+            let ops: List<Delta<str, i32>> = [Delta::Update("a", 1)];
+            narrate(ops, serializer);
+            match finish() {
+                Frame::Text(let text) => print(text),
+                Frame::Binary(_) => print("binary"),
+            }
+        }
+        "#,
+        "[{\"Update\":[\"a\",1]}]\n",
+    );
+}
+
+#[test]
+fn b244_maps_conditional_wire_impl_takes_the_same_path() {
+    // The second pin the item asks for: `Map<K, V>`'s Wire impl is conditional
+    // on both parameters exactly like `Delta`'s, and reaching it through
+    // `List<Map<K, V>>` is the same two-parameter chain.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::wire::{ Wire, Serializer, Frame };
+        import std::json::json_codec;
+        import std::map::Map;
+        import std::hash::Hashable;
+
+        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<Map<K, V>>, serializer: Serializer) {
+            rows.describe(serializer);
+        }
+
+        fun main() {
+            let codec = json_codec();
+            let (serializer, finish) = (codec.writer)();
+            mut row: Map<str, i32> = Map::new();
+            row.insert("a", 1);
+            let rows: List<Map<str, i32>> = [row];
+            narrate(rows, serializer);
+            match finish() {
+                Frame::Text(let text) => print(text),
+                Frame::Binary(_) => print("binary"),
+            }
+        }
+        "#,
+        "[[{\"key\":\"a\",\"value\":1}]]\n",
+    );
+}
+
+#[test]
+fn b244_two_instantiations_of_the_same_nested_conditional_impl_stay_apart() {
+    // The miscompile the instance key allowed: two instantiations of `narrate`
+    // whose element types differ only INSIDE the constructor shared one
+    // emission, so the second list narrated through the first's monomorphized
+    // `describe` — `"z"` printed as a bare `z`, invalid JSON, from a compile
+    // that reported nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::wire::{ Wire, Delta, Serializer, Frame };
+        import std::json::json_codec;
+
+        fun narrate<K: Wire, T: Wire>(ops: List<Delta<K, T>>, serializer: Serializer) {
+            ops.describe(serializer);
+        }
+
+        fun main() {
+            let codec = json_codec();
+            let (serializer, finish) = (codec.writer)();
+            let a: List<Delta<str, i32>> = [Delta::Update("a", 1)];
+            let b: List<Delta<str, str>> = [Delta::Update("b", "z")];
+            (serializer.begin_list)(2);
+            narrate(a, serializer);
+            narrate(b, serializer);
+            (serializer.end_list)();
+            match finish() {
+                Frame::Text(let text) => print(text),
+                Frame::Binary(_) => print("binary"),
+            }
+        }
+        "#,
+        "[[{\"Update\":[\"a\",1]}],[{\"Update\":[\"b\",\"z\"]}]]\n",
+    );
+}
+
+#[test]
+fn b244_one_generic_parameter_nested_in_a_constructor_is_the_same_hole() {
+    // The narrowing that says what the shape really is: TWO parameters are not
+    // required — one is enough as long as the conditional impl binds its
+    // parameter to a CONSTRUCTOR containing it. `List<Option<T>>` failed
+    // identically before the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::wire::{ Wire, Serializer, Frame };
+        import std::json::json_codec;
+
+        fun narrate<T: Wire>(ops: List<Option<T>>, serializer: Serializer) {
+            ops.describe(serializer);
+        }
+
+        fun main() {
+            let codec = json_codec();
+            let (serializer, finish) = (codec.writer)();
+            let ops: List<Option<i32>> = [Some(1)];
+            narrate(ops, serializer);
+            match finish() {
+                Frame::Text(let text) => print(text),
+                Frame::Binary(_) => print("binary"),
+            }
+        }
+        "#,
+        "[1]\n",
+    );
+}
+
+#[test]
+fn b244_a_bare_generic_receiver_still_grounds() {
+    // The control: the shape that always worked — the conditional impl binds
+    // its parameter straight to the enclosing function's, with no constructor
+    // in between — must keep working, since the fix changes how every instance
+    // substitution is entered.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::wire::{ Wire, Serializer, Frame };
+        import std::json::json_codec;
+
+        fun narrate<T: Wire>(items: List<T>, serializer: Serializer) {
+            items.describe(serializer);
+        }
+
+        fun main() {
+            let codec = json_codec();
+            let (serializer, finish) = (codec.writer)();
+            narrate([1, 2], serializer);
+            match finish() {
+                Frame::Text(let text) => print(text),
+                Frame::Binary(_) => print("binary"),
+            }
+        }
+        "#,
+        "[1,2]\n",
+    );
+}
