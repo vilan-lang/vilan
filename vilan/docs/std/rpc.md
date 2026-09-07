@@ -33,11 +33,19 @@ host over WebSocket, waits for the server's announcement, and verifies the
 ```vilan,fragment
 struct RemoteSource<T> { … }
 
-impl RemoteSource<type T> {
+impl RemoteSource<type T> with Source<Option<T>> {
 	fun get(self): Option<T>                              // passive: the cache, `None` before the first update
+	[must_use]
+	fun on_change(self, observer: |Option<T>| void): Subscription    // counted, lazy: no immediate call
+	[must_use]
+	fun sub(self, observer: |Option<T>| void): Subscription          // counted, eager: one immediate call
+	fun effect(self, observer: |Option<T>| void)                     // counted, eager, owner-scoped
+}
+
+impl RemoteSource<type T> {
+	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
 	fun status(self): SignalCell<Status>                      // passive: `Waiting` until a value has arrived, then `Ready`
 	fun or(self, initial: T): SignalCell<T>                   // counted, owner-scoped: `initial` until the first update
-	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
 }
@@ -45,6 +53,14 @@ impl RemoteSource<type T> {
 [derive(PartialEq, Debug)]
 enum Status { Waiting, Ready }
 ```
+
+A mirror is a **`Source<Option<T>>`** (tracker A52), so `on_change`, `effect`,
+`effect_on_change` and every generic `S: Source<…>` consumer — `selector`
+among them — take one. The trait argument is `Option<T>` because that is what
+a mirror holds, so a `RemoteSource<List<Note>>` is *not* a `Source<List<Note>>`
+and `bind_each` takes `mirror.or([])`. `sub` has one spelling per view of the
+value: the inherent one hands the observer a present `T`, the trait's hands it
+the `Option<T>`, and the observer's own parameter type picks between them.
 
 A mirror holds `Option<T>` — `None` until the first `Update` lands — and
 **subscribes by demand**: every `or`, `map`, and `sub` takes a counted lease
@@ -74,9 +90,10 @@ takes its element type from the mirror
 
 ## Keyed mirrors: `KeyedSource<K, T>`
 
-The mirror an `[expose(keyed)]` field produces. Where a `RemoteSource<T>`
-receives the whole value on every change, this one receives a `Patch` of
-`Delta` ops and applies them in order — and it can lease **one key**.
+The mirror an `[expose(keyed)]` / `[expose(keyed = K)]` field produces.
+Where a `RemoteSource<T>` receives the whole value on every change, this one
+receives a `Patch` of `Delta` ops and applies them in order — and it can lease
+**one key**.
 
 ```vilan,fragment
 struct KeyedSource<K, T> { … }
@@ -116,6 +133,14 @@ Hand-wired exposures use `ReactiveServer::expose_keyed(source, key_of)`
 a `Keyed<K>` bound alone because `K` appears nowhere else in the
 signature, and vilan infers a type parameter from a call's types, not from
 its bounds.
+
+The attribute generates whichever of the two the field's collection calls for,
+and the key type comes from wherever it is written (tracker A51): a `Map<K, V>`
+element names it and takes the bare `[expose(keyed)]`, and every other
+collection names it in the attribute — `[expose(keyed = str)] items:
+SignalCell<List<Task>>`. The generated wiring is the hand-written call, frame
+for frame, and the two spellings are one contract: same `Patch` frames, same
+`KeyedSource<K, T>`, same contract hash.
 
 ## Errors
 
@@ -213,10 +238,10 @@ a closed connection stayed reachable from its transport; the server half runs
 per disconnect, through `drop_session`.
 
 ```vilan,fragment
-fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff)
+fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff); offers `vilan-rpc`
 fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str>
 fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure>
-enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"
+enum DialFailure { Unreachable(str), Refused(str) }   // Refused carries "401"/"403"/"503"
 impl SocketDuplex {
 	fun transport(self): SocketTransport
 }
@@ -228,6 +253,12 @@ in one frame, which is the only way a refusal can be told from an unreachable
 server — no host WebSocket exposes a failed handshake's HTTP status. A refusal
 ends the retry budget at the first attempt.  `connect_socket` and
 `connect_socket_with` are this with the failure flattened to its sentence.
+
+`connect_socket` offers `vilan-rpc` (tracker A52), because the refusal frame is
+only sent to a client that named the protocol — a bare connect that offered
+nothing could not tell a 401 from an outage and paid the whole backoff to learn
+nothing. `connect_socket_with` offers exactly the list it is given, which is the
+seam for a peer that speaks something else.
 
 ## Server plumbing (`std::rpc_server`, process layer)
 

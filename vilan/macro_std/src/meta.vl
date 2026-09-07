@@ -44,11 +44,19 @@ impl TypeExpr {
 // exposure is the KEYED form `[expose(keyed)]` — a keyed collection patched
 // element by element rather than resent whole (A39). `keyed` is only ever true
 // where `exposed` is.
+//
+// `key` is the KEY TYPE the attribute named, as written — `[expose(keyed = str)]`
+// (A51) — or `""` when the field is not keyed or its key is to be read off a
+// `Map<K, V>` element. A keyed mirror is a `KeyedSource<K, T>` and vilan has no
+// associated types, so a collection that does not name its key in its own type
+// (a `List<T>`) has nowhere else to get one; this is the one attribute argument
+// in the language that is a type rather than a word.
 export struct Field {
 	name: str,
 	type_: TypeExpr,
 	exposed: bool,
 	keyed: bool,
+	key: str,
 }
 
 // One declared generic parameter of a struct or enum: its name, its written

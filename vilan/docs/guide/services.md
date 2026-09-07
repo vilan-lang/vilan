@@ -259,6 +259,20 @@ about the type pretends otherwise. You read it one of four ways:
 - `mirror.get(): Option<T>` and `mirror.status(): SignalCell<Status>`
   (`Waiting` / `Ready`) — passive reads. They open nothing.
 
+A mirror is also a **`Source<Option<T>>`**, so everything the trait gives
+every other observable value is on it: `on_change` (the lazy attach — no
+immediate call, and the channel's first frame is a change), `effect` /
+`effect_on_change`, and any generic `S: Source<…>` function, `selector`
+included. The trait argument is `Option<T>` because that is what a mirror
+holds; a `RemoteSource<List<Note>>` is therefore *not* a `Source<List<Note>>`,
+and `bind_each` still takes `mirror.or([])` rather than the mirror. `sub` has
+one spelling per view of the value: `mirror.sub(|note| …)` is the inherent
+present-only one above, and the trait's `sub` — reached through a generic
+receiver — hands you the `Option<T>`. `map` and `or` stay inherent, which is
+what keeps their stricter law (a mirror derivation *must* have an owner) on a
+concrete receiver; a generic `S: Source<…>` calling `.map` gets the trait's
+owner-optional default.
+
 ```vilan,browser
 import std::json::json_codec;
 import std::reactive::{ Signal, SignalCell };
@@ -323,11 +337,27 @@ thousand, to every connected client.
 `[expose(keyed)]` makes the collection **keyed**, and then only what moved
 crosses. Two things are required of it:
 
-- the field's element is written as a **`Map<K, V>`** — that is where the
-  key type comes from, and the `[service]` expansion reads it before any
-  type resolves;
+- the **key type is written somewhere the expansion can read it**, before
+  any type resolves — a `Map<K, V>` element names it in the collection and
+  takes the bare `[expose(keyed)]`; every other collection names it in the
+  attribute, as `[expose(keyed = K)]`;
 - the value implements **`Keyed<K>`** (its own identity) and
   **`PartialEq`** (what "changed" means).
+
+The two spellings are **one contract**: same frames, same
+`KeyedSource<K, T>` on the client, same surface entry, same contract hash.
+What differs is only what the server stores.
+
+```vilan,fragment
+import std::reactive::SignalCell;
+
+[service(TaskClient)]
+struct Tasks {
+	// A list needs the key in the attribute: `List<Task>` names only the
+	// element, and a keyed mirror is a `KeyedSource<K, T>`.
+	[expose(keyed = str)] items: SignalCell<List<Task>>,
+}
+```
 
 ```vilan,fragment
 import std::map::Map;
@@ -447,8 +477,9 @@ Three things that table says out loud:
   `ReactiveServer::expose_keyed(source, key_of)` for a `List<T>` and
   `expose_keyed_map(source, key_of)` for a `Map<K, V>`, with
   `ReactiveClient::attached_keyed_source` / `keyed_source` on the other
-  end. The `List<T>` form is only reachable this way: the macro needs the
-  key type written in the field, and a list does not carry one.
+  end. `[expose(keyed = K)]` generates the first of those and
+  `[expose(keyed)]` the second, frame for frame — the hand-wired form is
+  the escape for a source neither attribute can name, not for the `List`.
 
 ## Connection state and reconnection
 

@@ -187,6 +187,19 @@ enum Reject {
 	/// 429 — a limit, not a judgement: `max_connections`, the per-IP
 	/// handshake rate, or the app's own.
 	TooMany,
+	/// 503 — the infrastructure behind this service is not ready to serve
+	/// this client (tracker A52). A judgement about NEITHER the credential
+	/// nor the rate: the token may be perfect and the client may be the only
+	/// one asking, and the answer is still no, because the database is down,
+	/// the migration is mid-flight, or the node is draining for a deploy.
+	///
+	/// A48 named the gap and declined to fill it, because the refusal it
+	/// needed (a verifier that timed out) is not one an app gives; this arm
+	/// is one an app gives, from its own `authorize`, and it is the only
+	/// honest word for the case. `TooMany` would tell a client to slow down
+	/// when its rate was never the problem, and `Forbidden` would tell it to
+	/// fix a credential that is fine.
+	Unavailable,
 }
 
 /// The status line each refusal is answered with.
@@ -195,6 +208,7 @@ fun reject_status(reject: Reject): str {
 		Reject::Unauthorized => "401 Unauthorized",
 		Reject::Forbidden => "403 Forbidden",
 		Reject::TooMany => "429 Too Many Requests",
+		Reject::Unavailable => "503 Service Unavailable",
 	}
 }
 
@@ -212,17 +226,30 @@ fun reject_code(reject: Reject): str {
 		Reject::Unauthorized => "401",
 		Reject::Forbidden => "403",
 		Reject::TooMany => "429",
+		Reject::Unavailable => "503",
 	}
 }
 
-/// Whether this refusal is one the CLIENT can act on rather than wait out
-/// (A47): a judgement about the credential it presented. `TooMany` is not —
-/// it is a limit, it says nothing about the credential, and retrying after a
-/// backoff is the right answer to it.
-fun is_judgement(reject: Reject): bool {
+/// Whether this refusal is one the server TELLS the client about, as the typed
+/// `__reject:<status>` frame on an upgraded socket, rather than a status line
+/// on a raw one (A47, widened by A52).
+///
+/// The line is not "is this a judgement about the credential" — it is "did the
+/// APP decide this". `Unauthorized`, `Forbidden` and `Unavailable` are the
+/// three answers an app's own `authorize` may give, so reaching any of them
+/// costs an attacker whatever `handshake_rate` and `max_connections` already
+/// cost: the app hook runs behind both. `TooMany` is the refusal those limits
+/// THEMSELVES produce, which is exactly the one a flood provokes, so it is
+/// never eligible and the expensive path stays bounded by construction (A47's
+/// DoS trade, unchanged by the fourth arm).
+///
+/// What the client does with each still differs, and that is the client's
+/// business: 401/403 mean stop, 503 means not now.
+fun tells_the_client(reject: Reject): bool {
 	match reject {
 		Reject::Unauthorized => true,
 		Reject::Forbidden => true,
+		Reject::Unavailable => true,
 		Reject::TooMany => false,
 	}
 }
@@ -269,7 +296,7 @@ fun refuse_upgrade(request: NodeRequest, socket: NodeSocket, reject: Reject) {
 	// "the client offered `vilan-rpc`", asked through the selection itself:
 	// the selection IS that name exactly when it was offered.
 	let speaks_rpc = selected_protocol(offered_protocols(headers)) == rpc_subprotocol();
-	if is_judgement(reject) && speaks_rpc && has_json_field(headers, "sec-websocket-key") {
+	if tells_the_client(reject) && speaks_rpc && has_json_field(headers, "sec-websocket-key") {
 		write_upgrade_101(socket, headers);
 		socket.write_bytes(text_frame(reject_announcement(reject)));
 		socket.write_bytes(close_frame());
@@ -505,7 +532,7 @@ impl Service {
 
 	/// Decide whether a client may connect AT ALL, before the socket exists
 	/// (`transport-rpc.md` Q4's transport half, A40). `check` runs on the
-	/// upgrade request; `Err(reject)` answers 401/403/429 on the raw socket
+	/// upgrade request; `Err(reject)` answers 401/403/429/503 on the raw socket
 	/// and destroys it — no connection id, no reactive session, no service
 	/// instance — and `Ok(session)` becomes `Connection.session`, which
 	/// `Service::factory`'s `build` reads to construct that client's instance.
@@ -610,14 +637,15 @@ impl Service {
 	/// anyone. `handshake_rate` caps how fast the pile grows; only a bound on
 	/// the verifier caps how big it gets.
 	///
-	/// The refusal is `Reject::TooMany` — 429, not 503. The distinction the
-	/// `Reject` enum draws is judgement (401/403) against LIMIT (429), and a
-	/// verifier that did not answer in time is a limit: it says nothing about
-	/// the credential, and it is exactly the case a client should retry. 503
-	/// would be the more precise HTTP word for "this server is not well", and
-	/// it is deliberately not used, because a fourth status would mean a
-	/// fourth arm on an enum whose three arms are the three answers an app's
-	/// own `authorize` may give — and this refusal is not one an app gives.
+	/// The refusal is `Reject::TooMany` — 429, and still not 503 now that
+	/// `Reject::Unavailable` exists (A52). The distinction the enum draws is
+	/// judgement (401/403) against LIMIT (429) against the app's own "not now"
+	/// (503), and a verifier that did not answer in time is a limit: it says
+	/// nothing about the credential, and it is exactly the case a client
+	/// should retry. `Unavailable` is a refusal an APP gives from its own
+	/// `authorize`; this one is std refusing on the app's behalf because the
+	/// app said nothing at all, and reporting it as the app's judgement would
+	/// be a claim std cannot make.
 	///
 	/// A hook that answers LATE is not raced back in: the socket is already
 	/// destroyed and the timeout is one-way, so a straggling verifier's reply

@@ -169,7 +169,7 @@ than the minor release after the warning first shipped.
 ```text
 struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
-field  = [ "[" "expose" "]" ] IDENT [ ":" type ] ;
+field  = [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
 
 enum          = [ "resource" ] "enum" IDENT [ generic-params ]
                 "{" [ variant { "," variant } [ "," ] ] "}" ;

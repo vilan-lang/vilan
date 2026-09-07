@@ -3059,3 +3059,192 @@ fn b245_a_defaulted_parameter_the_clause_argument_grounds_reaches_a_supertrait()
         "parameter 1 of `Meters`'s `eq` is `Meters`, but `PartialEq` declares `Feet`",
     );
 }
+
+/// A generic `[service]` subject. The refusal is a cascade out of the
+/// expansion rather than one curated sentence — the client struct's own
+/// transport parameter is spelled `T` and collides with the subject's — and
+/// this pin records that, because a curated refusal is owed here and cannot be
+/// written without saying what the unfixed shape currently says.
+#[test]
+fn a52_a_generic_service_subject_is_refused_by_the_expansion() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        [service(StoreClient)]
+        struct Store<T: Wire + PartialEq> {
+            [expose] items: SignalCell<List<T>>,
+        }
+        impl Store<type T: Wire + PartialEq> {
+            [rpc]
+            fun count(self): i32 { self.items.get().len() }
+        }
+        fun main() { print("store"); }
+        main();
+        "#;
+    assert_fails_with(
+        source,
+        "'contract_hash' is already defined for 'StoreClient<T>'",
+    );
+    assert_fails_with(source, "`Store` takes 1 type argument, 0 given");
+}
+
+/// The other spelling: naming the source by TRAIT. B184 made a trait-typed
+/// field legal sugar over a hidden type parameter and carved attributed
+/// declarations out, because `[derive]` and `[service]` write code from the
+/// types the author wrote. This is that carve-out reached through `[expose]`,
+/// and it is one curated sentence that names the rule.
+#[test]
+fn a52_an_expose_of_a_trait_typed_source_field_is_refused_at_the_annotation() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        [service(StoreClient)]
+        struct Store {
+            [expose] items: Source<List<Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#;
+    assert_fails_with(
+        source,
+        "A field MAY name a trait, but not on a declaration carrying an attribute",
+    );
+}
+
+/// The control that keeps both of the above from reading as "an exposed field
+/// must be a `SignalCell`": a user type that implements `Source<T>` — declared
+/// generic, applied concretely — is exposable, and the generated
+/// `session.expose(self.items)` infers `T` off its impl.
+#[test]
+fn a52_an_expose_of_a_user_source_type_is_accepted() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        struct Stored<T> { inner: SignalCell<T> }
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose] items: Stored<List<Task>>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { self.items.get().len() }
+        }
+        fun main() { print(Store { items = Stored { inner = Signal::new([]) } }.contract_hash()); }
+        main();
+        "#,
+    );
+}
+
+/// The bare `[expose(keyed)]` over a `List<T>` — A39's refused shape, still
+/// refused, with the sentence that now names the way out.
+#[test]
+fn an_expose_keyed_list_without_a_key_type_names_the_attribute_argument() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] tasks: SignalCell<List<Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "nothing names its KEY type",
+    );
+}
+
+/// The key is named, and the collection is one the keyed exposure cannot read.
+/// `expose_keyed` takes a `Source<List<T>>` and `expose_keyed_map` a
+/// `Source<Map<K, V>>`; those two are what the expansion picks between, off the
+/// annotation, before any type resolves — so a third collection has to be told
+/// so here or it would simply not be exposed and nothing would say why (B202).
+#[test]
+fn an_expose_keyed_with_a_key_type_still_needs_a_list_or_a_map() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = str)] tasks: SignalCell<Task>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "its collection is not written as a `List<T>` or a `Map<K, V>`",
+    );
+}
+
+/// The argument is a TYPE, and the parser says so where it stands rather than
+/// backtracking the whole attribute and reporting it as a missing field name.
+/// This is the one attribute argument in the language that is a type rather
+/// than a word, so the refusal has to say what shape is wanted.
+#[test]
+fn an_expose_keyed_argument_that_is_not_a_type_is_refused_where_it_stands() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = 3)] tasks: SignalCell<List<Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "`[expose(keyed = …)]`'s argument is a TYPE",
+    );
+}
+
+/// Both accepted forms, in one program: the `Map` element that names its own
+/// key and takes the bare attribute (A39, unchanged), and the `List` element
+/// that names its key in the attribute (A51). The control for the three
+/// refusals above.
+#[test]
+fn both_keyed_expose_spellings_compile_side_by_side() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] by_map: SignalCell<Map<str, Task>>,
+            [expose(keyed = str)] by_list: SignalCell<List<Task>>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { self.by_list.get().len() }
+        }
+        fun main() {
+            print(Store { by_map = Signal::new(Map::new()), by_list = Signal::new([]) }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}

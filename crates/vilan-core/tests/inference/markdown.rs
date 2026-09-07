@@ -5350,3 +5350,208 @@ fn serve_builds_content_type_reads_the_extension_through_path_extname() {
         "image/png\nnone\nnone\nimage/x-icon\nfont/woff2\n",
     );
 }
+
+// --- A52: a mirror IS a `Source` -------------------------------------------
+//
+// `RemoteSource<T>` carried `get`/`map`/`or` as INHERENT members and
+// implemented nothing, so A49's `on_change` was not on it, `effect` was not on
+// it, and no generic `S: Source<..>` function could take one — the mirror sat
+// outside the trait every other observable value in the estate is behind. The
+// impl is at `Option<T>`, which is what a mirror holds; the counted lease is
+// unchanged and the impl names it rather than adding a second mechanism.
+//
+// Every pin below was planted red by deleting the `impl RemoteSource<type T>
+// with Source<Option<T>>` block: the first three fail with "no member
+// 'on_change' on type 'RemoteSource'" / "does not implement trait 'Source'",
+// and the fourth's refusal is the one it asserts either way (see its comment).
+
+/// The three members the impl buys, on one mirror: `on_change` (the lazy
+/// attach, no immediate call), `effect` (the owner-tied eager form), and a
+/// GENERIC `S: Source<T>` consumer that knows nothing about rpc. The counted
+/// lease is what all three ride, so the frames are the ordinary ones.
+#[test]
+fn a52_an_rpc_mirror_is_a_source_and_drives_a_generic_consumer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::io::print;
+        import std::option::Option::{ None, Some, self };
+        import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun show(value: Option<i32>): str {
+            match value {
+                Some(let n) => i"{n}",
+                None => "-",
+            }
+        }
+
+        // Knows nothing about rpc: a mirror reaches it because it is a Source.
+        fun trace<T, S: Source<T>>(source: S, label: str, render: |T| str) {
+            print(i"{label}-get:{render(source.get())}");
+            source.effect(|value| print(i"{label}-eager:{render(value)}"));
+        }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: SignalCell<i32> = Signal::new(1);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let scope = Owner::new();
+            owner_scope.run(scope, || {
+                // `on_change` does NOT fire for the value already held (an
+                // unopened mirror holds `None`); the channel's first frame is
+                // a change and does reach it.
+                let lazy = remote.on_change(|value| print(i"lazy:{show(value)}"));
+                trace(remote, "generic", |value: Option<i32>| show(value));
+                counter.set(2);
+                lazy.dispose();
+                counter.set(3);
+            });
+            scope.dispose();
+        }
+        "#,
+        // `lazy:1` is the seeding frame reaching the LAZY attach: the observer
+        // is registered before the lease is taken, so the first value the
+        // channel delivers is a change from the `None` the mirror held.
+        "lazy:1\n\
+         generic-get:1\n\
+         generic-eager:1\n\
+         lazy:2\n\
+         generic-eager:2\n\
+         generic-eager:3\n",
+    );
+}
+
+/// `selector` is the generic `Source` consumer the estate already ships, and a
+/// mirror now goes straight into it: one subscription on the channel, two cell
+/// writes per change whatever the row count. The keys are `Option<T>` because
+/// that is what the mirror holds — `Some(2)` is the row that is selected while
+/// the server's value is 2.
+#[test]
+fn a52_an_rpc_mirror_feeds_selector_and_two_cells_move_per_change() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::io::print;
+        import std::option::Option::{ None, Some, self };
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope, selector };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let current: SignalCell<i32> = Signal::new(1);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(current);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let scope = Owner::new();
+            owner_scope.run(scope, || {
+                let picked = selector(remote);
+                let one = picked.of(Some(1));
+                let two = picked.of(Some(2));
+                print(i"seed {one.get()}/{two.get()}");
+                current.set(2);
+                print(i"moved {one.get()}/{two.get()}");
+                current.set(3);
+                print(i"gone {one.get()}/{two.get()}");
+            });
+            scope.dispose();
+        }
+        "#,
+        "seed true/false\n\
+         moved false/true\n\
+         gone false/false\n",
+    );
+}
+
+/// The inherent `sub` still wins on a concrete receiver, and still hands the
+/// observer a present `T` — the shape every caller in the estate and every doc
+/// fence was written against. The two `sub`s are told apart by the observer's
+/// own parameter type: this one takes `|T|`, `Source::sub` takes `|Option<T>|`
+/// and confronts the Option, so nothing silently reaches the other one. Both
+/// take the same counted lease and both make exactly ONE immediate call.
+#[test]
+fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::io::print;
+        import std::option::Option::{ None, Some, self };
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        // The trait's `sub`, reached through a generic receiver: it makes the
+        // immediate call with whatever the mirror holds, `None` included.
+        fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {
+            let live = source.sub(observe);
+            live.dispose();
+        }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: SignalCell<i32> = Signal::new(9);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            through_the_trait(remote, |value: Option<i32>| match value {
+                Some(let n) => print(i"trait:{n}"),
+                None => print("trait:none"),
+            });
+            let present = remote.sub(|value: i32| print(i"inherent:{value}"));
+            counter.set(10);
+            present.dispose();
+        }
+        "#,
+        "trait:9\n\
+         inherent:9\n\
+         inherent:10\n",
+    );
+}
+
+/// The boundary the impl does NOT cross, pinned so the sentence in `rpc.vl` is
+/// checkable: a `RemoteSource<List<T>>` is a `Source<Option<List<T>>>`, and
+/// `bind_each` wants a `Source<List<T>>`. The mirror's value IS the option —
+/// `get` cannot invent a `T` before the first frame — so the seam into a list
+/// binding is still `or([])`, which the second half of this pin drives.
+#[test]
+fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
+    assert_fails_browser_with(
+        r#"
+        import std::json::json_codec;
+        import std::reactive::{ Signal, SignalCell };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::ui::{ mount_root, view };
+
+        [derive(Wire, PartialEq, Debug)]
+        struct Todo { id: i32, label: str }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let todos: SignalCell<List<Todo>> = Signal::new([]);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
+            let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let _root = mount_root("app", || view("ul")
+                .bind_each(remote, |todo: Todo| todo.id, |todo| view("li").text(todo.label)));
+        }
+        "#,
+        "'RemoteSource<List<Todo>>' does not implement trait 'Source<List<T>>'",
+    );
+    assert_compiles_browser(
+        r#"
+        import std::json::json_codec;
+        import std::reactive::{ Signal, SignalCell };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::ui::{ mount_root, view };
+
+        [derive(Wire, PartialEq, Debug)]
+        struct Todo { id: i32, label: str }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let todos: SignalCell<List<Todo>> = Signal::new([]);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
+            let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let _root = mount_root("app", || view("ul")
+                .bind_each(remote.or([]), |todo: Todo| todo.id, |todo| view("li").text(todo.label)));
+        }
+        "#,
+    );
+}

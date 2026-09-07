@@ -876,8 +876,23 @@ fun handle_drop(duplex: SocketDuplex) {
 /// socket is open — sends are safe after this returns). Dials with the same
 /// backoff as a reconnect, so a briefly-unavailable server delays the start
 /// instead of failing it; a server that stays away returns `Err`.
+///
+/// It offers `vilan-rpc` (tracker A52) — the same offer `dial_for_service`
+/// makes, and for the same reason A47 gave it to the generated `connect`: the
+/// server's typed refusal frame is only ever sent to a client that named this
+/// protocol, so a bare connect that did NOT offer it could not tell a 401 from
+/// an outage and paid ~24 s of backoff to learn nothing. This is the call a
+/// first program writes — the one in `guide/services.md`'s WebSocket fence and
+/// in every hand-built `Client { transport = socket.transport(), .. }` — so the
+/// bare spelling being the blind one was the wrong default.
+///
+/// `connect_socket_with(url, protocols)` is untouched and remains the escape:
+/// a list written by hand is offered exactly as written, `vilan-rpc` included
+/// only if the caller writes it. A server that speaks something else selects
+/// the client's first non-credential offer, which is what makes an explicit
+/// list the right seam for a non-vilan peer.
 fun connect_socket(url: str): Result<SocketDuplex, str> {
-	connect_socket_with(url, [])
+	connect_socket_with(url, [rpc_subprotocol()])
 }
 
 /// `connect_socket`, offering `protocols` on the handshake (A40) — the seam a
@@ -951,7 +966,14 @@ enum RpcOutcome {
 
 /// An infrastructure-level failure — distinct from an application error, which is part of
 /// a procedure's own return type (e.g. `Option<User>` for "might not exist").
-[derive(Wire, Debug)]
+///
+/// `PartialEq` because the commonest thing an app does with one is COMPARE it
+/// (tracker A52): `if error == RpcError::Unauthorized { sign_in() }` is the
+/// whole point of a typed error, and without the derive a caller had to reach
+/// for a `match` with an arm per variant or read `debug()` back as text. The
+/// payload arms compare their sentences, which is what a `Transport(reason)`
+/// against a literal means.
+[derive(Wire, Debug, PartialEq)]
 enum RpcError {
 	Transport(str),
 	Decode(str),
@@ -960,6 +982,13 @@ enum RpcError {
 	// sides were built against different service surfaces.
 	Contract(str),
 	Unauthorized,
+	/// The server refused this connection with a 503 (tracker A52): a
+	/// judgement about NEITHER the credential nor the rate — the infrastructure
+	/// behind the service is not ready to serve this client. The client's
+	/// answer is "not now", where `Unauthorized`'s is "not with this
+	/// credential": retrying later is the right thing, retrying immediately is
+	/// not, and re-authenticating is beside the point.
+	Unavailable,
 }
 
 // --- Envelope encode/decode (shared by `call`, the protocol, and benchmarks) --
@@ -2132,7 +2161,22 @@ struct RemoteSource<T> {
 	cache: SignalCell<Option<T>>,
 }
 
-impl RemoteSource<type T> {
+/// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
+/// holds: `None` until the first frame lands, the value after. Until this impl
+/// existed `RemoteSource` carried `get`/`map`/`or` as inherent members and
+/// implemented nothing, so A49's `on_change` was not on it, `effect` was not on
+/// it, and no generic `S: Source<..>` function — `selector`, an application's
+/// own — could take one. Every observing path still goes through the same
+/// counted lease; the impl adds no second mechanism, it names the one there is.
+///
+/// The trait argument is `Option<T>` and not `T` because the mirror's value is
+/// the Option: `get` cannot invent a `T` before the first frame. So a
+/// `RemoteSource<List<Note>>` is a `Source<Option<List<Note>>>` and does NOT
+/// satisfy `bind_each`'s `Source<List<T>>` — the seam into a list binding is
+/// still `or([])`, exactly as `guide/services.md` writes it. What the impl
+/// buys is everything that reads a source WITHOUT flattening it: `on_change`,
+/// `effect`, `effect_on_change`, and any generic consumer.
+impl RemoteSource<type T> with Source<Option<T>> {
 	/// The mirror's current value: `None` until the first update lands.
 	/// Passive — no lease, no frame; an unwatched mirror reads `None`
 	/// forever, which is correct: nothing asked.
@@ -2140,17 +2184,75 @@ impl RemoteSource<type T> {
 		self.cache.get()
 	}
 
+	/// The trait's subscription primitive, counted like every other observing
+	/// path: attach WITHOUT the immediate call, and hold the channel open until
+	/// the subscription is disposed.
+	///
+	/// ORDER is the whole content of this body, and it is forced rather than
+	/// chosen: attach FIRST, then take the lease. Taking the lease is what
+	/// sends `Subscribe`, and over an in-process transport the server's seeding
+	/// `Update` comes back INSIDE that call — so acquiring first would drop the
+	/// first value on a `duplex_pair` and deliver it over a socket, which is a
+	/// transport-dependent contract and not one at all. Attached first, the
+	/// seed is a change from the `None` the mirror held when the observer was
+	/// registered, on every transport. Nothing is swallowed: `on_change`'s
+	/// contract is "never for the value the source ALREADY holds", and an
+	/// unopened mirror already holds `None`.
+	[must_use]
+	fun on_change(self, observer: |Option<T>| void): Subscription {
+		let subscription = self.cache.on_change(observer);
+		subscription.release.write() = Some(|| self.release());
+		self.acquire();
+		subscription
+	}
+
+	/// The trait's `sub` default, OVERRIDDEN — because the default is
+	/// `on_change` plus one call with `get()`, and on a mirror `on_change`
+	/// itself delivers the seeding frame, so the default would make the
+	/// immediate call TWICE. `lease` is the honest eager form: take the lease,
+	/// then attach with `SignalCell::sub`, whose one immediate call is the
+	/// contract's.
+	[must_use]
+	fun sub(self, observer: |Option<T>| void): Subscription {
+		self.lease(observer)
+	}
+
+	/// `effect` for the same reason as `sub`, and by the same body plus the
+	/// ambient owner: the trait's default is `effect_on_change` and one call,
+	/// and `effect_on_change` is `on_change`, which already made it.
+	fun effect(self, observer: |Option<T>| void) {
+		get_owner().take(self.lease(observer));
+	}
+}
+
+impl RemoteSource<type T> {
 	/// Observe the mirror through `transform`, as a plain `SignalCell<U>` — the
 	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
 	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
-	/// it opens the channel if nothing else has, and the lease is released
-	/// when the enclosing owner is disposed, which for a view is unmount. So
-	/// it requires an ambient owner, statically: calling it where no
-	/// `owner_scope.run` encloses is a compile error, which makes "a network
-	/// subscription must have an owner" a compile-time law. `transform` sees
-	/// `None` until the first frame lands — the one place the `Option` is
-	/// confronted, and where a fallback of a DIFFERENT type than `T` belongs
-	/// (`"Loading…"` from a `RemoteSource<i32>`).
+	/// it opens the channel if nothing else has, and the lease is released when
+	/// the enclosing owner is disposed, which for a view is unmount. So it
+	/// requires an ambient owner, STATICALLY (`get_owner`, not the trait
+	/// default's `register_with_owner`): calling it where no `owner_scope.run`
+	/// encloses is a compile error, which makes "a network subscription must
+	/// have an owner" a compile-time law (A25). The trait's default is
+	/// deliberately owner-OPTIONAL, because `current_path().map(parse)` at
+	/// module level is a documented idiom and a network subscription at module
+	/// level is not one.
+	///
+	/// INHERENT rather than an override inside the `Source` impl, and that is a
+	/// COMPILER LIMIT and not a preference: written as an override, `status`'s
+	/// own `self.cache.map(..)` — a call on a `SignalCell` field, which
+	/// inherits the trait's default — miscompiles, and `register_with_owner`
+	/// runs with an undefined owner (`self[0].v.push` on `undefined` at module
+	/// scope; both A25 owner pins go red). Overriding a default that the
+	/// receiver's own field type inherits is the shape that breaks. The cost of
+	/// keeping it inherent is that the STRICT law reaches a concrete
+	/// `mirror.map(..)` only; a generic `S: Source<Option<T>>` calling `.map`
+	/// gets the owner-optional default.
+	///
+	/// `transform` sees `None` until the first frame lands — the one place the
+	/// `Option` is confronted, and where a fallback of a DIFFERENT type than
+	/// `T` belongs (`"Loading…"` from a `RemoteSource<i32>`).
 	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U> {
 		let derived = SignalCell::new(transform(self.get()));
 		get_owner().take(self.lease(|value| {
@@ -2193,6 +2295,14 @@ impl RemoteSource<type T> {
 	/// releases it — the last release closes the channel (an `Unsubscribe`,
 	/// deferred to the ambient turn's settle so a same-turn re-subscribe
 	/// cancels it; with no ambient turn, sent at once).
+	///
+	/// INHERENT, and it outranks the trait's `sub` on a concrete receiver — the
+	/// two are told apart by the observer's own parameter type and cannot be
+	/// confused for one another: this one takes `|T|`, `Source::sub` takes
+	/// `|Option<T>|` and makes the immediate call with whatever the mirror
+	/// holds. A generic `S: Source<Option<T>>` reaches that one; `mirror.sub`
+	/// reaches this one, which is the shape every caller was written against
+	/// and the one a view wants (a `None` is not a value to render).
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
 		self.lease(|value| {
@@ -2689,6 +2799,12 @@ fun dial_for_service_with(url: str, protocols: List<str>): Result<SocketDuplex, 
 		// log to carry.
 		DialFailure::Refused(let status) => if status == "401" || status == "403" {
 			RpcError::Unauthorized
+		} else if status == "503" {
+			// A52's arm. Distinct from `Unauthorized` because the app's answer
+			// differs — a sign-in prompt is the wrong response to a draining
+			// node — and distinct from `Transport` because the server ANSWERED:
+			// it is not unreachable, it declined.
+			RpcError::Unavailable
 		} else {
 			RpcError::Transport(i"refused by the server ({status})")
 		},
@@ -2940,16 +3056,23 @@ macro fun service(item: Item): Source {
 	//
 	// A KEYED field (`[expose(keyed)]`, A39) reads TWO types off the annotation
 	// rather than one — the mirror is a `KeyedSource<K, T>` — and vilan has no
-	// associated types, so `K` can only come from the field's written type.
-	// `SignalCell<Map<K, V>>` names both; the refusal for anything else is the
-	// analyzer's, said in the vocabulary of the field (`check_expose_fields`),
-	// for B202's reason: a field this loop skips would otherwise be silently
-	// unexposed.
+	// associated types, so `K` can only come from what the author wrote.
+	// `SignalCell<Map<K, V>>` names both in the collection itself; every other
+	// keyed collection names only its element, and A51 gives it the attribute
+	// ARGUMENT to name the key with: `[expose(keyed = str)] SignalCell<List<T>>`.
+	// The refusal for anything else is the analyzer's, said in the vocabulary of
+	// the field (`check_expose_fields`), for B202's reason: a field this loop
+	// skips would otherwise be silently unexposed.
 	mut exposed_names: List<str> = [];
 	mut exposed_elements: List<str> = [];
 	// The key type per exposed field, or `""` for the whole-value form — the
 	// discriminator every later loop reads.
 	mut exposed_keys: List<str> = [];
+	// Whether the keyed collection is a `Map` (the values are the elements) or
+	// a `List` (the collection IS the elements). Only the server-side exposure
+	// call differs; the wire, the mirror and the contract entry do not, which
+	// is why the two forms hash identically and patch identically.
+	mut exposed_maps: List<bool> = [];
 	for field in target.fields {
 		if field.exposed {
 			if field.type_.arguments.len() == 1 {
@@ -2962,9 +3085,26 @@ macro fun service(item: Item): Source {
 										Some(let value) => {
 											exposed_names.push(field.name);
 											exposed_elements.push(value.render());
-											exposed_keys.push(key.render());
+											// A written argument wins: it is
+											// what the author said the key is.
+											exposed_keys.push(if field.key == "" {
+												key.render()
+											} else {
+												field.key
+											});
+											exposed_maps.push(true);
 										},
 										None => {},
+									},
+									None => {},
+								}
+							} else if field.key != "" && element.name == "List" && element.arguments.len() == 1 {
+								match element.arguments.get(0) {
+									Some(let value) => {
+										exposed_names.push(field.name);
+										exposed_elements.push(value.render());
+										exposed_keys.push(field.key);
+										exposed_maps.push(false);
 									},
 									None => {},
 								}
@@ -2973,6 +3113,7 @@ macro fun service(item: Item): Source {
 							exposed_names.push(field.name);
 							exposed_elements.push(element.render());
 							exposed_keys.push("");
+							exposed_maps.push(false);
 						}
 					},
 					None => {},
@@ -3064,10 +3205,22 @@ macro fun service(item: Item): Source {
 				Some(let found) => found,
 				None => "_",
 			};
+			let is_map = match exposed_maps.get(exposure_index) {
+				Some(let found) => found,
+				None => true,
+			};
 			// The key projection is a value parameter (`std::rpc`'s
 			// `expose_keyed_map` documents why); `Keyed` is what makes
-			// `element.key()` resolve on the element type.
-			exposures.push(i"session.expose_keyed_map(self.{field_name}, |element: {element}| element.key())");
+			// `element.key()` resolve on the element type. The `List` form is
+			// the same call one layer down — `expose_keyed` is
+			// `expose_keyed_map` without the `values()` projection — which is
+			// what makes the two forms one channel shape.
+			let exposer = if is_map {
+				"expose_keyed_map"
+			} else {
+				"expose_keyed"
+			};
+			exposures.push(i"session.{exposer}(self.{field_name}, |element: {element}| element.key())");
 		}
 		exposure_index = exposure_index + 1;
 	}

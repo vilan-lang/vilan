@@ -79,6 +79,10 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
     ("on", "the element head's event form: `on:click(..)`"),
     ("hidden", "the sole argument of `[doc(hidden)]`"),
     (
+        "keyed",
+        "the sole argument of `[expose(keyed)]` / `[expose(keyed = K)]` (A39, A51)",
+    ),
+    (
         "as",
         "the contextual alias on an import/use path leaf (§3.2, E142)",
     ),

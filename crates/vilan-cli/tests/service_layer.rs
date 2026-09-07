@@ -1816,3 +1816,540 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `RpcError` compares (tracker A52). The commonest thing an application does
+/// with a typed error is ask WHICH one it is, and until the derive landed
+/// `error == RpcError::Unauthorized` was a compile error — the answer was a
+/// `match` with an arm per variant, or `debug()` read back as text. No server
+/// here: the claim is about the type, not about a wire.
+///
+/// Red first: with the derive off `vilan run` refuses with "type 'RpcError'
+/// does not implement the `PartialEq` operator" on every one of these lines.
+#[test]
+fn an_rpc_error_compares_by_arm_and_by_payload() {
+    let dir = temp_project("rpc_error_eq");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::rpc::RpcError;
+
+fun main() {
+	let held: RpcError = RpcError::Unauthorized;
+	print(i"same-unit:{held == RpcError::Unauthorized}");
+	print(i"same-payload:{RpcError::Transport("gone") == RpcError::Transport("gone")}");
+	print(i"other-payload:{RpcError::Transport("gone") == RpcError::Transport("here")}");
+	print(i"other-arm:{RpcError::Decode("gone") == RpcError::Transport("gone")}");
+	print(i"unit-vs-payload:{held == RpcError::Contract("drift")}");
+	print(i"ne:{held != RpcError::Unauthorized}");
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "same-unit:true",
+        // A payload arm compares its SENTENCE, which is what a `Transport`
+        // against a literal means.
+        "same-payload:true",
+        "other-payload:false",
+        // Same payload, different arm — the discriminant is part of it.
+        "other-arm:false",
+        "unit-vs-payload:false",
+        "ne:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the comparison run:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A52: the 503 arm — an infrastructure refusal an app can give -----------
+
+/// A service that is up, reads the token fine, and still says no: the
+/// infrastructure behind it is not ready. `AUTHORIZED_SERVER` with its whole
+/// `authorize` body replaced, so the two differ in exactly the refusal.
+fn draining_server() -> String {
+    let refused = AUTHORIZED_SERVER.replace(
+        r#"			.authorize(|handshake: Handshake| match handshake.token() {
+				Some(let token) => if token == "good" {
+					Result::Ok(Session::of("ada").with_credential(token))
+				} else {
+					Result::Err(Reject::Forbidden)
+				},
+				None => Result::Err(Reject::Unauthorized),
+			}))"#,
+        r#"			.authorize(|_handshake: Handshake| Result::Err(Reject::Unavailable)))"#,
+    );
+    assert!(
+        refused.contains("Reject::Unavailable"),
+        "the authorize body to replace moved"
+    );
+    refused
+}
+
+/// The wire half of A52's arm: 503 both ways out of `refuse_upgrade`. A vilan
+/// client (one that offered `vilan-rpc`) is upgraded and told
+/// `__reject:503` as a frame; anything else — a browser, a probe, a health
+/// check — gets the plain status line, `503 Service Unavailable`.
+///
+/// `Unavailable` is eligible for the frame path where `TooMany` is not, and the
+/// DoS bound A47 argued is untouched: eligibility is "the APP decided this",
+/// and the app's `authorize` runs behind `handshake_rate` and
+/// `max_connections`, which produce `TooMany` and nothing else.
+///
+/// Red first: with the arm absent the program does not compile
+/// (`Reject::Unavailable` is not a variant); with the arm present but left out
+/// of `tells_the_client`, the frame leg reads back `HTTP/1.1 503 Service
+/// Unavailable` instead of the 101 and the client cannot see it at all.
+#[test]
+fn an_unavailable_service_refuses_with_503_as_a_frame_and_as_a_status_line() {
+    let (server, port) = spawn_service_server("unavailable", &draining_server());
+
+    let told = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    assert!(
+        told.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a vilan client must be upgraded so the 503 can be a frame: {told}"
+    );
+    assert!(
+        told.contains("__reject:503"),
+        "the refusal frame must carry 503: {told}"
+    );
+    assert!(
+        !told.contains("__conn:"),
+        "a refused client must never be announced a connection id: {told}"
+    );
+
+    // Everything that does not speak this protocol keeps plain HTTP semantics.
+    let plain = raw_upgrade(port, "/", "");
+    assert!(
+        plain.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "a non-rpc handshake must get the status line: {plain}"
+    );
+
+    drop(server);
+}
+
+/// The client half, end to end: `connect` against a service whose `authorize`
+/// answers `Reject::Unavailable` comes back `RpcError::Unavailable` — not
+/// `Unauthorized` (the credential is fine), not `Transport` (the server
+/// answered) — and it comes back AT ONCE, because a refusal ends the dial loop
+/// exactly as A47's does.
+///
+/// The comparison is written with `==` rather than a `match`, which is A52's
+/// other half working: the derive and the arm are one surface for an app.
+#[test]
+fn a_client_refused_by_infrastructure_reports_unavailable_and_compares_equal() {
+    let dir = temp_project("unavailable_client");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(draining_server()
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::RpcError;\nimport std::result::Result::{ Ok, Err };",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let _client) => print("connected:unexpected"),
+		Err(let error) => {
+			print(i"refused:{error.debug()}");
+			print(i"is-unavailable:{error == RpcError::Unavailable}");
+			print(i"is-unauthorized:{error == RpcError::Unauthorized}");
+		},
+	}
+	exit(0);
+}
+"#),
+    );
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("run")
+        .arg(".")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the unavailable-client program");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    for expected in [
+        "refused:Unavailable",
+        "is-unavailable:true",
+        "is-unauthorized:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing; stdout was:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The same bound A47's pin carries, and for the same reason: the burned
+    // budget is ~27.75 s of sleeping alone, and a build is inside this figure.
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "the refusal must not wait out the retry budget; the whole run took {elapsed:?}"
+    );
+
+    drop(dir);
+}
+
+/// A52's steer: bare `connect_socket(url)` offers `vilan-rpc`, so the refusal
+/// frame reaches it. The observable is the one A47 built the frame for — a
+/// refused connect answers AT ONCE with the server's status in the sentence,
+/// where an offer-nothing client cannot be told and pays the whole retry
+/// budget for `could not reach …`.
+///
+/// This is the call a first program writes: `connect_socket` + a hand-built
+/// `Client { transport = socket.transport(), … }` is the WebSocket fence in
+/// `guide/services.md` and the shape three pins in this file already use, so
+/// the bare spelling being the blind one was the wrong default. The explicit
+/// list is untouched, which the second half asserts: `connect_socket_with(url,
+/// ["chat.v1"])` offers `chat.v1` and NOT `vilan-rpc`, read back off the
+/// server's own `Handshake::protocols`.
+///
+/// Red first: with `connect_socket_with(url, [])` restored, the refused leg
+/// reads `refused:could not reach ws://localhost:<port>/` after ~24 s of
+/// backoff instead of naming the 401.
+#[test]
+fn a_bare_connect_socket_offers_vilan_rpc_and_an_explicit_list_is_untouched() {
+    let dir = temp_project("bare_offer");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ connect_socket, connect_socket_with };
+import std::rpc_server::{ Handshake, Reject, Service, Session };
+
+[service(NotesClient)]
+struct Notes {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun ping(self): i32 {
+		1
+	}
+}
+
+let notes: Notes = Notes { count = Signal::new(0) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec()))
+			.authorize(|handshake: Handshake| {
+				print(i"offered:{join(handshake.protocols)}");
+				Result::Err(Reject::Unauthorized)
+			}))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun join(names: List<str>): str {
+	mut out = "";
+	for name in names {
+		out = out + name + "|";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match connect_socket(i"ws://localhost:{port}/") {
+		Ok(let _socket) => print("bare:connected-unexpected"),
+		Err(let reason) => print(i"bare:{reason}"),
+	}
+	match connect_socket_with(i"ws://localhost:{port}/", ["chat.v1"]) {
+		Ok(let _socket) => print("explicit:connected-unexpected"),
+		Err(let reason) => print(i"explicit:{reason}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let started = Instant::now();
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let elapsed = started.elapsed();
+    // The bare call offered the protocol, so the server's typed refusal frame
+    // reached it and the status is in the sentence.
+    assert!(
+        stdout.contains("offered:vilan-rpc|"),
+        "a bare connect_socket must offer `vilan-rpc`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("bare:refused by the server (401)"),
+        "a bare connect_socket must be TOLD the refusal:\n{stdout}"
+    );
+    // The explicit list is offered exactly as written — no `vilan-rpc` smuggled
+    // in — so that client is refused the old, blind way.
+    assert!(
+        stdout.contains("offered:chat.v1|"),
+        "an explicit protocol list must be offered verbatim:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("explicit:could not reach"),
+        "a client that did not name the protocol is not told the status:\n{stdout}"
+    );
+    // One burned budget (the explicit leg's) is in this figure, not two.
+    assert!(
+        elapsed < Duration::from_secs(80),
+        "the bare leg must not wait out a retry budget of its own; the run took {elapsed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A51: `[expose(keyed = K)]` over a `List<T>`, end to end ----------------
+
+/// The `List` keyed service and its `Map` twin in one program, so the contract
+/// hashes can be compared: the two forms differ only in what the SERVER stores,
+/// and the wire, the mirror and the surface entry are the same, so they must
+/// hash the same. `PlainChat` is the control that keeps that from being
+/// vacuous — the same surface with a whole-value exposure hashes differently.
+const KEYED_LIST_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::rpc_server::Service;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// A51's shape: the collection names only its element, and the KEY comes from
+// the attribute argument.
+[service(ListChatClient)]
+struct ListChat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed = str)] messages: SignalCell<List<Message>>,
+}
+
+impl ListChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		self.messages.update(|&mut list| {
+			list.push(Message { id, channel, body });
+		});
+		self.messages.get().len()
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		mut found = false;
+		mut next: List<Message> = [];
+		for message in self.messages.get() {
+			if message.id == id {
+				found = true;
+				next.push(Message { id, channel = message.channel, body });
+			} else {
+				next.push(message);
+			}
+		}
+		self.messages.set(next);
+		found
+	}
+}
+
+// A39's shape, unchanged: the `Map` names both types and takes the bare form.
+[service(MapChatClient)]
+struct MapChat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl MapChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+// The whole-value control.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+	[expose] messages: SignalCell<Map<str, Message>>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: ListChat = ListChat { topic = Signal::new("general"), messages = Signal::new([]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun render(list: List<Message>): str {
+	mut out = "";
+	for message in list {
+		out = out + message.id + "=" + message.body + " ";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match ListChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// The generated mirror is a `KeyedSource<str, Message>` — the key
+			// type came off the attribute, the element off the `List`.
+			let topic = client.topic.sub(|value| print(i"topic:{value}"));
+			let watch = client.messages.sub_key("m2", |value| match value {
+				Some(let message) => print(i"m2:{message.body}"),
+				None => print("m2:absent"),
+			});
+			print(i"post:{client.post("m1", 0, "hello").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", 0, "world").unwrap_or(0 - 1)}");
+			print(i"edit:{client.edit("m1", "hello again").unwrap_or(false)}");
+			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
+			print(i"held:{render(client.messages.get().unwrap_or([]))}");
+			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
+			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			print(i"list-hash:{client.contract_hash()}");
+			print(i"map-hash:{map_twin.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"fault:{client.messages.fault().is_some()}");
+			watch.dispose();
+			topic.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// A51's macro form, end to end over a real WebSocket: `[expose(keyed = str)]`
+/// over a `SignalCell<List<Message>>` mints the keyed channel, the generated
+/// client carries a `KeyedSource<str, Message>`, and a per-key subscription
+/// through it holds ITS message and no other — the same claims A39's `Map`
+/// twin makes, on the collection A39 refused.
+///
+/// The hashes are the other half. The two keyed forms hash IDENTICALLY, and
+/// that is the point rather than a coincidence: they differ only in what the
+/// server stores, and a client built against one can connect to the other
+/// because the frames, the mirror and the surface entry are the same. The
+/// whole-value control hashes differently, which keeps the equality from being
+/// a claim that the hash ignores exposure.
+///
+/// Red first: `[expose(keyed = str)]` did not parse before A51 (`expected a
+/// field name`), and with the argument dropped the field is refused —
+/// "nothing names its KEY type".
+#[test]
+fn a_keyed_list_field_mirrors_as_a_keyed_source_and_hashes_as_its_map_twin() {
+    let dir = temp_project("keyed_list_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_LIST_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "m2:absent",
+        "m2:world",
+        "m2:world again",
+        "topic:general",
+        "topic-held:general",
+        "post:1",
+        "post:2",
+        "edit:true",
+        "held:m2=world again",
+        "fault:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the keyed-list service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("held:m1="),
+        "a per-key subscription received a message it never asked for:\n{stdout}"
+    );
+    let hash_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    let list_hash = hash_of("list-hash:");
+    let map_hash = hash_of("map-hash:");
+    let plain_hash = hash_of("plain-hash:");
+    assert_eq!(
+        list_hash, map_hash,
+        "the two keyed forms are one contract — same frames, same mirror, same \
+         surface entry — so they must hash the same:\n{stdout}"
+    );
+    assert_ne!(
+        list_hash, plain_hash,
+        "a whole-value exposure is a different contract:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

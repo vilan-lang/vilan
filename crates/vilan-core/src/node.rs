@@ -1123,22 +1123,32 @@ impl std::fmt::Display for BackingLiteral<'_> {
 }
 
 /// Whether a struct field is exposed to a service's client, and in what shape
-/// (`proposal/transport-rpc.md` §4.2; tracker A39).
+/// (`proposal/transport-rpc.md` §4.2; tracker A39, A51).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Exposure {
+pub enum Exposure<'src> {
     /// Not exposed.
     #[default]
     None,
     /// `[expose]` — the source's WHOLE value crosses on every change, as an
     /// `Update` frame, and the client mirrors it in a `RemoteSource<T>`.
     Whole,
-    /// `[expose(keyed)]` — the source is a keyed collection, and only what
-    /// changed crosses, as a `Patch` of `Delta` ops. The client mirrors it in a
-    /// `KeyedSource<K, T>`, which can also subscribe to ONE key.
-    Keyed,
+    /// `[expose(keyed)]` / `[expose(keyed = K)]` — the source is a keyed
+    /// collection, and only what changed crosses, as a `Patch` of `Delta` ops.
+    /// The client mirrors it in a `KeyedSource<K, T>`, which can also subscribe
+    /// to ONE key.
+    ///
+    /// The payload is the key type AS WRITTEN in the attribute argument, when
+    /// one was written. It exists because the mirror needs TWO types and vilan
+    /// has no associated types to read the key from: a `Map<K, V>` element
+    /// names both and needs no argument (`None`), and every other collection —
+    /// a `List<T>`, which is what A39 refused — names only the element, so the
+    /// key comes from the attribute (`Some("str")`). It is source text rather
+    /// than a node because it is handed to the macro engine as a string and to
+    /// the formatter as one; nothing here resolves it.
+    Keyed(Option<&'src str>),
 }
 
-impl Exposure {
+impl<'src> Exposure<'src> {
     /// Whether the field crosses to the client at all — the question every
     /// caller that does not care about the shape is asking.
     pub fn is_exposed(self) -> bool {
@@ -1147,14 +1157,29 @@ impl Exposure {
 
     /// Whether the field is the keyed form.
     pub fn is_keyed(self) -> bool {
-        matches!(self, Self::Keyed)
+        matches!(self, Self::Keyed(_))
+    }
+
+    /// The key type the attribute named, if it named one — `""` when the field
+    /// is not keyed or the key is to be read off a `Map<K, V>` element. The
+    /// empty string is the discriminator the macro engine and the generated
+    /// service both already read for "no key here".
+    pub fn key_type(self) -> &'src str {
+        match self {
+            Self::Keyed(Some(written)) => written,
+            _ => "",
+        }
     }
 }
 
 // One struct field: its name (with the name's own span), optional type
 // annotation, and whether (and how) it is `[expose]`d — observable by a
 // service's client as a mirrored `Source` (`proposal/transport-rpc.md` §4.2).
-pub type StructField<'src> = (Spanned<&'src str>, Option<Spanned<Node<'src>>>, Exposure);
+pub type StructField<'src> = (
+    Spanned<&'src str>,
+    Option<Spanned<Node<'src>>>,
+    Exposure<'src>,
+);
 
 // One field of a struct LITERAL: its name, and the value assigned to it —
 // `None` for the shorthand form, where the name is also the value's binding.

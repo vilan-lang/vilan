@@ -2115,6 +2115,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                             .unwrap_or_else(void_type_expr),
                         js::Node::Bool(exposed.is_exposed()),
                         js::Node::Bool(exposed.is_keyed()),
+                        string_literal(exposed.key_type()),
                     ])
                 })
                 .collect();
@@ -2244,6 +2245,10 @@ pub(crate) fn construct_service(
                     .unwrap_or_else(void_type_expr),
                 js::Node::Bool(exposed.is_exposed()),
                 js::Node::Bool(exposed.is_keyed()),
+                // `[expose(keyed = K)]`'s argument, as written — the key type
+                // the mirror is keyed by, or `""` for a field that is not keyed
+                // or whose key is read off a `Map<K, V>` element (A51).
+                string_literal(exposed.key_type()),
             ])
         })
         .collect();

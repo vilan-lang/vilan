@@ -792,3 +792,380 @@ fn a_keyed_mirror_resubscribes_the_keys_it_holds_after_a_rebind() {
         "a keyed mirror kept a ghost across a reconnect:\n{stdout}"
     );
 }
+
+// --- A51: what `keyed_diff` costs in CPU, per change per connection ---------
+//
+// A39 measured the keyed channel's BYTES and found them O(change): an edit in a
+// 1,000-message platform went from 123,753 bytes to 95. It also recorded, and
+// did not measure, the other half — `keyed_diff` re-keys two whole snapshots on
+// every change, so the CPU is O(N) per change, and it is paid once per
+// SUBSCRIBED CONNECTION because each connection's forward runs its own diff.
+// The client half is O(N) too: `KeyedSource::apply` reaches `index_of` per op,
+// which is a linear scan of the mirror.
+//
+// This is the measurement A51 asks for BEFORE anything incremental is built.
+// Two scales (1,000 and 10,000 rows) crossed with two connection counts (1 and
+// 8), each run twice — once making the changes, once making none — so the
+// seed, the process start and the node runtime subtract out and what is left is
+// the changes alone.
+//
+// CPU, not wall: `getrusage(RUSAGE_CHILDREN)` around each `node` run, which is
+// the child's user+system time and accrues nothing to preemption. Every row
+// stamps the 1-minute loadavg anyway, so a row measured on a busy box says so.
+// `#[ignore]`d — it spawns eight node processes and is a measurement, not a
+// gate. Run it with:
+//
+// ```text
+// cargo nextest run -p vilan-cli --test reactive_channels --run-ignored \
+//     ignored-only -E 'test(keyed_diff)' --no-capture
+// ```
+
+/// The measured program: `rows` rows behind one keyed channel, `connections`
+/// independent sessions each holding a whole-collection lease, and `changes`
+/// single-element edits. Every parameter is substituted, so the two runs of a
+/// pair differ in `changes` and in nothing else.
+const KEYED_DIFF_COST: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, Subscription };
+import std::rpc::{ KeyedSource, ReactiveClient, ReactiveServer, duplex_pair };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Row {
+	id: str,
+	value: i32,
+	body: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+fun corpus(count: i32): List<Row> {
+	mut all: List<Row> = [];
+	mut index = 0;
+	for index < count {
+		all.push(Row {
+			id = i"row-{index}",
+			value = index,
+			body = "the quick brown fox jumps over the lazy dog, repeatedly and at length",
+		});
+		index += 1;
+	}
+	all
+}
+
+fun main() {
+	let rows = __ROWS__;
+	let connections = __CONNECTIONS__;
+	let changes = __CHANGES__;
+	let store: SignalCell<List<Row>> = Signal::new(corpus(rows));
+
+	mut leases: List<Subscription> = [];
+	mut opened = 0;
+	for opened < connections {
+		let (client_end, server_end) = duplex_pair();
+		let session = ReactiveServer::new(server_end, json_codec());
+		let client = ReactiveClient::new(client_end, json_codec());
+		let channel = session.expose_keyed(store, |row: Row| row.key());
+		let mirror: KeyedSource<str, Row> = client.keyed_source(channel);
+		leases.push(mirror.sub(|_list| {}));
+		opened += 1;
+	}
+
+	mut made = 0;
+	for made < changes {
+		// One element edited in place: the smallest change there is, and the
+		// one A39's byte measurement priced at 95 bytes.
+		store.update(|&mut list| {
+			list[0] = Row {
+				id = "row-0",
+				value = made,
+				body = "the quick brown fox jumps over the lazy dog, repeatedly and at length",
+			};
+		});
+		made += 1;
+	}
+
+	for lease in leases {
+		lease.dispose();
+	}
+	print(i"rows={rows} connections={connections} changes={changes}");
+}
+"#;
+
+/// The child processes' accumulated CPU (user + system) so far — the clock this
+/// measurement reads. `RUSAGE_CHILDREN` counts REAPED children, and a nextest
+/// test owns its process, so a delta taken around one `Command::output` is that
+/// one child and nothing else.
+#[cfg(unix)]
+fn children_cpu_now() -> Option<Duration> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `getrusage` writes the `rusage` we hand it and reads nothing
+    // else; the pointer is to a live local.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
+    if result != 0 {
+        return None;
+    }
+    let of = |time: libc::timeval| {
+        Duration::from_secs(time.tv_sec.max(0) as u64)
+            + Duration::from_micros(time.tv_usec.max(0) as u64)
+    };
+    Some(of(usage.ru_utime) + of(usage.ru_stime))
+}
+
+/// Every other host: no children-CPU clock, so the measurement DECLINES rather
+/// than reports a wall-clock number under a CPU heading.
+#[cfg(not(unix))]
+fn children_cpu_now() -> Option<Duration> {
+    None
+}
+
+fn loadavg_1m() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[test]
+#[ignore = "A51: a measurement, not a gate — it spawns eight node processes and reports numbers"]
+fn keyed_diff_cpu_per_change_per_connection() {
+    let Some(_probe) = children_cpu_now() else {
+        eprintln!("PERF declined: this host exposes no children-CPU clock");
+        return;
+    };
+    let dir = temp_project("keyed_diff_cost");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+
+    // One `vilan build` per shape, then `node` on the bundle — so the compile
+    // is never inside a measured span.
+    let measure = |rows: i32, connections: i32, changes: i32| -> Duration {
+        write(
+            &dir,
+            "src/main.vl",
+            &KEYED_DIFF_COST
+                .replace("__ROWS__", &rows.to_string())
+                .replace("__CONNECTIONS__", &connections.to_string())
+                .replace("__CHANGES__", &changes.to_string()),
+        );
+        let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["build", dir.to_str().unwrap()])
+            .output()
+            .expect("build the measured program");
+        assert!(
+            built.status.success(),
+            "the measured program did not build:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let bundle = dir.join("src").join("main.mjs");
+        assert!(bundle.exists(), "the bundle is not at {}", bundle.display());
+        let before = children_cpu_now().expect("a children-CPU clock");
+        let ran = Command::new("node")
+            .arg(&bundle)
+            .output()
+            .expect("run the measured program");
+        let after = children_cpu_now().expect("a children-CPU clock");
+        assert!(
+            ran.status.success(),
+            "the measured program did not run:\n{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        after.saturating_sub(before)
+    };
+
+    const CHANGES: i32 = 200;
+    println!("PERF loadavg-before {}", loadavg_1m());
+    for rows in [1_000, 10_000] {
+        for connections in [1, 8] {
+            let idle = measure(rows, connections, 0);
+            let busy = measure(rows, connections, CHANGES);
+            let attributable = busy.saturating_sub(idle);
+            let per =
+                attributable.as_secs_f64() * 1000.0 / f64::from(CHANGES) / f64::from(connections);
+            println!(
+                "PERF {{\"section\":\"a51-keyed-diff\",\"rows\":{rows},\"connections\":{connections},\
+                 \"changes\":{CHANGES},\"idle_ms\":{:.1},\"busy_ms\":{:.1},\
+                 \"attributable_ms\":{:.1},\"ms_per_change_per_connection\":{per:.4},\
+                 \"clock\":\"children-cpu\",\"load\":\"{}\"}}",
+                idle.as_secs_f64() * 1000.0,
+                busy.as_secs_f64() * 1000.0,
+                attributable.as_secs_f64() * 1000.0,
+                loadavg_1m()
+            );
+        }
+    }
+    println!("PERF loadavg-after {}", loadavg_1m());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A51: the `List<T>` keyed exposure gets its macro form ------------------
+
+/// `[expose(keyed = str)] tasks: SignalCell<List<Task>>` — A39 refused this
+/// shape and steered to `Map<K, V>` or the hand-wired `expose_keyed`, because a
+/// keyed mirror is a `KeyedSource<K, T>` and a `List<T>` names only the
+/// element. A51's ruling gives the key to the ATTRIBUTE, which is the one place
+/// the author can write it and the expansion can read it before any type
+/// resolves.
+///
+/// The claim is that the generated wiring IS the hand-written one, and it is
+/// measured on the wire rather than argued: one source, two channels — one
+/// reached through the generated `__attach`, one through a hand-written
+/// `session.expose_keyed(tasks, |task| task.key())` — and every frame the two
+/// put on their relays, for a seed and three changes, is compared after the
+/// channel id (which is a fresh counter, not a shape) is normalized away.
+const GENERATED_AGAINST_HAND_WIRED: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{
+	DuplexEnd,
+	KeyedSource,
+	ReactiveClient,
+	ReactiveServer,
+	RpcError,
+	call,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::shared::Shared;
+import std::wire::{ Frame, Keyed, Serializer, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Task { id: str, label: str }
+
+impl Task with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(StoreClient)]
+struct Store {
+	[expose(keyed = str)] tasks: SignalCell<List<Task>>,
+}
+
+impl Store {
+	[rpc]
+	fun touch(self): i32 {
+		self.tasks.get().len()
+	}
+}
+
+let tasks: SignalCell<List<Task>> = Signal::new([
+	Task { id = "a", label = "alpha" },
+	Task { id = "b", label = "beta" },
+]);
+let store: Store = Store { tasks };
+
+fun text_of(frame: Frame): str {
+	match frame {
+		Frame::Text(let text) => text,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun logged_pair(label: str): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| server_relay.send(frame));
+	server_relay.on_frame(|frame| {
+		print(i"{label} {text_of(frame)}");
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun main() {
+	// (1) the GENERATED wiring, reached exactly as a client reaches it.
+	let (gen_client_end, gen_server_end) = logged_pair("gen");
+	register_session(1, gen_server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()));
+	let attached: Result<List<i32>, RpcError> = call(transport, json_codec(), "__attach", [|serializer: Serializer| 1.describe(serializer)]);
+	let channels = attached.unwrap_or([]);
+	print(i"gen-channel:{channels[0]}");
+	let gen_client = ReactiveClient::new(gen_client_end, json_codec());
+	let gen_mirror: KeyedSource<str, Task> = gen_client.keyed_source(channels[0]);
+	let gen_lease = gen_mirror.sub(|_list| {});
+
+	// (2) the HAND-WIRED call the macro writes, on the same source.
+	let (hand_client_end, hand_server_end) = logged_pair("hand");
+	let hand_session = ReactiveServer::new(hand_server_end, json_codec());
+	let hand_channel = hand_session.expose_keyed(tasks, |task: Task| task.key());
+	print(i"hand-channel:{hand_channel}");
+	let hand_client = ReactiveClient::new(hand_client_end, json_codec());
+	let hand_mirror: KeyedSource<str, Task> = hand_client.keyed_source(hand_channel);
+	let hand_lease = hand_mirror.sub(|_list| {});
+
+	tasks.update(|&mut list| { list[0] = Task { id = "a", label = "edited" }; });
+	tasks.update(|&mut list| { list.push(Task { id = "c", label = "gamma" }); });
+	tasks.update(|&mut list| { let _gone = list.remove(1); });
+
+	print(i"held gen={gen_mirror.get().unwrap_or([]).len()} hand={hand_mirror.get().unwrap_or([]).len()}");
+	gen_lease.dispose();
+	hand_lease.dispose();
+	print("done");
+}
+"#;
+
+#[test]
+fn the_generated_keyed_list_exposure_is_the_hand_wired_one_frame_for_frame() {
+    let stdout = run_program("keyedlist", GENERATED_AGAINST_HAND_WIRED);
+    let channel_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    let generated_channel = channel_of("gen-channel:");
+    let hand_channel = channel_of("hand-channel:");
+    assert_ne!(
+        generated_channel, hand_channel,
+        "the two channels must be distinct, or the comparison is vacuous"
+    );
+    // The channel id is a process-wide counter, so it is the one byte that
+    // legitimately differs; everything else must match exactly.
+    let frames = |label: &str, channel: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix(label))
+            .map(|frame| frame.replace(&format!("[{channel},"), "[C,"))
+            .collect()
+    };
+    let generated = frames("gen ", &generated_channel);
+    let hand = frames("hand ", &hand_channel);
+    assert!(
+        !generated.is_empty(),
+        "the generated channel put nothing on the wire:\n{stdout}"
+    );
+    assert_eq!(
+        generated, hand,
+        "the generated keyed exposure and the hand-wired one must be the same \
+         channel, frame for frame:\n{stdout}"
+    );
+    // And the frames are the ones A39 pinned for the keyed shape: a `Reset`
+    // seed, then one op per change, naming the key and nothing else.
+    assert_eq!(
+        generated,
+        vec![
+            "{\"Patch\":[C,[{\"Reset\":[{\"id\":\"a\",\"label\":\"alpha\"},{\"id\":\"b\",\"label\":\"beta\"}]}]]}",
+            "{\"Patch\":[C,[{\"Update\":[\"a\",{\"id\":\"a\",\"label\":\"edited\"}]}]]}",
+            "{\"Patch\":[C,[{\"Insert\":[\"c\",{\"id\":\"c\",\"label\":\"gamma\"},2]}]]}",
+            "{\"Patch\":[C,[{\"Remove\":\"b\"}]]}",
+        ],
+        "the keyed frames moved:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("held gen=2 hand=2"),
+        "both mirrors must hold the same collection:\n{stdout}"
+    );
+}
