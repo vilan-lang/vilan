@@ -246,6 +246,16 @@ fn visibility_marker_rule(marker: &str) -> String {
     )
 }
 
+/// The rule a block-like statement followed by an operator breaks (B248).
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself — a
+/// block-like statement is COMPLETE — and names the sanctioned spelling, which
+/// is the parentheses B231 already admits the form inside.
+const BLOCK_LIKE_STATEMENT_IS_COMPLETE: &str = "a statement that begins with `match`, `if`, `for` or `{` is COMPLETE at its \
+     closing brace, so this operator begins a new statement rather than continuing the one above: \
+     parenthesize the block-like form — `(match x { .. }) + 1` — to use its value as an operand. \
+     (The rule is what lets a line beginning `-x` or `*p` mean subtraction or a dereference by \
+     where it sits.)";
+
 /// The rule `let mut x = …` breaks. Curated (diagnostics-standard.md B6): `let`
 /// and `mut` are the two BINDING FORMS, not a keyword and a modifier on it, so
 /// the pair is a Rust spelling with no reading here — and the failure it
@@ -1046,6 +1056,60 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.note_expected(TERMINATOR_EXPECTED);
     }
 
+    /// B248: refuse an operator that continues an expression the block-like
+    /// statement just parsed has already ENDED, and steer to the parentheses that
+    /// spell what was meant.
+    ///
+    /// B231 admitted a block-like form as an OPERAND (`flag && match p() { .. }`),
+    /// where nothing is ambiguous because an operator has already committed the
+    /// position to an expression. As the HEAD of a statement it is a different
+    /// question, and vilan answers it the way Rust does: a statement that begins
+    /// with `match`, `if`, `for` or `{` is COMPLETE at its closing brace, so what
+    /// follows begins a new statement. That rule is what makes a leading `-` or
+    /// `*` on the next line mean subtraction or a dereference by where it sits
+    /// rather than by what the parser felt like — and the language already relies
+    /// on it: `if c { 1 } else { 2 }` followed by `* 3;` parses today as two
+    /// statements, and admitting the tower after a block-like head would silently
+    /// re-read it as one.
+    ///
+    /// So the shape is refused, and the refusal is the whole change: the token
+    /// stream is unaltered and the block-like statement still stands, which is
+    /// what keeps the operator's own statement reporting nothing further. Before
+    /// this the author got `found '+' expected an expression` pointed at the
+    /// operator — true, and about a statement they did not know they had written.
+    ///
+    /// Only an operator that cannot BEGIN an expression is refused. `-`, `!`, `&`
+    /// and `*` can, and the two readings of those are exactly the ambiguity the
+    /// rule exists to settle: they begin a new statement, as they always have.
+    fn refuse_block_like_head(&mut self) {
+        // A binary operator, unless it is one of the four PREFIXES. The rest of
+        // the continuation set is deliberately left alone, each for its own
+        // reason: `<` and `>` are control characters here and a statement CAN
+        // begin with `<` (element syntax), and a postfix `.` chain
+        // (`match x { .. }.to_str()`) is a different shape whose recovery would
+        // have to take the member with it.
+        let continues = matches!(
+            self.peek(),
+            Some(Token::Op(symbol)) if !matches!(*symbol, "!" | "-" | "&" | "*")
+        );
+        if !continues {
+            return;
+        }
+        self.errors.push(ParseError {
+            span: self.here_span(),
+            reason: ParseErrorReason::Rule(BLOCK_LIKE_STATEMENT_IS_COMPLETE),
+            context: self.context_stack.clone(),
+            hint: None,
+        });
+        // Step over the operator, which is chumsky's skip-then-retry recovery and
+        // is what makes this REPLACE the bare failure rather than sit above it:
+        // the right operand becomes a statement of its own and parses, so the
+        // author gets one diagnostic naming the shape instead of two, the second
+        // of them `found '+' expected an expression` about a statement they did
+        // not know they had written (diagnostics-standard B5).
+        self.bump();
+    }
+
     /// Push an `Expected` error for a failure at `position`: the found token, its
     /// curated `expected` set, its production `context`, and the structural
     /// `!=`-soup hint when it applies. Shared by the top-level leftover diagnostic
@@ -1808,6 +1872,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return Some(expression);
             }
             if is_block_like(&expression.0) && !parser.peek_is_ctrl('}') {
+                parser.refuse_block_like_head();
                 return Some(expression);
             }
             // The expression is complete and its `;` is not there. Record the

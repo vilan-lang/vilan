@@ -9002,3 +9002,104 @@ fn b231_the_parenthesized_control_is_unchanged() {
         "yes\n",
     );
 }
+
+// --- B248: a block-like STATEMENT is complete ----------------------------------
+//
+// B231 admitted a block-like form as an OPERAND, where an operator has already
+// committed the position to an expression. As the HEAD of a statement it is a
+// different question, and vilan answers it the way Rust does: `match x { .. }` in
+// leading statement position is COMPLETE at its closing brace, so `+ 1` after it
+// begins a new statement. Admitting the tower there would re-read `* 3` on the
+// next line as a multiplication, which is exactly what the rule exists to settle.
+// The refusal replaces the bare `found '+' expected an expression` — true, and
+// about a statement the author did not know they had written.
+
+#[test]
+fn b248_a_match_head_followed_by_an_operator_steers_to_parentheses() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 } + 1;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "found '+' expected an expression");
+}
+
+#[test]
+fn b248_the_parenthesized_spelling_is_accepted() {
+    // The spelling the refusal steers to, running: the steer has to be a fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let x = 1;
+            print((match x { 1 => 10, _ => 20 }) + 1);
+        }
+        "#,
+        "11\n",
+    );
+}
+
+#[test]
+fn b248_an_if_head_is_refused_the_same_way() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let c = true;
+            if c { 1 } else { 2 } + 1;
+        }
+        "#,
+        "is COMPLETE at its closing brace",
+    );
+}
+
+#[test]
+fn b248_a_bare_block_head_is_refused_the_same_way() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            { 1 } + 1;
+        }
+        "#,
+        "is COMPLETE at its closing brace",
+    );
+}
+
+#[test]
+fn b248_a_prefix_operator_still_begins_its_own_statement() {
+    // The control the rule EXISTS for, and the reason the shape above is refused
+    // rather than admitted: `*` and `-` can begin an expression, so a line
+    // starting with one is a statement of its own — as it is today, and as it
+    // would silently stop being if the tower ran on after a block-like head.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let c = true;
+            if c { print("branch"); } else { }
+            -1;
+            print("done");
+        }
+        "#,
+        "branch\ndone\n",
+    );
+}
+
+#[test]
+fn b248_a_block_like_operand_is_untouched() {
+    // B231's own shape, one line below the refusal: an operator BEFORE the
+    // block-like form still admits it, because nothing there is ambiguous.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let flag = true;
+            if flag && match 3 { 3 => true, _ => false } {
+                print("yes");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
