@@ -799,11 +799,24 @@ impl<'src> Lexer<'src> {
             match self.bytes.get(self.position) {
                 None => break self.position, // unterminated; best-effort
                 Some(b'}') => break self.position,
+                // A `"…"` inside the hole that does not close — at a line break
+                // or at end of input. It is the one `None` that is NOT a
+                // malformed hole: it says nothing of its own because the
+                // enclosing literal holds the same break and states the rule
+                // once (diagnostics-standard B5), and ending the hole here is
+                // what carries the body scan to that break.
+                Some(b'"') => match self.lex_hole_token() {
+                    Some(token) => inner.push(token),
+                    None => break self.position,
+                },
                 Some(_) => match self.lex_hole_token() {
                     Some(token) => inner.push(token),
-                    // A construct no hole token matches (a nested `{`, an illegal
-                    // char) makes the hole malformed; stop (clean sources never do).
-                    None => break self.position,
+                    // A construct no hole token matches — a nested `{` (a block, a
+                    // `match`, an `if`, a struct literal), or a character in no
+                    // charset. The hole holds an EXPRESSION (`lexical.md` §3.4:
+                    // `hole = '{' , expression , '}'`) and this text is not one, so
+                    // it is REFUSED by name rather than abandoned mid-body — B247.
+                    None => return self.refuse_malformed_hole(brace_open),
                 },
             }
         };
@@ -815,6 +828,54 @@ impl<'src> Lexer<'src> {
         wrapped.extend(inner);
         wrapped.push((Token::Ctrl(')'), hole_span));
         wrapped
+    }
+
+    /// Refuse a hole whose text is not an expression ([`HOLE_IS_NOT_AN_EXPRESSION`])
+    /// and resynchronize past it, returning what the hole contributes to the
+    /// literal: one EMPTY fragment.
+    ///
+    /// Before B247 the malformed hole simply ENDED at the offending byte and the
+    /// body scan resumed one byte later, in the middle of the hole — so `i"{if c {
+    /// 1 } else { 2 }}"` produced six diagnostics, among them the line-break ban
+    /// about a break nobody wrote and an unclosed `(` from the hole's own generated
+    /// paren. Now the offender is stated once, at the hole's own `{` (the span the
+    /// author has to edit), and the rest of the literal lexes normally: one
+    /// diagnostic per root cause (diagnostics-standard.md B5).
+    ///
+    /// The empty fragment is what keeps it to one: the wrapper `("" + …)` stays
+    /// well formed, so nothing downstream reports a second time. It is never a
+    /// VALUE — the error above fails the program before any fragment is unescaped —
+    /// which is also why the hole's raw text is not carried through: an i-string
+    /// hole must never be emitted verbatim (B247's find).
+    ///
+    /// Resynchronization is the matching `}` by brace depth, bounded by the
+    /// literal's own edges (a line break or a quote, neither of which a hole may
+    /// cross unbroken) so the scan can never leave the literal it started in.
+    fn refuse_malformed_hole(&mut self, brace_open: usize) -> Vec<Spanned<Token<'src>>> {
+        self.errors.push(LexError {
+            position: brace_open,
+            character: '{',
+            rule: Some(HOLE_IS_NOT_AN_EXPRESSION),
+        });
+        let mut depth = 0usize;
+        let mut at = brace_open;
+        while let Some(&byte) = self.bytes.get(at) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        at += 1;
+                        break;
+                    }
+                }
+                b'\n' | b'\r' | b'"' => break,
+                _ => {}
+            }
+            at += 1;
+        }
+        self.position = at;
+        vec![(Token::String(""), span(brace_open, at))]
     }
 
     /// Lex one token inside an interpolation hole, or `None` if the current
@@ -900,6 +961,16 @@ pub const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` bloc
 pub const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
      breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is \
      `std::style::declare`";
+
+/// The rule a hole whose text is not an expression breaks (B247). A hole holds
+/// an EXPRESSION and `{` / `}` DELIMIT it (`lexical.md` §3.4), so a nested brace
+/// closes the hole early — a block, a `match`, an `if` and a struct literal
+/// cannot be written inline — and a character in no charset cannot lex there at
+/// all. Curated (diagnostics-standard.md B6): the prohibition explains itself and
+/// names the sanctioned spelling.
+const HOLE_IS_NOT_AN_EXPRESSION: &str = "an interpolation hole holds one expression, and `{` and `}` delimit it: a \
+     nested brace — a block, a `match`, an `if`, a struct literal — ends the hole early; bind the \
+     value with a `let` first and write its name in the hole";
 
 /// The rule an unescaped `}` in an interpolated string breaks. Curated
 /// (diagnostics-standard.md B6): the braces are the hole's, and the sanctioned

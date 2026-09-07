@@ -492,7 +492,7 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
             // (against the base layer only).
             Ok(first) => {
                 let goal = match unit.entry_mode {
-                    vilan_core::EntryMode::Declared => CompileGoal::Check,
+                    vilan_core::EntryMode::Declared { .. } => CompileGoal::Check,
                     vilan_core::EntryMode::OpenFile { .. } => CompileGoal::CheckModule,
                 };
                 let mut platforms = vec![first];
@@ -3323,8 +3323,11 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             // No project to colour it: the CLI's `node` default answers, and
             // there is nothing about the file's own situation to explain.
             platform_reasons: Vec::new(),
-            // A file with no `[package]` above it IS the program it names.
-            entry_mode: vilan_core::EntryMode::Declared,
+            // A file with no `[package]` above it IS the program it names, and
+            // there is no manifest to name any other (B250).
+            entry_mode: vilan_core::EntryMode::Declared {
+                declared_entries: Vec::new(),
+            },
         },
         platform: None,
         shared_platforms: Vec::new(),
@@ -3363,11 +3366,13 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
     let shared_platforms: Vec<Platform> = platforms.collect();
     // B239/B240: which situation this compile is in, and — in file mode — which
     // of the package's files are programs a module may not import.
+    // B250: the same set on both legs. Which one this is decides only what
+    // `pkg::<this file>` means; a file the manifest declares is a program on
+    // either.
+    let declared_entries = vilan_core::platform_color::declared_entry_module_names(&manifest);
     let entry_mode = match is_package_module(&pkg_root, &manifest, &entry) {
-        false => vilan_core::EntryMode::Declared,
-        true => vilan_core::EntryMode::OpenFile {
-            declared_entries: vilan_core::platform_color::declared_entry_module_names(&manifest),
-        },
+        false => vilan_core::EntryMode::Declared { declared_entries },
+        true => vilan_core::EntryMode::OpenFile { declared_entries },
     };
     Ok(Project::Single {
         unit: Unit {
@@ -3489,7 +3494,12 @@ fn read_manifest_quietly(directory: &Path) -> Result<(Manifest, Vec<String>), St
 }
 
 /// Builds a [`Unit`] from a package manifest in `directory`.
-fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions) -> Unit {
+fn unit_from_package(
+    directory: &Path,
+    package: &Package,
+    manifest: &Manifest,
+    options: BuildOptions,
+) -> Unit {
     let pkg_root = directory.join(package.root());
     Unit {
         name: package.name.clone().unwrap_or_default(),
@@ -3501,8 +3511,12 @@ fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions)
         // A package leg is compiled under its own declared `target`, which the
         // manifest says out loud — nothing for E119 to explain.
         platform_reasons: Vec::new(),
-        // The `[package] entry` itself: the program the manifest declares.
-        entry_mode: vilan_core::EntryMode::Declared,
+        // The `[package] entry` itself: the program the manifest declares —
+        // beside the package's other declared programs, which a MODULE of this
+        // package may not import either (B250: the set is read on both legs).
+        entry_mode: vilan_core::EntryMode::Declared {
+            declared_entries: vilan_core::platform_color::declared_entry_module_names(manifest),
+        },
     }
 }
 
@@ -3519,9 +3533,13 @@ fn package_units(
 ) -> Vec<(Unit, Platform)> {
     if manifest.entries.is_empty() {
         let platform = package.resolved_target().unwrap_or_default();
-        return vec![(unit_from_package(directory, package, options), platform)];
+        return vec![(
+            unit_from_package(directory, package, manifest, options),
+            platform,
+        )];
     }
     let pkg_root = directory.join(package.root());
+    let declared_entries = vilan_core::platform_color::declared_entry_module_names(manifest);
     let mut units: Vec<(Unit, Platform)> = manifest
         .entries
         .iter()
@@ -3537,8 +3555,12 @@ fn package_units(
                     // As above: this leg's `[entry.<name>] target` IS the
                     // explanation, and the author wrote it.
                     platform_reasons: Vec::new(),
-                    // An `[entry.<name>]` path: declared, by name.
-                    entry_mode: vilan_core::EntryMode::Declared,
+                    // An `[entry.<name>]` path: declared, by name — and the
+                    // whole declared set beside it, which a module of this
+                    // package may not import (B250).
+                    entry_mode: vilan_core::EntryMode::Declared {
+                        declared_entries: declared_entries.clone(),
+                    },
                 },
                 entry.resolved_target().unwrap_or_default(),
             )
@@ -3711,7 +3733,7 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
     }
 
     Ok(Project::Single {
-        unit: unit_from_package(directory, package, options),
+        unit: unit_from_package(directory, package, &manifest, options),
         platform: package.resolved_target(),
         // A package addressed as a DIRECTORY builds its own entry: one leg and
         // one color — a file-mode question (E113), and it has no file to ask
@@ -7153,7 +7175,11 @@ mod tests {
                 split: false,
                 options: BuildOptions::default(),
                 platform_reasons: Vec::new(),
-                entry_mode: vilan_core::EntryMode::Declared,
+                // A test fixture's unit: no manifest, so no other declared
+                // program to name (B250).
+                entry_mode: vilan_core::EntryMode::Declared {
+                    declared_entries: Vec::new(),
+                },
             },
             platform,
         )

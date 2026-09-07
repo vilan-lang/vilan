@@ -6351,3 +6351,103 @@ fn b254_a_blanket_impls_async_member_is_still_a_candidate() {
         "receives an async closure",
     );
 }
+
+#[test]
+fn b247_an_operator_in_a_hole_is_a_hole() {
+    // The find's expression, spelled as an i-string: a hole is an EXPRESSION, not
+    // a name, and the value under node proves it interpolated rather than printed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(i"{1 + 2}");
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b247_a_method_call_in_a_hole_is_a_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Counter { n: i32 }
+        impl Counter {
+            fun doubled(self): i32 { self.n * 2 }
+        }
+        fun main() {
+            let c = Counter { n = 4 };
+            print(i"{c.doubled()}");
+        }
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b247_a_plain_name_hole_is_the_control() {
+    // The shape that always worked, beside a hole that carries an operator: both
+    // are one grammar, so the two interpolate into one literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let x = 7;
+            print(i"{x} then {x + 1}");
+        }
+        "#,
+        "7 then 8\n",
+    );
+}
+
+#[test]
+fn b247_a_hole_that_is_not_an_expression_is_refused_once() {
+    // Red before the fix: SIX diagnostics — `unclosed '('`, `found 'i' expected a
+    // token`, `found '}' expected a token`, `found 'else' expected an expression`,
+    // the LINE BREAK ban about a break nobody wrote, and two missing terminators —
+    // because the hole ended at the nested `{` and the body scan resumed one byte
+    // later, inside the hole. Now one refusal, at the hole's own `{`.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let c = true;
+            print(i"{if c { 1 } else { 2 }}");
+        }
+        "#,
+        "an interpolation hole holds one expression",
+    );
+}
+
+#[test]
+fn b247_a_refused_hole_does_not_report_a_line_break() {
+    // The half of the cascade that pointed at the wrong rule entirely: the literal
+    // used to run off the end of its line, so the author was told a string cannot
+    // span lines.
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(i"{ a{b} }");
+        }
+        "#,
+        "a string cannot span lines",
+    );
+}
+
+#[test]
+fn b247_a_plain_string_never_interpolates() {
+    // The find's own spelling, and the reason it is not the bug it looked like:
+    // `"…"` has no holes at all (`vilan/test/string-interpolation.vl` pins the
+    // same line). A brace-shaped run in a plain string is TEXT, and stays text.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print("{1 + 2}");
+        }
+        "#,
+        "{1 + 2}\n",
+    );
+}

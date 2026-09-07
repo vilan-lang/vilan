@@ -3247,6 +3247,16 @@ pub struct Analyzer<'src> {
     // `module_id_by_name`, whose `pkg` namespace is then the entry's alone.
     packages: Vec<LoadedPackage>,
     package_of_source: HashMap<SourceId, usize>,
+    /// B250: the DEPENDENCY the entry buffer was remapped into, by the name a
+    /// dependent addresses it with, when a dependency file is opened as the
+    /// entry (the editor, `vilan check <path>`).
+    ///
+    /// The remap is right — inside the dependency, its siblings are `pkg::` —
+    /// and it is silent: `SourceId(0)` starts on the entry package and the
+    /// entry-as-module arm moves it, so an `import <depname>::…` written in that
+    /// file resolved before the file was opened this way and stops after. The
+    /// name is kept so the miss can SAY so rather than only refuse.
+    entry_module_package: Option<String>,
     // The prelude (prelude.md §9.2, implementation option 1). `prelude_exports`
     // is every loaded module's importable names by module scope — what a
     // prelude module would publish, read syntactically at load. `prelude_seeds`
@@ -4485,6 +4495,7 @@ impl<'src> Analyzer<'src> {
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
             package_of_source: HashMap::default(),
+            entry_module_package: None,
             prelude_exports: HashMap::default(),
             prelude_seeds: Vec::new(),
             prelude_entry_bindings: Vec::new(),
@@ -15484,10 +15495,59 @@ impl<'src> Analyzer<'src> {
         type_id: TypeId,
         subject: Option<&SignatureSubject<'_>>,
     ) -> String {
-        match subject.and_then(|subject| self.signature_position_label(type_id, subject)) {
-            Some(label) => label,
-            None => self.declaration_type_label(type_id),
+        if let Some(label) =
+            subject.and_then(|subject| self.signature_position_label(type_id, subject))
+        {
+            return label;
         }
+        // B249: every OTHER position of the member renders in the impl's terms
+        // too — the trait's own generic parameters carry the arguments the
+        // `with` clause gave them, at whatever depth they sit.
+        let substitution = subject
+            .map(|subject| self.trait_argument_substitution(subject))
+            .unwrap_or_default();
+        if substitution.is_empty() {
+            return self.declaration_type_label(type_id);
+        }
+        self.pretty_print_type(&type_id.get_type(self), &substitution)
+    }
+
+    /// B249: the declaring trait's own generic parameters mapped to the
+    /// arguments THIS impl's `with` clause supplied them — the substitution a
+    /// suggested declaration is rendered under, empty on every side but
+    /// [`SignatureSide::Impl`].
+    ///
+    /// B206 fixed the two AMBIGUOUS positions (`Self`, a `= Self`-defaulted
+    /// parameter) and only those, by written name, because those are the two the
+    /// resolved type cannot tell apart. An ordinary parameter — `trait
+    /// Source<T>`'s `T` — is not ambiguous at all and rendered as written, so
+    /// `impl Counted with Source<i32>` was told to `declare fun on_change(self,
+    /// observer: |T| void)` for a `T` it does not have and cannot introduce. The
+    /// copyable line has to be copyable, so the parameter takes the argument.
+    ///
+    /// It is a substitution rather than a per-position lookup because the
+    /// parameter is usually NESTED — `|T| void`, `List<T>`, `Option<T>` — and
+    /// only the renderer walks that far. A position that is exactly the
+    /// parameter is covered by the same map.
+    ///
+    /// An identity pair is dropped so the map stays empty in the common case: an
+    /// impl that passes the trait its OWN binder (`impl SignalCell<type T> with
+    /// Source<T>`) already reads right, and rendering it through a substitution
+    /// would be the same string by a longer road.
+    fn trait_argument_substitution(&self, subject: &SignatureSubject<'_>) -> SubstitutionContext {
+        let SignatureSide::Impl(_, trait_arguments) = subject.rendered_for else {
+            return SubstitutionContext::default();
+        };
+        let Some(trait_) = self.traits.get(&subject.declaring_trait_id) else {
+            return SubstitutionContext::default();
+        };
+        trait_
+            .generic_parameter_constraint_ids
+            .iter()
+            .copied()
+            .zip(trait_arguments.iter().copied())
+            .filter(|(parameter, argument)| parameter != argument)
+            .collect()
     }
 
     /// How an ambiguous `Self` / `= Self`-defaulted position of a trait member
@@ -30701,6 +30761,41 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B250: why a `<depname>::…` import in a DEPENDENCY file opened as the
+    /// entry no longer resolves, said at the import that broke.
+    ///
+    /// A dependency file handed to the analysis as the entry is analyzed as its
+    /// own module from the buffer, and `package_of_source[SourceId(0)]` is
+    /// remapped from the entry package to the dependency. That is the right
+    /// answer — inside the dependency, its siblings are `pkg::` and its own
+    /// dependencies are the edges that resolve — but it is a SILENT change of
+    /// meaning for a file that already compiles as part of a dependent build:
+    /// the one root the remap takes away is the dependency's own name, which is
+    /// how every file OUTSIDE it addresses it. So the miss is annotated with the
+    /// fact only the loader knows, and with the spelling that works here.
+    ///
+    /// Scoped to exactly that root. Any other unresolved root in the same file
+    /// is an ordinary miss and reads as one.
+    fn entry_as_dependency_module_note(
+        &self,
+        root: &str,
+        source: SourceId,
+        span: Span,
+    ) -> Option<crate::error::Note> {
+        let package = self.entry_module_package.as_deref()?;
+        if source != SourceId(0) || package != root {
+            return None;
+        }
+        Some(crate::error::Note::here(
+            span,
+            format!(
+                "this file is being checked as a module of `{package}` — it lives inside that \
+                 package, so its siblings are `pkg::` here, not `{package}::`. Write \
+                 `import pkg::…` for a module of `{package}` itself"
+            ),
+        ))
+    }
+
     fn resolve_import_root(&self, root: &str, source: SourceId) -> Option<Id> {
         if let Some(&package_index) = self.package_of_source.get(&source) {
             let package = &self.packages[package_index];
@@ -30758,9 +30853,10 @@ impl<'src> Analyzer<'src> {
             Some(module_id) => module_id,
             None => {
                 if report {
+                    let note = self.entry_as_dependency_module_note(root, source_id, root_span);
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
-                        note: None,
+                        note,
                         span: root_span,
                         msg: format!("cannot find module '{}' to import", root),
                     });
@@ -45644,7 +45740,7 @@ pub struct Workspace {
 /// siblings import it. The two situations disagree about exactly one thing —
 /// what `pkg::<that file>` means — so the fact is carried as its own flag rather
 /// than inferred from the shape of the world.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryMode {
     /// The analyzed file is a program: an entry the manifest declares (the
     /// single `[package] entry`, an `[entry.<name>]` path), or a bare file with
@@ -45653,8 +45749,21 @@ pub enum EntryMode {
     ///
     /// The default, and the answer for every caller with no project to ask: a
     /// test harness, a macro world, a compile of the file it was handed.
-    #[default]
-    Declared,
+    Declared {
+        /// The package's OTHER declared programs, same set and same source as
+        /// [`Self::OpenFile`]'s (B250).
+        ///
+        /// B240 gave the set to file mode alone, arguing it is only ever a
+        /// question there. It is a question on both legs: with the entry
+        /// `client.vl`, a sibling's `import pkg::server::…` loaded `server.vl`
+        /// as an ordinary module — while file mode, holding the same manifest,
+        /// refused it. Agreement is per PACKAGE, not per leg: a file the
+        /// manifest declares is a program on every surface that looks at it.
+        ///
+        /// Empty for a caller with no manifest to read, which leaves B226's own
+        /// refusal (the entry's alias, added beside this set) exactly as it was.
+        declared_entries: Vec<String>,
+    },
     /// FILE MODE: the analyzed file is a MODULE of its package that a front end
     /// handed to the analysis as the entry, because a file is all it had. It is
     /// walked as the program (it needs no `main`, its derives expand, its own
@@ -45668,19 +45777,42 @@ pub enum EntryMode {
         /// `pkg::<name>` may NOT reach, for the reason [`Self::Declared`]
         /// states (B240).
         ///
-        /// It rides on the mode rather than beside it because it is only ever
-        /// a question in file mode: a declared entry knows which file it is,
-        /// and a sibling importing it is B226's refusal. An open MODULE knows
-        /// its own file is importable (B239) and nothing more — until the
-        /// front end, which read the manifest, hands over the set, `views.vl`
-        /// importing `pkg::client::helper` is clean in the editor and refused
-        /// by `vilan check .`, whose `client` leg compiles that very file as
-        /// the entry.
+        /// It rides on the mode because the mode is what the front end already
+        /// threads, and because the OPEN file's own name is the one entry this
+        /// set must never hold: an open module is importable (B239), and the
+        /// package's other programs are not. `views.vl` importing
+        /// `pkg::client::helper` was clean in the editor and refused by `vilan
+        /// check .`, whose `client` leg compiles that very file as the entry,
+        /// until the front end — which read the manifest — handed the set over.
         ///
         /// Empty for a caller with no manifest to read, which is the answer
         /// that keeps every existing file-mode analysis exactly as it was.
         declared_entries: Vec<String>,
     },
+}
+
+impl Default for EntryMode {
+    /// A declared entry with no manifest behind it — a test harness, a macro
+    /// world, a compile of the file it was handed. `#[default]` cannot spell it
+    /// now that the variant carries the package's declared programs (B250).
+    fn default() -> Self {
+        EntryMode::Declared {
+            declared_entries: Vec::new(),
+        }
+    }
+}
+
+impl EntryMode {
+    /// The package's declared programs, whichever leg is asking (B250). The set
+    /// is the same fact on both — `crate::platform_color::declared_entry_module_names`
+    /// off the one manifest — and reading it through one accessor is what keeps
+    /// the two legs from drifting again.
+    pub fn declared_entries(&self) -> &[String] {
+        match self {
+            EntryMode::Declared { declared_entries } => declared_entries,
+            EntryMode::OpenFile { declared_entries } => declared_entries,
+        }
+    }
 }
 
 /// Where a program's ambient scope is SET, in the reader's terms — the web-set
@@ -47853,7 +47985,7 @@ fn analyze_inner<'src>(
                 // imports its own name is the silent no-op it has always been —
                 // `a_non_entry_self_import_stays_clean` is that control, and the
                 // editor must not invent a warning the build never prints.
-                if matches!(workspace.entry_mode, EntryMode::Declared)
+                if matches!(workspace.entry_mode, EntryMode::Declared { .. })
                     && let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
                         .into_iter()
                         .find(|(module, _)| *module == name)
@@ -47898,6 +48030,27 @@ fn analyze_inner<'src>(
                     // `entry_is_inside_std` makes that analysis uncacheable, so
                     // there was no mark to undo.)
                     expanded_sources.remove(&SourceId(0));
+                    // B250: and the remap this arm is about to make, recorded by
+                    // NAME. `package_of_source[SourceId(0)]` starts on the entry
+                    // package and the `Origin::Dep` arm below moves it to the
+                    // dependency, which is what makes `pkg::` the spelling inside
+                    // this file — and what makes an `import <depname>::…` already
+                    // in it stop resolving. The unresolved-root miss reads this to
+                    // say which package the file is being checked as part of.
+                    if let Origin::Dep(dependency_index) = origin {
+                        analyzer.entry_module_package = workspace
+                            .entry_dependencies
+                            .iter()
+                            .find(|(_, index)| *index == dependency_index)
+                            .map(|(name, _)| name.clone())
+                            .or_else(|| {
+                                workspace.packages.get(dependency_index).and_then(|spec| {
+                                    spec.base_root
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                })
+                            });
+                    }
                     (nodes, entry_source, SourceId(0))
                 } else {
                     let Some(loaded) = load_package_module(&module_path) else {
@@ -48307,12 +48460,26 @@ fn analyze_inner<'src>(
     // `pkg::client::helper` was clean in the editor and refused by `vilan check
     // .`, whose `client` leg compiles that same file as the entry — until the
     // front end, which read the manifest, handed the set over on `EntryMode`.
-    let refused_entry_modules: Vec<&str> = match &workspace.entry_mode {
-        EntryMode::Declared => entry_alias_module.into_iter().collect(),
-        EntryMode::OpenFile { declared_entries } => {
-            declared_entries.iter().map(String::as_str).collect()
-        }
-    };
+    //
+    // B250 closes the last of it: the declared set is read on BOTH legs. With
+    // the entry `client.vl`, a sibling's `import pkg::server::…` used to load
+    // `server.vl` as an ordinary module while file mode, holding the same
+    // manifest, refused it — agreement is per PACKAGE, not per leg. The entry's
+    // OWN alias joins the set on the declared leg only (in file mode the open
+    // file is a module, and importable — B239), and it is what still answers for
+    // a caller with no manifest to read.
+    let mut refused_entry_modules: Vec<&str> = workspace
+        .entry_mode
+        .declared_entries()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if matches!(workspace.entry_mode, EntryMode::Declared { .. })
+        && let Some(alias) = entry_alias_module
+        && !refused_entry_modules.contains(&alias)
+    {
+        refused_entry_modules.push(alias);
+    }
     if !refused_entry_modules.is_empty() {
         // In file mode the OPEN FILE is one of the importers: it is a module of
         // this package like any other, and its own `import pkg::client::…` is
