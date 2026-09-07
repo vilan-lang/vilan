@@ -249,7 +249,7 @@ function $R(body, $S) {
 	return $U;
 }
 function $X(self, value, $Y) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$B(self, $Y);
 }
 function $V(self, transform, $W) {

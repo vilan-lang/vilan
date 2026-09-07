@@ -31,7 +31,7 @@ function $a(self, index, value) {
 			__at_put(self, cursor, __clone(__at(self, cursor - 1)));
 			cursor = cursor - 1;
 		}
-		__at_put(self, index, value);
+		__at_put(self, index, __clone(value));
 	}
 }
 function $b(self, index) {

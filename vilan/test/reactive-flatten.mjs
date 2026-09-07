@@ -163,7 +163,7 @@ function $s(self, $t) {
 	return $v;
 }
 function $q(self, value, $r) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$s(self, $r);
 }
 function $B(signal, observer) {
@@ -247,7 +247,7 @@ function $Q(self, $t) {
 	return $S;
 }
 function $P(self, value, $r) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$Q(self, $r);
 }
 function $aa(self, $t) {
@@ -273,7 +273,7 @@ function $aa(self, $t) {
 	return $ac;
 }
 function $Z(self, value, $r) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$aa(self, $r);
 }
 function $af(self, observer) {

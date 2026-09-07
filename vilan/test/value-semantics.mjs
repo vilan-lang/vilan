@@ -14,7 +14,7 @@ function $a(self) {
 		if (seeded) {
 			total = total + item;
 		} else {
-			total = item;
+			total = __clone(item);
 			seeded = true;
 		}
 	}

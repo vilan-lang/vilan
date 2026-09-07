@@ -28,7 +28,9 @@ fun main() {
 
 	// The two writes: 1 leaves, 2 arrives. Row three is not touched at all —
 	// the observer mirrors the outgoing key rather than walking the cells.
-	// witness: const previous = current2.v; current2.v = value;
+	// The mirror's write is rule 1's copy at an assignment (B257): the
+	// observer's `value` is the caller's, and `current` keeps its own.
+	// witness: const previous = current2.v; current2.v = __clone(value);
 	current.set(2);
 	print(i"after 2: {one.get()} {two.get()} {three.get()}");
 

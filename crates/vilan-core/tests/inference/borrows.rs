@@ -9002,3 +9002,156 @@ fn b231_the_parenthesized_control_is_unchanged() {
         "yes\n",
     );
 }
+
+// --- B257: rule 1 at an ASSIGNMENT from a live place ------------------------
+
+#[test]
+fn b257_assigning_a_live_list_copies_it() {
+    // P1. §6.1 names assignment first — `b = a` installs a second owner of
+    // `a`'s storage exactly as `mut b = a` does. `a` is READ after the
+    // assignment, so this is not rule 2's last-use elision declining to fire:
+    // the site was never a candidate at all. `compute_clone_sites`' Assignment
+    // arm asked `type_id_of_expr`, which answers `None` for a bare
+    // `Expr::Local` (a variable READ interns no type of its own), so the
+    // `let Some(type_id)` guard dropped every plain local on the right of `=`.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut a = [1, 2, 3];
+            mut b = [0];
+            b = a;
+            print(a.len());
+            a.push(4);
+            print(b.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("b = __clone(a);"),
+            "an assignment from a live list aliased its source:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n3\n");
+}
+
+#[test]
+fn b257_assigning_a_live_struct_copies_it() {
+    // P2. The same miss at the other aggregate shape, and it is §6.1's own
+    // example rewritten as an assignment: `r = q; q.x = 10` left `r.x` at 10.
+    let source = r#"
+        import std::io::print;
+        struct Point { x: i32, y: i32 }
+        fun main() {
+            mut q = Point { x = 1, y = 2 };
+            mut r = Point { x = 0, y = 0 };
+            r = q;
+            print(q.x);
+            q.x = 10;
+            print(r.x);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__clone(q)"),
+            "an assignment from a live struct aliased its source:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "1\n1\n");
+}
+
+#[test]
+fn b257_assigning_a_dead_list_still_elides() {
+    // P3. Rule 2 must keep firing: `c` is never read again, so the assignment
+    // moves rather than copies and the program has no `__clone` at all. This is
+    // the half a "always copy at an assignment" patch would have eaten.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut c = [1, 2, 3];
+            mut d = [0];
+            d = c;
+            d.push(9);
+            print(d.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a dead source's donation copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "4\n");
+}
+
+#[test]
+fn b257_the_binding_form_is_the_control() {
+    // P4. `mut f = e` always copied — the `let` arm passes the variable's own
+    // declared type, which is never `None`. It must go on doing so.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut e = [1, 2, 3];
+            mut f = e;
+            e.push(4);
+            print(f.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("let f = __clone(e);"),
+            "the binding control stopped copying:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn b257_a_write_through_a_shared_view_copies_its_source() {
+    // P5. The form B255 came in through: `h.write() = c` is an assignment whose
+    // target `rewrite_view_assignment_targets` has already turned into a
+    // `Dereference`, and whose value is a live local. It lowered to `h.v = c`,
+    // so a later `c.push(4)` grew the cell — which is how `bind_each`'s
+    // `row_items.write() = list` came to hold the reconciler's own input.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            mut c = [1, 2, 3];
+            let h = Shared::new([0]);
+            h.write() = c;
+            c.push(4);
+            print(h.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("h.v = __clone(c);"),
+            "a write through a Shared view aliased its source:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn b257_a_bare_parameter_stored_by_an_assignment_copies() {
+    // The std shape the corpus diff is made of, and a miscompile of its own:
+    // `List::insert`'s `self[index] = value` wrote the CALLER's aggregate into
+    // the receiver's slot. A bare parameter is a loan the callee may not hand
+    // on (§6.3), and `is_elidable_copy` never elides one, so the store copies.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut rows = [[0]];
+            mut row = [1, 2];
+            rows.insert(0, row);
+            row.push(3);
+            print(rows[0].len());
+        }
+        "#;
+    assert_compiles_and_runs(source, "2\n");
+}

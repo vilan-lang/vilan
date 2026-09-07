@@ -158,7 +158,7 @@ function $i(self, $j) {
 	return $l;
 }
 function $g(self, value, $h) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$i(self, $h);
 }
 function $w(policy, body) {

@@ -128,7 +128,7 @@ function $n(self, $o) {
 	return $q;
 }
 function $l(self, value, $m) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$n(self, $m);
 }
 function $v(slot, $w, $x) {

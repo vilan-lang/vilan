@@ -175,7 +175,7 @@ function $k(self, $l) {
 	return $n;
 }
 function $i(self, value, $j) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$k(self, $j);
 }
 function $v(signal, observer) {
@@ -202,7 +202,7 @@ function $c(source, $d, $e) {
 	const current2 = __shared_new($f(source));
 	register_with_owner($u(source, (value) => {
 		const previous = current2.v;
-		current2.v = value;
+		current2.v = __clone(value);
 		const $g = __map_get(cells.v, hash(previous));
 		let $h = null;
 		if ($g[0] === 0) {
@@ -268,7 +268,7 @@ function $V(self, $l) {
 	return $X;
 }
 function $U(self, value, $j) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$V(self, $j);
 }
 function $ac(body, $ad) {

@@ -173,7 +173,7 @@ function $w(self, $x) {
 	return $z;
 }
 function $u(self, value, $v) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 	$w(self, $v);
 }
 function $H(owner2, body) {
