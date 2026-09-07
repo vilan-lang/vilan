@@ -9711,3 +9711,101 @@ fn b206_an_ordinary_parameter_still_renders_as_written() {
         "declare `fun tag(self, name: str): str`",
     );
 }
+
+// --- B249: the suggested declaration renders in the IMPL's terms ---------------
+//
+// `impl Counted with Source<i32>` was told to ``declare `fun on_change(self,
+// observer: |T| void)` `` — a `T` the impl does not have and cannot introduce, so
+// the one line the diagnostic exists to be copied is the one line that cannot be.
+// B206 fixed the two AMBIGUOUS positions (`Self`, a `= Self`-defaulted parameter)
+// and only those, because those are the two the resolved type cannot tell apart;
+// an ordinary `T` is not ambiguous at all and rendered as written. The trait's own
+// parameters now carry the `with` clause's arguments through the rendering, at
+// whatever depth they sit.
+
+#[test]
+fn b249_a_trait_parameter_takes_the_impls_argument() {
+    // The find's own shape, against std's own `Source<T>`: `T` is nested inside a
+    // closure type, which is why it is a substitution and not a per-position
+    // lookup.
+    let source = r#"
+        import std::reactive::Source;
+        struct Counted { n: i32 }
+        impl Counted with Source<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        source,
+        "declare `fun on_change(self, observer: |i32| void): Subscription`",
+    );
+    assert_fails_without(source, "|T| void");
+}
+
+#[test]
+fn b249_a_parameter_in_return_position_takes_it_too() {
+    let source = r#"
+        trait Counted<T> {
+            fun latest(self): T;
+        }
+        struct P { x: i32 }
+        impl P with Counted<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "declare `fun latest(self): i32`");
+    assert_fails_without(source, "): T`");
+}
+
+#[test]
+fn b249_a_two_parameter_trait_substitutes_by_position() {
+    // The pin that makes it a substitution rather than "replace the one
+    // parameter": `A` and `B` take their own arguments, and the repeated `A`
+    // takes the same one in both positions.
+    assert_fails_with(
+        r#"
+        trait Pairer<A, B> {
+            fun pair(self, a: A, b: B): A;
+        }
+        struct P { x: i32 }
+        impl P with Pairer<i32, str> { }
+        fun main() {}
+        "#,
+        "declare `fun pair(self, a: i32, b: str): i32`",
+    );
+}
+
+#[test]
+fn b249_a_generic_impl_passing_its_own_binder_is_unchanged() {
+    // The leg that already read right, and still does: an impl that hands the
+    // trait its OWN binder renders that binder, which is a name the impl has. The
+    // identity pair is dropped from the map, so this string is built the same way
+    // it was before.
+    assert_fails_with(
+        r#"
+        trait Counted<T> {
+            fun on_change(self, observer: |T| void);
+        }
+        struct Box2<type T> { v: T }
+        impl Box2<type T> with Counted<T> { }
+        fun main() {}
+        "#,
+        "declare `fun on_change(self, observer: |T| void)`",
+    );
+}
+
+#[test]
+fn b249_a_generic_impl_renaming_the_parameter_takes_its_own_name() {
+    // The proof that the leg above is the substitution agreeing rather than the
+    // substitution being skipped: rename the impl's binder and the suggestion
+    // follows it, because `U` is the name THIS impl can write.
+    assert_fails_with(
+        r#"
+        trait Counted<T> {
+            fun on_change(self, observer: |T| void);
+        }
+        struct Box2<type U> { v: U }
+        impl Box2<type U> with Counted<U> { }
+        fun main() {}
+        "#,
+        "declare `fun on_change(self, observer: |U| void)`",
+    );
+}

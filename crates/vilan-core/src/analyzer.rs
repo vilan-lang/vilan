@@ -15418,10 +15418,59 @@ impl<'src> Analyzer<'src> {
         type_id: TypeId,
         subject: Option<&SignatureSubject<'_>>,
     ) -> String {
-        match subject.and_then(|subject| self.signature_position_label(type_id, subject)) {
-            Some(label) => label,
-            None => self.declaration_type_label(type_id),
+        if let Some(label) =
+            subject.and_then(|subject| self.signature_position_label(type_id, subject))
+        {
+            return label;
         }
+        // B249: every OTHER position of the member renders in the impl's terms
+        // too — the trait's own generic parameters carry the arguments the
+        // `with` clause gave them, at whatever depth they sit.
+        let substitution = subject
+            .map(|subject| self.trait_argument_substitution(subject))
+            .unwrap_or_default();
+        if substitution.is_empty() {
+            return self.declaration_type_label(type_id);
+        }
+        self.pretty_print_type(&type_id.get_type(self), &substitution)
+    }
+
+    /// B249: the declaring trait's own generic parameters mapped to the
+    /// arguments THIS impl's `with` clause supplied them — the substitution a
+    /// suggested declaration is rendered under, empty on every side but
+    /// [`SignatureSide::Impl`].
+    ///
+    /// B206 fixed the two AMBIGUOUS positions (`Self`, a `= Self`-defaulted
+    /// parameter) and only those, by written name, because those are the two the
+    /// resolved type cannot tell apart. An ordinary parameter — `trait
+    /// Source<T>`'s `T` — is not ambiguous at all and rendered as written, so
+    /// `impl Counted with Source<i32>` was told to `declare fun on_change(self,
+    /// observer: |T| void)` for a `T` it does not have and cannot introduce. The
+    /// copyable line has to be copyable, so the parameter takes the argument.
+    ///
+    /// It is a substitution rather than a per-position lookup because the
+    /// parameter is usually NESTED — `|T| void`, `List<T>`, `Option<T>` — and
+    /// only the renderer walks that far. A position that is exactly the
+    /// parameter is covered by the same map.
+    ///
+    /// An identity pair is dropped so the map stays empty in the common case: an
+    /// impl that passes the trait its OWN binder (`impl SignalCell<type T> with
+    /// Source<T>`) already reads right, and rendering it through a substitution
+    /// would be the same string by a longer road.
+    fn trait_argument_substitution(&self, subject: &SignatureSubject<'_>) -> SubstitutionContext {
+        let SignatureSide::Impl(_, trait_arguments) = subject.rendered_for else {
+            return SubstitutionContext::default();
+        };
+        let Some(trait_) = self.traits.get(&subject.declaring_trait_id) else {
+            return SubstitutionContext::default();
+        };
+        trait_
+            .generic_parameter_constraint_ids
+            .iter()
+            .copied()
+            .zip(trait_arguments.iter().copied())
+            .filter(|(parameter, argument)| parameter != argument)
+            .collect()
     }
 
     /// How an ambiguous `Self` / `= Self`-defaulted position of a trait member
