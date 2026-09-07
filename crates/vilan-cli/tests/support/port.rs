@@ -147,3 +147,38 @@ impl Drop for Server {
         self.stop();
     }
 }
+
+/// A port nothing is listening on *right now*: bind `127.0.0.1:0`, read what
+/// the OS handed out, release it.
+///
+/// [`Server`] above is the DEFAULT and this is not a shortcut past it. N40's
+/// finding stands unchanged — a bind-release-rebind is a TOCTOU window, and
+/// under ~10 parallel suites it is not theoretical: `serve_build` failed on
+/// "the server should bind 45673" after 114 s while passing 10/10 alone, and
+/// the same shape had already struck three times in one day. Wherever a server
+/// can bind `.port(0)` and report the number back, it must, and there is no
+/// window at all.
+///
+/// What is left over for this function is the one case a port-0 bind cannot
+/// serve: a test that needs the SAME number across two INDEPENDENT binds.
+/// `transport_robustness` kills its server and starts a second process the
+/// still-running client has to reconnect to, so the second bind must land on
+/// the first one's port, and only a number known in advance can say which. The
+/// window there is irreducible (the kill releases the port); what is not
+/// irreducible is how long it is held open, so the rule for a caller is:
+/// **pick immediately before the spawn that binds, never before a
+/// `vilan build`.** Passing the number as an argv to the spawned program is
+/// what makes that possible; baking it into a source that then has to be
+/// compiled is what made `transport_robustness` flake on `EADDRINUSE` under
+/// lane load with a window a whole build wide.
+///
+/// It lives here so there is one of it. Five suites carried a private copy —
+/// four of them with a one-line comment or none — and a helper whose entire
+/// content is a caveat is the worst kind to duplicate.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}

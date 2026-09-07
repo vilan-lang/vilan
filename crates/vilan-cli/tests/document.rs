@@ -42,13 +42,14 @@
 //! own bytes, unchecked beyond what `from_shell` already did.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod support;
+use support::port::free_port;
 
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -347,16 +348,6 @@ fn generated_server(port: u16) -> String {
          \t\t.start();\n\
          }}\n"
     )
-}
-
-/// Bind an ephemeral port and release it — the standard small TOCTOU window
-/// this suite's server tests all take.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
 }
 
 fn wait_for_port(port: u16) -> bool {

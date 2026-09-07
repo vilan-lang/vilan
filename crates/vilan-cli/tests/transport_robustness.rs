@@ -26,13 +26,15 @@ use std::process::Command;
 // The reconnect tests drive the server with `kill -STOP`/`-KILL`; everything
 // that exists only to serve them is unix-gated with them (see the tests).
 #[cfg(unix)]
-use std::net::TcpListener;
-#[cfg(unix)]
 use std::process::{Child, Stdio};
+#[cfg(unix)]
+use std::sync::OnceLock;
 #[cfg(unix)]
 use std::sync::mpsc::Receiver;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+
+mod support;
 
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_robust_{tag}_{}", std::process::id()));
@@ -44,25 +46,6 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     let path = dir.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, contents).unwrap();
-}
-
-/// Bind an ephemeral port, then release it — a free port for the server (a small
-/// TOCTOU window). Fixed literals are unbindable outright inside Windows'
-/// Hyper-V/WSL reserved ranges (windows-support.md §4).
-///
-/// The one probe backlog E19's port-0 rework deliberately LEFT: these tests kill
-/// the server and start a SECOND server process that the client must reconnect
-/// to, so the port has to be the same across two independent binds — which a
-/// port-0 bind cannot promise. Phase 1 could announce its port for phase 3 to
-/// reuse, but that only moves the window (the port is released by the kill), so
-/// it buys nothing the probe does not already have.
-#[cfg(unix)]
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// A node child whose stdout lines stream to a channel; killed on drop.
@@ -234,8 +217,12 @@ async fun main() {
 	} else {
 		Service::new(board.dispatcher().into_protocol(json_codec()))
 	};
+	// argv[2], not a number compiled in: the harness picks the port right
+	// before this process is spawned, so the bind-release-rebind window is a
+	// spawn wide instead of a `vilan build` wide (tracker N58).
+	let port = args().get(2).unwrap().parse_i32().unwrap();
 	Server::builder()
-		.port(9297)
+		.port(port)
 		.with_service(service)
 		.on_request(|request| Response::builder().code(404).body("nope").build())
 		.on_start(|server| print(i"listening {initial} {mode}"))
@@ -250,12 +237,13 @@ import std::shared::Shared;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
 import std::time::sleep;
-import std::process::exit;
+import std::process::{ args, exit };
 import std::rpc::ConnectionState;
 import common::{ StatusBoard, StatusClient };
 
 async fun main() {
-	match StatusClient::connect("ws://localhost:9297/", json_codec()) {
+	let port = args().get(0).unwrap().parse_i32().unwrap();
+	match StatusClient::connect(i"ws://localhost:{port}/", json_codec()) {
 		Ok(let client) => {
 			let state = client.transport.connection_state();
 			let fast_fired: Shared<bool> = Shared::new(false);
@@ -331,13 +319,15 @@ async fun main() {
 #[cfg(unix)]
 const WATCH_CLIENT: &str = r#"import std::io::print;
 import std::json::json_codec;
+import std::process::args;
 import std::result::Result::{ self, Ok, Err };
 import std::time::sleep;
 import std::rpc::ConnectionState;
 import common::{ StatusBoard, StatusClient };
 
 async fun main() {
-	match StatusClient::connect("ws://localhost:9297/", json_codec()) {
+	let port = args().get(0).unwrap().parse_i32().unwrap();
+	match StatusClient::connect(i"ws://localhost:{port}/", json_codec()) {
 		Ok(let client) => {
 			let watching_state = client.transport.connection_state().sub(|current| {
 				print(i"state:{current.debug()}");
@@ -391,20 +381,31 @@ fn patient_watch_client() -> String {
 
 /// One built project — `common` (the shared `[service]`), `server` (the
 /// mode-taking server above) and `client` (whichever program the test drives)
-/// — on one ephemeral port, ready to spawn processes from. The port is
-/// substituted into both halves at build time, so it lives in the sources
-/// rather than on this value.
+/// — ready to spawn processes from.
+///
+/// The port is NOT baked into the sources any more (N58): both halves read it
+/// from argv, and the fixture picks it on the FIRST spawn, whichever half that
+/// is. That is the whole fix for the `EADDRINUSE` this suite flaked on under
+/// lane load — the pick used to happen before a `vilan build`, so a number the
+/// OS called free was claimed by a sibling suite during the ~30 s it took to
+/// compile the project that would bind it. The window is now a `node` spawn,
+/// and it is irreducible for the reason `support::port::free_port` states: the
+/// client must reconnect to the SAME port after the server is killed, so the
+/// number has to be known in advance.
 #[cfg(unix)]
 struct ReconnectFixture {
     directory: PathBuf,
+    /// Picked once, lazily, by whichever of [`ReconnectFixture::server`] and
+    /// [`ReconnectFixture::client`] is called first — always the server in
+    /// practice, but both halves must agree and neither may pick twice.
+    port: OnceLock<u16>,
 }
 
 #[cfg(unix)]
 impl ReconnectFixture {
-    /// Write the three packages, substitute the port into both halves, build.
+    /// Write the three packages and build. No port yet — see the type's doc.
     fn build(tag: &str, client_source: &str) -> ReconnectFixture {
         let directory = temp_project(tag);
-        let port = free_port().to_string();
         write(
             &directory,
             "vilan.toml",
@@ -426,16 +427,8 @@ impl ReconnectFixture {
             "[package]\nname = \"client\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
         );
         write(&directory, "common/src/lib.vl", COMMON);
-        write(
-            &directory,
-            "server/src/main.vl",
-            &SERVER.replace("9297", &port),
-        );
-        write(
-            &directory,
-            "client/src/main.vl",
-            &client_source.replace("9297", &port),
-        );
+        write(&directory, "server/src/main.vl", SERVER);
+        write(&directory, "client/src/main.vl", client_source);
 
         let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
             .args(["build", directory.to_str().unwrap()])
@@ -447,16 +440,29 @@ impl ReconnectFixture {
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        ReconnectFixture { directory }
+        ReconnectFixture {
+            directory,
+            port: OnceLock::new(),
+        }
+    }
+
+    /// The port both halves bind and connect to, picked on first use.
+    fn port(&self) -> String {
+        self.port.get_or_init(support::port::free_port).to_string()
     }
 
     /// A server process serving `status`, in one of the three failure modes.
     fn server(&self, status: &str, mode: &str) -> LineChild {
-        LineChild::spawn(&self.directory.join("dist/server.mjs"), &[status, mode])
+        let port = self.port();
+        LineChild::spawn(
+            &self.directory.join("dist/server.mjs"),
+            &[status, mode, &port],
+        )
     }
 
     fn client(&self) -> LineChild {
-        LineChild::spawn(&self.directory.join("dist/client.mjs"), &[])
+        let port = self.port();
+        LineChild::spawn(&self.directory.join("dist/client.mjs"), &[&port])
     }
 
     /// Only on the success path, deliberately: a failed run leaves the built
@@ -684,13 +690,14 @@ import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
 import std::option::Option::{ self, Some, None };
 import std::time::sleep;
-import std::process::exit;
+import std::process::{ args, exit };
 import std::rpc::ConnectionState;
 import std::reactive::{ draft, Draft, DraftState };
 import common::{ StatusBoard, StatusClient };
 
 async fun main() {
-	match StatusClient::connect("ws://localhost:9297/", json_codec()) {
+	let port = args().get(0).unwrap().parse_i32().unwrap();
+	match StatusClient::connect(i"ws://localhost:{port}/", json_codec()) {
 		Ok(let client) => {
 			// Every commit attempt is numbered, so "exactly one re-push" is
 			// observable rather than inferred.
@@ -907,8 +914,10 @@ async fun main() {
 		None => 0,
 	};
 	let board = Board { extra = Signal::new(value) };
+	// argv[1] — see SERVER above.
+	let port = args().get(1).unwrap().parse_i32().unwrap();
 	Server::builder()
-		.port(9298)
+		.port(port)
 		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
 		.on_request(|request| Response::builder().code(404).body("nope").build())
 		.on_start(|server| print(i"listening {value}"))
@@ -925,6 +934,7 @@ async fun main() {
 #[cfg(unix)]
 const DYNAMIC_CLIENT: &str = r#"import std::io::print;
 import std::json::json_codec;
+import std::process::args;
 import std::result::Result::{ self, Ok, Err };
 import std::shared::Shared;
 import std::time::sleep;
@@ -942,7 +952,8 @@ import std::rpc::{
 };
 
 async fun main() {
-	match connect_socket("ws://localhost:9298/") {
+	let port = args().get(0).unwrap().parse_i32().unwrap();
+	match connect_socket(i"ws://localhost:{port}/") {
 		Ok(let socket) => {
 			let transport = socket.transport();
 			let reactive = ReactiveClient::new(bridge(socket), json_codec());
@@ -983,17 +994,19 @@ async fun main() {
 }
 "#;
 
-/// The two-package project for the dynamic pin, on its own ephemeral port.
+/// The two-package project for the dynamic pin, on its own ephemeral port —
+/// picked at spawn time and read from argv, exactly as [`ReconnectFixture`]
+/// does and for the same reason.
 #[cfg(unix)]
 struct DynamicFixture {
     directory: PathBuf,
+    port: OnceLock<u16>,
 }
 
 #[cfg(unix)]
 impl DynamicFixture {
     fn build(tag: &str) -> DynamicFixture {
         let directory = temp_project(tag);
-        let port = free_port().to_string();
         write(
             &directory,
             "vilan.toml",
@@ -1009,16 +1022,8 @@ impl DynamicFixture {
             "client/vilan.toml",
             "[package]\nname = \"client\"\ntarget = \"node\"\n",
         );
-        write(
-            &directory,
-            "server/src/main.vl",
-            &DYNAMIC_SERVER.replace("9298", &port),
-        );
-        write(
-            &directory,
-            "client/src/main.vl",
-            &DYNAMIC_CLIENT.replace("9298", &port),
-        );
+        write(&directory, "server/src/main.vl", DYNAMIC_SERVER);
+        write(&directory, "client/src/main.vl", DYNAMIC_CLIENT);
         let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
             .args(["build", directory.to_str().unwrap()])
             .output()
@@ -1029,15 +1034,24 @@ impl DynamicFixture {
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        DynamicFixture { directory }
+        DynamicFixture {
+            directory,
+            port: OnceLock::new(),
+        }
+    }
+
+    fn port(&self) -> String {
+        self.port.get_or_init(support::port::free_port).to_string()
     }
 
     fn server(&self, value: &str) -> LineChild {
-        LineChild::spawn(&self.directory.join("dist/server.mjs"), &[value])
+        let port = self.port();
+        LineChild::spawn(&self.directory.join("dist/server.mjs"), &[value, &port])
     }
 
     fn client(&self) -> LineChild {
-        LineChild::spawn(&self.directory.join("dist/client.mjs"), &[])
+        let port = self.port();
+        LineChild::spawn(&self.directory.join("dist/client.mjs"), &[&port])
     }
 }
 
