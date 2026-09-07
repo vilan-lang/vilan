@@ -46070,20 +46070,43 @@ struct ModuleTables {
 }
 
 impl ModuleTables {
-    /// How many rows this slice holds — the record's own size, in the only
-    /// unit that is cheap to add up (see [`CHECKED_CACHE_TABLE_ROWS`]).
-    fn rows(&self) -> usize {
-        self.last_uses.len()
+    /// What this slice costs, in bytes — the unit the budget is set in (M46).
+    ///
+    /// A row COUNT was the first bound (M19 T1b) and it is a proxy: the eleven
+    /// tables' rows differ by an order of magnitude in width. A `last_uses`
+    /// row is one `Id`, four bytes; a `last_use_statements` row is an `Id`, a
+    /// `Vec` header and a chain of `Id`s behind it, which for a long statement
+    /// chain is hundreds. Counting rows prices those the same and cannot say
+    /// what the cache is holding — the question a budget exists to answer.
+    ///
+    /// Element counts, not allocator counts: `Vec::capacity` would price the
+    /// slack a `collect` happened to leave, which is a fact about a growth
+    /// policy rather than about the record. The figure is therefore a floor,
+    /// and the budget is set knowing it.
+    fn bytes(&self) -> usize {
+        let id = std::mem::size_of::<Id>();
+        let flat = self.last_uses.len()
             + self.last_use_opaque.len()
             + self.last_use_unreached.len()
-            + self.last_use_statements.len()
-            + self.declaration_statements.len()
-            + self.bumps.len()
-            + self.clone_sites.len()
-            + self.return_clone_sites.len()
             + self.return_view_reads.len()
             + self.scalar_view_calls.len()
-            + self.scalar_view_refs.len()
+            + self.scalar_view_refs.len();
+        let chains: usize = self
+            .last_use_statements
+            .iter()
+            .chain(self.declaration_statements.iter())
+            .map(|(_, chain)| std::mem::size_of::<(Id, Vec<Id>)>() + chain.len() * id)
+            .sum();
+        let bumps: usize = self
+            .bumps
+            .iter()
+            .map(|(_, set)| {
+                std::mem::size_of::<(Id, BTreeSet<u32>)>() + set.len() * std::mem::size_of::<u32>()
+            })
+            .sum();
+        let decisions = (self.clone_sites.len() + self.return_clone_sites.len())
+            * std::mem::size_of::<(Id, CopyDecision)>();
+        flat * id + chains + bumps + decisions
     }
 }
 
@@ -46147,18 +46170,82 @@ struct WorldChecks {
     source_hashes: Vec<u64>,
     sources_fingerprint: u64,
     per_source: HashMap<u32, ModuleDiagnostics>,
-    /// M19 T1b: how many class D table rows this record holds — the input to
-    /// the row budget below, kept as a running total so the budget costs an
-    /// addition rather than a walk.
-    table_rows: usize,
+    /// M46: what this record costs in BYTES — the input to the budget below,
+    /// kept as a running total so enforcing it costs an addition rather than a
+    /// walk. M19 T1b counted ROWS here, which priced a one-`Id` last-use row
+    /// and a hundred-`Id` statement chain the same.
+    bytes: usize,
+    /// M24's shape: the tick of the last store or hit, so eviction is least
+    /// recently USED rather than oldest stored.
+    last_used: u64,
+}
+
+impl WorldChecks {
+    /// What the whole record retains (M46): the per-module diagnostics and,
+    /// dominating them by two orders of magnitude on a real world, the class D
+    /// table slices.
+    fn compute_bytes(&self) -> usize {
+        let hashes = self.source_hashes.len() * std::mem::size_of::<u64>();
+        let modules: usize = self
+            .per_source
+            .values()
+            .map(|module| {
+                std::mem::size_of::<(u32, ModuleDiagnostics)>()
+                    + (module.diagnostics.len() + module.warnings.len())
+                        * std::mem::size_of::<crate::error::Error>()
+                    + module.tables.as_ref().map_or(0, ModuleTables::bytes)
+            })
+            .sum();
+        hashes + modules
+    }
 }
 
 /// The recorded checks, keyed exactly as the worlds are. Not stored inside
 /// [`StoredWorld`] because the record is filled AFTER the world is stored —
 /// the checks run past the entry walk — and because a world evicted for bytes
 /// (M24) can be rebuilt while its record stays valid under the same content.
-static CHECKED_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, WorldChecks>>> =
+static CHECKED_CACHE: std::sync::OnceLock<std::sync::Mutex<CheckedCacheState>> =
     std::sync::OnceLock::new();
+
+/// The record map's whole mutable state, under one lock — M24's shape for
+/// [`BASE_CACHE`], applied here for the same reason (M46): the byte total is
+/// kept rather than recomputed, because eviction reads it on every store.
+#[derive(Default)]
+struct CheckedCacheState {
+    records: HashMap<BaseCacheKey, WorldChecks>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl CheckedCacheState {
+    fn next_tick(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    /// Evicts least-recently-used records until the retained bytes fit the
+    /// budget (M46), `keep` — the record just written — exempt, exactly as
+    /// M24's world eviction exempts the world just stored: a single record
+    /// larger than the budget bounds the cache at one rather than switching it
+    /// off. Ties on `last_used` cannot happen (the tick is monotonic and one
+    /// record is touched per store), so the victim is a function of the
+    /// sequence of stores and hits and nothing else.
+    fn evict_to_budget(&mut self, keep: Option<&BaseCacheKey>) {
+        let budget = CHECKED_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        while self.bytes > budget {
+            let victim = self
+                .records
+                .iter()
+                .filter(|(key, _)| Some(*key) != keep)
+                .min_by_key(|(_, record)| record.last_used)
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else { return };
+            if let Some(evicted) = self.records.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(evicted.bytes);
+            }
+        }
+    }
+}
 
 /// The record map's key bound. It does the crudest thing that cannot grow:
 /// past the bound the map starts over. A session that meets more than this
@@ -46166,21 +46253,61 @@ static CHECKED_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey,
 /// what it paid before this cache existed.
 const CHECKED_CACHE_KEYS: usize = 256;
 
-/// M19 T1b's second bound, and the one that actually holds the memory down.
+/// M19 T1b's second bound, in the unit that answers the question (M46).
 ///
 /// T1's values were diagnostics — kilobytes at worst against the base cache's
-/// megabytes — so a key count was budget enough. T1b's are TABLES: a 58-source
-/// application records a row per last use, per statement chain, per clone
-/// site and per scalar-view site, which is hundreds of thousands of rows for
-/// one world. A key count cannot see that, so the rows are counted too, and
-/// past the bound the map starts over exactly as it does past the key count.
+/// megabytes — so a key count was budget enough. T1b's are TABLES: a real
+/// world records a row per last use, per statement chain, per clone site and
+/// per scalar-view site, and a key count cannot see that. T1b therefore added
+/// a ROW budget of eight million, which is a proxy and was written down as
+/// one: the eleven tables' rows differ in width by an order of magnitude, so
+/// "eight million rows" named no amount of memory and its own comment had to
+/// guess ("on the order of a hundred megabytes").
 ///
-/// Sized against M24's own retained-world budget rather than invented: eight
-/// million rows is on the order of a hundred megabytes of `Id`s and their
-/// chains, a fraction of [`BASE_CACHE_DEFAULT_BUDGET`]'s 512 MB of worlds, and
-/// far past what any editing session reaches — one world shape per package,
-/// platform and prelude.
-const CHECKED_CACHE_TABLE_ROWS: usize = 8_000_000;
+/// The budget is bytes now, and [`ModuleTables::bytes`] is what counts them.
+/// Sized against M24's retained-world budget rather than invented: one eighth
+/// of [`BASE_CACHE_DEFAULT_BUDGET`], because a record is a fraction of the
+/// world it describes and the two caches are bounded by the same argument.
+/// The row bound is gone rather than kept beside it — two bounds on one thing
+/// is one bound and one number nobody can act on.
+pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_DEFAULT_BUDGET / 8;
+
+static CHECKED_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(CHECKED_CACHE_DEFAULT_BUDGET);
+
+/// Sets the recorded-checks byte budget (M46) and enforces it at once — M24's
+/// [`set_base_cache_budget`], for the other half of what a world costs.
+#[doc(hidden)]
+pub fn set_checked_cache_budget(bytes: usize) {
+    CHECKED_CACHE_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    let cache = CHECKED_CACHE.get_or_init(|| std::sync::Mutex::new(CheckedCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.evict_to_budget(None);
+}
+
+/// The recorded-checks budget in force (M46).
+#[doc(hidden)]
+pub fn checked_cache_budget() -> usize {
+    CHECKED_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the recorded checks retain right now, in bytes, and how many world
+/// shapes are recorded (M46) — the measurement surface, and what the eviction
+/// pins read.
+#[doc(hidden)]
+pub fn checked_cache_retained() -> (usize, usize) {
+    CHECKED_CACHE
+        .get()
+        .map(|cache| {
+            let state = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.bytes, state.records.len())
+        })
+        .unwrap_or((0, 0))
+}
 
 /// §3.2's `sources_fingerprint`: the WORLD's source paths, in order, hashed.
 ///
@@ -46236,10 +46363,10 @@ fn checked_cache_lookup(
     source_hashes: &[u64],
 ) -> Option<HashMap<u32, ModuleDiagnostics>> {
     let cache = CHECKED_CACHE.get()?;
-    let state = cache
+    let mut state = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let recorded = state.get(key)?;
+    let recorded = state.records.get(key)?;
     // `[0]` is the entry, which is the file that changed; every other source
     // must be byte-identical to the run that recorded, or the remembered
     // answers are about text nobody is compiling.
@@ -46249,7 +46376,14 @@ fn checked_cache_lookup(
         return None;
     }
     assert_replay_sources_stable(recorded.sources_fingerprint, &sources[1..]);
-    Some(recorded.per_source.clone())
+    let served = recorded.per_source.clone();
+    // M46: a hit refreshes recency, so the eviction below is least recently
+    // USED — the record a session keeps replaying is the one it keeps.
+    let tick = state.next_tick();
+    if let Some(recorded) = state.records.get_mut(key) {
+        recorded.last_used = tick;
+    }
+    Some(served)
 }
 
 /// Records what this analysis derived for the modules it actually re-derived.
@@ -46263,12 +46397,12 @@ fn checked_cache_store(
     derived: HashMap<u32, ModuleDiagnostics>,
     purge: &HashSet<u32>,
 ) {
-    let cache = CHECKED_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
+    let cache = CHECKED_CACHE.get_or_init(|| std::sync::Mutex::new(CheckedCacheState::default()));
     let mut state = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fingerprint = replay_sources_fingerprint(&sources[1..]);
-    let existing = state.get(key).filter(|recorded| {
+    let existing = state.records.get(key).filter(|recorded| {
         recorded.source_hashes.len() == source_hashes.len()
             && recorded.source_hashes[1..] == source_hashes[1..]
             && recorded.sources_fingerprint == fingerprint
@@ -46283,22 +46417,27 @@ fn checked_cache_store(
         per_source.remove(index);
     }
     per_source.extend(derived);
-    if state.len() >= CHECKED_CACHE_KEYS && !state.contains_key(key) {
-        state.clear();
+    if state.records.len() >= CHECKED_CACHE_KEYS && !state.records.contains_key(key) {
+        state.records.clear();
+        state.bytes = 0;
     }
-    let table_rows = per_source
-        .values()
-        .map(|module| module.tables.as_ref().map_or(0, ModuleTables::rows))
-        .sum();
-    state.insert(
-        key.clone(),
-        WorldChecks {
-            source_hashes: source_hashes.to_vec(),
-            sources_fingerprint: fingerprint,
-            per_source,
-            table_rows,
-        },
-    );
+    let tick = state.next_tick();
+    let mut record = WorldChecks {
+        source_hashes: source_hashes.to_vec(),
+        sources_fingerprint: fingerprint,
+        per_source,
+        bytes: 0,
+        last_used: tick,
+    };
+    record.bytes = record.compute_bytes();
+    let bytes = record.bytes;
+    if let Some(displaced) = state.records.insert(key.clone(), record) {
+        state.bytes = state.bytes.saturating_sub(displaced.bytes);
+    }
+    state.bytes += bytes;
+    // M46: the diagnostics half is small, but the same eviction runs here so
+    // there is ONE place the bound is enforced rather than one per writer.
+    state.evict_to_budget(Some(key));
 }
 
 /// Attaches M19 T1b's class D table slices to a record the diagnostics store
@@ -46322,7 +46461,8 @@ fn checked_cache_store_tables(
     let mut state = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(recorded) = state.get_mut(key) else {
+    let previous_bytes = state.records.get(key).map_or(0, |record| record.bytes);
+    let Some(recorded) = state.records.get_mut(key) else {
         return;
     };
     // The world moved under the record between the two stores (another thread
@@ -46335,31 +46475,40 @@ fn checked_cache_store_tables(
     }
     for (index, slice) in tables {
         if let Some(module) = recorded.per_source.get_mut(&index) {
-            recorded.table_rows = recorded
-                .table_rows
-                .saturating_sub(module.tables.as_ref().map_or(0, ModuleTables::rows))
-                + slice.rows();
+            let was = module.tables.as_ref().map_or(0, ModuleTables::bytes);
+            let now = slice.bytes();
+            recorded.bytes = recorded.bytes.saturating_sub(was) + now;
             module.tables = Some(slice);
         }
     }
-    // The row budget (see [`CHECKED_CACHE_TABLE_ROWS`]), enforced where the
-    // rows are written. Crude on purpose and in the same shape as the key
-    // bound: past it the map starts over and every world pays one full class D
-    // phase again, which is what it paid before this tranche.
-    let rows: usize = state.values().map(|record| record.table_rows).sum();
-    if rows > CHECKED_CACHE_TABLE_ROWS {
-        state.clear();
+    // M46: the tables are where the bytes are, so the budget is enforced where
+    // they are written — and it EVICTS the least recently used record rather
+    // than clearing the map, which is what the row budget did. Clearing means
+    // one oversized session throws away every other world shape's record and
+    // every one of them pays a full class D phase again; evicting means the
+    // shapes a session keeps replaying survive. The record just written is
+    // exempt, as M24's world is.
+    let bytes = recorded.bytes;
+    let tick = state.next_tick();
+    if let Some(recorded) = state.records.get_mut(key) {
+        recorded.last_used = tick;
     }
+    state.bytes = state
+        .bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(bytes);
+    state.evict_to_budget(Some(key));
 }
 
 /// Drops every recorded checks set — the companion of [`base_cache_clear`],
 /// so a test that clears the worlds is not served a record of one.
 fn checked_cache_clear() {
     if let Some(cache) = CHECKED_CACHE.get() {
-        cache
+        let mut state = cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.records.clear();
+        state.bytes = 0;
     }
 }
 

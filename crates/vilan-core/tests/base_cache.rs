@@ -2130,3 +2130,249 @@ fn a_panicking_analysis_releases_its_construction_claim() {
     // And the cache still works afterwards.
     let _ = observe(PROGRAM_E);
 }
+
+// --- M46: the recorded checks are bounded in BYTES, and evict ---------------
+
+/// Programs with distinct import sets, so each records its own world shape.
+/// Three distinct import sets, two of them distinct SIZES — 85,712 bytes of
+/// record for A and 85,712 for C, against 90,536 for B on this tree. A and B
+/// differing is what lets the eviction pin name WHICH record went: a survivors'
+/// total made of two equal weights would be satisfied by an LRU running
+/// backwards just as well.
+const RECORD_A: &str = "import std::io::print;\nfun main() { print(1); }\n";
+const RECORD_B: &str = "import std::time::sleep;\nfun main() { }\n";
+const RECORD_C: &str = "import std::math::PI;\nfun main() { let _x = PI; }\n";
+
+/// Analyzes each fixture once and clears, so the counts below are the OUTER
+/// analyses' and nothing else.
+///
+/// A first analysis of an import set that reaches a macro-DEFINING std module
+/// compiles a macro world, and that world records checks under a key of its
+/// own — so `std::time`'s first analysis adds two records where its second
+/// adds one (the macro world is served from `macro_world_cache` afterwards and
+/// re-records nothing). This file's header warns about exactly that instrument
+/// hazard for the hit/miss counters; the retained-byte counters have it too.
+fn warm_record_fixtures() {
+    for program in [RECORD_A, RECORD_B, RECORD_C] {
+        let _ = observe(program);
+    }
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// M19 T1b bounded the class D table slices by a ROW count of eight million,
+/// and said in its own comment that this was "on the order of a hundred
+/// megabytes" — a guess, because the eleven tables' rows differ in width by an
+/// order of magnitude. The bound is bytes now, and this is the accounting: a
+/// record costs what it costs, the figure comes back when the record goes, and
+/// the cache is non-empty in between (the guard against a vacuous budget pin).
+#[test]
+fn the_checked_cache_records_and_releases_what_it_retains() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = vilan_core::analyzer::checked_cache_budget();
+    vilan_core::analyzer::set_checked_cache_budget(
+        vilan_core::analyzer::CHECKED_CACHE_DEFAULT_BUDGET,
+    );
+    warm_record_fixtures();
+    assert_eq!(
+        vilan_core::analyzer::checked_cache_retained(),
+        (0, 0),
+        "the clear left something behind"
+    );
+
+    let _ = observe(RECORD_A);
+    let (bytes_one, records_one) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(records_one, 1, "one world shape, one record");
+    assert!(
+        bytes_one > 0,
+        "a recorded world costs nothing, which the tables make impossible"
+    );
+
+    let _ = observe(RECORD_B);
+    let (bytes_two, records_two) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(records_two, 2, "a distinct import set is a distinct record");
+    assert!(
+        bytes_two > bytes_one,
+        "the second record retained nothing: {bytes_two} is not more than {bytes_one}"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        vilan_core::analyzer::checked_cache_retained(),
+        (0, 0),
+        "the bytes did not come back"
+    );
+    vilan_core::analyzer::set_checked_cache_budget(restore);
+}
+
+/// The bound EVICTS rather than clearing. The row budget's answer to pressure
+/// was `state.clear()`, so one oversized session threw away every other world
+/// shape's record and each of them paid a full class D phase again; M24 had
+/// already settled the shape for worlds and this is the same one — least
+/// recently USED goes, the record just written stays.
+///
+/// The budget is computed from the records' own measured sizes rather than
+/// guessed at, so exactly ONE record must go and which one is a claim: the
+/// budget fits A and C with half of B's bytes to spare, and B is the record
+/// nothing has touched since.
+#[test]
+fn the_checked_cache_budget_evicts_the_least_recently_used_record() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = vilan_core::analyzer::checked_cache_budget();
+    vilan_core::analyzer::set_checked_cache_budget(
+        vilan_core::analyzer::CHECKED_CACHE_DEFAULT_BUDGET,
+    );
+
+    warm_record_fixtures();
+    // What each shape is worth ALONE, measured rather than assumed — the
+    // survivors' total is how this pin names WHICH record was evicted.
+    let mut alone = Vec::new();
+    for program in [RECORD_A, RECORD_B, RECORD_C] {
+        vilan_core::analyzer::base_cache_clear();
+        let _ = observe(program);
+        let (bytes, records) = vilan_core::analyzer::checked_cache_retained();
+        assert_eq!(records, 1, "one shape, one record");
+        assert!(bytes > 0, "a recorded world costs nothing");
+        alone.push(bytes);
+    }
+    let (bytes_a, bytes_b, bytes_c) = (alone[0], alone[1], alone[2]);
+    assert_ne!(
+        bytes_a, bytes_b,
+        "A and B weigh the same, so the survivors' total cannot say which one \
+         was evicted — this pin would be blind to an LRU that ran backwards"
+    );
+
+    // Three shapes under a budget that fits them all — the vacuity guard: a
+    // pin that evicts under a budget nothing could satisfy proves nothing.
+    vilan_core::analyzer::base_cache_clear();
+    let _ = observe(RECORD_A);
+    let _ = observe(RECORD_B);
+    let _ = observe(RECORD_C);
+    let (bytes_three, records_three) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(records_three, 3, "three shapes must fit the default budget");
+
+    // Touch A, so the least recently used of the three is B — and C is about
+    // to be re-written, which exempts it.
+    let _ = observe(RECORD_A);
+
+    // Room for A and C plus half of B: one record must go, and only one.
+    let budget = bytes_three - bytes_b / 2;
+    vilan_core::analyzer::set_checked_cache_budget(budget);
+    let _ = observe(RECORD_C);
+    let (bytes_after, records_after) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(
+        records_after, 2,
+        "expected exactly one eviction from {records_three} records \
+         ({bytes_three} bytes, budget {budget}), got {records_after} at {bytes_after}"
+    );
+    assert!(
+        bytes_after <= budget,
+        "the retained bytes {bytes_after} still exceed the budget {budget}"
+    );
+    // WHICH one went. The least recently used is B; evicting from the other
+    // end would have taken A, which weighs a different amount.
+    assert_eq!(
+        bytes_after,
+        bytes_a + bytes_c,
+        "the wrong record was evicted: {bytes_after} bytes survive, and A+C is \
+         {} while B+C is {} — the eviction ran from the wrong end of the \
+         recency order",
+        bytes_a + bytes_c,
+        bytes_b + bytes_c
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::set_checked_cache_budget(restore);
+}
+
+/// M24's vacuity clause, for this cache: a record larger than the whole budget
+/// bounds the map at ONE rather than switching the cache off. A one-byte
+/// budget must still serve the record just written.
+#[test]
+fn a_one_byte_checked_cache_budget_still_keeps_the_record_just_written() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = vilan_core::analyzer::checked_cache_budget();
+    warm_record_fixtures();
+    vilan_core::analyzer::set_checked_cache_budget(1);
+    let _ = observe(RECORD_A);
+    let _ = observe(RECORD_B);
+    let (_, records) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(
+        records, 1,
+        "a budget smaller than one record must bound the cache at one, not zero"
+    );
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::set_checked_cache_budget(restore);
+}
+
+/// **The measurement M46 replaced a guess with**, in the perf-baseline shape
+/// (`proposal/perf-baseline.md` §3): `#[ignore]`d, run deliberately, one
+/// `PERF {…}` JSON line per subject so two runs diff as text.
+///
+/// M19 T1b bounded the class D table slices at eight million ROWS and could
+/// only guess what that was worth ("on the order of a hundred megabytes"). The
+/// rows are counted in bytes now, and this prints them: what one world's record
+/// costs, how many of the world's modules carry a table slice, and therefore
+/// how many world shapes the default budget admits. It asserts only that the
+/// figures are non-vacuous — a measurement that fails is a measurement nobody
+/// runs.
+///
+/// ```text
+/// cargo nextest run -p vilan-core --test base_cache --run-ignored ignored-only \
+///     -E 'test(checked_cache_bytes)' --no-capture
+/// ```
+#[test]
+#[ignore = "a measurement, not a gate: run deliberately (proposal/perf-baseline.md §3)"]
+fn checked_cache_bytes_per_world() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string());
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let budget = vilan_core::analyzer::CHECKED_CACHE_DEFAULT_BUDGET;
+    let mut widest = 0usize;
+    for (name, program) in [
+        ("io", RECORD_A),
+        ("time", RECORD_B),
+        ("math", RECORD_C),
+        (
+            "router",
+            "import std::router::current_path;\nfun main() { }\n",
+        ),
+        (
+            "web_wide",
+            "import std::io::print;\nimport std::router::current_path;\n\
+             import std::time::sleep;\nimport std::math::PI;\nfun main() { print(PI); }\n",
+        ),
+    ] {
+        vilan_core::analyzer::base_cache_clear();
+        let _ = observe(program);
+        let (bytes, records) = vilan_core::analyzer::checked_cache_retained();
+        widest = widest.max(bytes);
+        let worlds_in_budget = if bytes == 0 { 0 } else { budget / bytes };
+        println!(
+            "PERF {{\"section\":\"checked_cache\",\"corpus\":\"{name}\",\
+             \"mode\":\"tables\",\"metric\":\"retained_bytes\",\"profile\":\"{profile}\",\
+             \"load\":\"{load}\",\"records\":{records},\"bytes\":{bytes},\
+             \"budget_bytes\":{budget},\"worlds_in_budget\":{worlds_in_budget},\
+             \"note\":\"one analysis of this import set, cache cleared first\"}}"
+        );
+    }
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        widest > 0,
+        "every subject recorded nothing — the measurement measured the harness"
+    );
+}
