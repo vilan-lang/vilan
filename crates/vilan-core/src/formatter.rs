@@ -4142,10 +4142,17 @@ impl<'src> Printer<'src> {
         self.out.push_str(" {");
         self.indent += 1;
         let mut prev_end = open;
-        for ((field_name, value), span) in fields {
+        for (field @ (field_name, value), span) in fields {
             let field_start = self.out.len();
             let comment_cursor = self.cursor;
-            self.flush_element_comments(span.into_range().start, prev_end);
+            // Up to the field's VALUE, not to the field: a comment written
+            // between the name and the value (`name = // why ⏎ value`) sits
+            // INSIDE the field span, and flushing only to the span's start
+            // would leave it for whatever flushes next — which is how it ended
+            // up below the whole statement, orphaned from the field it
+            // explains (E146 rule 4). Above the field is where it stays.
+            let anchor = Self::field_comment_anchor(field, *span);
+            self.flush_element_comments(anchor, prev_end);
             prev_end = span.into_range().end;
             self.line();
             let line_start = self.out.len();
@@ -4154,7 +4161,7 @@ impl<'src> Printer<'src> {
             if self.over_line_budget(line_start) {
                 self.out.truncate(field_start);
                 self.cursor = comment_cursor;
-                self.flush_element_comments(span.into_range().start, prev_end);
+                self.flush_element_comments(anchor, prev_end);
                 self.line();
                 self.split = Split::Tail;
                 self.print_struct_field(field_name, value);
@@ -4182,12 +4189,12 @@ impl<'src> Printer<'src> {
     ///
     /// A comment written between the name and the value (`x = // why⏎ x`) is
     /// NOT a reason to keep the long form. The printer has no inline slot for
-    /// one there — such a comment already flushed out below the statement
-    /// before this rule existed, since it sits INSIDE a field span and so does
-    /// not force the split the way a comment between fields does — and
-    /// suppressing the collapse for it would make the reprint non-idempotent:
-    /// the first pass would keep `x = x` and relocate the comment, and the
-    /// second, with the comment now outside the field, would collapse anyway.
+    /// one there, and suppressing the collapse for it would make the reprint
+    /// non-idempotent: the first pass would keep `x = x` and move the comment,
+    /// and the second, with the comment now outside the field, would collapse
+    /// anyway. Where the comment GOES is E146 rule 4's answer — onto its own
+    /// line above the field, in the literal's split form, rather than out
+    /// below the whole statement.
     fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
         let split = std::mem::take(&mut self.split);
         self.out.push_str(field_name);
@@ -4200,6 +4207,32 @@ impl<'src> Printer<'src> {
         self.out.push_str(" = ");
         self.split = split;
         self.print_expr(value);
+    }
+
+    /// The offset a split literal flushes a field's leading comments up to: the
+    /// field's VALUE when it has one, and otherwise the field itself.
+    ///
+    /// A comment between the name and the value is inside the field's own span,
+    /// so a flush bounded by that span's start would step over it. Bounded by
+    /// the value instead, it is emitted on its own line above the field — which
+    /// is where it belongs and, on the next pass, where it already is.
+    fn field_comment_anchor(field: &StructInitializerField<'src>, span: Span) -> usize {
+        let (_, value) = field;
+        value.as_ref().map_or_else(
+            || span.into_range().start,
+            |value| value.1.into_range().start,
+        )
+    }
+
+    /// Whether a standalone comment sits between one of `fields`' names and its
+    /// value — the trigger for forcing a struct literal into its split form
+    /// (E146 rule 4). Inline there is no line to hold such a comment, so it
+    /// fell out below the whole statement.
+    fn comment_inside_a_field(&self, fields: &[Spanned<StructInitializerField<'src>>]) -> bool {
+        fields.iter().any(|(field, span)| {
+            let anchor = Self::field_comment_anchor(field, *span);
+            self.has_comment_in(span.into_range().start, anchor)
+        })
     }
 
     /// Whether a standalone comment sits in one of the GAPS between the source
@@ -4942,6 +4975,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {}");
                 } else if split != Split::Off
                     || self.comment_outside_elements(fields.1, &field_spans)
+                    || self.comment_inside_a_field(&fields.0)
                     || self.any_field_spans_lines(&fields.0)
                 {
                     self.print_split_struct(&fields.0, fields.1.into_range().start);
@@ -5070,9 +5104,8 @@ impl<'src> Printer<'src> {
     /// decision is made once at the head of the chain and threaded down, so an
     /// `else if` never disagrees with the `if` it hangs off.
     fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>, split: Split) {
-        let inline = split == Split::Off
-            && !self.at_line_start()
-            && self.arms_are_expressions(branch);
+        let inline =
+            split == Split::Off && !self.at_line_start() && self.arms_are_expressions(branch);
         self.print_if_chain(branch, inline);
     }
 
@@ -7693,12 +7726,12 @@ mod struct_field_shorthand {
     #[test]
     fn a_comment_inside_a_collapsing_field_is_kept_and_the_reprint_is_idempotent() {
         // A comment written between the name and the value has no inline slot
-        // in either spelling — it sat inside a field span, so it never forced
-        // the split the way a comment BETWEEN fields does, and it already
-        // relocated below the statement before this rule existed. It must still
-        // survive, and the reprint must settle in one pass: suppressing the
-        // collapse for it would collapse on the SECOND pass instead, with the
-        // comment then outside the field.
+        // in either spelling. It must still survive, and the reprint must
+        // settle in one pass: suppressing the collapse for it would collapse on
+        // the SECOND pass instead, with the comment then outside the field.
+        // Since E146 rule 4 it forces the literal's split form and lands on its
+        // own line ABOVE the field it explains, rather than below the whole
+        // statement — so the field collapses AND the comment stays put.
         let source = "fun demo() {\n\
                       \tlet point = Point {\n\
                       \t\tx = // deliberately the same name\n\
@@ -7712,8 +7745,8 @@ mod struct_field_shorthand {
             "the comment was dropped:\n{formatted}"
         );
         assert!(
-            formatted.contains("Point { x, y }"),
-            "the fields did not collapse:\n{formatted}"
+            formatted.contains("\t\t// deliberately the same name\n\t\tx,\n\t\ty,\n"),
+            "the comment left its field, or the fields did not collapse:\n{formatted}"
         );
         assert_eq!(
             super::format(&formatted),
@@ -8258,6 +8291,71 @@ mod split_comment_attachment {
     //! a comment inside a closure body a link carries belongs to that body and
     //! already prints where it was written.
     use super::bailing_constructs::assert_construct;
+
+    // --- E146 rule 4: the gap INSIDE a field ---------------------------------
+    //
+    // The one interior the rule above did not reach. A comment between a
+    // field's name and its value sits inside the field's own span, so it forced
+    // no split and no flush claimed it — it fell out below the whole statement,
+    // exactly the orphaning backlog 41 closed everywhere else. The field's
+    // VALUE, not the field, is the boundary a split literal flushes up to now.
+
+    /// The comment stays with the field it explains, on its own line above it,
+    /// and the literal splits to make room. The fixture fits the budget, so
+    /// only the comment can be splitting it.
+    #[test]
+    fn a_comment_between_a_field_name_and_its_value_stays_with_the_field() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet t = Task { id = 1, name = // the row's label, not the display name\n\
+             \t\t\"x\", flag = true };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet t = Task {\n\
+             \t\tid = 1,\n\
+             \t\t// the row's label, not the display name\n\
+             \t\tname = \"x\",\n\
+             \t\tflag = true,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The FIRST field's gap too — nothing before it in the literal but the
+    /// `{`, so the flush has to reach the value from the opening brace.
+    #[test]
+    fn a_comment_inside_the_first_field_attaches_to_it() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet t = Task { id = // always the row id\n\
+             \t\t1, flag = true };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet t = Task {\n\
+             \t\t// always the row id\n\
+             \t\tid = 1,\n\
+             \t\tflag = true,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// And the canonical form is where it settles: one pass, then nothing —
+    /// `assert_construct` asserts the idempotence the fmt gate depends on, and
+    /// the second pass sees a comment that is now BETWEEN fields, which rule A
+    /// splits on for its own reason. The two rules have to agree, and this is
+    /// where that is checked.
+    #[test]
+    fn the_moved_comment_is_a_fixed_point() {
+        let canonical = "fun demo() {\n\
+                         \tlet t = Task {\n\
+                         \t\tid = 1,\n\
+                         \t\t// the row's label, not the display name\n\
+                         \t\tname = \"x\",\n\
+                         \t};\n\
+                         }\n";
+        assert_construct(canonical, canonical);
+    }
 
     /// A comment before the FIRST element, which no between-elements gap covers —
     /// the case that needs the construct's own opening boundary. Fixture fits the
@@ -9153,8 +9251,12 @@ mod import_sorting {
             "import std::option::Option::{ self, None, Some };\n",
         );
         assert_eq!(
-            normalize(raw_tokens("import std::option::Option::{ Some, None, self };\n")),
-            normalize(raw_tokens("import std::option::Option::{ self, None, Some };\n")),
+            normalize(raw_tokens(
+                "import std::option::Option::{ Some, None, self };\n"
+            )),
+            normalize(raw_tokens(
+                "import std::option::Option::{ self, None, Some };\n"
+            )),
             "the net must see the two orders of one group as one",
         );
     }
