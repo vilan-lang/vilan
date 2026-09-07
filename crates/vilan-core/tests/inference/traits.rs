@@ -2574,3 +2574,108 @@ fn b184_the_sugar_emits_exactly_what_the_written_generic_emits() {
         "one consumer body per hidden argument:\n{sugared}"
     );
 }
+
+// --- A52: a GENERIC source field under `[expose]`/`[service]` ---------------
+//
+// Both spellings are refused, and the two pins below fix the shape so the
+// refusals can be read as a decision rather than found again. A `[service]`
+// subject may not be generic, and an exposed field may not name its source by
+// TRAIT — which is B184's carve-out, said in as many words at the annotation.
+//
+// The gap is not local to `std::rpc`'s macro. `ServiceItem` carries no
+// generics at all (`meta.vl`: name, client_name, fields, methods), so the
+// expansion cannot spell `impl Store<type T>` even in principle; and past that
+// the wire has no answer for a generic service — the contract hash is built
+// from WRITTEN types, so every instantiation of `Store<T>` would hash
+// identically and a `Store<Task>` client would connect to a `Store<Note>`
+// server, and `Client::connect(url, codec)` returns `Client<SocketTransport>`
+// with nowhere for the element type to come from. The user-written escape is
+// the third pin's shape, and it works today: a CONCRETE type that implements
+// `Source<T>` is exposable, generic in its own declaration or not.
+
+/// A generic `[service]` subject. The refusal is a cascade out of the
+/// expansion rather than one curated sentence — the client struct's own
+/// transport parameter is spelled `T` and collides with the subject's — and
+/// this pin records that, because a curated refusal is owed here and cannot be
+/// written without saying what the unfixed shape currently says.
+#[test]
+fn a52_a_generic_service_subject_is_refused_by_the_expansion() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        [service(StoreClient)]
+        struct Store<T: Wire + PartialEq> {
+            [expose] items: SignalCell<List<T>>,
+        }
+        impl Store<type T: Wire + PartialEq> {
+            [rpc]
+            fun count(self): i32 { self.items.get().len() }
+        }
+        fun main() { print("store"); }
+        main();
+        "#;
+    assert_fails_with(
+        source,
+        "'contract_hash' is already defined for 'StoreClient<T>'",
+    );
+    assert_fails_with(source, "`Store` takes 1 type argument, 0 given");
+}
+
+/// The other spelling: naming the source by TRAIT. B184 made a trait-typed
+/// field legal sugar over a hidden type parameter and carved attributed
+/// declarations out, because `[derive]` and `[service]` write code from the
+/// types the author wrote. This is that carve-out reached through `[expose]`,
+/// and it is one curated sentence that names the rule.
+#[test]
+fn a52_an_expose_of_a_trait_typed_source_field_is_refused_at_the_annotation() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        [service(StoreClient)]
+        struct Store {
+            [expose] items: Source<List<Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#;
+    assert_fails_with(
+        source,
+        "A field MAY name a trait, but not on a declaration carrying an attribute",
+    );
+}
+
+/// The control that keeps both of the above from reading as "an exposed field
+/// must be a `SignalCell`": a user type that implements `Source<T>` — declared
+/// generic, applied concretely — is exposable, and the generated
+/// `session.expose(self.items)` infers `T` off its impl.
+#[test]
+fn a52_an_expose_of_a_user_source_type_is_accepted() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        struct Stored<T> { inner: SignalCell<T> }
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose] items: Stored<List<Task>>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { self.items.get().len() }
+        }
+        fun main() { print(Store { items = Stored { inner = Signal::new([]) } }.contract_hash()); }
+        main();
+        "#,
+    );
+}
