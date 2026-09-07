@@ -6717,24 +6717,6 @@ fn b233_the_implicit_generic_sugar_is_held_to_the_same_rule() {
 }
 
 #[test]
-fn b233_a_concrete_right_operand_against_a_bounded_parameter_still_compiles() {
-    // The BOUNDARY, stated as a pin so a later tightening has to move it
-    // deliberately: this rule is about two parameters meeting. A concrete right
-    // operand against a bounded parameter is a wider question (an `impl Bag
-    // with Add` reached with an `i32` is its own defect) and is left exactly as
-    // it stands.
-    assert_compiles_and_runs(
-        r#"
-        import std::io::print;
-        import std::operators::Add;
-        fun bump<P: Add>(a: P): P { a + 1 }
-        fun main() { print(bump(1)); }
-        "#,
-        "2\n",
-    );
-}
-
-#[test]
 fn b233_a_nominal_left_operand_keeps_b180s_own_steer() {
     // B180's site is untouched: a left operand with a subject to name still
     // gets the impl advice, not the bound advice.
@@ -6977,5 +6959,179 @@ fn the_bindable_set_still_binds_an_impl_binder_and_a_trait_parameter() {
         }
         "#,
         "two\n3\n",
+    );
+}
+
+// --- B246: a CONCRETE right operand against a bounded parameter -------------
+//
+// B233 refused two rigid parameters meeting on an operator and stated the
+// remaining hole as a pin: `fun bump<P: Add>(a: P): P { a + 1 }` compiled, and
+// `bump(1)` printed `2`. It is UNSOUND for the same reason B233's shape was,
+// one step along — a bare `P: Add` means `Add<B = Self>`, so `P`'s `add`
+// accepts a `P` and only a `P`, and an `i32` there belongs only if some
+// instantiation's `Add` declares `B = i32`. Nothing in the signature promises
+// that, and a struct whose `Add` declares `B = Self` flatly denies it: the
+// dispatched `add` receives an `i32` where its own body reads a `Bag`.
+//
+// The bound is where the operand is DECLARABLE (`<P: Add<i32>>` says a `P`
+// takes an `i32`, and every instantiation must then satisfy it), so that is
+// what the steer names — B233's steer, at the one operand shape it did not
+// reach. Where the parameter is IMPLICIT (B186's `fun bump(a: Add)`) there is
+// no name to put in a bound: the binder displays as its TRAIT, which is B218's
+// face, so the steer does not pretend it has a name and names the rewrite that
+// gives it one instead.
+//
+// CENSUS, the owner's condition for closing this: every bounded-parameter
+// operator with a concrete right operand across std, the 128 corpus programs,
+// the eleven examples, the benchmarks, macro_std and the CLI templates — and,
+// counted separately, kolt (three entries) and the website (four). ZERO in all
+// of them. Nothing in the estate stops compiling.
+
+#[test]
+fn b246_a_concrete_right_operand_against_a_bounded_parameter_is_refused() {
+    // The filed shape, and B233's boundary pin moved deliberately: this
+    // compiled and ran, printing `2`.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun bump<P: Add>(a: P): P { a + 1 }
+        fun main() { print(bump(1)); }
+        "#,
+        "`P`'s `add` accepts `P`, but the right operand is `i32`",
+    );
+}
+
+#[test]
+fn b246_the_refusal_steers_to_the_bound_the_author_meant() {
+    // The steer is the bound, for B233's reason: a parameter left operand has
+    // no impl subject to name.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun bump<P: Add>(a: P): P { a + 1 }
+        fun main() { print(bump(1)); }
+        "#,
+        "Say so in the bound (`<P: Add<i32>>`), which every instantiation must then satisfy",
+    );
+}
+
+#[test]
+fn b246_the_parameterized_bound_is_the_spelling_that_works() {
+    // And the steer owes a spelling that COMPILES — the whole of B179's rule
+    // for a steer. It does.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        fun bump<P: Add<i32>>(a: P): P { a + 1 }
+        fun main() { print(bump(1)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b246_the_implicit_binder_is_not_offered_a_name_it_does_not_have() {
+    // B186's sugar declares the parameter, and it has no name: it displays as
+    // its TRAIT (B218's face), so `<Add: Add<i32>>` would be a steer into a
+    // second refusal. The rewrite that gives it a name is what the message
+    // names instead.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun bump(a: Add) { let _ = a + 1; }
+        fun main() {}
+        "#,
+        "This parameter was written as a trait annotation, so it has no name to bind: \
+         write it out (`fun …<P: Add<i32>>(…: P, …)`)",
+    );
+}
+
+#[test]
+fn b246_the_unsound_program_the_refusal_removes() {
+    // What the accept cost: a struct whose `Add` declares `B = Self` reaches
+    // `add` with an `i32`, and the body reads a field off it. Refused at the
+    // declaration now, once, for every instantiation.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        struct Bag { n: i32 }
+        impl Bag with Add {
+            fun add(self, b: Bag): Bag { Bag { n = self.n + b.n } }
+        }
+        fun bump<P: Add>(a: P): P { a + 1 }
+        fun main() { print(bump(Bag { n = 1 }).n); }
+        "#,
+        "`P`'s `add` accepts `P`, but the right operand is `i32`",
+    );
+}
+
+#[test]
+fn b246_the_same_parameter_on_both_sides_still_adds() {
+    // B233's control, unmoved: the rule is about what the bound admits, and a
+    // `P` is always admitted.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        fun twice<P: Add>(a: P, b: P): P { a + b }
+        fun main() { print(twice(1, 2)); }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b246_a_concrete_left_operand_is_untouched() {
+    // The counterweight: this rule fires only on a bounded PARAMETER. An
+    // ordinary `1 + 1`, and a nominal left operand whose impl declares its own
+    // `B`, go nowhere near it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        struct Meters { n: i32 }
+        impl Meters with Add<i32> {
+            fun add(self, b: i32): Meters { Meters { n = self.n + b } }
+        }
+        fun main() { print((Meters { n = 1 } + 2).n + 1); }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b246_the_rule_reaches_every_dispatched_operator() {
+    // One channel, every operator — B233's own claim, now over the concrete
+    // operand too.
+    assert_fails_with(
+        r#"
+        import std::compare::PartialEq;
+        fun same<P: PartialEq>(a: P): bool { a == 1 }
+        fun main() {}
+        "#,
+        "`P`'s `eq` accepts `P`, but the right operand is `i32`",
+    );
+}
+
+#[test]
+fn b246_an_inferable_parameter_is_still_the_call_sites_business() {
+    // The gate that keeps this a DECLARATION rule: a parameter the site is
+    // inferring is a hole the call fills, so an operator inside a call's own
+    // substitution is not this refusal. `List::sum`-shaped std code compiles
+    // exactly as it did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let numbers = [1, 2, 3];
+            mut total = 0;
+            for n in numbers { total = total + n; }
+            print(total);
+        }
+        main();
+        "#,
+        "6\n",
     );
 }

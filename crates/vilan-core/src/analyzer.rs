@@ -16217,6 +16217,38 @@ impl<'src> Analyzer<'src> {
                  that same parameter (`impl {subject_name}<type {rhs_label}> with \
                  {trait_name}<{rhs_label}>`)"
             )
+        } else if let Type::Generic(constraint_id) = lhs_type {
+            // B246: a CONCRETE right operand against a bounded PARAMETER. The
+            // steer above has an impl to name because the subject is nominal;
+            // here the subject is a parameter, so — as in B233 — the bound is
+            // the only declaration that can say a `{subject_label}` takes an
+            // `{rhs_label}` there, and it must say so for EVERY instantiation.
+            //
+            // An IMPLICIT binder (B186's `fun bump(a: Add)`) has no name to put
+            // in a bound: it displays as its trait, which is the trait's name
+            // and not the parameter's (B218's face). So the steer does not
+            // pretend it has one — it names the rewrite that gives it one,
+            // which is the written form of the very sugar the author used.
+            let named = self.generic_constraint_names.get(constraint_id).copied();
+            let implicit = self.implicit_generic_scopes.contains_key(constraint_id);
+            match (named, implicit) {
+                (Some(name), false) => format!(
+                    "a bound promises a trait's METHODS, never that `{name}` ADMITS an \
+                     `{rhs_label}` — every instantiation of `{name}` decides that for \
+                     itself, and one whose `{trait_name}` declares `B = Self` refuses it. \
+                     Say so in the bound (`<{name}: {trait_name}<{rhs_label}>>`), which \
+                     every instantiation must then satisfy, or make the operand a \
+                     `{declared_label}`"
+                ),
+                _ => format!(
+                    "a bound promises a trait's METHODS, never that the parameter ADMITS an \
+                     `{rhs_label}` — every instantiation decides that for itself, and one \
+                     whose `{trait_name}` declares `B = Self` refuses it. This parameter was \
+                     written as a trait annotation, so it has no name to bind: write it out \
+                     (`fun …<P: {trait_name}<{rhs_label}>>(…: P, …)`), or make the operand \
+                     that same parameter"
+                ),
+            }
         } else {
             format!(
                 "`{symbol}` dispatches to that impl, which reads the value as \
@@ -16263,14 +16295,22 @@ impl<'src> Analyzer<'src> {
     /// through `method_member_in_trait_at`, exactly as a method call on a
     /// bounded receiver takes them.
     ///
-    /// The rule fires only when the right operand is a parameter the ENCLOSING
-    /// declaration owns — `generic_is_rigid_here`, B219's shared predicate,
-    /// asked here with the operator's own scope in `rigid_binder_scope` (this
-    /// check runs in `finalize_build`, outside constraint resolution, where the
-    /// scope is otherwise `None`). A parameter the site is INFERRING is a hole
-    /// the call fills and the call site's own business; a CONCRETE right
-    /// operand against a bounded parameter (`fun bump<P: Add>(a: P) { a + 1 }`)
-    /// is a wider question than this one, left as it stands.
+    /// The LEFT operand must be a parameter the ENCLOSING declaration owns —
+    /// `generic_is_rigid_here`, B219's shared predicate, asked here with the
+    /// operator's own scope in `rigid_binder_scope` (this check runs in
+    /// `finalize_build`, outside constraint resolution, where the scope is
+    /// otherwise `None`). A parameter the site is INFERRING is a hole the call
+    /// fills and the call site's own business.
+    ///
+    /// B246 closed the other half: a CONCRETE right operand
+    /// (`fun bump<P: Add>(a: P) { a + 1 }`), which B233 left as the stated
+    /// boundary. It is the same defect one step along — the bound says what a
+    /// `P` adds, and a bare `P: Add` means `Add<B = Self>`, so an `i32` there
+    /// belongs only if some instantiation's `Add` declares `B = i32`, which
+    /// nothing in the signature promises and `impl Bag with Add<Bag>` flatly
+    /// denies. Census across std, the corpus, the docs fences, the examples,
+    /// the benchmarks, macro_std, the CLI templates, kolt and the website:
+    /// ZERO sites, so nothing in the estate stops compiling.
     fn refuse_operator_right_operand_on_bound(
         &mut self,
         op: BinaryOp,
@@ -16284,15 +16324,26 @@ impl<'src> Analyzer<'src> {
             return false;
         };
         let rhs_type = self.infer_type(rhs_id, lhs_type, &HashMap::default());
-        let Type::Generic(rhs_constraint_id) = rhs_type else {
+        // An operand with no type yet is nobody's verdict.
+        if matches!(rhs_type, Type::Unknown | Type::Unresolved) {
             return false;
+        }
+        let rhs_constraint_id = match rhs_type {
+            Type::Generic(rhs_constraint_id) => Some(rhs_constraint_id),
+            _ => None,
         };
         let scope_id = self.expr_id_to_scope_id_map.get(&binary_id).copied();
         let saved_scope = std::mem::replace(&mut self.rigid_binder_scope, scope_id);
-        let both_rigid = self.generic_is_rigid_here(constraint_id)
-            && self.generic_is_rigid_here(rhs_constraint_id);
+        let left_rigid = self.generic_is_rigid_here(constraint_id);
+        // A right operand that is a parameter must be rigid too (B233); one
+        // that is CONCRETE is checked on the left operand's rigidity alone
+        // (B246) — there is no second declaration to ask about.
+        let right_admissible = match rhs_constraint_id {
+            Some(rhs_constraint_id) => self.generic_is_rigid_here(rhs_constraint_id),
+            None => true,
+        };
         self.rigid_binder_scope = saved_scope;
-        if !both_rigid {
+        if !left_rigid || !right_admissible {
             return false;
         }
         let Some((member_id, declaring_trait_id, declaring_arguments)) = self
