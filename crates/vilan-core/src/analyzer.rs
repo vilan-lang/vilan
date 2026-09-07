@@ -3685,6 +3685,13 @@ pub struct Analyzer<'src> {
     // grounds, checked once that type has settled — rather than as a type the
     // binding is forced to.
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
+    // B251: every WRITTEN application of a struct that declared bounded
+    // parameters — `(struct id, written arguments, span, source, type id)` —
+    // asked after `build()` by `check_written_nominal_bounds`. A type
+    // application binds a declaration's parameters exactly as a call does, but
+    // records nothing into `method_call_substitution`, so the bound check every
+    // call gets never reached it.
+    written_nominal_bound_sites: Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId)>,
     // B182: the annotation slots a REFUSED bare trait resolved to `Unknown`,
     // each with the site its one report was filed at. B161 resolves a refused
     // annotation to `Unknown` "so the one report stands alone instead of
@@ -4571,6 +4578,7 @@ impl<'src> Analyzer<'src> {
             bound_position_type_ids: HashSet::default(),
             path_head_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
+            written_nominal_bound_sites: Vec::new(),
             binding_trait_constraints: Vec::new(),
             refused_annotation_slots: HashMap::default(),
             refused_annotation_traits: HashMap::default(),
@@ -5681,6 +5689,131 @@ impl<'src> Analyzer<'src> {
                 },
                 variable_id,
             );
+        }
+    }
+
+    /// B251: a WRITTEN type application binds a declaration's parameters, so
+    /// its arguments owe the same bounds every other binding owes.
+    ///
+    /// [`Self::check_generic_bound_satisfaction`] asks this of a call (through
+    /// `method_call_substitution`) and of a construction (a struct literal, an
+    /// enum-variant call); a type application records into neither, so
+    /// `struct Held<T, S: Signal<List<T>>> { list: S }` accepted
+    /// `Held<i32, SignalCell<List<str>>>` in any annotation. The bound the
+    /// second argument had to meet is `Signal<List<i32>>` — the first argument
+    /// grounds it — and nothing checked it, so the annotation carried a `str`
+    /// list out through a declared `i32` one.
+    ///
+    /// The sites are recorded at the annotation (the drain over
+    /// `prepped_type_locals`) and asked here, after `build()`, for the reason
+    /// every bound check runs late: impls and argument types are final only
+    /// then. An application already refused on its ARITY records nothing —
+    /// one report per written spelling (B188) — and neither does a path head,
+    /// which applies nothing.
+    fn check_written_nominal_bounds(&mut self) {
+        for (struct_id, written_arguments, span, source_id, type_id) in
+            std::mem::take(&mut self.written_nominal_bound_sites)
+        {
+            let Some(struct_) = self.structs.get(&struct_id) else {
+                continue;
+            };
+            let owner_name = struct_.name;
+            let declared = struct_.generic_parameter_constraint_ids.clone();
+            let parameter_names: Vec<&str> = self
+                .declared_generic_parameters
+                .get(&struct_id)
+                .map(|declared| declared.iter().map(|parameter| parameter.name).collect())
+                .unwrap_or_default();
+            // A declared bound's arguments may name SIBLING parameters
+            // (`S: Signal<List<T>>`) — ground them in this application's own
+            // arguments, exactly as the construction sites do.
+            let declared_bindings: SubstitutionContext = declared
+                .iter()
+                .copied()
+                .zip(written_arguments.iter().copied())
+                .collect();
+            for (index, (constraint_id, argument_type_id)) in
+                declared.iter().zip(&written_arguments).enumerate()
+            {
+                let bound_traits = self.generic_bound_traits(*constraint_id);
+                if bound_traits.is_empty() {
+                    continue;
+                }
+                let argument_type = argument_type_id.get_type(self);
+                // Indeterminate arguments are other diagnostics' business, and
+                // a bare trait in an argument position is the trait-object
+                // error's — the same skip list the call-site check uses.
+                if matches!(
+                    argument_type,
+                    Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
+                ) {
+                    continue;
+                }
+                for (required_trait_id, required_arguments) in &bound_traits {
+                    let required_arguments: Vec<TypeId> = required_arguments
+                        .iter()
+                        .map(|argument| {
+                            let argument = argument.get_type(self);
+                            self.substitute_type(&argument, &declared_bindings)
+                                .get_type_id(self)
+                        })
+                        .collect();
+                    if self.satisfies_trait_bound(
+                        &argument_type,
+                        *required_trait_id,
+                        &required_arguments,
+                        0,
+                    ) {
+                        continue;
+                    }
+                    let Some(trait_label) =
+                        self.bound_trait_label(*required_trait_id, &required_arguments)
+                    else {
+                        continue;
+                    };
+                    let type_label = self.pretty_print_type(&argument_type, &HashMap::default());
+                    let parameter_label = match parameter_names.get(index) {
+                        Some(name) => format!("'{name}'"),
+                        None => format!("{}", index + 1),
+                    };
+                    // A generic argument fails by MISSING the bound on its own
+                    // declaration — name that fix; a concrete one by missing
+                    // the impl. The wording follows the call-site pair, with
+                    // the OWNER and the position it wrote naming where the
+                    // requirement comes from: the bound is written on the
+                    // declaration, not here, so the message has to carry it.
+                    let msg = match matches!(argument_type, Type::Generic(_)) {
+                        true => format!(
+                            "generic parameter '{type_label}' is missing the bound \
+                             ': {trait_label}' required by parameter {parameter_label} of \
+                             '{owner_name}'"
+                        ),
+                        false => format!(
+                            "'{type_label}' does not implement trait '{trait_label}', \
+                             required by the bound on parameter {parameter_label} of \
+                             '{owner_name}'"
+                        ),
+                    };
+                    let note = self
+                        .structs
+                        .get(&struct_id)
+                        .map(|struct_| crate::error::Note {
+                            span: struct_.name_span,
+                            msg: format!("'{owner_name}' is declared here"),
+                            source: self.source_of_id(struct_id),
+                        });
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note,
+                            span,
+                            msg,
+                        },
+                        source_id,
+                        type_id,
+                    );
+                }
+            }
         }
     }
 
@@ -36463,6 +36596,22 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // B251: a parameter reachable ONLY through another parameter's BOUND
+        // (`struct Held<T, S: Signal<List<T>>> { list: S }`) has no field to
+        // ground it — every field names `S` — so both loops above leave it
+        // unbound and the literal typed as `Held<any, SignalCell<List<i32>>>`,
+        // an `any` that then satisfied anything downstream. B186 built the
+        // recovery for CALLS (`derive_generics_from_bounds`: once `S` is
+        // concrete, read `T` back out of `SignalCell<List<i32>>`'s `Signal`
+        // impl); a struct literal binds the same shape through a different
+        // door and never reached it. Same set both ways, exactly as the call
+        // path passes it: the literal's own parameters are what it may bind
+        // and what it must record.
+        self.derive_generics_from_bounds(
+            &literal_param_ids,
+            &literal_param_ids,
+            &mut substitution_context,
+        );
         // Fill the struct's type arguments from the bindings inferred above
         // (`Box { value = 5 }` -> `Box<i32>`), so methods called on the value
         // monomorphize against the concrete element type. A parameter no field
@@ -37334,6 +37483,38 @@ impl<'src> Analyzer<'src> {
                             source_id,
                             type_id,
                         );
+                    }
+                    // B251: the written arguments of a STRUCT application are
+                    // checked against that struct's declared bounds — the same
+                    // question `check_generic_bound_satisfaction` asks of every
+                    // binding a CALL records, which a written type application
+                    // never reaches (nothing records into
+                    // `method_call_substitution` here). Without it
+                    // `struct Held<T, S: Signal<List<T>>>` accepted
+                    // `Held<i32, SignalCell<List<str>>>`: the bound the second
+                    // argument had to meet is `Signal<List<i32>>`, and the
+                    // annotation then handed a `str` list out through a
+                    // declared `i32` one. Recorded here and asked after
+                    // `build()`, where impls and arguments are final; an
+                    // application already refused on its arity has nothing left
+                    // to check (one report per written spelling, B188), and a
+                    // path head applies nothing.
+                    if !refused_arity
+                        && !is_path_head
+                        && !argument_type_ids.is_empty()
+                        && let Type::Struct(struct_id, _) = subject_type
+                        && matches!(
+                            self.expr_id_to_expr_map.get(&subject_id),
+                            Some(Expr::Struct(_))
+                        )
+                    {
+                        self.written_nominal_bound_sites.push((
+                            struct_id,
+                            argument_type_ids.clone(),
+                            span,
+                            source_id,
+                            type_id,
+                        ));
                     }
                     // Attach the written generic arguments to the nominal type
                     // (`Option<i32>` -> `Enum(option_id, [i32])`). A bare name
@@ -49006,6 +49187,9 @@ fn analyze_over_world<'src>(
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
         analyzer.check_binding_hidden_nominal_constraints();
+        // B251's twin of the bound check above, at the third binding channel:
+        // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
+        analyzer.check_written_nominal_bounds();
         analyzer.check_tuple_spreads();
     }
     unless_cancelled! {
