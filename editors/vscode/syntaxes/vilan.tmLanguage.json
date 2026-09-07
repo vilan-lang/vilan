@@ -331,6 +331,15 @@
      }
     },
     {
+     "comment": "The `as` ALIAS in an import path \u2014 `import a::b as c;`, `use a::{ b as c };` (E142/E145). Contextual like `context` and `sync`: the lexer hands `as` back as an identifier and `let as = 1` parses, so the guard is BOTH sides \u2014 an identifier character before it and a name after it, which is the only place the alias can sit.",
+     "match": "(?<=[A-Za-z0-9_])\\s+(as)\\b(?=\\s+[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "keyword.control.import.vilan"
+      }
+     }
+    },
+    {
      "name": "constant.language.vilan",
      "match": "\\b(true|false|null)\\b"
     },

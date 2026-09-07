@@ -2468,6 +2468,10 @@ impl Document {
         if !self.offset_touches_a_token(offset) {
             return None;
         }
+        // An OPERATOR token: the method the operator dispatches to (E149).
+        if let Some(rendered) = self.operator_hover(program, offset) {
+            return Some(rendered);
+        }
         let id = self.entity_at(offset)?;
         // A function (or requirement-carrying binding): the full signature.
         if let Some(target) = self.analysis(program).function_target(id) {
@@ -2540,6 +2544,56 @@ impl Document {
             out.push_str(&requirement);
         }
         out
+    }
+
+    /// The hover for a binary OPERATOR token under `offset`: the declaration
+    /// of the method that operator dispatches to (E149).
+    ///
+    /// `a == b` is a call, and the editor said nothing about it — an operator
+    /// is the one call spelled without a name, so every path that answers "what
+    /// is under the cursor" by resolving an IDENTIFIER answered nothing here,
+    /// including hover, and a reader asking which `eq` runs got a blank.
+    ///
+    /// The answer is not recomputed: B180 already recorded which method each
+    /// binary expression selected (`Program::binary_op_dispatch`), because the
+    /// emitter needs it, so the hover is that record rendered — the editor and
+    /// the emission cannot disagree about which `eq` this `==` is.
+    ///
+    /// `None` where there is no record, which is exactly the native operators:
+    /// native JS IS `1 + 2`'s semantics, nothing dispatches, and there is no
+    /// declaration to show. The gap test is what makes this an OPERATOR hover
+    /// rather than an expression one — the cursor must sit between the two
+    /// operands, not on either of them, so hovering `a` in `a == b` still
+    /// hovers `a`.
+    fn operator_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let entry = SourceId(0);
+        let mut best: Option<(Id, usize)> = None;
+        for (id, expr) in &program.entity_map {
+            let Expr::Binary(_, left, right) = expr else {
+                continue;
+            };
+            if program.source_of(*id) != Some(entry) {
+                continue;
+            }
+            let (Some(left), Some(right)) = (
+                vilan_ide::analysis::span_of(program, *left),
+                vilan_ide::analysis::span_of(program, *right),
+            ) else {
+                continue;
+            };
+            // The operator token is what lies between the operands. A caret on
+            // either operand is that operand's hover, not this one.
+            if !(left.end <= offset && offset < right.start) {
+                continue;
+            }
+            let width = right.start - left.end;
+            if best.is_none_or(|(_, best_width)| width < best_width) {
+                best = Some((*id, width));
+            }
+        }
+        let method = *program.binary_op_dispatch.get(&best?.0)?;
+        let declaration = program.declaration_labels.get(&method)?;
+        Some(self.compose_hover(program, method, declaration, None))
     }
 
     /// The hover for a keyword under `offset`: a one-line meaning and a deep
@@ -3419,6 +3473,14 @@ impl Document {
         };
         self.reference_index
             .occurrences_of(definition)
+            // E149: a generated row indexes a TEMPLATE no file holds, so its
+            // offsets are nobody's text and it cannot become a client
+            // location. `references_across` dropped these as a side effect of
+            // going through `canonical_sources`, which has no entry for
+            // `DERIVED_SOURCE`; this face returned them, so the two disagreed
+            // about what a symbol's references are — the very thing the one
+            // index exists to prevent.
+            .filter(|occurrence| occurrence.source != DERIVED_SOURCE)
             .map(|occurrence| (occurrence.source, occurrence.span))
             .collect()
     }
@@ -3546,8 +3608,31 @@ impl Document {
     pub fn reference_target(&self, offset: usize) -> Option<(Definition, DefinitionKind)> {
         let program = self.program.as_ref()?;
         let occurrence = self.reference_index.at(SourceId(0), offset)?;
-        let kind = crate::references::kind_of(program, occurrence.definition)?;
-        Some((occurrence.definition, kind))
+        // E149: a struct-init shorthand `A { x }` is ONE identifier naming two
+        // definitions (E134), and the row carries whichever of them
+        // `Definition::sort_key` put first — declaration order. So a caret
+        // there answered for the field in one file and for the local in
+        // another, and E143's rename expanded to `renamed = x` or to
+        // `x = renamed` depending on which was declared first. Both are
+        // correct readings of the site; neither is a reason for the editor to
+        // decide by accident. Ruled 2026-09-07: the caret means the LOCAL —
+        // the binding is one hop away by name (`A { x }` reads `x`), where the
+        // field is reached only through the type, and a user who means the
+        // field has its declaration and `a.x` to start from.
+        let definition = match occurrence.co_definition {
+            Some(other) => [occurrence.definition, other]
+                .into_iter()
+                .find(|candidate| {
+                    matches!(
+                        crate::references::kind_of(program, *candidate),
+                        Some(DefinitionKind::Binding)
+                    )
+                })
+                .unwrap_or(occurrence.definition),
+            None => occurrence.definition,
+        };
+        let kind = crate::references::kind_of(program, definition)?;
+        Some((definition, kind))
     }
 
     /// The spans a rename of the symbol under `offset` must rewrite, or the
@@ -4169,6 +4254,12 @@ impl Document {
             // pruning on no evidence is how a green build gets broken.
             return true;
         };
+        // E145: an `as` alias binds a NAME OF ITS OWN, and it is the alias —
+        // not the path segment — that the file's code spells. So the alias's
+        // uses are what keep the import, and an alias for a prelude name is
+        // never redundant: it renames the thing, which is the whole point of
+        // writing it.
+        let alias = program.import_alias_spans.get(&(entry, leaf_span)).copied();
         // (0) The PRELUDE already binds this definition ambiently
         // (`prelude.md` §11.1): the import is redundant, so removing it cannot
         // change what the file means, and leaving it would have the estate
@@ -4177,10 +4268,10 @@ impl Document {
         // my_lib::print;` beside an ambient `std::io::print` is not redundant and
         // survives. This is the action's existing contract ("prune the leaves
         // the analyzer reports as unused") reaching one more kind of unused.
-        if program.prelude_bindings.contains(&definition_id) {
+        if alias.is_none() && program.prelude_bindings.contains(&definition_id) {
             return false;
         }
-        let definition = Definition::Entity(definition_id);
+        let definition = Definition::Entity(alias.unwrap_or(definition_id));
 
         // A reference written by the file's IMPORT LIST is not the file using
         // anything: an import path's segments resolve to the same definitions
@@ -4217,7 +4308,7 @@ impl Document {
         // analyzer's own provenance: did this file resolve anything DECLARED in
         // the file this import reaches into?
         if matches!(
-            crate::references::kind_of(program, definition),
+            crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
         ) && let Some(home) = program.source_of(definition_id)
         {
@@ -4308,6 +4399,103 @@ impl Document {
         candidates
     }
 
+    /// The "Declare the inferred contexts" edit for `diagnostic`, from either
+    /// refusal B242 raises — `None` when it is neither.
+    ///
+    /// ONE fix with two sources, because it is one fix: the same title, the
+    /// same intent, and the book documents one row for it. What differs is
+    /// only where the clause goes.
+    ///
+    ///  - The SUBSET refusal (a declared clause narrower than the body) anchors
+    ///    at the clause's own NAME LIST and SPELLS the clause the body needs,
+    ///    so the fix is that span and the names out of that spelling — the
+    ///    message and the edit are one string and cannot disagree (E58c's
+    ///    rule).
+    ///  - The BOUNDARY refusal (E148) is the one a caller actually meets, and
+    ///    it offers neither. It anchors at the CALL — one function's body
+    ///    naming another function's clause — so the function to edit is not
+    ///    the one the diagnostic points into, and that function declares no
+    ///    clause, so there is no span to overwrite and no spelling to copy.
+    ///    That edit is an INSERTION at the end of a signature, a point nothing
+    ///    in the analyzed program recorded until `Func::signature_end` did.
+    fn declare_contexts_fix(
+        &self,
+        program: &Program,
+        diagnostic: &vilan_core::Error,
+    ) -> Option<(Span, String)> {
+        if let Some(spelling) = declare_contexts_spelling(&diagnostic.msg) {
+            return Some((diagnostic.span, spelling.to_string()));
+        }
+        declare_context_here_name(&diagnostic.msg)?;
+        self.declare_contexts_on_the_caller(program, diagnostic.span)
+    }
+
+    /// E148: the edit that declares, on the function CONTAINING `at`, every
+    /// context B242's boundary refusal names inside it — the zero-width
+    /// insertion point at the end of that function's signature, and the clause
+    /// to write there.
+    ///
+    /// `None` when there is no enclosing function (a top-level call, whose only
+    /// cure is a `run`), when the parser recorded no insertion point for it (a
+    /// synthesized function), or when it already CARRIES a clause — that is
+    /// B242's subset refusal and its own fix, which rewrites the clause in
+    /// place rather than adding a second one.
+    fn declare_contexts_on_the_caller(
+        &self,
+        program: &Program,
+        at: Span,
+    ) -> Option<(Span, String)> {
+        let function = self.enclosing_function(program, at)?;
+        if program
+            .function_context_clause_spans
+            .contains_key(&function)
+        {
+            return None;
+        }
+        let signature_end = program
+            .function_signature_end_spans
+            .get(&function)
+            .copied()?;
+        // Every boundary refusal anchored inside this same function, in source
+        // order, deduplicated — one clause, not one fix per context.
+        let mut names: Vec<&str> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue;
+            }
+            let Some(name) = declare_context_here_name(&diagnostic.msg) else {
+                continue;
+            };
+            if self.enclosing_function(program, diagnostic.span) != Some(function) {
+                continue;
+            }
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        (!names.is_empty()).then(|| (signature_end, context_clause_insertion(&names)))
+    }
+
+    /// The innermost function of THIS file whose declaration contains `span` —
+    /// the function an edit anchored at `span` belongs to (E148).
+    fn enclosing_function(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .functions
+            .keys()
+            .copied()
+            .filter(|id| program.source_of(*id) == Some(SourceId(0)))
+            .filter_map(|id| vilan_ide::analysis::span_of(program, id).map(|whole| (id, whole)))
+            .filter(|(_, whole)| whole.start <= span.start && span.end <= whole.end)
+            .min_by_key(|(_, whole)| whole.end - whole.start)
+            .map(|(id, _)| id)
+    }
+
     /// The quickfix menu for the diagnostics overlapping `range` (LIVE
     /// space — safe because the caller gates staleness first, S3: while
     /// non-stale, live spans and this document's own `diagnostics` spans
@@ -4357,15 +4545,12 @@ impl Document {
                     span: diagnostic.span,
                     replacement: suggestion.to_string(),
                 });
-            } else if let Some(spelling) = declare_contexts_spelling(&diagnostic.msg) {
-                // B242: the subset refusal anchors at the clause's NAME LIST and
-                // carries the clause its body needs, so the fix is that span
-                // and the names out of that spelling — the message and the edit
-                // are one string, and cannot disagree (E58c's rule).
+            } else if let Some((span, replacement)) = self.declare_contexts_fix(program, diagnostic)
+            {
                 fixes.push(QuickFix {
                     title: "Declare the inferred contexts".to_string(),
-                    span: diagnostic.span,
-                    replacement: spelling.to_string(),
+                    span,
+                    replacement,
                 });
             } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
                 // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
@@ -4675,6 +4860,28 @@ fn unresolved_name(message: &str) -> Option<&str> {
 fn declare_contexts_spelling(message: &str) -> Option<&str> {
     let rest = message.split("— write `context ").nth(1)?;
     rest.strip_suffix('`')
+}
+
+/// The context B242's BOUNDARY refusal offers to declare on the caller — the
+/// name after "or declare `context " in
+/// ``… — call it under `s.run(..)`, or declare `context s` here too``.
+/// `None` for every other message (E148).
+fn declare_context_here_name(message: &str) -> Option<&str> {
+    message
+        .split("or declare `context ")
+        .nth(1)?
+        .strip_suffix("` here too")
+}
+
+/// The `context` clause text that declares `names`, as the grammar spells it:
+/// one name bare, several in parentheses (`parse_context_clause`). Written
+/// with its leading space, so it appends to a signature.
+fn context_clause_insertion(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => format!(" context {only}"),
+        many => format!(" context ({})", many.join(", ")),
+    }
 }
 
 /// The suggested name in a "did you mean" note E58 attaches to the
@@ -5765,6 +5972,208 @@ pub(crate) mod tests {
                 "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
             );
         }
+    }
+
+    // E149: hovering an operator answers with the method it dispatches to.
+    //
+    // An operator is the one call spelled without a name, so every path that
+    // answers "what is under the cursor" by resolving an IDENTIFIER answered
+    // nothing at a `==` — a reader asking which `eq` runs got a blank. The
+    // answer is B180's own dispatch record rendered, not a second resolution,
+    // so the editor and the emission cannot disagree about which `eq` this is.
+
+    /// The hover at the offset `needle` locates (plus `at`) in `source`.
+    fn operator_hover_at(source: &str, needle: &str, at: usize) -> Option<String> {
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture must analyze clean: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let hover = document.hover(source.find(needle).expect("the needle") + at);
+        let _ = std::fs::remove_dir_all(&dir);
+        hover
+    }
+
+    /// A user `impl Point with Add` / `with PartialEq`, and a native `+` in the
+    /// impl body as the control.
+    const OPERATOR_IMPLS: &str = "import std::operators::Add;\nimport std::compare::PartialEq;\nimport std::io::print;\n\nstruct Point {\n\tx: i32,\n}\n\nimpl Point with Add {\n\tfun add(self, other: Point): Point {\n\t\tPoint { x = self.x + other.x }\n\t}\n}\n\nimpl Point with PartialEq {\n\tfun eq(self, other: Point): bool {\n\t\tself.x == other.x\n\t}\n}\n\nfun main() {\n\tlet a = Point { x = 1 };\n\tlet b = Point { x = 2 };\n\tlet c = a + b;\n\tif a == b {\n\t\tprint(c.x);\n\t}\n}\n";
+
+    #[test]
+    fn e149_hovering_an_equality_operator_answers_with_its_eq() {
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "if a == b", 5),
+            Some("```vilan\nfun eq(self, other: Point): bool\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_hovering_a_plus_answers_with_its_add() {
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "a + b", 2),
+            Some("```vilan\nfun add(self, other: Point): Point\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_hovering_a_derived_equality_answers_with_the_generated_eq() {
+        // The `==` a user never wrote a method for: `[derive(PartialEq)]`
+        // generates one, the dispatch record names it, and the hover shows it
+        // — which is the answer to "what does this `==` actually run".
+        let source = "import std::compare::PartialEq;\nimport std::io::print;\n\n[derive(PartialEq)]\nstruct Tag {\n\tn: i32,\n}\n\nfun main() {\n\tlet a = Tag { n = 1 };\n\tlet b = Tag { n = 2 };\n\tif a == b {\n\t\tprint(1);\n\t}\n}\n";
+        assert_eq!(
+            operator_hover_at(source, "if a == b", 5),
+            Some("```vilan\nfun eq(self, other: Tag): bool\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_a_native_operator_and_an_operand_are_untouched() {
+        // The two controls that make the pins above claims about DISPATCH
+        // rather than about operator tokens. A native `+` dispatches to
+        // nothing — native JS is its semantics — so there is no declaration to
+        // show and the hover stays empty; and a caret on an OPERAND is still
+        // that operand's hover, because the operator arm asks for a cursor in
+        // the gap BETWEEN the two.
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "self.x + other.x", 7),
+            None,
+        );
+        let on_operand = operator_hover_at(OPERATOR_IMPLS, "a + b", 0);
+        assert!(
+            on_operand.is_some_and(|hover| hover.contains("Point")),
+            "a caret on `a` still hovers the binding",
+        );
+    }
+
+    // E148: B242's BOUNDARY refusal gets the fix too.
+    //
+    // The subset refusal below is the easy half: it anchors at the clause's own
+    // name list and SPELLS the clause the body needs, so the fix is that span
+    // and that string. The boundary refusal is the hard one, and it is the one
+    // a caller actually meets — it anchors at the CALL, inside a function that
+    // declares no clause at all, so there is neither a span to overwrite nor a
+    // spelling to copy. The edit goes on the enclosing `fun`'s signature, at a
+    // point nothing in the analyzed program recorded until `Func::signature_end`
+    // did: after the parameters, after the return type, after a `borrows`
+    // clause, before the body's `{`.
+
+    /// The `(title, span, replacement)` of every fix over `files`, with the
+    /// entry file's text — the shape the E148 pins read.
+    fn boundary_fixes(files: &[(&str, &str)]) -> (Vec<(String, Span, String)>, String) {
+        let (directory, document) = analyze_workspace(files);
+        let program = document.program.as_ref().expect("the fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| (fix.title, fix.span, fix.replacement))
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        (fixes, text)
+    }
+
+    /// The one context fix among `fixes`, asserted to be a ZERO-WIDTH insertion
+    /// immediately after `after` — a declaration fix adds a clause and must
+    /// never overwrite a byte of the signature it lands on. Returns the clause
+    /// it writes.
+    fn context_insertion_after(
+        fixes: &[(String, Span, String)],
+        text: &str,
+        after: &str,
+    ) -> String {
+        let matching: Vec<&(String, Span, String)> = fixes
+            .iter()
+            .filter(|(title, _, _)| title == "Declare the inferred contexts")
+            .collect();
+        assert_eq!(matching.len(), 1, "{fixes:#?}");
+        let (_, span, replacement) = matching[0];
+        let expected = text.find(after).expect("the anchor is in the fixture") + after.len();
+        assert_eq!(
+            (span.start, span.end),
+            (expected, expected),
+            "the fix must insert right after {after:?}, not at {:?}",
+            &text[span.into_range()],
+        );
+        replacement.clone()
+    }
+
+    /// A caller of a context-declaring `render`, with `signature` as its own
+    /// declaration — the fixture every E148 pin varies.
+    fn boundary_caller(signature: &str, body: &str, call: &str) -> String {
+        format!(
+            "import std::io::print;\nimport std::context::Context;\n\n\
+             let settings: Context<i32> = Context::new();\n\n\
+             fun deep(): i32 {{\n\tsettings.get()\n}}\n\n\
+             fun render(x: i32): i32 context settings {{\n\tdeep() + x\n}}\n\n\
+             {signature} {{\n{body}\n}}\n\n\
+             fun main() {{\n\t{call}\n}}\nmain();\n"
+        )
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_on_a_bare_fun() {
+        let source = boundary_caller("fun show()", "\tprint(render(1));", "show();");
+        let (fixes, text) = boundary_fixes(&[("main.vl", &source)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "fun show()"),
+            " context settings",
+        );
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_after_a_return_type() {
+        let source = boundary_caller("fun show(): i32", "\trender(1)", "print(show());");
+        let (fixes, text) = boundary_fixes(&[("main.vl", &source)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "fun show(): i32"),
+            " context settings",
+        );
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_after_a_borrows_clause() {
+        // The clause goes AFTER `borrows slot`, which is the whole reason the
+        // insertion point is the parser's and not "just before the `{`" read
+        // off the return type.
+        let source = boundary_caller(
+            "fun show(slot: &mut i32): &mut i32 borrows slot",
+            "\tprint(render(1));\n\tslot",
+            "let mut n = 0;\n\tlet view = show(&mut n);\n\tprint(*view);",
+        );
+        let (fixes, text) = boundary_fixes(&[("main.vl", &source)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "borrows slot"),
+            " context settings",
+        );
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_in_the_callers_own_file() {
+        // The callee and its clause live in another file; the refusal, the
+        // caller and the edit are all here. (The fix could never reach the
+        // other file anyway — `quickfixes` refuses a diagnostic that is not
+        // this document's — which is why the pin is that it still fires.)
+        let helper = "import std::context::Context;\n\n\
+             let settings: Context<i32> = Context::new();\n\n\
+             fun deep(): i32 {\n\tsettings.get()\n}\n\n\
+             fun render(x: i32): i32 context settings {\n\tdeep() + x\n}\n";
+        let main = "import std::io::print;\nimport pkg::helper::render;\n\n\
+             fun show(): i32 {\n\trender(1)\n}\n\n\
+             fun main() {\n\tprint(show());\n}\nmain();\n";
+        let (fixes, text) = boundary_fixes(&[("main.vl", main), ("helper.vl", helper)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "fun show(): i32"),
+            " context settings",
+        );
     }
 
     // B242: the subset refusal spells the clause the body needs, and the fix
