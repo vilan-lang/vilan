@@ -99,27 +99,27 @@ function dispose(self, $l) {
 function defer(self, cleanup) {
 	self[0].v.push(cleanup);
 }
-function register_with_owner(subscription, $E, $F) {
-	const $G = $F;
-	let $H = null;
-	if ($G[0] === 0) {
-		const owner = $G[1];
-		$H = $I(owner, subscription, $E);
+function register_with_owner(subscription, $F, $G) {
+	const $H = $G;
+	let $I = null;
+	if ($H[0] === 0) {
+		const owner = $H[1];
+		$I = $J(owner, subscription, $F);
 	} else {
-		$H = __clone(subscription);
+		$I = __clone(subscription);
 	}
-	return $H;
+	return $I;
 }
-function defer_to_owner(cleanup, $M) {
-	const $N = $M;
-	let $O = null;
-	if ($N[0] === 0) {
-		const owner = $N[1];
-		$O = defer(owner, cleanup);
+function defer_to_owner(cleanup, $N) {
+	const $O = $N;
+	let $P = null;
+	if ($O[0] === 0) {
+		const owner = $O[1];
+		$P = defer(owner, cleanup);
 	} else {
-		$O = undefined;
+		$P = undefined;
 	}
-	return $O;
+	return $P;
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -185,9 +185,9 @@ function $C(self, observer) {
 	observer($h(self));
 	return subscription;
 }
-function $I(self, item, $J) {
+function $J(self, item, $K) {
 	self[0].v.push(() => {
-		dispose(item, $J);
+		dispose(item, $K);
 		return;
 	});
 	return __clone(item);
@@ -211,80 +211,80 @@ function $e(self, $f, $g) {
 		return;
 	}), $f, $g);
 	defer_to_owner(() => {
-		const $K = inner_subscription.v;
-		let $L = null;
-		if ($K[0] === 1) {
-			$L = $K;
+		const $L = inner_subscription.v;
+		let $M = null;
+		if ($L[0] === 1) {
+			$M = $L;
 		} else {
-			$L = [ 0, dispose($K[1], $f) ];
+			$M = [ 0, dispose($L[1], $f) ];
 		}
-		$L;
+		$M;
 		inner_subscription.v = [ 1 ];
 		return;
 	}, $g);
 	return derived;
 }
-function $Q(self, $t) {
-	const $R = $t;
-	let $S = null;
-	if ($R[0] === 0) {
-		const turn = $R[1];
-		$S = enqueue(turn, self[1].v);
+function $R(self, $t) {
+	const $S = $t;
+	let $T = null;
+	if ($S[0] === 0) {
+		const turn = $S[1];
+		$T = enqueue(turn, self[1].v);
 	} else {
-		const $T = $x(draining_turns.v);
-		let $U = null;
-		if ($T[0] === 0) {
-			const draining = $T[1];
-			$U = enqueue(draining, self[1].v);
+		const $U = $x(draining_turns.v);
+		let $V = null;
+		if ($U[0] === 0) {
+			const draining = $U[1];
+			$V = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$U = undefined;
+			$V = undefined;
 		}
-		$S = $U;
+		$T = $V;
 	}
-	return $S;
+	return $T;
 }
-function $P(self, value, $r) {
+function $Q(self, value, $r) {
 	self[0].v = value;
-	$Q(self, $r);
+	$R(self, $r);
 }
-function $aa(self, $t) {
-	const $ab = $t;
-	let $ac = null;
-	if ($ab[0] === 0) {
-		const turn = $ab[1];
-		$ac = enqueue(turn, self[1].v);
+function $ab(self, $t) {
+	const $ac = $t;
+	let $ad = null;
+	if ($ac[0] === 0) {
+		const turn = $ac[1];
+		$ad = enqueue(turn, self[1].v);
 	} else {
-		const $ad = $x(draining_turns.v);
-		let $ae = null;
-		if ($ad[0] === 0) {
-			const draining = $ad[1];
-			$ae = enqueue(draining, self[1].v);
+		const $ae = $x(draining_turns.v);
+		let $af = null;
+		if ($ae[0] === 0) {
+			const draining = $ae[1];
+			$af = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$ae = undefined;
+			$af = undefined;
 		}
-		$ac = $ae;
+		$ad = $af;
 	}
-	return $ac;
+	return $ad;
 }
-function $Z(self, value, $r) {
+function $aa(self, value, $r) {
 	self[0].v = value;
-	$aa(self, $r);
+	$ab(self, $r);
 }
-function $af(self, observer) {
+function $ag(self, observer) {
 	return $B(self, observer);
 }
-function $V(self, transform, $W, $X) {
+function $W(self, transform, $X, $Y) {
 	const derived = $b(transform($h(self)));
-	register_with_owner($af(self, (value) => {
-		$Z(derived, transform(value), $W);
+	register_with_owner($ag(self, (value) => {
+		$aa(derived, transform(value), $X);
 		return;
-	}), $W, $X);
+	}), $X, $Y);
 	return derived;
 }
 const next_subscriber_id = __shared_new(0);
@@ -296,13 +296,13 @@ const joined = $e(outer, [ 1 ], [ 1 ]);
 console.log($h(joined));
 $q(first, 2, [ 1 ]);
 console.log($h(joined));
-$P(outer, second, [ 1 ]);
+$Q(outer, second, [ 1 ]);
 console.log($h(joined));
 $q(first, 99, [ 1 ]);
 console.log($h(joined));
 $q(second, 11, [ 1 ]);
 console.log($h(joined));
-const doubled = $V(joined, (value) => {
+const doubled = $W(joined, (value) => {
 	return value * 2;
 }, [ 1 ], [ 1 ]);
 $q(second, 21, [ 1 ]);

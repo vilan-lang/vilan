@@ -8821,7 +8821,23 @@ impl<'src> Transformer<'src> {
             self.record_hit(|recorder| recorder.instances.get(&key).copied());
             return name;
         }
-        let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        // COMPOSE with the substitution in force, rather than replacing it
+        // (B244). `resolve_type_id` grounds a bound type only when it is a bare
+        // `Generic`; a bound type that is CONSTRUCTOR-HEADED with a generic
+        // inside — `Option<T>`, the element `List<Option<T>>`'s own conditional
+        // impl binds — cannot be grounded here at all, because the transformer
+        // reads an immutable `Program` and there is no `Option<i32>` to mint.
+        // Replacing the outer bindings therefore stranded that inner `T`: the
+        // nested dispatch bound it to a parameter with nothing behind it, and
+        // the innermost call fell through to the trait's bodyless requirement
+        // (the never-silent `internal:` error). Keeping the outer entries the
+        // inner ones do not shadow leaves the chain walkable — `resolve_type_id`
+        // already follows a binding to a binding — so `T` still reaches `i32`
+        // however many constructors sit between them. Inner wins on a collision;
+        // constraint ids are per-declaration, so the two sets are otherwise
+        // disjoint.
+        let mut substitution: HashMap<TypeId, TypeId> = self.current_substitution.clone();
+        substitution.extend(entries);
         // One entry per distinct instance KEY (see [`INSTANCE_LOG`]): the memo
         // hit above returned, so reaching here is a mint.
         if let Some(function) = self.program.functions.get(&function_id) {
@@ -9308,6 +9324,20 @@ impl<'src> Transformer<'src> {
                 out.push(')');
             }
             Type::Generic(constraint_id) => {
+                // A generic the active substitution binds spells as what it
+                // STANDS FOR (B244). The top-level bound types are resolved
+                // before they reach here, but a generic NESTED inside a bound
+                // type is not — and spelling `List<Option<T>>`'s element as
+                // `G(T)` gave every instantiation of the outer function the
+                // same instance key, merging `Option<i32>` with `Option<str>`.
+                // Following the binding is the same walk `resolve_type_id`
+                // performs and stops at an unbound (or self-bound) parameter,
+                // which stays id-keyed as before.
+                let resolved = self.resolve_type_id(type_id);
+                if resolved != type_id {
+                    self.write_type_key(resolved, out);
+                    return;
+                }
                 let _ = write!(out, "G{}", constraint_id.0);
             }
             // No nested type ids to spell — `Any`, `Never`, `Function(Id)`,

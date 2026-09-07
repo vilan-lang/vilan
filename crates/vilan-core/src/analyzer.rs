@@ -16407,6 +16407,22 @@ impl<'src> Analyzer<'src> {
     ///
     /// Shared by `receiver.member()` and by `for x in receiver`, which drive the
     /// same defaults through the same `GenericDispatch::OnType` channel.
+    ///
+    /// The second half runs over the whole SUPERTRAIT CHAIN, not just the trait
+    /// the `with` clause names (B243). An impl written in ONE block —
+    /// `impl Cell<type T> with Signal<T>` — reaches `Source`'s defaults
+    /// (`map`, `effect_on_change`) through `Signal`'s own `with Source<T>`, and
+    /// those bodies are written in `Source`'s parameters, which are different
+    /// constraint ids from `Signal`'s. Binding only the clause's trait left
+    /// every one of them abstract, so `x.map(|v| v * 2)` typed `v` as the
+    /// TRAIT's `T` and steered the author to `add it where T is declared on
+    /// trait Source` — a std file. Splitting the impl into `with Source<T>` +
+    /// `with Signal<T>` worked only because it made `Source` a clause trait,
+    /// which is A49's recipe for kolt's `StorageSignalCell` and is no longer
+    /// required. `trait_with_supertraits_at` already carries each trait's
+    /// arguments through the chain (B164's substitution), so the walk is the
+    /// same one the bound and default-body paths take; the clause's own trait
+    /// is its first element, so this subsumes what was here.
     fn inherited_default_bindings(
         &mut self,
         subject_type: &Type,
@@ -16419,14 +16435,18 @@ impl<'src> Analyzer<'src> {
             .reconcile_declaration(&impl_subject, subject_type, &impl_subject)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
-        let trait_parameter_ids = self
-            .traits
-            .get(&trait_id)
-            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-            .unwrap_or_default();
-        for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(trait_arguments) {
-            let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
-            bindings.insert(*parameter_id, resolved.get_type_id(self));
+        for (chain_trait_id, chain_arguments) in
+            self.trait_with_supertraits_at(trait_id, trait_arguments)
+        {
+            let trait_parameter_ids = self
+                .traits
+                .get(&chain_trait_id)
+                .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+                .unwrap_or_default();
+            for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(&chain_arguments) {
+                let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
+                bindings.insert(*parameter_id, resolved.get_type_id(self));
+            }
         }
         bindings
     }
@@ -17042,6 +17062,37 @@ impl<'src> Analyzer<'src> {
                         .get(struct_id)
                         .and_then(|struct_| struct_.fields.get(*field_index))
                         .map(|field| field.type_id),
+                );
+            }
+            // B252: a CALL reads its callee's declared return type, and that
+            // annotation is a slot like any other. The call's own result type is
+            // not it — the result is a fresh id the solver grounds from the
+            // signature — so every fallback above missed, and a refused return
+            // annotation cascaded (`cannot call method 'who' on unknown` after
+            // `'Greet' is a trait, not a type`) where the same trait refused at a
+            // closure PARAMETER stood its uses down. The callee's slot is what
+            // the two have in common, exactly as the field's is for a field read.
+            Some(Expr::Call(function_call_id)) => {
+                let callee_id = self
+                    .function_calls
+                    .get(function_call_id)
+                    .map(|call| call.subject_id)
+                    .and_then(
+                        |subject_id| match self.expr_id_to_expr_map.get(&subject_id) {
+                            // A named function reaches its call site as a LOCAL
+                            // reference to the entity (functions are bound in scope
+                            // like any other name), so the binding id is the
+                            // function id; `Expr::Function` is the declaration form.
+                            Some(Expr::Function(id) | Expr::Local(id) | Expr::Variable(id)) => {
+                                Some(*id)
+                            }
+                            _ => None,
+                        },
+                    );
+                slots.extend(
+                    callee_id
+                        .and_then(|function_id| self.functions.get(&function_id))
+                        .and_then(|function| function.return_type_id),
                 );
             }
             _ => {}

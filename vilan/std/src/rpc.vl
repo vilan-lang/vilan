@@ -1636,15 +1636,7 @@ fun send_patch<K: Wire, T: Wire>(
 	ops: List<Delta<K, T>>,
 ) {
 	transport.send(encode_patch(codec, channel, |serializer: Serializer| {
-		// The list is narrated element by element rather than through
-		// `List<Delta<K, T>>`'s own `Wire` impl: a conditional impl reached
-		// through two generic parameters at once has no concrete receiver to
-		// dispatch from here, and the shape is the same either way.
-		(serializer.begin_list)(ops.len());
-		for op in ops {
-			op.describe(serializer);
-		}
-		(serializer.end_list)();
+		ops.describe(serializer);
 	}));
 }
 

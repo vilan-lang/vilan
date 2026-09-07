@@ -2574,3 +2574,305 @@ fn b184_the_sugar_emits_exactly_what_the_written_generic_emits() {
         "one consumer body per hidden argument:\n{sugared}"
     );
 }
+
+// --- B252: a refused RETURN annotation stands its uses down too --------------
+//
+// B182's stand-down is keyed on the annotation's SLOT — the type id the
+// refusal resolved to `Unknown` — and every consumer reaches it through the
+// expression that reads it: a binding, a parameter, a field. A CALL reads its
+// callee's return annotation, but the call's own result type is a fresh id the
+// solver grounds from the signature, not the annotation's slot, so the covered
+// set missed it and a refused return cascaded (`cannot call method 'who' on
+// unknown`) where the same trait refused at a closure PARAMETER stood down.
+// The callee's declared return type id is what the two have in common.
+
+#[test]
+fn b252_a_refused_return_annotation_does_not_cascade_through_its_uses() {
+    // The exhibit: one mistake, one report. `Greet` in return position is
+    // refused (with the steer to a generic return), and the call's use is that
+    // refusal restated in the vocabulary of a type the author never wrote.
+    let source = format!(
+        r#"{GREET}
+        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().greet());
+        }}
+        main();
+        "#
+    );
+    assert_fails_once_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_without(&source, "on unknown");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused annotation is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b252_a_field_read_through_a_refused_return_stands_down_as_well() {
+    // The second of B182's three consumers, reached the same way: the field
+    // access asks the same covered set of the same slot, so widening the set
+    // answers for both halves at once.
+    let source = format!(
+        r#"{GREET}
+        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().name);
+        }}
+        main();
+        "#
+    );
+    assert_fails_once_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_without(&source, "cannot access field");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused annotation is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b252_an_unrelated_unknown_still_reports_beside_a_refused_return() {
+    // E104's lesson at this grain, the same control B182's own pin carries: the
+    // stand-down is asked PER CALL, of the slot that call's callee declares —
+    // never of "is this type unknown". B188's arity refusal resolves `Holder`
+    // to `Unknown` under a rule this family knows nothing about, and a call on
+    // THAT still refuses, in the same program whose `pick()` stands down.
+    let source = format!(
+        r#"{GREET}
+        struct Holder<T> {{ v: T }}
+        struct Other {{ held: Holder }}
+        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().greet());
+            let other = Other {{ held = 1 }};
+            print(other.held.length());
+        }}
+        main();
+        "#
+    );
+    assert_fails_with(&source, "'Greet' is a trait, not a type");
+    assert_fails_with(&source, "`Holder` takes 1 type argument, 0 given");
+    assert_fails_with(&source, "cannot call method 'length' on unknown");
+    assert_fails_without(&source, "'greet' on unknown");
+}
+
+#[test]
+fn b252_a_missing_method_on_a_well_typed_return_still_reports() {
+    // The non-vacuity control: the widening must not silence a call whose
+    // callee's return annotation is perfectly good. `Dog` has no `bark`, and
+    // that is a mistake nobody has been told about.
+    let source = format!(
+        r#"{GREET}
+        fun pick(): Dog {{ Dog {{ name = "rex" }} }}
+        fun main() {{
+            print(pick().bark());
+        }}
+        main();
+        "#
+    );
+    assert_fails_with(&source, "no method 'bark'");
+}
+
+// --- B243: a one-block sub-trait impl substitutes the whole chain ------------
+//
+// `impl Cell<type T> with Signal<T>` reaches `Source`'s defaults — `map`,
+// `effect_on_change` — through `Signal`'s own `with Source<T>`, and those
+// bodies are written in `Source`'s parameters, which are DIFFERENT constraint
+// ids from `Signal`'s. `inherited_default_bindings` bound only the parameters
+// of the trait the `with` clause names, so every one of them stayed abstract:
+// `x.map(|v| v * 2)` typed `v` as the trait's `T` and steered the author to
+// "add it where `T` is declared on `trait Source`" — a std file, and no fix.
+// Splitting the impl into `with Source<T>` + `with Signal<T>` worked only
+// because it made `Source` a clause trait; that is A49's recipe for kolt's
+// `StorageSignalCell`, and it is no longer required.
+//
+// B216's `supertrait_position_type` is the neighbour: the same "a supertrait's
+// member is written in ITS terms" fact, decided there for an ambiguous `Self`
+// position and here for the trait's own parameters. The walk is B164's
+// `trait_with_supertraits_at`, which already carries each trait's arguments
+// through the chain.
+
+#[test]
+fn b243_a_one_block_sub_trait_impl_grounds_a_supertrait_defaults_closure_parameter() {
+    // The exhibit, in the user's own vocabulary so nothing depends on std's
+    // shape: `mapped` is a `Src` default, the impl names only `Sig`, and the
+    // closure parameter must be the `i32` the receiver binds. Before the fix
+    // this refused with "`*` on `T` needs `T: Mul`", naming a parameter
+    // declared on a trait the author did not write the impl against.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Src<T> {
+            fun get(self): T;
+            fun mapped(self, transform: sync |T| T): T { transform(self.get()) }
+        }
+
+        trait Sig<T> with Src<T> {
+            fun label(self): str;
+        }
+
+        struct Cell<T> { v: T }
+
+        impl Cell<type T> with Sig<T> {
+            fun get(self): T { self.v }
+            fun label(self): str { "cell" }
+        }
+
+        fun main() {
+            let c = Cell { v = 3 };
+            print(c.mapped(|n| n * 2));
+            print(c.label());
+        }
+        main();
+        "#,
+        "6\ncell\n",
+    );
+}
+
+#[test]
+fn b243_a_one_block_signal_impl_reaches_source_map_and_effect_on_change() {
+    // The shape the item was filed on, against std's own traits: `map` and
+    // `effect_on_change` are `Source` defaults, the impl writes one block of
+    // `Signal<T>`, and the derived cell tracks the writes. `10` is the
+    // owner-registered effect firing on the change, `2` and `10` the derived
+    // value before and after.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source, SignalCell, Subscription, comp };
+
+        struct Cell<T> { inner: SignalCell<T> }
+
+        impl Cell<type T> with Signal<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+            fun set(self, value: T) { self.inner.set(value) }
+            fun notify(self) { self.inner.notify() }
+        }
+
+        fun main() {
+            let c = Cell { inner = Signal::new(1) };
+            let doubled = c.map(|v| v * 2);
+            print(doubled.get());
+            let (_built, scope) = comp(|| {
+                c.effect_on_change(|v| print(v + 10));
+            });
+            c.set(5);
+            print(doubled.get());
+            scope.dispose();
+        }
+        main();
+        "#,
+        "2\n15\n10\n",
+    );
+}
+
+#[test]
+fn b243_the_split_impl_still_works() {
+    // A49's recipe, kept green: making `Source` a clause trait of its own was
+    // the workaround, and the fix must not cost it. Same program, two blocks.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source, SignalCell, Subscription };
+
+        struct Cell<T> { inner: SignalCell<T> }
+
+        impl Cell<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        impl Cell<type T> with Signal<T> {
+            fun set(self, value: T) { self.inner.set(value) }
+            fun notify(self) { self.inner.notify() }
+        }
+
+        fun main() {
+            let c = Cell { inner = Signal::new(1) };
+            let doubled = c.map(|v| v * 2);
+            print(doubled.get());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b243_a_supertrait_parameter_the_clause_fixes_grounds_to_what_it_fixed() {
+    // The chain carries ARGUMENTS, not just names (B164's substitution, which
+    // is what `trait_with_supertraits_at` is for): a sub-trait that fixes its
+    // supertrait's parameter to a concrete type grounds the default's closure
+    // parameter to THAT type, not to the impl's own.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Src<T> {
+            fun get(self): T;
+            fun mapped(self, transform: sync |T| T): T { transform(self.get()) }
+        }
+
+        trait Counted with Src<i32> {
+            fun label(self): str;
+        }
+
+        struct Cell { v: i32 }
+
+        impl Cell with Counted {
+            fun get(self): i32 { self.v }
+            fun label(self): str { "cell" }
+        }
+
+        fun main() {
+            let c = Cell { v = 4 };
+            print(c.mapped(|n| n + 1));
+        }
+        main();
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b243_an_unbounded_parameter_is_still_refused_in_the_default_itself() {
+    // The non-vacuity control: the widening grounds a parameter at the CALL,
+    // and must not make the default's own body typecheck against a parameter
+    // that promises nothing. `T` is unbounded on `Src`, so `*` inside the
+    // default is the same refusal it always was.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Src<T> {
+            fun get(self): T;
+            fun twice(self): T { self.get() * 2 }
+        }
+
+        struct Cell<T> { v: T }
+
+        impl Cell<type T> with Src<T> {
+            fun get(self): T { self.v }
+        }
+
+        fun main() {
+            let c = Cell { v = 3 };
+            print(c.twice());
+        }
+        main();
+        "#,
+        "needs `T: Mul`",
+    );
+}

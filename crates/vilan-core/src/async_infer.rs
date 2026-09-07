@@ -615,14 +615,20 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
         }
         // An INHERITED default called on a concrete value carries no trait
         // either, and the receiver is not `Self`, so it keeps the widest answer.
-        GenericDispatch::OnType(Some(_), member) => members_named(program, member),
+        // An INHERITED default called on a concrete value: the receiver is
+        // KNOWN, and it is narrowed by exactly the same fact as the `self` call
+        // below (B254). Recording this dispatch at all means the receiver's own
+        // impl chain reached a trait declaring `member` — so an unrelated type's
+        // same-named member can never be selected here either.
+        GenericDispatch::OnType(Some(_), member) => trait_subject_candidates(program, member),
         // A `self` call inside a default BODY: narrowed to what a `Self` can be.
-        GenericDispatch::OnType(None, member) => default_body_candidates(program, member),
+        GenericDispatch::OnType(None, member) => trait_subject_candidates(program, member),
     }
 }
 
-/// The candidate set for a `self` re-dispatch inside a trait DEFAULT body
-/// (`GenericDispatch::OnType(None, member)`).
+/// The candidate set for an `OnType` dispatch — a `self` re-dispatch inside a
+/// trait DEFAULT body (`OnType(None, member)`) and an INHERITED default reached
+/// on a concrete value (`OnType(Some(receiver), member)`) alike.
 ///
 /// The record does not carry its trait, so the fallback answer is every
 /// same-named member — and that set is wide by a class no such call can ever
@@ -644,7 +650,17 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
 /// `|| Subscription` fields, then reported the field-escape divergence against
 /// std's own source. Same shape as the same-named-STATIC miscoloring
 /// `is_self_method` closed: a name collision reaching across unrelated types.
-fn default_body_candidates(program: &Program, member: &str) -> Vec<Id> {
+///
+/// B254 is the KNOWN-receiver sibling, and the argument is the same one: a
+/// dispatch is recorded here only because the receiver's own impl chain reached
+/// a trait declaring `member` (`inherited_default_candidates`), so the receiver
+/// implements such a trait and an unrelated type's member is no more selectable
+/// than it was for `Self`. Only the `_for` call sites narrowed before, and they
+/// are the per-instantiation refinement rather than the answer every caller
+/// gets. `call_graph::successors` and `init_order` read this same set to build
+/// reachability edges, so the narrowing removes bogus edges there too — strictly
+/// more accurate in the same direction.
+fn trait_subject_candidates(program: &Program, member: &str) -> Vec<Id> {
     // The traits that could own the body: the ones declaring `member`, plus —
     // since a member reached from a SUPERTRAIT is declared there and inherited
     // here (B205) — every trait whose supertraits reach one. Closing the set

@@ -6220,3 +6220,134 @@ fn b220_an_array_impls_method_is_not_reachable_at_another_length() {
         "[i32; 3] has no method 'first'",
     );
 }
+
+// --- B254: the KNOWN-receiver sibling of a49-async's narrowing ---------------
+//
+// a49-async narrowed `GenericDispatch::OnType(None, member)` — a `self` call
+// inside a trait default body — to the trait's own subjects. The other half of
+// the record, `OnType(Some(receiver), member)`, kept the widest answer: every
+// same-named member in the program, however unrelated its type. Only the `_for`
+// call sites (platform coloring's per-instantiation refinement) narrowed, and
+// that is not the answer every caller gets — `call_graph::successors` and
+// `init_order` read the unrefined set, as does async inference.
+//
+// The argument is the same one. This dispatch is recorded only because the
+// receiver's own impl chain reached a trait declaring `member`, so the receiver
+// implements such a trait and an unrelated type's inherent member is no more
+// selectable here than it was for `Self`.
+
+#[test]
+fn b254_an_inherited_default_on_a_concrete_value_is_not_colored_by_an_unrelated_async_member() {
+    // The exhibit, in `a_trait_default_starter_stored_in_a_plain_field_is_not_
+    // refused`'s own shape one level up: the starter calls the INHERITED
+    // default on a concrete `Cell`, and `Client` — which implements nothing —
+    // spells an async inherent member of that name. Refused as a field escape
+    // before the narrowing, for a program that awaits nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Client { }
+
+        impl Client {
+            async fun doubled(self): i32 { 1 }
+        }
+
+        trait Peek {
+            fun get(self): i32;
+            fun doubled(self): i32 { self.get() * 2 }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Peek {
+            fun get(self): i32 { self.n }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            let holder = Holder { start = || cell.doubled() };
+            print((holder.start)());
+        }
+        "#,
+        "14\n",
+    );
+}
+
+#[test]
+fn b254_a_genuinely_async_override_on_another_implementor_still_colors_the_dispatch() {
+    // The control that keeps it a NARROWING: `Slow` implements the dispatching
+    // trait and overrides the default with an async member, so it is a member
+    // the receiver's dispatch could select at another instantiation — the
+    // over-approximation stands and the store is still refused.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Peek {
+            fun get(self): i32;
+            fun doubled(self): i32 { self.get() * 2 }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Peek {
+            fun get(self): i32 { self.n }
+        }
+
+        struct Slow { n: i32 }
+        impl Slow with Peek {
+            fun get(self): i32 { self.n }
+            async fun doubled(self): i32 { self.n }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            let holder = Holder { start = || cell.doubled() };
+            print((holder.start)());
+        }
+        "#,
+        "receives an async closure",
+    );
+}
+
+#[test]
+fn b254_a_blanket_impls_async_member_is_still_a_candidate() {
+    // The second control, on the arm the narrowing deliberately keeps whole: a
+    // blanket subject has no nominal head to test, applies to whatever binds —
+    // this trait's implementors included — and stays a candidate. Still
+    // refused, and it must be.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Marker { fun mark(self): i32; }
+
+        trait Peek {
+            fun get(self): i32;
+            fun doubled(self): i32 { self.get() * 2 }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Peek {
+            fun get(self): i32 { self.n }
+        }
+
+        impl type T: Marker {
+            async fun doubled(self): i32 { 1 }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            let holder = Holder { start = || cell.doubled() };
+            print((holder.start)());
+        }
+        "#,
+        "receives an async closure",
+    );
+}
