@@ -3295,6 +3295,14 @@ pub struct Analyzer<'src> {
     // binds a view and a value annotation binds a value. Absent ⇒ no annotation.
     binding_annotation_view: HashMap<Id, bool>,
     prepped_imports: PreppedImports<'src>,
+    /// Every `as` alias in the program, by its own entity id (E145).
+    import_aliases: IndexMap<Id, ImportAlias<'src>>,
+    /// Every identifier that SPELLS an alias: `(file, span)` → alias id
+    /// (E145). The scope binds the target, so a use's `Expr::Local` names the
+    /// target and nothing in the resolved program says which of the two names
+    /// the page carries; this table does. Filled once, after resolution, by
+    /// [`Analyzer::collect_import_alias_spans`].
+    import_alias_spans: HashMap<(SourceId, Span), Id>,
     // Macro invocations (macro-engine.md §2), keyed by the invocation NODE's
     // address (stable: all walked ASTs are leaked or outlive the analysis).
     // Item-position invocations walk to nothing (their output was appended to
@@ -4326,6 +4334,34 @@ fn operator_trait_required_method(trait_name: &str) -> Option<(&'static str, &'s
     }
 }
 
+/// An `as` alias, as a NAME OF ITS OWN (E145).
+///
+/// `import a::b as c` binds `c`, and `c` is not a second spelling of `b` — it
+/// is a declaration the importing file makes, whose target happens to live
+/// elsewhere. Recording it as a spelling is what made a rename through an
+/// alias COLLAPSE it (`greet as hello` renamed to `greeting as greeting`), and
+/// what made an alias whose name is a different LENGTH from its target's
+/// disappear from the reference index entirely: every use narrowed against the
+/// target's name, so `greet as hi` dropped both calls and rename answered
+/// "there is no symbol to rename here".
+///
+/// The alias therefore gets an entity id, a name, and a declaration span, and
+/// the uses that resolve THROUGH it are recorded against it
+/// ([`Analyzer::import_alias_uses`]). The scope still binds the target
+/// directly, so nothing about typing, dispatch or code generation changes: this
+/// is an editor-facing identity, and it is deliberately the only thing it is.
+#[derive(Clone, Copy, Debug)]
+pub struct ImportAlias<'src> {
+    /// The alias as written — the name this file binds and its code uses.
+    pub name: &'src str,
+    /// The alias's own span: its declaration site.
+    pub name_span: Span,
+    /// The file the `import`/`use` statement is written in.
+    pub source: SourceId,
+    /// The definition the aliased path resolved to.
+    pub target: Id,
+}
+
 /// The queue an `import`/`use` statement's leaves wait in until the world can
 /// resolve them: the namespace path, the leaf name the path RESOLVES to, the
 /// scope the statement binds into, the statement's span, the leaf's span, the
@@ -4490,6 +4526,8 @@ impl<'src> Analyzer<'src> {
             reported_literal_errors: HashSet::default(),
             binding_annotation_view: HashMap::default(),
             prepped_imports: Vec::new(),
+            import_aliases: IndexMap::default(),
+            import_alias_spans: HashMap::default(),
             macro_item_invocations: HashSet::default(),
             macro_signatures: HashMap::default(),
             macro_expression_expansions: HashMap::default(),
@@ -30450,7 +30488,109 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The alias id a use of `name` in `source` that resolved to `target` goes
+    /// through, if any (E145). A file binds each alias once, and the alias's
+    /// own name is what the file's code spells, so the triple is an address.
+    fn alias_binding(&self, source: SourceId, name: &str, target: Id) -> Option<Id> {
+        self.import_aliases
+            .iter()
+            .find(|(_, alias)| {
+                alias.source == source && alias.name == name && alias.target == target
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Registers `name` as an alias declaration of its own and returns its id
+    /// (E145). Idempotent: the import drain re-attempts a deferred import, and
+    /// a second id for one `as` would double the alias's declaration row.
+    fn record_import_alias(
+        &mut self,
+        source: SourceId,
+        name: &'src str,
+        name_span: Span,
+        target: Id,
+    ) -> Id {
+        if let Some(existing) = self.alias_binding(source, name, target) {
+            return existing;
+        }
+        let id = self.new_entity_id();
+        self.import_aliases.insert(
+            id,
+            ImportAlias {
+                name,
+                name_span,
+                source,
+                target,
+            },
+        );
+        id
+    }
+
+    /// Fills [`Analyzer::import_alias_spans`] once resolution is done (E145).
+    ///
+    /// Which of an alias's two names an identifier carries is a fact about the
+    /// TEXT, not about the resolved program: the scope binds `c` straight to
+    /// what `a::b` resolved to, so a use of `c` and a use of `b` produce the
+    /// same `Expr::Local(b)`. Asking the source is therefore not a shortcut
+    /// around a better answer — it is the only place the answer exists. It is
+    /// asked once, after the walk, rather than at each resolution site, because
+    /// imports and uses drain in an order neither one controls.
+    ///
+    /// A program with no `as` in it does no work here at all.
+    fn collect_import_alias_spans(&mut self) {
+        if self.import_aliases.is_empty() {
+            return;
+        }
+        let mut found: Vec<((SourceId, Span), Id)> = Vec::new();
+        let note = |analyzer: &Self,
+                    found: &mut Vec<((SourceId, Span), Id)>,
+                    source: SourceId,
+                    span: Span,
+                    target: Id| {
+            let Some(spelled) = analyzer.spelling_at(source, span.into_range()) else {
+                return;
+            };
+            if let Some(alias_id) = analyzer.alias_binding(source, spelled, target) {
+                found.push(((source, span), alias_id));
+            }
+        };
+        // The alias's own declaration: `c` in `import a::b as c`.
+        for (alias_id, alias) in &self.import_aliases {
+            found.push(((alias.source, alias.name_span), *alias_id));
+        }
+        // Type positions, import/`use` path segments, match-pattern segments,
+        // macro names — everything the analyzer records AS a reference.
+        for (source, span, definition, _) in &self.type_references {
+            if let Some(target) = definition {
+                note(self, &mut found, *source, *span, *target);
+            }
+        }
+        // Value positions: a bare name resolved to the entity it reads.
+        for (use_id, expr) in &self.expr_id_to_expr_map {
+            let (Expr::Local(target) | Expr::Variable(target) | Expr::Parameter(target)) = expr
+            else {
+                continue;
+            };
+            if use_id == target {
+                continue;
+            }
+            let (Some(source), Some(span)) =
+                (self.source_of_id(*use_id), self.span_map.get(use_id))
+            else {
+                continue;
+            };
+            note(self, &mut found, source, **span, *target);
+        }
+        self.import_alias_spans = found.into_iter().collect();
+    }
+
     fn record_reference(&mut self, source_id: SourceId, span: Span, target_id: Id) {
+        // An alias has no expression of its own; its label is the aliased
+        // item's, so hover over `c` in `import a::b as c` still reads `b`.
+        let target_id = match self.import_aliases.get(&target_id) {
+            Some(alias) => alias.target,
+            None => target_id,
+        };
         let label_type = match self.expr_id_to_expr_map.get(&target_id) {
             Some(Expr::Enum(id)) | Some(Expr::EnumVariant(id, _)) => Type::Enum(*id, Vec::new()),
             Some(Expr::Struct(id)) => Type::Struct(*id, Vec::new()),
@@ -30679,6 +30819,7 @@ impl<'src> Analyzer<'src> {
         // exists.
         let bind_name = match alias {
             Some((alias, alias_span)) => {
+                self.record_import_alias(source_id, alias, alias_span, target_id);
                 self.record_reference(source_id, alias_span, target_id);
                 alias
             }
@@ -37133,6 +37274,7 @@ impl<'src> Analyzer<'src> {
                 // and rename through it.
                 let bind_name = match alias {
                     Some((alias, alias_span)) => {
+                        self.record_import_alias(source_id, alias, alias_span, current);
                         self.record_reference(source_id, alias_span, current);
                         alias
                     }
@@ -42352,6 +42494,14 @@ pub struct Program<'src> {
     // label)`. Type names aren't entities, so this drives go-to-definition and
     // hover on them (e.g. `Option`, `i32`, a trait bound).
     pub type_references: Vec<(SourceId, Span, Option<Id>, String)>,
+    /// Every `as` alias, by its own entity id (E145) — a declaration the
+    /// importing file makes, whose target lives elsewhere.
+    pub import_aliases: IndexMap<Id, ImportAlias<'src>>,
+    /// Every identifier that SPELLS an alias: `(file, span)` → alias id (E145).
+    /// The reference index reads it to attribute a row to the name the page
+    /// actually carries, which is what lets the alias and its target rename
+    /// independently.
+    pub import_alias_spans: HashMap<(SourceId, Span), Id>,
     // The definitions this package's PRELUDE binds ambiently (`prelude.md`
     // §11.1). Organize Imports reads it to strip an import the prelude already
     // covers: an import whose leaf resolves to one of these definitions binds
@@ -49633,6 +49783,8 @@ fn analyze_over_world<'src>(
         expr_types.insert(trait_id, label);
     }
 
+    // E145: which identifiers spell an `as` alias rather than its target.
+    analyzer.collect_import_alias_spans();
     // Render each type reference's hover label now that all types are resolved.
     let type_references = analyzer
         .type_references
@@ -49864,6 +50016,8 @@ fn analyze_over_world<'src>(
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,
+        import_aliases: std::mem::take(&mut analyzer.import_aliases),
+        import_alias_spans: std::mem::take(&mut analyzer.import_alias_spans),
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         declaration_labels,

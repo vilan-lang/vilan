@@ -34,6 +34,14 @@
 //!    that cannot be narrowed is dropped rather than emitted wrong, and the drop
 //!    is *counted*, so an incomplete answer can be refused instead of silently
 //!    returned.
+//!
+//!    It held with ONE exception until E145: an `as` alias was a second
+//!    spelling of its target, so an alias row's text was not its definition's
+//!    name. The exception was also a defect — an alias of a different LENGTH
+//!    from its target could not be narrowed at all, so every use of it was
+//!    dropped and the symbol vanished from the editor. An alias is a
+//!    definition of its own now (`Program::import_aliases`), and the invariant
+//!    has no exception left.
 //! 2. **No two rows share a span IN A FILE.** The analyzer records some
 //!    references more than once (a struct's constructor name lands in both
 //!    `type_references` and `struct_initializer_to_def`; a match pattern's
@@ -143,6 +151,9 @@ pub enum DefinitionKind {
     Variant,
     Trait,
     Module,
+    /// An `as` alias — a name the importing file declares for something
+    /// declared elsewhere (E145).
+    Alias,
 }
 
 impl DefinitionKind {
@@ -157,6 +168,7 @@ impl DefinitionKind {
             DefinitionKind::Variant => "enum variant",
             DefinitionKind::Trait => "trait",
             DefinitionKind::Module => "module",
+            DefinitionKind::Alias => "import alias",
         }
     }
 }
@@ -325,6 +337,27 @@ impl ReferenceIndex {
                 *dropped.entry(definition).or_default() += 1;
                 return;
             };
+            // E145: this identifier may SPELL an `as` alias rather than the
+            // definition the scope bound it to. The alias is a declaration of
+            // its own, so the row names the alias — and it is narrowed against
+            // the ALIAS's name, which is the half that was silently fatal:
+            // `import pkg::helper::greet as hi` narrowed each `hi()` against
+            // `greet`, the lengths disagreed, and both uses were dropped, so
+            // find-references answered nothing and rename answered "there is
+            // no symbol to rename here". An alias whose name happened to be
+            // the same length survived — spelling its target's name back at
+            // INVARIANT 1, which is the exception this removes.
+            let (name, anchor, definition) = match program.import_alias_spans.get(&(source, span)) {
+                Some(alias_id) if Definition::Entity(*alias_id) != definition => {
+                    match program.import_aliases.get(alias_id) {
+                        // An alias is always written as a bare identifier, so
+                        // its span is the name exactly.
+                        Some(alias) => (alias.name, Anchor::Exact, Definition::Entity(*alias_id)),
+                        None => (name, anchor, definition),
+                    }
+                }
+                _ => (name, anchor, definition),
+            };
             match narrow(span, name, anchor) {
                 Some(span) => rows.push(Occurrence {
                     source,
@@ -338,10 +371,25 @@ impl ReferenceIndex {
         };
 
         // --- Declarations -------------------------------------------------
+        // An `as` alias declares a name (E145): `import a::b as c` is where `c`
+        // comes from, and `c` renames independently of `b` because it is not a
+        // second spelling of it — it is this file's own name for it.
         // Every declaration span comes from a table that stores a NAME span.
         // `span_map` is consulted only where its entry *is* the name (a
         // parameter), never as a general fallback — falling back to it is what
         // used to put a whole `fun … { … }` declaration into a rename.
+        for (id, alias) in &program.import_aliases {
+            push(
+                &mut rows,
+                &mut dropped,
+                Some(alias.source),
+                Some(alias.name_span),
+                alias.name,
+                Anchor::Exact,
+                Definition::Entity(*id),
+                true,
+            );
+        }
         for (id, variable) in &program.variables {
             push(
                 &mut rows,
@@ -841,6 +889,9 @@ pub fn name_of<'a>(program: &'a Program, definition: Definition) -> Option<&'a s
             .and_then(|structure| structure.fields.get(index))
             .map(|field| field.name),
         Definition::Entity(id) => {
+            if let Some(alias) = program.import_aliases.get(&id) {
+                return Some(alias.name);
+            }
             if let Some(variable) = program.variables.get(&id) {
                 return Some(variable.name);
             }
@@ -878,6 +929,9 @@ pub fn kind_of(program: &Program, definition: Definition) -> Option<DefinitionKi
     match definition {
         Definition::Field(..) => Some(DefinitionKind::Field),
         Definition::Entity(id) => {
+            if program.import_aliases.contains_key(&id) {
+                return Some(DefinitionKind::Alias);
+            }
             if program.variables.contains_key(&id) || program.parameters.contains_key(&id) {
                 return Some(DefinitionKind::Binding);
             }
@@ -909,6 +963,12 @@ pub fn kind_of(program: &Program, definition: Definition) -> Option<DefinitionKi
 /// this import reaches into?"
 pub fn declaration_source(program: &Program, definition: Definition) -> Option<SourceId> {
     match definition {
+        // An alias id is minted while the import queue drains, after the file
+        // walks that own the entity ranges, so `source_of` cannot place it —
+        // the alias records its own file (E145).
+        Definition::Entity(id) if program.import_aliases.contains_key(&id) => {
+            program.import_aliases.get(&id).map(|alias| alias.source)
+        }
         Definition::Entity(id) => program.source_of(id),
         Definition::Field(struct_id, _) => program.source_of(struct_id),
     }
@@ -2148,30 +2208,37 @@ fun main(): i32 {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- E142: an `as` alias is a second SPELLING of one definition ----------
+    // --- E145: an `as` alias is a NAME OF ITS OWN ---------------------------
     //
-    // The scope binds the alias to the very entity the path resolved to, which
-    // is what makes an alias a rename rather than a copy — so find-references
-    // and rename see ONE symbol with two spellings, exactly as they do for a
-    // prelude name and an explicit import of it. Every use site spelled by the
-    // alias is a reference to the aliased item, the alias itself is one too,
-    // and so is the path segment it renames — the segment always was.
+    // E142 built the alias as a second SPELLING of one definition: the scope
+    // binds `c` to whatever `a::b` resolved to, so find-references and rename
+    // saw one symbol with two names and rewrote both. That answer had two
+    // costs, and the second one was fatal.
     //
-    // Rename therefore rewrites ALL FOUR, which is the only complete answer
-    // available while an alias is a spelling rather than a definition of its
-    // own: rewriting the uses and not the alias leaves the import binding a
-    // name nothing uses, and rewriting the alias and not the path segment
-    // leaves the import naming an item that no longer exists. The cost is that
-    // renaming through an alias collapses it (`greet as hello` becomes
-    // `greeting as greeting`), which is a compiling program and a redundant
-    // one. Making the alias its own definition — so the two names rename
-    // independently — needs an entity that forwards to the target through
-    // typing, and is recorded rather than built here.
+    //  - A rename through the alias COLLAPSED it: `greet as hello` renamed to
+    //    `greeting as greeting`, a compiling program and a redundant one.
+    //  - Every use of the alias was narrowed against the TARGET's name, so an
+    //    alias of a different length simply vanished: `greet as hi` dropped
+    //    both `hi()` calls out of the index, find-references answered nothing
+    //    and rename answered "there is no symbol to rename here". The E142
+    //    fixture's `hello` is five letters, exactly as `greet` is, and that
+    //    coincidence is the only reason the shape looked like it worked.
     //
-    // This is the one row class INVARIANT 1 above does not describe (a row
-    // whose text is not the definition's own name). The matrix fixture carries
-    // no alias, so that assertion stands as written; these pins carry their own
-    // fixture.
+    // Ruled 2026-09-07: rename PRESERVES an alias. `import a::b as c` is a
+    // declaration this file makes — `c` is not another way of writing `b`, it
+    // is this file's own name for it — so the alias gets an entity id, a
+    // declaration span, and rows of its own (`Program::import_aliases` and
+    // `import_alias_spans`, filled from the SOURCE, since which of the two
+    // names an identifier carries is a fact about the text and not about the
+    // resolved program). The scope still binds the target directly, so nothing
+    // about typing or code generation moved: this is an editor identity.
+    //
+    // Renaming the definition rewrites its declaration and the import's path
+    // segment and leaves the alias standing; renaming the alias, or any use of
+    // it, rewrites the alias and its uses and never the definition. And with
+    // the alias naming itself, INVARIANT 1 above holds without exception —
+    // `an alias row's text is not its definition's name` was the one row class
+    // it could not describe, and there is no longer such a row.
 
     const ALIASED: &str = "\
 import pkg::helper::greet as hello;
@@ -2183,48 +2250,119 @@ fun main(): i32 {
 }
 ";
 
+    /// The same import with an alias SHORTER than the name it renames — the
+    /// shape that used to disappear from the index entirely.
+    const SHORT_ALIAS: &str = "\
+import pkg::helper::greet as hi;
+
+fun main(): i32 {
+\thi();
+\thi();
+\t0
+}
+";
+
+    const HELPER: &str = "fun greet(): i32 {\n\t1\n}\n";
+
     fn aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[("main.vl", ALIASED), ("helper.vl", HELPER)])
+    }
+
+    fn short_aliased() -> (std::path::PathBuf, Document) {
         crate::document::tests::analyze_workspace(&[
-            ("main.vl", ALIASED),
-            ("helper.vl", "fun greet(): i32 {\n\t1\n}\n"),
+            ("main.vl", SHORT_ALIAS),
+            ("helper.vl", HELPER),
         ])
     }
 
-    /// The spans a query at `offset` reports, rendered as the text each covers.
-    fn aliased_texts(document: &Document, spans: Vec<(SourceId, Span)>) -> Vec<&'static str> {
-        let _ = document;
+    /// The spans a query at `offset` reports, rendered as the text each covers
+    /// in `text` (the entry file's).
+    fn alias_texts(text: &'static str, spans: Vec<(SourceId, Span)>) -> Vec<&'static str> {
         let mut found: Vec<(usize, &str)> = spans
             .into_iter()
             .filter(|(source, _)| *source == SourceId(0))
             .map(|(_, span)| {
                 let range = span.into_range();
-                (range.start, ALIASED.get(range).expect("inside the fixture"))
+                (range.start, text.get(range).expect("inside the fixture"))
             })
             .collect();
         found.sort();
         found.into_iter().map(|(_, text)| text).collect()
     }
 
+    /// The spans a query at `offset` reports, rendered as the text each covers.
+    fn aliased_texts(document: &Document, spans: Vec<(SourceId, Span)>) -> Vec<&'static str> {
+        let _ = document;
+        alias_texts(ALIASED, spans)
+    }
+
     #[test]
-    fn e142_find_references_follows_an_import_alias() {
+    fn e145_find_references_from_the_alias_side_lists_the_alias_and_its_uses() {
         let (dir, document) = aliased();
-        // From a USE site spelled by the alias: the alias itself and both calls.
+        // From a USE site spelled by the alias: the alias declaration and both
+        // calls — and NOT the path segment, which names the function.
         let offset = ALIASED.find("\thello();").expect("fixture") + 1;
         assert_eq!(
             aliased_texts(&document, document.references(offset)),
-            vec!["greet", "hello", "hello", "hello"],
-            "the path segment, the alias and both uses are one symbol",
+            vec!["hello", "hello", "hello"],
+            "the alias and its uses are one symbol; the path segment is not",
+        );
+        // And from the alias's own span, the same answer.
+        let on_alias = ALIASED.find("as hello").expect("fixture") + 3;
+        assert_eq!(
+            aliased_texts(&document, document.references(on_alias)),
+            vec!["hello", "hello", "hello"],
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn e142_a_rename_through_an_alias_rewrites_every_spelling() {
+    fn e145_find_references_from_the_definition_side_lists_the_path_segment() {
         let (dir, document) = aliased();
-        let offset = ALIASED.find("\thello();").expect("fixture") + 1;
+        // From the import's path segment, which is the one place this file
+        // writes the function's own name: the declaration in helper.vl (not in
+        // this text) and the segment itself.
+        let on_segment = ALIASED.find("::greet").expect("fixture") + 2;
+        assert_eq!(
+            aliased_texts(&document, document.references(on_segment)),
+            vec!["greet"],
+            "the alias and its uses spell another name and are not listed here",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_a_rename_at_the_definition_leaves_the_alias_standing() {
+        let (dir, document) = aliased();
+        let on_segment = ALIASED.find("::greet").expect("fixture") + 2;
         let edits = document
-            .rename_edits(offset, "greeting")
-            .expect("a rename through an alias");
+            .rename_edits(on_segment, "greeting")
+            .expect("a rename at the imported definition");
+        assert_eq!(
+            aliased_texts(
+                &document,
+                edits
+                    .iter()
+                    .map(|(source, span, _)| (*source, *span))
+                    .collect(),
+            ),
+            vec!["greet"],
+            "the path segment moves; `as hello` is this file's own name and stays",
+        );
+        assert!(
+            edits.iter().all(|(_, _, text)| text == "greeting"),
+            "every edit writes the new name plainly",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_a_rename_at_the_alias_moves_the_alias_and_its_uses() {
+        let (dir, document) = aliased();
+        let on_alias = ALIASED.find("as hello").expect("fixture") + 3;
+        let edits = document
+            .rename_edits(on_alias, "hi")
+            .expect("a rename at the alias");
         assert_eq!(
             aliased_texts(
                 &document,
@@ -2233,8 +2371,57 @@ fun main(): i32 {
                     .map(|(source, span, _)| (source, span))
                     .collect(),
             ),
-            vec!["greet", "hello", "hello", "hello"],
-            "rename rewrites exactly what find-references reported",
+            vec!["hello", "hello", "hello"],
+            "the alias and both uses move; `greet` is not this file's to rename",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_a_rename_at_a_use_of_the_alias_moves_the_alias() {
+        let (dir, document) = aliased();
+        let offset = ALIASED.find("\thello();").expect("fixture") + 1;
+        let edits = document
+            .rename_edits(offset, "hi")
+            .expect("a rename at a use of the alias");
+        assert_eq!(
+            aliased_texts(
+                &document,
+                edits
+                    .into_iter()
+                    .map(|(source, span, _)| (source, span))
+                    .collect(),
+            ),
+            vec!["hello", "hello", "hello"],
+            "a use renames what it spells: the alias",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_an_alias_shorter_than_its_target_is_still_a_symbol() {
+        // The half that was silently fatal: every use narrowed against the
+        // TARGET's name, `hi` is not five bytes long, and both calls were
+        // DROPPED — `references` answered `[]` and `rename_edits` answered
+        // `Err(NotAnIdentifier)`, i.e. "there is no symbol to rename here".
+        let (dir, document) = short_aliased();
+        let offset = SHORT_ALIAS.find("\thi();").expect("fixture") + 1;
+        assert_eq!(
+            alias_texts(SHORT_ALIAS, document.references(offset)),
+            vec!["hi", "hi", "hi"],
+        );
+        let edits = document
+            .rename_edits(offset, "howdy")
+            .expect("a rename through a short alias");
+        assert_eq!(
+            alias_texts(
+                SHORT_ALIAS,
+                edits
+                    .into_iter()
+                    .map(|(source, span, _)| (source, span))
+                    .collect(),
+            ),
+            vec!["hi", "hi", "hi"],
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2260,5 +2447,34 @@ fun main(): i32 {
             "the alias must be an indexed occurrence",
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // INVARIANT 1, UN-EXCEPTED (E145). The alias row was the one class the
+    // assertion above could not describe, so the matrix fixture deliberately
+    // carried no `as`. It holds over one now: every row in an aliasing file
+    // covers exactly its own definition's name.
+    #[test]
+    fn e145_every_indexed_span_covers_an_identifier_through_an_alias_too() {
+        for (text, (dir, document)) in [(ALIASED, aliased()), (SHORT_ALIAS, short_aliased())] {
+            let program = document.program.as_ref().expect("program");
+            let index = document.reference_index();
+            let mut checked = 0;
+            for row in index.rows() {
+                if row.source != SourceId(0) {
+                    continue;
+                }
+                let name = name_of(program, row.definition).expect("a named definition");
+                let covered = text
+                    .get(row.span.into_range())
+                    .unwrap_or_else(|| panic!("span {:?} is outside the entry text", row.span));
+                assert_eq!(
+                    covered, name,
+                    "row {row:?} covers {covered:?}, which is not the identifier {name:?}",
+                );
+                checked += 1;
+            }
+            assert!(checked >= 4, "expected the whole file, checked {checked}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

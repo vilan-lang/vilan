@@ -72,6 +72,10 @@ const CONTEXTUAL_WORDS: &[(&str, &str)] = &[
         "sync",
         "the marker opening a closure type: `(sync || View)`",
     ),
+    (
+        "as",
+        "the alias in an import path: `import a::b as c` (E142)",
+    ),
     ("self", "the receiver parameter"),
     ("Self", "the implementing type inside an `impl`"),
     (
@@ -419,6 +423,79 @@ fn every_grammar_keyword_is_a_lexer_keyword_or_contextual() {
         assert!(
             textmate.contains(*word) || highlight.contains(*word),
             "`{word}` ({role}) is allowed as contextual but no grammar colours it any more — drop it from CONTEXTUAL_WORDS"
+        );
+    }
+}
+
+/// Whether each of `texts` matches `regex`, evaluated in node — the grammars'
+/// rules use lookbehind, which Rust's `regex` crate does not have, and the
+/// point of the pin is to run the rule the way the editor and the book run it.
+fn regex_matches(regex: &str, texts: &[&str]) -> Vec<bool> {
+    const SCRIPT: &str = r#"
+        const compiled = new RegExp(process.env.VILAN_REGEX);
+        for (const text of process.env.VILAN_TEXTS.split("\u001f")) {
+            console.log(compiled.test(text) ? "yes" : "no");
+        }
+    "#;
+    let output = Command::new("node")
+        .args(["-e", SCRIPT])
+        .env("VILAN_REGEX", regex)
+        .env("VILAN_TEXTS", texts.join("\u{1f}"))
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "evaluating {regex:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line == "yes")
+        .collect()
+}
+
+/// The rule of `grammar` under `key` whose regex spells exactly `word` — the
+/// contextual rules are one word each, so this addresses one of them.
+fn contextual_rule<'a>(grammar: &'a Grammar, key: &str, word: &str) -> &'a Rule {
+    grammar
+        .rules(key)
+        .into_iter()
+        .find(|rule| literal_words(&rule.regex) == [word])
+        .unwrap_or_else(|| panic!("no `{word}`-only rule under `{key}`"))
+}
+
+/// `as` colours as a keyword in BOTH grammars, and ONLY where an alias can sit
+/// (E145; E142 shipped the alias with `as` in neither grammar).
+///
+/// It is not a lexer keyword — `let as = 1;` parses, which is why it is in
+/// [`CONTEXTUAL_WORDS`] — so each grammar guards it by position, and a guard
+/// that merely EXISTS proves nothing: these run the two rules the way the
+/// editor and the book do, over the shapes an alias takes and the shapes a
+/// value named `as` takes.
+#[test]
+fn the_import_alias_as_is_coloured_by_position_in_both_grammars() {
+    const ALIASES: &[&str] = &[
+        "import a::b as c;",
+        "import pkg::helper::greet as hello;",
+        "use a::{ b as c };",
+    ];
+    const NOT_ALIASES: &[&str] = &["let as = 1;", "let x = as;", "as(1)", "value.as"];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "as");
+        assert_eq!(
+            regex_matches(&rule.regex, ALIASES),
+            vec![true; ALIASES.len()],
+            "{file}: {:?} misses an import alias among {ALIASES:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, NOT_ALIASES),
+            vec![false; NOT_ALIASES.len()],
+            "{file}: {:?} colours `as` where it is an ordinary name ({NOT_ALIASES:?})",
+            rule.regex,
         );
     }
 }

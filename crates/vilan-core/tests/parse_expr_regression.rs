@@ -560,3 +560,73 @@ fn a_multi_value_attribute_reports_at_the_comma_in_both_element_spellings() {
 // also compiled as a target of its own — a binary with no tests in it, whose only
 // output was four "never used" warnings against the arrays this file consumes.
 include!("parse_expr_regression/fixtures.rs");
+
+/// E145. The `::` line rule at the two productions E142 left out: a TYPE PATH
+/// and a STRUCT-LITERAL HEAD, which probe both tokens before consuming the
+/// separator. Neither can swallow a following statement — the harm E142's rule
+/// was written for — so the extension buys consistency: one rule about where a
+/// path's next name may sit, rather than a rule with two exceptions. Both
+/// positions parsed the join CLEANLY before this (`style::` ⏎ `Style` was the
+/// annotation `style::Style`, with no diagnostic to see), and the census that
+/// made the rule free holds here too: zero lines end in `::` across the tree.
+///
+/// The rule reuses E142's ledger row — the expectation string is the same
+/// sentence, because the mistake and its two cures are the same.
+#[test]
+fn a_path_may_not_cross_a_line_break_in_a_type() {
+    let source = "fun demo(x: style::\n\tStyle): i32 { 0 }\n";
+    assert!(
+        parse_clean(source).is_none(),
+        "the annotation must not join"
+    );
+    let messages: Vec<String> = diagnostics_at(source)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("a `::` path does not cross a line break")),
+        "expected the line rule, got {messages:?}",
+    );
+}
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_a_struct_literal_head() {
+    let source = "fun demo(): i32 {\n\tlet p = shapes::\n\tDot { x = 1 };\n\t0\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(
+            A_NAME_ON_THIS_LINE.replace("found 'print'", "found 'Dot'"),
+            "Dot".to_string()
+        )],
+    );
+}
+
+#[test]
+fn a_qualified_type_and_literal_head_on_one_line_are_untouched() {
+    // The control the extension must not eat: the same two shapes, joined.
+    assert!(
+        parse_clean(
+            "mod style { struct Style { a: i32 } }\n\
+             fun demo(x: style::Style): i32 { 0 }\n"
+        )
+        .is_some()
+    );
+    assert!(
+        parse_clean(
+            "mod shapes { struct Dot { x: i32 } }\n\
+             fun demo(): i32 {\n\tlet p = shapes::Dot { x = 1 };\n\t0\n}\n"
+        )
+        .is_some()
+    );
+    // And a break inside the literal's BODY — which is not a `::`
+    // continuation — is how a wide literal wraps.
+    assert!(
+        parse_clean(
+            "mod shapes { struct Dot { x: i32 } }\n\
+             fun demo(): i32 {\n\tlet p = shapes::Dot {\n\t\tx = 1,\n\t};\n\t0\n}\n"
+        )
+        .is_some()
+    );
+}

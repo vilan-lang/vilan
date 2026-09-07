@@ -4168,6 +4168,12 @@ impl Document {
             // pruning on no evidence is how a green build gets broken.
             return true;
         };
+        // E145: an `as` alias binds a NAME OF ITS OWN, and it is the alias —
+        // not the path segment — that the file's code spells. So the alias's
+        // uses are what keep the import, and an alias for a prelude name is
+        // never redundant: it renames the thing, which is the whole point of
+        // writing it.
+        let alias = program.import_alias_spans.get(&(entry, leaf_span)).copied();
         // (0) The PRELUDE already binds this definition ambiently
         // (`prelude.md` §11.1): the import is redundant, so removing it cannot
         // change what the file means, and leaving it would have the estate
@@ -4176,10 +4182,10 @@ impl Document {
         // my_lib::print;` beside an ambient `std::io::print` is not redundant and
         // survives. This is the action's existing contract ("prune the leaves
         // the analyzer reports as unused") reaching one more kind of unused.
-        if program.prelude_bindings.contains(&definition_id) {
+        if alias.is_none() && program.prelude_bindings.contains(&definition_id) {
             return false;
         }
-        let definition = Definition::Entity(definition_id);
+        let definition = Definition::Entity(alias.unwrap_or(definition_id));
 
         // A reference written by the file's IMPORT LIST is not the file using
         // anything: an import path's segments resolve to the same definitions
@@ -4216,7 +4222,7 @@ impl Document {
         // analyzer's own provenance: did this file resolve anything DECLARED in
         // the file this import reaches into?
         if matches!(
-            crate::references::kind_of(program, definition),
+            crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
         ) && let Some(home) = program.source_of(definition_id)
         {

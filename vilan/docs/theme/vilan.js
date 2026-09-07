@@ -89,6 +89,14 @@
 			className: "keyword",
 			begin: "(?<=\\()sync\\b",
 		};
+		// `as` is CONTEXTUAL the same way (E142/E145): it names an import
+		// alias — `import a::b as c;` — and a value may still be NAMED `as`.
+		// Guarded on BOTH sides, since between two identifiers is the only
+		// place the alias sits.
+		const IMPORT_ALIAS = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
+		};
 		const TYPE = {
 			className: "type",
 			begin: "\\b[A-Z][a-zA-Z0-9_]*",
@@ -122,6 +130,7 @@
 				NUMBER,
 				CONTEXT_CLAUSE,
 				SYNC_MARKER,
+				IMPORT_ALIAS,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
 				FUNCTION,

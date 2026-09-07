@@ -2548,11 +2548,17 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// separator and the token after it.
     ///
     /// The rule lands on the two productions that COMMIT to a separator: the
-    /// expression path here and the `import`/`use` path. A type path and a
-    /// struct-literal head probe both tokens before consuming the `::` and
-    /// leave a trailing one exactly where it was, and they sit inside an
-    /// annotation or a literal head where there is no following STATEMENT to
-    /// swallow — which is the harm this rule exists to stop.
+    /// expression path here and the `import`/`use` path. E145 extended it to
+    /// the two that PROBE both tokens first — a type path
+    /// ([`Parser::parse_path_type`]) and a struct-literal head
+    /// ([`Parser::parse_struct_initializer`]), through
+    /// [`Parser::peeked_separator_crosses_a_line`]. Neither can swallow a
+    /// following STATEMENT, which is the harm the rule was written for, so
+    /// the extension buys consistency rather than a new save: one rule about
+    /// where a path's next name may sit, not a rule with two exceptions a
+    /// reader has to learn. The census that made it free is E142's — zero
+    /// lines end in `::` across the tree, kolt and the book — and it holds at
+    /// these two positions as well.
     ///
     /// The parser is otherwise entirely line-insensitive (`tokens_adjacent` is
     /// byte adjacency, not line identity), so this reads the source text
@@ -2574,6 +2580,34 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.source
             .get(from..to)
             .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// [`Self::separator_crosses_a_line`] for a production that has NOT
+    /// consumed the separator yet (E145): a type path or a struct-literal
+    /// head, which probe the `::` and the name after it before committing to
+    /// either. The separator is therefore at the cursor rather than behind it.
+    ///
+    /// Notes the expectation and answers `true` when that `::` ends its line,
+    /// so the loop stops and leaves the separator exactly where it was — which
+    /// is what those two productions promise their callers, and what lets the
+    /// enclosing statement's recovery report the note once, located.
+    fn peeked_separator_crosses_a_line(&mut self) -> bool {
+        let Some(separator) = self.tokens.get(self.position) else {
+            return false;
+        };
+        let from = separator.1.into_range().end;
+        let to = match self.tokens.get(self.position + 1) {
+            Some((_, span)) => span.into_range().start,
+            None => self.eoi,
+        };
+        let crosses = self
+            .source
+            .get(from..to)
+            .is_some_and(|gap| gap.contains('\n'));
+        if crosses {
+            self.note_expected(A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE);
+        }
+        crosses
     }
 
     /// [`Self::separator_crosses_a_line`] as the guard a path continuation
@@ -2745,7 +2779,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             let mut namespace: Vec<&'src str> = Vec::new();
             let mut name_start = parser.position;
             let mut name = parser.eat_ident()?;
-            while parser.peek_is_op("::") && matches!(parser.peek_at(1), Some(Token::Ident(_))) {
+            while parser.peek_is_op("::")
+                && matches!(parser.peek_at(1), Some(Token::Ident(_)))
+                // E145: and that name is on this line.
+                && !parser.peeked_separator_crosses_a_line()
+            {
                 namespace.push(name);
                 parser.bump(); // `::`
                 name_start = parser.position;
@@ -4399,7 +4437,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         // tokens before committing is what keeps a trailing `::` — one that
         // belongs to whatever the caller parses next — exactly where it was,
         // without the backtracking an `eat_op` here would need.
-        while self.peek_is_op("::") && matches!(self.peek_at(1), Some(Token::Ident(_))) {
+        while self.peek_is_op("::")
+            && matches!(self.peek_at(1), Some(Token::Ident(_)))
+            // E145: and that name is on this line.
+            && !self.peeked_separator_crosses_a_line()
+        {
             let span = self.span_from(start);
             namespace = Some(match namespace {
                 Some(inner) => (Node::StaticAccessor(Box::new(inner), name, None), span),
