@@ -564,7 +564,7 @@ fn analyze_source_unfenced(
                 block_ordinal += 1;
                 let start = node.1.into_range().start;
                 let head: Span = (start..start).into();
-                node.0 = Node::Func(Func {
+                node.0 = Node::Func(Box::new(Func {
                     name: (name, head),
                     is_async: false,
                     external: false,
@@ -582,7 +582,7 @@ fn analyze_source_unfenced(
                     borrows: None,
                     contexts: None,
                     body: Some(body),
-                });
+                }));
             }
         }
         let mut defined = std::collections::HashSet::new();

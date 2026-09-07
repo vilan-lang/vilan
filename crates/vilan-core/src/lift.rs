@@ -57,8 +57,10 @@ fn seal<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
     (Node::LiftRegion(steps, Box::new(body)), span)
 }
 
-fn seal_boxed<'src>(node: Box<Spanned<Node<'src>>>) -> Box<Spanned<Node<'src>>> {
-    Box::new(seal(*node))
+// In place, in the box the tree already owns — see `css::desugar_boxed`.
+fn seal_boxed<'src>(mut node: Box<Spanned<Node<'src>>>) -> Box<Spanned<Node<'src>>> {
+    take_and_seal(&mut node);
+    node
 }
 
 fn seal_opt<'src>(node: Option<Box<Spanned<Node<'src>>>>) -> Option<Box<Spanned<Node<'src>>>> {

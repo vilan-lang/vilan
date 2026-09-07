@@ -331,9 +331,9 @@ fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<(&'a Func<'src>, Span)
     nodes
         .iter()
         .filter_map(|(node, span)| match node {
-            Node::MacroFun(function) => Some((function, *span)),
+            Node::MacroFun(function) => Some((&**function, *span)),
             Node::Export(inner) => match &inner.0 {
-                Node::MacroFun(function) => Some((function, inner.1)),
+                Node::MacroFun(function) => Some((&**function, inner.1)),
                 _ => None,
             },
             _ => None,

@@ -421,11 +421,17 @@ fn descend_if<'src>(branch: NodeIfBranch<'src>, source: &'src str) -> NodeIfBran
     }
 }
 
+// Rewrites IN the box the tree already owns rather than unboxing, desugaring
+// and boxing the result again: `take_and_desugar` is the same replace-in-place
+// the slot walkers use, and reusing the allocation is what keeps this off
+// clippy's `boxed_local` — which started firing once M32 narrowed `Node`
+// enough for the lint to notice the round trip.
 fn desugar_boxed<'src>(
-    node: Box<Spanned<Node<'src>>>,
+    mut node: Box<Spanned<Node<'src>>>,
     source: &'src str,
 ) -> Box<Spanned<Node<'src>>> {
-    Box::new(desugar(*node, source))
+    take_and_desugar(&mut node, source);
+    node
 }
 
 fn desugar_opt<'src>(
