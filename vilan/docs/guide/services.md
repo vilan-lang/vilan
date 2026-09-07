@@ -259,6 +259,20 @@ about the type pretends otherwise. You read it one of four ways:
 - `mirror.get(): Option<T>` and `mirror.status(): SignalCell<Status>`
   (`Waiting` / `Ready`) — passive reads. They open nothing.
 
+A mirror is also a **`Source<Option<T>>`**, so everything the trait gives
+every other observable value is on it: `on_change` (the lazy attach — no
+immediate call, and the channel's first frame is a change), `effect` /
+`effect_on_change`, and any generic `S: Source<…>` function, `selector`
+included. The trait argument is `Option<T>` because that is what a mirror
+holds; a `RemoteSource<List<Note>>` is therefore *not* a `Source<List<Note>>`,
+and `bind_each` still takes `mirror.or([])` rather than the mirror. `sub` has
+one spelling per view of the value: `mirror.sub(|note| …)` is the inherent
+present-only one above, and the trait's `sub` — reached through a generic
+receiver — hands you the `Option<T>`. `map` and `or` stay inherent, which is
+what keeps their stricter law (a mirror derivation *must* have an owner) on a
+concrete receiver; a generic `S: Source<…>` calling `.map` gets the trait's
+owner-optional default.
+
 ```vilan,browser
 import std::json::json_codec;
 import std::reactive::{ Signal, SignalCell };

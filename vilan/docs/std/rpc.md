@@ -33,11 +33,19 @@ host over WebSocket, waits for the server's announcement, and verifies the
 ```vilan,fragment
 struct RemoteSource<T> { … }
 
-impl RemoteSource<type T> {
+impl RemoteSource<type T> with Source<Option<T>> {
 	fun get(self): Option<T>                              // passive: the cache, `None` before the first update
+	[must_use]
+	fun on_change(self, observer: |Option<T>| void): Subscription    // counted, lazy: no immediate call
+	[must_use]
+	fun sub(self, observer: |Option<T>| void): Subscription          // counted, eager: one immediate call
+	fun effect(self, observer: |Option<T>| void)                     // counted, eager, owner-scoped
+}
+
+impl RemoteSource<type T> {
+	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
 	fun status(self): SignalCell<Status>                      // passive: `Waiting` until a value has arrived, then `Ready`
 	fun or(self, initial: T): SignalCell<T>                   // counted, owner-scoped: `initial` until the first update
-	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
 }
@@ -45,6 +53,14 @@ impl RemoteSource<type T> {
 [derive(PartialEq, Debug)]
 enum Status { Waiting, Ready }
 ```
+
+A mirror is a **`Source<Option<T>>`** (tracker A52), so `on_change`, `effect`,
+`effect_on_change` and every generic `S: Source<…>` consumer — `selector`
+among them — take one. The trait argument is `Option<T>` because that is what
+a mirror holds, so a `RemoteSource<List<Note>>` is *not* a `Source<List<Note>>`
+and `bind_each` takes `mirror.or([])`. `sub` has one spelling per view of the
+value: the inherent one hands the observer a present `T`, the trait's hands it
+the `Option<T>`, and the observer's own parameter type picks between them.
 
 A mirror holds `Option<T>` — `None` until the first `Update` lands — and
 **subscribes by demand**: every `or`, `map`, and `sub` takes a counted lease

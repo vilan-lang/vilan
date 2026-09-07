@@ -2147,7 +2147,22 @@ struct RemoteSource<T> {
 	cache: SignalCell<Option<T>>,
 }
 
-impl RemoteSource<type T> {
+/// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
+/// holds: `None` until the first frame lands, the value after. Until this impl
+/// existed `RemoteSource` carried `get`/`map`/`or` as inherent members and
+/// implemented nothing, so A49's `on_change` was not on it, `effect` was not on
+/// it, and no generic `S: Source<..>` function — `selector`, an application's
+/// own — could take one. Every observing path still goes through the same
+/// counted lease; the impl adds no second mechanism, it names the one there is.
+///
+/// The trait argument is `Option<T>` and not `T` because the mirror's value is
+/// the Option: `get` cannot invent a `T` before the first frame. So a
+/// `RemoteSource<List<Note>>` is a `Source<Option<List<Note>>>` and does NOT
+/// satisfy `bind_each`'s `Source<List<T>>` — the seam into a list binding is
+/// still `or([])`, exactly as `guide/services.md` writes it. What the impl
+/// buys is everything that reads a source WITHOUT flattening it: `on_change`,
+/// `effect`, `effect_on_change`, and any generic consumer.
+impl RemoteSource<type T> with Source<Option<T>> {
 	/// The mirror's current value: `None` until the first update lands.
 	/// Passive — no lease, no frame; an unwatched mirror reads `None`
 	/// forever, which is correct: nothing asked.
@@ -2155,17 +2170,75 @@ impl RemoteSource<type T> {
 		self.cache.get()
 	}
 
+	/// The trait's subscription primitive, counted like every other observing
+	/// path: attach WITHOUT the immediate call, and hold the channel open until
+	/// the subscription is disposed.
+	///
+	/// ORDER is the whole content of this body, and it is forced rather than
+	/// chosen: attach FIRST, then take the lease. Taking the lease is what
+	/// sends `Subscribe`, and over an in-process transport the server's seeding
+	/// `Update` comes back INSIDE that call — so acquiring first would drop the
+	/// first value on a `duplex_pair` and deliver it over a socket, which is a
+	/// transport-dependent contract and not one at all. Attached first, the
+	/// seed is a change from the `None` the mirror held when the observer was
+	/// registered, on every transport. Nothing is swallowed: `on_change`'s
+	/// contract is "never for the value the source ALREADY holds", and an
+	/// unopened mirror already holds `None`.
+	[must_use]
+	fun on_change(self, observer: |Option<T>| void): Subscription {
+		let subscription = self.cache.on_change(observer);
+		subscription.release.write() = Some(|| self.release());
+		self.acquire();
+		subscription
+	}
+
+	/// The trait's `sub` default, OVERRIDDEN — because the default is
+	/// `on_change` plus one call with `get()`, and on a mirror `on_change`
+	/// itself delivers the seeding frame, so the default would make the
+	/// immediate call TWICE. `lease` is the honest eager form: take the lease,
+	/// then attach with `SignalCell::sub`, whose one immediate call is the
+	/// contract's.
+	[must_use]
+	fun sub(self, observer: |Option<T>| void): Subscription {
+		self.lease(observer)
+	}
+
+	/// `effect` for the same reason as `sub`, and by the same body plus the
+	/// ambient owner: the trait's default is `effect_on_change` and one call,
+	/// and `effect_on_change` is `on_change`, which already made it.
+	fun effect(self, observer: |Option<T>| void) {
+		get_owner().take(self.lease(observer));
+	}
+}
+
+impl RemoteSource<type T> {
 	/// Observe the mirror through `transform`, as a plain `SignalCell<U>` — the
 	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
 	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
-	/// it opens the channel if nothing else has, and the lease is released
-	/// when the enclosing owner is disposed, which for a view is unmount. So
-	/// it requires an ambient owner, statically: calling it where no
-	/// `owner_scope.run` encloses is a compile error, which makes "a network
-	/// subscription must have an owner" a compile-time law. `transform` sees
-	/// `None` until the first frame lands — the one place the `Option` is
-	/// confronted, and where a fallback of a DIFFERENT type than `T` belongs
-	/// (`"Loading…"` from a `RemoteSource<i32>`).
+	/// it opens the channel if nothing else has, and the lease is released when
+	/// the enclosing owner is disposed, which for a view is unmount. So it
+	/// requires an ambient owner, STATICALLY (`get_owner`, not the trait
+	/// default's `register_with_owner`): calling it where no `owner_scope.run`
+	/// encloses is a compile error, which makes "a network subscription must
+	/// have an owner" a compile-time law (A25). The trait's default is
+	/// deliberately owner-OPTIONAL, because `current_path().map(parse)` at
+	/// module level is a documented idiom and a network subscription at module
+	/// level is not one.
+	///
+	/// INHERENT rather than an override inside the `Source` impl, and that is a
+	/// COMPILER LIMIT and not a preference: written as an override, `status`'s
+	/// own `self.cache.map(..)` — a call on a `SignalCell` field, which
+	/// inherits the trait's default — miscompiles, and `register_with_owner`
+	/// runs with an undefined owner (`self[0].v.push` on `undefined` at module
+	/// scope; both A25 owner pins go red). Overriding a default that the
+	/// receiver's own field type inherits is the shape that breaks. The cost of
+	/// keeping it inherent is that the STRICT law reaches a concrete
+	/// `mirror.map(..)` only; a generic `S: Source<Option<T>>` calling `.map`
+	/// gets the owner-optional default.
+	///
+	/// `transform` sees `None` until the first frame lands — the one place the
+	/// `Option` is confronted, and where a fallback of a DIFFERENT type than
+	/// `T` belongs (`"Loading…"` from a `RemoteSource<i32>`).
 	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U> {
 		let derived = SignalCell::new(transform(self.get()));
 		get_owner().take(self.lease(|value| {
@@ -2208,6 +2281,14 @@ impl RemoteSource<type T> {
 	/// releases it — the last release closes the channel (an `Unsubscribe`,
 	/// deferred to the ambient turn's settle so a same-turn re-subscribe
 	/// cancels it; with no ambient turn, sent at once).
+	///
+	/// INHERENT, and it outranks the trait's `sub` on a concrete receiver — the
+	/// two are told apart by the observer's own parameter type and cannot be
+	/// confused for one another: this one takes `|T|`, `Source::sub` takes
+	/// `|Option<T>|` and makes the immediate call with whatever the mirror
+	/// holds. A generic `S: Source<Option<T>>` reaches that one; `mirror.sub`
+	/// reaches this one, which is the shape every caller was written against
+	/// and the one a view wants (a `None` is not a value to render).
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
 		self.lease(|value| {
