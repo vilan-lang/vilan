@@ -493,3 +493,62 @@ fn a_panic_surfaces_as_thrown_with_its_message() {
         "unexpected message: {message}"
     );
 }
+
+#[test]
+fn the_node_runner_gives_each_run_a_working_directory_of_its_own() {
+    // Tracker N59. A corpus program that names a relative path — `file.vl` and
+    // `watch.vl` each `create_dir_all` a scratch tree and remove it at the end —
+    // used to write into the TEST process's working directory, which is
+    // `crates/vilan-core`, so a run that died between the create and the remove
+    // stranded a `file-corpus-<random>/` in the crate. The runner hands the child
+    // a directory of its own now, and this pin holds the three properties that
+    // fix rests on: the child's directory is not the test process's, two runs
+    // never share one, and a clean run leaves nothing behind.
+    let program = "import { mkdirSync } from 'node:fs';\n\
+                   mkdirSync('file-corpus-n59-pin');\n\
+                   console.log(process.cwd());\n";
+    let first_path = scratch_js("cwd_a", program);
+    let first = run_node_within(&first_path, NODE_TIMEOUT);
+    let _ = std::fs::remove_file(&first_path);
+    let second_path = scratch_js("cwd_b", program);
+    let second = run_node_within(&second_path, NODE_TIMEOUT);
+    let _ = std::fs::remove_file(&second_path);
+
+    let (first_out, _, first_exit) = first.expect("the first run must complete");
+    let (second_out, _, second_exit) = second.expect("the second run must complete");
+    assert_eq!((first_exit, second_exit), (0, 0), "both runs must succeed");
+
+    // Both sides canonicalized at the source: node reports a REAL path (symlinks
+    // resolved, and on Windows the temp root is an 8.3 short name), so the
+    // spelled process directory would compare unequal for a reason that is not
+    // the claim.
+    let canonical = |text: &str| {
+        vilan_core::util::canonical_path_of_unwritten(std::path::Path::new(text.trim()))
+    };
+    let here = vilan_core::util::canonical_path_of_unwritten(
+        std::env::current_dir().expect("the test process has a working directory"),
+    );
+    assert_ne!(
+        canonical(&first_out),
+        here,
+        "the child inherited the test process's working directory — a relative \
+         write lands in the crate"
+    );
+    assert_ne!(
+        canonical(&first_out),
+        canonical(&second_out),
+        "two runs shared one working directory — N54's hazard, one directory \
+         deeper"
+    );
+
+    // Nothing in the crate, and nothing left in TEMP either: the run owns the
+    // directory, so it takes the scratch tree with it.
+    assert!(
+        !here.join("file-corpus-n59-pin").exists(),
+        "the child's relative `mkdir` reached the test process's directory"
+    );
+    assert!(
+        !canonical(&first_out).exists(),
+        "a completed run left its working directory behind"
+    );
+}

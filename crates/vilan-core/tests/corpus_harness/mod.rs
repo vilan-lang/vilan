@@ -285,9 +285,63 @@ pub fn run_node(path: &Path) -> Result<(String, i32), String> {
 /// `limit` is a parameter rather than [`NODE_TIMEOUT`] outright so the runner's
 /// own timeout pin can ask for a deadline it is willing to WAIT for; every gate
 /// over the corpus passes the constant.
+///
+/// The child gets a scratch working directory OF ITS OWN (tracker N59). It used
+/// to inherit the test process's, which is `crates/vilan-core`, so a corpus
+/// program that names a relative path wrote into the crate directory:
+/// `file.vl` and `watch.vl` each `create_dir_all` a scratch tree relative to the
+/// working directory and remove it at the end, and a panic, a timeout kill or a
+/// Ctrl-C in between stranded one there for the next lane's `git status` to
+/// find. An ignore line covered the symptom; a working directory the run owns
+/// ends it at the source, and a strand now lands in TEMP where a strand belongs.
+///
+/// Two consequences, both deliberate. The program path is resolved against the
+/// CALLER's working directory first — `node <relative path>` would otherwise
+/// look inside the scratch tree — so a gate that names a program relatively
+/// still runs the program it meant. And the scratch tree is per RUN, not per
+/// process: two runs of one program overlap by construction (the differentials
+/// run it in processes that know nothing about each other, N54), and a shared
+/// working directory would put their scratch trees on top of each other.
 pub fn run_node_within(path: &Path, limit: Duration) -> Result<(String, String, i32), String> {
+    // Resolved BEFORE the child is given a directory of its own.
+    let program = vilan_core::util::canonical_path_of_unwritten(path);
+    let cwd = scratch_cwd();
+    std::fs::create_dir_all(&cwd).map_err(|error| {
+        format!(
+            "could not create the scratch working directory {}: {error}",
+            cwd.display()
+        )
+    })?;
+    let outcome = run_node_in(&program, &cwd, limit);
+    // Best effort, and the only cleanup there is: a run that DIES skips this,
+    // which is the whole reason the directory is under TEMP.
+    let _ = std::fs::remove_dir_all(&cwd);
+    outcome
+}
+
+/// A working directory no other run holds, named so a strand says which process
+/// left it.
+fn scratch_cwd() -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Unwritten by construction — `canonical_path_of_unwritten` resolves the
+    // temp root (Windows spells it as an 8.3 short name) and re-attaches the
+    // leaf, so both sides of any later comparison are like with like.
+    vilan_core::util::canonical_path_of_unwritten(
+        std::env::temp_dir().join(format!("vilan_node_cwd_{}_{unique}", std::process::id())),
+    )
+}
+
+/// [`run_node_within`]'s body, with the working directory already made.
+fn run_node_in(
+    program: &Path,
+    cwd: &Path,
+    limit: Duration,
+) -> Result<(String, String, i32), String> {
     let mut child = Command::new("node")
-        .arg(path)
+        .arg(program)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
