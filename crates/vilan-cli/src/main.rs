@@ -4297,103 +4297,165 @@ fn build_workspace_artifacts(
     // kept in DECLARATION order however the round chose to compile them: the
     // record is a statement about the workspace, not about one round's schedule.
     let mut recorded: Vec<Option<BuildWatchLeg>> = (0..members.len()).map(|_| None).collect();
-    for index in schedule.order.clone() {
-        let (unit, platform) = &members[index];
-        if platform.is_none() {
-            continue;
-        }
-        // B203 — asked HERE, at this leg's turn, and not for every leg before
-        // the round began. A leg's recorded sources can include another leg's
-        // `dist/` artifact (a server leg bundling the client's bundle), and a
-        // freshness question asked before that producer compiled is answered
-        // against the artifact it is about to overwrite: the consumer was
-        // judged fresh, skipped, and left holding bytes that no longer exist.
-        // The order above puts the producer first; asking at this turn is what
-        // makes the answer describe the `dist/` this round will ship.
-        let fresh = may_reuse
-            && !schedule.downstream_of_a_recompile(index, &recompiled)
-            && state_leg(watch_state.as_deref(), &unit.name)
-                .is_some_and(|leg| hmr::leg_is_current(&leg.sources, current_source_hash));
-        if fresh {
-            // Reuse: the leg's artifact in `dist/` was compiled from exactly
-            // these bytes, so a recompile would rewrite the file it already
-            // holds. Its bundled names still have to occupy the collision map
-            // — the other legs' copies are checked against them this round
-            // just as they were last round — and they are already on disk, so
-            // no copy is repeated.
-            let previous = state_leg(watch_state.as_deref(), &unit.name)
-                .expect("`fresh` is decided off the recorded leg");
-            for (source, name) in &previous.bundled {
-                bundled_names.insert(name.clone(), source.clone());
+    // M51 — whether the round has compiled a leg yet. The FIRST leg compiles
+    // alone on this thread: it is what fills the process-global caches every
+    // later leg meets warm (the clean-parse cache, the base world, the macro
+    // worlds), and starting a whole tier cold would have each of them analyze
+    // `std` from scratch — N times the CPU for one world. The same shape, and
+    // the same reason, as M35's parallel `check`.
+    let mut warmed = false;
+    // What the legs of the CURRENT tier have already written into `dist/` this
+    // round — `(leg, extension, bundled names)`, which is everything
+    // [`leg_writes`] needs to say whether a path is one of them. Read by the
+    // stale-read guard below; cleared at each tier, because a leg of an
+    // EARLIER tier wrote before this tier compiled and is not a hazard.
+    let mut written_this_tier: Vec<(String, &'static str, Vec<(PathBuf, String)>)> = Vec::new();
+    for tier in schedule_tiers(&schedule) {
+        // B203's question, still asked at each leg's own turn — which for a
+        // tier is this loop. No leg of a tier reads a leg of the same tier
+        // ([`schedule_tiers`] splits the schedule exactly there), so putting a
+        // sibling into `recompiled` cannot change a sibling's answer: these are
+        // the answers a serial round gave, in the order it gave them.
+        let mut plan: Vec<(usize, bool)> = Vec::new();
+        for index in tier {
+            let (unit, platform) = &members[index];
+            if platform.is_none() {
+                continue;
             }
+            let fresh = may_reuse
+                && !schedule.downstream_of_a_recompile(index, &recompiled)
+                && state_leg(watch_state.as_deref(), &unit.name)
+                    .is_some_and(|leg| hmr::leg_is_current(&leg.sources, current_source_hash));
+            if !fresh {
+                recompiled.insert(index);
+            }
+            plan.push((index, fresh));
+        }
+        // The ONE phase that overlaps (M51). Every writer below stays serial
+        // and in schedule order: `dist/` is one directory, `write_chunks`
+        // sweeps a namespace, `bundled_names` is written by each leg and read
+        // by every later one, and `explain`'s log is a report about a build,
+        // not about a scheduler. So the collision blame, the report and the
+        // round's own lines are the serial round's, whatever order the compiles
+        // finished in.
+        let compiling: Vec<usize> = plan
+            .iter()
+            .filter(|(_, fresh)| !fresh)
+            .map(|(index, _)| *index)
+            .collect();
+        let mut compiles = compile_tier(members, &compiling, debug, emission, &mut warmed);
+        written_this_tier.clear();
+        for (index, fresh) in plan {
+            let (unit, platform) = &members[index];
+            if fresh {
+                // Reuse: the leg's artifact in `dist/` was compiled from exactly
+                // these bytes, so a recompile would rewrite the file it already
+                // holds. Its bundled names still have to occupy the collision map
+                // — the other legs' copies are checked against them this round
+                // just as they were last round — and they are already on disk, so
+                // no copy is repeated.
+                let previous = state_leg(watch_state.as_deref(), &unit.name)
+                    .expect("`fresh` is decided off the recorded leg");
+                for (source, name) in &previous.bundled {
+                    bundled_names.insert(name.clone(), source.clone());
+                }
+                let output = artifact_path(&dist, &unit.name, *platform);
+                println!(
+                    "{} {} -> {}",
+                    paint::out(paint::Style::CYAN, "Fresh"),
+                    unit.entry.display(),
+                    paint::out(paint::Style::BOLD, &output.display().to_string())
+                );
+                recorded[index] = Some(BuildWatchLeg {
+                    name: previous.name.clone(),
+                    sources: previous.sources.clone(),
+                    bundled: previous.bundled.clone(),
+                });
+                continue;
+            }
+            let mut leg = compiles
+                .remove(&index)
+                .expect("the tier compiled every leg the plan did not call fresh");
+            // The stale-read guard, and the price of compiling a tier at once.
+            // A tier's compiles all read the `dist/` the tier STARTED with, and
+            // the edges that would have split the tier come from the PREVIOUS
+            // round's record — which a first build, and a `--watch` round one,
+            // do not have. So the answer is checked against what the compile
+            // actually loaded: if this leg read a file a leg earlier in this
+            // tier has just written, the speculative compile saw the previous
+            // build's bytes where a serial round would have seen this one's.
+            // Throw it away — its diagnostics with it, they were about the
+            // wrong `dist/` — and compile the leg again HERE, which is exactly
+            // where a serial round compiled it. One wasted compile, for the one
+            // leg with the edge, on the one round that could not know about it:
+            // the record this round writes puts the leg in a tier of its own
+            // from the next round on.
+            if let Ok(compiled) = &leg.compiled
+                && reads_a_leg_written_this_tier(&dist, &compiled.sources, &written_this_tier)
+            {
+                leg = compile_leg(members, index, debug, emission);
+            }
+            if emission == Emission::WholeBundles {
+                note_split_ignored(unit);
+            }
+            // M35's replay, for the build: rendered on the leg's own thread,
+            // printed at the leg's own place in the schedule.
+            replay_captured(leg.reports);
+            let chunks = leg.chunks;
+            let mut compiled = leg.compiled?;
+            // What the NEXT round re-hashes to decide this leg's skip (M22).
+            // Recorded whether or not a watch is running: the cost is a clone of
+            // the loaded-file list, and a state to write it into is what makes it
+            // a watch. Written into a per-leg slot and merged after the join, so
+            // no worker ever holds the round's state.
+            recorded[index] = Some(BuildWatchLeg {
+                name: unit.name.clone(),
+                sources: compiled.sources.iter().cloned().collect(),
+                bundled: compiled.bundled.clone(),
+            });
+            // Before the writers, which record the files this leg's facts explain.
+            explain::leg_facts(&unit.name, std::mem::take(&mut compiled.explain));
             let output = artifact_path(&dist, &unit.name, *platform);
+            let styles = write_assets(&output, &compiled.assets);
+            let assets = write_bundled(
+                &dist,
+                &compiled.bundled,
+                &unit.name,
+                &reserved,
+                &mut bundled_names,
+            )?;
+            // Unconditional: this is also where a previous build's chunks are swept
+            // when this one wrote none, and where a browser leg's build manifest is
+            // written whether it split or not (`fullstack-dx.md` §10.3).
+            write_chunks(
+                &output,
+                &chunks,
+                styles.as_deref(),
+                &assets,
+                matches!(platform, Platform::Browser),
+            )?;
+            if let Err(error) = fs::write(&output, compiled.javascript) {
+                eprintln!(
+                    "{} cannot write {}: {error}",
+                    paint::error_prefix(),
+                    output.display()
+                );
+                return Err(ExitCode::FAILURE);
+            }
+            written_this_tier.push((
+                unit.name.clone(),
+                platform.script_extension(),
+                compiled.bundled,
+            ));
             println!(
                 "{} {} -> {}",
-                paint::out(paint::Style::CYAN, "Fresh"),
+                paint::out(paint::Style::GREEN, "Compiled"),
                 unit.entry.display(),
                 paint::out(paint::Style::BOLD, &output.display().to_string())
             );
-            recorded[index] = Some(BuildWatchLeg {
-                name: previous.name.clone(),
-                sources: previous.sources.clone(),
-                bundled: previous.bundled.clone(),
-            });
-            continue;
+            warn_superseded_sibling(&output);
+            explain::bundle(output, &unit.name);
         }
-        recompiled.insert(index);
-        if emission == Emission::WholeBundles {
-            note_split_ignored(unit);
-        }
-        let mut chunks = Vec::new();
-        let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
-        let mut compiled =
-            compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
-        // What the NEXT round re-hashes to decide this leg's skip (M22).
-        // Recorded whether or not a watch is running: the cost is a clone of
-        // the loaded-file list, and a state to write it into is what makes it
-        // a watch.
-        recorded[index] = Some(BuildWatchLeg {
-            name: unit.name.clone(),
-            sources: compiled.sources.iter().cloned().collect(),
-            bundled: compiled.bundled.clone(),
-        });
-        // Before the writers, which record the files this leg's facts explain.
-        explain::leg_facts(&unit.name, std::mem::take(&mut compiled.explain));
-        let output = artifact_path(&dist, &unit.name, *platform);
-        let styles = write_assets(&output, &compiled.assets);
-        let assets = write_bundled(
-            &dist,
-            &compiled.bundled,
-            &unit.name,
-            &reserved,
-            &mut bundled_names,
-        )?;
-        // Unconditional: this is also where a previous build's chunks are swept
-        // when this one wrote none, and where a browser leg's build manifest is
-        // written whether it split or not (`fullstack-dx.md` §10.3).
-        write_chunks(
-            &output,
-            &chunks,
-            styles.as_deref(),
-            &assets,
-            matches!(platform, Platform::Browser),
-        )?;
-        if let Err(error) = fs::write(&output, compiled.javascript) {
-            eprintln!(
-                "{} cannot write {}: {error}",
-                paint::error_prefix(),
-                output.display()
-            );
-            return Err(ExitCode::FAILURE);
-        }
-        println!(
-            "{} {} -> {}",
-            paint::out(paint::Style::GREEN, "Compiled"),
-            unit.entry.display(),
-            paint::out(paint::Style::BOLD, &output.display().to_string())
-        );
-        warn_superseded_sibling(&output);
-        explain::bundle(output, &unit.name);
     }
     if let Some(state) = watch_state {
         state.legs = recorded.into_iter().flatten().collect();
@@ -4545,6 +4607,191 @@ fn leg_schedule(dist: &Path, legs: &[ScheduledLeg]) -> LegSchedule {
         order: hmr::legs_in_artifact_order(&reads_the_artifacts_of),
         reads_the_artifacts_of,
     }
+}
+
+/// The schedule cut into TIERS — the groups a round may compile at once (M51).
+///
+/// A tier is a run of consecutive legs of [`LegSchedule::order`] in which no
+/// leg reads a leg of the same run. That is the exact condition the overlap
+/// needs, in both directions, because every WRITER stays serial and runs after
+/// the whole tier has compiled:
+///
+/// * a leg that reads a producer of an EARLIER tier sees this round's bytes —
+///   the producer compiled and was written before this tier began;
+/// * a leg that reads a producer of a LATER position sees the previous round's
+///   bytes, which is what a serial round showed it too (the producer had not
+///   written yet either) — the only way that arises is a cycle, which
+///   [`hmr::legs_in_artifact_order`] already breaks by index;
+/// * a leg that reads a producer of its OWN run is what opens a new tier, so
+///   it never arises.
+///
+/// Parallelism therefore caps at the widest tier, which is the honest ceiling:
+/// a chain of three legs that each read the next's artifact has three tiers of
+/// one and compiles exactly as it always did.
+///
+/// The edges come from the previous round's record and a round without one has
+/// none — every leg lands in one tier. That is safe for the ORDER (no leg is
+/// reordered; a tier is a contiguous run of the same schedule) and it is what
+/// the stale-read guard in [`build_workspace_artifacts`] answers for.
+fn schedule_tiers(schedule: &LegSchedule) -> Vec<Vec<usize>> {
+    let mut tiers: Vec<Vec<usize>> = Vec::new();
+    for leg in schedule.order.iter().copied() {
+        let opens_a_tier = match tiers.last() {
+            None => true,
+            Some(current) => current
+                .iter()
+                .any(|placed| schedule.reads_the_artifacts_of[leg].contains(placed)),
+        };
+        match tiers.last_mut() {
+            Some(current) if !opens_a_tier => current.push(leg),
+            _ => tiers.push(vec![leg]),
+        }
+    }
+    tiers
+}
+
+/// Whether any of `sources` is a file one of the legs `written` has already
+/// written into `dist/` this tier — the stale-read guard (M51).
+///
+/// Asked through [`leg_writes`], which is where "does this leg write that
+/// path" is answered for the schedule itself: one question, one answer, however
+/// it is reached.
+fn reads_a_leg_written_this_tier(
+    dist: &Path,
+    sources: &[(PathBuf, u64)],
+    written: &[(String, &'static str, Vec<(PathBuf, String)>)],
+) -> bool {
+    written.iter().any(|(name, extension, bundled)| {
+        let producer = ScheduledLeg {
+            name,
+            extension,
+            bundled,
+            sources: None,
+        };
+        sources
+            .iter()
+            .any(|(source, _)| leg_writes(dist, &producer, source))
+    })
+}
+
+/// One leg's compile, held until the round can use it at the leg's own place in
+/// the schedule (M51): what it produced, the route chunks its `split` asked
+/// for, and the diagnostics it rendered on its own thread.
+struct LegCompile {
+    chunks: Vec<EmittedChunk>,
+    reports: Vec<CapturedReport>,
+    compiled: Result<Compiled, ExitCode>,
+}
+
+/// Compiles one leg with its diagnostics captured rather than raced to stderr
+/// (M35's machinery, unchanged) — the unit of work a tier hands to a thread.
+fn compile_leg(
+    members: &[(Unit, Platform)],
+    index: usize,
+    debug: bool,
+    emission: Emission,
+) -> LegCompile {
+    let (unit, platform) = &members[index];
+    let mut chunks = Vec::new();
+    let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
+    capture_arm();
+    let compiled = compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink);
+    LegCompile {
+        chunks,
+        reports: capture_take(),
+        compiled,
+    }
+}
+
+/// Compiles a tier's legs — one thread each — and answers them by leg index.
+///
+/// The round's FIRST leg runs ALONE on this thread before anything is spawned:
+/// it fills the process-global caches (the clean-parse cache, the base world,
+/// the macro worlds) that every later leg then meets warm, which is M35's
+/// measured shape and the reason a parallel round costs no extra CPU. A tier
+/// with one leg to compile stays on this thread too, rather than paying for a
+/// thread to wait on.
+///
+/// **Abort.** A serial round stops at the first leg that fails (`?`), so the
+/// warm-up's failure returns before any worker is spawned. A failure INSIDE a
+/// tier cannot be seen before the tier is joined; the caller replays and aborts
+/// at the first failing leg in SCHEDULE order, so the terminal and `dist/` are
+/// the serial round's either way — the tier's later legs merely did work that
+/// is thrown away, and no leg after the failing one ever writes.
+fn compile_tier(
+    members: &[(Unit, Platform)],
+    tier: &[usize],
+    debug: bool,
+    emission: Emission,
+    warmed: &mut bool,
+) -> BTreeMap<usize, LegCompile> {
+    let mut done: BTreeMap<usize, LegCompile> = BTreeMap::new();
+    // The escape hatch a parallelism change owes its users, and the instrument
+    // its determinism pins compare against.
+    if sequential_build() {
+        *warmed = true;
+        for index in tier.iter().copied() {
+            let leg = compile_leg(members, index, debug, emission);
+            let failed = leg.compiled.is_err();
+            done.insert(index, leg);
+            if failed {
+                break;
+            }
+        }
+        return done;
+    }
+    let mut rest = tier;
+    if !*warmed && let Some((first, tail)) = rest.split_first() {
+        *warmed = true;
+        let leg = compile_leg(members, *first, debug, emission);
+        let failed = leg.compiled.is_err();
+        done.insert(*first, leg);
+        if failed {
+            return done;
+        }
+        rest = tail;
+    }
+    match rest {
+        [] => {}
+        [only] => {
+            done.insert(*only, compile_leg(members, *only, debug, emission));
+        }
+        rest => {
+            let compiled: Vec<(usize, LegCompile)> = std::thread::scope(|scope| {
+                let workers: Vec<_> = rest
+                    .iter()
+                    .copied()
+                    .map(|index| {
+                        std::thread::Builder::new()
+                            .stack_size(COMPILER_STACK_SIZE)
+                            .spawn_scoped(scope, move || {
+                                (index, compile_leg(members, index, debug, emission))
+                            })
+                            .expect("spawn a build worker")
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect()
+            });
+            done.extend(compiled);
+        }
+    }
+    done
+}
+
+/// `VILAN_SEQUENTIAL_BUILD`, read once: compiles a workspace's legs one after
+/// another, as every build did before M51. `VILAN_SEQUENTIAL_CHECK`'s twin, for
+/// the same two jobs — the escape hatch, and the reference a parallel round's
+/// `dist/` and terminal are held to.
+fn sequential_build() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VILAN_SEQUENTIAL_BUILD").is_ok_and(|value| value != "0"))
 }
 
 /// A watched source's content hash RIGHT NOW, read the way the compiler reads
