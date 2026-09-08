@@ -75,24 +75,26 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the three canonical orders. Four order-insensitivities
+/// nothing but trivia and the four canonical orders. Five order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
 /// (dropped), the canonical ordering of a top-level import run (see the
-/// canonical-import-order section below), the canonical ordering of a `style()`
-/// builder chain's links (see the canonical-style-chain-order section), and the
-/// canonical ordering of a `css` block's items (see the canonical-css-block-order
-/// section). Everything else must match token for token, so the net still catches
-/// every *other* reordering.
+/// canonical-import-order section below), the canonical ordering of an ELEMENT
+/// HEAD's items (see the canonical-element-head-order section), the canonical
+/// ordering of a `style()` builder chain's links (see the
+/// canonical-style-chain-order section), and the canonical ordering of a `css`
+/// block's items (see the canonical-css-block-order section). Everything else
+/// must match token for token, so the net still catches every *other*
+/// reordering.
 ///
 /// The css pass runs LAST so that a `style()` chain inside a hole is already
 /// canonical when a block's items are permuted around it — the block scan then
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_css_blocks(sort_style_chains(sort_import_runs(
+    sort_css_blocks(sort_style_chains(sort_element_heads(sort_import_runs(
         &drop_redundant_import_aliases(canonicalize_declaration_clauses(
             collapse_field_shorthands(drop_trailing_commas(tokens)),
         )),
-    )))
+    ))))
 }
 
 /// Drops an import alias that renames a name to ITSELF — `import a::b as b;` is
@@ -1424,6 +1426,373 @@ fn prune_import_branch<'src>(
             (!kept.is_empty()).then_some(ImportBranch::Set(kept))
         }
     }
+}
+
+// --- Canonical element-head order --------------------------------------------
+//
+// `vilan fmt` canonicalizes the order of the items in an element HEAD (E151) —
+// the import sorter's and the style-chain sorter's third sibling, and the one
+// whose commuting groups are the easiest to state and the easiest to get wrong.
+//
+// An element head holds three kinds of item, and the desugar
+// (`crates/vilan-core/src/elements.rs`) is the whole argument about which of
+// them commute:
+//
+//   * an UNDOTTED attribute `name(value)` lowers to `.attr("name", value)`,
+//     which fills the attribute slot called `name` on the view and nothing
+//     else;
+//   * an `on:event(handler)` lowers to `.on("event", handler)` (or `.on_event`
+//     for a one-parameter handler), which fills the handler slot called
+//     `event` and nothing else;
+//   * a DOTTED item splices VERBATIM as a chain link — `.class(…)`,
+//     `.styled(…)`, `.bind_text(…)`, a user method — and the formatter knows
+//     nothing whatever about what slots it writes.
+//
+// So the first two kinds commute with each other and among themselves (two
+// distinct slots are independent; two items naming the SAME slot are a
+// last-wins pair the STABLE sort keeps in written order), and the third does
+// not commute with anything: `.styled(s)` writes `class`, `.child(…)` appends
+// in order, and a user method may write whatever it likes.
+//
+// The rule that follows is the style sorter's barrier rule, one construct over:
+// a dotted link is a BARRIER holding its position absolutely, items sort only
+// within the runs BETWEEN barriers, and no link ever moves relative to another
+// link. That is correct with zero knowledge of user code, and it degrades
+// gracefully — a head that is all links is left exactly as written.
+//
+// Within a run the order is [`ELEMENT_ATTRIBUTE_ORDER`] then everything else
+// alphabetically, and every `on:` handler after every attribute, alphabetically
+// among themselves. The six leading names are the ones a reader looks for first:
+// what the element IS (`id`, `name`, `type`), then what it POINTS AT (`for`,
+// `href`, `src`).
+//
+// What the reorder cannot change is what the element BUILDS. Every moved item
+// fills a slot named by its own first argument, so the surviving slot map is
+// identical across any permutation the rules above allow; only the order the
+// slots were INSERTED in differs, which HTML reads as a set exactly as CSS
+// reads a class list. `crates/vilan-cli/tests/element_head_order.rs` proves it
+// over a corpus, by building each element in written and in sorted order and
+// diffing the emitted JS.
+//
+// Refused outright: a head with a comment anywhere inside it. A reordered head
+// would carry its comments to the wrong item, and the comment cursor only moves
+// forward — the same refusal the style sorter makes, for the same reason.
+//
+// One consequence is worth naming rather than leaving to be discovered: an
+// attribute's VALUE is an arbitrary expression, so moving the item moves when
+// that expression is EVALUATED. Values in practice are literals and signal
+// reads, and a style chain's arguments are the same bargain that order shipped
+// with — but a value whose side effect has an order is outside what either
+// sorter promises.
+
+/// The undotted attribute names that lead an element head, in order. Everything
+/// else follows them alphabetically.
+///
+/// Deliberately short and deliberately not a category table: unlike a `Style`
+/// method, an attribute name is open (`data-*`, `aria-*`, a web component's
+/// own), so a table that tried to be exhaustive would be wrong the day someone
+/// wrote an attribute it had never heard of. These six are the ones a reader
+/// looks for first — what the element IS, then what it POINTS AT — and
+/// alphabetical is the rule for the rest.
+#[doc(hidden)]
+pub const ELEMENT_ATTRIBUTE_ORDER: &[&str] = &["id", "name", "type", "for", "href", "src"];
+
+/// One item of an element head, as the ORDER sees it: an undotted attribute by
+/// name, an `on:` handler by event name, or a dotted chain link — whose name is
+/// deliberately not read, because a link is a barrier whatever it is called.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElementHeadKind<'src> {
+    Attribute(&'src str),
+    Event(&'src str),
+    Link,
+}
+
+/// The canonical order of `items`, as a permutation of their indices — or
+/// `None` when they are already in it, so an unchanged head stays on its
+/// existing code path, byte for byte.
+///
+/// A [`ElementHeadKind::Link`] is a barrier: it keeps its index, and the items
+/// on either side of it sort within their own run. The sort is STABLE, so two
+/// items that rank equal — two attributes with the same name, two handlers on
+/// the same event, the last-wins pairs — keep their written order.
+#[doc(hidden)]
+pub fn element_head_permutation(items: &[ElementHeadKind<'_>]) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = Vec::with_capacity(items.len());
+    let mut run: Vec<usize> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        if matches!(item, ElementHeadKind::Link) {
+            run.sort_by_key(|index| element_head_sort_key(&items[*index]));
+            order.append(&mut run);
+            order.push(at);
+            continue;
+        }
+        run.push(at);
+    }
+    run.sort_by_key(|index| element_head_sort_key(&items[*index]));
+    order.append(&mut run);
+    (order != (0..items.len()).collect::<Vec<_>>()).then_some(order)
+}
+
+/// One head item's sort key within its run: attributes before handlers, the
+/// six leading names before every other attribute, alphabetical inside each
+/// band.
+fn element_head_sort_key<'src>(item: &ElementHeadKind<'src>) -> (u8, usize, &'src str) {
+    match item {
+        ElementHeadKind::Attribute(name) => (
+            0,
+            ELEMENT_ATTRIBUTE_ORDER
+                .iter()
+                .position(|leading| leading == name)
+                .unwrap_or(ELEMENT_ATTRIBUTE_ORDER.len()),
+            name,
+        ),
+        ElementHeadKind::Event(name) => (1, 0, name),
+        // Unreachable: a link is a barrier and never enters a run.
+        ElementHeadKind::Link => (2, 0, ""),
+    }
+}
+
+/// One head item as the order sees it. The one place an `ElementHeadItem` is
+/// classified, shared by the printer and by [`element_heads`], so the corpus
+/// proof and the formatter cannot disagree about what an item IS.
+fn element_head_kind<'src>(
+    item: &crate::node::ElementHeadItem<'src>,
+    source: &'src str,
+) -> ElementHeadKind<'src> {
+    match item {
+        crate::node::ElementHeadItem::Chain(_) => ElementHeadKind::Link,
+        crate::node::ElementHeadItem::Event((name, _), _) => ElementHeadKind::Event(name),
+        crate::node::ElementHeadItem::Attribute(name, _) => {
+            ElementHeadKind::Attribute(&source[name.into_range()])
+        }
+    }
+}
+
+/// Reorders the head items of every element in `tokens` into the canonical
+/// order — the TOKEN-level twin of the printer's own reorder, and the thing
+/// that lets the safety net accept it.
+///
+/// `format` re-lexes its output and compares the token stream with the input's,
+/// so a printer that MOVES tokens has to be matched by a pass that reduces both
+/// sides to one canonical sequence — exactly what [`sort_import_runs`] and
+/// [`sort_style_chains`] do for the other two orders. Everything else must
+/// still match token for token, so the net keeps catching every OTHER
+/// reordering.
+///
+/// The scan is deliberately conservative. A head it cannot read to a `>` or
+/// `/>` — a turbofish on a chain link, an unbalanced group, anything the shape
+/// below does not cover — is left exactly as written, which can only cost a
+/// reorder (the net then refuses the reprint and the file stays unformatted),
+/// never produce a wrong one. Two consequences of the token stream carrying no
+/// spans are worth naming: `<` is also less-than and a generic's bracket, and a
+/// hyphenated name is several tokens. The first is harmless because a head of
+/// two or more items that closes with `>` is an element by the same grammar the
+/// parser reads; the second is handled by joining `name - name` runs the way
+/// `Parser::element_name_text` does, which is what the printer emits.
+///
+/// Nesting is reached by recursion into each item's own tokens (a `.child(…)`
+/// link carrying an element) and by the outer scan continuing past the head
+/// (the element's children).
+#[doc(hidden)]
+pub fn sort_element_heads<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
+    let mut result: Vec<Token<'src>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if matches!(tokens[index], Token::Ctrl('<'))
+            && let Some((head_start, items, head_end)) = element_head_item_tokens(&tokens, index)
+            && items.len() >= 2
+        {
+            let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+            let kinds: Vec<ElementHeadKind<'_>> = items
+                .iter()
+                .zip(&names)
+                .map(|(item, name)| match item.group {
+                    HEAD_GROUP_ATTRIBUTE => ElementHeadKind::Attribute(name),
+                    HEAD_GROUP_EVENT => ElementHeadKind::Event(name),
+                    _ => ElementHeadKind::Link,
+                })
+                .collect();
+            let order = element_head_permutation(&kinds)
+                .unwrap_or_else(|| (0..items.len()).collect::<Vec<_>>());
+            result.extend(tokens[index..head_start].iter().cloned());
+            for at in order {
+                let range = items[at].range.clone();
+                result.extend(sort_element_heads(tokens[range].to_vec()));
+            }
+            index = head_end;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+const HEAD_GROUP_ATTRIBUTE: u8 = 0;
+const HEAD_GROUP_EVENT: u8 = 1;
+const HEAD_GROUP_LINK: u8 = 2;
+
+/// One head item as [`sort_element_heads`] reads it: which of the three kinds
+/// it is, the name the order sorts it by, and the token range that moves whole.
+struct HeadItemTokens {
+    group: u8,
+    name: String,
+    range: std::ops::Range<usize>,
+}
+
+/// Whether `token` can be part of an element or attribute NAME — the parser's
+/// own `peek_at_is_name`, which is "anything but punctuation and a literal", so
+/// that a keyword-spelled attribute (`type`, `for`) reads as the name it is.
+fn is_element_name_token(token: &Token<'_>) -> bool {
+    !matches!(
+        token,
+        Token::Ctrl(_)
+            | Token::Op(_)
+            | Token::String(_)
+            | Token::MultilineString(_)
+            | Token::Number(..)
+    )
+}
+
+/// The name beginning at `at` — one token, or a hyphenated run joined the way
+/// `Parser::element_name_text` joins it — and the index just past it.
+fn element_name_tokens(tokens: &[Token<'_>], at: usize) -> Option<(String, usize)> {
+    if !tokens.get(at).is_some_and(is_element_name_token) {
+        return None;
+    }
+    let mut text = tokens[at].to_string();
+    let mut index = at + 1;
+    while matches!(tokens.get(index), Some(Token::Op("-")))
+        && tokens.get(index + 1).is_some_and(is_element_name_token)
+    {
+        text.push('-');
+        text.push_str(&tokens[index + 1].to_string());
+        index += 2;
+    }
+    Some((text, index))
+}
+
+/// The index just past the group whose OPENING delimiter sits at `open`, or
+/// `None` when it never closes.
+fn balanced_group_end(tokens: &[Token<'_>], open: usize) -> Option<usize> {
+    if !matches!(tokens.get(open), Some(Token::Ctrl('(' | '[' | '{'))) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, token) in tokens[open..].iter().enumerate() {
+        match token {
+            Token::Ctrl('(' | '[' | '{') => depth += 1,
+            Token::Ctrl(')' | ']' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The head items of the element whose `<` sits at `open`: where the head
+/// begins (just past the tag), the items, and the index of the closing `>` or
+/// of the `/` of a `/>`. `None` when the tokens are not a head this pass reads.
+fn element_head_item_tokens(
+    tokens: &[Token<'_>],
+    open: usize,
+) -> Option<(usize, Vec<HeadItemTokens>, usize)> {
+    let (_, head_start) = element_name_tokens(tokens, open + 1)?;
+    let mut items: Vec<HeadItemTokens> = Vec::new();
+    let mut index = head_start;
+    loop {
+        match tokens.get(index) {
+            Some(Token::Ctrl('>')) => return Some((head_start, items, index)),
+            Some(Token::Op("/")) if matches!(tokens.get(index + 1), Some(Token::Ctrl('>'))) => {
+                return Some((head_start, items, index));
+            }
+            // A dotted chain link — the barrier. Read strictly: a dot, a name,
+            // a call. Anything else (a turbofish, a bare `.field`) declines the
+            // whole head rather than guessing where the item ends.
+            Some(Token::Ctrl('.')) => {
+                if !tokens.get(index + 1).is_some_and(is_element_name_token) {
+                    return None;
+                }
+                let after = balanced_group_end(tokens, index + 2)?;
+                items.push(HeadItemTokens {
+                    group: HEAD_GROUP_LINK,
+                    name: String::new(),
+                    range: index..after,
+                });
+                index = after;
+            }
+            Some(token) if is_element_name_token(token) => {
+                // `on:event(handler)` — read before the attribute form, which
+                // would otherwise take `on` as a bare boolean attribute.
+                if matches!(token, Token::Ident("on"))
+                    && matches!(tokens.get(index + 1), Some(Token::Op(":")))
+                    && tokens.get(index + 2).is_some_and(is_element_name_token)
+                {
+                    let after = balanced_group_end(tokens, index + 3)?;
+                    items.push(HeadItemTokens {
+                        group: HEAD_GROUP_EVENT,
+                        name: tokens[index + 2].to_string(),
+                        range: index..after,
+                    });
+                    index = after;
+                    continue;
+                }
+                let (name, past_name) = element_name_tokens(tokens, index)?;
+                // A bare name is a boolean attribute; a `(` opens its value.
+                let after = if matches!(tokens.get(past_name), Some(Token::Ctrl('('))) {
+                    balanced_group_end(tokens, past_name)?
+                } else {
+                    past_name
+                };
+                items.push(HeadItemTokens {
+                    group: HEAD_GROUP_ATTRIBUTE,
+                    name,
+                    range: index..after,
+                });
+                index = after;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Every element head in `source`, outermost first, each as its items' kinds —
+/// what `crates/vilan-cli/tests/element_head_order.rs` reads to assert a
+/// tracked fixture still carries a head worth ordering and is already in the
+/// canonical order. Returns an empty list when the source does not parse, which
+/// the caller reads as "decide nothing".
+#[doc(hidden)]
+pub fn element_heads(source: &str) -> Vec<Vec<ElementHeadKind<'_>>> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut heads = Vec::new();
+    for item in &items {
+        collect_element_heads(item, source, &mut heads);
+    }
+    heads
+}
+
+fn collect_element_heads<'src>(
+    node: &Spanned<Node<'src>>,
+    source: &'src str,
+    heads: &mut Vec<Vec<ElementHeadKind<'src>>>,
+) {
+    if let Node::Element(body) = &node.0 {
+        heads.push(
+            body.head
+                .iter()
+                .map(|item| element_head_kind(item, source))
+                .collect(),
+        );
+    }
+    node.0
+        .for_each_child(&mut |child| collect_element_heads(child, source, heads));
 }
 
 /// The source spans of every TOP-LEVEL `import` / `use` / re-export statement.
@@ -3992,6 +4361,37 @@ impl<'src> Printer<'src> {
         true
     }
 
+    /// The order `body`'s head items print in: the canonical element-head order
+    /// (E151 — see the canonical-element-head-order section), or the written
+    /// order where that section refuses to reorder.
+    ///
+    /// Computed ONCE per element and handed to both renderings, so the inline
+    /// attempt and the split reprint cannot lay the head out in two different
+    /// orders.
+    ///
+    /// Two refusals. A head of fewer than two items has nothing to order. And a
+    /// head with a COMMENT anywhere inside it is left as written: a reordered
+    /// head would carry its comments to the wrong item, and the comment cursor
+    /// only ever moves forward — the style sorter's own refusal, for the same
+    /// reason.
+    fn element_head_order(&self, body: &crate::node::ElementBody<'src>) -> Vec<usize> {
+        let written = || (0..body.head.len()).collect::<Vec<usize>>();
+        if body.head.len() < 2 {
+            return written();
+        }
+        let spans = Self::element_item_spans(body);
+        let head_end = spans[body.head.len()].into_range().end;
+        if self.has_comment_in(body.tag.into_range().end, head_end) {
+            return written();
+        }
+        let kinds: Vec<ElementHeadKind<'src>> = body
+            .head
+            .iter()
+            .map(|item| element_head_kind(item, self.source))
+            .collect();
+        element_head_permutation(&kinds).unwrap_or_else(written)
+    }
+
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
         // A comment between the element's items forces the split — collapsed,
         // there is no line to keep it on — and the split loops below attach it
@@ -4002,25 +4402,26 @@ impl<'src> Printer<'src> {
                 .first()
                 .is_some_and(|child| matches!(child.node().0, Node::Element(_)))
             || self.comment_between_elements(&Self::element_item_spans(body));
+        let order = self.element_head_order(body);
         if !must_split {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
-            self.print_element_inline(body);
+            self.print_element_inline(body, &order);
             if !self.out[element_start..].contains('\n') && !self.current_line_over_budget() {
                 return;
             }
             self.out.truncate(element_start);
             self.cursor = comment_cursor;
         }
-        self.print_element_split(body);
+        self.print_element_split(body, &order);
     }
 
-    fn print_element_inline(&mut self, body: &crate::node::ElementBody<'src>) {
+    fn print_element_inline(&mut self, body: &crate::node::ElementBody<'src>, order: &[usize]) {
         self.out.push('<');
         self.out.push_str(&self.source[body.tag.into_range()]);
-        for item in &body.head {
+        for &at in order {
             self.out.push(' ');
-            self.print_element_head_item(item);
+            self.print_element_head_item(&body.head[at]);
         }
         if body.self_closing {
             self.out.push_str(" />");
@@ -4038,7 +4439,7 @@ impl<'src> Printer<'src> {
         self.out.push('>');
     }
 
-    fn print_element_split(&mut self, body: &crate::node::ElementBody<'src>) {
+    fn print_element_split(&mut self, body: &crate::node::ElementBody<'src>, order: &[usize]) {
         // Head-item source spans, for comment attachment between items.
         let head_spans: Vec<Span> = {
             let all = Self::element_item_spans(body);
@@ -4053,9 +4454,9 @@ impl<'src> Printer<'src> {
         let comment_cursor = self.cursor;
         self.out.push('<');
         self.out.push_str(&self.source[body.tag.into_range()]);
-        for item in &body.head {
+        for &at in order {
             self.out.push(' ');
-            self.print_element_head_item(item);
+            self.print_element_head_item(&body.head[at]);
         }
         let head_wide = self.out[head_start..].contains('\n') || self.current_line_over_budget();
         let split_head = (head_wide || comment_in_head) && !body.head.is_empty();
@@ -4065,8 +4466,13 @@ impl<'src> Printer<'src> {
             self.out.push('<');
             self.out.push_str(&self.source[body.tag.into_range()]);
             self.indent += 1;
+            // The comment flushes below run over the head items in the order
+            // they PRINT. That is safe precisely because a head that reorders
+            // carries no comment inside it (`element_head_order` refuses one),
+            // so every flush here is a no-op unless the order is the written
+            // one — in which case the spans ascend as they always did.
             let mut prev_end = body.tag.end;
-            for (item, item_span) in body.head.iter().zip(head_spans[1..].iter()) {
+            for (item, item_span) in order.iter().map(|&at| (&body.head[at], head_spans[1 + at])) {
                 let item_start = self.out.len();
                 let item_cursor = self.cursor;
                 self.flush_element_comments(item_span.start, prev_end);
@@ -8989,9 +9395,13 @@ mod element_layout {
     fn an_over_budget_head_splits_one_item_per_line() {
         let source = "fun demo(): View {\n\t<input placeholder(\"What needs doing?\") disabled aria-label(\"A long label here to push the head far past the hundred column budget\") />\n}\n";
         assert_over_budget(source.lines().nth(1).unwrap());
+        // The items come out in the canonical element-head order (E151) —
+        // none of these three is a leading name, so they are alphabetical.
+        // What this pin is about is the LAYOUT: one item per line, `/>` back
+        // at the element's own indent.
         assert_construct(
             source,
-            "fun demo(): View {\n\t<input\n\t\tplaceholder(\"What needs doing?\")\n\t\tdisabled\n\t\taria-label(\"A long label here to push the head far past the hundred column budget\")\n\t/>\n}\n",
+            "fun demo(): View {\n\t<input\n\t\taria-label(\"A long label here to push the head far past the hundred column budget\")\n\t\tdisabled\n\t\tplaceholder(\"What needs doing?\")\n\t/>\n}\n",
         );
     }
 
@@ -10949,6 +11359,234 @@ mod if_arm_layout {
              \tlabel\n\
              }\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod element_head_layout {
+    //! E151 — the element-head ATTRIBUTE sorter, the import and style-chain
+    //! sorters' third sibling.
+    //!
+    //! Undotted attributes lead, in [`ELEMENT_ATTRIBUTE_ORDER`] and then
+    //! alphabetically; `on:` handlers follow them alphabetically; a DOTTED
+    //! chain link is a barrier that keeps its position absolutely, so nothing
+    //! ever crosses one and no link ever moves relative to another link. The
+    //! desugar is the whole argument: an attribute and a handler each lower to
+    //! a call that fills the slot named by its own first argument, and a dotted
+    //! link splices verbatim and may write anything at all.
+    //!
+    //! The commutation is proved rather than argued, over a corpus, in
+    //! `crates/vilan-cli/tests/element_head_order.rs` — which builds and RUNS
+    //! each element both ways and compares the document it renders.
+    use super::bailing_constructs::assert_construct;
+    use super::{ELEMENT_ATTRIBUTE_ORDER, ElementHeadKind, element_head_permutation, format};
+
+    /// The canonical order, in one head: the six leading names in their own
+    /// order, then everything else alphabetically. Written backwards on
+    /// purpose, with a keyword-spelled name (`for`, `type`) and hyphenated ones
+    /// among them.
+    #[test]
+    fn undotted_attributes_take_the_canonical_order() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<label for(\"f\") aria-y(\"2\") src(\"s\") name(\"n\") href(\"h\") \
+             type(\"t\") id(\"i\")>\"l\"</label>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<label id(\"i\") name(\"n\") type(\"t\") for(\"f\") href(\"h\") src(\"s\") \
+             aria-y(\"2\")>\"l\"</label>\n\
+             }\n",
+        );
+        // A hyphenated name is several TOKENS, and both the printer and the
+        // token twin have to read it as one name.
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<i data-x(\"1\") aria-y(\"2\") id(\"i\")>\"h\"</i>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<i id(\"i\") aria-y(\"2\") data-x(\"1\")>\"h\"</i>\n\
+             }\n",
+        );
+    }
+
+    /// Handlers sort AFTER every attribute, and alphabetically among
+    /// themselves. A bare boolean attribute is an attribute like any other.
+    #[test]
+    fn handlers_follow_the_attributes_alphabetically() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<a on:click(|| go()) href(\"/x\") class(\"nav\") disabled id(\"home\") \
+             on:blur(|| leave())>\"go\"</a>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<a id(\"home\") href(\"/x\") class(\"nav\") disabled on:blur(|| leave()) \
+             on:click(|| go())>\"go\"</a>\n\
+             }\n",
+        );
+    }
+
+    /// A DOTTED link is a barrier. The attributes on either side of it sort
+    /// within their own run and never cross it — which is not a nicety: a link
+    /// may write the very slot an attribute beside it writes, and the formatter
+    /// knows nothing about what any link writes.
+    #[test]
+    fn a_dotted_link_is_a_barrier() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div title(\"t\") .styled(shell) src(\"s\") id(\"i\") .child(inner()) \
+             name(\"n\")>\"x\"</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div title(\"t\") .styled(shell) id(\"i\") src(\"s\") .child(inner()) \
+             name(\"n\")>\"x\"</div>\n\
+             }\n",
+        );
+        // The shape the barrier rule exists for: the attribute and the link
+        // write one slot, and the one written LAST wins. Both spellings are
+        // left exactly as written.
+        let after = "fun demo(): View {\n\t<div .class(\"a\") class(\"b\")>\"x\"</div>\n}\n";
+        let before = "fun demo(): View {\n\t<div class(\"b\") .class(\"a\")>\"x\"</div>\n}\n";
+        assert_construct(after, after);
+        assert_construct(before, before);
+    }
+
+    /// A head that is ALL links is left exactly as written — the degradation
+    /// the barrier rule buys, with zero knowledge of user code.
+    #[test]
+    fn a_head_of_only_links_is_untouched() {
+        let source = "fun demo(): View {\n\
+                      \t<div .child(second()) .styled(shell) .child(first())>\"x\"</div>\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// Two items that rank EQUAL keep their written order, because the sort is
+    /// stable — which is the whole of the last-wins story: `class("first")`
+    /// then `class("second")` renders `second`, and the reverse renders
+    /// `first`.
+    #[test]
+    fn a_last_wins_pair_keeps_its_written_order() {
+        let source = "fun demo(): View {\n\
+                      \t<div class(\"first\") class(\"second\") id(\"i\")>\"x\"</div>\n\
+                      }\n";
+        assert_construct(
+            source,
+            "fun demo(): View {\n\
+             \t<div id(\"i\") class(\"first\") class(\"second\")>\"x\"</div>\n\
+             }\n",
+        );
+        // Two handlers on one event, likewise.
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<a on:click(|| second()) on:blur(|| leave()) on:click(|| first())>\"g\"</a>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<a on:blur(|| leave()) on:click(|| second()) on:click(|| first())>\"g\"</a>\n\
+             }\n",
+        );
+    }
+
+    /// A head with a COMMENT anywhere inside it is left as written: a reordered
+    /// head would carry its comments to the wrong item, and the comment cursor
+    /// only moves forward. The style sorter's refusal, for the same reason.
+    #[test]
+    fn a_comment_in_the_head_refuses_the_reorder() {
+        let source = "fun demo(): View {\n\
+                      \t<div\n\
+                      \t\t// the interesting one\n\
+                      \t\ttitle(\"t\")\n\
+                      \t\tid(\"i\")\n\
+                      \t>\n\
+                      \t\t\"x\"\n\
+                      \t</div>\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// A nested element's head sorts too — reached by the printer's own
+    /// recursion, and by the token twin's.
+    #[test]
+    fn a_nested_elements_head_sorts() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div .child(<span type(\"a\") id(\"b\")>\"x\"</span>)>\"y\"</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div .child(<span id(\"b\") type(\"a\")>\"x\"</span>)>\"y\"</div>\n\
+             }\n",
+        );
+    }
+
+    /// The order function itself, at the unit: a barrier holds its INDEX, and
+    /// the runs on either side sort independently.
+    #[test]
+    fn the_permutation_sorts_only_within_the_runs() {
+        let head = [
+            ElementHeadKind::Attribute("title"),
+            ElementHeadKind::Link,
+            ElementHeadKind::Attribute("src"),
+            ElementHeadKind::Attribute("id"),
+            ElementHeadKind::Event("click"),
+            ElementHeadKind::Link,
+            ElementHeadKind::Attribute("name"),
+        ];
+        assert_eq!(
+            element_head_permutation(&head),
+            Some(vec![0, 1, 3, 2, 4, 5, 6])
+        );
+        // A head already in the order answers `None`, so an unchanged head
+        // stays on its existing code path.
+        let canonical: Vec<ElementHeadKind<'_>> = head
+            .iter()
+            .enumerate()
+            .map(|(at, _)| head[[0, 1, 3, 2, 4, 5, 6][at]])
+            .collect();
+        assert_eq!(element_head_permutation(&canonical), None);
+    }
+
+    /// The leading names are the ones the order names, in the order it names
+    /// them — a table this short is worth pinning against a typo.
+    #[test]
+    fn the_leading_names_are_the_six_the_order_names() {
+        assert_eq!(
+            ELEMENT_ATTRIBUTE_ORDER,
+            &["id", "name", "type", "for", "href", "src"]
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check`. Asserted from the UNFORMATTED side.
+    #[test]
+    fn every_head_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(): View {\n\t<input type(\"checkbox\") disabled aria-label(\"Done\") \
+                 name(\"n\") id(\"i\") />\n}\n",
+                true,
+            ),
+            (
+                "fun b(): View {\n\t<input id(\"i\") name(\"n\") type(\"checkbox\") \
+                 aria-label(\"Done\") disabled />\n}\n",
+                false,
+            ),
+            (
+                "fun c(): View {\n\t<div .class(\"a\") class(\"b\")>\"x\"</div>\n}\n",
+                false,
+            ),
+            (
+                "fun d(): View {\n\t<a on:click(|| go()) href(\"/x\") \
+                 on:blur(|| leave())>\"go\"</a>\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
     }
 }
 
