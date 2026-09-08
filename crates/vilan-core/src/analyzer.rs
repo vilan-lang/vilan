@@ -46996,11 +46996,47 @@ thread_local! {
     static BASE_CACHE_CLAIMS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The default retained-world byte budget (M24): generous, because the point
-/// is a BOUND, not a diet — a session that meets a handful of key shapes must
-/// never notice it, and one that walks a large workspace must not grow
-/// without end. Overridable at server start; see [`set_base_cache_budget`].
-pub const BASE_CACHE_DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+/// How much more a retained world WEIGHS than [`base_cache_world_bytes`]
+/// records (M50) — the ratio between the two currencies, measured.
+///
+/// M24 set a 512 MiB budget and compared it against the M11 figure, which is
+/// the world's source TEXTS plus M41's per-`TypeId` census: source-proportional
+/// by design, because an eviction has to be able to recompute exactly what the
+/// store recorded without a heap audit. What that figure is NOT is what the
+/// world weighs. The ~229 analyzer tables the resolve fills — scopes, the
+/// entity and expression maps, the type tables, the registry clone each stored
+/// world carries — are derived state the counter does not try to count, and
+/// they are most of the world.
+///
+/// Measured with `world_cache_spike.rs`'s weighing harness (eight distinct
+/// keys minted through `macro_limits` over one wide-`std` closure, minus a
+/// same-key control that pays the identical per-analysis transient, parse cache
+/// and interner warmed first so nothing process-global is credited to a world):
+/// **4,701,037 B resident per world against 194,843 B recorded — 24.1×**, on a
+/// release build at loadavg 112. So 512 MiB of RECORDED bytes was a bound on
+/// the order of **12 GB resident**: the cache was bounded, and not where M24
+/// thought.
+///
+/// Two things the item suspected are deliberately NOT in this number, and that
+/// is the other half of the finding: the leaked module ASTs and the interned
+/// name tables are process-global (`parse_clean_cached`'s immortal cache, the
+/// display-name interner) — they are paid once, shared by every world, and a
+/// PER-WORLD figure must not carry them. The harness warms both before it
+/// weighs, so neither is in the 4.7 MB either. The gap is the derived tables.
+pub const BASE_CACHE_WEIGHT_FACTOR: usize = 24;
+
+/// The retained-world budget in the currency a session actually has: RESIDENT
+/// bytes (M24's number, M50's unit). Generous, because the point is a BOUND,
+/// not a diet — a session that meets a handful of key shapes must never notice
+/// it, and one that walks a large workspace must not grow without end.
+pub const BASE_CACHE_RESIDENT_BUDGET: usize = 512 * 1024 * 1024;
+
+/// The same bound, expressed in the currency [`BaseCacheState::retained_bytes`]
+/// counts in (M50) — which is what [`BaseCacheState::evict_to_budget`] compares
+/// against, so it is what the budget has to be denominated in. Overridable at
+/// server start; see [`set_base_cache_budget`] and
+/// [`base_cache_budget_for_resident`].
+pub const BASE_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_RESIDENT_BUDGET / BASE_CACHE_WEIGHT_FACTOR;
 
 static BASE_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(BASE_CACHE_DEFAULT_BUDGET);
@@ -47084,6 +47120,31 @@ pub fn set_base_cache_budget(bytes: usize) {
 #[doc(hidden)]
 pub fn base_cache_budget() -> usize {
     BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A resident-byte figure, converted into the currency the budget is spent in
+/// (M50). The front-end knob is in MiB of MEMORY, which is what anyone
+/// reasoning about a language server's footprint means by it, and
+/// [`set_base_cache_budget`] takes recorded bytes — this is the one conversion
+/// between them, so no front end has to know the factor.
+///
+/// `0` survives as `0`: "retain nothing but the world just stored" is a
+/// legitimate way to take the cache out of a measurement (M24), and dividing
+/// it must not turn it into something else.
+pub fn base_cache_budget_for_resident(bytes: usize) -> usize {
+    bytes / BASE_CACHE_WEIGHT_FACTOR
+}
+
+/// What the retained worlds actually WEIGH, in resident bytes (M50): the
+/// recorded figure, re-denominated by the measured factor.
+///
+/// [`base_cache_retained_bytes`] is the budget's own currency and stays exactly
+/// what it was — the M11 tally's number, which an eviction can recompute. This
+/// is the number to put in front of a human, because it is the one in the unit
+/// a machine has.
+#[doc(hidden)]
+pub fn base_cache_retained_weight() -> usize {
+    base_cache_retained_bytes().saturating_mul(BASE_CACHE_WEIGHT_FACTOR)
 }
 
 /// The bytes the retained worlds are recorded as holding right now (M24) —
@@ -47617,11 +47678,18 @@ const CHECKED_CACHE_KEYS: usize = 256;
 ///
 /// The budget is bytes now, and [`ModuleTables::bytes`] is what counts them.
 /// Sized against M24's retained-world budget rather than invented: one eighth
-/// of [`BASE_CACHE_DEFAULT_BUDGET`], because a record is a fraction of the
-/// world it describes and the two caches are bounded by the same argument.
-/// The row bound is gone rather than kept beside it — two bounds on one thing
-/// is one bound and one number nobody can act on.
-pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_DEFAULT_BUDGET / 8;
+/// of it, because a record is a fraction of the world it describes and the two
+/// caches are bounded by the same argument. The row bound is gone rather than
+/// kept beside it — two bounds on one thing is one bound and one number nobody
+/// can act on.
+///
+/// M50: against [`BASE_CACHE_RESIDENT_BUDGET`] rather than
+/// [`BASE_CACHE_DEFAULT_BUDGET`], and the VALUE is unchanged at 64 MiB.
+/// [`ModuleTables::bytes`] is a structural count of the rows it holds — a
+/// figure in the same units a machine has — so it needs no re-denomination,
+/// while the base cache's does; deriving this from the re-denominated constant
+/// would have silently divided this budget by 24 as well.
+pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_RESIDENT_BUDGET / 8;
 
 static CHECKED_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(CHECKED_CACHE_DEFAULT_BUDGET);

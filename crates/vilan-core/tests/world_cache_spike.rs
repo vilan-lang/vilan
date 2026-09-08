@@ -256,3 +256,114 @@ fn resident_bytes() -> Option<usize> {
     let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
     Some(pages * 4096)
 }
+
+/// M50: **the world's weight, pinned against the counter within the stated
+/// factor.**
+///
+/// The sibling measurement above found that a retained world weighs far more
+/// than `base_cache_retained_bytes` records, and left the number indicative.
+/// M24's budget was denominated in that counter, so "512 MiB retained" was a
+/// bound on the order of 12 GB resident — the cache was bounded, and not where
+/// M24 thought. `BASE_CACHE_WEIGHT_FACTOR` is the ratio, measured, and
+/// `BASE_CACHE_DEFAULT_BUDGET` is the resident bound divided by it.
+///
+/// A constant taken from one measurement rots silently, so this is a pin and
+/// not a comment: the same eight-key weighing, asserting that the factor the
+/// harness measures is within **3×** of the one the compiler ships. The band is
+/// wide on purpose — RSS is a blunt instrument and this asserts a DENOMINATION,
+/// not a byte count — and it still reds by orders of magnitude on the change
+/// that matters, which is the counter quietly starting (or stopping) to count
+/// the derived tables that make up the gap.
+///
+/// It DECLINES rather than fails where the instrument is not available: no
+/// `/proc/self/statm`, or a control that grew at least as much as the
+/// measurement, means there is no reading here to assert on.
+#[test]
+fn one_retained_world_weighs_what_the_shipped_factor_says_it_does() {
+    let load = loadavg_1m();
+    const WORLDS: u64 = 8;
+    /// How far the measured factor may sit from the shipped one, either way.
+    const SLACK: f64 = 3.0;
+
+    let (growth, control, recorded, count) = on_one_thread(move || {
+        let spec = vilan_core::manifest::resolve_std(&std_root());
+        // Everything per-process but not per-world, warmed first: the parse
+        // cache's leaked texts and trees, the interner, the allocator's arenas.
+        // A per-world figure must not carry them — and the fact that they are
+        // NOT the gap is half of M50's finding.
+        vilan_core::analyzer::base_cache_clear();
+        analyze_on_this_thread(&spec, WIDE_A);
+        vilan_core::analyzer::base_cache_clear();
+
+        let control_before = resident_bytes();
+        for _ in 0..WORLDS {
+            analyze_on_this_thread(&spec, WIDE_A);
+        }
+        let control = resident_bytes()
+            .zip(control_before)
+            .map(|(after, before)| after.saturating_sub(before));
+        vilan_core::analyzer::base_cache_clear();
+
+        let before = resident_bytes();
+        for fuel in 0..WORLDS {
+            let mut workspace = Workspace::default();
+            workspace.macro_limits.fuel = 1_000_000 + fuel;
+            let (program, _errors) = analyze_source(
+                WIDE_A,
+                &spec,
+                Path::new("."),
+                Path::new("world_weight_pin.vl"),
+                Some(Platform::default()),
+                &workspace,
+            );
+            drop(program);
+        }
+        let growth = resident_bytes()
+            .zip(before)
+            .map(|(after, before)| after.saturating_sub(before));
+        let count = vilan_core::analyzer::base_cache_retained();
+        let recorded = vilan_core::analyzer::base_cache_retained_bytes();
+        let weight = vilan_core::analyzer::base_cache_retained_weight();
+        assert_eq!(
+            weight,
+            recorded * vilan_core::analyzer::BASE_CACHE_WEIGHT_FACTOR,
+            "the reported weight is the recorded figure re-denominated, and \
+             nothing else"
+        );
+        vilan_core::analyzer::base_cache_clear();
+        (growth, control, recorded, count)
+    });
+
+    assert_eq!(
+        count, WORLDS as usize,
+        "each distinct macro-fuel key must retain a world of its own, or this \
+         is weighing something other than {WORLDS} worlds"
+    );
+
+    let (Some(growth), Some(control)) = (growth, control) else {
+        println!("M50-WEIGHT DECLINED: no /proc/self/statm on this host");
+        return;
+    };
+    if growth <= control {
+        println!(
+            "M50-WEIGHT DECLINED: rss_growth={growth} B did not exceed \
+             rss_control={control} B, so there is no per-world reading (load={load})"
+        );
+        return;
+    }
+    let per_world = (growth - control) / (WORLDS as usize - 1);
+    let recorded_per_world = recorded / count.max(1);
+    let measured = per_world as f64 / recorded_per_world.max(1) as f64;
+    let shipped = vilan_core::analyzer::BASE_CACHE_WEIGHT_FACTOR as f64;
+    println!(
+        "M50-WEIGHT rss_per_world={per_world} B recorded_per_world={recorded_per_world} B \
+         measured_factor={measured:.1} shipped_factor={shipped:.0} load={load}"
+    );
+    assert!(
+        measured >= shipped / SLACK && measured <= shipped * SLACK,
+        "a retained world weighs {measured:.1}x what the counter records, and \
+         `BASE_CACHE_WEIGHT_FACTOR` says {shipped:.0}x — the budget is \
+         denominated on that factor, so re-measure it (the harness above prints \
+         the raw figures) rather than widening this band"
+    );
+}
