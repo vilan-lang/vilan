@@ -2228,9 +2228,7 @@ impl RemoteSource<type T> with Source<Option<T>> {
 	fun effect(self, observer: |Option<T>| void) {
 		get_owner().take(self.lease(observer));
 	}
-}
 
-impl RemoteSource<type T> {
 	/// Observe the mirror through `transform`, as a plain `SignalCell<U>` — the
 	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
 	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
@@ -2244,16 +2242,13 @@ impl RemoteSource<type T> {
 	/// module level is a documented idiom and a network subscription at module
 	/// level is not one.
 	///
-	/// INHERENT rather than an override inside the `Source` impl, and that is a
-	/// COMPILER LIMIT and not a preference: written as an override, `status`'s
-	/// own `self.cache.map(..)` — a call on a `SignalCell` field, which
-	/// inherits the trait's default — miscompiles, and `register_with_owner`
-	/// runs with an undefined owner (`self[0].v.push` on `undefined` at module
-	/// scope; both A25 owner pins go red). Overriding a default that the
-	/// receiver's own field type inherits is the shape that breaks. The cost of
-	/// keeping it inherent is that the STRICT law reaches a concrete
-	/// `mirror.map(..)` only; a generic `S: Source<Option<T>>` calling `.map`
-	/// gets the owner-optional default.
+	/// An OVERRIDE of the trait's `map`, which is what makes the strict law
+	/// reach a generic `S: Source<Option<T>>` too and not merely a concrete
+	/// `mirror.map(..)`. It was inherent until B258: overriding a default that
+	/// the receiver's own field type inherits used to promote `status`'s own
+	/// `self.cache.map(..)` — a call on a `SignalCell` field, which inherits
+	/// the OWNER-OPTIONAL default — to this strict body's flavor, and
+	/// `register_with_owner` ran with an undefined owner.
 	///
 	/// `transform` sees `None` until the first frame lands — the one place the
 	/// `Option` is confronted, and where a fallback of a DIFFERENT type than
@@ -2265,7 +2260,9 @@ impl RemoteSource<type T> {
 		}));
 		derived
 	}
+}
 
+impl RemoteSource<type T> {
 	/// `map` for the same-type case: `initial` until the first frame, the
 	/// mirrored value after. Counted and owner-released exactly like `map`,
 	/// because it IS `map` — `client.notes.or([])` inside a view replaces the

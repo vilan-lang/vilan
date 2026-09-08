@@ -624,10 +624,15 @@ fn analyze(
     // over-propagate async-ness); the context analysis adds the edges
     // LOCALLY: for each dispatch site, every candidate callee — the named
     // member's trait default plus every implementation's override, across the
-    // traits declaring that name. Over-approximation is sound here (an extra
-    // caller edge only strengthens the coverage demand); the same sites join
-    // the threading plan, and a callee that turns out not to need the value
-    // simply ignores the extra argument.
+    // traits declaring that name — NARROWED, where the receiver is known, to
+    // the members that receiver's head can select (B258). Over-approximation
+    // is sound for the coverage demand alone; it is not sound for the FLAVOR
+    // (`settle_strict` promotes a whole site off one strict candidate), so a
+    // `self.cache.map(..)` on a `SignalCell` field that inherits the
+    // owner-OPTIONAL `Source::map` default must not see `RemoteSource`'s
+    // strict override of the same name. The same sites join the threading
+    // plan, and a callee that turns out not to need the value simply ignores
+    // the extra argument.
     // The name and candidate lookups live in `dispatch_refine` (shared with
     // the const-only capability check since B143).
     let dispatch_member_name =
@@ -649,7 +654,9 @@ fn analyze(
             let Some(name) = dispatch_member_name(call.call_id) else {
                 continue;
             };
-            let candidates = dispatch_candidates(name);
+            let candidates =
+                crate::dispatch_refine::known_receiver_candidates(program, call.call_id)
+                    .unwrap_or_else(|| dispatch_candidates(name));
             for &candidate in &candidates {
                 dispatch_callers
                     .entry(candidate)

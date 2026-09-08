@@ -3248,3 +3248,137 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
         "#,
     );
 }
+
+// --- B258: overriding a trait DEFAULT the receiver's own FIELD type inherits
+// ------------------------------------------------------------------------
+// A miscompile of the `context` pass's flavor propagation, not of dispatch:
+// `candidates_of` is NAME-keyed, so a dispatch site's candidate list held every
+// override of every trait declaring the name — including ones the receiver
+// could never select. One strict candidate promotes a whole site's flavor
+// (`settle_strict`), so `Mirror`'s STRICT override of `Tag::label` rewrote
+// `self.cell.label()` — a call on a `Cell` FIELD, which inherits the
+// owner-OPTIONAL default — into a bare hand-off with no value to hand: the
+// default's `get_safe()` read `Some(undefined)` and answered `under undefined`
+// where it should have answered "no scope". std's shape was
+// `RemoteSource::map` over `status`'s own `self.cache.map(..)`
+// (`register_with_owner` on an undefined owner), which is why `map` was
+// inherent until this closed. Fixed by narrowing an `OnType` site with a KNOWN
+// receiver to the members that receiver's head selects — the narrowing
+// `dispatch_refine` already ran for coverage, now shared with the flavor.
+
+/// The shape itself: a `Mirror` whose FIELD is a `Cell` calling the trait
+/// default `Cell` inherits, with `Mirror` overriding that same default in its
+/// own sub-trait impl. The field call must run the DEFAULT, with the FIELD as
+/// the receiver (`default(cell)`, never `override(mirror)`), and must read the
+/// context SAFELY — absent outside a `run`, present inside one.
+#[test]
+fn b258_a_field_call_on_an_inherited_default_is_not_promoted_by_a_siblings_override() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ None, Some, self };
+
+        let scope: Context<str> = Context::new();
+
+        trait Tag<T> {
+            fun raw(self): T;
+            fun name(self): str;
+
+            // The DEFAULT: an owner-OPTIONAL read.
+            fun label(self): str {
+                match scope.get_safe() {
+                    Some(let value) => i"default({self.name()}) under {value}",
+                    None => i"default({self.name()}), no scope",
+                }
+            }
+        }
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> with Tag<T> {
+            fun raw(self): T { self.value }
+            fun name(self): str { "cell" }
+        }
+
+        struct Mirror<T> { cell: Cell<T> }
+
+        impl Mirror<type T> with Tag<Option<T>> {
+            fun raw(self): Option<T> { Some(self.cell.raw()) }
+            fun name(self): str { "mirror" }
+
+            // The OVERRIDE, and a STRICT read.
+            fun label(self): str {
+                i"override({self.name()}) under {scope.get()}"
+            }
+        }
+
+        impl Mirror<type T> {
+            // The field call: `self.cell` is a `Cell<T>`, which INHERITS.
+            fun field_label(self): str { self.cell.label() }
+        }
+
+        fun main() {
+            let mirror = Mirror { cell = Cell { value = 7 } };
+            print(mirror.field_label());
+            print(scope.run("s", || mirror.field_label()));
+            print(scope.run("s", || mirror.label()));
+        }
+        main();
+        "#,
+        "default(cell), no scope\n\
+         default(cell) under s\n\
+         override(mirror) under s\n",
+    );
+}
+
+/// The control: where the override IS the receiver's own type, the strict read
+/// still fences. `mirror.label()` outside every `run` is the coverage refusal —
+/// narrowing the candidate list must not weaken the law on the receiver that
+/// really does select the strict body.
+#[test]
+fn b258_the_override_still_fences_on_its_own_receiver() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ None, Some, self };
+
+        let scope: Context<str> = Context::new();
+
+        trait Tag<T> {
+            fun raw(self): T;
+
+            fun label(self): str {
+                match scope.get_safe() {
+                    Some(let value) => i"default under {value}",
+                    None => "default, no scope",
+                }
+            }
+        }
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> with Tag<T> {
+            fun raw(self): T { self.value }
+        }
+
+        struct Mirror<T> { cell: Cell<T> }
+
+        impl Mirror<type T> with Tag<Option<T>> {
+            fun raw(self): Option<T> { Some(self.cell.raw()) }
+
+            fun label(self): str {
+                i"override under {scope.get()}"
+            }
+        }
+
+        fun main() {
+            let mirror = Mirror { cell = Cell { value = 7 } };
+            print(mirror.label());
+        }
+        main();
+        "#,
+        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
