@@ -513,17 +513,4 @@ impl Event {
 	/// capture no element at all.
 	[extern(get, "target.value")]
 	external fun target_value(self): str;
-
-	/// The element the event was dispatched to (`event.target`) — what an
-	/// outside-click guard hands to `Element::contains`, and the only reason
-	/// this exists: a listener on the document or the window is told WHERE the
-	/// event happened by nothing else.
-	///
-	/// Read `target_value` instead when the question is what an input holds.
-	/// The element is the sharp end of the same read (`proposal/lifetimes.md`
-	/// §5, V3): holding it past the handler re-opens the element ↔ listener
-	/// cycle that straddles the language/host boundary, which no vilan-side
-	/// disposal can see both halves of. Ask it a question and drop it.
-	[extern(get, "target")]
-	external fun target(self): Element;
 }
