@@ -5037,6 +5037,12 @@ impl<'src> Printer<'src> {
             Node::If(branch) => self.print_if_branch(branch, split),
             Node::Match(subject, legs) => {
                 self.out.push_str("match ");
+                // The SUBJECT continues the measured line — `match <subject> {`
+                // is one line, and the subject is the only thing on it with a
+                // layout of its own — so it takes the split permission, exactly
+                // as an `if` condition does (E147, extended by E150 rule B).
+                // Without this an over-budget `match` had nowhere to break.
+                self.split = split;
                 self.print_expr(subject);
                 self.out.push_str(" {");
                 self.indent += 1;
@@ -5088,6 +5094,12 @@ impl<'src> Printer<'src> {
                 self.out.push_str("for");
                 if let Some(condition) = condition {
                     self.out.push(' ');
+                    // `for <condition> {` — vilan's `while` — is one measured
+                    // line whose only layout site is the condition, so the
+                    // condition takes the split permission the `if` condition
+                    // takes (E147, extended by E150 rule B). A bare `for {` has
+                    // no condition and nothing to hand it to.
+                    self.split = split;
                     self.print_expr(condition);
                 }
                 self.out.push(' ');
@@ -10937,6 +10949,177 @@ mod if_arm_layout {
              \tlabel\n\
              }\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_and_match_head_layout {
+    //! E150 rule B — a `for` (vilan's `while`) CONDITION and a `match` SUBJECT
+    //! take the split permission an `if` condition took at E147.
+    //!
+    //! E147 gave the `if` condition the permission on one argument: `if <cond> {`
+    //! is one measured line and the condition is the only thing on it with a
+    //! layout of its own, so without the permission an over-budget `if` had
+    //! nowhere to break at all. `for <cond> {` and `match <subject> {` are the
+    //! same sentence with a different keyword — one measured line, one layout
+    //! site — and they were left out only because E147 was written for `if`.
+    //!
+    //! There is no over-budget instance of either in the tree, so these pins
+    //! WRITE one: the rule is a rule about the shape, not a rescue of a line
+    //! that happens to exist today.
+    //!
+    //! The permission reaches the head and stops there. A loop's body is a
+    //! statement list, which is a fresh layout context (`print_items` clears
+    //! the permission on entry); a `match`'s legs are printed with `Split::Off`
+    //! and earn their own permission from their own measured lines.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// The `while` shape. Before rule B this line stayed at 129 columns however
+    /// many operators it held; now it breaks at the lowest-precedence operator,
+    /// operator-leading, one level in — E147's rendering, reached from a second
+    /// keyword.
+    #[test]
+    fn a_loop_condition_over_the_budget_breaks() {
+        let joined = "\tfor text.contains(\" \") || text.contains(\"\\\"\") \
+                      || text.contains(\"(\") || text.contains(\".\") \
+                      || text.contains(\"+\") || text.contains(\"-\") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun scan(text: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor text.contains(\" \") || text.contains(\"\\\"\") || text.contains(\"(\") \
+             || text.contains(\".\") || text.contains(\"+\") || text.contains(\"-\") {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+            "fun scan(text: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor text.contains(\" \")\n\
+             \t\t|| text.contains(\"\\\"\")\n\
+             \t\t|| text.contains(\"(\")\n\
+             \t\t|| text.contains(\".\")\n\
+             \t\t|| text.contains(\"+\")\n\
+             \t\t|| text.contains(\"-\") {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+        );
+    }
+
+    /// The `match` shape, and with it the boundary: the permission reaches the
+    /// SUBJECT and nothing else. The legs here are braced bodies E150 rule A
+    /// keeps inline, and they stay inline while the head above them breaks —
+    /// each leg earns its own permission from its own measured line.
+    #[test]
+    fn a_match_subject_over_the_budget_breaks_and_the_legs_do_not() {
+        let joined = "\tmatch name.contains(\"(\") || name.contains(\"[\") \
+                      || name.contains(\"|\") || name.contains(\"&\") \
+                      || name.contains(\",\") || name.contains(\" \") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun classify(name: str): str {\n\
+             \tmatch name.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") {\n\
+             \t\ttrue => { \"opaque\" },\n\
+             \t\tfalse => { \"plain\" },\n\
+             \t}\n\
+             }\n",
+            "fun classify(name: str): str {\n\
+             \tmatch name.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\")\n\
+             \t\t|| name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \") {\n\
+             \t\ttrue => { \"opaque\" },\n\
+             \t\tfalse => { \"plain\" },\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The entry is width and nothing else, in both directions: a head that
+    /// fits stays on its line, and a hand-broken head that fits joins back.
+    #[test]
+    fn a_head_that_fits_stays_on_its_line() {
+        let source = "fun demo(a: bool, b: bool, c: bool): str {\n\
+                      \tfor a || b || c {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      \tmatch a || b || c {\n\
+                      \t\ttrue => \"y\",\n\
+                      \t\tfalse => \"n\",\n\
+                      \t}\n\
+                      }\n";
+        assert!(columns("\tfor a || b || c {") <= LINE_BUDGET);
+        assert!(columns("\tmatch a || b || c {") <= LINE_BUDGET);
+        assert_construct(source, source);
+        assert_construct(
+            "fun demo(a: bool, b: bool, c: bool): str {\n\
+             \tfor a\n\
+             \t\t|| b\n\
+             \t\t|| c {\n\
+             \t\tlog(\"x\");\n\
+             \t}\n\
+             \tmatch a\n\
+             \t\t|| b\n\
+             \t\t|| c {\n\
+             \t\ttrue => \"y\",\n\
+             \t\tfalse => \"n\",\n\
+             \t}\n\
+             }\n",
+            source,
+        );
+    }
+
+    /// A bare `for {` — the unconditional loop — has no condition to hand the
+    /// permission to, and the arm that would hand it over is not reached.
+    #[test]
+    fn a_bare_loop_has_no_condition_to_break() {
+        let source = "fun spin() {\n\
+                      \tfor {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check`. Asserted from the UNFORMATTED side, which is where
+    /// a two-pass rule would show.
+    #[test]
+    fn every_head_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(t: str): i32 {\n\tmut n = 0;\n\tfor t.contains(\" \") \
+                 || t.contains(\"q\") || t.contains(\"(\") || t.contains(\".\") \
+                 || t.contains(\"+\") || t.contains(\"-\") {\n\t\tn += 1;\n\t}\n\tn\n}\n",
+                true,
+            ),
+            (
+                "fun b(n: str): str {\n\tmatch n.contains(\"(\") || n.contains(\"[\") \
+                 || n.contains(\"|\") || n.contains(\"&\") || n.contains(\",\") \
+                 || n.contains(\" \") {\n\t\ttrue => \"y\",\n\t\tfalse => \"n\",\n\t}\n}\n",
+                true,
+            ),
+            (
+                "fun c(a: bool, b: bool, c: bool) {\n\tfor a || b || c {\n\t\tlog(\"x\");\n\t}\n}\n",
+                false,
+            ),
+            ("fun d() {\n\tfor {\n\t\tlog(\"x\");\n\t}\n}\n", false),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
     }
 }
 
