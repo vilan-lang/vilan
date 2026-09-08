@@ -171,6 +171,20 @@ impl LastUse {
         !self.opaque.contains(&binding_id) && self.last_uses.contains(&use_id)
     }
 
+    /// Whether the pass REFUSES to answer for `binding_id` — the module doc's
+    /// opacity set, asked directly.
+    ///
+    /// B267's cell-aware elision asks this rather than `is_last_use`, and the
+    /// difference is the point. A read of a `Shared` slot has no dying source
+    /// to donate storage: the cell outlives the binding, so what the elision
+    /// needs is not "is this read the last one?" but "did the walk survey every
+    /// read of the BINDING, from one region?" — because a binding some other
+    /// region also reads (a closure capture, §4) can be read after the analysis
+    /// has stopped looking, and the cell's storage would still be under it.
+    pub(super) fn is_opaque(&self, binding_id: Id) -> bool {
+        self.opaque.contains(&binding_id)
+    }
+
     /// Where `binding_id`'s teardown region ends — §6's disposal answer.
     /// An opaque binding falls back to the scope end it has always had; the
     /// pass never guesses a drop point it cannot stand behind.

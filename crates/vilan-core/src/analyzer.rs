@@ -3671,6 +3671,16 @@ pub struct Analyzer<'src> {
     /// filled once the tree is final (after the view-assignment rewrite) and
     /// read by rule 2's elision. Empty until then, which elides nothing.
     last_use: liveness::LastUse,
+    /// B267: the program's `Shared` cells — filled beside `last_use`, once the
+    /// tree is final, and read by rule 2's cell-aware elision. Empty until
+    /// then, which names no cell and so elides nothing.
+    shared_cells: SharedCells,
+    /// B267: the bindings whose `Shared` read may ALIAS the cell instead of
+    /// copying it. Two readers, and they pull opposite ways, which is the whole
+    /// of the rule: rule 1's binding copy is skipped at these sites, and rule
+    /// 2's move elision must then refuse to move OUT of them — like B53's
+    /// shared captures, a binding that owns nothing has nothing to donate.
+    shared_read_bindings: HashSet<Id>,
     resolved_types: HashMap<Id, TypeId>,
     // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
     // construction, keyed by the element's expr id — the type the tuple rule
@@ -4673,6 +4683,8 @@ impl<'src> Analyzer<'src> {
             prepped_uses: Vec::new(),
             reference_count: HashMap::default(),
             last_use: liveness::LastUse::default(),
+            shared_cells: SharedCells::default(),
+            shared_read_bindings: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             scope_id: 0,
@@ -22528,6 +22540,468 @@ impl<'src> Analyzer<'src> {
         sites
     }
 
+    /// B267: the `Shared` member declarations the cell analysis keys on —
+    /// `new`, `read`, `write` and `clone`, found the way the intrinsic table
+    /// finds them (the primitive struct's identity, so a user's same-named type
+    /// is untouched).
+    fn shared_members(&self) -> Option<[HashSet<Id>; 4]> {
+        let shared_struct_id = self.primitive_struct_ids.get("Shared").copied()?;
+        let mut members: [HashSet<Id>; 4] = Default::default();
+        for implementation in &self.implementations {
+            let subject_is_shared = matches!(
+                self.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(id, _)) if *id == shared_struct_id
+            );
+            if !subject_is_shared {
+                continue;
+            }
+            for (slot, name) in ["new", "read", "write", "clone"].into_iter().enumerate() {
+                if let Some(id) = implementation.declarations.get(name).copied() {
+                    members[slot].insert(id);
+                }
+            }
+        }
+        Some(members)
+    }
+
+    /// A call's callee declaration and its RECEIVER (argument position 0), for
+    /// the member lookups below.
+    fn call_callee_and_receiver(&self, expr_id: Id) -> Option<(Id, Id)> {
+        let Expr::Call(call_id) = self.expr_id_to_expr_map.get(&expr_id)? else {
+            return None;
+        };
+        let function_call = self.function_calls.get(call_id)?;
+        let Expr::Local(callee_id) = self.expr_id_to_expr_map.get(&function_call.subject_id)?
+        else {
+            return None;
+        };
+        Some((*callee_id, function_call.argument_ids.first().copied()?))
+    }
+
+    /// Whether `expr_id`'s value is a `Shared<_>` HANDLE (not the value inside
+    /// one) — the type test the slot walk filters every occurrence with.
+    fn is_shared_handle(&self, expr_id: Id) -> bool {
+        let Some(shared_struct_id) = self.primitive_struct_ids.get("Shared").copied() else {
+            return false;
+        };
+        self.place_value_type_id(expr_id)
+            .is_some_and(|type_id| self.type_is_shared_handle(type_id, shared_struct_id))
+    }
+
+    /// The same question asked of an interned type.
+    fn type_is_shared_handle(&self, type_id: TypeId, shared_struct_id: Id) -> bool {
+        matches!(type_id.borrow_type(self), Type::Struct(id, _) if *id == shared_struct_id)
+    }
+
+    /// B267: the program's [`SharedCells`] — one walk over the expression map.
+    ///
+    /// Three things come out of it, and each is a syntactic fact rather than an
+    /// inference: which slots can hold one cell (the unions), which cells a
+    /// write mutates in place (the classification), and where the reads are.
+    ///
+    /// **Why unions rather than a root comparison.** `place_root` answers
+    /// "which binding is this path rooted at", which is not cell identity:
+    /// `Subscription`'s `subscribers` field is initialized from `SignalCell`'s,
+    /// so a write through one reaches a read through the other, and `let g =
+    /// h.clone()` hands the same cell to a second name outright. Every way a
+    /// handle can move between slots is one of four forms — a binding's
+    /// initializer, a construction slot, an assignment, and `clone()` — so
+    /// unioning at those four and dropping everything ELSE into `Unknown`
+    /// covers the relation without an alias analysis.
+    fn compute_shared_cells(&self) -> SharedCells {
+        let Some([new_ids, read_ids, write_ids, clone_ids]) = self.shared_members() else {
+            return SharedCells::default();
+        };
+        let mut cells = SharedCells::default();
+        // Pass 1 — the calls, and the assignment targets that make a write a
+        // REBIND. `rewrite_view_assignment_targets` has already turned
+        // `h.write() = x` into an assignment to a `Dereference` of the call, so
+        // the rebinding form is "the target IS this call, bare or dereferenced"
+        // and every other spelling (`h.write().push(9)`, `h.write()[0] = 9`,
+        // `mutate(h.write())`) falls through to the in-place classification.
+        let mut clone_receivers: HashMap<Id, Id> = HashMap::default();
+        let mut new_calls: HashSet<Id> = HashSet::default();
+        let mut write_receivers: Vec<(Id, Id)> = Vec::new();
+        let mut benign: HashSet<Id> = HashSet::default();
+        let mut rebinding: HashSet<Id> = HashSet::default();
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            if let Expr::Assignment(target_id, _) = expr {
+                let named = match self.expr_id_to_expr_map.get(target_id) {
+                    Some(Expr::Dereference(operand_id)) => *operand_id,
+                    _ => *target_id,
+                };
+                rebinding.insert(named);
+            }
+            let Some((callee_id, receiver_id)) = self.call_callee_and_receiver(*expr_id) else {
+                continue;
+            };
+            if new_ids.contains(&callee_id) {
+                new_calls.insert(*expr_id);
+            } else if read_ids.contains(&callee_id) {
+                benign.insert(receiver_id);
+                cells.reads.insert(*expr_id, CellSlot::Unknown);
+            } else if write_ids.contains(&callee_id) {
+                benign.insert(receiver_id);
+                write_receivers.push((*expr_id, receiver_id));
+            } else if clone_ids.contains(&callee_id) {
+                benign.insert(receiver_id);
+                clone_receivers.insert(*expr_id, receiver_id);
+            }
+        }
+        // The slot a handle expression names. `clone()` is transparent: it
+        // hands back the receiver's own cell, so the chain is followed rather
+        // than dropped into `Unknown`.
+        let slot_of = |mut expr_id: Id| -> Option<CellSlot> {
+            for _ in 0..clone_receivers.len() + 1 {
+                match self.expr_id_to_expr_map.get(&expr_id)? {
+                    Expr::Local(binding_id) => return Some(CellSlot::Binding(*binding_id)),
+                    Expr::Field(_, struct_id, index) => {
+                        return Some(CellSlot::Field(*struct_id, *index));
+                    }
+                    Expr::Call(_) => expr_id = *clone_receivers.get(&expr_id)?,
+                    _ => return None,
+                }
+            }
+            None
+        };
+        // Pass 2 — the unions, at the four forms a handle moves between slots.
+        // A slot fed by `Shared::new` is a FRESH cell and joins nothing; that
+        // is what keeps `bind_each`'s four cells four cells.
+        let mut placed: HashSet<Id> = HashSet::default();
+        let mut moved: Vec<(CellSlot, Id)> = Vec::new();
+        for (parameter_id, parameter) in self.parameters.iter() {
+            if let Some(shared_struct_id) = self.primitive_struct_ids.get("Shared").copied()
+                && self.type_is_shared_handle(parameter.type_id, shared_struct_id)
+            {
+                cells.union(CellSlot::Binding(*parameter_id), CellSlot::Unknown);
+            }
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Variable(variable_id) => {
+                    if let Some(variable) = self.variables.get(variable_id)
+                        && let Some(value_id) = variable.initial
+                        && self.is_shared_handle(value_id)
+                    {
+                        moved.push((CellSlot::Binding(*variable_id), value_id));
+                    }
+                }
+                Expr::StructInitializer(struct_id, assignments) => {
+                    for (index, value_id) in assignments {
+                        if self.is_shared_handle(*value_id) {
+                            moved.push((CellSlot::Field(*struct_id, *index), *value_id));
+                        }
+                    }
+                }
+                Expr::Assignment(target_id, value_id) => {
+                    if self.is_shared_handle(*target_id)
+                        && let Some(target_slot) = slot_of(*target_id)
+                    {
+                        placed.insert(*target_id);
+                        moved.push((target_slot, *value_id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (slot, value_id) in moved {
+            placed.insert(value_id);
+            if new_calls.contains(&value_id) {
+                continue;
+            }
+            cells.union(slot, slot_of(value_id).unwrap_or(CellSlot::Unknown));
+        }
+        // Pass 3 — the escape taint. A handle that appears anywhere ELSE (an
+        // argument, a list element, a returned tail, an `is` subject) has been
+        // handed to code this walk cannot see, so its slot joins `Unknown` and
+        // every write through an unplaceable handle now hazards it.
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            if !matches!(expr, Expr::Local(_) | Expr::Field(_, _, _))
+                || benign.contains(expr_id)
+                || placed.contains(expr_id)
+                || !self.is_shared_handle(*expr_id)
+            {
+                continue;
+            }
+            cells.union(
+                slot_of(*expr_id).unwrap_or(CellSlot::Unknown),
+                CellSlot::Unknown,
+            );
+        }
+        // Pass 4 — resolve every read and write onto its component, and record
+        // which components a write MUTATES rather than rebinds.
+        let read_ids: Vec<Id> = cells.reads.keys().copied().collect();
+        for read_id in read_ids {
+            let receiver_id = self
+                .call_callee_and_receiver(read_id)
+                .map(|(_, receiver_id)| receiver_id);
+            let slot = receiver_id
+                .and_then(slot_of)
+                .map_or(CellSlot::Unknown, |slot| cells.find(slot));
+            cells.reads.insert(read_id, slot);
+        }
+        for (write_id, receiver_id) in write_receivers {
+            let slot = slot_of(receiver_id).map_or(CellSlot::Unknown, |slot| cells.find(slot));
+            let rebinds = rebinding.contains(&write_id);
+            cells.writes.insert(write_id, (slot, rebinds));
+            if !rebinds {
+                cells.mutated.insert(slot);
+            }
+        }
+        cells
+    }
+
+    /// B267 (`B256`'s unblocker): the bindings whose `Shared` read may keep
+    /// naming the cell's storage instead of copying it — rule 2 (§6.2) read at
+    /// a slot rather than at a local.
+    ///
+    /// **Why rule 2 could not see this before.** [`Self::is_elidable_copy`]
+    /// asks whether the SOURCE dies at the read, which is the only reason
+    /// aliasing it can never be observed. A cell does not die: `let b =
+    /// h.read()` leaves `h` holding the same storage, and every later read of
+    /// `h` reaches it. So the question is asked from the other end — not "is
+    /// the source dead?" but "can anything mutate that storage while the
+    /// binding holds it, and can the binding hand it on?" — and it has four
+    /// answers, all of them syntactic:
+    ///
+    /// - **The binding may not be mutated in place.** `mut c = h.read();
+    ///   c.push(10)` would grow the CELL, which is the second half of B256's
+    ///   report. `collect_written_roots`' in-place set is whole-program, so a
+    ///   write from anywhere lands here.
+    /// - **The binding may not sit at a value seam.** Returning it, or handing
+    ///   it back out of a match leg, would leak the cell's storage past the
+    ///   frame under the "a call owns its result" premise every other elision
+    ///   rests on. The same question `compute_capture_clone_sites` asks of a
+    ///   capture, asked of a binding.
+    /// - **The liveness pass must not be opaque about it** — which is how a
+    ///   closure capture refuses: a capture reads the binding from another
+    ///   region, so the walk cannot survey its reads and will not stand behind
+    ///   an answer about them (`LastUse::is_opaque`).
+    /// - **The CELL's storage must be safe**, which is the cell-aware half and
+    ///   has two shapes. Either no write to that cell mutates it in place at
+    ///   all — every write REBINDS the slot, and a rebind installs a fresh
+    ///   value and leaves the old one alone, so nothing can ever reach back
+    ///   into what the read handed out (`bind_each`'s `row_views`/`row_owners`,
+    ///   whose only writes are `row_views.write() = next_views`) — or a rebind
+    ///   ORPHANS the storage before anything else runs
+    ///   ([`Self::rebind_orphans_the_read`], which is `drain`'s
+    ///   `let wave = turn.pending.read(); turn.pending.write() = [];`).
+    ///
+    /// The second shape is where B267's "decide" was: `drain` clears the cell
+    /// on the very next line, and that clear IS a write — but it is the write
+    /// that ENDS the aliasing rather than one that exploits it, so the elision
+    /// holds through it and the wave list is never deep-copied per drain
+    /// iteration. What the elision cannot survive is an in-place write reaching
+    /// the storage first, which is exactly what the ordering test refuses.
+    fn compute_shared_read_bindings(&self) -> HashSet<Id> {
+        if self.shared_cells.reads.is_empty() {
+            return HashSet::default();
+        }
+        let written_roots = self.collect_written_roots();
+        let seam_roots = self.value_seam_roots();
+        let sequences = self.statement_sequences();
+        let mut bindings = HashSet::default();
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            let Expr::Variable(variable_id) = expr else {
+                continue;
+            };
+            let Some(value_id) = self
+                .variables
+                .get(variable_id)
+                .and_then(|variable| variable.initial)
+            else {
+                continue;
+            };
+            let Some(cell) = self.shared_cells.reads.get(&value_id).copied() else {
+                continue;
+            };
+            if written_roots.in_place.contains(variable_id)
+                || seam_roots.contains(variable_id)
+                || self.last_use.is_opaque(*variable_id)
+            {
+                continue;
+            }
+            if !self.shared_cells.mutated.contains(&cell)
+                || self.rebind_orphans_the_read(*expr_id, cell, &sequences)
+            {
+                bindings.insert(*variable_id);
+            }
+        }
+        bindings
+    }
+
+    /// B267's ordering test: whether a REBIND of `cell` is reached, on the
+    /// declaring block's own straight line, before anything that could mutate
+    /// the cell in place.
+    ///
+    /// Sibling statements are the interval this can be asked over, and that is
+    /// deliberate: two statements of one block run one after the other on every
+    /// path that runs either, so a rebind found here is a rebind that HAPPENS,
+    /// where one inside a branch is only a rebind that might. Anything between
+    /// them that could reach a write refuses — conservatively, ANY call, since
+    /// a cell this test is asked about is one some write does mutate and a
+    /// callee could be that write (`enqueue`'s `turn.pending.write().push`,
+    /// which is exactly what runs later in `drain`'s own loop, after the clear
+    /// has already orphaned the wave).
+    fn rebind_orphans_the_read(
+        &self,
+        declaration_id: Id,
+        cell: CellSlot,
+        sequences: &[&Vec<Id>],
+    ) -> bool {
+        let Some((statements, index)) = sequences.iter().find_map(|statements| {
+            statements
+                .iter()
+                .position(|statement_id| *statement_id == declaration_id)
+                .map(|index| (*statements, index))
+        }) else {
+            return false;
+        };
+        for statement_id in &statements[index + 1..] {
+            // The rebinding statement itself: its VALUE runs before the slot is
+            // replaced, so the value has to be as harmless as the statements
+            // before it were.
+            if let Some(Expr::Assignment(target_id, value_id)) =
+                self.expr_id_to_expr_map.get(statement_id)
+            {
+                let named = match self.expr_id_to_expr_map.get(target_id) {
+                    Some(Expr::Dereference(operand_id)) => *operand_id,
+                    _ => *target_id,
+                };
+                if self.shared_cells.writes.get(&named) == Some(&(cell, true)) {
+                    return !self.spans_a_cell_hazard(*value_id, cell);
+                }
+            }
+            if self.spans_a_cell_hazard(*statement_id, cell) {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Whether anything inside `expr_id`'s source span could mutate `cell` in
+    /// place — a call, or a non-rebinding write to the cell itself.
+    ///
+    /// Asked over SPANS rather than over a child walk: containment in the
+    /// statement's own text is a superset of its subtree, and a superset is the
+    /// safe direction for a refusal test. `Shared`'s own `new`/`read`/`clone`
+    /// are not calls in this sense — they run no user code and write nothing —
+    /// but a `write()` is, whatever it turns out to be.
+    fn spans_a_cell_hazard(&self, expr_id: Id, cell: CellSlot) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let (start, end) = (span.start, span.end);
+        self.expr_id_to_expr_map.iter().any(|(other_id, other)| {
+            if !matches!(other, Expr::Call(_)) || *other_id == expr_id {
+                return false;
+            }
+            if self.source_of_id(*other_id) != Some(source) {
+                return false;
+            }
+            let Some(other_span) = self.span_map.get(other_id) else {
+                return false;
+            };
+            if other_span.start < start || other_span.end > end {
+                return false;
+            }
+            match self.shared_cells.writes.get(other_id) {
+                // A rebind of this very cell is not a hazard — it is the answer
+                // — and a write to any other cell cannot reach this storage.
+                Some((written, rebinds)) => *written == cell && !rebinds,
+                None => !self.shared_cells.reads.contains_key(other_id),
+            }
+        })
+    }
+
+    /// Every straight-line STATEMENT SEQUENCE in the program — the intervals
+    /// [`Self::rebind_orphans_the_read`] may reason about program order over.
+    fn statement_sequences(&self) -> Vec<&Vec<Id>> {
+        let mut sequences: Vec<&Vec<Id>> = Vec::new();
+        for function in self.functions.values() {
+            if function.has_body {
+                sequences.push(&function.body.0);
+            }
+        }
+        for module in self.modules.values() {
+            sequences.push(&module.body.0);
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Block((statements, _))
+                | Expr::For(_, (statements, _))
+                | Expr::ForEach(_, _, (statements, _)) => sequences.push(statements),
+                Expr::If(branch) => Self::collect_branch_sequences(branch, &mut sequences),
+                _ => {}
+            }
+        }
+        sequences
+    }
+
+    /// The `if`/`else if`/`else` chain's own sequences, for the walk above.
+    fn collect_branch_sequences<'a>(branch: &'a ExprIfBranch, sequences: &mut Vec<&'a Vec<Id>>) {
+        match branch {
+            ExprIfBranch::If(_, (statements, _), otherwise) => {
+                sequences.push(statements);
+                if let Some(otherwise) = otherwise {
+                    Self::collect_branch_sequences(otherwise, sequences);
+                }
+            }
+            ExprIfBranch::Else((statements, _)) => sequences.push(statements),
+        }
+    }
+
+    /// Every binding root a VALUE SEAM can hand out — the same question
+    /// [`Self::compute_capture_clone_sites`] asks of its captures, asked of the
+    /// whole program, because B267's elision has to know whether the storage it
+    /// is about to share can leave the frame that shares it.
+    fn value_seam_roots(&self) -> HashSet<Id> {
+        let mut roots = HashSet::default();
+        for function in self.functions.values() {
+            if function.has_body {
+                self.insert_seam_roots(function.body.1, &mut roots);
+            }
+        }
+        for closure in self.closures.values() {
+            self.insert_seam_roots(closure.return_, &mut roots);
+        }
+        for module in self.modules.values() {
+            self.insert_seam_roots(module.body.1, &mut roots);
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::FunctionReturn(Some(value_id)) => {
+                    self.insert_seam_roots(*value_id, &mut roots);
+                }
+                Expr::Match(_, legs) => {
+                    for leg in legs {
+                        self.insert_seam_roots(leg.body, &mut roots);
+                    }
+                }
+                Expr::Block((_, tail_id))
+                | Expr::For(_, (_, tail_id))
+                | Expr::ForEach(_, _, (_, tail_id)) => self.insert_seam_roots(*tail_id, &mut roots),
+                Expr::If(branch) => self.insert_branch_seam_roots(branch, &mut roots),
+                _ => {}
+            }
+        }
+        roots
+    }
+
+    /// The `if` chain's tails, for the walk above.
+    fn insert_branch_seam_roots(&self, branch: &ExprIfBranch, roots: &mut HashSet<Id>) {
+        match branch {
+            ExprIfBranch::If(_, (_, tail_id), otherwise) => {
+                self.insert_seam_roots(*tail_id, roots);
+                if let Some(otherwise) = otherwise {
+                    self.insert_branch_seam_roots(otherwise, roots);
+                }
+            }
+            ExprIfBranch::Else((_, tail_id)) => self.insert_seam_roots(*tail_id, roots),
+        }
+    }
+
     /// Rule 2 (elision): whether a copy of an aggregate place can be downgraded
     /// to a move because the aliasing can never be observed. Sound, not
     /// complete. The source must be a plain local binding — a field/element
@@ -22560,7 +23034,12 @@ impl<'src> Analyzer<'src> {
         let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&value_id) else {
             return false;
         };
-        if shared_captures.contains(binding_id) {
+        // B267: nor a binding whose own value is a `Shared` read the cell-aware
+        // rule let alias the cell. It is B53's shared capture one form along —
+        // it owns nothing, so it has nothing to donate, and moving out of it
+        // would hand a second owner the cell's storage through an elision that
+        // is sound only for an owner.
+        if shared_captures.contains(binding_id) || self.shared_read_bindings.contains(binding_id) {
             return false;
         }
         self.variables.contains_key(binding_id) && self.last_use.is_last_use(value_id, *binding_id)
@@ -42765,6 +43244,93 @@ struct WrittenRoots {
     in_place: HashSet<Id>,
 }
 
+/// B267: a SLOT that can hold a `Shared` handle — the coordinate the cell-aware
+/// elision reasons about.
+///
+/// A slot is not a cell: two slots can hold the same cell (`let g = h.clone()`,
+/// a field initialized from another field, a handle passed to a parameter), and
+/// the elision's whole question is "can this write reach the storage that read
+/// handed out?", which is a question about CELLS. So [`SharedCells`] unions the
+/// slots that can hold one cell into components and every comparison is a
+/// component comparison.
+///
+/// `Unknown` is the component every handle the compiler cannot place joins — a
+/// parameter's, a call result's, one that escaped into an argument or a list.
+/// It is a component like any other, not a poison: a write through an
+/// unplaceable handle hazards the unplaceable cells and nothing else, because a
+/// placeable slot that ever reaches an unplaceable position is unioned into it
+/// at that position.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum CellSlot {
+    /// A binding (a local or a parameter) that holds a handle.
+    Binding(Id),
+    /// A struct field that holds one: the struct and the field's index.
+    Field(Id, usize),
+    /// Every handle with no slot the compiler can name.
+    Unknown,
+}
+
+/// B267: the program's `Shared` cells — which slots can hold the same one, and
+/// which of those cells a write ever mutates IN PLACE.
+///
+/// **The distinction the whole item turns on.** `h.write() = x` REBINDS the
+/// slot: a fresh value is installed and the old one is left exactly as it was,
+/// so a binding that already read the old value becomes its sole owner. Every
+/// other write through `write()` — `h.write().push(9)`, `update`'s
+/// `mutate(self.value.write())`, a component write — mutates the storage a
+/// previous read handed out, and is the aliasing hazard rule 2 must refuse.
+/// The two forms are `Expr::Assignment`'s two shapes at the same intrinsic,
+/// which is why they can be told apart syntactically at all.
+#[derive(Clone, Debug, Default)]
+struct SharedCells {
+    /// The union-find parent map over slots. A slot absent from it is its own
+    /// representative.
+    parents: HashMap<CellSlot, CellSlot>,
+    /// Component representatives some write mutates in place. A read of a cell
+    /// outside this set can never be aliased into by a later write, whatever
+    /// calls run in between.
+    mutated: HashSet<CellSlot>,
+    /// Every `Shared.read()` call expression, and the slot it reads through.
+    reads: HashMap<Id, CellSlot>,
+    /// Every `Shared.write()` call expression: the slot it writes through, and
+    /// whether the write REBINDS that slot rather than mutating its value.
+    writes: HashMap<Id, (CellSlot, bool)>,
+}
+
+impl SharedCells {
+    /// The component representative of `slot` — path-halving find over
+    /// [`Self::parents`].
+    fn find(&self, slot: CellSlot) -> CellSlot {
+        let mut current = slot;
+        // The union step below always points a representative at another
+        // representative, so the chain is short; the bound is belt and braces
+        // against a cycle no construction here can produce.
+        for _ in 0..self.parents.len() + 1 {
+            match self.parents.get(&current) {
+                Some(parent) if *parent != current => current = *parent,
+                _ => return current,
+            }
+        }
+        current
+    }
+
+    /// Merge the components of `left` and `right`. `Unknown` always wins, so a
+    /// component that ever touches an unplaceable handle IS the unplaceable
+    /// component and reads a write through any other unplaceable handle as its
+    /// own.
+    fn union(&mut self, left: CellSlot, right: CellSlot) {
+        let (left, right) = (self.find(left), self.find(right));
+        if left == right {
+            return;
+        }
+        if left == CellSlot::Unknown {
+            self.parents.insert(right, left);
+        } else {
+            self.parents.insert(left, right);
+        }
+    }
+}
+
 /// The drop scan's outputs, carried as one value so the walk's signature stays
 /// readable ([`Analyzer::plan_expr`] threads it through every arm).
 ///
@@ -51323,6 +51889,11 @@ fn analyze_over_world<'src>(
     // enrolled binding's teardown `finally` closes. Must follow the dataflow;
     // `plan_resource_drops` (which bindings drop) ran long before it.
     analyzer.plan_last_use_drop_extents();
+    // B267: the cell-aware half of rule 2, which needs the dataflow above and
+    // feeds every elision below — a binding it admits copies nothing at its
+    // read and may donate nothing at its own.
+    analyzer.shared_cells = analyzer.compute_shared_cells();
+    analyzer.shared_read_bindings = analyzer.compute_shared_read_bindings();
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.

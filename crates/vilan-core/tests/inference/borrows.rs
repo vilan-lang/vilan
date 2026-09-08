@@ -9358,3 +9358,163 @@ fn b256_a_shared_read_in_temporary_position_stays_free() {
     }
     assert_compiles_and_runs(source, "3\n6\n");
 }
+
+// --- B267: the cell-aware last-use elision ----------------------------------
+
+#[test]
+fn b267_a_read_of_a_cell_only_rebound_keeps_the_cells_storage() {
+    // `bind_each`'s per-notify shape, reduced: a cell whose only writes REPLACE
+    // the slot, read into a binding that is walked and nothing more. A rebind
+    // installs a fresh value and leaves the old one exactly as it was, so
+    // nothing can ever reach back into what the read handed out and the copy
+    // rule 1 would ask for cannot be observed by any program.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let rows: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let previous = rows.read();
+            mut total = 0;
+            for row in previous {
+                total += row;
+            }
+            rows.write() = [9];
+            print(total);
+            print(rows.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a read of a cell nothing mutates in place copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "6\n1\n");
+}
+
+#[test]
+fn b267_a_rebind_on_the_next_line_orphans_the_read_before_any_mutation() {
+    // `drain`'s shape, and the ordering B267 had to decide. The cell IS mutated
+    // in place elsewhere in the program, so the elision cannot rest on the
+    // cell's writes alone — but the clear one line down REBINDS the slot before
+    // anything runs, and from there the wave is the binding's alone. The push
+    // that follows lands on the fresh list, never on the wave.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let pending: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let wave = pending.read();
+            pending.write() = [];
+            pending.write().push(7);
+            mut total = 0;
+            for item in wave {
+                total += item;
+            }
+            print(total);
+            print(pending.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a read the very next line orphans copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "6\n1\n");
+}
+
+#[test]
+fn b267_a_read_of_one_cell_survives_a_write_to_a_different_cell() {
+    // Cell identity is the whole of the rule: a write mutates the cell it is
+    // written through and no other, so a second cell's `push` is not a hazard
+    // for the first cell's read. Two `Shared::new` bindings are two cells, and
+    // the slot walk says so without an alias analysis.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let left: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let right: Shared<List<i32>> = Shared::new([4, 5]);
+            let snapshot = left.read();
+            right.write().push(9);
+            mut total = 0;
+            for item in snapshot {
+                total += item;
+            }
+            print(total);
+            print(right.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a write to a different cell refused the elision:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "6\n3\n");
+}
+
+#[test]
+#[ignore = "B267's elision is only OBSERVABLE once B256's place treatment makes \
+            a shared read a copy site — until then nothing copies here to elide. \
+            Un-ignored in the commit that lands B256."]
+fn b267_an_in_place_write_before_the_rebind_refuses_the_elision() {
+    // The hazard the ordering test exists to catch: the in-place write reaches
+    // the read's storage FIRST, and the rebind that follows is too late to
+    // orphan anything. So this read copies, and the binding keeps the three
+    // elements it was handed.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let before = cell.read();
+            cell.write().push(9);
+            cell.write() = [];
+            print(before.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__clone"),
+            "a read a later in-place write reaches did not copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+#[ignore = "B267's elision is only OBSERVABLE once B256's place treatment makes \
+            a shared read a copy site — see \
+            `b267_an_in_place_write_before_the_rebind_refuses_the_elision`."]
+fn b267_a_read_whose_binding_a_closure_captures_copies() {
+    // A closure captures BINDINGS (§6.9), so a captured binding is read from a
+    // region the last-use walk cannot survey — it says so by refusing to answer
+    // at all, and the elision refuses with it. Conservative on purpose: the
+    // cell here is only ever rebound, so the alias would in fact be harmless,
+    // and the pin is that B267 does not go looking.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let snapshot = cell.read();
+            let show = || snapshot.len();
+            cell.write() = [9];
+            print(show());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__clone"),
+            "a read a closure captures elided its copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
