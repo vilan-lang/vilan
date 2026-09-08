@@ -90,6 +90,7 @@ guide/reactive.md h2 keyed-reconciliation
 guide/reactive.md h2 traps
 guide/routing.md h1 routing
 guide/routing.md h2 the-route-model
+guide/routing.md h2 reading-the-url-back
 guide/routing.md h2 the-live-path-becomes-a-route-signal
 guide/routing.md h2 pages-swap-on-the-route
 guide/routing.md h2 links-and-navigation
