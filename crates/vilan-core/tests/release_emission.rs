@@ -374,7 +374,7 @@ fn a_loop_condition_is_reevaluates_under_release() {
         r#"
 import std::io::print;
 
-import std::option::Option::{ None, Some, self };
+import std::option::Option::{ self, None, Some };
 
 fun main() {
 	mut found: Option<i32> = None;

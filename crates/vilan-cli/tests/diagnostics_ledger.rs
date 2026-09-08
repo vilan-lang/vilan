@@ -170,9 +170,27 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
     ),
     (
         "229",
-        "the nine `ParseErrorReason::Rule` statements, held by the parse-rule tests",
+        "the `ParseErrorReason::Rule` statements, held by the parse-rule tests",
     ),
 ];
+
+/// How many sites in `parsing.rs` CONSTRUCT a `ParseErrorReason::Rule`, which is
+/// the population row 229 stands for.
+///
+/// The note above used to carry the number in prose, and prose does not red: it
+/// said "nine" — the count at Order 22, when row 206 founded the class — through
+/// every arc that added one, and the ledger row itself had already been rewritten
+/// to "twenty-two by Order 29" without the note noticing (tracker N60). So the
+/// number lives here, where [`the_keyless_row_still_counts_the_rule_sites`] holds
+/// it to the tree, and the note names no count at all.
+///
+/// Construction sites only. `parsing.rs` mentions the variant three more times —
+/// the `match &error.reason` arm that RENDERS one, and two doc comments — and a
+/// mention is not a statement. Three of the twenty carry a caller-supplied
+/// `&'static str` rather than a literal (the lexer's rule constants come through
+/// one of them), which is why the enumeration in check (3) cannot reach the row
+/// and why it is keyless in the first place.
+const RULE_STATEMENT_SITES: usize = 20;
 
 /// Appendix heads that cannot be held against the tree literally, with the
 /// reason each cannot. Every one is a COMPOSED head — the entry quotes a
@@ -1117,5 +1135,39 @@ fn every_non_message_head_still_names_a_headless_entry() {
          naming a CONDITION that does not. Delete the entry — an entry that quotes \
          its message is checkable, and this list is what says it is not:\n{}",
         stale.join("\n")
+    );
+}
+
+#[test]
+fn the_keyless_row_still_counts_the_rule_sites() {
+    // Tracker N60. Row 229 is keyless because its messages are `&'static str`
+    // constants the enumeration cannot reach, so the only thing standing for
+    // them is a COUNT — and a count written in prose went eleven sites stale
+    // across seven orders without a single gate noticing. This is that count,
+    // asked of the tree.
+    let parsing = repository_root().join("crates/vilan-core/src/parsing.rs");
+    let source = std::fs::read_to_string(&parsing)
+        .unwrap_or_else(|error| panic!("{}: {error}", parsing.display()));
+    let mentions = source.matches("ParseErrorReason::Rule(").count();
+    // The one mention that is not a statement: the arm that renders a `Rule`
+    // back into its message. The two doc comments spell the variant without the
+    // paren and never reach this count.
+    let rendering_arm = source
+        .matches("ParseErrorReason::Rule(rule) => rule.to_string()")
+        .count();
+    assert_eq!(
+        rendering_arm, 1,
+        "the arm that renders a `Rule` moved or was reworded — the subtraction \
+         below no longer subtracts it"
+    );
+    assert_eq!(
+        mentions - rendering_arm,
+        RULE_STATEMENT_SITES,
+        "`parsing.rs` builds {} `ParseErrorReason::Rule` statement(s), and \
+         `RULE_STATEMENT_SITES` says {RULE_STATEMENT_SITES}. A rule statement \
+         added or removed moves ledger row 229's population: update the constant \
+         here AND the row in `proposal/diagnostics-ledger.md`, which carries the \
+         same number in prose.",
+        mentions - rendering_arm
     );
 }

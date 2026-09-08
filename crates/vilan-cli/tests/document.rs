@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod support;
-use support::port::free_port;
+use support::port::{free_port, wait_for_port};
 
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -348,17 +348,6 @@ fn generated_server(port: u16) -> String {
          \t\t.start();\n\
          }}\n"
     )
-}
-
-fn wait_for_port(port: u16) -> bool {
-    let deadline = Instant::now() + support::run_liveness();
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 fn http_get(port: u16, path: &str) -> String {

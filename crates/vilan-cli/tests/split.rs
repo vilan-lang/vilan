@@ -30,7 +30,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod support;
-use support::port::free_port;
+use support::port::{free_port, wait_for_port};
 
 /// The emitted artifacts, in the order the golden directory holds them.
 const ARTIFACTS: &[&str] = &[
@@ -895,17 +895,6 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
     );
 }
 
-fn wait_for_port(port: u16, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
 /// A plain HTTP GET, returning the response body bytes.
 fn http_get(port: u16, path: &str) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
@@ -1008,10 +997,7 @@ fn a_split_builds_chunks_are_servable_through_the_manifest() {
         .expect("spawn the server");
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert!(
-            wait_for_port(port, Duration::from_secs(30)),
-            "the server should listen on {port}"
-        );
+        assert!(wait_for_port(port), "the server should listen on {port}");
         // Every chunk the build wrote is served, byte for byte, at the path the
         // embedded map will ask for — and the server was told none of their
         // names.

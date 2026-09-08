@@ -182,3 +182,30 @@ pub fn free_port() -> u16 {
         .expect("read the bound address")
         .port()
 }
+
+/// Poll until something accepts a connection on `port`, or the liveness budget
+/// runs out. `true` if the server came up.
+///
+/// The other half of [`free_port`]'s story, and it was four private copies with
+/// three signatures — `document` and `asset_bundle` spent [`super::run_liveness`],
+/// `split` a caller's `Duration::from_secs(30)` and `init` a caller's
+/// `Duration::from_secs(20)` — which is N58's `free_port` finding one function
+/// over (tracker N60).
+///
+/// One signature, and it takes NO deadline. The wait is a liveness bound and not
+/// a claim about how fast a server boots, so the number is a property of the
+/// MACHINE (`run_liveness()` denominates it in what one compile costs here, right
+/// now) and never of the call site; a caller-chosen constant is a fixed clock
+/// around real work, which is the shape that put 20 s and 30 s a build's width
+/// apart in two suites that wanted the same thing. A green wait never pays it —
+/// the loop returns on the first connection.
+pub fn wait_for_port(port: u16) -> bool {
+    let deadline = Instant::now() + super::run_liveness();
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
