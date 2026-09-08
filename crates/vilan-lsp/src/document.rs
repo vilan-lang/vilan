@@ -8322,6 +8322,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn b261_hover_on_an_implicit_binder_shows_the_source_spelling_not_the_face() {
+        // B261 gave B186's implicit binder a FACE — `impl Add` — so an operator
+        // head can tell the parameter from the trait it is bound by. That face
+        // is the DIAGNOSTIC's, and this pins the boundary: the editor surface
+        // still answers with the trait, because the trait is what the author
+        // wrote at that offset and the only spelling they can write back. Same
+        // answer `b184_a_trait_typed_field_paints_as_an_interface_and_hovers_as_
+        // the_bound` gives one level out, for the same reason.
+        let hover = hover_at_cursor(
+            "import std::operators::Add;\n\nfun bump(a: A|dd) {\n\tlet _ = a;\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the annotation should produce a label");
+        assert!(hover.contains("Add"), "hover on the annotation: {hover:?}");
+        assert!(
+            !hover.contains("impl Add"),
+            "the face is the diagnostic's, not the editor's: {hover:?}"
+        );
+    }
+
+    #[test]
     fn b184_an_inlay_hint_on_a_trait_typed_struct_shows_the_hidden_argument() {
         // The display rule where a reader meets it most often. An unannotated
         // binding's hint is the value's type, and the value's type is `C<A>` —
