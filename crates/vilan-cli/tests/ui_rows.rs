@@ -114,6 +114,7 @@ class StubElement {
         if (predicate(this)) return this;
         for (const child of this.children) { const hit = child.find(predicate); if (hit) return hit; }
         return null;
+    }
     focus() { this.focused = true; global.activeElement = this; global.focusLog.push(describe(this)); }
     // `element.matches(":focus")` is how `View::autofocus` reads back whether
     // its request was honored (B271); the stub answers the one selector it is
