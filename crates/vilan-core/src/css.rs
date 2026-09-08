@@ -20,10 +20,13 @@
 //! | `prop: <anything else>;` | `.raw("prop", <the value's source slice as a str, holes interpolated>)` |
 //! | `.name { … }` | `.name(style() … )` |
 //! | `.name(a, b) { … }` | `.name(a, b, style() … )` |
+//! | `.name(a, b);` | `.name(a, b)` — a chain link, verbatim (A69) |
 //!
-//! Name-blind on both rows: an undotted item is ALWAYS `.raw`, a dotted one is
-//! ALWAYS a method call, so the pass never consults `Style`'s method list and a
-//! method added to `Style` can never change what existing `css` means.
+//! Name-blind on every row: an undotted item is ALWAYS `.raw`, a dotted one is
+//! ALWAYS a method call — with a `{ … }` body it takes the body's chain as its
+//! last argument, with a `;` it takes nothing — so the pass never consults
+//! `Style`'s method list and a method added to `Style` can never change what
+//! existing `css` means.
 //!
 //! **Spans are cut here, in the first slice, on purpose** (§7.3). Element
 //! syntax reached its LSP slice and found that its desugar's wide generated
@@ -57,8 +60,8 @@
 //! untouched nodes unrebuilt.
 
 use crate::node::{
-    BinaryOp, Closure, CssBody, CssDeclaration, CssItem, CssNested, CssValuePiece, ElementHeadItem,
-    If, Node, NodeIfBranch, NodeList,
+    BinaryOp, Closure, CssBody, CssDeclaration, CssItem, CssLink, CssNested, CssValuePiece,
+    ElementHeadItem, If, Node, NodeIfBranch, NodeList,
 };
 use crate::span::{Span, Spanned};
 
@@ -139,6 +142,7 @@ fn build_chain<'src>(body: CssBody<'src>, head: Span, source: &'src str) -> Span
         let member = match item {
             CssItem::Declaration(declaration) => declaration_link(declaration, source),
             CssItem::Nested(nested) => nested_link(nested, source),
+            CssItem::Link(link) => chain_link(link, source),
         };
         chain = attach(chain, member);
     }
@@ -242,6 +246,39 @@ fn nested_link<'src>(nested: CssNested<'src>, source: &'src str) -> Spanned<Node
     (
         Node::Call(
             Box::new((Node::Accessor(name.0), anchor)),
+            None,
+            (arguments, span),
+        ),
+        span,
+    )
+}
+
+/// `.name(a, b);` → `.name(a, b)` (A69): a chain link is the method call it
+/// reads as, spliced at its written position with nothing added and nothing
+/// consulted. `.ghost;` and `.ghost();` are the same call — a bare member and
+/// a zero-argument call are one thing on a `Style`.
+///
+/// The accessor takes the NAME's own span, unlike every other generated
+/// accessor here. A link is not scaffolding: the author wrote a method call
+/// and means one, so hover, go-to-definition and the semantic-token painter
+/// should all treat it as the method reference it is. A condition rule's head
+/// stays zero-width because there the name is CSS-side syntax that happens to
+/// be spelled like a method.
+fn chain_link<'src>(link: CssLink<'src>, source: &'src str) -> Spanned<Node<'src>> {
+    let CssLink {
+        name,
+        mut arguments,
+        // The two spellings are one call; only the formatter cares which was
+        // written.
+        parenthesized: _,
+        span,
+    } = link;
+    for argument in arguments.iter_mut() {
+        take_and_desugar(argument, source);
+    }
+    (
+        Node::Call(
+            Box::new((Node::Accessor(name.0), name.1)),
             None,
             (arguments, span),
         ),
@@ -512,28 +549,39 @@ mod tests {
     /// where the emitted-bytes gate in `inference::styling` is the same claim at
     /// the other end of the pipeline.
     ///
-    /// One node differs on purpose and is normalized here: B270 made the SEED
-    /// hygienic, so the block's is a `StdItem("style", "style")` where the
-    /// hand-written chain's is whatever `style` means at the site. The claim is
-    /// therefore "the chain, seeded by std's own `style`" — the seed has its own
-    /// pins below, and the normalization is a no-op on the chain side, which can
-    /// never contain a `StdItem`.
+    /// One node is peeled from the block's side before the comparison, and it
+    /// is a MARK on the chain rather than part of it: A68's `const` — a block
+    /// is a compile-time asset, and the desugar writes the word. It forwards
+    /// to its inner expression in the analyzer and has its own pins; what is
+    /// compared here is what it wraps.
+    ///
+    /// The SEED is normalized for the same reason: B270 made it hygienic, so
+    /// the block's is `std::style::style` where a hand-written chain's is
+    /// whatever `style` means at the site.
     fn shapes_match(block: &str, chain: &str) -> (String, String) {
-        // The chain side is written in `const`, because A68 made the block
-        // wrap its own chain in one: a block is a compile-time asset by
-        // construction, so the claim is "the chain, in `const`". A written
-        // `const css { … }` therefore nests two markers, which the analyzer's
-        // forwarding makes indistinguishable from one.
-        (
-            normalize_seed(&strip_spans(&lowered(block))),
-            normalize_seed(&strip_spans(&lowered(&format!("const {chain}")))),
-        )
+        (strip_spans(&peeled(block)), strip_spans(&peeled(chain)))
     }
 
-    /// The hygienic seed read as the accessor it means (B270), so the shape
-    /// comparison above is about the CHAIN and not about the seed.
-    fn normalize_seed(debug: &str) -> String {
-        debug
+    /// [`lowered`] with the marks off and the seed read as the accessor it
+    /// means.
+    fn peeled(source: &str) -> String {
+        let wrapped = format!("let probe = {source};");
+        let leaked: &'static str = Box::leak(wrapped.into_boxed_str());
+        let (tree, errors) = parsing::parse(leaked);
+        assert!(
+            errors.is_empty(),
+            "{source} did not parse cleanly: {errors:?}"
+        );
+        let mut items: Spanned<NodeList<'static>> = tree.expect("a tree");
+        super::rewrite_items(&mut items.0, leaked);
+        let Node::Let(_, _, Some(value), _) = &items.0[0].0 else {
+            panic!("expected a `let` with a value");
+        };
+        let mut node: &Spanned<Node<'static>> = value;
+        while let Node::Const(inner) = &node.0 {
+            node = inner;
+        }
+        format!("{node:?}")
             .replace("StdItem(\"style\", \"style\")", "Accessor(\"style\")")
             .replace("StdItem(\"ui\", \"view\")", "Accessor(\"view\")")
     }
@@ -639,6 +687,63 @@ mod tests {
     fn an_empty_block_is_a_bare_style_call() {
         let (block, chain) = shapes_match("css { }", "style()");
         assert_eq!(block, chain);
+    }
+
+    // --- A69: chain links -----------------------------------------------------
+
+    #[test]
+    fn a_bare_chain_link_is_the_method_call_it_reads_as() {
+        let (block, chain) = shapes_match("css { .ghost(); }", "style().ghost()");
+        assert_eq!(block, chain);
+    }
+
+    #[test]
+    fn a_chain_link_carries_its_arguments_verbatim() {
+        let (block, chain) =
+            shapes_match(r#"css { .custom(1, "x"); }"#, r#"style().custom(1, "x")"#);
+        assert_eq!(block, chain);
+    }
+
+    #[test]
+    fn a_chain_link_is_emitted_at_its_written_position() {
+        // Between declarations, in written order — the lowering reorders
+        // nothing, and a link's position is what it means (an opaque method
+        // may write any property at all).
+        let (block, chain) = shapes_match(
+            "css { color: red; .ghost(); padding: 1rem; }",
+            r#"style().raw("color", "red").ghost().raw("padding", "1rem")"#,
+        );
+        assert_eq!(block, chain);
+    }
+
+    #[test]
+    fn a_bare_member_and_an_empty_call_are_one_link() {
+        assert_eq!(
+            strip_spans(&peeled("css { .ghost; }")),
+            strip_spans(&peeled("css { .ghost(); }"))
+        );
+    }
+
+    #[test]
+    fn a_dotted_item_with_a_body_is_still_a_condition_rule() {
+        // The control: A69 splits the dotted half by what FOLLOWS the head, so
+        // the condition rule is untouched — its inner chain still rides in as
+        // the last argument.
+        let (block, chain) = shapes_match(
+            "css { .hover { color: red; } }",
+            r#"style().hover(style().raw("color", "red"))"#,
+        );
+        assert_eq!(block, chain);
+    }
+
+    #[test]
+    fn a_chain_links_accessor_keeps_the_names_own_span() {
+        // Unlike every other generated accessor here, which is zero-width
+        // scaffolding: a link IS a method call the author wrote, so hover,
+        // go-to-definition and the token painter should all see the method.
+        // `let probe = css { .ghost(); }` — `ghost` starts at 19.
+        let tree = lowered("css { .ghost(); }");
+        assert!(tree.contains("(Accessor(\"ghost\"), 19..24)"), "{tree}");
     }
 
     // --- Spans (§7.3) ---------------------------------------------------------

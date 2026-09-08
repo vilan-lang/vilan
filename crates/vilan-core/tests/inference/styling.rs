@@ -5501,6 +5501,91 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     );
 }
 
+// --- A69: a CHAIN LINK inside a block ----------------------------------------
+//
+// A dotted item ending in `;` is a verbatim `Style` method call at its written
+// position — the element syntax's own rule (dotted = chain link) read on the
+// style side, and the way an app's helpers and std's combinators reach the
+// block. The exhibit is kolt's own three (`flex_row`, `ghost`, `select_off`),
+// restated here at the same shape: `impl Style` methods over `raw` and
+// `within`, called from a block.
+
+#[test]
+fn a_chain_link_calls_an_apps_own_style_helper() {
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Display, FlexDirection, UserSelect };
+        impl Style {
+            fun flex_row(self): Style {
+                self.display(Display::Flex).flex_direction(FlexDirection::Row)
+            }
+            fun select_off(self): Style {
+                self.within("data-user-select", "false", style().user_select(UserSelect::Off))
+            }
+            fun ghost(self): Style {
+                self.raw("pointer-events", "none").select_off()
+            }
+        }
+        let card = css {
+            .flex_row();
+            gap: 1rem;
+            .ghost();
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+    assert!(css.contains("{flex-direction:row}"), "{css}");
+    assert!(css.contains("{gap:1rem}"), "{css}");
+    assert!(css.contains("{pointer-events:none}"), "{css}");
+    assert!(css.contains("user-select"), "{css}");
+}
+
+#[test]
+fn a_chain_link_takes_arguments_and_a_block_still_equals_its_chain() {
+    // The headline claim, extended to the new item: block and chain emit the
+    // same sheet, link arguments included.
+    let block = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let a = css { color: red; .nudge(Length::px(4)); padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    let chain = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let a = const style().raw("color", "red").nudge(Length::px(4)).raw("padding", "1rem");
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(block, chain);
+}
+
+#[test]
+fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
+    // The `;` is required of a link exactly as it is of a declaration — the
+    // formatter may never invent a token.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let a = css { .ghost() };
+        fun main() {}
+        main();
+        "#,
+        "';'",
+    );
+}
+
 // --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
 //
 // `Style::raw` calls `emit`, the compile-time channel, so a chain only means

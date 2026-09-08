@@ -380,11 +380,13 @@ child        = element | STRING | ISTRING | "{" expression "}" ;
 
 css-block    = "css" css-body ;        (* atom position; excluded in conditions *)
 css-body     = "{" { css-item } "}" ;
-css-item     = css-declaration | css-rule ;
+css-item     = css-declaration | css-rule | css-link ;
 css-declaration = css-property ":" css-value ";" ;
 css-property = { "-" } element-name ;  (* span-adjacent, as an element name is *)
 css-rule     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                css-body ;
+css-link     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+               ";" ;                   (* a chain link, verbatim *)
 css-value    = css-piece { css-piece } ;   (* to the ";" at brace depth 0 *)
 css-piece    = "{" expression "}"          (* a hole *)
              | TOKEN ;                     (* any token but ";", "{", "}" *)
@@ -435,9 +437,15 @@ from condition operands exactly as a struct initializer is (§3.8).
 followed immediately by `{`.
 
 Inside the body the **dot decides, and decides alone**: an undotted item
-is a *declaration* and a dotted one is a *condition rule*, so the
-grammar never consults any method list and a method added to `Style`
-cannot change what an existing block means. A property name is a
+is a *declaration* and a dotted one is a method call, so the grammar
+never consults any method list and a method added to `Style` cannot
+change what an existing block means. What FOLLOWS a dotted head splits
+it, exactly as it does in a head item's element syntax: a `{ … }` body
+makes a **condition rule**, and a `;` makes a **chain link** — a
+verbatim method call spliced into the chain at its written position
+(`.ghost();`, `.flex_row();`, `.custom(a, b);`). A bare member and an
+empty argument list are the same call, so `.ghost;` and `.ghost();`
+both mean `.ghost()`. A property name is a
 span-adjacent name-`-`-name run, the element-name rule (so
 `flex-direction` is three tokens and `--color-ink` is five, while
 `data - id` is arithmetic). The `;` is **required** after every

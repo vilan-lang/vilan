@@ -195,13 +195,21 @@ pub struct CssBody<'src> {
 }
 
 /// One item of a `css` block. The dot is the whole disambiguator (§3):
-/// undotted is a declaration, dotted is a condition combinator — so the
-/// grammar never consults `Style`'s method list, and adding a method to
-/// `Style` can never change what existing `css` means.
+/// undotted is a declaration, dotted is a method call — so the grammar never
+/// consults `Style`'s method list, and adding a method to `Style` can never
+/// change what existing `css` means.
+///
+/// A69 splits the dotted half by what FOLLOWS the head, which is the element
+/// syntax's own rule read on the style side: a `{ … }` body makes it a
+/// condition rule, and a `;` makes it a plain CHAIN LINK — `.ghost();`,
+/// `.flex_row();`, `.custom(a, b);` — spliced into the chain at its written
+/// position. That is how an app's own helpers and std's combinators reach the
+/// block, and it claims the grammar space css-block.md §10 left free for it.
 #[derive(Debug)]
 pub enum CssItem<'src> {
     Declaration(CssDeclaration<'src>),
     Nested(CssNested<'src>),
+    Link(CssLink<'src>),
 }
 
 impl CssItem<'_> {
@@ -212,6 +220,7 @@ impl CssItem<'_> {
         match self {
             CssItem::Declaration(declaration) => declaration.span,
             CssItem::Nested(nested) => nested.span,
+            CssItem::Link(link) => link.span,
         }
     }
 }
@@ -245,6 +254,28 @@ pub enum CssValuePiece<'src> {
     Hole(Spanned<Node<'src>>, Span),
     /// A run of value text, verbatim from source.
     Text(Span),
+}
+
+/// `.name;` / `.name(a, b);` — a CHAIN LINK (A69), lowering to exactly the
+/// method call it reads as, at its written position in the chain. Nothing is
+/// appended and nothing is consulted: a link is the one item whose meaning is
+/// entirely the method's, which is what lets an app's helpers (`.flex_row()`,
+/// `.ghost()`, `.select_off()`) and std's own combinators be written inside a
+/// block at all.
+#[derive(Debug)]
+pub struct CssLink<'src> {
+    pub name: Spanned<&'src str>,
+    /// The call's arguments, ordinary vilan expressions. A bare member and an
+    /// empty list are the same call — `.ghost;` and `.ghost();` both LOWER to
+    /// `.ghost()`, because a bare member and a zero-argument call are one
+    /// thing on a `Style`.
+    pub arguments: Vec<Spanned<Node<'src>>>,
+    /// Whether a `(` was written. The two spellings mean the same call, so the
+    /// desugar never reads this — the FORMATTER does, because it may never
+    /// invent or delete a token, and `.ghost;` and `.ghost();` differ by two.
+    pub parenthesized: bool,
+    /// The link's own span, `;` inclusive.
+    pub span: Span,
 }
 
 /// `.name { … }` / `.name(a, b) { … }` — a condition combinator, lowering to
@@ -1297,6 +1328,11 @@ fn visit_css_body<'a, 'src>(
                     visit(argument);
                 }
                 visit_css_body(&nested.body, visit);
+            }
+            CssItem::Link(link) => {
+                for argument in &link.arguments {
+                    visit(argument);
+                }
             }
         }
     }

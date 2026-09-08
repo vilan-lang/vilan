@@ -3241,15 +3241,22 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// what existing `css` means.
     fn parse_css_item(&mut self) -> Option<CssItem<'src>> {
         if self.peek_is_ctrl('.') {
-            return self.parse_css_nested().map(CssItem::Nested);
+            return self.parse_css_dotted();
         }
         self.parse_css_declaration().map(CssItem::Declaration)
     }
 
-    /// `.name { … }` / `.name(a, b) { … }` — a condition combinator. Only the
-    /// OUTERMOST block arrives through the atom; every nested rule re-enters
-    /// here directly, so the nesting needs its own depth level (B142).
-    fn parse_css_nested(&mut self) -> Option<CssNested<'src>> {
+    /// A DOTTED item: `.name { … }` (a condition combinator) or `.name;` (a
+    /// chain link, A69). The head is one parse either way and what FOLLOWS it
+    /// decides — a `{` makes a rule, anything else a link — so the grammar
+    /// still never consults `Style`'s method list, and the two forms need no
+    /// lookahead past the head.
+    ///
+    /// Only the OUTERMOST block arrives through the atom; every nested rule
+    /// re-enters here directly, so the nesting needs its own depth level
+    /// (B142). A link nests nothing and pays the same bound harmlessly, which
+    /// is cheaper than splitting the head parse in two.
+    fn parse_css_dotted(&mut self) -> Option<CssItem<'src>> {
         self.parse_nested_as(
             Self::CSS_NESTING_REFUSAL,
             |parser, _span| {
@@ -3259,38 +3266,55 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.bump();
                 None
             },
-            Self::parse_css_nested_inner,
+            Self::parse_css_dotted_inner,
         )
     }
 
-    /// [`Parser::parse_css_nested`]'s body, past the depth bound.
-    fn parse_css_nested_inner(&mut self) -> Option<CssNested<'src>> {
+    /// [`Parser::parse_css_dotted`]'s body, past the depth bound.
+    fn parse_css_dotted_inner(&mut self) -> Option<CssItem<'src>> {
         let start = self.position;
         self.expect_ctrl('.')?;
         let name_span = self.here_span();
         let Some(name) = self.eat_ident() else {
             self.report_css_failure(
-                "a condition combinator (`.hover { … }`, `.within(\"a\", \"b\") { … }`)",
+                "a condition combinator (`.hover { … }`) or a chain link (`.ghost();`)",
             );
             return None;
         };
         // The head's arguments are ORDINARY vilan expressions, so
         // `.within("data-theme", "dark") { … }` and `.pseudo("first-child") { … }`
-        // work with no special casing (§4.3).
-        let arguments = if self.peek_is_ctrl('(') {
+        // work with no special casing (§4.3) — and so do a link's.
+        let parenthesized = self.peek_is_ctrl('(');
+        let arguments = if parenthesized {
             self.parse_argument_list()?.0
         } else {
             Vec::new()
         };
         let head = self.span_from(start);
+        // A69: `{` is the condition rule, and anything else is a chain link
+        // ended by its required `;` — the same terminator a declaration takes,
+        // reported the same gap-anchored way.
+        if !self.peek_is_ctrl('{') {
+            if !self.peek_is_ctrl(';') {
+                self.report_css_failure(TERMINATOR_EXPECTED);
+                return None;
+            }
+            self.bump();
+            return Some(CssItem::Link(crate::node::CssLink {
+                name: (name, name_span),
+                arguments,
+                parenthesized,
+                span: self.span_from(start),
+            }));
+        }
         let body = self.parse_css_body()?;
-        Some(CssNested {
+        Some(CssItem::Nested(CssNested {
             name: (name, name_span),
             arguments,
             body,
             head,
             span: self.span_from(start),
-        })
+        }))
     }
 
     /// `property: value;` — one declaration. The `;` is REQUIRED, including
