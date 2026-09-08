@@ -2488,6 +2488,10 @@ impl Document {
         if let Some(rendered) = self.alias_hover(program, offset) {
             return Some(rendered);
         }
+        // A module directory with no body: what it HOLDS (E152).
+        if let Some(rendered) = self.namespace_hover(program, offset) {
+            return Some(rendered);
+        }
         // A type name in type position: the full declaration when known.
         if let Some((definition, label)) = self.type_reference_at(program, offset) {
             if let Some(definition) = definition
@@ -2593,6 +2597,128 @@ impl Document {
         if let Some(requirement) = self.platform_requirements.get(&target) {
             out.push_str("\n\n");
             out.push_str(requirement);
+        }
+        Some(out)
+    }
+
+    /// Whether `id` is a module directory with NO body of its own — A65's pure
+    /// namespace, the node the loader mints for `lib` in `pkg::lib::ui::widget`
+    /// when `lib/lib.vl` is not part of this program.
+    ///
+    /// Such a node names no source file, so the analyzer attributes its one-id
+    /// range to the ENTRY and gives it an empty span — the honest answer to
+    /// "which file declares this", since no file does. Every module loaded from
+    /// a file has a source of its own, and the entry file is not a module
+    /// entity at all, so "a module attributed to `SourceId(0)`" is nearly the
+    /// bodiless set — the one other member is the `pkg::<entry>` alias arm,
+    /// which names the entry file and holds no children, so the submodule
+    /// scope is what separates them. A directory node exists BECAUSE a child
+    /// path asked for it, so a namespace always has one.
+    fn is_namespace_module(&self, program: &Program, id: Id) -> bool {
+        program.modules.contains_key(&id)
+            && program.module_children_scopes.contains_key(&id)
+            && program.source_of(id) == Some(SourceId(0))
+            && program
+                .span_map
+                .get(&id)
+                .is_none_or(|span| span.start == span.end)
+    }
+
+    /// The submodules a namespace holds, by name, in a deterministic order.
+    fn namespace_children(&self, program: &Program, id: Id) -> Vec<(String, Id)> {
+        let Some(scope_id) = program.module_children_scopes.get(&id) else {
+            return Vec::new();
+        };
+        let Some(scope) = program.scopes.get(scope_id) else {
+            return Vec::new();
+        };
+        let mut children: Vec<(String, Id)> = scope
+            .name_to_id_map
+            .iter()
+            .filter(|(_, child)| program.modules.contains_key(*child))
+            .map(|(name, child)| ((*name).to_string(), *child))
+            .collect();
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        children
+    }
+
+    /// Where go-to-definition lands for a pure namespace (E152): its first
+    /// child's FILE, at line 1.
+    ///
+    /// The alternative considered and rejected was a `file://` URI naming the
+    /// DIRECTORY itself, which is what the segment literally denotes. It is a
+    /// well-formed URI and a lie to every client: `textDocument/definition`
+    /// answers a `Location`, a location has a range in a TEXT DOCUMENT, and no
+    /// editor can open a directory as one — VS Code reports "unable to open"
+    /// and lands the user nowhere, which is a worse answer than the entry's top
+    /// line this replaces. The first child's file is a real document, it is
+    /// inside the namespace, and it is where a reader who followed
+    /// `pkg::lib::ui` was going anyway. Line 1 rather than a name span because
+    /// the namespace HAS no name span: nothing in that file spells `ui`.
+    ///
+    /// Deterministic: the children are ordered by name, and a child that is
+    /// itself bodiless recurses, so a namespace holding only namespaces still
+    /// answers with a file. `None` when the namespace holds nothing loadable,
+    /// which is the honest silence — the caller falls through to its own
+    /// answer.
+    fn namespace_location(&self, program: &Program, id: Id) -> Option<(SourceId, Span)> {
+        if !self.is_namespace_module(program, id) {
+            return None;
+        }
+        let mut seen: Vec<Id> = vec![id];
+        let mut frontier: std::collections::VecDeque<Id> = self
+            .namespace_children(program, id)
+            .into_iter()
+            .map(|(_, child)| child)
+            .collect();
+        while let Some(child) = frontier.pop_front() {
+            if seen.contains(&child) {
+                continue;
+            }
+            seen.push(child);
+            match program.source_of(child) {
+                Some(source) if source != SourceId(0) => {
+                    return Some((source, Span::from(0..0)));
+                }
+                // A bodiless child: its own children answer instead, ahead of
+                // this namespace's later ones, so the walk stays depth-first
+                // and the answer stays "the first child, all the way down".
+                _ => {
+                    for (offset, (_, nested)) in self
+                        .namespace_children(program, child)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        frontier.insert(offset, nested);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The hover for a pure namespace: what it HOLDS (E152).
+    ///
+    /// A namespace has no declaration, so the plain `module ui` the type label
+    /// produced was the whole answer — a restatement of the word under the
+    /// caret. The children are the only fact about it, and they are the fact a
+    /// reader asking about `pkg::lib::ui` wants: which paths does this segment
+    /// open onto.
+    fn namespace_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (definition, _) = self.type_reference_at(program, offset)?;
+        let definition = definition?;
+        if !self.is_namespace_module(program, definition) {
+            return None;
+        }
+        let module = program.modules.get(&definition)?;
+        let children = self.namespace_children(program, definition);
+        let mut out = format!("```vilan\nnamespace {}\n```", module.name);
+        if !children.is_empty() {
+            let names: Vec<String> = children
+                .iter()
+                .map(|(name, _)| format!("`{name}`"))
+                .collect();
+            out.push_str(&format!("\n\nHolds {}.", names.join(", ")));
         }
         Some(out)
     }
@@ -2861,6 +2987,11 @@ impl Document {
         // target (a generic) yields nothing rather than falling through.
         if let Some((definition, _)) = self.type_reference_at(program, offset) {
             let definition = definition?;
+            // A pure NAMESPACE names no file, so it has no declaration to land
+            // on; its first child's does (E152).
+            if let Some(location) = self.namespace_location(program, definition) {
+                return Some(location);
+            }
             return Some((
                 program.source_of(definition)?,
                 self.analysis(program).definition_name_span(definition)?,
@@ -13788,6 +13919,116 @@ pub(crate) mod tests {
             vec!["widget".to_string()],
             "a pure namespace offers its children and nothing else"
         );
+    }
+
+    // --- E152: a pure namespace has somewhere to point ---------------------
+    //
+    // A directory with no `lib.vl` is a module node the loader mints so a path
+    // can pass through it, and it names no file — so the analyzer attributes
+    // its one-id range to the ENTRY at an empty span, which is honest about
+    // provenance and wrong as a destination: go-to-definition on `ui` in
+    // `pkg::lib::ui::widget` landed on line 1 of the file the caret was
+    // already in. Hover said `module ui`, a restatement of the word under the
+    // caret.
+    //
+    // Ruled here: the destination is the namespace's FIRST CHILD's file, at
+    // line 1 — not a `file://` URI naming the directory, which is well-formed
+    // and unopenable (a `Location` is a range in a text document; no editor
+    // opens a directory as one, and "unable to open" is worse than the wrong
+    // line this replaces). The hover answers with what the namespace HOLDS,
+    // which is the only fact about it and the one a reader following the path
+    // is asking for.
+
+    /// The entry names the namespace TWICE, so "references" has something to
+    /// be more than a tautology about.
+    const E152_ENTRY: &str = "\
+import pkg::lib::ui::widget::label;
+import pkg::lib::ui::widget::wide;
+
+fun main() {
+\tlet _ = label();
+\tlet _ = wide();
+}
+";
+
+    fn e152_workspace() -> (PathBuf, Document) {
+        analyze_workspace(&[
+            ("main.vl", E152_ENTRY),
+            ("lib/lib.vl", "fun surface(): i32 {\n\t3\n}\n"),
+            (
+                "lib/ui/widget.vl",
+                "fun label(): str {\n\t\"w\"\n}\n\nfun wide(): i32 {\n\t1\n}\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn e152_definition_on_a_pure_namespace_lands_in_its_first_childs_file() {
+        let (dir, document) = e152_workspace();
+        let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
+        let (source, span) = document
+            .definition(offset)
+            .expect("a namespace segment has a definition");
+        assert_ne!(
+            source,
+            SourceId(0),
+            "`ui` names no name in the entry, and landing there is the bug",
+        );
+        let program = document.program.as_ref().expect("program");
+        let landed = program.canonical_sources[source.0 as usize].clone();
+        assert!(
+            landed.ends_with("widget.vl"),
+            "the namespace's first child's file: {landed:?}",
+        );
+        assert_eq!(span, Span::from(0..0), "line 1 — nothing there spells `ui`");
+        // And the namespace ABOVE it, `lib`, whose body this program never
+        // loaded, walks down through `ui` to the same file.
+        let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
+        assert_eq!(
+            document.definition(above),
+            Some((source, Span::from(0..0))),
+            "a namespace of namespaces still answers with a file",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e152_hover_on_a_pure_namespace_names_what_it_holds() {
+        let (dir, document) = e152_workspace();
+        let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
+        assert_eq!(
+            document.hover(offset).as_deref(),
+            Some("```vilan\nnamespace ui\n```\n\nHolds `widget`."),
+        );
+        let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
+        assert_eq!(
+            document.hover(above).as_deref(),
+            Some("```vilan\nnamespace lib\n```\n\nHolds `ui`."),
+        );
+        // A module with a file of its own is unmoved: it has a declaration,
+        // and `namespace` is not what it is.
+        let leaf = E152_ENTRY.find("::widget").expect("the `widget` segment") + 2;
+        assert_eq!(document.hover(leaf).as_deref(), Some("module widget"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e152_references_on_a_pure_namespace_list_the_segments_that_name_it() {
+        let (dir, document) = e152_workspace();
+        let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
+        let found: Vec<&str> = document
+            .references(offset)
+            .into_iter()
+            .filter(|(source, _)| *source == SourceId(0))
+            .map(|(_, span)| E152_ENTRY.get(span.into_range()).expect("in the entry"))
+            .collect();
+        assert_eq!(
+            found,
+            vec!["ui", "ui"],
+            "a namespace has no declaration row; the path segments that name \
+             it are its whole occurrence set",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
