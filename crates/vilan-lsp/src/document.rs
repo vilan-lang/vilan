@@ -5854,18 +5854,38 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The ratified first target (E54): element syntax with no `view` in
-    // scope. `<div/>` desugars to an unresolved `view` accessor, which
-    // already carries the "element syntax lowers to std::ui::view" note
-    // (element-syntax S4) — the quickfix comes from the SAME general
-    // unresolved-name path as any other name, reaching `view` in real std
-    // via `import_candidates`' disk scan, not from the note's text.
+    // The ratified first target (E54) was element syntax with no `view` in
+    // scope: `<div/>` desugared to an unresolved `view` accessor. B270 (Order
+    // 30) made the element HYGIENIC — `<tag />` means `std::ui::view` whatever
+    // the site's scope holds, and needs no import — so the element itself no
+    // longer raises anything. The `View` TYPE written beside it still does,
+    // and it takes the SAME general unresolved-name path as any other name,
+    // reaching `std::ui` in real std via `import_candidates`' disk scan (the
+    // `std::web` re-export is skipped: nobody is told to `import
+    // std::web::View`). Applied, the file is CLEAN — which is the element's
+    // hygiene pinned from the editor's side too.
     #[test]
-    fn quickfix_offers_the_add_import_fix_for_an_unresolved_element_view() {
+    fn quickfix_offers_the_add_import_fix_for_the_view_type_beside_a_hygienic_element() {
         let (dir, document) =
-            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _x = <div/>;\n}\n")]);
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _x: View = <div/>;\n}\n")]);
         let program = document.program.as_ref().unwrap();
         let text = document.line_index.text();
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|error| error.msg.contains("cannot find type 'View'")),
+            "the written type is unresolved: {:#?}",
+            document.diagnostics
+        );
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .all(|error| !error.msg.contains("cannot find 'view'")),
+            "B270: the element head needs no import: {:#?}",
+            document.diagnostics
+        );
         let whole_file = Span {
             start: 0,
             end: text.len(),
@@ -5873,12 +5893,12 @@ pub(crate) mod tests {
         let fixes = document.quickfixes(program, whole_file);
         let view_fixes: Vec<_> = fixes
             .iter()
-            .filter(|fix| fix.title.contains("`view`"))
+            .filter(|fix| fix.title.contains("`View`"))
             .collect();
         assert_eq!(
             view_fixes.len(),
             1,
-            "expected exactly one unambiguous `view` fix: {:?}",
+            "expected exactly one unambiguous `View` fix: {:?}",
             fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
         );
         assert!(
@@ -5886,19 +5906,17 @@ pub(crate) mod tests {
             "{}",
             view_fixes[0].title
         );
-        assert_eq!(view_fixes[0].replacement, "import std::ui::view;\n");
-        // Applied and re-analyzed: the element head resolves.
+        assert_eq!(view_fixes[0].replacement, "import std::ui::View;\n");
+        // Applied and re-analyzed: the type resolves through the import and
+        // the element head through its own seed — nothing is left.
         let mut applied = text.to_string();
         applied.replace_range(view_fixes[0].span.into_range(), &view_fixes[0].replacement);
         let entry = dir.join("main.vl");
         std::fs::write(&entry, &applied).unwrap();
         let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
         assert!(
-            reanalyzed
-                .diagnostics
-                .iter()
-                .all(|error| !error.msg.contains("cannot find 'view'")),
-            "applying the fix should resolve the element head: {:#?}",
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
             reanalyzed.diagnostics
         );
         let _ = std::fs::remove_dir_all(&dir);
