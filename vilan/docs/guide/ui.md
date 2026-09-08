@@ -368,7 +368,7 @@ it *is* — at every attachment site, including a `when` body or a
 
 ```vilan,fragment
 view("input").attr("type", "text").on_mount(|element| element.focus())
-view("input").attr("type", "text").autofocus()          // the same thing
+view("input").attr("type", "text").autofocus()          // and then some
 ```
 
 `autofocus` is the reason the hook exists. HTML's `autofocus` attribute
@@ -377,6 +377,38 @@ mounted later — and the workaround it forces (mint a uuid, set it as the
 id, start a 1 ms timer, look the element back up) is three lines of
 ceremony around a value you already had. There is nothing to look up:
 the callback is handed the element.
+
+`on_mount` promises the element is IN THE DOCUMENT, and that is all it
+promises. A microtask runs before the frame's rendering step, so at that
+moment the element is connected but not yet *rendered*: no layout, no
+resolved style, and no `ResizeObserver` reaction to either. `focus()` has
+a precondition — connected, rendered, visible, not inert, all of them at
+the call — and the platform's answer to a target that is not is to do
+nothing, silently. An overlay panel held at `visibility: hidden` until a
+`ResizeObserver` places it and flips it visible is exactly the shape that
+refuses.
+
+So `autofocus` is not `on_mount(|e| e.focus())`: it attempts in the
+microtask, and if the element did not take focus it attempts again on the
+next animation frame and once more on the frame after, then stops. Three
+attempts on the platform's own clock — no timer, no millisecond to tune.
+Written out, with `std::dom::request_animation_frame` as the clock and
+`matches(":focus")` as the read-back (`focus()` returns nothing):
+
+```vilan,fragment
+view("input").on_mount(|element| {
+	element.focus();
+	if !element.matches(":focus") {
+		request_animation_frame(|| element.focus());
+	}
+})
+```
+
+Two things no retry fixes. iOS Safari ignores a programmatic `focus()`
+outside a user gesture whatever frame it runs on; and the sound shape for
+an overlay is that focus is a consequence of the SHOW — a hook the driver
+runs when it flips visibility, or `<dialog>.showModal()`, whose focusing
+steps run once the dialog is rendered.
 
 The hook is a **microtask**, which is enough because the whole
 synchronous build — and the `mount` that finishes it — runs to

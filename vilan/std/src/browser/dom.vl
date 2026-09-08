@@ -42,6 +42,22 @@ external fun query_selector(selector: str): Element;
 /// as a `List` (a real array, so `map`/`for`-in/`len` all work).
 external fun query_selector_all(selector: str): List<Element>;
 
+/// `requestAnimationFrame(callback)` — run `callback` before the next rendering
+/// step (backlog B271).
+///
+/// The browser twin of `std::reactive`'s `queue_microtask`, and it lives HERE
+/// rather than beside it because it is a browser API: node has a microtask
+/// queue and no frames, and `std::reactive` is the layer both targets share.
+///
+/// The difference is the whole reason this exists. A microtask runs before the
+/// rendering step, so layout, style resolution and every observer that reacts
+/// to them (`ResizeObserver`, `IntersectionObserver`) have not happened yet; a
+/// frame callback runs after the previous rendering step, so what those made
+/// visible is visible. Anything whose precondition is "rendered" — focus, a
+/// measurement, a scroll into view — belongs on this clock and not on a timer.
+[extern("requestAnimationFrame", retains)]
+external fun request_animation_frame(callback: || void);
+
 impl Element {
 	/// Sets the element's text content (`element.textContent = text`).
 	[extern(set, "textContent")]
@@ -86,8 +102,25 @@ impl Element {
 	/// `autofocus` attribute only fires on a document's initial parse, so
 	/// anything mounted later — every custom modal — has to ask; this is what
 	/// `View::autofocus` calls.
+	///
+	/// It is a REQUEST with a precondition, not a command: the platform focuses
+	/// only a target that is connected, rendered, visible and not inert AT THE
+	/// CALL, and silently does nothing otherwise. `visibility: hidden` refuses;
+	/// so does a `display: none` ancestor, and so does an `inert` subtree. "Just
+	/// created" is never the problem — `View::on_mount` already guarantees the
+	/// element is in the document — "still hidden" is.
 	[extern(method, "focus")]
 	external fun focus(self): void;
+
+	/// Whether the element matches a CSS selector (`element.matches(selector)`).
+	///
+	/// `matches(":focus")` is how a caller asks whether a `focus()` was HONORED,
+	/// which the void-returning `focus` cannot say. It is `document.activeElement
+	/// === element` in the selector engine's own vocabulary, and unlike a
+	/// document-level read it needs no handle comparison between two opaque
+	/// `Element`s.
+	[extern(method, "matches")]
+	external fun matches(self, selector: str): bool;
 
 	/// The element's current value (`element.value`) — e.g. what the user has
 	/// typed into an `<input>`.

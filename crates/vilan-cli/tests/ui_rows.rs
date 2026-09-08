@@ -70,18 +70,32 @@ class StubElement {
     }
     replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
     addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    focus() { this.focused = true; global.focusLog.push(describe(this)); }
+    focus() { this.focused = true; global.activeElement = this; global.focusLog.push(describe(this)); }
+    // `element.matches(":focus")` is how `View::autofocus` reads back whether
+    // its request was honored (B271); the stub answers the one selector it is
+    // ever asked for.
+    matches(selector) {
+        if (selector !== ":focus") throw new Error("the stub knows only :focus, got " + selector);
+        return global.activeElement === this;
+    }
 }
 const documentRoot = new StubElement("root");
 global.focusLog = [];
+global.activeElement = null;
 global.document = {
     createElement: (tag) => new StubElement(tag),
     createElementNS: (namespace, tag) => new StubElement(tag),
     getElementById: () => documentRoot,
     querySelector: () => null,
     querySelectorAll: () => [],
+    get activeElement() { return global.activeElement; },
 };
 global.window = { addEventListener: () => {} };
+// The frame clock. node has none, and every leg but B271's only needs it to
+// EXIST — a macrotask is the honest stand-in for "after the rendering step".
+// B271's own leg replaces this with a queue it drives, because "on the next
+// frame" is a claim about order.
+global.requestAnimationFrame = (callback) => setTimeout(callback, 0);
 /// Whether `node` is reachable from the document root by parent links — the
 /// question `on_mount` exists to answer.
 function inDocument(node) {
@@ -443,6 +457,157 @@ fn autofocus_focuses_the_modal_input_once_it_is_in_the_document() {
     assert!(
         stdout.contains("@doc"),
         "the element must be in the document when focus() runs; got:\n{stdout}"
+    );
+}
+
+// --- B271: `focus()` has a PRECONDITION, and the retry is frame-shaped ------
+//
+// `on_mount`'s microtask runs BEFORE the frame's rendering step, so an element
+// that becomes focusable only during that step is not focusable when the first
+// `focus()` lands — and the platform's answer to a target that is hidden,
+// unrendered or inert is to do nothing, silently. kolt's overlay panel is
+// `visibility: hidden` until a ResizeObserver callback places it and flips it
+// visible, so `autofocus` was a no-op there every time. Not a race: the browser
+// rule.
+//
+// `autofocus` is bounded and frame-aware now — attempt in the microtask, then
+// on the next animation frame, then once more on the frame after, then stop —
+// and this is the pin. The stub is extended by exactly what makes the claim
+// measurable: a `visibility` a hidden element refuses `focus()` with,
+// `document.activeElement` tracking what actually took it, `matches(":focus")`
+// reading it back, and a `requestAnimationFrame` that fires nothing until the
+// test says `flushFrame()`. A frame that never comes on its own is the point:
+// "on the next frame" is a claim about ORDER, and a real rAF would let a pass
+// mean "eventually".
+const DOM_STUB_FRAMES: &str = r##"
+// A hidden element refuses focus. The platform reads a computed style; the
+// stub reads a marker attribute the fixture sets, which is the same fact with
+// no layout engine behind it.
+const setAttributeBase = StubElement.prototype.setAttribute;
+StubElement.prototype.setAttribute = function (name, value) {
+    setAttributeBase.call(this, name, value);
+    if (name === "data-visibility") this.visibility = value;
+};
+StubElement.prototype.focus = function () {
+    const refused = this.visibility === "hidden";
+    global.focusLog.push(describe(this) + (refused ? "!refused" : "!taken"));
+    if (refused) return;
+    this.focused = true;
+    global.activeElement = this;
+};
+let frameQueue = [];
+global.requestAnimationFrame = (callback) => frameQueue.push(callback);
+global.flushFrame = () => {
+    const due = frameQueue;
+    frameQueue = [];
+    for (const callback of due) callback();
+    return due.length;
+};
+global.findByName = (name) => {
+    const walk = (node) => {
+        if (node.attributes && node.attributes.name === name) return node;
+        for (const child of node.children) {
+            const found = walk(child);
+            if (found) return found;
+        }
+        return null;
+    };
+    return walk(documentRoot);
+};
+"##;
+
+/// The overlay's shape: a panel mounted hidden, `autofocus` chained onto its
+/// input. Nothing here mentions a frame — that is the whole point of the
+/// one-word form.
+const HIDDEN_AUTOFOCUS: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let _root = mount_root("app", || {
+		view("div").when(open, || {
+			view("input").attr("name", "modal").attr("data-visibility", "hidden").autofocus()
+		})
+	});
+	open.set(true);
+	print("built");
+}
+
+main();
+"#;
+
+/// The pin: refused in the microtask, taken on the FIRST frame after the
+/// subtree is flipped visible — and the retry stops there rather than running
+/// forever.
+#[test]
+fn b271_autofocus_is_refused_in_the_microtask_and_taken_on_the_first_frame() {
+    let harness = format!(
+        "{DOM_STUB}\n{DOM_STUB_FRAMES}\nrequire(\"./app.js\");\n\
+         setTimeout(() => {{\n  \
+         const panel = findByName(\"modal\");\n  \
+         console.log(\"microtask=\" + focusLog.join(\"|\"));\n  \
+         console.log(\"activeBefore=\" + (activeElement ? activeElement.attributes.name : \"none\"));\n  \
+         // The ResizeObserver callback: the panel is placed and flipped visible\n  \
+         // in the rendering step a frame callback runs after.\n  \
+         panel.visibility = \"visible\";\n  \
+         console.log(\"ranFrame=\" + flushFrame());\n  \
+         console.log(\"afterFrame=\" + focusLog.join(\"|\"));\n  \
+         console.log(\"activeAfter=\" + (activeElement ? activeElement.attributes.name : \"none\"));\n  \
+         console.log(\"tail=\" + flushFrame());\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("b271_frames", HIDDEN_AUTOFOCUS, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert!(
+        line("microtask=").ends_with("!refused"),
+        "a hidden element refuses focus, and the microtask is where it is \
+         still hidden; got:\n{stdout}"
+    );
+    assert!(
+        line("microtask=").contains("@doc"),
+        "the element IS in the document — `on_mount`'s promise is kept and is \
+         not the problem; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("activeBefore="),
+        "activeBefore=none",
+        "nothing took focus in the microtask; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("ranFrame="),
+        "ranFrame=1",
+        "exactly one frame callback was queued by the refused attempt; \
+         got:\n{stdout}"
+    );
+    let after = line("afterFrame=");
+    let attempts: Vec<&str> = after.trim_start_matches("afterFrame=").split('|').collect();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "two attempts: the microtask's and the first frame's; got:\n{stdout}"
+    );
+    assert!(
+        attempts[1].ends_with("!taken"),
+        "the first frame after the flip takes focus; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("activeAfter="),
+        "activeAfter=modal",
+        "`document.activeElement` is the input `autofocus` was chained onto; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("tail="),
+        "tail=0",
+        "the retry is BOUNDED: a taken focus queues no further frame; \
+         got:\n{stdout}"
     );
 }
 
