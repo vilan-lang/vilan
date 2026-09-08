@@ -211,9 +211,24 @@ const CSS_BLOCK_IS_BRACE_INITIAL: &str = "a `css { … }` block is brace-initial
      `(css { … })`";
 
 /// What a `css` block's body admits — the dot rule, spelled for the reader
-/// (proposal/css-block.md §3).
-const CSS_ITEM_EXPECTED: &str =
-    "a declaration (`property: value;`) or a nested rule (`.name { … }`)";
+/// (proposal/css-block.md §3), chain links included (A69).
+const CSS_ITEM_EXPECTED: &str = "a declaration (`property: value;`), a nested rule (`.name { … }`) or a chain link \
+     (`.name();`)";
+
+/// The rule a CSS pseudo-class written CSS-style breaks (tracker E153).
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself and
+/// names the sanctioned spelling.
+///
+/// `:hover { … }` is the single most likely thing for a CSS writer to type
+/// inside a block, and it reported the bare `found ':' expected a declaration
+/// …` — true, and no help at all, because the reader has to guess that the
+/// answer is a DOT. The dotted rule is deliberate: one name-blind form covers
+/// pseudo-classes, breakpoints, `within` and `divide`, so the grammar never
+/// consults a method list. The message says that, and names the fix.
+const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as a DOTTED rule: `.hover { … }`, not `:hover { … }`. \
+     One name-blind form covers pseudo-classes, breakpoints (`.md`), ancestor guards \
+     (`.within(…)`) and `.divide` — so the grammar never consults a method list, and a \
+     method added to `Style` cannot change what a block means";
 
 /// The rule `!important` breaks inside a `css` block. Curated
 /// (diagnostics-standard.md B6): the prohibition explains itself and names the
@@ -3284,15 +3299,36 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// what existing `css` means.
     fn parse_css_item(&mut self) -> Option<CssItem<'src>> {
         if self.peek_is_ctrl('.') {
-            return self.parse_css_nested().map(CssItem::Nested);
+            return self.parse_css_dotted();
+        }
+        // E153: an item that STARTS with `:` is a CSS pseudo-class selector,
+        // the one thing a CSS writer is most likely to reach for here. Steered
+        // rather than reported as a missing declaration — the answer is a dot,
+        // and nothing in "expected a declaration" says so.
+        if self.peek_is_op(":") {
+            let context = self.context_stack.clone();
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(CSS_PSEUDO_CLASS_IS_DOTTED),
+                context,
+                hint: None,
+            });
+            return None;
         }
         self.parse_css_declaration().map(CssItem::Declaration)
     }
 
-    /// `.name { … }` / `.name(a, b) { … }` — a condition combinator. Only the
-    /// OUTERMOST block arrives through the atom; every nested rule re-enters
-    /// here directly, so the nesting needs its own depth level (B142).
-    fn parse_css_nested(&mut self) -> Option<CssNested<'src>> {
+    /// A DOTTED item: `.name { … }` (a condition combinator) or `.name;` (a
+    /// chain link, A69). The head is one parse either way and what FOLLOWS it
+    /// decides — a `{` makes a rule, anything else a link — so the grammar
+    /// still never consults `Style`'s method list, and the two forms need no
+    /// lookahead past the head.
+    ///
+    /// Only the OUTERMOST block arrives through the atom; every nested rule
+    /// re-enters here directly, so the nesting needs its own depth level
+    /// (B142). A link nests nothing and pays the same bound harmlessly, which
+    /// is cheaper than splitting the head parse in two.
+    fn parse_css_dotted(&mut self) -> Option<CssItem<'src>> {
         self.parse_nested_as(
             Self::CSS_NESTING_REFUSAL,
             |parser, _span| {
@@ -3302,38 +3338,55 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.bump();
                 None
             },
-            Self::parse_css_nested_inner,
+            Self::parse_css_dotted_inner,
         )
     }
 
-    /// [`Parser::parse_css_nested`]'s body, past the depth bound.
-    fn parse_css_nested_inner(&mut self) -> Option<CssNested<'src>> {
+    /// [`Parser::parse_css_dotted`]'s body, past the depth bound.
+    fn parse_css_dotted_inner(&mut self) -> Option<CssItem<'src>> {
         let start = self.position;
         self.expect_ctrl('.')?;
         let name_span = self.here_span();
         let Some(name) = self.eat_ident() else {
             self.report_css_failure(
-                "a condition combinator (`.hover { … }`, `.within(\"a\", \"b\") { … }`)",
+                "a condition combinator (`.hover { … }`) or a chain link (`.ghost();`)",
             );
             return None;
         };
         // The head's arguments are ORDINARY vilan expressions, so
         // `.within("data-theme", "dark") { … }` and `.pseudo("first-child") { … }`
-        // work with no special casing (§4.3).
-        let arguments = if self.peek_is_ctrl('(') {
+        // work with no special casing (§4.3) — and so do a link's.
+        let parenthesized = self.peek_is_ctrl('(');
+        let arguments = if parenthesized {
             self.parse_argument_list()?.0
         } else {
             Vec::new()
         };
         let head = self.span_from(start);
+        // A69: `{` is the condition rule, and anything else is a chain link
+        // ended by its required `;` — the same terminator a declaration takes,
+        // reported the same gap-anchored way.
+        if !self.peek_is_ctrl('{') {
+            if !self.peek_is_ctrl(';') {
+                self.report_css_failure(TERMINATOR_EXPECTED);
+                return None;
+            }
+            self.bump();
+            return Some(CssItem::Link(crate::node::CssLink {
+                name: (name, name_span),
+                arguments,
+                parenthesized,
+                span: self.span_from(start),
+            }));
+        }
         let body = self.parse_css_body()?;
-        Some(CssNested {
+        Some(CssItem::Nested(CssNested {
             name: (name, name_span),
             arguments,
             body,
             head,
             span: self.span_from(start),
-        })
+        }))
     }
 
     /// `property: value;` — one declaration. The `;` is REQUIRED, including

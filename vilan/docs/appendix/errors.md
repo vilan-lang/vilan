@@ -382,8 +382,13 @@ printed `1,2` for a `Point { x = 1, y = 2 }`. Render it first —
 `point.to_string()`, adding an `impl Point with Display` if the type has
 none. **An interpolated string is this same concatenation** (`i"a{x}b"`
 *is* `("" + "a" + x + "b")`), so a hole gets the identical error and the
-identical fix; the same goes for a `css` block value that mixes text
-with holes. A backed enum is included in the refusal on purpose: its
+identical fix. A `css` block's hole is the one that is NOT this
+concatenation any more (A34): a mixed value passes each hole through
+`std::style::piece`, so `border: 1px solid {Color::gray(500)};` keeps
+the value typed and puts its `:root` line on the sheet — which is why
+the message steers a style token into a block rather than into
+`.to_string()`, whose text would name a custom property nothing
+declares. A backed enum is included in the refusal on purpose: its
 backing is a lowering detail, not a rendering the program chose.
 A **generic parameter** gets the same error worded for its bounds — an
 unbounded one promises nothing, and one bounded to something other than
@@ -816,21 +821,6 @@ workspace is yours: a member package your project root's `packages`
 declares reports exactly like your entry's modules — the read anchors
 at itself, in the member's file.)
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
-
-**"element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` …"**
-`<tag />` is sugar for a `view("tag")` call, and something in this file
-declares its own `view`, which captured the callee — so every element in
-the file resolves to your function instead of the library's. Shadowing a
-name is allowed on purpose, and the desugar's callee is an ordinary name
-like any other; what this message exists for is that the capture is
-*invisible* in the element, which otherwise reports an argument count
-nobody wrote. Two ways out: rename your `view` (what a generator over an
-external name set should do — `lucide` ships an icon called `view`), or
-write the element as the call it lowers to, `ui::view(…)`, whose
-qualified path no local name can capture. If the message you got instead
-is `cannot find 'view' in this scope`, nothing is shadowing — you just
-need `import std::ui::{ view, View };`.
-→ [Building UI](../guide/ui.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**
 A function that reads an ambient context (like the current owner) can't

@@ -3132,6 +3132,61 @@ fn the_web_prelude_binds_signal_view_and_the_ambient_modules() {
     );
 }
 
+// --- B270: a desugar's std reference is scope-independent ------------------
+//
+// The `css` block's seed and element syntax's callee used to be BARE names
+// resolved at the site, and the web prelude is exactly where that broke: it
+// makes `style` an ambient MODULE, so every `css { … }` in an application
+// package reported "`style` is a module, not a value; qualify through it" —
+// the form was unusable in the packages it was designed for. The seed is a
+// `Node::StdItem`, resolved through `std`'s own namespace, and the loader
+// seeds `std::style` off the reference itself.
+
+#[test]
+fn b270_a_css_block_compiles_under_the_web_preludes_ambient_style_module() {
+    // The owner's repro (kolt channel.vl:71), reduced. `style::Length::rem` in
+    // the same file is the control: the ambient MODULE is untouched and still
+    // qualifies, which the interim workaround (a per-file
+    // `import std::style::{ Length, style };`) cost the file.
+    let entry = "let card = const css { display: flex; };\n\
+        fun main() {\n\
+        \tlet gap = style::Length::rem(1);\n\
+        \tprint(card.class_list());\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn b270_a_local_style_binding_does_not_capture_a_block_under_a_prelude() {
+    // Hygiene under the prelude too: a local binding wins for the NAME, and
+    // wins nothing at all for the desugar's seed.
+    let entry = "fun main() {\n\
+        \tlet style = 1;\n\
+        \tlet card = const css { display: flex; };\n\
+        \tprint(card.class_list());\n\
+        \tprint(i\"{style}\");\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
 #[test]
 fn an_ambient_module_is_beaten_by_an_explicit_member_import() {
     // §4.1/§13.11, and the reason the `style` module costs the estate nothing:

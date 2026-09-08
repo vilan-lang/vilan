@@ -5186,29 +5186,111 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
     assert!(css.contains(":root{--space-4:1rem}"), "{css}");
 }
 
+// --- A34: a typed style token MID-VALUE --------------------------------------
+//
+// A value that MIXES text and holes used to be built to the i-string's shape —
+// `("" + "calc(" + space(4) + " + 2px)")` — so it inherited the
+// concatenation's rules: a `Length` is a two-field struct, and B148 refused it
+// outright, which was the honest state because no correct spelling existed.
+// `.text` reaches the var reference and DROPS the `:root` line the one-hole
+// path carries, which is the exact hazard the block was built to close.
+//
+// Each hole of a mixed value now goes through `std::style::piece`, which
+// returns the text and puts the `:root` line on the sheet. This replaces
+// `a_mixed_css_value_refuses_a_struct_hole`, which pinned the gap.
+
 #[test]
-fn a_mixed_css_value_refuses_a_struct_hole() {
-    // B148's css end. A value that MIXES text and holes is built to the
-    // i-string's shape — `("" + "calc(" + space(4) + " + 2px)")`
-    // (`css::build_value`) — so it inherited the concatenation's hole: a
-    // `Length` is a two-field struct, and the host rendered the tuple straight
-    // into the declaration, sheet fragment and all
-    // (`calc(var(--space-4),:root{--space-4:1rem} + 2px)`). The concatenation
-    // rule refuses it here for the same reason it refuses `"x" + point`.
-    //
-    // A `str` or a number hole in a mixed value is unaffected — those render —
-    // so what this closes is the typed style values (`Length`, `Color`) used
-    // MID-value. There is no correct spelling for that today: `.text` reaches
-    // the var reference but drops the `:root` line the one-hole row above
-    // carries, which is the hazard S1 closed. Refusing is the honest state.
-    assert_fails_with(
+fn a_mid_value_token_carries_its_root_line() {
+    // The item's own exhibit: `border: 1px solid {Color::gray(500)}` emits the
+    // var reference AND the token that declares it.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Color };
+        let _s = const css { border: 1px solid {Color::gray(500)}; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{border:1px solid var(--gray-500)}"), "{css}");
+    assert!(css.contains(":root{--gray-500:"), "{css}");
+}
+
+#[test]
+fn a_mid_value_length_carries_its_root_line_too() {
+    // `space` is the token with a `:root` line to lose; `calc` is the value
+    // shape that forced the mixed path in the first place.
+    let css = style_css(
         r#"
         import std::style::{ style, space };
         let _s = const css { padding: calc({space(4)} + 2px); };
         fun main() {}
         main();
         "#,
-        "`+` on `str` concatenates, and `Length` has no string form",
+    );
+    assert!(
+        css.contains("{padding:calc(var(--space-4) + 2px)}"),
+        "{css}"
+    );
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+}
+
+#[test]
+fn the_single_hole_path_is_unchanged_by_the_mid_value_one() {
+    // The control. A value that is EXACTLY one hole still passes its
+    // expression through untouched — it keeps its TYPE and reaches
+    // `Style::raw`, which is what makes `gap: {space(4)};` a `Length` rather
+    // than a rendered string, and what the emitted-bytes gate compares.
+    let block = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const css { gap: {space(4)}; };
+        fun main() {}
+        main();
+        "#,
+    );
+    let chain = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const style().raw("gap", space(4));
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(block, chain);
+}
+
+#[test]
+fn a_mid_value_hole_of_a_type_with_no_piece_is_still_refused() {
+    // The refusal survives, one trait over: a value assembled from text and
+    // holes still cannot render an arbitrary struct, and now says which trait
+    // would let it.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        struct Point { x: i32, y: i32 }
+        let _s = const css { padding: calc({Point { x = 1, y = 2 }} + 2px); };
+        fun main() {}
+        main();
+        "#,
+        "CssPiece",
+    );
+}
+
+#[test]
+fn a_whole_value_still_demands_a_css_value_and_its_unit() {
+    // Why `CssPiece` is a SECOND trait rather than the same one: a whole value
+    // must carry its own unit, so a bare number is still refused there and the
+    // author is still steered to `space(4)` / `px(4)`. A piece sits inside
+    // text that supplies the unit, which is why a bare number is legal there.
+    assert_fails_with(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style { style().raw("padding", 4) }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+        "CssValue",
     );
 }
 
@@ -5501,35 +5583,347 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     );
 }
 
+// --- A69: a CHAIN LINK inside a block ----------------------------------------
+//
+// A dotted item ending in `;` is a verbatim `Style` method call at its written
+// position — the element syntax's own rule (dotted = chain link) read on the
+// style side, and the way an app's helpers and std's combinators reach the
+// block. The exhibit is kolt's own three (`flex_row`, `ghost`, `select_off`),
+// restated here at the same shape: `impl Style` methods over `raw` and
+// `within`, called from a block.
+
 #[test]
-fn a_block_without_style_in_scope_fails_at_the_css_keyword() {
-    // The one generated accessor S2 gave a REAL span, and this is what the
-    // span was kept for (§7.3): the block lowers to `style()`, so a missing
-    // `import std::style::style` fails on the generated accessor — and the
-    // squiggle lands on the word that asked for a `Style`, not on a
-    // zero-width anchor somewhere inside the block.
-    assert_fails_spanning(
+fn a_chain_link_calls_an_apps_own_style_helper() {
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Display, FlexDirection, UserSelect };
+        impl Style {
+            fun flex_row(self): Style {
+                self.display(Display::Flex).flex_direction(FlexDirection::Row)
+            }
+            fun select_off(self): Style {
+                self.within("data-user-select", "false", style().user_select(UserSelect::Off))
+            }
+            fun ghost(self): Style {
+                self.raw("pointer-events", "none").select_off()
+            }
+        }
+        let card = css {
+            .flex_row();
+            gap: 1rem;
+            .ghost();
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+    assert!(css.contains("{flex-direction:row}"), "{css}");
+    assert!(css.contains("{gap:1rem}"), "{css}");
+    assert!(css.contains("{pointer-events:none}"), "{css}");
+    assert!(css.contains("user-select"), "{css}");
+}
+
+#[test]
+fn a_chain_link_takes_arguments_and_a_block_still_equals_its_chain() {
+    // The headline claim, extended to the new item: block and chain emit the
+    // same sheet, link arguments included.
+    let block = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let a = css { color: red; .nudge(Length::px(4)); padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    let chain = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let a = const style().raw("color", "red").nudge(Length::px(4)).raw("padding", "1rem");
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(block, chain);
+}
+
+#[test]
+fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
+    // The `;` is required of a link exactly as it is of a declaration — the
+    // formatter may never invent a token.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let a = css { .ghost() };
+        fun main() {}
+        main();
+        "#,
+        "expected `;` to end this statement",
+    );
+}
+
+// --- A70: `std::style::prelude`, ambient inside a block ----------------------
+
+#[test]
+fn a_hole_reaches_the_style_prelude_with_no_import() {
+    // `{rem(4)}` and `{gray(500)}` are the hole spellings. Nothing is
+    // imported: the module is ambient inside a block, and the loader seeds it
+    // off the block itself.
+    let css = style_css(
+        r#"
+        let card = css {
+            gap: {space(4)};
+            padding: {rem(1)};
+            color: {gray(500)};
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{gap:var(--space-4)}"), "{css}");
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+    assert!(css.contains("{padding:1rem}"), "{css}");
+    assert!(css.contains("{color:var(--gray-500)}"), "{css}");
+    assert!(css.contains(":root{--gray-500:"), "{css}");
+}
+
+#[test]
+fn a_local_binding_beats_the_ambient_style_prelude() {
+    // The rule that makes the module safe to grow: the site's own scope is
+    // asked first, always, so no file can be broken by a name added to it.
+    let css = style_css(
+        r#"
+        import std::style::Length;
+        fun main() {}
+        fun rem(value: f64): Length { Length::px(value) }
+        let card = css { padding: {rem(4)}; };
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:4px}"), "{css}");
+}
+
+#[test]
+fn a_chain_links_arguments_see_the_prelude_too() {
+    // Every expression written inside a block is a block expression: a hole,
+    // a condition head's argument, and a link's argument alike.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let card = css { .nudge(rem(1)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{margin-top:1rem}"), "{css}");
+}
+
+#[test]
+fn the_style_prelude_is_importable_in_any_block() {
+    // Outside a `css` block it is an ordinary module: a brace list binds the
+    // members bare, and the module name qualifies them. Both spellings are
+    // block-scoped, so a `const { … }` can carry its own.
+    assert_compiles(
+        r#"
+        import std::style::Style;
+        fun palette(): Style {
+            const {
+                import std::style::prelude::{ rem, s };
+                s().raw("padding", rem(1))
+            }
+        }
+        fun main() { let _s = palette(); }
+        main();
+        "#,
+    );
+    assert_compiles(
+        r#"
+        import std::style::Style;
+        fun palette(): Style {
+            const {
+                import std::style::prelude;
+                prelude::s().raw("padding", prelude::rem(1))
+            }
+        }
+        fun main() { let _s = palette(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn the_style_prelude_is_not_ambient_outside_a_block() {
+    // The other half of "ambient inside a block": the names are not in scope
+    // anywhere else, so the module costs the bare namespace nothing.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let a = const style().raw("padding", rem(1));
+        fun main() {}
+        main();
+        "#,
+        "cannot find 'rem' in this scope",
+    );
+}
+
+// --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
+//
+// `Style::raw` calls `emit`, the compile-time channel, so a chain only means
+// anything inside a `const` — and every block had to be written
+// `const css { … }`, with `let b = css { padding: 1rem; };` refused as
+// "`raw` … is compile-time-only; evaluate this call inside a `const`
+// expression". A block IS a compile-time asset by definition, so the desugar
+// writes the word. A hole that reads a runtime binding still gets const-eval's
+// refusal, now at the hole rather than at a `const` nobody wrote.
+
+#[test]
+fn a_block_needs_no_const_written_in_front_of_it() {
+    let css = style_css(
+        r#"
+        let plain = css { padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:1rem}"), "{css}");
+}
+
+#[test]
+fn a_written_const_block_still_compiles_and_means_the_same() {
+    // Idempotence, which is what lets every block already written with `const`
+    // stay exactly as it is: the desugar's marker and the author's nest, and
+    // `const` forwards to its inner expression, so the two spellings are one
+    // tree and one rule on the sheet.
+    let written = style_css(
+        r#"
+        let a = const css { padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    let bare = style_css(
+        r#"
+        let a = css { padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(written, bare);
+}
+
+#[test]
+fn a_block_in_an_element_head_needs_no_const_either() {
+    // The other everyday position: `.styled(css { … })` on markup, where the
+    // written `const` reads worst of all.
+    assert!(
+        compile_browser(
+            r#"
+        import std::ui::mount_root;
+        fun main() {
+            mount_root("app", || <div .styled(css { display: flex; })>"hi"</div>);
+        }
+        main();
+        "#
+        )
+        .is_ok(),
+        "a bare block inside markup must compile"
+    );
+}
+
+#[test]
+fn a_runtime_hole_is_refused_at_the_hole() {
+    // The half A68 does NOT change: a block is compile-time, so a hole reading
+    // a runtime value cannot be evaluated — and const-eval says so at the hole,
+    // which is the expression that cannot be read.
+    // Occurrence 2 of `width` is the HOLE's read — occurrence 0 is the
+    // parameter and 1 is the CSS property name — so this pins the anchor as
+    // well as the message.
+    assert_fails_spanning_nth(
+        r#"
+        fun styled(width: str) {
+            let _s = css { width: {width}; };
+        }
+        fun main() { styled("10px"); }
+        main();
+        "#,
+        "width",
+        2,
+        "`width` is a runtime value; a `const` expression reads only compile-time-known bindings",
+    );
+}
+
+// --- B270: the seed is a scope-independent reference to std ------------------
+//
+// The block's seed used to be a bare `style` accessor resolved at the SITE,
+// which made the whole form unusable in the packages it was built for: under
+// `prelude = "std::web"` the ambient `style` is a MODULE, so every block failed
+// with "`style` is a module, not a value" (kolt channel.vl:71). It also let any
+// local `style` capture a call nobody had written. The seed is now
+// `std::style::style` whatever the site says, and the loader pulls `std::style`
+// in off the reference, so a block needs no import at all.
+//
+// This replaces `a_block_without_style_in_scope_fails_at_the_css_keyword`,
+// which pinned the behaviour B270 reverses. The note it also pinned
+// (`css_style_import_note`) survives for the one state that can still miss —
+// a std with no `style` item — and is unreachable from a well-formed std.
+
+#[test]
+fn a_block_needs_no_style_import_at_all() {
+    // The pin the old test inverts. No import, no prelude: the block still
+    // means std's `style()`, and the sheet still gets the declaration.
+    let css = style_css(
+        r#"
+        let _s = const css { display: flex; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+}
+
+#[test]
+fn a_local_style_binding_does_not_capture_the_blocks_seed() {
+    // Hygiene's whole point: a `let style = 1;` in scope is not what `css {}`
+    // reaches. Before B270 this reported "1 is not callable" against the `css`
+    // keyword.
+    let css = style_css(
         r#"
         fun main() {
+            let style = 1;
             let _s = const css { display: flex; };
+            let _n = style + 1;
         }
+        main();
         "#,
-        "css",
-        "cannot find 'style' in this scope",
     );
-    // S4's tailored note. The generic report is honest but disjointed — `css`
-    // underlined, `style` in the message, nothing drawing the line — so the
-    // note says which is which, on the element-syntax precedent.
-    assert_fails_noting(
+    assert!(css.contains("{display:flex}"), "{css}");
+}
+
+#[test]
+fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
+    // `import std::style::style as s;` binds `s` and nothing called `style`.
+    // The block is unaffected either way — the alias is for the CHAIN, and the
+    // two spellings sit side by side.
+    let css = style_css(
         r#"
-        fun main() {
-            let _s = const css { display: flex; };
-        }
+        import std::style::style as s;
+        let _a = const s().raw("color", "red");
+        let _b = const css { display: flex; };
+        fun main() {}
+        main();
         "#,
-        "cannot find 'style' in this scope",
-        "css",
-        "a `css { … }` block lowers to a std::style::style chain",
     );
+    assert!(css.contains("{display:flex}"), "{css}");
+    assert!(css.contains("{color:red}"), "{css}");
 }
 
 #[test]

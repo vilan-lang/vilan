@@ -102,13 +102,19 @@ fn build_chain<'src>(
         punctuation: _,
     } = body;
     let tag_text = &source[tag.into_range()];
-    // The generated `view` accessor spans `<tag` — an unresolved `view` (the
-    // import is missing) then underlines the element head itself, which is
-    // what the user wrote. The tailored import note rides S4 with the docs.
+    // The generated `view` reference spans `<tag`, so a diagnostic about the
+    // view underlines the element head itself, which is what the user wrote.
+    //
+    // It is a `StdItem` (B270), not a bare accessor: `<div />` means
+    // `std::ui::view` whatever `view` names at the site, so a local `view`
+    // binding — a `let`, a `fun`, an icon set's generated `view` (A35's find)
+    // — no longer captures the desugar's callee, and the loader seeds
+    // `std::ui` off the reference rather than off an import the author must
+    // remember.
     let head_span: Span = (span.start..tag.end).into();
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::Accessor("view"), head_span)),
+            Box::new((Node::StdItem("ui", "view"), head_span)),
             None,
             (vec![(Node::String(tag_text), tag)], tag),
         ),

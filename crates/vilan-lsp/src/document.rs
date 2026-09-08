@@ -1144,6 +1144,9 @@ struct CssSpans {
     scaffolding: Vec<Span>,
     properties: Vec<Span>,
     conditions: Vec<Span>,
+    /// A69: chain-link names — `Style` method references written inside a
+    /// block, which paint exactly as a condition head does.
+    methods: Vec<Span>,
 }
 
 /// The `css` keyword's own length. A `Node::Css` span starts exactly at the
@@ -1171,6 +1174,10 @@ fn collect_css_body_spans(body: &vilan_core::node::CssBody<'_>, out: &mut CssSpa
                 out.conditions.push(nested.name.1);
                 collect_css_body_spans(&nested.body, out);
             }
+            // A69: a chain link's name is a METHOD reference, not a condition
+            // axis — it paints as the method call it is, which is also the
+            // span the desugar gives its accessor.
+            CssItem::Link(link) => out.methods.push(link.name.1),
         }
     }
 }
@@ -3231,6 +3238,9 @@ impl Document {
             for span in css.conditions {
                 tokens.push((span, TokenKind::Method, 0));
             }
+            for span in css.methods {
+                tokens.push((span, TokenKind::Method, 0));
+            }
         }
 
         // Sort and drop overlaps: narrowest-first at each start, then keep
@@ -5257,6 +5267,16 @@ fn render_chain_link(item: &CssItem<'_>, source: &str) -> Option<String> {
             arguments.push(render_inline_chain(&nested.body, source)?);
             Some(format!(".{}({})", nested.name.0, arguments.join(", ")))
         }
+        // A69: a chain link IS the method call, so the conversion is the
+        // identity on it.
+        CssItem::Link(link) => {
+            let arguments: Vec<String> = link
+                .arguments
+                .iter()
+                .map(|argument| source[argument.1.into_range()].to_string())
+                .collect();
+            Some(format!(".{}({})", link.name.0, arguments.join(", ")))
+        }
     }
 }
 
@@ -6479,6 +6499,27 @@ pub(crate) mod tests {
             )),
             "{fixes:?}"
         );
+    }
+
+    // E153: `:hover { … }` is the single most likely thing for a CSS writer to
+    // type inside a block, and it reported the bare `found ':' expected a
+    // declaration …` — true, and no help at all, because nothing in it says
+    // the answer is a DOT. The steer names `.hover` and says why the dotted
+    // form is the only one: it is name-blind, so one rule covers pseudo-
+    // classes, breakpoints, `within` and `divide`.
+    #[test]
+    fn a_css_pseudo_class_selector_is_steered_to_the_dotted_rule() {
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\t:hover {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n";
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let published = document.published_diagnostics();
+        let messages = messages(&published);
+        assert!(
+            messages.iter().any(|message| message
+                .contains("writes a pseudo-class as a DOTTED rule")
+                && message.contains("`.hover { … }`")),
+            "{messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     // §7.2 fix 5, "the existing quickfix, unchanged" — asserted rather than
@@ -10713,6 +10754,44 @@ pub(crate) mod tests {
         assert_eq!(unique.len(), labels.len(), "{labels:?}");
         // Nothing merely in scope, and no construct snippets.
         for wrong in ["card", "str", "space", "fun", "for … in { }", "print"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` may not appear in a css body: {labels:?}"
+            );
+        }
+    }
+
+    // E153: the vocabulary is the CSS PROPERTY INDEX, not just std's slots.
+    // `raw` writes any property, so a block reaches all of CSS — and the
+    // fifty-odd names a `Style` method happens to have were silent about the
+    // properties a block exists for.
+    #[test]
+    fn css_property_position_offers_the_whole_css_index() {
+        let labels = css_block_completions("\tlet card = css {\n\t\tsc~\n\t};\n");
+        for property in [
+            "mask",
+            "contain",
+            "scroll-snap-type",
+            "text-wrap",
+            "clip-path",
+            "backdrop-filter",
+        ] {
+            assert!(
+                labels.contains(&property.to_string()),
+                "`{property}` is a CSS property and no `Style` method writes it: {labels:?}"
+            );
+        }
+        // std's own slots come FIRST, in canonical order: those are the
+        // properties this system has a typed method for, and the sequence
+        // `vilan fmt` would put them in.
+        let display = labels.iter().position(|label| label == "display");
+        let mask = labels.iter().position(|label| label == "mask");
+        assert!(
+            display < mask,
+            "a std slot must precede an index-only property: {display:?} / {mask:?}"
+        );
+        // Still no scope, and still no vendor prefixes.
+        for wrong in ["card", "space", "print", "-webkit-mask-composite"] {
             assert!(
                 !labels.contains(&wrong.to_string()),
                 "`{wrong}` may not appear in a css body: {labels:?}"

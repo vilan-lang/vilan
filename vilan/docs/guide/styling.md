@@ -61,7 +61,7 @@ beside the chain, it becomes the chain.
 import std::ui::{ view, View, mount_root };
 import std::style::{ style, space, Style, Color };
 
-let card = const css {
+let card = css {
 	display: flex;
 	gap: {space(2)};
 	padding: {space(4)};
@@ -96,7 +96,7 @@ ones added later, and nesting order is combinator order: media outside,
 then the relation, then the attribute, then the pseudo-class.
 
 ```vilan,fragment
-let panel = const css {
+let panel = css {
 	color: {Color::gray(900)};
 
 	.within("data-theme", "dark") {
@@ -114,7 +114,63 @@ through verbatim — `repeat(3, 1fr)`, `url("tile.png")`, `50%`, `1.5rem`
 — and `{expression}` drops a typed vilan value in. A value that is
 *exactly* one hole keeps its type, which is what carries a token's
 `:root` line onto the sheet, so write `gap: {space(4)};` rather than
-`gap: 1rem;` when you mean the scale.
+`gap: 1rem;` when you mean the scale. A hole **mid-value** carries its
+token too: `border: 1px solid {Color::gray(500)};` writes
+`1px solid var(--gray-500)` and puts the `:root` line that declares
+`--gray-500` on the sheet beside it.
+
+**Inside a block, the token vocabulary is ambient.** `rem`, `px`, `em`,
+`pct`, `vh`, `vw`, `auto` and `space`; `black`, `white`, `transparent`,
+`hex`, `gray`, `blue`, `red`, `green`, `rgba` and `oklch` — the
+`std::style::prelude` module, in scope inside a `css` block and nowhere
+else, so a hole reads as the CSS it stands for:
+
+```vilan,fragment
+let chip = css {
+	padding: {space(2)};
+	color: {gray(700)};
+	border: 1px solid {gray(300)};
+	border-radius: {rem(0.25)};
+};
+```
+
+Your own names always win: a `let rem = …` or an `import` in scope is
+what a hole means, and the module is only asked when nothing else
+answers. Outside a block these are ordinary imports —
+`import std::style::prelude::{ rem, gray };` binds them bare, and
+`import std::style::prelude;` qualifies through the name.
+
+**A dotted item ending in `;` is a chain link** — a `Style` method call,
+spliced exactly where you wrote it. That is how your own helpers reach a
+block:
+
+```vilan,fragment
+impl Style {
+	fun flex_row(self): Style {
+		self.display(Display::Flex).flex_direction(FlexDirection::Row)
+	}
+}
+
+let toolbar = css {
+	.flex_row();
+	gap: {space(2)};
+	padding: {space(1)};
+};
+```
+
+The dot is the whole rule, and what follows it decides: a `{ … }` body
+is a condition rule, a `;` is a link. `vilan fmt` treats a link as a
+**barrier** — an opaque method may write any property, so nothing sorts
+across it and its position is preserved.
+
+**A block is `const` on its own.** A style is a compile-time asset — the
+chain writes its rules into the stylesheet as it is built — so the chain
+spelling needs `const` in front of it, and the block does not: it writes
+the word for you. `let card = css { … };` is the whole declaration. What
+that does *not* buy you is reading a runtime value: a hole that reads a
+function parameter or a signal is refused at the hole, because there is
+nothing compile-time to put on the sheet. Writing `const css { … }`
+yourself still compiles and means exactly the same thing.
 
 Four things the block does not do, each on purpose:
 
@@ -148,7 +204,7 @@ explaining the wrong declaration.
 
 ```vilan,fragment
 // formats as: display, padding, then `.md` before `.hover`
-let button = const css {
+let button = css {
 	.hover { background-color: {Color::gray(200)}; }
 	padding: {space(2)};
 	.md { padding: {space(4)}; }

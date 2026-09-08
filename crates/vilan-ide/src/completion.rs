@@ -620,10 +620,19 @@ fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
 fn css_block_completions(position: CssPosition) -> Vec<Completion> {
     match position {
         CssPosition::Property => {
+            // E153: std's slots FIRST, in canonical order — those are the
+            // properties this system has a typed method for, and the sequence
+            // `vilan fmt` would put them in — then the rest of the CSS
+            // property index (`css_properties::CSS_PROPERTIES`), which is what
+            // the block exists to reach: `raw` writes ANY property, and the
+            // fifty-odd std slots were silent about `mask`, `contain` and
+            // `scroll-snap-type`. Ordering is the whole difference between the
+            // two halves; both are offered as fields.
             let mut seen: HashSet<&str> = HashSet::new();
             STYLE_PROPERTY_METHODS
                 .iter()
-                .flat_map(|method| method.properties.iter())
+                .flat_map(|method| method.properties.iter().copied())
+                .chain(vilan_core::css_properties::CSS_PROPERTIES.iter().copied())
                 .filter(|property| seen.insert(property))
                 .map(|property| Completion::bare(property.to_string(), CompletionKind::Field))
                 .collect()

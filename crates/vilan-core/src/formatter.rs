@@ -1226,6 +1226,18 @@ fn css_body_items(tokens: &[Token<'_>], open: usize) -> Option<(Vec<CssTokenItem
                 if matches!(tokens.get(scan), Some(Token::Ctrl('('))) {
                     scan = balanced_end(tokens, scan)? + 1;
                 }
+                // A69: a `;` here is a CHAIN LINK, which ranks as a barrier —
+                // an opaque method may write any property, so nothing sorts
+                // across it, exactly as for an unknown declaration.
+                if matches!(tokens.get(scan), Some(Token::Ctrl(';'))) {
+                    items.push(CssTokenItem {
+                        rank: None,
+                        range: cursor..scan + 1,
+                        body_open: None,
+                    });
+                    cursor = scan + 1;
+                    continue;
+                }
                 if !matches!(tokens.get(scan), Some(Token::Ctrl('{'))) {
                     return None;
                 }
@@ -3827,6 +3839,12 @@ impl<'src> Printer<'src> {
                     css_item_rank(false, &self.source[declaration.property.into_range()])
                 }
                 crate::node::CssItem::Nested(nested) => css_item_rank(true, nested.name.0),
+                // A69: a chain link is an opaque method — it may write any
+                // property at all (kolt's `.ghost()` writes `pointer-events`
+                // and a `within` rule in one call) — so it is a BARRIER, the
+                // same verdict an unknown property gets, and nothing sorts
+                // across it. Its position is what it means.
+                crate::node::CssItem::Link(_) => None,
             })
             .collect();
         match canonical_permutation(&ranks) {
@@ -3913,7 +3931,24 @@ impl<'src> Printer<'src> {
                 self.print_css_declaration(declaration)
             }
             crate::node::CssItem::Nested(nested) => self.print_css_nested(nested),
+            crate::node::CssItem::Link(link) => self.print_css_link(link),
         }
+    }
+
+    /// `.name(a, b);` — a chain link (A69). The arguments are ordinary vilan
+    /// expressions and print as any call's do. The PARENS are reproduced as
+    /// written, not normalized: `.ghost;` and `.ghost();` are the same call
+    /// and the formatter may never invent or delete a token, so each reprints
+    /// as itself.
+    fn print_css_link(&mut self, link: &crate::node::CssLink<'src>) {
+        self.out.push('.');
+        self.out.push_str(link.name.0);
+        if link.parenthesized {
+            self.out.push('(');
+            self.print_expression_list(&link.arguments);
+            self.out.push(')');
+        }
+        self.out.push(';');
     }
 
     /// `property: value;`. The property is a source slice (it spans several
@@ -6152,6 +6187,42 @@ mod bailing_constructs {
         assert_construct(
             "fun f() {\n\tcss { .within(\"data-theme\",\"dark\") { color: red; } }\n}\n",
             "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_chain_link_prints_as_a_call_and_holds_its_place() {
+        // A69. A link is an opaque method — it may write any property at all —
+        // so it is a BARRIER: nothing sorts across it, exactly as for an
+        // unknown declaration. `display` stays after `.ghost();` here, though
+        // the canonical order would put it first.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t.ghost();\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t.ghost();\n\t\tdisplay: flex;\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_bare_link_member_keeps_its_spelling() {
+        // A bare member and an empty argument list are the same call on a
+        // `Style` and lower alike, but the formatter reproduces what was
+        // written: normalizing either way would invent or delete a token,
+        // which is the one thing it may never do.
+        assert_construct(
+            "fun f(){css{.ghost;}}\n",
+            "fun f() {\n\tcss { .ghost; }\n}\n",
+        );
+        assert_construct(
+            "fun f(){css{.ghost();}}\n",
+            "fun f() {\n\tcss { .ghost(); }\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_link_with_arguments_prints_them_as_a_call_does() {
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\t.inset( 1,2 );\n\t}\n}\n",
+            "fun f() {\n\tcss { .inset(1, 2); }\n}\n",
         );
     }
 

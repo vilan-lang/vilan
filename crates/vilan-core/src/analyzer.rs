@@ -3385,6 +3385,17 @@ pub struct Analyzer<'src> {
     // legal exactly in these (a block-scoped `import` is not exportable, H2).
     module_scope_ids: HashSet<Id>,
     prepped_locals: Vec<(Id, &'src str)>,
+    // B270: a desugar's scope-independent std references — `(id, module, item)`
+    // for each `Node::StdItem`. They resolve through `std`'s own namespace, not
+    // through the use site's scope, so the `css` block's `style()` seed and
+    // element syntax's `view(…)` callee mean std's function whatever the site
+    // binds those names to.
+    prepped_std_items: Vec<(Id, &'src str, &'src str)>,
+    // A70: how deep the walk is inside a `css` block's desugared body, and the
+    // bare names minted while it was — the ones `std::style::prelude` answers
+    // when the site's own scope does not.
+    css_scope_depth: usize,
+    css_scope_locals: HashSet<Id>,
     // Comprehension binders whose element type isn't set yet — a method call on
     // one defers (like an unknown closure parameter) rather than erroring.
     untyped_comprehension_binders: HashSet<Id>,
@@ -4630,6 +4641,9 @@ impl<'src> Analyzer<'src> {
             macro_failed_sites: HashSet::default(),
             module_scope_ids: HashSet::default(),
             prepped_locals: Vec::new(),
+            prepped_std_items: Vec::new(),
+            css_scope_depth: 0,
+            css_scope_locals: HashSet::default(),
             untyped_comprehension_binders: HashSet::default(),
             prepped_for_each: Vec::new(),
             for_each_next: HashMap::default(),
@@ -21910,43 +21924,6 @@ impl<'src> Analyzer<'src> {
         })
     }
 
-    /// A35, the SHADOWED twin of [`Analyzer::element_view_import_note`]: the
-    /// element desugar's callee is a bare `view`, so a user item of that name
-    /// captures it, and every `<tag />` in the file then reports
-    /// `` `view` expects 0 arguments, but got 1 instead `` against the element —
-    /// a message about an arity nobody wrote, with the shadowing item shown only
-    /// as "declared here". Any generator over an external name set walks into
-    /// this (lucide ships an icon called `view`); RULED 2026-09-01 to be named
-    /// in the diagnostic rather than fixed by making the desugar hygienic —
-    /// shadowing a name is a ruled feature, and this is a curated message for
-    /// the one name where the shadow is invisible in the source.
-    ///
-    /// Same detection as the absent case: the SUBJECT's span is markup — it
-    /// starts with `<`, a span only the element desugar gives an accessor — so
-    /// a hand-written `view(..)` call, whose subject span is the ident, keeps
-    /// the ordinary arity message. `None` for everything else, including a
-    /// `view` that resolved to std's own (which takes its argument and never
-    /// reaches an arity failure).
-    fn element_view_shadow_message(&self, subject_id: Id, callee_id: Id) -> Option<String> {
-        if self.functions.get(&callee_id)?.name != "view" {
-            return None;
-        }
-        let span = **self.span_map.get(&subject_id)?;
-        let source = self.source_of_id(subject_id).unwrap_or(SourceId(0));
-        if !self
-            .source_text(source)?
-            .get(span.into_range())?
-            .starts_with('<')
-        {
-            return None;
-        }
-        Some(
-            "element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` \
-             — rename it, or write this element as its lowered call, `ui::view(…)`"
-                .to_string(),
-        )
-    }
-
     /// A `css { … }` block lowers to `std::style::style` (css-block.md §5.1,
     /// S4): an unresolved `style` whose span is the `css` KEYWORD — the one
     /// span the block's desugar gives a generated accessor on purpose, so the
@@ -24768,6 +24745,19 @@ impl<'src> Analyzer<'src> {
             self.const_exprs.push(inner_id);
             return inner_id;
         }
+        // A70: a `css` block's desugared body forwards like `const` does, and
+        // marks its subtree while it walks — every bare name minted under it
+        // is a name WRITTEN INSIDE A BLOCK, which is where the style prelude
+        // is ambient. The depth is a counter because a block can hold a block
+        // (a hole may open one), and the mark is per ENTITY rather than per
+        // scope: scopes are shared with the surrounding code, and the site's
+        // own bindings must keep winning.
+        if let Node::CssScope(inner) = &node.0 {
+            self.css_scope_depth += 1;
+            let inner_id = self.walk_expr_node(inner, scope_id);
+            self.css_scope_depth -= 1;
+            return inner_id;
+        }
         // A recorded lift-region paren group forwards like `const` does: the
         // region rewrite normally dissolves it, so one reaching the walk sits
         // in a position the rewrite does not descend into — its inner marks
@@ -24793,6 +24783,10 @@ impl<'src> Analyzer<'src> {
             // Handled by the forwarding arm above; a `Const` node never
             // reaches the entity match.
             Node::Const(..) => unreachable!("`const` forwards to its inner expression"),
+            // Likewise A70's block mark, which forwards the same way.
+            Node::CssScope(..) => {
+                unreachable!("a css block's scope mark forwards to its inner expression")
+            }
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
             Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
@@ -24836,11 +24830,22 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Number(whole, *fraction, *suffix))
             }
             Node::Accessor(name) => {
+                if self.css_scope_depth > 0 {
+                    self.css_scope_locals.insert(id);
+                }
                 self.prepped_locals.push((id, name));
                 None
             }
             Node::AccessorWithGenerics(name, _generic_arguments) => {
+                if self.css_scope_depth > 0 {
+                    self.css_scope_locals.insert(id);
+                }
                 self.prepped_locals.push((id, name));
+                None
+            }
+            // B270: a desugar's std reference never consults `scope_id`.
+            Node::StdItem(module, item) => {
+                self.prepped_std_items.push((id, module, item));
                 None
             }
             // `type X` binders only appear in type position (impl subjects).
@@ -34152,18 +34157,17 @@ impl<'src> Analyzer<'src> {
                         None => argument_ids,
                     };
                     if argument_ids.len() != parameters.len() {
-                        // A35: the one arity failure whose count is nobody's
-                        // mistake — the element desugar's `view` captured by a
-                        // user item — gets a message about the capture instead.
-                        let msg = self
-                            .element_view_shadow_message(subject_id, function_id)
-                            .unwrap_or_else(|| {
-                                self.argument_count_message(
-                                    self.callable_name(function_id),
-                                    &parameters,
-                                    argument_ids.len(),
-                                )
-                            });
+                        // A35's curated message used to sit here, for the one
+                        // arity failure whose count was nobody's mistake — the
+                        // element desugar's `view` captured by a user item.
+                        // B270 made that callee hygienic, so there is no
+                        // capture left to report and every arity failure here
+                        // is once again an arity the author wrote.
+                        let msg = self.argument_count_message(
+                            self.callable_name(function_id),
+                            &parameters,
+                            argument_ids.len(),
+                        );
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: self.declared_here_note(function_id),
@@ -38674,6 +38678,47 @@ impl<'src> Analyzer<'src> {
     /// clause might publish cannot resolve until the pass that publishes it has
     /// run, and every other name — the call subjects the divergence leaves are
     /// read from among them — must resolve before it.
+    /// B270: resolve one desugar-minted std reference through `std`'s OWN
+    /// namespace, exactly as `resolve_import` walks `import std::style::style`
+    /// — the root module, then the submodule, then the item — and never
+    /// through the entity's scope.
+    ///
+    /// The walk is the import machinery's because the answer must be the
+    /// import's answer: whatever `import std::ui::view` would have bound is
+    /// what `<div />` means, layer overlays and all.
+    ///
+    /// A miss DEGRADES to the site's scope (`resolve_prepped_local`) instead of
+    /// inventing a message. The only ways to miss are a std that has no such
+    /// module or item at all — a hand-pointed `--std`, a half-written layer —
+    /// and in that state the site's scope is the only information there is, so
+    /// the pre-B270 diagnostics ("cannot find 'view'", A35's shadow steer) are
+    /// exactly the right ones to fall back on.
+    fn resolve_prepped_std_item(&mut self, id: Id, module: &'src str, item: &'src str) {
+        let Some(subject_id) = self.std_item_id(&[module], item) else {
+            self.resolve_prepped_local(id, item);
+            return;
+        };
+        let rc = self.reference_count.entry(subject_id).or_insert(0);
+        *rc += 1;
+        self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
+    }
+
+    /// `std::<module…>::<item>`'s entity, or `None` when std does not have it.
+    /// The modules are walked in order, so `["style", "prelude"]` descends
+    /// `std::style` and then its `style/prelude.vl` child — the same walk
+    /// `resolve_import` makes for the import that spells it.
+    fn std_item_id(&self, modules: &[&str], item: &str) -> Option<Id> {
+        let std_module_id = *self.module_id_by_name.get("std")?;
+        let mut scope_id = self.modules.get(&std_module_id)?.body.1;
+        let mut module_id = None;
+        for module in modules {
+            let found = self.member_or_submodule(module, scope_id, module_id)?;
+            scope_id = self.modules.get(&found)?.body.1;
+            module_id = Some(found);
+        }
+        self.member_or_submodule(item, scope_id, module_id)
+    }
+
     fn resolve_prepped_local(&mut self, id: Id, name: &'src str) {
         let scope_id = self.get_scope_id_for_entity(id);
         // A use resolves at its own byte offset (positional visibility,
@@ -38683,7 +38728,20 @@ impl<'src> Analyzer<'src> {
             Some(span) if span.end > span.start => span.start,
             _ => usize::MAX,
         };
-        match self.resolve_value_name_at(name, scope_id, use_offset) {
+        // A70: inside a `css` block the style prelude is AMBIENT — but only
+        // after the site's own scope has been asked and answered nothing, so
+        // an explicit local binding, import or declaration always wins and no
+        // file can be broken by a name added to that module. Resolved here,
+        // at the one seam where "the scope has nothing" is already known.
+        let resolved = self
+            .resolve_value_name_at(name, scope_id, use_offset)
+            .or_else(|| {
+                self.css_scope_locals
+                    .contains(&id)
+                    .then(|| self.std_item_id(&["style", "prelude"], name))
+                    .flatten()
+            });
+        match resolved {
             Some(subject_id) => {
                 if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                     let diagnostics_before = self.diagnostics.len();
@@ -39020,6 +39078,12 @@ impl<'src> Analyzer<'src> {
         // a guard in an ENCLOSING scope publishes, nothing wider: a file with
         // no guard clause defers nothing, and an unrelated local that happens
         // to share a capture's name is not a use the pass can change.
+        // B270's drain runs FIRST: a std reference has no scope to wait for, and
+        // resolving it before the locals means an `Expr::Local` is already in
+        // place when the ordinary pass walks the same chain.
+        for (id, module, item) in std::mem::take(&mut self.prepped_std_items) {
+            self.resolve_prepped_std_item(id, module, item);
+        }
         let mut guarded_locals = Vec::new();
         for (id, name) in std::mem::take(&mut self.prepped_locals) {
             if self.guard_may_publish(id, name) {
@@ -41851,13 +41915,26 @@ impl<'src> Analyzer<'src> {
                             // this very concatenation and is refused here too,
                             // so steering to one would steer into the same
                             // garbage. `.to_string()` is the whole fix.
+                            //
+                            // A34 edits the tail (ledger row 355 keeps its id).
+                            // A `css` block's hole is the ONE hole that is not
+                            // this concatenation any more: it goes through
+                            // `std::style::piece`, which carries the value's
+                            // `:root` line onto the sheet — so a reader who
+                            // met this message while assembling a CSS value by
+                            // hand needs to know that the block has a spelling
+                            // and that `.to_string()` would be the wrong one
+                            // there (it drops the token's declaration).
                             format!(
                                 "`+` on `str` concatenates, and `{rhs_label}` has no string form: \
                                  concatenating it renders the value's runtime shape — a struct is \
                                  a tuple, an enum a tagged array — not the value. Call \
                                  `.to_string()` on it, implementing `Display` for its type if it \
                                  has none; an i-string hole is this same concatenation, so it \
-                                 needs the same call"
+                                 needs the same call — but a `css` block's hole is not, and a \
+                                 typed style value belongs in one: \
+                                 `border: 1px solid {{Color::gray(500)}};` keeps the value typed \
+                                 and carries its `:root` line onto the sheet"
                             )
                         } else if self.is_str_type(&rhs_type) {
                             // The mirror shape, where the numeric steer ("suffix
@@ -47176,6 +47253,43 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
 /// std module's own siblings, `std` when scanning the entry program for the std
 /// submodules it addresses by path (e.g. `import std::option::Option`), or a
 /// dependency's import name.
+/// The std modules a DESUGAR reached for (B270): the distinct `Node::StdItem`
+/// module names at any depth, interned so no entry-text slice reaches the
+/// world's maps (M21/S3c — the same rule the entry's own std refs follow).
+///
+/// A hygienic reference is not an import, so nothing else would tell the loader
+/// that a file holding one `css { … }` block needs `std::style`, or that one
+/// `<div />` needs `std::ui`. This is that seed, and it is what lets the block
+/// and the element compile with no import written at all. The set is small and
+/// closed — two names today — and empty for the overwhelming majority of files,
+/// which pay one `for_each_child` walk that stops at the first miss.
+fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
+    fn walk(node: &Spanned<Node>, found: &mut Vec<String>) {
+        match &node.0 {
+            Node::StdItem(module, _) => {
+                if !found.iter().any(|seen| seen == module) {
+                    found.push((*module).to_string());
+                }
+            }
+            // A70: a `css` block makes `std::style::prelude` ambient inside
+            // itself, so the module has to be loaded for a hole to be able to
+            // reach it — the same seed, for the same reason.
+            Node::CssScope(_) => {
+                if !found.iter().any(|seen| seen == "style::prelude") {
+                    found.push("style::prelude".to_string());
+                }
+            }
+            _ => {}
+        }
+        node.0.for_each_child(&mut |child| walk(child, found));
+    }
+    let mut found = Vec::new();
+    for node in nodes {
+        walk(node, &mut found);
+    }
+    found.into_iter().map(interned_display_name).collect()
+}
+
 /// Whether an AST carries a `[service(..)]` item at any depth — the trigger
 /// for loading the std `service` macro's host module into the prelude.
 fn contains_service(nodes: &NodeList) -> bool {
@@ -50289,6 +50403,13 @@ fn analyze_inner<'src>(
     if contains_service(&nodes.0) {
         to_load.push((Origin::Std, "rpc"));
     }
+    // B270: a `css` block or an element in the entry needs its desugar's std
+    // module whether or not the author imported anything.
+    to_load.extend(
+        collect_std_item_modules(&nodes.0)
+            .into_iter()
+            .map(|module| (Origin::Std, module)),
+    );
     let entry_std_refs = collect_module_paths(&nodes.0, "std");
 
     to_load.extend(
@@ -51076,6 +51197,13 @@ fn analyze_inner<'src>(
             if contains_service(&ast.0) {
                 to_load.push((Origin::Std, "rpc"));
             }
+            // B270, the entry's twin: a loaded module's own `css` blocks and
+            // elements seed their std modules, whatever package it belongs to.
+            to_load.extend(
+                collect_std_item_modules(&ast.0)
+                    .into_iter()
+                    .map(|module| (Origin::Std, module)),
+            );
             // Seed the module's `std::` and `<dep>::` references. Only the *building*
             // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
             // (`Dep`) are its internals, loaded for typing without a gate (the
