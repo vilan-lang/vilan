@@ -5586,6 +5586,113 @@ fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
     );
 }
 
+// --- A70: `std::style::prelude`, ambient inside a block ----------------------
+
+#[test]
+fn a_hole_reaches_the_style_prelude_with_no_import() {
+    // `{rem(4)}` and `{gray(500)}` are the hole spellings. Nothing is
+    // imported: the module is ambient inside a block, and the loader seeds it
+    // off the block itself.
+    let css = style_css(
+        r#"
+        let card = css {
+            gap: {space(4)};
+            padding: {rem(1)};
+            color: {gray(500)};
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{gap:var(--space-4)}"), "{css}");
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+    assert!(css.contains("{padding:1rem}"), "{css}");
+    assert!(css.contains("{color:var(--gray-500)}"), "{css}");
+    assert!(css.contains(":root{--gray-500:"), "{css}");
+}
+
+#[test]
+fn a_local_binding_beats_the_ambient_style_prelude() {
+    // The rule that makes the module safe to grow: the site's own scope is
+    // asked first, always, so no file can be broken by a name added to it.
+    let css = style_css(
+        r#"
+        import std::style::Length;
+        fun main() {}
+        fun rem(value: f64): Length { Length::px(value) }
+        let card = css { padding: {rem(4)}; };
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:4px}"), "{css}");
+}
+
+#[test]
+fn a_chain_links_arguments_see_the_prelude_too() {
+    // Every expression written inside a block is a block expression: a hole,
+    // a condition head's argument, and a link's argument alike.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let card = css { .nudge(rem(1)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{margin-top:1rem}"), "{css}");
+}
+
+#[test]
+fn the_style_prelude_is_importable_in_any_block() {
+    // Outside a `css` block it is an ordinary module: a brace list binds the
+    // members bare, and the module name qualifies them. Both spellings are
+    // block-scoped, so a `const { … }` can carry its own.
+    assert_compiles(
+        r#"
+        import std::style::Style;
+        fun palette(): Style {
+            const {
+                import std::style::prelude::{ rem, s };
+                s().raw("padding", rem(1))
+            }
+        }
+        fun main() { let _s = palette(); }
+        main();
+        "#,
+    );
+    assert_compiles(
+        r#"
+        import std::style::Style;
+        fun palette(): Style {
+            const {
+                import std::style::prelude;
+                prelude::s().raw("padding", prelude::rem(1))
+            }
+        }
+        fun main() { let _s = palette(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn the_style_prelude_is_not_ambient_outside_a_block() {
+    // The other half of "ambient inside a block": the names are not in scope
+    // anywhere else, so the module costs the bare namespace nothing.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let a = const style().raw("padding", rem(1));
+        fun main() {}
+        main();
+        "#,
+        "cannot find 'rem' in this scope",
+    );
+}
+
 // --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
 //
 // `Style::raw` calls `emit`, the compile-time channel, so a chain only means

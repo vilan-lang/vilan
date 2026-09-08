@@ -3390,6 +3390,11 @@ pub struct Analyzer<'src> {
     // element syntax's `view(…)` callee mean std's function whatever the site
     // binds those names to.
     prepped_std_items: Vec<(Id, &'src str, &'src str)>,
+    // A70: how deep the walk is inside a `css` block's desugared body, and the
+    // bare names minted while it was — the ones `std::style::prelude` answers
+    // when the site's own scope does not.
+    css_scope_depth: usize,
+    css_scope_locals: HashSet<Id>,
     // Comprehension binders whose element type isn't set yet — a method call on
     // one defers (like an unknown closure parameter) rather than erroring.
     untyped_comprehension_binders: HashSet<Id>,
@@ -4621,6 +4626,8 @@ impl<'src> Analyzer<'src> {
             module_scope_ids: HashSet::default(),
             prepped_locals: Vec::new(),
             prepped_std_items: Vec::new(),
+            css_scope_depth: 0,
+            css_scope_locals: HashSet::default(),
             untyped_comprehension_binders: HashSet::default(),
             prepped_for_each: Vec::new(),
             for_each_next: HashMap::default(),
@@ -23818,6 +23825,19 @@ impl<'src> Analyzer<'src> {
             self.const_exprs.push(inner_id);
             return inner_id;
         }
+        // A70: a `css` block's desugared body forwards like `const` does, and
+        // marks its subtree while it walks — every bare name minted under it
+        // is a name WRITTEN INSIDE A BLOCK, which is where the style prelude
+        // is ambient. The depth is a counter because a block can hold a block
+        // (a hole may open one), and the mark is per ENTITY rather than per
+        // scope: scopes are shared with the surrounding code, and the site's
+        // own bindings must keep winning.
+        if let Node::CssScope(inner) = &node.0 {
+            self.css_scope_depth += 1;
+            let inner_id = self.walk_expr_node(inner, scope_id);
+            self.css_scope_depth -= 1;
+            return inner_id;
+        }
         // A recorded lift-region paren group forwards like `const` does: the
         // region rewrite normally dissolves it, so one reaching the walk sits
         // in a position the rewrite does not descend into — its inner marks
@@ -23843,6 +23863,10 @@ impl<'src> Analyzer<'src> {
             // Handled by the forwarding arm above; a `Const` node never
             // reaches the entity match.
             Node::Const(..) => unreachable!("`const` forwards to its inner expression"),
+            // Likewise A70's block mark, which forwards the same way.
+            Node::CssScope(..) => {
+                unreachable!("a css block's scope mark forwards to its inner expression")
+            }
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
             Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
@@ -23886,10 +23910,16 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Number(whole, *fraction, *suffix))
             }
             Node::Accessor(name) => {
+                if self.css_scope_depth > 0 {
+                    self.css_scope_locals.insert(id);
+                }
                 self.prepped_locals.push((id, name));
                 None
             }
             Node::AccessorWithGenerics(name, _generic_arguments) => {
+                if self.css_scope_depth > 0 {
+                    self.css_scope_locals.insert(id);
+                }
                 self.prepped_locals.push((id, name));
                 None
             }
@@ -37660,7 +37690,7 @@ impl<'src> Analyzer<'src> {
     /// the pre-B270 diagnostics ("cannot find 'view'", A35's shadow steer) are
     /// exactly the right ones to fall back on.
     fn resolve_prepped_std_item(&mut self, id: Id, module: &'src str, item: &'src str) {
-        let Some(subject_id) = self.std_item_id(module, item) else {
+        let Some(subject_id) = self.std_item_id(&[module], item) else {
             self.resolve_prepped_local(id, item);
             return;
         };
@@ -37669,13 +37699,20 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
     }
 
-    /// `std::<module>::<item>`'s entity, or `None` when std does not have it.
-    fn std_item_id(&self, module: &str, item: &str) -> Option<Id> {
+    /// `std::<module…>::<item>`'s entity, or `None` when std does not have it.
+    /// The modules are walked in order, so `["style", "prelude"]` descends
+    /// `std::style` and then its `style/prelude.vl` child — the same walk
+    /// `resolve_import` makes for the import that spells it.
+    fn std_item_id(&self, modules: &[&str], item: &str) -> Option<Id> {
         let std_module_id = *self.module_id_by_name.get("std")?;
-        let std_scope_id = self.modules.get(&std_module_id)?.body.1;
-        let module_id = self.member_or_submodule(module, std_scope_id, None)?;
-        let module_scope_id = self.modules.get(&module_id)?.body.1;
-        self.member_or_submodule(item, module_scope_id, Some(module_id))
+        let mut scope_id = self.modules.get(&std_module_id)?.body.1;
+        let mut module_id = None;
+        for module in modules {
+            let found = self.member_or_submodule(module, scope_id, module_id)?;
+            scope_id = self.modules.get(&found)?.body.1;
+            module_id = Some(found);
+        }
+        self.member_or_submodule(item, scope_id, module_id)
     }
 
     fn resolve_prepped_local(&mut self, id: Id, name: &'src str) {
@@ -37687,7 +37724,20 @@ impl<'src> Analyzer<'src> {
             Some(span) if span.end > span.start => span.start,
             _ => usize::MAX,
         };
-        match self.resolve_value_name_at(name, scope_id, use_offset) {
+        // A70: inside a `css` block the style prelude is AMBIENT — but only
+        // after the site's own scope has been asked and answered nothing, so
+        // an explicit local binding, import or declaration always wins and no
+        // file can be broken by a name added to that module. Resolved here,
+        // at the one seam where "the scope has nothing" is already known.
+        let resolved = self
+            .resolve_value_name_at(name, scope_id, use_offset)
+            .or_else(|| {
+                self.css_scope_locals
+                    .contains(&id)
+                    .then(|| self.std_item_id(&["style", "prelude"], name))
+                    .flatten()
+            });
+        match resolved {
             Some(subject_id) => {
                 if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                     let diagnostics_before = self.diagnostics.len();
@@ -45954,10 +46004,21 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
 /// which pay one `for_each_child` walk that stops at the first miss.
 fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
     fn walk(node: &Spanned<Node>, found: &mut Vec<String>) {
-        if let Node::StdItem(module, _) = &node.0
-            && !found.iter().any(|seen| seen == module)
-        {
-            found.push((*module).to_string());
+        match &node.0 {
+            Node::StdItem(module, _) => {
+                if !found.iter().any(|seen| seen == module) {
+                    found.push((*module).to_string());
+                }
+            }
+            // A70: a `css` block makes `std::style::prelude` ambient inside
+            // itself, so the module has to be loaded for a hole to be able to
+            // reach it — the same seed, for the same reason.
+            Node::CssScope(_) => {
+                if !found.iter().any(|seen| seen == "style::prelude") {
+                    found.push("style::prelude".to_string());
+                }
+            }
+            _ => {}
         }
         node.0.for_each_child(&mut |child| walk(child, found));
     }

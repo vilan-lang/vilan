@@ -122,7 +122,13 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             // with `const` is untouched down to the emitted byte. A hole that
             // reads a runtime binding is refused by const-eval AT THE HOLE,
             // which is the diagnostic that was always wanted here.
-            (Node::Const(Box::new((chain.0, span))), span)
+            // A70: the chain is wrapped in a `CssScope` too, INSIDE the
+            // `const` — the mark that says "these expressions were written
+            // inside a block", which is where `std::style::prelude` is
+            // ambient. Both wrappers forward to their inner expression, so the
+            // tree the analyzer types is still the chain.
+            let scoped = (Node::CssScope(Box::new((chain.0, span))), span);
+            (Node::Const(Box::new(scoped)), span)
         }
         other => descend((other, span), source),
     }
@@ -549,11 +555,13 @@ mod tests {
     /// where the emitted-bytes gate in `inference::styling` is the same claim at
     /// the other end of the pipeline.
     ///
-    /// One node is peeled from the block's side before the comparison, and it
-    /// is a MARK on the chain rather than part of it: A68's `const` — a block
-    /// is a compile-time asset, and the desugar writes the word. It forwards
-    /// to its inner expression in the analyzer and has its own pins; what is
-    /// compared here is what it wraps.
+    /// Two nodes are peeled from the block's side before the comparison, both
+    /// of them MARKS on the chain rather than parts of it: A68's `const`
+    /// (a block is a compile-time asset, and the desugar writes the word) and
+    /// A70's `CssScope` (which expressions were written inside a block, so the
+    /// style prelude can be ambient in them). Both forward to their inner
+    /// expression in the analyzer, and each has its own pin below; what is
+    /// compared here is what they wrap.
     ///
     /// The SEED is normalized for the same reason: B270 made it hygienic, so
     /// the block's is `std::style::style` where a hand-written chain's is
@@ -578,7 +586,7 @@ mod tests {
             panic!("expected a `let` with a value");
         };
         let mut node: &Spanned<Node<'static>> = value;
-        while let Node::Const(inner) = &node.0 {
+        while let Node::Const(inner) | Node::CssScope(inner) = &node.0 {
             node = inner;
         }
         format!("{node:?}")

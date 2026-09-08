@@ -672,6 +672,18 @@ pub enum Node<'src> {
     // design — names.md §4.7) and why the loader seeds the module it names
     // (`collect_std_item_modules`) rather than waiting for an import.
     StdItem(&'src str, &'src str),
+    // A70: the desugared body of a `css { … }` block, wrapping the whole chain
+    // it lowered to. It FORWARDS like `const` does — the inner expression is
+    // the entity, no wrapper — and exists only to tell the analyzer which
+    // expressions were written INSIDE a block, because `std::style::prelude`
+    // is ambient exactly there: a bare name in a hole, a condition head's
+    // argument or a chain link's argument resolves against the site's scope
+    // first and against that module only if nothing in scope answers.
+    //
+    // A whole-subtree mark rather than a per-hole one, because every
+    // expression a block can hold sits under this node and the generated
+    // scaffolding around them binds no names of its own.
+    CssScope(Box<Spanned<Self>>),
     String(&'src str),
     // A triple-quoted string's raw inner text; trimmed to its content by
     // `util::trim_multiline_string` (validated in the analyzer, trimmed in the
@@ -887,6 +899,7 @@ impl<'src> Node<'src> {
             | Node::Lifted(inner)
             | Node::LiftGroup(inner)
             | Node::Spread(inner)
+            | Node::CssScope(inner)
             | Node::Unary(_, inner) => visit(inner),
             Node::StaticAccessor(subject, _, generic_arguments) => {
                 visit(subject);

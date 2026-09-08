@@ -1,0 +1,107 @@
+// The css block's hole vocabulary (tracker A70): free-function aliases of the
+// typed style tokens, so a hole reads as the CSS it stands for.
+//
+// A block's holes are where the type system lives (css-block.md §10), and the
+// price of that was `{Length::rem(4.0)}` and `{Color::gray(500)}` inside a
+// value that is otherwise plain CSS: the qualifying segment is noise at every
+// hole, and under the web prelude — where `style` is an ambient MODULE — it is
+// `{style::Length::rem(4.0)}`. These are the same values under the names CSS
+// itself uses, and nothing else: every function here is one line, and the
+// `Length`/`Color` constructors stay exactly where they are.
+//
+// The module is AMBIENT INSIDE A CSS HOLE (names.md §4.7's ambient-module
+// rule, applied to one syntactic position): the lowering resolves a hole's
+// bare names against the site's scope FIRST and against this module only if
+// nothing there answers, so an explicit local binding always wins and no file
+// can be broken by a name added here. Outside a block it is an ordinary
+// module — `import std::style::prelude::{ rem, gray };` binds what it names.
+//
+// `s()` is `style()` under the one-letter name a chain written inside a
+// `const { … }` wants; the builder itself is untouched.
+
+import pkg::style::{ Color, Length, Style, space as scale_step, style as open_style };
+
+// --- lengths ------------------------------------------------------------------
+
+fun rem(value: f64): Length {
+	Length::rem(value)
+}
+
+fun px(value: f64): Length {
+	Length::px(value)
+}
+
+fun em(value: f64): Length {
+	Length::em(value)
+}
+
+fun pct(value: f64): Length {
+	Length::pct(value)
+}
+
+fun vh(value: f64): Length {
+	Length::vh(value)
+}
+
+fun vw(value: f64): Length {
+	Length::vw(value)
+}
+
+fun auto(): Length {
+	Length::auto()
+}
+
+/// The spacing scale, by step — `{space(4)}` is the token, not a copied
+/// `1rem`, and it carries its own `:root` line onto the sheet.
+fun space(step: i32): Length {
+	scale_step(step)
+}
+
+// --- colors -------------------------------------------------------------------
+
+fun black(): Color {
+	Color::black()
+}
+
+fun white(): Color {
+	Color::white()
+}
+
+fun transparent(): Color {
+	Color::transparent()
+}
+
+fun hex(value: str): Color {
+	Color::hex(value)
+}
+
+fun gray(step: i32): Color {
+	Color::gray(step)
+}
+
+fun blue(step: i32): Color {
+	Color::blue(step)
+}
+
+fun red(step: i32): Color {
+	Color::red(step)
+}
+
+fun green(step: i32): Color {
+	Color::green(step)
+}
+
+fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color {
+	Color::rgba(red, green, blue, alpha)
+}
+
+fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
+	Color::oklch(lightness, chroma, hue)
+}
+
+// --- the builder --------------------------------------------------------------
+
+/// `style()` under the name a chain written inline wants.
+fun s(): Style {
+	open_style()
+}
