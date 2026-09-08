@@ -629,6 +629,18 @@ pub enum Node<'src> {
         &'src str,
         Option<GenericArguments<'src>>,
     ),
+    // A DESUGAR's scope-independent reference to a std item (B270): the module
+    // under `std` and the item's name. `css { … }` seeds its chain with
+    // `StdItem("style", "style")` and element syntax calls
+    // `StdItem("ui", "view")`, so both mean std's function whatever the site's
+    // scope binds those names to — a `let style = 1;`, an ambient `style`
+    // MODULE from `std::web`, an `import … as s`, or nothing at all.
+    //
+    // No source spells this: it exists only in a desugared tree, which is why
+    // it is not a path (`std::style::style` written inline is refused by
+    // design — names.md §4.7) and why the loader seeds the module it names
+    // (`collect_std_item_modules`) rather than waiting for an import.
+    StdItem(&'src str, &'src str),
     String(&'src str),
     // A triple-quoted string's raw inner text; trimmed to its content by
     // `util::trim_multiline_string` (validated in the analyzer, trimmed in the
@@ -797,6 +809,7 @@ impl<'src> Node<'src> {
         match self {
             // Leaves.
             Node::Accessor(_)
+            | Node::StdItem(..)
             | Node::Bool(_)
             | Node::Error
             | Node::Import(_)

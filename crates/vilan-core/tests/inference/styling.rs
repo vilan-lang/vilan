@@ -5501,35 +5501,69 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     );
 }
 
+// --- B270: the seed is a scope-independent reference to std ------------------
+//
+// The block's seed used to be a bare `style` accessor resolved at the SITE,
+// which made the whole form unusable in the packages it was built for: under
+// `prelude = "std::web"` the ambient `style` is a MODULE, so every block failed
+// with "`style` is a module, not a value" (kolt channel.vl:71). It also let any
+// local `style` capture a call nobody had written. The seed is now
+// `std::style::style` whatever the site says, and the loader pulls `std::style`
+// in off the reference, so a block needs no import at all.
+//
+// This replaces `a_block_without_style_in_scope_fails_at_the_css_keyword`,
+// which pinned the behaviour B270 reverses. The note it also pinned
+// (`css_style_import_note`) survives for the one state that can still miss —
+// a std with no `style` item — and is unreachable from a well-formed std.
+
 #[test]
-fn a_block_without_style_in_scope_fails_at_the_css_keyword() {
-    // The one generated accessor S2 gave a REAL span, and this is what the
-    // span was kept for (§7.3): the block lowers to `style()`, so a missing
-    // `import std::style::style` fails on the generated accessor — and the
-    // squiggle lands on the word that asked for a `Style`, not on a
-    // zero-width anchor somewhere inside the block.
-    assert_fails_spanning(
+fn a_block_needs_no_style_import_at_all() {
+    // The pin the old test inverts. No import, no prelude: the block still
+    // means std's `style()`, and the sheet still gets the declaration.
+    let css = style_css(
+        r#"
+        let _s = const css { display: flex; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+}
+
+#[test]
+fn a_local_style_binding_does_not_capture_the_blocks_seed() {
+    // Hygiene's whole point: a `let style = 1;` in scope is not what `css {}`
+    // reaches. Before B270 this reported "1 is not callable" against the `css`
+    // keyword.
+    let css = style_css(
         r#"
         fun main() {
+            let style = 1;
             let _s = const css { display: flex; };
+            let _n = style + 1;
         }
+        main();
         "#,
-        "css",
-        "cannot find 'style' in this scope",
     );
-    // S4's tailored note. The generic report is honest but disjointed — `css`
-    // underlined, `style` in the message, nothing drawing the line — so the
-    // note says which is which, on the element-syntax precedent.
-    assert_fails_noting(
+    assert!(css.contains("{display:flex}"), "{css}");
+}
+
+#[test]
+fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
+    // `import std::style::style as s;` binds `s` and nothing called `style`.
+    // The block is unaffected either way — the alias is for the CHAIN, and the
+    // two spellings sit side by side.
+    let css = style_css(
         r#"
-        fun main() {
-            let _s = const css { display: flex; };
-        }
+        import std::style::style as s;
+        let _a = const s().raw("color", "red");
+        let _b = const css { display: flex; };
+        fun main() {}
+        main();
         "#,
-        "cannot find 'style' in this scope",
-        "css",
-        "a `css { … }` block lowers to a std::style::style chain",
     );
+    assert!(css.contains("{display:flex}"), "{css}");
+    assert!(css.contains("{color:red}"), "{css}");
 }
 
 #[test]

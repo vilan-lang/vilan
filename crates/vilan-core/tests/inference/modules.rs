@@ -2117,72 +2117,72 @@ fn hyphenated_attribute_names_parse_and_emit_verbatim() {
 }
 
 #[test]
-fn an_element_without_view_in_scope_fails_at_the_element_head() {
-    // No auto-import: the desugared `view` accessor spans `<tag`, so the
-    // unresolved-name diagnostic underlines the element head the user wrote —
-    // and carries the import steer as a note (element-syntax S4).
-    assert_fails_spanning(
+fn an_element_needs_no_view_import_at_all() {
+    // B270, replacing `an_element_without_view_in_scope_fails_at_the_element_
+    // head`, which pinned the behaviour this reverses. The desugar's callee is
+    // a scope-independent reference to `std::ui::view` and the loader seeds
+    // `std::ui` off that reference, so an element compiles with nothing
+    // imported — the import steer survives only for a std that cannot supply
+    // `view` at all.
+    assert_compiles(
         r#"
         fun main() {
             let _x = <div/>;
         }
         "#,
-        "<div",
-        "cannot find 'view' in this scope",
-    );
-    assert_fails_noting(
-        r#"
-        fun main() {
-            let _x = <div/>;
-        }
-        "#,
-        "cannot find 'view' in this scope",
-        "<div",
-        "element syntax lowers to std::ui::view",
     );
 }
 
-// --- A35: the element desugar's `view`, SHADOWED --------------------------
+// --- A35, SUPERSEDED by B270: the element desugar's `view` is HYGIENIC -----
 //
-// The desugar's callee is a bare `view`, so a user item of that name captures
-// it. lucide ships an icon called `view`, its generated `fun view(): View`
+// The desugar's callee was a bare `view`, so a user item of that name captured
+// it: lucide ships an icon called `view`, its generated `fun view(): View`
 // silently took over, and every `<tag />` in the file reported
 // `` `view` expects 0 arguments, but got 1 instead `` against the ELEMENT — an
-// arity nobody wrote, with the shadowing item shown only as "declared here".
-// RULED 2026-09-01: name it in the diagnostic. The desugar stays capturable
-// (shadowing a name is a ruled feature; `an_explicit_import_shadows_a_prelude_
-// name_silently` is the neighbouring pin), so this is a message, not hygiene.
+// arity nobody wrote. A35 RULED that to a curated message (2026-09-01), on the
+// ground that shadowing a name is a ruled feature.
+//
+// B270 (the owner's find, 2026-09-07) overturns the ground: the `css` block's
+// twin seed made the whole form UNUSABLE under `prelude = "std::web"`, where
+// the ambient `style` is a module, and no message can rescue a form that
+// cannot be written. Both desugars now name their std item directly, so
+// neither is capturable and A35's message has nothing left to report — it is
+// deleted here with its ledger row (360) and its errors-appendix entry.
+// Shadowing is untouched as a language feature: what changed is that a
+// GENERATED callee nobody wrote is no longer a name the site can bind.
 
 #[test]
-fn a35_a_shadowed_element_view_names_the_shadow_instead_of_an_arity() {
-    assert_fails_spanning(
+fn b270_a_shadowing_view_does_not_capture_the_element_desugar() {
+    // A35's own repro, inverted. `view` is the file's own function AND the
+    // element head's callee is std's — both live in one file.
+    assert_compiles(
         r#"
         fun view(): i32 { 1 }
         fun main() {
+            let _n = view();
             let _x = <div/>;
         }
         "#,
-        "div",
-        "element syntax lowers to `std::ui::view`, and `view` here is your own `fun view`",
+    );
+    // And the local form, which is the one a `let` in a function body makes:
+    // a non-callable binding, which used to report "1 is not callable" at the
+    // element head.
+    assert_compiles(
+        r#"
+        fun main() {
+            let view = 1;
+            let _x = <div/>;
+            let _n = view + 1;
+        }
+        "#,
     );
 }
 
 #[test]
-fn a35_the_shadowed_steer_names_both_ways_out() {
-    // Renaming, or writing the element as the call it lowers to. Neither is
-    // guessable from `` `view` expects 0 arguments ``, which is why the
-    // curated message exists at all.
-    assert_fails_with(
-        r#"
-        fun view(): i32 { 1 }
-        fun main() {
-            let _x = <div/>;
-        }
-        "#,
-        "rename it, or write this element as its lowered call, `ui::view(…)`",
-    );
-    // Both ways out, compiled (audit run 7's steer sweep, ledger row 360).
-    // The lowered call, which needs the module rather than the bare name:
+fn b270_the_lowered_call_still_needs_its_module() {
+    // The control: hygiene is for the DESUGAR's callee, not for hand-written
+    // code. `ui::view("div")` typed out still resolves through the import the
+    // author wrote, and a bare `view()` still means the file's own.
     assert_compiles(
         r#"
         import std::ui;
@@ -2191,38 +2191,6 @@ fn a35_the_shadowed_steer_names_both_ways_out() {
             let _x = ui::view("div");
         }
         "#,
-    );
-    // And the rename. What the element lowers to has to still be REACHABLE
-    // after the shadow is gone — ambient from the web prelude in the projects
-    // that meet this message, and named explicitly here, since the harness
-    // compiles against the base one.
-    assert_compiles(
-        r#"
-        import std::ui::view;
-        fun render(): i32 { 1 }
-        fun main() {
-            let _x = <div/>;
-        }
-        "#,
-    );
-}
-
-#[test]
-fn a35_the_shadowed_message_still_points_at_the_declaration() {
-    // The C3 note is what makes "your own `fun view`" actionable: it is the
-    // site. It was already there; the primary is what changed.
-    assert_fails_noting(
-        r#"
-        fun view(): i32 { 1 }
-        fun main() {
-            let _x = <div/>;
-        }
-        "#,
-        "element syntax lowers to `std::ui::view`",
-        // The first `view` in the source is the declaration's own name span,
-        // which is where the C3 note lands.
-        "view",
-        "`view` is declared here",
     );
 }
 
@@ -2253,19 +2221,17 @@ fn a35_a_hand_written_view_call_keeps_the_ordinary_arity_message() {
 }
 
 #[test]
-fn a35_the_absent_case_still_gets_the_import_steer() {
-    // The two arms are twins and must not collapse into one: with no `view` in
-    // scope at all there is nothing to name as a shadow, and the answer is the
-    // import.
-    assert_fails_noting(
+fn b270_an_explicit_view_import_is_still_redundant_rather_than_wrong() {
+    // The other control: files that already import `view` — every file written
+    // before B270 — keep compiling, and the import keeps meaning what it said.
+    assert_compiles(
         r#"
+        import std::ui::view;
         fun main() {
             let _x = <div/>;
+            let _y = view("span");
         }
         "#,
-        "cannot find 'view' in this scope",
-        "<div",
-        "element syntax lowers to std::ui::view; add",
     );
 }
 

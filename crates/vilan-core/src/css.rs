@@ -32,9 +32,20 @@
 //! nondeterministically — repair work in S5 for a decision made in S2. So every
 //! generated SCAFFOLDING accessor here takes a ZERO-WIDTH anchor: `.raw` and
 //! each condition combinator's method reference, and the `style()` that seeds a
-//! nested rule's inner chain. The one accessor with a real span is the outer
-//! `style()`, which takes the `css` keyword's own span — an unresolved `style`
-//! (the import is missing) then underlines the word that asked for one.
+//! nested rule's inner chain. The one seed with a real span is the outer
+//! `style()`, which takes the `css` keyword's own span — a diagnostic about
+//! the block's own value then underlines the word that asked for one.
+//!
+//! **The seed is HYGIENIC** (B270): it is a `Node::StdItem("style", "style")`,
+//! a scope-independent reference to `std::style::style`, not a bare `style`
+//! accessor resolved at the site. A bare accessor made the whole form unusable
+//! under `prelude = "std::web"`, where `style` is the ambient MODULE — every
+//! block in an application package failed with "`style` is a module, not a
+//! value" — and it let any local `style` capture a desugar nobody had written.
+//! A block means std's `style()` under the web prelude, under a local
+//! `let style = 1;`, under `import std::style::style as s;`, and with no
+//! prelude at all; the loader seeds `std::style` off the reference itself, so
+//! the form needs no import to work.
 //!
 //! Property names and value text are stored as SPANS by the parser (a
 //! hyphenated or custom property spans tokens carrying no joined text) and
@@ -104,7 +115,7 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
 fn build_chain<'src>(body: CssBody<'src>, head: Span, source: &'src str) -> Spanned<Node<'src>> {
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::Accessor("style"), head)),
+            Box::new((Node::StdItem("style", "style"), head)),
             None,
             (Vec::new(), head),
         ),
@@ -486,8 +497,26 @@ mod tests {
     /// arc's headline claim (§5.1) — and this is the claim at tree granularity,
     /// where the emitted-bytes gate in `inference::styling` is the same claim at
     /// the other end of the pipeline.
+    ///
+    /// One node differs on purpose and is normalized here: B270 made the SEED
+    /// hygienic, so the block's is a `StdItem("style", "style")` where the
+    /// hand-written chain's is whatever `style` means at the site. The claim is
+    /// therefore "the chain, seeded by std's own `style`" — the seed has its own
+    /// pins below, and the normalization is a no-op on the chain side, which can
+    /// never contain a `StdItem`.
     fn shapes_match(block: &str, chain: &str) -> (String, String) {
-        (strip_spans(&lowered(block)), strip_spans(&lowered(chain)))
+        (
+            normalize_seed(&strip_spans(&lowered(block))),
+            normalize_seed(&strip_spans(&lowered(chain))),
+        )
+    }
+
+    /// The hygienic seed read as the accessor it means (B270), so the shape
+    /// comparison above is about the CHAIN and not about the seed.
+    fn normalize_seed(debug: &str) -> String {
+        debug
+            .replace("StdItem(\"style\", \"style\")", "Accessor(\"style\")")
+            .replace("StdItem(\"ui\", \"view\")", "Accessor(\"view\")")
     }
 
     /// A `Debug` tree with every span (`Span` renders as `start..end`) replaced
@@ -603,11 +632,41 @@ mod tests {
 
     #[test]
     fn the_outer_style_accessor_spans_the_css_keyword() {
-        // The one generated accessor with a real span: an unresolved `style`
-        // (the import is missing) underlines the word that asked for one.
-        // `let probe = ` is 12 bytes, so the keyword is 12..15.
+        // The one generated seed with a real span, so a diagnostic about the
+        // block's value underlines the word that asked for one. `let probe = `
+        // is 12 bytes, so the keyword is 12..15.
         let tree = lowered("css { display: flex; }");
-        assert!(tree.contains("(Accessor(\"style\"), 12..15)"), "{tree}");
+        assert!(
+            tree.contains("(StdItem(\"style\", \"style\"), 12..15)"),
+            "{tree}"
+        );
+    }
+
+    // --- The hygienic seed (B270) ---------------------------------------------
+
+    #[test]
+    fn the_seed_is_a_scope_independent_std_reference() {
+        // Not `Accessor("style")`: the block means `std::style::style`, and no
+        // binding at the site — a local `let style`, `std::web`'s ambient
+        // `style` MODULE — can be what it reaches. The resolution half is
+        // pinned in `inference::styling` and `module_resolution`; this is the
+        // TREE half, which is where the bare accessor used to be.
+        let tree = lowered("css { display: flex; }");
+        assert!(tree.contains("StdItem(\"style\", \"style\")"), "{tree}");
+        assert!(!tree.contains("Accessor(\"style\")"), "{tree}");
+    }
+
+    #[test]
+    fn a_nested_rules_seed_is_the_same_std_reference() {
+        // Every seed is hygienic, not just the outer one: a condition rule's
+        // inner chain is a `style()` too, and a site binding must not capture it
+        // there either.
+        let tree = lowered("css { .hover { color: red; } }");
+        assert_eq!(
+            tree.matches("StdItem(\"style\", \"style\")").count(),
+            2,
+            "{tree}"
+        );
     }
 
     #[test]
@@ -633,7 +692,10 @@ mod tests {
         // combinator head — a generated accessor sharing the head would paint
         // `.hover` as a method reference.
         let tree = lowered("css { .hover { color: red; } }");
-        assert!(tree.contains("(Accessor(\"style\"), 25..25)"), "{tree}");
+        assert!(
+            tree.contains("(StdItem(\"style\", \"style\"), 25..25)"),
+            "{tree}"
+        );
     }
 
     #[test]
