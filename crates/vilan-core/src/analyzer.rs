@@ -27691,6 +27691,16 @@ impl<'src> Analyzer<'src> {
             || self.primitive_struct_ids.get("Context") == Some(&id)
     }
 
+    /// B263: whether a call's `List`-shaped return already has its element
+    /// determined — by a binder of the declaration the CALL sits in.
+    fn return_element_is_a_caller_binder(&self, return_type: &Type, call_id: Id) -> bool {
+        matches!(return_type, Type::Struct(id, arguments)
+            if self.is_slot_container(*id)
+                && arguments.len() == 1
+                && matches!(arguments[0].get_type(self), Type::Generic(constraint_id)
+                    if self.generic_is_enclosing_binder(constraint_id, call_id)))
+    }
+
     /// If `type_` is a `List` whose element is an unbound generic (i.e. the
     /// result of `List::new()`), replaces the element with a fresh inference
     /// slot stable for this call id, so the element can be unified from later
@@ -29116,7 +29126,11 @@ impl<'src> Analyzer<'src> {
                                 }
                             }
                         }
-                        let return_type = self.freshen_list_element_slots(return_type, id);
+                        let return_type =
+                            match self.return_element_is_a_caller_binder(&return_type, id) {
+                                true => return_type,
+                                false => self.freshen_list_element_slots(return_type, id),
+                            };
                         // Specialize a `Self` return, STRUCTURALLY. A trait
                         // member's `self` parameter is typed as the declaring
                         // trait's abstract self type (`Type::Trait(trait, [])`),

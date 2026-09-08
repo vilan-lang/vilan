@@ -8248,3 +8248,157 @@ fn b262_an_unbounded_enum_parameters_written_argument_is_still_free() {
         "#,
     );
 }
+
+// --- B263: a determined `List` element, erased on the way out of a call ------
+//
+// `impl Held<type T> { fun first(self): T { self.list.get()[0] } }` over
+// `struct Held<T> { list: Signal<List<T>> }` reported "cannot index this List:
+// its element type is never determined". The bound-driven recovery is not what
+// was missing: `self.list.get()` really does resolve through the bound to
+// `List<T>`, with `T` the enclosing binder. `freshen_list_element_slots` then
+// REPLACED that element with a fresh inference slot.
+//
+// That helper exists for `List::new()`, whose element is a genuine hole to fill
+// from later `push` calls, and its test was "the element is an unbound generic"
+// — true of `List::new()`'s own parameter and equally true of a caller's rigid
+// `T`, which is not a hole at all but the answer. So the one shape that had
+// already been solved was the one it discarded.
+//
+// The guard is B219's family predicate, `generic_is_enclosing_binder`: an
+// element that is a binder of the declaration the CALL sits in is determined,
+// and the call's return keeps it. Only the DECLARED-function return path is
+// guarded; `List::new()` is `external fun new(): List<T>` and reaches the other
+// one, where the element is the callee's own parameter and freshening is right.
+//
+// Not an impl-body rule, though that is where it was found: the same free
+// function `fun first<T, S: Signal<List<T>>>(s: S): T { s.get()[0] }` failed
+// identically, and is pinned below.
+
+#[test]
+fn b263_an_impl_body_reads_the_element_through_a_bounded_siblings_bound() {
+    // The filed exhibit, run. `T` is reachable only through the hidden
+    // parameter's bound (B184's sugar spells `list: Signal<List<T>>`), and the
+    // body indexes what `get()` returns.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T> { list: Signal<List<T>> }
+        impl Held<type T> {
+            fun first(self): T { self.list.get()[0] }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([1, 2, 3]) };
+            print(h.first());
+        }
+        main();
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b263_the_written_sibling_parameter_form_reads_it_too() {
+    // The same shape with the parameter written out rather than hidden — the
+    // two spell one struct (B251's pair), so both had the defect and both are
+    // pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T, S: Signal<List<T>>> { list: S }
+        impl Held<type T, type S: Signal<List<T>>> {
+            fun first(self): T { self.list.get()[0] }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([4, 5]) };
+            print(h.first());
+        }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b263_a_free_function_over_the_same_bound_is_the_same_defect() {
+    // Where the diagnosis parts from the filing: this is not an impl-body rule.
+    // A free function whose parameter carries the same bound indexed the same
+    // `List<unknown>`, and it is the same erasure — there is no impl, no field
+    // and no sibling parameter in it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        fun first<T, S: Signal<List<T>>>(s: S): T { s.get()[0] }
+        fun main() { print(first(SignalCell::new([6, 7]))); }
+        main();
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn b263_a_methods_own_generic_still_binds_from_its_argument() {
+    // The generic-method control: a method declaring its OWN parameter beside
+    // the impl's binder still infers that parameter from the call, and the
+    // impl's binder still reaches the element.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T> { list: Signal<List<T>> }
+        impl Held<type T> {
+            fun first(self): T { self.list.get()[0] }
+            fun tagged<U>(self, tag: U): U { tag }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([8, 9]) };
+            print(h.first());
+            print(h.tagged("x"));
+        }
+        main();
+        "#,
+        "8\nx\n",
+    );
+}
+
+#[test]
+fn b263_the_literal_form_is_unchanged() {
+    // B251's half, re-asked: the recovery AT THE LITERAL still grounds `T` and
+    // still reports it, so the guard has not moved the answer this family
+    // already had.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_HIDDEN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32, SignalCell<List<i32>>> instead.",
+    );
+}
+
+#[test]
+fn b263_an_open_list_element_is_still_filled_from_later_pushes() {
+    // The counterweight, and the reason the guard is not simply "never
+    // freshen": `List::new()`'s element IS a hole, and a later `push` is what
+    // fills it. Inside a generic declaration too, where the guard's predicate
+    // has an enclosing binder to find.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun collect<T>(a: T, b: T): List<T> {
+            mut out = List::new();
+            out.push(a);
+            out.push(b);
+            out
+        }
+        fun main() { print(collect(1, 2).len()); }
+        main();
+        "#,
+        "2\n",
+    );
+}
