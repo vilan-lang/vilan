@@ -54,12 +54,31 @@ signal.
 ## Text children and mixed content
 
 `child` takes more than a `View`. Anything that can fill a child
-position works — the value's type decides what lands in the DOM:
+position works — the value's type decides what lands in the DOM. Three
+static arms, and a reactive twin for each:
 
-- a `View` appends as an element;
-- a `str` appends as a **text node**;
-- a `SignalCell<str>` appends as a text node kept in sync;
-- a `List<View>` appends every view, in order.
+- a `View` appends as an element; a `Source<View>` appends the view it
+  holds and **replaces** it whenever the source changes;
+- a `str` appends as a **text node**; a `Source<str>` appends a text
+  node kept in sync;
+- a `List<View>` appends every view, in order; a `Source<List<View>>`
+  appends the run and replaces the whole run on every change.
+
+That pairing is the whole contract: whatever may be a child statically
+may be a child reactively, and `{expr}` in element syntax means the same
+thing either way. The reactive arms register one subscription with the
+nearest boundary, so a `{signal}` child inside a `bind_each` row stops
+replacing anything when the row is disposed — but the views themselves
+arrive already built, so each one's own bindings belong to the scope
+that *constructed* it. Reach for `.swap(source, |value| …)` when every
+subtree must be built and disposed per value; reach for a `Source<View>`
+child when the views are values the app already holds. (A replacement is
+appended, like `when`'s and `swap`'s, so put a reactive element child
+last or wrap it in an element of its own.)
+
+A `Source<List<View>>` is not a reconciler: it replaces the run rather
+than moving surviving rows. `bind_each` is the keyed form, and it is
+what a list of *data* wants.
 
 Text nodes make mixed content direct: prose around an inline element is
 a run of siblings, not a pile of wrapper spans.
@@ -85,9 +104,10 @@ re-sets whenever it changes — `attr("href", signal)` and
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
 
-`attr` and `child` dispatch through traits rather than a bound, so their
-reactive arms are `SignalCell<str>` specifically — a custom `Source` goes
-through the named binding (`bind_attr`, `bind_text`) for now.
+`attr` and `child` dispatch through traits rather than a bound, and
+their reactive arms are blanket impls over `Source`, so a derived
+signal, a `RemoteSource` or a mirror of your own fills either position
+exactly as a cell does.
 
 ## Element syntax
 

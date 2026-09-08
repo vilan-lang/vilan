@@ -193,12 +193,17 @@ impl View {
 		self
 	}
 
-	/// Append content — structure only, no ownership bookkeeping. Anything
-	/// `Slot` fills a child position (proposal/element-syntax.md §5): a `View`
-	/// appends as an element, a `str` as a text node, a `SignalCell<str>` as a
-	/// text node kept in sync, a `List<View>` appends each. Text and element
-	/// children interleave as real siblings — mixed content without wrapper
-	/// spans.
+	/// Append content. Anything `Slot` fills a child position
+	/// (proposal/element-syntax.md §5), which is the whole CHILD CONTRACT
+	/// (B268): a `View` appends as an element, a `str` as a text node, a
+	/// `List<View>` appends each, and a `Source` of any of those three keeps
+	/// the position in sync — text re-set in place, an element or a run
+	/// replaced. Text and element children interleave as real siblings — mixed
+	/// content without wrapper spans.
+	///
+	/// Structure only for the static arms; the reactive ones register their one
+	/// subscription with the nearest enclosing boundary, exactly as every
+	/// `bind_*` does.
 	fun child<C: Slot>(self, content: C): View {
 		content.place(self);
 		self
@@ -822,12 +827,17 @@ fun clear_chunk_error() {
 /// static-vs-tracked distinction, and ordinary trait dispatch decides what
 /// lands in the DOM.
 ///
-/// The tracked arm is `SignalCell<str>` and not `Source<str>` — DEFERRED, not an
-/// oversight (A33). `bind_text` and friends widened to a `Source` BOUND, which
-/// is an ordinary generic parameter; the trait arms here would have to widen to
-/// a BLANKET impl (`impl S: Source<str> with Slot`), and that machinery is
-/// B158's. When it lands, this impl and `AttrValue`'s twin below collapse into
-/// one blanket arm each and the element syntax follows for free.
+/// THE CHILD CONTRACT (B268), six arms in three pairs — a `str`, a `View`, a
+/// `List<View>`, and a `Source` of each. The static arm places once; the
+/// reactive arm places and REPLACES, owning its own re-render under the nearest
+/// boundary. That pairing is the whole rule: whatever may be a child statically
+/// may be a child reactively, and `{expr}` in element syntax means the same
+/// thing either way.
+///
+/// The trait keeps the name `Slot` rather than becoming a `Child`: it already
+/// IS this contract — the arms grew, the trait did not change — `Child` is
+/// taken on the process twin (the `enum Child` `render` walks), and every doc
+/// page and generic helper in the estate spells the bound `Slot` today.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 trait Slot {
 	fun place(self, parent: View);
@@ -865,12 +875,79 @@ impl type S: Source<str> with Slot {
 	}
 }
 
-/// Several child elements, in order.
+/// Several child elements, in order — a STATIC run, placed once. This is the
+/// arm a fragment literal would walk through (A46): its type is `List<View>`,
+/// and a list already fills a child position.
 impl List<View> with Slot {
 	fun place(self, parent: View) {
 		for item in self {
 			parent.element.append(item.element);
 		}
+	}
+}
+
+/// A reactive ELEMENT child — the view the source holds, replaced whenever it
+/// changes. `swap`'s shape without `swap`'s render closure: the source's value
+/// IS the new subtree, so there is nothing to build, only the previous element
+/// to remove and the new one to append.
+///
+/// This is what `{signal}` means when the signal carries a `View`. It used to
+/// mean the text arm below — a `Signal<View>` reached the `Source<str>` blanket
+/// because a bound's ARGUMENTS were dropped when an impl was matched to a
+/// receiver — and the DOM took the view's runtime shape, `[object Object]`
+/// (B268; kolt views.vl:543 wrote `.swap(signal, |x| view)` to avoid it).
+///
+/// OWNERSHIP, exactly (proposal/ambient-owner.md §5). The re-render is an
+/// ambient `effect`, so the SUBSCRIPTION belongs to the nearest boundary and
+/// dies with it: a `{signal}` child inside a `bind_each` row stops replacing
+/// anything the moment the row is disposed. What it does NOT own is the views
+/// themselves — each arrived already built, under whatever owner was ambient
+/// where it was CONSTRUCTED, so a replaced view's own bindings die with that
+/// scope and not here. Reach for `swap(source, |value| …)` when each subtree
+/// must be built and disposed per value; reach for this when the views are
+/// values the app already holds.
+///
+/// POSITION: the replacement is APPENDED, like `when`'s and `swap`'s, so a
+/// `{signal}` followed by static siblings re-orders itself behind them on the
+/// first change. Put it last, or wrap it in an element of its own.
+impl type S: Source<View> with Slot {
+	fun place(self, parent: View) {
+		let element = parent.element;
+		let live: Shared<Option<View>> = Shared::new(None);
+		self.effect(|next: View| {
+			match live.read() {
+				Some(let previous) => previous.element.remove(),
+				None => {},
+			}
+			element.append(next.element);
+			live.write() = Some(next);
+		});
+	}
+}
+
+/// A reactive RUN of element children — the `List<View>` arm's reactive twin,
+/// and the door A46's fragment walks through in a `{signal}` hole. The whole
+/// run is replaced on every change: every previous element is removed, every
+/// new one appended, in order.
+///
+/// Not a reconciler, deliberately. `bind_each` is the keyed form — it moves
+/// surviving rows and rebuilds only what changed, and it is what a list of DATA
+/// wants. This one takes a list of VIEWS, which carries no key and no item to
+/// compare, so there is nothing to reconcile against; it is the grouping arm,
+/// with the same ownership story as the single-view arm above.
+impl type S: Source<List<View>> with Slot {
+	fun place(self, parent: View) {
+		let element = parent.element;
+		let live: Shared<List<View>> = Shared::new([]);
+		self.effect(|next: List<View>| {
+			for previous in live.read() {
+				previous.element.remove();
+			}
+			for item in next {
+				element.append(item.element);
+			}
+			live.write() = next;
+		});
 	}
 }
 

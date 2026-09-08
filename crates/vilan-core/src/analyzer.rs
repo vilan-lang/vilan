@@ -15087,6 +15087,13 @@ impl<'src> Analyzer<'src> {
     /// receiver binds them to. Only a NOMINAL binding can fail: anything still
     /// abstract or unresolved is undecided here, and an undecided bound is not
     /// evidence for dropping a candidate.
+    ///
+    /// A PARAMETERIZED bound is checked at its own arguments (B268), not at its
+    /// trait id alone: `impl type S: Source<str>` is not applicable to a
+    /// `SignalCell<View>`. Reading the id only made every blanket over a
+    /// parameterized trait match every instantiation of it, which is how a
+    /// `Signal<View>` in child position reached `std::ui`'s `Source<str>` text
+    /// arm and stringified the view.
     fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
         let impl_subject_type = impl_subject.get_type(self);
         let Some((_, bindings)) =
@@ -15094,15 +15101,91 @@ impl<'src> Analyzer<'src> {
         else {
             return true;
         };
-        bindings.iter().all(|(constraint_id, bound_id)| {
+        let bindings: Vec<(TypeId, TypeId)> = bindings.into_iter().collect();
+        for (constraint_id, bound_id) in bindings {
             let bound = bound_id.get_type(self);
             if !matches!(bound, Type::Struct(..) | Type::Enum(..)) {
+                continue;
+            }
+            for (trait_id, arguments) in self.generic_bound_traits(constraint_id) {
+                if !self.type_implements_trait_at(&bound, trait_id, &arguments) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether `subject_type` implements `trait_id` AT `required` — the bound's
+    /// own arguments, which [`type_implements_trait`] drops on the floor.
+    ///
+    /// CONSERVATIVE by construction, because this decides whether a candidate
+    /// competes at all: an unparameterized bound, a receiver with no impl of the
+    /// trait in view, and any instantiation this pass cannot compute are all
+    /// UNDECIDED and answer true. Only a receiver that positively provides the
+    /// trait at other arguments — `SignalCell<View>` asked for `Source<str>` —
+    /// answers false. A bound argument that is still a binder (`impl type S:
+    /// Source<type T>`) is a hole and matches whatever the receiver provides.
+    fn type_implements_trait_at(
+        &mut self,
+        subject_type: &Type,
+        trait_id: Id,
+        required: &[TypeId],
+    ) -> bool {
+        if required.is_empty() {
+            return self.type_implements_trait(subject_type, trait_id);
+        }
+        let providers: Vec<(TypeId, Vec<TypeId>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| implementation.trait_ids.contains(&trait_id))
+            .filter(|implementation| {
+                self.compare_type(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
+            .map(|implementation| {
+                let written = implementation
+                    .trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)
+                    .map(|(_, arguments)| arguments.clone())
+                    .unwrap_or_default();
+                (implementation.subject, written)
+            })
+            .collect();
+        if providers.is_empty() {
+            return true;
+        }
+        let mut decided = false;
+        for (provider_subject, written) in providers {
+            let provided = self.instantiated_home_arguments(
+                subject_type,
+                trait_id,
+                &written,
+                provider_subject,
+            );
+            if provided.len() != required.len() {
+                // An erased or unpadded instantiation says nothing about the
+                // arguments; not evidence for dropping the candidate.
                 return true;
             }
-            self.generic_bound_trait_ids(*constraint_id)
-                .into_iter()
-                .all(|trait_id| self.type_implements_trait(&bound, trait_id))
-        })
+            decided = true;
+            let fits = required
+                .iter()
+                .zip(provided.iter())
+                .all(|(required_id, provided_id)| {
+                    let required_type = required_id.get_type(self);
+                    let provided_type = provided_id.get_type(self);
+                    self.compare_type(&required_type, &provided_type, &HashMap::default())
+                });
+            if fits {
+                return true;
+            }
+        }
+        !decided
     }
 
     /// The home trait's arguments as THIS receiver instantiates them — B73's R1

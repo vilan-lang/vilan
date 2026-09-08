@@ -42,6 +42,19 @@ function identify(node) {
     if (!identities.has(node)) identities.set(node, nextIdentity++);
     return identities.get(node);
 }
+/// An inline style declaration block, enough of one for the questions asked
+/// here: `setProperty` with an empty value REMOVES the declaration, which is
+/// what the CSSOM does and what `View::show` relies on to restore an element's
+/// prior inline `display` (A60).
+class StubStyle {
+    constructor() { this.properties = {}; }
+    setProperty(name, value) {
+        if (value === "" || value === null || value === undefined) delete this.properties[name];
+        else this.properties[name] = value;
+    }
+    getPropertyValue(name) { return this.properties[name] || ""; }
+    removeProperty(name) { delete this.properties[name]; }
+}
 class StubElement {
     constructor(tag) {
         this.tagName = tag;
@@ -52,11 +65,16 @@ class StubElement {
         this.value = "";
         this.attributes = {};
         this.focused = false;
-        this.style = { setProperty: () => {} };
+        this.style = new StubStyle();
     }
     set textContent(text) { this._text = text; this.children = []; }
     get textContent() { return this._text; }
     setAttribute(name, value) { this.attributes[name] = value; }
+    removeAttribute(name) { delete this.attributes[name]; }
+    // `hidden` is a reflecting property in the DOM: the attribute is what CSS
+    // and assistive technology see, so the stub reflects it too.
+    set hidden(on) { if (on) this.attributes.hidden = ""; else delete this.attributes.hidden; }
+    get hidden() { return "hidden" in this.attributes; }
     appendChild(child) {
         if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
         child.parent = this;
@@ -72,11 +90,25 @@ class StubElement {
     addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
     focus() { this.focused = true; global.focusLog.push(describe(this)); }
 }
+/// A text node — a real sibling of the element children, which is what makes
+/// a `str` or a `Source<str>` in child position measurable at all.
+class StubText {
+    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
+    set textContent(text) { this._text = text; }
+    get textContent() { return this._text; }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
+    }
+}
 const documentRoot = new StubElement("root");
 global.focusLog = [];
 global.document = {
     createElement: (tag) => new StubElement(tag),
     createElementNS: (namespace, tag) => new StubElement(tag),
+    createTextNode: (text) => new StubText(text),
     getElementById: () => documentRoot,
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -761,5 +793,191 @@ fn b255_an_in_place_remove_under_bind_each_by_keeps_the_surviving_rows() {
     assert_eq!(
         identities, expected,
         "the surviving rows must keep their elements, in order; got:\n{stdout}"
+    );
+}
+
+// --- B268: the child contract ------------------------------------------------
+
+/// Every arm of `Slot` at once, static and reactive, then the whole root
+/// disposed. The two reactive ELEMENT arms are written in element syntax —
+/// `<main>{panel}</main>` is the kolt shape (views.vl:543), the one that had
+/// no spelling but `.swap(signal, |x| view)`.
+const CHILD_CONTRACT: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let label: SignalCell<str> = Signal::new("one");
+	let panel: SignalCell<View> = Signal::new(view("p").text("first"));
+	let run: SignalCell<List<View>> = Signal::new([view("li").text("a"), view("li").text("b")]);
+	let statics: List<View> = [view("i").text("x"), view("i").text("y")];
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("section").child("plain").child(view("em").text("element")).child(statics))
+			.child(<h1>{label}</h1>)
+			.child(<main>{panel}</main>)
+			.child(<ul>{run}</ul>)
+	});
+	print(i"built={tree()}");
+	label.set("two");
+	panel.set(view("p").text("second"));
+	run.set([view("li").text("c")]);
+	print(i"changed={tree()}");
+	root.dispose();
+	label.set("three");
+	panel.set(view("p").text("third"));
+	run.set([view("li").text("d")]);
+	print(i"disposed={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// The child contract, arm by arm (B268).
+///
+/// RED BEFORE THE FIX on the two element arms: a `Signal<View>` and a
+/// `Signal<List<View>>` in child position reached the `Source<str>` text arm —
+/// a bound's ARGUMENTS were dropped when an impl was matched to a receiver, so
+/// every blanket over a parameterized trait matched every instantiation of it —
+/// and the DOM took the view's runtime shape, `#text'[object Object]'`, which
+/// never changed again.
+///
+/// The static arms ride along as the no-regression half: a `str`, a `View` and
+/// a `List<View>` still place, and `Signal<str>` still keeps a text node in
+/// sync rather than being pushed off its own arm by the new ones.
+#[test]
+fn b268_every_child_arm_places_and_the_reactive_ones_replace_and_die_with_the_boundary() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("child_contract", CHILD_CONTRACT, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    let built = line("built=");
+    let changed = line("changed=");
+    let disposed = line("disposed=");
+
+    // The static arms: a text node, an element, and a run of elements.
+    for expected in ["#text", "'plain'", "em#", "'element'", "'x'", "'y'"] {
+        assert!(
+            built.contains(expected),
+            "the static child arms must place {expected}; got:\n{stdout}"
+        );
+    }
+    // The reactive arms placed VIEWS, not their stringification.
+    assert!(
+        !built.contains("[object Object]"),
+        "a Signal<View> child must render the view, not its runtime shape; \
+         got:\n{stdout}"
+    );
+    assert!(
+        built.contains("p#") && built.contains("'first'"),
+        "a Signal<View> child must place the view it holds; got:\n{stdout}"
+    );
+    assert!(
+        built.contains("'a'") && built.contains("'b'"),
+        "a Signal<List<View>> child must place every view it holds; got:\n{stdout}"
+    );
+    assert!(
+        built.contains("'one'"),
+        "a Signal<str> child must still place a text node; got:\n{stdout}"
+    );
+
+    // Each reactive arm re-rendered, and left nothing of its predecessor.
+    assert!(
+        changed.contains("'two'") && !changed.contains("'one'"),
+        "a Signal<str> child must re-set its text node; got:\n{stdout}"
+    );
+    assert!(
+        changed.contains("'second'") && !changed.contains("'first'"),
+        "a Signal<View> child must replace the view and remove the old one; \
+         got:\n{stdout}"
+    );
+    assert!(
+        changed.contains("'c'") && !changed.contains("'a'") && !changed.contains("'b'"),
+        "a Signal<List<View>> child must replace the whole run; got:\n{stdout}"
+    );
+
+    // And the subscriptions died with the root owner: three more writes, no
+    // change to the tree at all.
+    assert_eq!(
+        disposed, changed,
+        "every reactive child arm registers with the nearest boundary, so \
+         disposing it must stop the replacement; got:\n{stdout}"
+    );
+}
+
+/// The SSR twins of the two new arms: read once, the value at render time
+/// being the value served — no subscription, no later change to follow.
+const CHILD_CONTRACT_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let label: SignalCell<str> = Signal::new("one");
+	let panel: SignalCell<View> = Signal::new(view("p").text("first"));
+	let run: SignalCell<List<View>> = Signal::new([view("li").text("a"), view("li").text("b")]);
+	let statics: List<View> = [view("i").text("x")];
+	print(render(view("div")
+		.child("plain")
+		.child(statics)
+		.child(<h1>{label}</h1>)
+		.child(<main>{panel}</main>)
+		.child(<ul>{run}</ul>)));
+}
+
+main();
+"#;
+
+/// Builds `app` for the default (process) target and runs the emitted `.mjs`,
+/// returning its stdout — the SSR half of [`build_and_run`].
+fn build_and_run_process(tag: &str, app: &str) -> String {
+    let dir = temp_project(tag);
+    std::fs::create_dir_all(&dir).expect("create the program directory");
+    let source = dir.join("app.vl");
+    std::fs::write(&source, app).expect("write the program");
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new("node")
+        .arg("app.mjs")
+        .current_dir(&dir)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "the server render failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    stdout
+}
+
+#[test]
+fn b268_the_ssr_twins_of_the_new_child_arms_render_the_views_they_hold() {
+    let stdout = build_and_run_process("child_contract_ssr", CHILD_CONTRACT_SSR);
+    assert_eq!(
+        stdout,
+        "<div>plain<i>x</i><h1>one</h1><main><p>first</p></main><ul><li>a</li><li>b</li></ul></div>\n",
+        "the server render must serialize a Source<View> and a \
+         Source<List<View>> child as the elements they hold"
     );
 }

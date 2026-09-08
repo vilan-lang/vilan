@@ -172,9 +172,10 @@ impl View {
 	}
 
 	/// Append content. Anything `Slot` fills a child position
-	/// (proposal/element-syntax.md §5): a `View` appends as an element, a
-	/// `str` as a text node, a `SignalCell<str>` as a text node read once, a
-	/// `List<View>` appends each.
+	/// (proposal/element-syntax.md §5) — the CHILD CONTRACT (B268): a `View`
+	/// appends as an element, a `str` as a text node, a `List<View>` appends
+	/// each, and a `Source` of any of those three is READ ONCE, the value at
+	/// render time being the value served.
 	fun child<C: Slot>(self, content: C): View {
 		content.place(self);
 		self
@@ -346,10 +347,10 @@ impl View {
 /// the type-directed half of `child`: the value's type carries the
 /// static-vs-tracked distinction; on this twin every arm reads once.
 ///
-/// The tracked arm stays `SignalCell<str>` rather than `Source<str>` — DEFERRED
-/// with the browser twin's (A33): widening a trait ARM means a blanket impl
-/// (`impl S: Source<str> with Slot`), which is B158's machinery, not a bound on
-/// an ordinary generic parameter.
+/// THE CHILD CONTRACT (B268), the same six arms the browser twin declares — a
+/// `str`, a `View`, a `List<View>`, and a `Source` of each. The name stays
+/// `Slot` and not `Child` for the reason this file makes plainest: `Child` is
+/// the ENUM `render` walks, three declarations above.
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 trait Slot {
 	fun place(self, parent: View);
@@ -377,10 +378,31 @@ impl type S: Source<str> with Slot {
 	}
 }
 
-/// Several child elements, in order.
+/// Several child elements, in order — the static run A46's fragment would
+/// lower to.
 impl List<View> with Slot {
 	fun place(self, parent: View) {
 		for item in self {
+			parent.children.write().push(Child::Element(item));
+		}
+	}
+}
+
+/// A reactive element child, READ ONCE: the view the source holds at render
+/// time is the one served (B268). The browser twin replaces it on every
+/// change; here there is no later change to follow.
+impl type S: Source<View> with Slot {
+	fun place(self, parent: View) {
+		parent.children.write().push(Child::Element(self.get()));
+	}
+}
+
+/// A reactive run of element children, read once — the `List<View>` arm's
+/// server end. KEEP IN STEP with the browser twin.
+impl type S: Source<List<View>> with Slot {
+	fun place(self, parent: View) {
+		let items: List<View> = self.get();
+		for item in items {
 			parent.children.write().push(Child::Element(item));
 		}
 	}

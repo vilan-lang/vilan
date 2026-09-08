@@ -116,7 +116,7 @@ fun view(tag: str): View
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
-trait Slot { fun place(self, parent: View) }          // View | str | SignalCell<str> | List<View>
+trait Slot { fun place(self, parent: View) }   // str | View | List<View>, and a Source of each
 trait AttrValue { fun apply(self, parent: View, name: str) }   // str | SignalCell<str>
 ```
 
@@ -151,7 +151,7 @@ too.
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
-| `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`SignalCell<str>`), or `List<View>` |
+| `child` | `(content: C): View`; `C: Slot` | the child contract: `str`, `View`, `List<View>`, and a `Source` of each — text re-set in place, an element or a run replaced |
 | `children` | `(items: List<View>): View` | append several |
 | `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
