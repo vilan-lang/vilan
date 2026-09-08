@@ -513,6 +513,7 @@ tour/resources.md h2 owning-background-work-ownednursery
 tour/resources.md h2 traps
 tour/values-and-types.md h1 values-and-types
 tour/values-and-types.md h2 bindings
+tour/values-and-types.md h2 reserved-words
 tour/values-and-types.md h2 primitives
 tour/values-and-types.md h2 strings-and-interpolation
 tour/values-and-types.md h2 tuples
