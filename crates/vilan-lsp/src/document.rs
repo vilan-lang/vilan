@@ -529,6 +529,37 @@ impl RenameRefusal {
     }
 }
 
+/// `declaration` with the FIRST whole-word occurrence of `from` rewritten to
+/// `to` — how an alias hover puts its own name into the target's signature
+/// (B264).
+///
+/// A declaration label leads with its keyword and then its name (`fun greet():
+/// i32`, `struct Point {`), so the first whole word that spells the target's
+/// name is the declared name and nothing else. Whole-word is what makes that
+/// true rather than nearly true: `fun greeting()` must not become
+/// `fun hiing()`. Where the name is not found the label is returned unchanged
+/// — the hover still says `(alias)`, which is the fact the caret asked about.
+fn rename_leading_word(declaration: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return declaration.to_string();
+    }
+    let bytes = declaration.as_bytes();
+    let boundary = |index: usize| match bytes.get(index) {
+        Some(byte) => !(byte.is_ascii_alphanumeric() || *byte == b'_'),
+        None => true,
+    };
+    let mut cursor = 0;
+    while let Some(hit) = declaration[cursor..].find(from) {
+        let start = cursor + hit;
+        let end = start + from.len();
+        if (start == 0 || boundary(start - 1)) && boundary(end) {
+            return format!("{}{to}{}", &declaration[..start], &declaration[end..]);
+        }
+        cursor = start + 1;
+    }
+    declaration.to_string()
+}
+
 /// Whether `name` is a valid vilan identifier — a rename that writes anything
 /// else produces a program that does not parse.
 pub fn is_identifier(name: &str) -> bool {
@@ -2453,6 +2484,10 @@ impl Document {
             return Some(keyword);
         }
         let program = self.program.as_ref()?;
+        // An `as` alias: the ALIAS's name with the TARGET's signature (B264).
+        if let Some(rendered) = self.alias_hover(program, offset) {
+            return Some(rendered);
+        }
         // A type name in type position: the full declaration when known.
         if let Some((definition, label)) = self.type_reference_at(program, offset) {
             if let Some(definition) = definition
@@ -2515,6 +2550,51 @@ impl Document {
             (Some(type_label), None) => Some(type_label),
             (None, requirement) => requirement,
         }
+    }
+
+    /// The hover for an identifier that spells an `as` alias — its own name
+    /// carrying the target's signature, TypeScript's `(alias) …` line (B264,
+    /// ruled 2026-09-07 with TS as the reference; `tsserver` answers
+    /// `(alias) bar(): number` at a use of `import { foo as bar }`, and
+    /// `(alias) type Bar = …` at a type-position one).
+    ///
+    /// It is one line rather than two because the alias has nothing else to
+    /// say: `hi` IS `greet`, and the only fact the target's own hover would
+    /// lose is which of the two names this file spells — which is precisely
+    /// the fact the caret is on. Go-to-definition still resolves THROUGH to
+    /// the target's declaration (the same ruling), so the hop is one keystroke
+    /// away and the hover does not have to be a directory.
+    ///
+    /// The site is decided by the reference INDEX, not by re-reading the text:
+    /// a row whose definition is an [`crate::references::DefinitionKind::Alias`]
+    /// is exactly an identifier this file spells with the alias's name (E145),
+    /// so hover, find-references and rename cannot disagree about which of an
+    /// import's two names the caret is on.
+    fn alias_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (definition, _) = self.reference_target(offset)?;
+        let Definition::Entity(id) = definition else {
+            return None;
+        };
+        let alias = program.import_aliases.get(&id)?;
+        let target = alias.target;
+        let declaration = program.declaration_labels.get(&target)?;
+        let target_name = crate::references::name_of(program, Definition::Entity(target))?;
+        let declaration = rename_leading_word(declaration, target_name, alias.name);
+        let declaration = if program.async_functions.contains(&target) {
+            format!("async {declaration}")
+        } else {
+            declaration
+        };
+        let mut out = format!("```vilan\n(alias) {declaration}\n```");
+        if let Some(docs) = self.analysis(program).doc_comment_of(target) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        if let Some(requirement) = self.platform_requirements.get(&target) {
+            out.push_str("\n\n");
+            out.push_str(requirement);
+        }
+        Some(out)
     }
 
     /// Assembles a declaration hover: the fenced declaration (with inferred
