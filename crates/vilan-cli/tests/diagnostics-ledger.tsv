@@ -162,7 +162,7 @@ row	flagship	key
 129	-	no bound of this type parameter ({}) has a member '{}'
 130	-	cannot find trait '{}'
 131	-	'{}' is not a trait
-132	flagship	'{}' does not implement trait '{}': missing '{}'
+132	flagship	'{type_label}' does not implement trait '{trait_label}': missing '{member_name}'
 133	-	this {construct} is `{label}`, but a condition must be `bool
 134	flagship	`{symbol}` takes `bool` operands; the {side} operand is `{la
 135	flagship	`bool` has no ordering: `{symbol}` models `PartialOrd`, whic

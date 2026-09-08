@@ -6529,7 +6529,9 @@ fn a49_a_source_that_provides_only_sub_is_refused_and_names_on_change() {
 
         fun main() {}
         "#,
-        "does not implement trait 'Source': missing 'on_change'",
+        // B260: the head names the trait as the `with` clause wrote it, so this
+        // impl's `Source<T>` is what the sentence says.
+        "does not implement trait 'Source<T>': missing 'on_change'",
     );
 }
 

@@ -15802,6 +15802,34 @@ impl<'src> Analyzer<'src> {
         self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
+    /// B260: a trait named in a diagnostic HEAD, carrying the arguments the
+    /// `with` clause gave it — `Source<i32>`, never the bare `Source`.
+    ///
+    /// B249 read those arguments for the SUGGESTED DECLARATION
+    /// ([`trait_argument_substitution`], which is this list zipped onto the
+    /// trait's own parameters); the head above it kept naming the trait
+    /// unparameterized, so `impl Counted with Source<i32>` was told it "does not
+    /// implement trait 'Source'" and then handed a signature written in `i32` —
+    /// the arguments were what the refusal was ABOUT and the sentence naming the
+    /// trait was the one place they did not appear. A program with two impls of
+    /// one trait at different arguments could not tell the two refusals apart.
+    ///
+    /// Rendered with an EMPTY substitution because these arguments are already in
+    /// the impl's own terms: a concrete one prints itself, and an impl passing the
+    /// trait its own binder (`impl SignalCell<type T> with Source<T>`) prints `T`,
+    /// which is what the author wrote. An elided clause renders the bare name, so
+    /// a trait whose parameters are all defaulted reads as it always has.
+    fn trait_label_with_arguments(&self, trait_name: &str, arguments: &[TypeId]) -> String {
+        if arguments.is_empty() {
+            return trait_name.to_string();
+        }
+        let rendered: Vec<String> = arguments
+            .iter()
+            .map(|argument| self.declaration_type_label(*argument))
+            .collect();
+        format!("{trait_name}<{}>", rendered.join(", "))
+    }
+
     /// [`declaration_type_label`] rendered FOR one side of a trait/impl pair
     /// (B206, E128): an ambiguous `Self` / `= Self`-defaulted position renders
     /// as what it means THERE.
@@ -39443,6 +39471,10 @@ impl<'src> Analyzer<'src> {
                         &check.trait_arguments,
                     ),
                 };
+                // B260: and the HEAD names the trait the same way the suggested
+                // declaration is written — with the `with` clause's arguments.
+                let trait_label =
+                    self.trait_label_with_arguments(check.trait_name, &check.trait_arguments);
                 let (signature, note) = self
                     .traits
                     .get(&declaring_trait_id)
@@ -39516,19 +39548,18 @@ impl<'src> Analyzer<'src> {
                         )
                     };
                     format!(
-                        "`impl {subject_name} with {}`{inherited} provides no `{member_name}`: an \
-                         operator trait's method is required at impl time. \
+                        "`impl {subject_name} with {trait_label}`{inherited} provides no \
+                         `{member_name}`: an operator trait's method is required at impl time. \
                          `{declaring_trait_name}` declares a body for it, but that body is \
                          `panic(\"not implemented yet\")` — it exists so `{symbol}=` can derive \
                          from `{symbol}`, not so `{member_name}` can go unwritten — so this impl \
                          compiles clean and the first `{symbol}` on a `{subject_name}` throws at \
-                         runtime, naming neither the type nor the method.{declare}{steer}",
-                        check.trait_name
+                         runtime, naming neither the type nor the method.{declare}{steer}"
                     )
                 } else {
                     format!(
                         "'{}' does not implement trait '{}': missing '{}'{}",
-                        subject_name, check.trait_name, member_name, expected_signature
+                        subject_name, trait_label, member_name, expected_signature
                     )
                 };
                 self.diagnostics.push(Error {
