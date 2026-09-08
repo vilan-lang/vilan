@@ -40,7 +40,8 @@ view so you can keep going:
   `pointer_x()`/`pointer_y()`). For window-level events, and for a listener
   you need to remove, drop to `std::dom` — [Escaping to the DOM](#escaping-to-the-dom).
 - **Reactive bindings**: `.bind_text(source)`, `.bind_class(source)`,
-  `.bind_attr(name, source)`, `.style_var(name, source)`.
+  `.bind_attr(name, source)`, `.toggle_attr(name, flag)`,
+  `.style_var(name, source)`.
 
 Every `bind_*` sets the property now and re-sets it whenever the source
 changes. There is no render loop to trigger.
@@ -103,6 +104,13 @@ re-sets whenever it changes — `attr("href", signal)` and
 `bind_attr("href", signal)` are the same binding, chosen by type or by
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
+
+A BOOLEAN attribute is a different thing and has its own binding:
+`inert`, `disabled`, `hidden` and `open` mean *present*, so there is no
+string that turns one off — `attr("disabled", "false")` is a disabled
+control. `.toggle_attr(name, flag)` takes a `Source<bool>` and writes
+the attribute when it is true, removes it when it is false:
+`shell.toggle_attr("inert", modal_open)`.
 
 `attr` and `child` dispatch through traits rather than a bound, and
 their reactive arms are blanket impls over `Source`, so a derived

@@ -981,3 +981,112 @@ fn b268_the_ssr_twins_of_the_new_child_arms_render_the_views_they_hold() {
          Source<List<View>> child as the elements they hold"
     );
 }
+
+// --- A66: a boolean-attribute binding ----------------------------------------
+
+/// `inert` on the app shell while a modal is up — kolt's exhibit
+/// (views.vl:74), hand-written there over its own `remove_attribute` extern.
+/// Toggled on, off, and on again, then the boundary disposed and the source
+/// written once more.
+const TOGGLE_ATTR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let modal: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div").toggle_attr("inert", modal).child(view("p").text("shell"))
+	});
+	print(i"initial={shell_attributes()}");
+	modal.set(true);
+	print(i"open={shell_attributes()}");
+	modal.set(false);
+	print(i"closed={shell_attributes()}");
+	modal.set(true);
+	print(i"reopened={shell_attributes()}");
+	root.dispose();
+	modal.set(false);
+	print(i"disposed={shell_attributes()}");
+}
+
+[extern("__shell_attributes")]
+external fun shell_attributes(): str;
+
+main();
+"#;
+
+/// PRESENCE, not value (A66): the attribute is written as the empty string
+/// when the source is true and REMOVED when it is false — never set to
+/// `"false"`, which is a present boolean attribute and therefore still on.
+/// And the effect is the boundary's: disposing the root stops the toggling.
+#[test]
+fn a66_toggle_attr_adds_and_removes_the_attribute_and_dies_with_its_boundary() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shell_attributes = () => {{\n  \
+         const shell = documentRoot.children[0];\n  \
+         return JSON.stringify(shell.attributes);\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("toggle_attr", TOGGLE_ATTR, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("initial="),
+        "{}",
+        "a false source must leave the attribute off entirely; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("open="),
+        "{\"inert\":\"\"}",
+        "a true source must write the attribute as the empty string; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("closed="),
+        "{}",
+        "a false source must REMOVE the attribute, not write a value; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("reopened="),
+        "{\"inert\":\"\"}",
+        "the binding must keep toggling; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("disposed="),
+        "{\"inert\":\"\"}",
+        "the effect registers with the nearest boundary, so disposing it must \
+         stop the toggle; got:\n{stdout}"
+    );
+}
+
+/// The SSR twin: the attribute is rendered when the source is currently true
+/// and absent when it is false. Presence is the whole meaning, so a false
+/// source has nothing to serialize.
+const TOGGLE_ATTR_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let modal: SignalCell<bool> = Signal::new(true);
+	let quiet: SignalCell<bool> = Signal::new(false);
+	print(render(view("div").toggle_attr("inert", modal).attr("id", "shell")));
+	print(render(view("dialog").toggle_attr("open", quiet)));
+}
+
+main();
+"#;
+
+#[test]
+fn a66_the_ssr_twin_renders_a_true_boolean_attribute_and_omits_a_false_one() {
+    let stdout = build_and_run_process("toggle_attr_ssr", TOGGLE_ATTR_SSR);
+    assert_eq!(
+        stdout, "<div inert=\"\" id=\"shell\"></div>\n<dialog></dialog>\n",
+        "the server render must carry a true boolean attribute in insertion \
+         order and omit a false one entirely"
+    );
+}

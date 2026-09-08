@@ -21,6 +21,7 @@ impl Element {
 	fun set_text(self, text: str)                      // textContent =
 	fun set_class(self, name: str)                     // className =
 	fun set_attribute(self, name: str, value: str)
+	fun remove_attribute(self, name: str)              // removeAttribute — a boolean attribute's off
 	fun set_style_property(self, name: str, value: str) // style.setProperty (CSS custom props)
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
@@ -157,6 +158,7 @@ too.
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
 | `bind_styled` | `(source: S): View`; `S: Source<Style>` | reactive compiled style — `styled`'s reactive twin |
 | `bind_attr` | `(name: str, source: S): View`; `S: Source<str>` | reactive attribute |
+| `toggle_attr` | `(name: str, source: S): View`; `S: Source<bool>` | reactive BOOLEAN attribute — presence, not value (`inert`, `disabled`, `hidden`, `open`): present when true, removed when false |
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |

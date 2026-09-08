@@ -55,6 +55,15 @@ impl Element {
 	[extern(method, "setAttribute")]
 	external fun set_attribute(self, name: str, value: str): void;
 
+	/// Removes an attribute (`element.removeAttribute(name)`). The other half
+	/// of a BOOLEAN attribute, whose meaning is presence and not value: `inert`,
+	/// `disabled`, `hidden`, `open` are on when the attribute is there at all,
+	/// so turning one off means taking it away, never setting it to `"false"`.
+	/// `View::toggle_attr` is the binding written over this; removing an
+	/// attribute that is not there is a no-op, as in the DOM.
+	[extern(method, "removeAttribute")]
+	external fun remove_attribute(self, name: str): void;
+
 	/// Sets a CSS custom property (`element.style.setProperty(name, value)`) —
 	/// the DOM end of the styling system's dynamic-value channel
 	/// (proposal/ui-styling.md §2.1).

@@ -260,6 +260,28 @@ impl View {
 		self
 	}
 
+	/// A BOOLEAN attribute, bound: present when `source` is true, absent when
+	/// it is false (A66). `inert`, `disabled`, `hidden`, `open` — the family
+	/// whose meaning is PRESENCE, not value, so `attr("disabled", "false")` is
+	/// a disabled control and there is no string that turns one off.
+	///
+	/// `bind_attr`'s twin at the other value type: an effect under the current
+	/// owner, dying with the boundary that built it exactly as every binding
+	/// does. The set writes the empty string, which is the canonical spelling
+	/// of a present boolean attribute (`<div inert>` and `<div inert="">`
+	/// serialize alike).
+	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
+		let element = self.element;
+		source.effect(|present| {
+			if present {
+				element.set_attribute(name, "");
+			} else {
+				element.remove_attribute(name);
+			}
+		});
+		self
+	}
+
 	/// Two-way bind an `<input>`'s value to a signal: the input shows the
 	/// signal, and typing writes it back.
 	///

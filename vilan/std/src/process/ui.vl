@@ -216,6 +216,18 @@ impl View {
 		self
 	}
 
+	/// A boolean attribute, read once: rendered when `source` is currently true
+	/// and absent when it is false (A66). Presence is the whole meaning, so
+	/// there is nothing to render for the false case — the browser twin's
+	/// `remove_attribute` has no server counterpart because the attribute was
+	/// never written. KEEP IN STEP with the browser twin.
+	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
+		if source.get() {
+			set_attribute(self.attributes, name, "");
+		}
+		self
+	}
+
 	/// A two-way input bind, server side: the input renders with its current
 	/// value. The write-back listener is client business — accepted and dropped.
 	/// Bounded on `Signal<str>`, matching the browser twin's write-back half
