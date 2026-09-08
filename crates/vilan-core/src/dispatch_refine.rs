@@ -265,6 +265,38 @@ pub fn impl_members_for_bound(
         .collect()
 }
 
+/// The candidates an `OnType` site with a KNOWN receiver can actually select
+/// among — the members the receiver's HEAD selects — or `None` when nothing
+/// narrows the site: an `OnConstraint` or unrecorded dispatch, a receiver-less
+/// `OnType` (a `self` call inside a shared trait default body), a receiver
+/// that resolves to a generic or opaque type, or an empty selection. Every
+/// `None` means "keep the union", so this only ever narrows where the
+/// language says it may.
+///
+/// [`candidates_of`] is NAME-keyed and therefore program-wide: every override
+/// of every trait declaring the name, whatever the receiver. That
+/// over-approximation is sound for a consumer that reads an edge as a DEMAND
+/// (coverage asks for more; the const-only check refuses more) and unsound for
+/// one that reads the candidate SET as a property of the site — the `context`
+/// pass's flavor promotion is the case B258 found: one strict candidate
+/// promotes the whole site, so `RemoteSource`'s strict override of
+/// `Source::map` rewrote `self.cache.map(..)`, a call on a `SignalCell` field
+/// that inherits the OWNER-OPTIONAL default, into a bare-owner hand-off with
+/// no owner to hand.
+pub fn known_receiver_candidates(program: &Program, call_id: Id) -> Option<Vec<Id>> {
+    let Some(GenericDispatch::OnType(Some(receiver), member)) =
+        crate::async_infer::dispatch_at(program, call_id)
+    else {
+        return None;
+    };
+    let resolved = program.type_id_to_type_map.get(&receiver)?;
+    if !crate::impl_select::is_resolvable(resolved) {
+        return None;
+    }
+    let selected = impl_members_for(program, receiver, member);
+    (!selected.is_empty()).then_some(selected)
+}
+
 /// The traits a generic parameter's constraint names, transitively through
 /// supertraits — the impls a call through that parameter may reach.
 ///
@@ -448,30 +480,26 @@ fn refined_edges_timed(
         };
         let (constraint, member) = match crate::async_infer::dispatch_at(program, site.call) {
             Some(GenericDispatch::OnConstraint(constraint, member)) => (constraint, member),
-            Some(GenericDispatch::OnType(Some(receiver), member)) => {
+            Some(GenericDispatch::OnType(Some(_), _)) => {
                 // A concrete-receiver re-dispatch (the Gap-E shape: an
                 // inherited trait default). The receiver's HEAD cannot
                 // change under substitution, and the head is what selects
                 // among candidates, so the site narrows to the members the
-                // head selects — edges from the site's owner, no entry
-                // enumeration. A receiver resolving to a generic or opaque
-                // type keeps the union, as does an empty selection.
-                match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
-                        let selected = impl_members_for(program, receiver, member);
-                        if selected.is_empty() {
-                            union_fallback(&mut edges);
-                        } else {
-                            for candidate in selected {
-                                edges.push(RefinedEdge {
-                                    caller: site.owner,
-                                    anchor: site.call,
-                                    callee: candidate,
-                                });
-                            }
+                // head selects ([`known_receiver_candidates`]) — edges from
+                // the site's owner, no entry enumeration. A receiver
+                // resolving to a generic or opaque type keeps the union, as
+                // does an empty selection.
+                match known_receiver_candidates(program, site.call) {
+                    Some(selected) => {
+                        for candidate in selected {
+                            edges.push(RefinedEdge {
+                                caller: site.owner,
+                                anchor: site.call,
+                                callee: candidate,
+                            });
                         }
                     }
-                    _ => union_fallback(&mut edges),
+                    None => union_fallback(&mut edges),
                 }
                 continue;
             }
