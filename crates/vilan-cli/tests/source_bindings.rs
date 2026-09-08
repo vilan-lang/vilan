@@ -68,7 +68,15 @@ const DOM_STUB: &str = r#"class StubElement {
         this.hidden = false;
         this.attributes = {};
         this.properties = {};
-        this.style = { setProperty: (name, value) => { this.properties[name] = value; } };
+        this.style = {
+            setProperty: (name, value) => {
+                // CSSOM: an empty value removes the declaration.
+                if (value === "") delete this.properties[name];
+                else this.properties[name] = value;
+            },
+            getPropertyValue: (name) => this.properties[name] || "",
+            removeProperty: (name) => { delete this.properties[name]; },
+        };
     }
     set textContent(text) { this._text = text; this.children = []; }
     get textContent() { return this._text; }
@@ -267,8 +275,11 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
              got:\n{updated}"
         );
     }
+    // A60: `show(false)` makes two writes — the `hidden` attribute and the
+    // inline `display:none` that actually hides a styled element. This stub
+    // serializes an inline style property as an attribute of its own name.
     assert!(
-        updated.contains("<i hidden>"),
+        updated.contains(r#"<i display="none" hidden>"#),
         "`show(false)` must hide the element after the write; got:\n{updated}"
     );
     assert!(

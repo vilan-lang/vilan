@@ -155,17 +155,28 @@ class StubElement {
         // form folds the namespace into the one the process twin seeds on the
         // svg root, so the namespace decision lands in the byte comparison.
         if (namespace === SVG_NS && tag === "svg") this.attributes.push(["xmlns", namespace]);
-        this.style = { setProperty: (n, v) => this._upsertStyle(n, v) };
+        this.styleProperties = new Map();
+        this.style = {
+            setProperty: (n, v) => this._upsertStyle(n, v),
+            getPropertyValue: (n) => this.styleProperties.get(n) || "",
+            removeProperty: (n) => this._upsertStyle(n, ""),
+        };
     }
     _upsert(name, value) {
         const i = this.attributes.findIndex(([n]) => n === name);
         if (i >= 0) this.attributes[i] = [name, value]; else this.attributes.push([name, value]);
     }
     _remove(name) { this.attributes = this.attributes.filter(([n]) => n !== name); }
+    // CSSOM: an empty value REMOVES the declaration, and a repeated name
+    // updates in place rather than appending a second one. `View::show`
+    // restores an element's prior inline `display` by writing back what it
+    // read, which is the empty string when there was none.
     _upsertStyle(name, value) {
-        const cur = this.attributes.find(([n]) => n === "style");
-        const decl = name + ":" + value;
-        this._upsert("style", cur ? cur[1] + ";" + decl : decl);
+        if (value === "" || value === null || value === undefined) this.styleProperties.delete(name);
+        else this.styleProperties.set(name, value);
+        if (this.styleProperties.size === 0) { this._remove("style"); return; }
+        const text = [...this.styleProperties].map(([n, v]) => n + ":" + v).join(";");
+        this._upsert("style", text);
     }
     set className(v) { this._upsert("class", v); }
     get className() { const a = this.attributes.find(([n]) => n === "class"); return a ? a[1] : ""; }
@@ -325,7 +336,9 @@ fn ssr_process_render_matches_browser_dom_tree() {
     assert!(
         server_markup.contains("<main class=\"app\" id=\"root\">")
             && server_markup.contains("<li>second &amp; third</li>")
-            && server_markup.contains("<aside hidden=\"\">")
+            // A60: `show(false)` writes both the `hidden` attribute and the
+            // inline `display:none` that actually beats an app's own rule.
+            && server_markup.contains("<aside hidden=\"\" style=\"display:none\">")
             && server_markup.contains(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"icon\" viewBox=\"0 0 24 24\"><path d=\"M5 12h14\"></path></svg>"
             ),

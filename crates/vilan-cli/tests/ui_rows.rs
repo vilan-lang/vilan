@@ -42,6 +42,19 @@ function identify(node) {
     if (!identities.has(node)) identities.set(node, nextIdentity++);
     return identities.get(node);
 }
+/// An inline style declaration block, enough of one for the questions asked
+/// here: `setProperty` with an empty value REMOVES the declaration, which is
+/// what the CSSOM does and what `View::show` relies on to restore an element's
+/// prior inline `display` (A60).
+class StubStyle {
+    constructor() { this.properties = {}; }
+    setProperty(name, value) {
+        if (value === "" || value === null || value === undefined) delete this.properties[name];
+        else this.properties[name] = value;
+    }
+    getPropertyValue(name) { return this.properties[name] || ""; }
+    removeProperty(name) { delete this.properties[name]; }
+}
 class StubElement {
     constructor(tag) {
         this.tagName = tag;
@@ -56,7 +69,7 @@ class StubElement {
         this.value = "";
         this.attributes = {};
         this.focused = false;
-        this.style = { setProperty: () => {} };
+        this.style = new StubStyle();
     }
     set textContent(text) { this._text = text; this.children = []; }
     get textContent() { return this._text; }
@@ -74,6 +87,10 @@ class StubElement {
         }
     }
     replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
+    // `hidden` is a reflecting property in the DOM: the attribute is what CSS
+    // and assistive technology see, so the stub reflects it too.
+    set hidden(on) { if (on) this.attributes.hidden = ""; else delete this.attributes.hidden; }
+    get hidden() { return "hidden" in this.attributes; }
     addEventListener(event, handler, capture) {
         const table = capture ? this.captureListeners : this.listeners;
         (table[event] = table[event] || []).push(handler);
@@ -124,12 +141,26 @@ class StubElement {
         return global.activeElement === this;
     }
 }
+/// A text node — a real sibling of the element children, which is what makes
+/// a `str` or a `Source<str>` in child position measurable at all.
+class StubText {
+    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
+    set textContent(text) { this._text = text; }
+    get textContent() { return this._text; }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
+    }
+}
 const documentRoot = new StubElement("root");
 global.focusLog = [];
 global.activeElement = null;
 global.document = {
     createElement: (tag) => new StubElement(tag),
     createElementNS: (namespace, tag) => new StubElement(tag),
+    createTextNode: (text) => new StubText(text),
     getElementById: () => documentRoot,
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -1237,5 +1268,494 @@ fn a59_observe_resize_fires_on_first_layout_and_stops_with_its_subscription() {
             "resized",
         ],
         "observe fires once on start and again on a change, and a disposed observer is silent; got:\n{stdout}"
+    );
+}
+
+/// Every arm of `Slot` at once, static and reactive, then the whole root
+/// disposed. The two reactive ELEMENT arms are written in element syntax —
+/// `<main>{panel}</main>` is the kolt shape (views.vl:543), the one that had
+/// no spelling but `.swap(signal, |x| view)`.
+const CHILD_CONTRACT: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let label: SignalCell<str> = Signal::new("one");
+	let panel: SignalCell<View> = Signal::new(view("p").text("first"));
+	let run: SignalCell<List<View>> = Signal::new([view("li").text("a"), view("li").text("b")]);
+	let statics: List<View> = [view("i").text("x"), view("i").text("y")];
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("section").child("plain").child(view("em").text("element")).child(statics))
+			.child(<h1>{label}</h1>)
+			.child(<main>{panel}</main>)
+			.child(<ul>{run}</ul>)
+	});
+	print(i"built={tree()}");
+	label.set("two");
+	panel.set(view("p").text("second"));
+	run.set([view("li").text("c")]);
+	print(i"changed={tree()}");
+	root.dispose();
+	label.set("three");
+	panel.set(view("p").text("third"));
+	run.set([view("li").text("d")]);
+	print(i"disposed={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// The SSR twins of the two new arms: read once, the value at render time
+/// being the value served — no subscription, no later change to follow.
+const CHILD_CONTRACT_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let label: SignalCell<str> = Signal::new("one");
+	let panel: SignalCell<View> = Signal::new(view("p").text("first"));
+	let run: SignalCell<List<View>> = Signal::new([view("li").text("a"), view("li").text("b")]);
+	let statics: List<View> = [view("i").text("x")];
+	print(render(view("div")
+		.child("plain")
+		.child(statics)
+		.child(<h1>{label}</h1>)
+		.child(<main>{panel}</main>)
+		.child(<ul>{run}</ul>)));
+}
+
+main();
+"#;
+
+/// `inert` on the app shell while a modal is up — kolt's exhibit
+/// (views.vl:74), hand-written there over its own `remove_attribute` extern.
+/// Toggled on, off, and on again, then the boundary disposed and the source
+/// written once more.
+const TOGGLE_ATTR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let modal: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div").toggle_attr("inert", modal).child(view("p").text("shell"))
+	});
+	print(i"initial={shell_attributes()}");
+	modal.set(true);
+	print(i"open={shell_attributes()}");
+	modal.set(false);
+	print(i"closed={shell_attributes()}");
+	modal.set(true);
+	print(i"reopened={shell_attributes()}");
+	root.dispose();
+	modal.set(false);
+	print(i"disposed={shell_attributes()}");
+}
+
+[extern("__shell_attributes")]
+external fun shell_attributes(): str;
+
+main();
+"#;
+
+/// The SSR twin: the attribute is rendered when the source is currently true
+/// and absent when it is false. Presence is the whole meaning, so a false
+/// source has nothing to serialize.
+const TOGGLE_ATTR_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let modal: SignalCell<bool> = Signal::new(true);
+	let quiet: SignalCell<bool> = Signal::new(false);
+	print(render(view("div").toggle_attr("inert", modal).attr("id", "shell")));
+	print(render(view("dialog").toggle_attr("open", quiet)));
+}
+
+main();
+"#;
+
+/// A flex container under `show`, plus the two style smalls the same item
+/// carries: `flex_grow` beside `flex_shrink`, and `Color::current()` composed
+/// through `.alpha()`.
+const SHOW_OVER_A_FLEX_ROW: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::style::{ Color, Display, preflight, style };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let _reset = const preflight();
+	let visible: SignalCell<bool> = Signal::new(true);
+	let _root = mount_root("app", || {
+		view("div")
+			.styled(const style()
+				.display(Display::Flex)
+				.flex_grow(1f)
+				.background(Color::current().alpha(0.1)))
+			.show(visible)
+			.child(view("p").text("row"))
+	});
+	print(i"shown={probe()}");
+	visible.set(false);
+	print(i"hidden={probe()}");
+	visible.set(true);
+	print(i"reshown={probe()}");
+}
+
+[extern("__probe")]
+external fun probe(): str;
+
+main();
+"#;
+
+/// The SSR twin makes the same two writes, so a server-rendered hidden element
+/// is hidden on the first paint rather than painted until the client's first
+/// toggle takes it away.
+const SHOW_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let visible: SignalCell<bool> = Signal::new(true);
+	let gone: SignalCell<bool> = Signal::new(false);
+	let width: SignalCell<str> = Signal::new("3rem");
+	print(render(view("div").attr("id", "shown").show(visible)));
+	print(render(view("div").attr("id", "gone").show(gone)));
+	print(render(view("div").style_var("--w", width).show(gone)));
+}
+
+main();
+"#;
+
+/// The child contract, arm by arm (B268).
+///
+/// RED BEFORE THE FIX on the two element arms: a `Signal<View>` and a
+/// `Signal<List<View>>` in child position reached the `Source<str>` text arm —
+/// a bound's ARGUMENTS were dropped when an impl was matched to a receiver, so
+/// every blanket over a parameterized trait matched every instantiation of it —
+/// and the DOM took the view's runtime shape, `#text'[object Object]'`, which
+/// never changed again.
+///
+/// The static arms ride along as the no-regression half: a `str`, a `View` and
+/// a `List<View>` still place, and `Signal<str>` still keeps a text node in
+/// sync rather than being pushed off its own arm by the new ones.
+#[test]
+fn b268_every_child_arm_places_and_the_reactive_ones_replace_and_die_with_the_boundary() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("child_contract", CHILD_CONTRACT, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    let built = line("built=");
+    let changed = line("changed=");
+    let disposed = line("disposed=");
+
+    // The static arms: a text node, an element, and a run of elements.
+    for expected in ["#text", "'plain'", "em#", "'element'", "'x'", "'y'"] {
+        assert!(
+            built.contains(expected),
+            "the static child arms must place {expected}; got:\n{stdout}"
+        );
+    }
+    // The reactive arms placed VIEWS, not their stringification.
+    assert!(
+        !built.contains("[object Object]"),
+        "a Signal<View> child must render the view, not its runtime shape; \
+         got:\n{stdout}"
+    );
+    assert!(
+        built.contains("p#") && built.contains("'first'"),
+        "a Signal<View> child must place the view it holds; got:\n{stdout}"
+    );
+    assert!(
+        built.contains("'a'") && built.contains("'b'"),
+        "a Signal<List<View>> child must place every view it holds; got:\n{stdout}"
+    );
+    assert!(
+        built.contains("'one'"),
+        "a Signal<str> child must still place a text node; got:\n{stdout}"
+    );
+
+    // Each reactive arm re-rendered, and left nothing of its predecessor.
+    assert!(
+        changed.contains("'two'") && !changed.contains("'one'"),
+        "a Signal<str> child must re-set its text node; got:\n{stdout}"
+    );
+    assert!(
+        changed.contains("'second'") && !changed.contains("'first'"),
+        "a Signal<View> child must replace the view and remove the old one; \
+         got:\n{stdout}"
+    );
+    assert!(
+        changed.contains("'c'") && !changed.contains("'a'") && !changed.contains("'b'"),
+        "a Signal<List<View>> child must replace the whole run; got:\n{stdout}"
+    );
+
+    // And the subscriptions died with the root owner: three more writes, no
+    // change to the tree at all.
+    assert_eq!(
+        disposed, changed,
+        "every reactive child arm registers with the nearest boundary, so \
+         disposing it must stop the replacement; got:\n{stdout}"
+    );
+}
+
+/// Builds `app` for the default (process) target and runs the emitted `.mjs`,
+/// returning its stdout — the SSR half of [`build_and_run`].
+fn build_and_run_process(tag: &str, app: &str) -> String {
+    let dir = temp_project(tag);
+    std::fs::create_dir_all(&dir).expect("create the program directory");
+    let source = dir.join("app.vl");
+    std::fs::write(&source, app).expect("write the program");
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new("node")
+        .arg("app.mjs")
+        .current_dir(&dir)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "the server render failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    stdout
+}
+
+#[test]
+fn b268_the_ssr_twins_of_the_new_child_arms_render_the_views_they_hold() {
+    let stdout = build_and_run_process("child_contract_ssr", CHILD_CONTRACT_SSR);
+    assert_eq!(
+        stdout,
+        "<div>plain<i>x</i><h1>one</h1><main><p>first</p></main><ul><li>a</li><li>b</li></ul></div>\n",
+        "the server render must serialize a Source<View> and a \
+         Source<List<View>> child as the elements they hold"
+    );
+}
+
+/// PRESENCE, not value (A66): the attribute is written as the empty string
+/// when the source is true and REMOVED when it is false — never set to
+/// `"false"`, which is a present boolean attribute and therefore still on.
+/// And the effect is the boundary's: disposing the root stops the toggling.
+#[test]
+fn a66_toggle_attr_adds_and_removes_the_attribute_and_dies_with_its_boundary() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shell_attributes = () => {{\n  \
+         const shell = documentRoot.children[0];\n  \
+         return JSON.stringify(shell.attributes);\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("toggle_attr", TOGGLE_ATTR, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("initial="),
+        "{}",
+        "a false source must leave the attribute off entirely; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("open="),
+        "{\"inert\":\"\"}",
+        "a true source must write the attribute as the empty string; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("closed="),
+        "{}",
+        "a false source must REMOVE the attribute, not write a value; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("reopened="),
+        "{\"inert\":\"\"}",
+        "the binding must keep toggling; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("disposed="),
+        "{\"inert\":\"\"}",
+        "the effect registers with the nearest boundary, so disposing it must \
+         stop the toggle; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn a66_the_ssr_twin_renders_a_true_boolean_attribute_and_omits_a_false_one() {
+    let stdout = build_and_run_process("toggle_attr_ssr", TOGGLE_ATTR_SSR);
+    assert_eq!(
+        stdout, "<div inert=\"\" id=\"shell\"></div>\n<dialog></dialog>\n",
+        "the server render must carry a true boolean attribute in insertion \
+         order and omit a false one entirely"
+    );
+}
+
+/// Builds `app.vl` for the browser, runs `harness.js`, and hands back the
+/// harness's stdout together with the EMITTED STYLESHEET — the two halves the
+/// `[hidden]` question needs, since the DOM stub models a tree and not a
+/// cascade.
+fn build_and_run_with_stylesheet(tag: &str, app: &str, harness: &str) -> (String, String) {
+    let dir = temp_project(tag);
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"ui_rows_{tag}\"\nroot = \".\"\nentry = \"app.vl\"\ntarget = \"browser\"\n"
+        ),
+    );
+    write(&dir, "app.vl", app);
+    write(&dir, "harness.js", harness);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let mut stylesheet = String::new();
+    for entry in std::fs::read_dir(&dir).expect("read the build directory") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_some_and(|extension| extension == "css") {
+            stylesheet.push_str(&std::fs::read_to_string(&path).expect("read the stylesheet"));
+        }
+    }
+    let run = Command::new("node")
+        .arg("harness.js")
+        .current_dir(&dir)
+        .output()
+        .expect("run node harness");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "harness failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    (stdout, stylesheet)
+}
+
+/// `show` on a flex container actually hides it (A60).
+///
+/// RED BEFORE THE FIX: `show` set the `hidden` PROPERTY and nothing else, and
+/// the rule that would have acted on it — `[hidden]{display:none}` — is emitted
+/// inside `@layer vilan.preflight` while a compiled `Style`'s own rules are
+/// UNLAYERED. An unlayered author declaration is the highest-priority author
+/// layer there is, so `.sX{display:flex}` beat the reset whatever its
+/// specificity and `show(false)` painted the row exactly as before. Both facts
+/// are asserted here, because the DOM stub models a tree and not a cascade:
+/// the emitted stylesheet says the reset cannot win, and the element says
+/// `show` hid it anyway.
+///
+/// No cascade layer could have fixed it — there is no layer above "unlayered" —
+/// and `!important` is refused permanently (css-block.md §10), so the fix is
+/// the inline `display`, put back to what the element had when the source turns
+/// true again.
+#[test]
+fn a60_show_hides_a_flex_container_the_preflight_rule_cannot_reach() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__probe = () => {{\n  \
+         const row = documentRoot.children[0];\n  \
+         return JSON.stringify({{ attributes: row.attributes, inline: row.style.properties }});\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let (stdout, stylesheet) =
+        build_and_run_with_stylesheet("show_flex", SHOW_OVER_A_FLEX_ROW, &harness);
+
+    // The mechanism, off the emitted sheet: the app's `display` is unlayered
+    // and the reset's `[hidden]` is not, so the reset loses outright.
+    assert!(
+        stylesheet
+            .lines()
+            .any(|line| line.ends_with("{display:flex}") && !line.starts_with("@layer")),
+        "the app's own `display` must be emitted UNLAYERED — the premise of \
+         this pin; got:\n{stylesheet}"
+    );
+    assert!(
+        stylesheet.contains("@layer vilan.preflight{[hidden]{display:none}}"),
+        "the preflight's `[hidden]` rule must be emitted in its own layer — \
+         the other half of the premise; got:\n{stylesheet}"
+    );
+
+    // The two style smalls the same item carries, on the same sheet.
+    assert!(
+        stylesheet
+            .lines()
+            .any(|line| line.ends_with("{flex-grow:1}")),
+        "`flex_grow` must emit its declaration; got:\n{stylesheet}"
+    );
+    assert!(
+        stylesheet.contains("background-color:rgb(from currentColor r g b / 0.1)"),
+        "`Color::current()` must render `currentColor` and stay composable \
+         under `.alpha()`; got:\n{stylesheet}"
+    );
+
+    // And the claim: the element is really hidden, and really restored.
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    let shown = line("shown=");
+    assert!(
+        !shown.contains("hidden") && shown.contains("\"inline\":{}"),
+        "a visible element must carry neither the attribute nor an inline \
+         display; got:\n{stdout}"
+    );
+    assert!(
+        line("hidden=").contains("\"hidden\":\"\"")
+            && line("hidden=").contains("\"display\":\"none\""),
+        "`show(false)` must set the `hidden` attribute AND the inline \
+         `display:none` that actually beats the app's own rule; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("reshown="),
+        shown,
+        "`show(true)` must put the element back exactly as it was — the \
+         attribute gone and the inline declaration removed, not left at some \
+         value `show` invented; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn a60_the_ssr_twin_serves_a_hidden_element_with_the_inline_display_too() {
+    let stdout = build_and_run_process("show_ssr", SHOW_SSR);
+    assert_eq!(
+        stdout,
+        "<div id=\"shown\"></div>\n\
+         <div id=\"gone\" hidden=\"\" style=\"display:none\"></div>\n\
+         <div style=\"--w:3rem;display:none\" hidden=\"\"></div>\n",
+        "a hidden element must be served with both writes, and the inline \
+         declaration must join whatever `style_var` already wrote"
     );
 }

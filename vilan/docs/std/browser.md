@@ -28,8 +28,9 @@ impl Element {
 	fun set_text(self, text: str)                      // textContent =
 	fun set_class(self, name: str)                     // className =
 	fun set_attribute(self, name: str, value: str)
-	fun remove_attribute(self, name: str)              // set_attribute's other half
-	fun set_style_property(self, name: str, value: str) // style.setProperty (CSS custom props)
+	fun remove_attribute(self, name: str)              // removeAttribute — a boolean attribute's off
+	fun set_style_property(self, name: str, value: str) // style.setProperty (an empty value REMOVES)
+	fun style_property(self, name: str): str           // style.getPropertyValue
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
 	fun remove(self)                                   // detach from the document
@@ -225,7 +226,7 @@ fun view(tag: str): View
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
-trait Slot { fun place(self, parent: View) }          // View | str | SignalCell<str> | List<View>
+trait Slot { fun place(self, parent: View) }   // str | View | List<View>, and a Source of each
 trait AttrValue { fun apply(self, parent: View, name: str) }   // str | SignalCell<str>
 ```
 
@@ -260,12 +261,13 @@ too.
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
-| `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`SignalCell<str>`), or `List<View>` |
+| `child` | `(content: C): View`; `C: Slot` | the child contract: `str`, `View`, `List<View>`, and a `Source` of each — text re-set in place, an element or a run replaced |
 | `children` | `(items: List<View>): View` | append several |
 | `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
 | `bind_styled` | `(source: S): View`; `S: Source<Style>` | reactive compiled style — `styled`'s reactive twin |
 | `bind_attr` | `(name: str, source: S): View`; `S: Source<str>` | reactive attribute |
+| `toggle_attr` | `(name: str, source: S): View`; `S: Source<bool>` | reactive BOOLEAN attribute — presence, not value (`inert`, `disabled`, `hidden`, `open`): present when true, removed when false |
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |
@@ -274,7 +276,7 @@ too.
 | `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
 | `swap` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<T>` | dispose + rebuild per changed value |
 | `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
-| `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
+| `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
 | `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve |
 

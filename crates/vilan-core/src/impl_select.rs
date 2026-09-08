@@ -184,6 +184,69 @@ pub fn subject_applies(program: &Program, subject: TypeId, target: TypeId) -> bo
     })
 }
 
+/// [`subject_applies`], with each binder's PARAMETERIZED bounds read at their
+/// own arguments (B268).
+///
+/// `bound_trait_ids` keeps the bound's trait id and drops its arguments, so
+/// every blanket over a parameterized trait applied to every instantiation of
+/// it: `impl type S: Source<str> with Slot` applied to a `SignalCell<View>`,
+/// and a `Signal<View>` in child position was placed by std's TEXT arm — the
+/// DOM taking the view's runtime shape, `[object Object]`.
+///
+/// Used only by [`applying_implementations`], and only as a NARROWING pass
+/// there: the analyzer's own bound check threads no arguments through a
+/// supertrait match (`satisfies_trait_bound`, v1), so a program it admitted
+/// must still find a body here. The public [`subject_applies`] stays at the
+/// trait id, which is what its other callers ask of it.
+fn subject_applies_at_arguments(program: &Program, subject: TypeId, target: TypeId) -> bool {
+    if !subject_applies(program, subject, target) {
+        return false;
+    }
+    let mut bindings = HashMap::default();
+    bind_subject(program, subject, target, &mut bindings);
+    bindings.iter().all(|(constraint_id, bound_type)| {
+        bound_type_ids(program, *constraint_id)
+            .iter()
+            .all(|bound_id| match program.type_id_to_type_map.get(bound_id) {
+                Some(Type::Trait(trait_id, bound_arguments)) => {
+                    bound_arguments_hold(program, *bound_type, *trait_id, bound_arguments)
+                }
+                _ => true,
+            })
+    })
+}
+
+/// Whether `concrete` provides `trait_id` AT `wanted` — the bound's own
+/// arguments. Lenient wherever it cannot tell, like [`instantiation_agrees`]
+/// itself: an unparameterized bound, a receiver with no impl of the trait in
+/// view, an arity mismatch, and a bound argument that is still a binder
+/// (`type S: Source<type T>`) all keep the impl.
+fn bound_arguments_hold(
+    program: &Program,
+    concrete: TypeId,
+    trait_id: Id,
+    wanted: &[TypeId],
+) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    let Some(provided) = provided_trait_arguments(program, concrete, trait_id) else {
+        return true;
+    };
+    if provided.len() != wanted.len() {
+        return true;
+    }
+    wanted.iter().zip(provided).all(|(wanted_id, provided_id)| {
+        match (
+            program.type_id_to_type_map.get(wanted_id),
+            program.type_id_to_type_map.get(&provided_id),
+        ) {
+            (Some(wanted), Some(provided)) => instantiation_agrees(program, wanted, provided),
+            _ => true,
+        }
+    })
+}
+
 /// The binders a subject writes, in walk order — the positions
 /// [`bounds_are_stronger`] aligns.
 fn collect_subject_binders(program: &Program, subject: TypeId, binders: &mut Vec<TypeId>) {
@@ -534,7 +597,7 @@ pub fn applying_implementations<'a, 'src>(
     if !is_resolvable(concrete_type) {
         return Vec::new();
     }
-    program
+    let by_instantiation: Vec<&Implementation> = program
         .implementations
         .iter()
         .filter(|implementation| match wanted {
@@ -543,6 +606,28 @@ pub fn applying_implementations<'a, 'src>(
             }
             None => true,
         })
+        .collect();
+    // Tier 1, at the bounds' own arguments (B268) — the pass that separates
+    // `impl type S: Source<str>` from `impl type S: Source<View>` on a
+    // `SignalCell<View>`.
+    let at_arguments: Vec<&Implementation> = by_instantiation
+        .iter()
+        .copied()
+        .filter(|implementation| {
+            subject_applies_at_arguments(program, implementation.subject, concrete)
+        })
+        .collect();
+    if !at_arguments.is_empty() {
+        return at_arguments;
+    }
+    // NARROWS, never empties — the same policy the analyzer's own
+    // `applicable_candidates` keeps. A bound's arguments are read more strictly
+    // here than in `satisfies_trait_bound`, which threads none through a
+    // supertrait match, so a program the analyzer admitted would otherwise
+    // resolve to its trait's body-less requirement and be reported as an
+    // internal error. It keeps the body it has always had instead.
+    by_instantiation
+        .into_iter()
         .filter(|implementation| subject_applies(program, implementation.subject, concrete))
         .collect()
 }

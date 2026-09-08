@@ -6640,7 +6640,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
         "#
         ),
         "<main><h1>alpha</h1><p class=\"alpha\"></p><a href=\"alpha\"></a>\
-         <div style=\"--w:alpha\"></div><i hidden=\"\"></i>\
+         <div style=\"--w:alpha\"></div><i hidden=\"\" style=\"display:none\"></i>\
          <ul><li>x</li><li>y</li></ul><aside><b>here</b></aside></main>\n",
     );
 }
@@ -7016,6 +7016,82 @@ fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
         main();
         "#,
         "[static]\n[first]\n[second]\n",
+    );
+}
+
+/// B268: two blankets over ONE parameterized trait at DIFFERENT arguments,
+/// which is the child contract's shape — `impl type S: Source<str> with Slot`
+/// beside `impl type S: Source<View> with Slot`.
+///
+/// A bound's ARGUMENTS were dropped when an impl was matched to a receiver, on
+/// both sides of the pipeline: the analyzer read `Source` and called both
+/// blankets applicable to a `SignalCell<Panel>` (reporting the pair as
+/// unrankable, "neither impl subject is more specific than the other"), and
+/// emission read `Source` and picked whichever came first. So a `Signal<View>`
+/// in child position took std's TEXT arm and the DOM got `[object Object]`.
+#[test]
+fn b268_two_blankets_over_one_trait_at_different_arguments_each_reach_their_own() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel { name: str, weight: i32 }
+
+        trait Place { fun place(self); }
+
+        impl type S: Source<str> with Place {
+            fun place(self) { print(i"text {self.get()}"); }
+        }
+
+        impl type S: Source<Panel> with Place {
+            fun place(self) { print(i"panel {self.get().name}"); }
+        }
+
+        fun slot<C: Place>(content: C) { content.place(); }
+
+        fun main() {
+            let label: SignalCell<str> = Signal::new("hello");
+            let panel: SignalCell<Panel> = Signal::new(Panel { name = "one", weight = 1 });
+            slot(label);
+            slot(panel);
+            label.set("goodbye");
+            slot(label);
+        }
+        main();
+        "#,
+        "text hello\npanel one\ntext goodbye\n",
+    );
+}
+
+/// The same pair, reached through the ELEMENT the bound is written on rather
+/// than through a generic function — a receiver whose type the analyzer can
+/// see resolves by the same order, and the concrete-argument blanket is not
+/// shadowed by the one that merely names the same trait.
+#[test]
+fn b268_a_concrete_receiver_picks_the_blanket_bounded_at_its_own_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel { name: str, weight: i32 }
+
+        trait Place { fun place(self); }
+
+        impl type S: Source<str> with Place {
+            fun place(self) { print(i"text {self.get()}"); }
+        }
+
+        impl type S: Source<Panel> with Place {
+            fun place(self) { print(i"panel {self.get().name}"); }
+        }
+
+        fun main() {
+            let panel: SignalCell<Panel> = Signal::new(Panel { name = "one", weight = 1 });
+            panel.place();
+        }
+        main();
+        "#,
+        "panel one\n",
     );
 }
 

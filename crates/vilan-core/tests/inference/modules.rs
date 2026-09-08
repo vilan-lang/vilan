@@ -1697,8 +1697,9 @@ fn ssr_swap_renders_the_current_value_branch() {
 
 #[test]
 fn ssr_show_toggles_the_hidden_attribute() {
-    // `show(true)` renders nothing extra; `show(false)` adds `hidden` (mirrors the
-    // DOM's `element.hidden`).
+    // `show(true)` renders nothing extra; `show(false)` adds BOTH the `hidden`
+    // attribute and the inline `display:none` — the two writes the browser twin
+    // makes, because the attribute alone loses to any app `display` (A60).
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
@@ -1709,7 +1710,7 @@ fn ssr_show_toggles_the_hidden_attribute() {
             print(render(view("span").show(Signal::new(false))));
         }
         "#,
-        "<span></span>\n<span hidden=\"\"></span>\n",
+        "<span></span>\n<span hidden=\"\" style=\"display:none\"></span>\n",
     );
 }
 

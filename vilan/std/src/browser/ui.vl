@@ -194,12 +194,17 @@ impl View {
 		self
 	}
 
-	/// Append content — structure only, no ownership bookkeeping. Anything
-	/// `Slot` fills a child position (proposal/element-syntax.md §5): a `View`
-	/// appends as an element, a `str` as a text node, a `SignalCell<str>` as a
-	/// text node kept in sync, a `List<View>` appends each. Text and element
-	/// children interleave as real siblings — mixed content without wrapper
-	/// spans.
+	/// Append content. Anything `Slot` fills a child position
+	/// (proposal/element-syntax.md §5), which is the whole CHILD CONTRACT
+	/// (B268): a `View` appends as an element, a `str` as a text node, a
+	/// `List<View>` appends each, and a `Source` of any of those three keeps
+	/// the position in sync — text re-set in place, an element or a run
+	/// replaced. Text and element children interleave as real siblings — mixed
+	/// content without wrapper spans.
+	///
+	/// Structure only for the static arms; the reactive ones register their one
+	/// subscription with the nearest enclosing boundary, exactly as every
+	/// `bind_*` does.
 	fun child<C: Slot>(self, content: C): View {
 		content.place(self);
 		self
@@ -252,6 +257,28 @@ impl View {
 		let element = self.element;
 		source.effect(|value| {
 			element.set_attribute(name, value);
+		});
+		self
+	}
+
+	/// A BOOLEAN attribute, bound: present when `source` is true, absent when
+	/// it is false (A66). `inert`, `disabled`, `hidden`, `open` — the family
+	/// whose meaning is PRESENCE, not value, so `attr("disabled", "false")` is
+	/// a disabled control and there is no string that turns one off.
+	///
+	/// `bind_attr`'s twin at the other value type: an effect under the current
+	/// owner, dying with the boundary that built it exactly as every binding
+	/// does. The set writes the empty string, which is the canonical spelling
+	/// of a present boolean attribute (`<div inert>` and `<div inert="">`
+	/// serialize alike).
+	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
+		let element = self.element;
+		source.effect(|present| {
+			if present {
+				element.set_attribute(name, "");
+			} else {
+				element.remove_attribute(name);
+			}
 		});
 		self
 	}
@@ -675,10 +702,38 @@ impl View {
 	/// Show or hide the element on a reactive condition — present when
 	/// `condition` is true, hidden otherwise. A pure visibility toggle: the
 	/// content stays mounted and its state (bindings, input text) survives.
+	///
+	/// TWO WRITES, and the second one is the one that hides (A60). The
+	/// `hidden` ATTRIBUTE is what CSS selectors and assistive technology read,
+	/// so it is set; but the preflight's `[hidden]{display:none}` rule sits in
+	/// `@layer vilan.preflight`, and a compiled `Style`'s rules are UNLAYERED —
+	/// an unlayered author declaration is the highest-priority author layer
+	/// there is, so `.sX{display:flex}` beats the reset whatever its
+	/// specificity, and `show` was a silent no-op on every flex container in a
+	/// real app (kolt's `child_relation("not([hidden])", …)` is that defect
+	/// wearing a HACK comment). No cascade layer can fix it, because there is
+	/// no layer above "unlayered"; `!important` is refused permanently
+	/// (css-block.md §10). So hiding writes the INLINE `display: none`, which
+	/// beats every rule in the sheet, and showing writes back the element's own
+	/// inline `display` — captured once, before the first toggle, because
+	/// `show` owns that slot from then on. `set_style_property` with the empty
+	/// string REMOVES the declaration (CSSOM), so an element that had no
+	/// inline display ends with none.
+	///
+	/// The cost is stated plainly: an app that writes this element's inline
+	/// `display` itself, after `show` has bound it, loses that write on the
+	/// next toggle. Style the element through a `Style` — which is what the
+	/// styling surface is for — and the two never meet.
 	fun show<S: Source<bool>>(self, condition: S): View {
 		let element = self.element;
+		let restored = element.style_property("display");
 		condition.effect(|visible| {
 			element.set_hidden(!visible);
+			if visible {
+				element.set_style_property("display", restored);
+			} else {
+				element.set_style_property("display", "none");
+			}
 		});
 		self
 	}
@@ -866,12 +921,17 @@ fun clear_chunk_error() {
 /// static-vs-tracked distinction, and ordinary trait dispatch decides what
 /// lands in the DOM.
 ///
-/// The tracked arm is `SignalCell<str>` and not `Source<str>` — DEFERRED, not an
-/// oversight (A33). `bind_text` and friends widened to a `Source` BOUND, which
-/// is an ordinary generic parameter; the trait arms here would have to widen to
-/// a BLANKET impl (`impl S: Source<str> with Slot`), and that machinery is
-/// B158's. When it lands, this impl and `AttrValue`'s twin below collapse into
-/// one blanket arm each and the element syntax follows for free.
+/// THE CHILD CONTRACT (B268), six arms in three pairs — a `str`, a `View`, a
+/// `List<View>`, and a `Source` of each. The static arm places once; the
+/// reactive arm places and REPLACES, owning its own re-render under the nearest
+/// boundary. That pairing is the whole rule: whatever may be a child statically
+/// may be a child reactively, and `{expr}` in element syntax means the same
+/// thing either way.
+///
+/// The trait keeps the name `Slot` rather than becoming a `Child`: it already
+/// IS this contract — the arms grew, the trait did not change — `Child` is
+/// taken on the process twin (the `enum Child` `render` walks), and every doc
+/// page and generic helper in the estate spells the bound `Slot` today.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 trait Slot {
 	fun place(self, parent: View);
@@ -909,12 +969,79 @@ impl type S: Source<str> with Slot {
 	}
 }
 
-/// Several child elements, in order.
+/// Several child elements, in order — a STATIC run, placed once. This is the
+/// arm a fragment literal would walk through (A46): its type is `List<View>`,
+/// and a list already fills a child position.
 impl List<View> with Slot {
 	fun place(self, parent: View) {
 		for item in self {
 			parent.element.append(item.element);
 		}
+	}
+}
+
+/// A reactive ELEMENT child — the view the source holds, replaced whenever it
+/// changes. `swap`'s shape without `swap`'s render closure: the source's value
+/// IS the new subtree, so there is nothing to build, only the previous element
+/// to remove and the new one to append.
+///
+/// This is what `{signal}` means when the signal carries a `View`. It used to
+/// mean the text arm below — a `Signal<View>` reached the `Source<str>` blanket
+/// because a bound's ARGUMENTS were dropped when an impl was matched to a
+/// receiver — and the DOM took the view's runtime shape, `[object Object]`
+/// (B268; kolt views.vl:543 wrote `.swap(signal, |x| view)` to avoid it).
+///
+/// OWNERSHIP, exactly (proposal/ambient-owner.md §5). The re-render is an
+/// ambient `effect`, so the SUBSCRIPTION belongs to the nearest boundary and
+/// dies with it: a `{signal}` child inside a `bind_each` row stops replacing
+/// anything the moment the row is disposed. What it does NOT own is the views
+/// themselves — each arrived already built, under whatever owner was ambient
+/// where it was CONSTRUCTED, so a replaced view's own bindings die with that
+/// scope and not here. Reach for `swap(source, |value| …)` when each subtree
+/// must be built and disposed per value; reach for this when the views are
+/// values the app already holds.
+///
+/// POSITION: the replacement is APPENDED, like `when`'s and `swap`'s, so a
+/// `{signal}` followed by static siblings re-orders itself behind them on the
+/// first change. Put it last, or wrap it in an element of its own.
+impl type S: Source<View> with Slot {
+	fun place(self, parent: View) {
+		let element = parent.element;
+		let live: Shared<Option<View>> = Shared::new(None);
+		self.effect(|next: View| {
+			match live.read() {
+				Some(let previous) => previous.element.remove(),
+				None => {},
+			}
+			element.append(next.element);
+			live.write() = Some(next);
+		});
+	}
+}
+
+/// A reactive RUN of element children — the `List<View>` arm's reactive twin,
+/// and the door A46's fragment walks through in a `{signal}` hole. The whole
+/// run is replaced on every change: every previous element is removed, every
+/// new one appended, in order.
+///
+/// Not a reconciler, deliberately. `bind_each` is the keyed form — it moves
+/// surviving rows and rebuilds only what changed, and it is what a list of DATA
+/// wants. This one takes a list of VIEWS, which carries no key and no item to
+/// compare, so there is nothing to reconcile against; it is the grouping arm,
+/// with the same ownership story as the single-view arm above.
+impl type S: Source<List<View>> with Slot {
+	fun place(self, parent: View) {
+		let element = parent.element;
+		let live: Shared<List<View>> = Shared::new([]);
+		self.effect(|next: List<View>| {
+			for previous in live.read() {
+				previous.element.remove();
+			}
+			for item in next {
+				element.append(item.element);
+			}
+			live.write() = next;
+		});
 	}
 }
 

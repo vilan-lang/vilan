@@ -130,11 +130,12 @@ impl Element {
 	[extern(method, "setAttribute")]
 	external fun set_attribute(self, name: str, value: str): void;
 
-	/// Removes an attribute (`element.removeAttribute(name)`) — the other half
-	/// of `set_attribute`, and the half a BOOLEAN attribute needs: `disabled`,
-	/// `open`, `aria-hidden` and the rest are read by their PRESENCE, so the
-	/// false state is the attribute being gone, not `="false"`. Removing an
-	/// attribute that is not there is a no-op, not an error.
+	/// Removes an attribute (`element.removeAttribute(name)`). The other half
+	/// of a BOOLEAN attribute, whose meaning is presence and not value: `inert`,
+	/// `disabled`, `hidden`, `open` are on when the attribute is there at all,
+	/// so turning one off means taking it away, never setting it to `"false"`.
+	/// `View::toggle_attr` is the binding written over this; removing an
+	/// attribute that is not there is a no-op, as in the DOM.
 	[extern(method, "removeAttribute")]
 	external fun remove_attribute(self, name: str): void;
 
@@ -143,6 +144,14 @@ impl Element {
 	/// (proposal/ui-styling.md §2.1).
 	[extern(method, "style.setProperty")]
 	external fun set_style_property(self, name: str, value: str): void;
+
+	/// One inline CSS property's current value
+	/// (`element.style.getPropertyValue(name)`), or `""` when the element
+	/// declares none. The read half of `set_style_property`: `View::show`
+	/// takes the element's own inline `display` before it starts writing that
+	/// slot, so it can put back exactly what it found.
+	[extern(method, "style.getPropertyValue")]
+	external fun style_property(self, name: str): str;
 
 	/// Appends `child` as the element's last child.
 	[extern(method, "appendChild")]

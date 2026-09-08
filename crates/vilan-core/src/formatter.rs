@@ -795,6 +795,7 @@ pub const STYLE_PROPERTY_METHODS: &[StyleMethod] = &[
     // it is its own family and may cross `flex`.
     StyleMethod { name: "flex_direction",        category: StyleCategory::FlexboxGrid,          family: "flex-direction",        properties: &["flex-direction"] },
     StyleMethod { name: "flex",                  category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex"] },
+    StyleMethod { name: "flex_grow",             category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex-grow"] },
     StyleMethod { name: "flex_shrink",           category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex-shrink"] },
     StyleMethod { name: "grid_template_columns", category: StyleCategory::FlexboxGrid,          family: "grid-template-columns", properties: &["grid-template-columns"] },
     StyleMethod { name: "gap",                   category: StyleCategory::FlexboxGrid,          family: "gap",                   properties: &["gap"] },

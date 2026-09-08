@@ -175,6 +175,16 @@ impl Color {
 		Color { text = "transparent", root = "" }
 	}
 
+	/// `currentColor` — the element's own `color`, used as a colour value: the
+	/// border, background or SVG fill that follows the text rather than
+	/// naming a token of its own. Declares nothing, like `hex` and `var`, and
+	/// `.alpha()` composes over it through the relative-colour form
+	/// (`rgb(from currentColor r g b / a)`), so a translucent tint of the
+	/// current text colour is one call.
+	fun current(): Color {
+		Color { text = "currentColor", root = "" }
+	}
+
 	/// The typed arbitrary-value escape.
 	fun hex(value: str): Color {
 		Color { text = value, root = "" }
@@ -864,6 +874,10 @@ impl Style {
 	/// nobody writes separately.
 	fun flex(self, value: str): Style {
 		self.raw("flex", value)
+	}
+
+	fun flex_grow(self, value: f64): Style {
+		self.raw("flex-grow", i"{value}")
 	}
 
 	fun flex_shrink(self, value: f64): Style {
