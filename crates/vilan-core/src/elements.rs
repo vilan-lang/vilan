@@ -59,7 +59,7 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Element(body) => {
             // Interior first: head links, handlers, attribute values, and
             // children may themselves contain elements.
-            let body = desugar_interior(body, source);
+            let body = desugar_interior(*body, source);
             build_chain(body, span, source)
         }
         other => descend((other, span), source),

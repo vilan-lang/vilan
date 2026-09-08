@@ -736,15 +736,13 @@ fn requirement_of<'program>(program: &'program Program, node: Id) -> Option<Requ
         return None;
     }
     let source = program.source_of(node)?;
-    // Canonicalized on both sides — `layer_platforms`' roots and
-    // `canonical_sources` alike (`windows-support.md` §5).
-    let path = program.canonical_sources.get(source.0 as usize)?;
-    for (root, _library, label, patterns) in &program.layer_platforms {
-        if !patterns.is_empty() && path.starts_with(root) {
-            return Some(Requirement { label, patterns });
-        }
-    }
-    None
+    // M53: the containment walk this used to run per node is resolved per
+    // SOURCE at `Program` construction (`Program::source_layers`), from the
+    // same canonicalized pair — the roots and `canonical_sources` alike
+    // (`windows-support.md` §5).
+    let index = program.source_layers.get(source.0 as usize)?.requiring? as usize;
+    let (_root, _library, label, patterns) = program.layer_platforms.get(index)?;
+    Some(Requirement { label, patterns })
 }
 
 /// A frame's display name: bare for user code, `name (lib::module)` for
@@ -759,18 +757,14 @@ fn frame_label(program: &Program, id: Id) -> String {
         .source_of(id)
         .and_then(|source| {
             // The STEM comes from the spelling the user gave; the containment
-            // test from the canonical form (`windows-support.md` §5).
+            // test from the canonical form, resolved per source (M53).
             let path = program.sources.get(source.0 as usize)?;
-            let canonical = program.canonical_sources.get(source.0 as usize)?;
-            Some((path, canonical))
+            let containing = program.source_layers.get(source.0 as usize)?.containing?;
+            Some((path, containing as usize))
         })
-        .and_then(|(path, canonical)| {
+        .and_then(|(path, containing)| {
             let stem = path.file_stem()?.to_string_lossy().into_owned();
-            let library = program
-                .layer_platforms
-                .iter()
-                .find(|(root, _, _, _)| canonical.starts_with(root))
-                .map(|(_, library, _, _)| library.clone())?;
+            let library = program.layer_platforms.get(containing)?.1.clone();
             Some(if stem == "lib" {
                 library
             } else {
@@ -789,15 +783,13 @@ fn is_user_code(program: &Program, id: Id) -> bool {
     let Some(source) = program.source_of(id) else {
         return false;
     };
-    // Canonicalized on both sides (`windows-support.md` §5) — a mismatch here
-    // silently reclassifies library code as the user's own.
-    let Some(path) = program.canonical_sources.get(source.0 as usize) else {
-        return false;
-    };
-    !program
-        .layer_platforms
-        .iter()
-        .any(|(root, _, _, _)| path.starts_with(root))
+    // M53: resolved per SOURCE at `Program` construction, from the same
+    // canonicalized pair the walk used to compare here (`windows-support.md`
+    // §5) — an unrecorded source keeps the old answer, "not the user's own".
+    program
+        .source_layers
+        .get(source.0 as usize)
+        .is_some_and(|layer| layer.containing.is_none())
 }
 
 fn violation(

@@ -461,16 +461,16 @@ pub enum Node<'src> {
     // markup sugar over the `std::ui` view chain. Exists only between parse
     // and the pre-analysis desugar (`elements::rewrite_items`); the formatter
     // prints it from source.
-    Element(ElementBody<'src>),
+    Element(Box<ElementBody<'src>>),
     // An enum declaration: name, generics, the `resource` flag (the
     // owned-resource modifier, destruction.md §3 — SURFACE ONLY, carried but
     // not yet classified on), and the variants — each a name, the types of its
     // optional data, and an optional explicit discriminant (`Less = -1`).
     Enum(
         Spanned<&'src str>,
-        Option<GenericParameters<'src>>,
+        Option<Box<GenericParameters<'src>>>,
         bool,
-        Spanned<Vec<Spanned<EnumVariant<'src>>>>,
+        Box<Spanned<Vec<Spanned<EnumVariant<'src>>>>>,
     ),
     Error,
     // A loop: `for { .. }` (infinite, condition `None`) or `for cond { .. }`
@@ -648,10 +648,10 @@ pub enum Node<'src> {
     // for a bodyless `;` declaration (only valid when `external`).
     Struct(
         Spanned<&'src str>,
-        Option<GenericParameters<'src>>,
+        Option<Box<GenericParameters<'src>>>,
         bool,
         bool,
-        Option<Spanned<Vec<Spanned<StructField<'src>>>>>,
+        Option<Box<Spanned<Vec<Spanned<StructField<'src>>>>>>,
     ),
     // B190: the head is B172's `type-path`, not a bare identifier. The
     // namespace segments are the modules the name was reached through, in
@@ -661,15 +661,15 @@ pub enum Node<'src> {
     StructInitializer(
         Vec<&'src str>,
         Spanned<&'src str>,
-        Option<GenericArguments<'src>>,
-        Spanned<Vec<Spanned<StructInitializerField<'src>>>>,
+        Option<Box<GenericArguments<'src>>>,
+        Box<Spanned<Vec<Spanned<StructInitializerField<'src>>>>>,
     ),
     Trait(
         Spanned<&'src str>,
-        Option<GenericParameters<'src>>,
+        Option<Box<GenericParameters<'src>>>,
         // Supertraits: the `A`, `B` in `trait T with A + B`.
         Vec<Spanned<Self>>,
-        Spanned<NodeList<'src>>,
+        Box<Spanned<NodeList<'src>>>,
     ),
     Tuple(NodeList<'src>),
     // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
@@ -719,7 +719,7 @@ impl<'src> Node<'src> {
     /// missing from the scan is exactly the bug this prevents.
     pub fn for_each_child<'a>(&'a self, visit: &mut dyn FnMut(&'a Spanned<Node<'src>>)) {
         fn visit_generic_parameters<'a, 'src>(
-            parameters: &'a Option<GenericParameters<'src>>,
+            parameters: Option<&'a GenericParameters<'src>>,
             visit: &mut dyn FnMut(&'a Spanned<Node<'src>>),
         ) {
             for parameter in parameters.iter().flat_map(|parameters| &parameters.0) {
@@ -909,7 +909,7 @@ impl<'src> Node<'src> {
                 visit(body);
             }
             Node::Enum(_, generic_parameters, _resource, variants) => {
-                visit_generic_parameters(generic_parameters, visit);
+                visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for (_, data, _) in variants.0.iter().map(|variant| &variant.0) {
                     for type_ in data {
                         visit(type_);
@@ -927,7 +927,7 @@ impl<'src> Node<'src> {
                 visit_body(&body.0, visit);
             }
             Node::Func(function) | Node::MacroFun(function) => {
-                visit_generic_parameters(&function.generic_parameters, visit);
+                visit_generic_parameters(function.generic_parameters.as_ref(), visit);
                 visit_parameters(&function.parameters, visit);
                 if let Some(return_type) = function.return_type.as_deref() {
                     visit(return_type);
@@ -1008,7 +1008,7 @@ impl<'src> Node<'src> {
                 }
             }
             Node::Struct(_, generic_parameters, _, _resource, fields) => {
-                visit_generic_parameters(generic_parameters, visit);
+                visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for (_, type_, _) in fields
                     .iter()
                     .flat_map(|fields| &fields.0)
@@ -1030,7 +1030,7 @@ impl<'src> Node<'src> {
                 }
             }
             Node::Trait(_, generic_parameters, supertraits, body) => {
-                visit_generic_parameters(generic_parameters, visit);
+                visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for supertrait in supertraits {
                     visit(supertrait);
                 }
