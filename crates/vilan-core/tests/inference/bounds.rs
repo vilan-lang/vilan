@@ -8042,3 +8042,209 @@ fn b251_an_unbounded_parameters_written_argument_is_still_free() {
         "#,
     );
 }
+
+// --- B262: the written-argument bound check, over every SORT -----------------
+//
+// B251 shipped `check_written_nominal_bounds` reading `structs` alone, and the
+// drain that feeds it recorded a struct alone. An `enum` and a `trait` declare
+// bounded parameters in the same grammar, bind them by the same positional
+// rule, and drain through the same `prepped_type_locals` queue — so
+// `Held<i32, SignalCell<List<str>>>`'s enum twin was still accepted, with the
+// same consequence: an annotation carrying a `str` list out through a declared
+// `i32` one. The sort test is B188's own, which has held all three since the
+// arity check shipped.
+//
+// The refusal is row 401's, unchanged — same wording, same note, same id. What
+// moved is which declarations reach it.
+//
+// CENSUS of bounded declarations across std, vilan/test, the eleven examples,
+// the benchmarks, macro_std, the CLI templates, the docs fences and the README:
+// four bounded STRUCTS (B251's own: `Map<K: Hashable, V>`, `Set<T: Hashable>`,
+// `Optimistic<T, S: Signal<T>>`, the rpc example's `AccountsClient<T:
+// Transport>`), TWO bounded TRAITS — the tour's `trait Holder<T: Label>` and
+// `types.md`'s `trait Doubler<T: Add>` — and ZERO bounded enums. Every written
+// application of the two traits satisfies its bound (`impl DogBox with
+// Holder<Dog>`, and `Dog` implements `Label`), so the estate refuses NOTHING
+// new: the count is zero, as it was for structs. kolt and the website, counted
+// separately and read-only, declare no bounded struct, enum or trait at all.
+
+const HELD_ENUM: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    enum Held<T, S: Signal<List<T>>> { Full(S), Empty }
+    "#;
+
+const HELD_TRAIT: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    trait Held<T, S: Signal<List<T>>> { fun item(self): S; }
+    "#;
+
+#[test]
+fn b262_an_enums_written_argument_is_checked_against_the_parameters_bound() {
+    // The filed shape: B251's struct exhibit with `enum` in place of `struct`.
+    // It compiled.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b262_the_enum_refusal_notes_the_declaration_the_bound_is_written_on() {
+    // The bound is written on the enum, not here, so the report points at it —
+    // the same note B251's struct half carries, reached through the sort-blind
+    // lookup rather than through `structs`.
+    assert_fails_noting(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "required by the bound on parameter 'S' of 'Held'",
+        "Held",
+        "'Held' is declared here",
+    );
+}
+
+#[test]
+fn b262_a_bounded_and_satisfied_enum_argument_compiles_and_runs() {
+    // The control per kind: the same annotation with an argument that MEETS the
+    // bound is exactly as it was.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<i32>>>): i32 {{
+                match h {{
+                    Held::Full(let s) => s.get().len(),
+                    Held::Empty => 0,
+                }}
+            }}
+            fun main() {{ print(show(Held::Full(SignalCell::new([1, 2])))); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b262_a_traits_written_argument_is_checked_against_the_parameters_bound() {
+    // The third sort, reached where a trait application is written: a BOUND.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_TRAIT}
+            fun show<H: Held<i32, SignalCell<List<str>>>>(h: H): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b262_a_bounded_and_satisfied_trait_argument_compiles_and_runs() {
+    // The satisfied control for the trait sort, in the same BOUND position the
+    // refusal above fires in: an argument that meets the bound is untouched.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_TRAIT}
+            fun show<H: Held<i32, SignalCell<List<i32>>>>(h: H): i32 {{
+                h.item().get().len()
+            }}
+            struct Box {{ inner: SignalCell<List<i32>> }}
+            impl Box with Held<i32, SignalCell<List<i32>>> {{
+                fun item(self): SignalCell<List<i32>> {{ self.inner }}
+            }}
+            fun main() {{ print(show(Box {{ inner = SignalCell::new([1, 2]) }})); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b262_the_estates_own_bounded_trait_still_compiles() {
+    // The census's live shape, run: the tour's `trait Holder<T: Label>` with
+    // `Dog`, which implements `Label`. This is what makes the estate count ZERO
+    // rather than merely untested — the two bounded traits in the tree are this
+    // one and `types.md`'s `Doubler<T: Add>`, and every argument written for
+    // either satisfies its bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> {
+            fun item(self): T;
+            fun describe(self): str { "holding " + self.item().label() }
+        }
+        struct Dog {}
+        impl Dog with Label { fun label(self): str { "a dog" } }
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        fun main() { print(DogBox {}.describe()); }
+        main();
+        "#,
+        "holding a dog\n",
+    );
+}
+
+#[test]
+#[ignore = "B262's boundary: an impl's `with` clause reaches neither the arity \
+            check nor the bound check - a site apart from the \
+            `prepped_type_locals` drain this item widens"]
+fn b262_an_impl_with_clauses_trait_argument_is_still_unchecked() {
+    // The boundary, pinned rather than claimed. An impl's `with` clause writes a
+    // trait APPLICATION, but it does not drain through `prepped_type_locals`:
+    // `impl CatBox with Holder<Cat>` is accepted with `Cat` implementing
+    // nothing, and so is `impl CatBox with Holder<Cat, i32>` — so B188's arity
+    // check misses the position too, which dates the hole well before this item.
+    // `vilan/docs/tour/data-and-traits.md` states the opposite in prose ("Each
+    // impl picks the argument … and is checked against the bound there"), so the
+    // page is ahead of the compiler here.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> { fun item(self): T; }
+        struct Cat {}
+        struct CatBox {}
+        impl CatBox with Holder<Cat> {
+            fun item(self): Cat { Cat {} }
+        }
+        fun main() { print(1); }
+        "#,
+        "'Cat' does not implement trait 'Label', required by the bound on parameter 'T' \
+         of 'Holder'",
+    );
+}
+
+#[test]
+fn b262_an_unbounded_enum_parameters_written_argument_is_still_free() {
+    // The counterweight, per B251's: a parameter with no bound requires nothing
+    // of its argument, and the widened check must not invent a requirement for
+    // one — `Option<T>` and `Result<T, E>` are the estate's own unbounded
+    // enums, written everywhere.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        enum Pair<A, B> { Both(A, B), Neither }
+        fun show(p: Pair<i32, str>): i32 {
+            match p {
+                Pair::Both(let a, _) => a,
+                Pair::Neither => 0,
+            }
+        }
+        fun main() { print(show(Pair::Both(1, "x"))); }
+        "#,
+    );
+}

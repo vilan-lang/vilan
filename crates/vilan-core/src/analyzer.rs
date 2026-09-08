@@ -5804,6 +5804,42 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B262: the declaration a written type application binds, whatever its
+    /// SORT — its name, its parameters' constraint ids, and the span the
+    /// "is declared here" note points at.
+    ///
+    /// [`Self::check_written_nominal_bounds`] shipped reading `structs` alone,
+    /// and the drain that feeds it recorded a struct alone, so
+    /// `Held<i32, SignalCell<List<str>>>`'s enum twin — the same parameters,
+    /// the same bound, the same unchecked written arguments — was still
+    /// accepted. An `enum` and a `trait` declare bounded parameters in the same
+    /// grammar and bind them by the same positional rule; there was never a
+    /// reason for the check to know which sort it was looking at, only a lookup
+    /// that did. This is that lookup, in the order B188's arity check reads the
+    /// three.
+    fn nominal_bound_owner(&self, owner_id: Id) -> Option<(&'src str, Vec<TypeId>, Span)> {
+        if let Some(struct_) = self.structs.get(&owner_id) {
+            return Some((
+                struct_.name,
+                struct_.generic_parameter_constraint_ids.clone(),
+                struct_.name_span,
+            ));
+        }
+        if let Some(enum_) = self.enums.get(&owner_id) {
+            return Some((
+                enum_.name,
+                enum_.generic_parameter_constraint_ids.clone(),
+                enum_.name_span,
+            ));
+        }
+        let trait_ = self.traits.get(&owner_id)?;
+        Some((
+            trait_.name,
+            trait_.generic_parameter_constraint_ids.clone(),
+            trait_.name_span,
+        ))
+    }
+
     /// B251: a WRITTEN type application binds a declaration's parameters, so
     /// its arguments owe the same bounds every other binding owes.
     ///
@@ -5823,17 +5859,15 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
-        for (struct_id, written_arguments, span, source_id, type_id) in
+        for (owner_id, written_arguments, span, source_id, type_id) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
-            let Some(struct_) = self.structs.get(&struct_id) else {
+            let Some((owner_name, declared, _)) = self.nominal_bound_owner(owner_id) else {
                 continue;
             };
-            let owner_name = struct_.name;
-            let declared = struct_.generic_parameter_constraint_ids.clone();
             let parameter_names: Vec<&str> = self
                 .declared_generic_parameters
-                .get(&struct_id)
+                .get(&owner_id)
                 .map(|declared| declared.iter().map(|parameter| parameter.name).collect())
                 .unwrap_or_default();
             // A declared bound's arguments may name SIBLING parameters
@@ -5906,14 +5940,13 @@ impl<'src> Analyzer<'src> {
                              '{owner_name}'"
                         ),
                     };
-                    let note = self
-                        .structs
-                        .get(&struct_id)
-                        .map(|struct_| crate::error::Note {
-                            span: struct_.name_span,
+                    let note = self.nominal_bound_owner(owner_id).map(|(_, _, name_span)| {
+                        crate::error::Note {
+                            span: name_span,
                             msg: format!("'{owner_name}' is declared here"),
-                            source: self.source_of_id(struct_id),
-                        });
+                            source: self.source_of_id(owner_id),
+                        }
+                    });
                     self.push_at_written_type(
                         Error {
                             trace: Vec::new(),
@@ -38280,8 +38313,8 @@ impl<'src> Analyzer<'src> {
                             type_id,
                         );
                     }
-                    // B251: the written arguments of a STRUCT application are
-                    // checked against that struct's declared bounds — the same
+                    // B251: the written arguments of a nominal application are
+                    // checked against that declaration's bounds — the same
                     // question `check_generic_bound_satisfaction` asks of every
                     // binding a CALL records, which a written type application
                     // never reaches (nothing records into
@@ -38295,17 +38328,28 @@ impl<'src> Analyzer<'src> {
                     // application already refused on its arity has nothing left
                     // to check (one report per written spelling, B188), and a
                     // path head applies nothing.
+                    //
+                    // B262: every SORT a written application can name, not just
+                    // structs. An `enum` and a `trait` declare bounded
+                    // parameters in the same grammar, bind them by the same
+                    // positional rule, and drain through this same queue — the
+                    // struct-shaped condition here was the only thing keeping
+                    // them out, so `Held<i32, SignalCell<List<str>>>`'s enum
+                    // twin was still accepted. The sort test is B188's own
+                    // (`written_application_arity_error`), which has held all
+                    // three since the arity check shipped.
                     if !refused_arity
                         && !is_path_head
                         && !argument_type_ids.is_empty()
-                        && let Type::Struct(struct_id, _) = subject_type
-                        && matches!(
-                            self.expr_id_to_expr_map.get(&subject_id),
-                            Some(Expr::Struct(_))
-                        )
+                        && let (
+                            Type::Struct(owner_id, _)
+                            | Type::Enum(owner_id, _)
+                            | Type::Trait(owner_id, _),
+                            Some(Expr::Struct(_) | Expr::Enum(_) | Expr::Trait(_)),
+                        ) = (&subject_type, self.expr_id_to_expr_map.get(&subject_id))
                     {
                         self.written_nominal_bound_sites.push((
-                            struct_id,
+                            *owner_id,
                             argument_type_ids.clone(),
                             span,
                             source_id,
