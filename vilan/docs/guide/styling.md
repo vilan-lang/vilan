@@ -230,8 +230,10 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   value is already whole, which is also what lets one named expression be
   reused across several properties. An empty value stops the build.
 - **`Color`** has `Color::white()`, `Color::black()`,
-  `Color::transparent()`, `Color::hex("#663399")`, and stepped ramps
-  like `Color::gray(300)`, `Color::blue(600)`, `Color::red(500)`,
+  `Color::transparent()`, `Color::current()` (CSS's `currentColor` — the
+  element's own text colour, for a border or an SVG fill that follows
+  it), `Color::hex("#663399")`, and stepped ramps like
+  `Color::gray(300)`, `Color::blue(600)`, `Color::red(500)`,
   `Color::green(500)`.
 - **Alpha** comes two ways. `Color::rgba(27, 6, 13, 0.9)` is a literal
   translucent colour — `hex`'s twin, for a palette outside the ramps.

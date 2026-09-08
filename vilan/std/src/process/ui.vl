@@ -107,6 +107,20 @@ fun set_attribute(attributes: Shared<List<Attribute>>, name: str, value: str) {
 	attributes.write() = updated;
 }
 
+/// Append one declaration to the element's `style` attribute, keeping whatever
+/// is already there — the server end of writing an inline style, shared by
+/// `style_var` and `show`.
+fun add_style_declaration(attributes: Shared<List<Attribute>>, declaration: str) {
+	mut current = "";
+	for attribute in attributes.read() {
+		if attribute.name == "style" {
+			current = attribute.value;
+		}
+	}
+	let next = if current == "" { declaration } else { current + ";" + declaration };
+	set_attribute(attributes, "style", next);
+}
+
 impl View {
 	/// Static text content. Like the DOM's `textContent`, this REPLACES any
 	/// children the node had.
@@ -133,15 +147,7 @@ impl View {
 	/// the server end of `width(Length::var("--w"))`. (No subscription: the
 	/// value at render time is the value served.)
 	fun style_var<S: Source<str>>(self, name: str, source: S): View {
-		mut current = "";
-		for attribute in self.attributes.read() {
-			if attribute.name == "style" {
-				current = attribute.value;
-			}
-		}
-		let declaration = name + ":" + source.get();
-		let next = if current == "" { declaration } else { current + ";" + declaration };
-		set_attribute(self.attributes, "style", next);
+		add_style_declaration(self.attributes, name + ":" + source.get());
 		self
 	}
 
@@ -345,11 +351,17 @@ impl View {
 		self
 	}
 
-	/// Show or hide on a condition, read once: a hidden element renders with the
-	/// `hidden` attribute (mirrors the DOM's `element.hidden`).
+	/// Show or hide on a condition, read once: a hidden element renders with
+	/// the `hidden` attribute AND an inline `display:none`, exactly the two
+	/// writes the browser twin makes (A60). The attribute alone does not hide
+	/// anything an app styled, because the preflight's `[hidden]` rule is
+	/// layered and a compiled `Style`'s rules are not — so serving the
+	/// attribute alone would paint the element until the client's first toggle
+	/// took it away. KEEP IN STEP with the browser twin.
 	fun show<S: Source<bool>>(self, condition: S): View {
 		if !condition.get() {
 			set_attribute(self.attributes, "hidden", "");
+			add_style_declaration(self.attributes, "display:none");
 		}
 		self
 	}

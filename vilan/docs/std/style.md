@@ -35,6 +35,7 @@ impl Color {
 	fun white(): Color
 	fun black(): Color
 	fun transparent(): Color
+	fun current(): Color           // currentColor — the element's own text colour
 	fun hex(value: str): Color     // "#663399"
 	fun var(name: str): Color      // a custom-property reference ("--accent"); the app declares it
 	fun gray(step: i32): Color     // ramps: 50…900
@@ -124,6 +125,7 @@ Layout:
 | `align_items` | `AlignItems` |
 | `justify_content` | `JustifyContent` |
 | `flex` | `str` — the shorthand, `"1 1 auto"` |
+| `flex_grow` | `f64` |
 | `flex_shrink` | `f64` |
 | `grid_template_columns` | `str` — `"repeat(3, 1fr)"` |
 | `gap`, `padding`, `padding_x`, `padding_y`, `margin`, `margin_x`, `margin_y` | `Length` |

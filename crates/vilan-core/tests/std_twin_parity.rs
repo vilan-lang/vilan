@@ -240,6 +240,15 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
+        "add_style_declaration",
+        Side::ProcessOnly,
+        "The append-one-declaration-to-the-`style`-attribute helper `style_var` \
+         and `show` share. Inline style on this twin is a STRING the serializer \
+         emits, so writing one means reading the attribute back and appending; \
+         the browser twin calls `style.setProperty`, which is that operation.",
+    ),
+    (
+        "ui",
         "is_void_element",
         Side::ProcessOnly,
         "A serialization detail behind `render`: void elements take no closing \

@@ -1090,3 +1090,203 @@ fn a66_the_ssr_twin_renders_a_true_boolean_attribute_and_omits_a_false_one() {
          order and omit a false one entirely"
     );
 }
+
+// --- A60: `show` must beat an app's own `display` ----------------------------
+
+/// A flex container under `show`, plus the two style smalls the same item
+/// carries: `flex_grow` beside `flex_shrink`, and `Color::current()` composed
+/// through `.alpha()`.
+const SHOW_OVER_A_FLEX_ROW: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::style::{ Color, Display, preflight, style };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let _reset = const preflight();
+	let visible: SignalCell<bool> = Signal::new(true);
+	let _root = mount_root("app", || {
+		view("div")
+			.styled(const style()
+				.display(Display::Flex)
+				.flex_grow(1f)
+				.background(Color::current().alpha(0.1)))
+			.show(visible)
+			.child(view("p").text("row"))
+	});
+	print(i"shown={probe()}");
+	visible.set(false);
+	print(i"hidden={probe()}");
+	visible.set(true);
+	print(i"reshown={probe()}");
+}
+
+[extern("__probe")]
+external fun probe(): str;
+
+main();
+"#;
+
+/// Builds `app.vl` for the browser, runs `harness.js`, and hands back the
+/// harness's stdout together with the EMITTED STYLESHEET — the two halves the
+/// `[hidden]` question needs, since the DOM stub models a tree and not a
+/// cascade.
+fn build_and_run_with_stylesheet(tag: &str, app: &str, harness: &str) -> (String, String) {
+    let dir = temp_project(tag);
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"ui_rows_{tag}\"\nroot = \".\"\nentry = \"app.vl\"\ntarget = \"browser\"\n"
+        ),
+    );
+    write(&dir, "app.vl", app);
+    write(&dir, "harness.js", harness);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let mut stylesheet = String::new();
+    for entry in std::fs::read_dir(&dir).expect("read the build directory") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_some_and(|extension| extension == "css") {
+            stylesheet.push_str(&std::fs::read_to_string(&path).expect("read the stylesheet"));
+        }
+    }
+    let run = Command::new("node")
+        .arg("harness.js")
+        .current_dir(&dir)
+        .output()
+        .expect("run node harness");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "harness failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    (stdout, stylesheet)
+}
+
+/// `show` on a flex container actually hides it (A60).
+///
+/// RED BEFORE THE FIX: `show` set the `hidden` PROPERTY and nothing else, and
+/// the rule that would have acted on it — `[hidden]{display:none}` — is emitted
+/// inside `@layer vilan.preflight` while a compiled `Style`'s own rules are
+/// UNLAYERED. An unlayered author declaration is the highest-priority author
+/// layer there is, so `.sX{display:flex}` beat the reset whatever its
+/// specificity and `show(false)` painted the row exactly as before. Both facts
+/// are asserted here, because the DOM stub models a tree and not a cascade:
+/// the emitted stylesheet says the reset cannot win, and the element says
+/// `show` hid it anyway.
+///
+/// No cascade layer could have fixed it — there is no layer above "unlayered" —
+/// and `!important` is refused permanently (css-block.md §10), so the fix is
+/// the inline `display`, put back to what the element had when the source turns
+/// true again.
+#[test]
+fn a60_show_hides_a_flex_container_the_preflight_rule_cannot_reach() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__probe = () => {{\n  \
+         const row = documentRoot.children[0];\n  \
+         return JSON.stringify({{ attributes: row.attributes, inline: row.style.properties }});\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let (stdout, stylesheet) =
+        build_and_run_with_stylesheet("show_flex", SHOW_OVER_A_FLEX_ROW, &harness);
+
+    // The mechanism, off the emitted sheet: the app's `display` is unlayered
+    // and the reset's `[hidden]` is not, so the reset loses outright.
+    assert!(
+        stylesheet
+            .lines()
+            .any(|line| line.ends_with("{display:flex}") && !line.starts_with("@layer")),
+        "the app's own `display` must be emitted UNLAYERED — the premise of \
+         this pin; got:\n{stylesheet}"
+    );
+    assert!(
+        stylesheet.contains("@layer vilan.preflight{[hidden]{display:none}}"),
+        "the preflight's `[hidden]` rule must be emitted in its own layer — \
+         the other half of the premise; got:\n{stylesheet}"
+    );
+
+    // The two style smalls the same item carries, on the same sheet.
+    assert!(
+        stylesheet
+            .lines()
+            .any(|line| line.ends_with("{flex-grow:1}")),
+        "`flex_grow` must emit its declaration; got:\n{stylesheet}"
+    );
+    assert!(
+        stylesheet.contains("background-color:rgb(from currentColor r g b / 0.1)"),
+        "`Color::current()` must render `currentColor` and stay composable \
+         under `.alpha()`; got:\n{stylesheet}"
+    );
+
+    // And the claim: the element is really hidden, and really restored.
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    let shown = line("shown=");
+    assert!(
+        !shown.contains("hidden") && shown.contains("\"inline\":{}"),
+        "a visible element must carry neither the attribute nor an inline \
+         display; got:\n{stdout}"
+    );
+    assert!(
+        line("hidden=").contains("\"hidden\":\"\"")
+            && line("hidden=").contains("\"display\":\"none\""),
+        "`show(false)` must set the `hidden` attribute AND the inline \
+         `display:none` that actually beats the app's own rule; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("reshown="),
+        shown,
+        "`show(true)` must put the element back exactly as it was — the \
+         attribute gone and the inline declaration removed, not left at some \
+         value `show` invented; got:\n{stdout}"
+    );
+}
+
+/// The SSR twin makes the same two writes, so a server-rendered hidden element
+/// is hidden on the first paint rather than painted until the client's first
+/// toggle takes it away.
+const SHOW_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let visible: SignalCell<bool> = Signal::new(true);
+	let gone: SignalCell<bool> = Signal::new(false);
+	let width: SignalCell<str> = Signal::new("3rem");
+	print(render(view("div").attr("id", "shown").show(visible)));
+	print(render(view("div").attr("id", "gone").show(gone)));
+	print(render(view("div").style_var("--w", width).show(gone)));
+}
+
+main();
+"#;
+
+#[test]
+fn a60_the_ssr_twin_serves_a_hidden_element_with_the_inline_display_too() {
+    let stdout = build_and_run_process("show_ssr", SHOW_SSR);
+    assert_eq!(
+        stdout,
+        "<div id=\"shown\"></div>\n\
+         <div id=\"gone\" hidden=\"\" style=\"display:none\"></div>\n\
+         <div style=\"--w:3rem;display:none\" hidden=\"\"></div>\n",
+        "a hidden element must be served with both writes, and the inline \
+         declaration must join whatever `style_var` already wrote"
+    );
+}

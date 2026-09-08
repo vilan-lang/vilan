@@ -70,6 +70,14 @@ impl Element {
 	[extern(method, "style.setProperty")]
 	external fun set_style_property(self, name: str, value: str): void;
 
+	/// One inline CSS property's current value
+	/// (`element.style.getPropertyValue(name)`), or `""` when the element
+	/// declares none. The read half of `set_style_property`: `View::show`
+	/// takes the element's own inline `display` before it starts writing that
+	/// slot, so it can put back exactly what it found.
+	[extern(method, "style.getPropertyValue")]
+	external fun style_property(self, name: str): str;
+
 	/// Appends `child` as the element's last child.
 	[extern(method, "appendChild")]
 	external fun append(self, child: Element): void;

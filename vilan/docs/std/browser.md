@@ -22,7 +22,8 @@ impl Element {
 	fun set_class(self, name: str)                     // className =
 	fun set_attribute(self, name: str, value: str)
 	fun remove_attribute(self, name: str)              // removeAttribute — a boolean attribute's off
-	fun set_style_property(self, name: str, value: str) // style.setProperty (CSS custom props)
+	fun set_style_property(self, name: str, value: str) // style.setProperty (an empty value REMOVES)
+	fun style_property(self, name: str): str           // style.getPropertyValue
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
 	fun remove(self)                                   // detach from the document
@@ -167,7 +168,7 @@ too.
 | `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
 | `swap` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<T>` | dispose + rebuild per changed value |
 | `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
-| `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
+| `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
 | `autofocus` | `(): View` | `on_mount(\|element\| element.focus())` — the modal-input form HTML's `autofocus` cannot serve |
 

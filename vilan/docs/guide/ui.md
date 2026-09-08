@@ -419,6 +419,16 @@ not visible:
 | | Content while off | State | Use for |
 |---|---|---|---|
 | `.show(condition)` | mounted, hidden | preserved | tabs, collapsibles, anything that should keep its input text |
+
+`show` makes two writes: the `hidden` attribute, which selectors and
+assistive technology read, and an inline `display: none`, which is what
+actually hides it. The attribute alone would not — the preflight's
+`[hidden]{display:none}` sits in `@layer vilan.preflight` and a compiled
+`Style`'s rules are unlayered, so any `display` you set beats the reset
+outright. Showing again puts back the element's own inline `display`,
+captured before the first toggle. If you write this element's inline
+`display` yourself after binding `show`, the next toggle takes it: style
+through a `Style` and the two never meet.
 | `.when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
 | `.swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
 
@@ -544,8 +554,9 @@ signals that should settle as one wave.
   hidden content is expensive, use `when`.
 - Inline SVG works: `view("svg").attr("viewBox", …).child(view("path")…)`
   creates real SVG-namespace elements, and the server render carries the
-  `xmlns`. But `show` drives the HTML-only `hidden` property, which SVG
-  ignores: toggle an SVG subtree with `when` (or a class) instead.
+  `xmlns`. `show` works on an SVG subtree too — it writes the inline
+  `display`, which SVG honours, not only the HTML-only `hidden`
+  attribute that SVG ignores.
 - `bind_value` fights remote updates (every keystroke overwrites). For
   server-backed fields, use `bind_draft`.
 - The `owner_scope` compile error means you built UI outside every

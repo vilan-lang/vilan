@@ -658,10 +658,38 @@ impl View {
 	/// Show or hide the element on a reactive condition — present when
 	/// `condition` is true, hidden otherwise. A pure visibility toggle: the
 	/// content stays mounted and its state (bindings, input text) survives.
+	///
+	/// TWO WRITES, and the second one is the one that hides (A60). The
+	/// `hidden` ATTRIBUTE is what CSS selectors and assistive technology read,
+	/// so it is set; but the preflight's `[hidden]{display:none}` rule sits in
+	/// `@layer vilan.preflight`, and a compiled `Style`'s rules are UNLAYERED —
+	/// an unlayered author declaration is the highest-priority author layer
+	/// there is, so `.sX{display:flex}` beats the reset whatever its
+	/// specificity, and `show` was a silent no-op on every flex container in a
+	/// real app (kolt's `child_relation("not([hidden])", …)` is that defect
+	/// wearing a HACK comment). No cascade layer can fix it, because there is
+	/// no layer above "unlayered"; `!important` is refused permanently
+	/// (css-block.md §10). So hiding writes the INLINE `display: none`, which
+	/// beats every rule in the sheet, and showing writes back the element's own
+	/// inline `display` — captured once, before the first toggle, because
+	/// `show` owns that slot from then on. `set_style_property` with the empty
+	/// string REMOVES the declaration (CSSOM), so an element that had no
+	/// inline display ends with none.
+	///
+	/// The cost is stated plainly: an app that writes this element's inline
+	/// `display` itself, after `show` has bound it, loses that write on the
+	/// next toggle. Style the element through a `Style` — which is what the
+	/// styling surface is for — and the two never meet.
 	fun show<S: Source<bool>>(self, condition: S): View {
 		let element = self.element;
+		let restored = element.style_property("display");
 		condition.effect(|visible| {
 			element.set_hidden(!visible);
+			if visible {
+				element.set_style_property("display", restored);
+			} else {
+				element.set_style_property("display", "none");
+			}
 		});
 		self
 	}

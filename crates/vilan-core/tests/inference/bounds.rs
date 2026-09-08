@@ -6638,7 +6638,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
         "#
         ),
         "<main><h1>alpha</h1><p class=\"alpha\"></p><a href=\"alpha\"></a>\
-         <div style=\"--w:alpha\"></div><i hidden=\"\"></i>\
+         <div style=\"--w:alpha\"></div><i hidden=\"\" style=\"display:none\"></i>\
          <ul><li>x</li><li>y</li></ul><aside><b>here</b></aside></main>\n",
     );
 }
