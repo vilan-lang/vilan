@@ -214,8 +214,27 @@ impl Event {
 	external fun alt_key(self): bool;
 
 	/// The key for a keyboard event (`event.key`): `"Enter"`, `"Escape"`, `"a"`, ….
+	/// This is the CHARACTER the layout produced — what a text-entry handler
+	/// wants, and what changes when the user switches keyboard layouts.
 	[extern(get, "key")]
 	external fun key(self): str;
+
+	/// The PHYSICAL key for a keyboard event (`event.code`): `"KeyE"`,
+	/// `"Digit1"`, `"Enter"`, `"Escape"` — the position on the board, unchanged
+	/// by the layout mapped onto it.
+	///
+	/// The pair matters, and picking wrong is silent. A shortcut table wants
+	/// `code`: `"KeyE"` is the same physical key on QWERTY, AZERTY and Dvorak,
+	/// where `key` there is `"e"`, `"e"` and `"."` — so a shortcut written
+	/// against `key` moves under the user's layout, and a shortcut written
+	/// against `code` does not. A text-entry handler wants `key`, for the
+	/// mirror-image reason: it is the character the user meant to type.
+	///
+	/// The names are the host's own (`KeyboardEvent.code`'s value space), so
+	/// a binding table reads the same in vilan as in the DOM docs it is
+	/// written from.
+	[extern(get, "code")]
+	external fun code(self): str;
 
 	/// Where the pointer is, in viewport coordinates (`event.clientX` /
 	/// `event.clientY`) — the numbers a drag subtracts.
@@ -230,6 +249,32 @@ impl Event {
 
 	[extern(get, "clientY")]
 	external fun pointer_y(self): f64;
+
+	/// The element the event was DISPATCHED TO — the innermost node under the
+	/// pointer or holding the focus (`event.target`).
+	///
+	/// This is the "did it land inside me?" accessor: a document-level click
+	/// listener reads `event.target()` and dismisses the overlay it guards when
+	/// the click landed outside it.
+	[extern(get, "target")]
+	external fun target(self): Element;
+
+	/// The element whose LISTENER is running (`event.currentTarget`) — the node
+	/// the handler was registered on, as the event bubbles past it.
+	///
+	/// Distinct from `target` and deliberately so, because the two answer
+	/// different questions and coincide only when the event was dispatched
+	/// straight at the listening element. `target` is where the event STARTED
+	/// (a click on the `<span>` inside a button is the span); `current_target`
+	/// is which handler is speaking (the button). A row of buttons sharing one
+	/// handler reads `current_target` to learn which row it is in — reading
+	/// `target` there gets whatever glyph the user happened to hit.
+	///
+	/// It is only meaningful DURING dispatch: the host clears it when the
+	/// handler returns, so a captured `Event` read later hands back null. Read
+	/// it in the handler, not out of one.
+	[extern(get, "currentTarget")]
+	external fun current_target(self): Element;
 
 	/// The value of the element the event was dispatched to
 	/// (`event.target.value`) — what an `<input>` holds right now, read from

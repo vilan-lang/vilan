@@ -58,7 +58,10 @@ impl Event {
 	fun ctrl_key(self): bool
 	fun shift_key(self): bool
 	fun alt_key(self): bool
-	fun key(self): str           // "Enter", "Escape", "a", …
+	fun key(self): str           // "Enter", "Escape", "a", … — the CHARACTER
+	fun code(self): str          // "KeyE", "Digit1", "Escape" — the PHYSICAL key
+	fun target(self): Element    // the node the event was dispatched to
+	fun current_target(self): Element  // the node whose listener is running
 	fun target_value(self): str  // event.target.value — the input's text
 	fun pointer_x(self): f64     // clientX — where the pointer is, in the viewport
 	fun pointer_y(self): f64     // clientY
@@ -97,6 +100,23 @@ moves.dispose();
 the handler you pass must be the same value the host was handed, so a freshly
 written closure removes nothing. `listen` exists so you don't have to hold that
 pairing right.
+
+**`key` is the character; `code` is the key.** A shortcut table wants `code`:
+`"KeyE"` is the same physical key on QWERTY, AZERTY and Dvorak, where `key`
+reads `"e"`, `"e"` and `"."` there — so a shortcut written against `key` moves
+under the user's layout and one written against `code` does not. A text-entry
+handler wants `key`, for the mirror-image reason. Both use the host's own value
+spaces, so a binding table reads the same here as in the DOM docs it came from.
+
+**`target` is where the event started; `current_target` is which handler is
+speaking.** They coincide only when the event was dispatched straight at the
+listening element. A click on the `<span>` inside a button has the span as
+`target` and the button as `current_target` — so a row of buttons sharing one
+handler reads `current_target` to learn which row it is in, and a
+document-level dismiss listener reads `target` to ask "did this land inside
+me?". `current_target` is only meaningful
+DURING dispatch: the host clears it when the handler returns, so read it in the
+handler rather than out of a captured event.
 
 `target_value` is how a listener reads what the user typed **without holding
 the element**. An element that reaches its own listener and back is a cycle
