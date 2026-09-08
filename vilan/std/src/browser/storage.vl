@@ -1,7 +1,33 @@
 // Web Storage (proposal/kolt-migration.md §2.4): `localStorage` /
-// `sessionStorage` on the browser layer. A missing key reads as "" (the host
-// returns null; the helper flattens it) — the client-side home for a session
-// token. Values are strings; encode structured data through a codec.
+// `sessionStorage` on the browser layer. Values are strings; encode structured
+// data through a codec (`std::json`'s `Json`/`FromJson` for a scalar, or
+// `encode_json`/`decode_json` for a `Wire` type).
+//
+// TWO FORMS, and which one a call site wants is a real question. The six FREE
+// functions below are the ONE-KEY form — read a session token, write a
+// preference — and they are not deprecated by what follows: they are shorter at
+// the site that only ever touches one key, and they flatten a missing key to ""
+// so nothing has to be unwrapped. The `Storage` HANDLE (`window()
+// .local_storage()`) is the form that enumerates and presence-tests a store,
+// and its `get` returns `Option<str>`, so it is also the form that can tell an
+// ABSENT key from one whose stored value is legitimately "". A sweep that
+// deletes the keys an app no longer declares needs `len` + `key_at`; a
+// "initialize this key if unset" pass needs `has`, which `!get(key).is_empty()`
+// answers wrongly for a stored "". Reach for the handle when the store itself
+// is the subject, and for the free functions when a key is.
+//
+// BROWSER-ONLY, and there is deliberately no process twin. An SSR leg has no
+// `window` and no per-user store, so the choice would be between a stub that
+// touches `window` (a crash on the server) and an in-memory map that answers
+// every read with a value the browser never wrote — and the second is worse,
+// because it turns a layer mistake into a silent divergence between the two
+// renders of one component. Importing `std::storage` from a process module is
+// a hard cross-platform error at analysis instead, which names the mistake at
+// the import. Persisted server state is `std::db`; state that must reach the
+// browser rides the render or an rpc call.
+
+import pkg::dom::Window;
+import pkg::option::Option::{ self, None, Some };
 
 /// `localStorage.getItem(key)` — "" when absent.
 [extern("__local_get")]
@@ -22,3 +48,114 @@ external fun session_set(key: str, value: str): void;
 
 [extern("sessionStorage.removeItem")]
 external fun session_remove(key: str): void;
+
+// --- The handle ---------------------------------------------------------------
+
+/// One of the host's two Web Storage areas, as a value you hold: a string→string
+/// map, scoped to the origin, that can be counted, enumerated, tested and
+/// cleared.
+///
+/// An opaque handle like `Element` — a reference to the ONE live store, not a
+/// snapshot of it, so copying it (binding it, passing it, keeping it in a field)
+/// shares the store rather than the strings in it. Reads see whatever was last
+/// written, from anywhere, including another tab.
+external struct Storage;
+
+// The two reader verbs sit on `Window` rather than being free functions,
+// because that is where the host puts them and where kolt reached for them —
+// and because a free `local_storage()` would need a runtime helper to address
+// a global PROPERTY, which is the cost `__dom_window` already paid once.
+// It does mean a call site imports BOTH: `std::dom`'s `window` for the handle
+// and `std::storage` for this impl, since an impl is in scope only where its
+// module is.
+impl Window {
+	/// `window.localStorage` — the origin-scoped store that outlives the tab.
+	[extern(get, "localStorage")]
+	external fun local_storage(self): Storage;
+
+	/// `window.sessionStorage` — the tab-scoped store, cleared when the tab
+	/// closes. The same surface, a shorter life.
+	[extern(get, "sessionStorage")]
+	external fun session_storage(self): Storage;
+}
+
+impl Storage {
+	/// How many keys the store holds (`storage.length`).
+	[extern(get, "length")]
+	external fun len(self): i32;
+
+	/// The name of the key at `index` (`storage.key(index)`), or `None` when
+	/// `index` is out of range.
+	///
+	/// This is the enumeration half: `len()` down to 0 calling `key_at(i - 1)`
+	/// visits every key, and counting DOWN is the shape to write, because
+	/// removing a key while walking renumbers everything above it.
+	///
+	/// The host's key ORDER is unspecified and may change between visits, so a
+	/// pass that both reads and removes must not assume it is stable — walk
+	/// downward and decide per key, or collect the names first.
+	fun key_at(self, index: i32): Option<str> {
+		let key = self.raw_key_at(index);
+		if is_null(key) {
+			None
+		} else {
+			Some(key)
+		}
+	}
+
+	/// The value stored under `key`, or `None` when the key is ABSENT.
+	///
+	/// This is the whole reason the handle exists. The free `get` above flattens
+	/// a missing key to "", which is right for a one-key read and wrong for
+	/// anything that has to tell "" apart from nothing: a key whose stored value
+	/// is legitimately the empty string reads back `Some("")` here and `""`
+	/// there, and only one of those two answers is a fact about the store.
+	fun get(self, key: str): Option<str> {
+		let value = self.raw_get(key);
+		if is_null(value) {
+			None
+		} else {
+			Some(value)
+		}
+	}
+
+	/// Whether `key` is present at all — including a key stored as "", which is
+	/// exactly what `!get(key).is_empty()` gets wrong.
+	fun has(self, key: str): bool {
+		!is_null(self.raw_get(key))
+	}
+
+	/// Stores `value` under `key` (`storage.setItem`), replacing whatever was
+	/// there.
+	[extern(method, "setItem")]
+	external fun set(self, key: str, value: str): void;
+
+	/// Removes `key` (`storage.removeItem`). Removing an absent key is a no-op,
+	/// not an error.
+	[extern(method, "removeItem")]
+	external fun remove(self, key: str): void;
+
+	/// Empties the store (`storage.clear()`) — EVERY key on this origin, not
+	/// only the ones this app wrote. An app that shares its origin with anything
+	/// else deletes its own keys by name instead.
+	[extern(method, "clear")]
+	external fun clear(self): void;
+
+	// The host forms the three wrappers above are built from. They are declared
+	// last because they are not the surface: `key` and `getItem` return null for
+	// an absent key or an out-of-range index, typed here as `str` because the
+	// binding has no `Option` return, and turning that null into an `Option` is
+	// the whole job of the wrappers. Call the wrappers.
+	[extern(method, "key")]
+	external fun raw_key_at(self, index: i32): str;
+
+	[extern(method, "getItem")]
+	external fun raw_get(self, key: str): str;
+}
+
+/// Whether a host value is JS `null`/`undefined` — the peek the two `Option`
+/// wrappers above need, and the same private guard `browser/ui.vl` keeps at the
+/// mount seam. Not part of this module's surface; it is here because a null a
+/// binding cannot type is only readable through a call like this one.
+[extern("__is_null")]
+external fun is_null(value: str): bool;

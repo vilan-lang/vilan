@@ -11,6 +11,7 @@
 import pkg::compare::{ Ordering, PartialEq, PartialOrd };
 import pkg::operators::{ Add, Sub };
 import pkg::option::Option::{ self, None, Some };
+import pkg::shared::Shared;
 import pkg::task::{ CancelSignal, ambient_signal };
 
 // --- The clock ---------------------------------------------------------------
@@ -270,5 +271,141 @@ impl Timer {
 	/// idempotent and a late cancel never rewrites a `true` into a `false`.
 	fun cancel(self) {
 		self.handle.cancel();
+	}
+}
+
+// --- Debounce ------------------------------------------------------------------
+
+/// Collapses a burst of calls into ONE, `delay` after the last of them —
+/// trailing edge.
+///
+/// Each `run` pushes the deadline out and REPLACES the callback, so a burst
+/// fires once, late, with the LAST callback: exactly what a search field wants
+/// (one query, for the text the user stopped typing) and what a resize handler
+/// wants (one layout pass, at the size the window settled at). There is at most
+/// one timer in flight however many times `run` is called.
+///
+/// It is trailing edge and not leading: the first call of a burst does not fire.
+/// A leading-edge `Throttle` is deliberately NOT shipped here — it is a
+/// different mechanism rather than a flag on this one (it fires immediately and
+/// then SUPPRESSES, so it needs no pending callback at all and its timer gates
+/// rather than schedules), and nothing has asked for it. It lands when something
+/// does, beside this rather than inside it.
+///
+///     let search = Debounce::new(Duration::millis(300));
+///     input.on_event("input", |event| {
+///         let text = event.target_value();
+///         search.run(|| query.set(text));
+///     });
+///
+/// Like `Timer`, a `Debounce` is a value wrapping shared cells, so copying it
+/// (binding it, passing it, keeping it in a field) shares the ONE debounce:
+/// `run` through any copy pushes the same deadline.
+///
+/// It takes no owner and registers no cleanup. `std::time` is the base clock
+/// module and sits below `std::reactive`, so a `Debounce` is a plain value in
+/// the shape `Timer` already established — `cancel()` is the teardown, and an
+/// app that wants one tied to a scope wraps it itself. A pending debounce keeps
+/// the host alive until it fires (the outstanding timer does), so cancel one you
+/// are done with if you want the program to be free to end.
+struct Debounce {
+	delay: Duration,
+	/// The deadline and the callback that will run at it — replaced whole by
+	/// every `run`, cleared when it fires or is cancelled.
+	///
+	/// The `Shared` cell IS required, and both directions of the rule are
+	/// load-bearing (`docs/spec/memory.md` §6). `run` takes `self` by loan and
+	/// the `async` block OUTLIVES that loan: it reads this field on every timer
+	/// tick, long after `run` returned. Rule 1 (§6.1) is why a plain field
+	/// cannot serve — values are copied, so the block would capture a COPY of
+	/// the deadline made at spawn time and never see a later `run`'s push, and
+	/// the copy it wrote would be discarded. `Shared` is the cell that makes
+	/// that escape legal, and rule 3 (§6.3) is what lets the block WRITE
+	/// through what is only a loan: `write()` is a second-class view projected
+	/// from the cell, not from `self`'s stack slot. (This is kolt's own
+	/// `// TODO: Investigate whether the `Shared` cell is needed.`, answered:
+	/// yes, and it cannot be a plain field.)
+	pending: Shared<Option<(Instant, || void)>>,
+	/// Whether a driving `async` loop is live. Set SYNCHRONOUSLY by `run`
+	/// before it spawns one, so that two `run`s in the same tick cannot both
+	/// spawn — a guard the spawned block cannot provide for itself, whatever
+	/// the host's scheduling does with it.
+	///
+	/// It also survives `cancel`: the loop is still parked when `cancel`
+	/// returns, so a `run` immediately after a `cancel` must NOT start a second
+	/// loop. It hands the still-live one a fresh deadline instead, which the
+	/// loop picks up when its cancelled wait resolves.
+	running: Shared<bool>,
+	/// The in-flight timer, so `cancel` can call it off rather than let it run
+	/// out. Without it a cancelled debounce fires nothing (the loop re-reads
+	/// `pending` and finds `None`) but still holds the host open for the rest of
+	/// the delay.
+	timer: Shared<Option<Timer>>,
+}
+
+impl Debounce {
+	/// A debounce that fires `delay` after the last `run`.
+	fun new(delay: Duration): Debounce {
+		Debounce {
+			delay,
+			pending = Shared::new(None),
+			running = Shared::new(false),
+			timer = Shared::new(None),
+		}
+	}
+
+	/// Schedule `fn` to run `delay` from now, REPLACING whatever was pending.
+	///
+	/// Calls inside the window collapse: the deadline moves out to `delay` from
+	/// THIS call and the callback becomes this one, so the burst costs one run
+	/// of the last closure. A call after the previous one has fired starts a
+	/// fresh window.
+	fun run(self, fn: || void) {
+		self.pending.write() = Some((now() + self.delay, fn));
+		// A loop already driving this cell — parked on a timer, or between one
+		// and the next — re-reads the deadline after every wait, so the push
+		// above is all this call has to do. Only the first call of a window
+		// starts one.
+		if !self.running.read() {
+			self.running.write() = true;
+			async {
+				for self.pending.read() is Some(let (deadline, _)) {
+					let timer = Timer::after_for(deadline.since(now()));
+					self.timer.write() = Some(timer);
+					if timer.wait() {
+						self.timer.write() = None;
+						// Re-read: a `run` that arrived DURING the wait pushed the
+						// deadline out, so the timer that just fired is early and
+						// the loop takes another turn. This is what makes a burst
+						// one run rather than one run per call.
+						if self.pending.read() is Some(let (moment, latest)) {
+							if now() >= moment {
+								self.pending.write() = None;
+								latest();
+							}
+						}
+					} else {
+						// `cancel` called the timer off. `pending` decides what
+						// happens next: `None` ends the loop at the head, `Some`
+						// (a `run` that came after the cancel) starts a new wait.
+						self.timer.write() = None;
+					}
+				}
+				self.running.write() = false;
+			};
+		}
+	}
+
+	/// Drop the pending callback and call the in-flight timer off: nothing
+	/// fires, and the host is released now rather than at the deadline.
+	///
+	/// Idempotent, and safe with nothing pending. A `run` after a `cancel`
+	/// starts a fresh window in the ordinary way.
+	fun cancel(self) {
+		self.pending.write() = None;
+		if self.timer.read() is Some(let timer) {
+			self.timer.write() = None;
+			timer.cancel();
+		}
 	}
 }

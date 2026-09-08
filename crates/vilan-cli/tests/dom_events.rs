@@ -577,3 +577,86 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
         "no removeEventListener binding may carry `retains`"
     );
 }
+
+// --- 5. `code`, `target` and `current_target` (tracker A58) -------------------
+
+/// The three getters kolt hand-wrote in three different files
+/// (`lib/input_system.vl:5-9`, `views.vl:31-34`, `lib/overlay.vl:91-94`), on one
+/// page.
+///
+/// `code` is read beside `key` on the same events, because the pair is the
+/// whole point: a shortcut table wants the PHYSICAL key and a text-entry
+/// handler wants the character, and a program that picks wrong is silently
+/// wrong only under another keyboard layout.
+///
+/// `target` and `current_target` are read from ONE dispatch to a node that is
+/// not the node the listener sits on — the only arrangement in which the two
+/// differ, and therefore the only one that can tell them apart. The handler
+/// marks each element it is handed, so the negative half is an assertion too:
+/// the inner node must NOT carry the `current_target` mark.
+const EVENT_TARGETS_AND_CODE: &str = r#"import std::io::print;
+import std::dom::{ Event, get_element_by_id, window };
+
+fun main() {
+	window().on_event("keydown", |event| {
+		print(i"key={event.key()} code={event.code()}");
+	});
+	let app = get_element_by_id("app");
+	app.on_event("click", |event| {
+		event.target().set_attribute("marked", "target");
+		event.current_target().set_attribute("marked", "current");
+	});
+}
+main();
+"#;
+
+#[test]
+fn code_reads_the_physical_key_and_target_and_current_target_are_distinct() {
+    let harness = format!(
+        r#"{DOM_STUB}
+require("./app.js");
+// The same physical key under two layouts: `code` is stable, `key` is not.
+window.fire("keydown", {{ key: "e", code: "KeyE" }});
+window.fire("keydown", {{ key: ".", code: "KeyE" }});
+window.fire("keydown", {{ key: "Escape", code: "Escape" }});
+
+// A click that STARTS on an inner node and is handled on the container.
+const inner = new StubTarget("span");
+documentRoot.appendChild(inner);
+documentRoot.fire("click", {{ target: inner, currentTarget: documentRoot }});
+assert(inner.attributes["marked"] === "target", "target() is the node the event was dispatched to");
+assert(documentRoot.attributes["marked"] === "current", "current_target() is the node the listener sits on");
+
+// The same dispatch straight at the listening element: the two coincide, which
+// is exactly why the previous case is the one that can tell them apart.
+const solo = new StubTarget("div");
+documentRoot.fire("click", {{ target: solo, currentTarget: solo }});
+assert(solo.attributes["marked"] === "current", "one node dispatched to and listening on reads both");
+done();
+"#
+    );
+    let stdout = build_and_run("event_targets_and_code", EVENT_TARGETS_AND_CODE, &harness);
+    assert!(
+        stdout.contains("key=e code=KeyE"),
+        "`code` must read event.code beside `key`; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("key=. code=KeyE"),
+        "`code` must be layout-independent where `key` is not — the same \
+         physical key under a second layout; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("key=Escape code=Escape"),
+        "a named key spells the same in both; got:\n{stdout}"
+    );
+    for claim in [
+        "target() is the node the event was dispatched to",
+        "current_target() is the node the listener sits on",
+        "one node dispatched to and listening on reads both",
+    ] {
+        assert!(
+            stdout.contains(&format!("ok   - {claim}")),
+            "the target exhibit must hold `{claim}`; got:\n{stdout}"
+        );
+    }
+}

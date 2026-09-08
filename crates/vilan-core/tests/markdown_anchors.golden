@@ -419,6 +419,8 @@ std/time.md h2 duration
 std/time.md h2 sleeping
 std/time.md h2 timer
 std/time.md h3 timers-and-nurseries
+std/time.md h2 debounce
+std/time.md h3 why-the-shared-cells
 std/time.md h2 notes
 std/traits.md h1 core-traits-reference
 std/traits.md h2 stdcompare

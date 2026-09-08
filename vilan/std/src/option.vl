@@ -303,6 +303,37 @@ impl str {
 	/// `"Infinity"` — parses.
 	external fun parse_f64(self): Option<f64>;
 
+	/// STRICT: `"true"` and `"false"`, nothing else — the exact inverse of
+	/// `Display::to_string` on a `bool` (`display.vl`, which renders those two
+	/// words), and the same set `std::json`'s bool `FromJson` accepts.
+	/// Whitespace-trimmed, exactly as `parse_i32` and `parse_f64` are: a
+	/// `parse_*` family that trims in two cases of three is a trap, and the
+	/// JSON reader tolerates the same padding.
+	///
+	/// `"1"`/`"0"` are deliberately NOT admitted, and neither are `"True"`,
+	/// `"yes"` or `""`. A parse whose accepted set is wider than its writer's
+	/// output is a parse that decides, on the author's behalf, that some OTHER
+	/// producer's convention was meant — and the two conventions disagree the
+	/// moment a value round-trips: `true.to_string()` is never `"1"`, so a
+	/// reader that accepts `"1"` accepts something this library cannot have
+	/// written. An app whose stored history really does hold `"1"` says so
+	/// itself, in one line at its own decoder, where the compatibility claim is
+	/// visible: `if text == "1" { Some(true) } else { text.parse_bool() }`.
+	///
+	/// The three-way idiom, so nothing here has to be hand-written: values go
+	/// OUT through `Display::to_string` (`import std::display::Display` — it is
+	/// a TRAIT method, so a module that has not imported the trait is told "no
+	/// method to_string"), come BACK through `str::parse_*`, and anything
+	/// structured rides `std::json`'s `Json`/`FromJson` instead of a pair of
+	/// hand-rolled closures.
+	fun parse_bool(self): Option<bool> {
+		match self.trim() {
+			"true" => Some(true),
+			"false" => Some(false),
+			_ => None,
+		}
+	}
+
 	/// The text with `prefix` removed, or `None` when it does not start with it
 	/// — `starts_with` tests, this one cuts. Distinguishing "absent" from
 	/// "present but empty" is why it is an `Option`: `"ab".strip_prefix("ab")`

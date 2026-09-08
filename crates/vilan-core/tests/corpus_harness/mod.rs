@@ -143,6 +143,7 @@ macro_rules! corpus_manifest {
             nursery => "nursery.vl",
             operator_overload => "operator-overload.vl",
             option_view => "option-view.vl",
+            parse_bool => "parse-bool.vl",
             parse_f64 => "parse-f64.vl",
             parse_i32 => "parse-i32.vl",
             preflight => "preflight.vl",
