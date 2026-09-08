@@ -5664,7 +5664,7 @@ fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
         fun main() {}
         main();
         "#,
-        "';'",
+        "expected `;` to end this statement",
     );
 }
 
