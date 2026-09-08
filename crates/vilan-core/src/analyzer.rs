@@ -3085,9 +3085,10 @@ pub struct Analyzer<'src> {
     /// [`Analyzer::resource_reaching_roots`] answered, restored rows included.
     /// Kept so the class D store can partition it per module.
     drop_scan_roots: HashSet<Id>,
-    /// M19 T1c: the digest of the resource-reaching nominal set that enrolment
-    /// was decided against ([`ModuleTables::drop_nominals`]).
-    drop_nominals_digest: u64,
+    /// M19 T1c / M49: the digest of the WORLD-declared half of the
+    /// resource-reaching nominal set that enrolment was decided against
+    /// ([`ModuleTables::drop_nominals_world`]).
+    drop_nominals_world_digest: u64,
     // M19 T1b / T0's free fix: `source_ranges` sorted by start, for a binary
     // search instead of `source_of_id`'s linear scan. Sealed beside
     // `frozen_ranges`, from the same ranges, and empty until then — the scan
@@ -4572,7 +4573,7 @@ impl<'src> Analyzer<'src> {
             reused_table_sources: Vec::new(),
             restored_tables: RestoredTables::default(),
             drop_scan_roots: HashSet::default(),
-            drop_nominals_digest: 0,
+            drop_nominals_world_digest: 0,
             sorted_source_ranges: Vec::new(),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
@@ -10065,13 +10066,16 @@ impl<'src> Analyzer<'src> {
     /// An unresolved callee is selected outright: "this signature reaches no
     /// resource" is a claim about a signature, and one nobody could read is not
     /// a claim this predicate is allowed to make.
-    fn resource_reaching_roots(&self) -> (HashSet<Id>, u64) {
+    fn resource_reaching_roots(&self) -> (HashSet<Id>, u64, u64) {
         let mut roots: HashSet<Id> = HashSet::default();
         let nominals = self.resource_reaching_nominals();
-        let digest = Self::drop_nominals_fingerprint(&nominals);
+        // M49: the WORLD half is the restore condition; the entry half rides
+        // along for the pin (`drop_plan_stats::nominals_fingerprints`) and for
+        // nothing else — see `drop_nominals_fingerprints`.
+        let (world_digest, entry_digest) = self.drop_nominals_fingerprints(&nominals);
         if nominals.is_empty() {
             crate::drop_plan_stats::record_gate(0);
-            return (roots, digest);
+            return (roots, world_digest, entry_digest);
         }
         // M19 T1c: a reused module's enrolment is RESTORED rather than
         // re-derived. This gate is the drop planner's whole price — it walks
@@ -10081,7 +10085,7 @@ impl<'src> Analyzer<'src> {
         // `Id`s: the gate's answer is one bit per body, so nothing here has to
         // cross the TypeId boundary.
         let restored_enrolment = self.restored_tables.drop_nominals_agree
-            && self.restored_tables.drop_nominals == Some(digest);
+            && self.restored_tables.drop_nominals_world == Some(world_digest);
         if restored_enrolment {
             roots.extend(self.restored_tables.drop_roots.iter().copied());
         }
@@ -10136,18 +10140,62 @@ impl<'src> Analyzer<'src> {
             }
         }
         crate::drop_plan_stats::record_gate(asked);
-        (roots, digest)
+        (roots, world_digest, entry_digest)
     }
 
-    /// [`ModuleTables::drop_nominals`]: the resource-reaching nominal set,
-    /// hashed. Sorted first — the set is a `HashSet`, and two analyses have to
-    /// agree on the digest of the same MEMBERSHIP, never on an iteration order.
-    fn drop_nominals_fingerprint(nominals: &HashSet<Id>) -> u64 {
-        let mut ids: Vec<u32> = nominals.iter().map(|id| id.0).collect();
+    /// [`ModuleTables::drop_nominals_world`] and its entry-declared twin: the
+    /// resource-reaching nominal set, hashed in TWO halves split by the source
+    /// that declared each nominal (M49).
+    ///
+    /// M19 T1c hashed the whole set into one digest, and that made the restore
+    /// condition read a fact about the ENTRY. Two entries of one package that
+    /// differ in whether they declare a `resource` — kolt's `server.vl` and its
+    /// `probe.vl`, and every application that has a data entry beside a UI one
+    /// — mint different sets over the same world, so each one's analysis
+    /// rejected the other's enrolment record and re-walked every module body.
+    /// The record survives the split because the half it is compared on cannot
+    /// move: the world's own declarations.
+    ///
+    /// **Why the entry half is not in the condition.** The gate asks a module
+    /// body whether it reaches one of the program's resource-reaching nominals,
+    /// and a module body can only name what the module can SEE — the world.
+    /// It declares no field of an entry type (the entry is walked last, over
+    /// the world, and nothing in the world imports it) and a `Generic` names
+    /// nothing ([`Self::type_mentions_nominal`]), so the containment closure
+    /// cannot carry an entry declaration into a world nominal either. The
+    /// belt-and-braces the single digest was there for is kept, whole, over
+    /// exactly the half that can move.
+    ///
+    /// Split by DECLARING SOURCE rather than by [`Self::table_entity`]: the
+    /// world ranges are empty on the analysis that WRITES a record (nothing was
+    /// restored into it), so a range-based split would record an empty world
+    /// half and disagree with every warm reader of it. `SourceId(0)` is the
+    /// entry; [`DERIVED_SOURCE`] and an unattributed id go in the WORLD half,
+    /// which is the conservative side — an id whose origin is not plainly the
+    /// entry's file goes on being compared.
+    ///
+    /// Each half is sorted first: the set is a `HashSet`, and two analyses have
+    /// to agree on the digest of the same MEMBERSHIP, never on an iteration
+    /// order.
+    fn drop_nominals_fingerprints(&self, nominals: &HashSet<Id>) -> (u64, u64) {
+        let mut world: Vec<u32> = Vec::new();
+        let mut entry: Vec<u32> = Vec::new();
+        for id in nominals {
+            if self.source_of_id(*id) == Some(SourceId(0)) {
+                entry.push(id.0);
+            } else {
+                world.push(id.0);
+            }
+        }
+        (Self::fnv1a_ids(&mut world), Self::fnv1a_ids(&mut entry))
+    }
+
+    /// One half of [`Self::drop_nominals_fingerprints`], sorted and hashed.
+    fn fnv1a_ids(ids: &mut [u32]) -> u64 {
         ids.sort_unstable();
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for id in ids {
-            hash ^= u64::from(id);
+        for id in ids.iter() {
+            hash ^= u64::from(*id);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
@@ -10437,7 +10485,9 @@ impl<'src> Analyzer<'src> {
         // must be found.
         if !self.declares_a_resource() {
             self.drop_scan_roots = HashSet::default();
-            self.drop_nominals_digest = Self::drop_nominals_fingerprint(&HashSet::default());
+            let (world_digest, entry_digest) = self.drop_nominals_fingerprints(&HashSet::default());
+            self.drop_nominals_world_digest = world_digest;
+            crate::drop_plan_stats::record_nominals(world_digest, entry_digest);
             crate::drop_plan_stats::record(0, self.offered_drop_scan_roots());
             crate::drop_plan_stats::record_gate(0);
             return;
@@ -10447,12 +10497,13 @@ impl<'src> Analyzer<'src> {
         // true for every program that loads a std module declaring one, so it
         // enrolled EVERY body; this asks the same question of each body's own
         // types and enrolls the ones that can reach a resource.
-        let (roots, nominals_digest) = self.resource_reaching_roots();
+        let (roots, world_digest, entry_digest) = self.resource_reaching_roots();
         // M19 T1c: kept for the record the class D store writes at the end of
         // the analysis — the gate's answer per body is what a reused module
         // serves instead of having every one of them re-walked.
         self.drop_scan_roots = roots.clone();
-        self.drop_nominals_digest = nominals_digest;
+        self.drop_nominals_world_digest = world_digest;
+        crate::drop_plan_stats::record_nominals(world_digest, entry_digest);
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
         // reachability (it lowers transformer-side to the `__drop` helper), so its
@@ -23734,7 +23785,7 @@ impl<'src> Analyzer<'src> {
     fn register_generic_parameters(
         &mut self,
         declaration_id: Id,
-        generic_parameters: &'src Option<GenericParameters<'src>>,
+        generic_parameters: Option<&'src GenericParameters<'src>>,
         scope_id: Id,
     ) -> Vec<TypeId> {
         self.declared_generic_parameters.insert(
@@ -25515,7 +25566,7 @@ impl<'src> Analyzer<'src> {
                     .collect::<Vec<_>>();
                 let generic_parameter_constraint_ids = self.register_generic_parameters(
                     id,
-                    &function.generic_parameters,
+                    function.generic_parameters.as_ref(),
                     body_scope_id,
                 );
                 // The return type is resolved in the body scope so it can refer
@@ -26227,8 +26278,11 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
-                let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(id, generic_parameters, body_scope_id);
+                let generic_parameter_constraint_ids = self.register_generic_parameters(
+                    id,
+                    generic_parameters.as_deref(),
+                    body_scope_id,
+                );
                 // A bodyless `struct Name;` is only valid when `external`; an
                 // ordinary struct must list its fields in `{ .. }` (possibly
                 // empty).
@@ -26315,8 +26369,11 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
-                let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(id, generic_parameters, body_scope_id);
+                let generic_parameter_constraint_ids = self.register_generic_parameters(
+                    id,
+                    generic_parameters.as_deref(),
+                    body_scope_id,
+                );
                 // Variants live in the enum's own namespace, reachable through
                 // `use Enum::{ ... }` or `Enum::Variant` — not the outer scope.
                 let variants_scope = self.create_scope(None);
@@ -26605,8 +26662,11 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
-                let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(id, generic_parameters, body_scope_id);
+                let generic_parameter_constraint_ids = self.register_generic_parameters(
+                    id,
+                    generic_parameters.as_deref(),
+                    body_scope_id,
+                );
                 let generic_parameter_names = generic_parameters
                     .as_ref()
                     .map(|parameters| {
@@ -29189,12 +29249,19 @@ impl<'src> Analyzer<'src> {
             return type_id.get_type(self);
         }
 
-        let constraint = match constraint {
-            Type::Generic(type_id) => substitution_context
-                .get(type_id)
-                .map(|x| x.get_type(self))
-                .unwrap_or_else(|| constraint.clone()),
-            x => x.clone(),
+        // M53: a `Cow`, not a clone. This runs on EVERY entry — 328,699 times
+        // in a cold kolt client check — and in the overwhelming majority of
+        // them the arm taken is the last one, which copied a whole `Type` (32
+        // bytes, and an allocation for the aggregate arms) so the body below
+        // could read a value where it already had a reference. Only the
+        // Generic arm that finds a substitution produces something new, and
+        // that arm is the one that keeps its `Owned`.
+        let constraint: std::borrow::Cow<'_, Type> = match constraint {
+            Type::Generic(type_id) => match substitution_context.get(type_id) {
+                Some(bound) => std::borrow::Cow::Owned(bound.get_type(self)),
+                None => std::borrow::Cow::Borrowed(constraint),
+            },
+            x => std::borrow::Cow::Borrowed(x),
         };
 
         // The entity may not exist yet (e.g. a deferred field accessor whose
@@ -29221,7 +29288,7 @@ impl<'src> Analyzer<'src> {
                     .closures
                     .get(&closure_id)
                     .map(|closure| closure.return_);
-                let inner_constraint = match &constraint {
+                let inner_constraint = match constraint.as_ref() {
                     Type::Struct(id, arguments) if self.is_task_handle(*id) => arguments
                         .first()
                         .map(|type_id| type_id.get_type(self))
@@ -29351,7 +29418,7 @@ impl<'src> Analyzer<'src> {
                         // Unsuffixed: a fractional literal is a float (`f32`
                         // only by expectation); an integer takes the expected
                         // numeric type, defaulting to `i32`.
-                        let expected = match &constraint {
+                        let expected = match constraint.as_ref() {
                             Type::Struct(id, _) => NUMERIC_PRIMITIVES
                                 .iter()
                                 .find(|name| self.primitive_struct_ids.get(**name) == Some(id))
@@ -29382,9 +29449,9 @@ impl<'src> Analyzer<'src> {
                 // `[T; n]`, the same literal elaborates to that array instead of
                 // a `List` — its element count must equal `n`, and each element
                 // is inferred against `T`. (`[a, b, c]` is otherwise a `List`.)
-                if let Type::Array(element_type_id, length) = constraint {
+                if let Type::Array(element_type_id, length) = constraint.as_ref() {
                     let element_type = element_type_id.get_type(self);
-                    if item_ids.len() != length && self.reported_literal_errors.insert(expr_id) {
+                    if item_ids.len() != *length && self.reported_literal_errors.insert(expr_id) {
                         self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -29424,7 +29491,7 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                     }
-                    return Type::Array(element_type_id, length);
+                    return Type::Array(*element_type_id, *length);
                 }
                 if item_ids.is_empty() {
                     return match self.primitive_struct_ids.get("List").copied() {
@@ -29460,7 +29527,7 @@ impl<'src> Analyzer<'src> {
                             // `expected_element` comment below).
                             if matches!(slot.borrow_type(self), Type::Unknown)
                                 && let Type::Struct(expected_struct_id, expected_arguments) =
-                                    &constraint
+                                    constraint.as_ref()
                                 && *expected_struct_id == list_id
                                 && let Some(expected_element_id) = expected_arguments.first()
                             {
@@ -29483,7 +29550,7 @@ impl<'src> Analyzer<'src> {
                 // seeded into the unification itself: directing every list
                 // literal's elements by the expectation shifts inference
                 // (adaptation order, generic grounding) far beyond this check.
-                let expected_element = match &constraint {
+                let expected_element = match constraint.as_ref() {
                     Type::Struct(id, arguments)
                         if Some(*id) == self.primitive_struct_ids.get("List").copied() =>
                     {
@@ -29555,7 +29622,7 @@ impl<'src> Analyzer<'src> {
                 // `[value; n]` is `[T; n]` where `T` is the value's type. Direct
                 // the value against the expected array's element type, if any.
                 let length = *length;
-                let element_constraint = match constraint {
+                let element_constraint = match constraint.as_ref() {
                     Type::Array(element_id, _) => element_id.get_type(self),
                     _ => Type::Unknown,
                 };
@@ -29591,7 +29658,7 @@ impl<'src> Analyzer<'src> {
                         exprs_seen,
                     );
                 }
-                let constraint_items = match constraint {
+                let constraint_items = match constraint.as_ref() {
                     Type::Tuple(items) => items.clone(),
                     _ => Vec::new(),
                 };
@@ -29815,7 +29882,7 @@ impl<'src> Analyzer<'src> {
                         // List<T>`) leaves `T` unbound and `T::member()` dangling.
                         // (Argument-bound generics are recorded during call-subject
                         // resolution; this fills the return-type-only gap.)
-                        if !matches!(constraint, Type::Unknown | Type::Unresolved) {
+                        if !matches!(constraint.as_ref(), Type::Unknown | Type::Unresolved) {
                             // The callee's own return-type generics — from the
                             // DECLARED type where there is one, so a caller
                             // generic introduced by substitution never counts as
@@ -30233,7 +30300,7 @@ impl<'src> Analyzer<'src> {
                 // matching arity, fill any unannotated (`Unknown`) parameter from
                 // it — so `|res|` passed where `|Res| void` is expected types
                 // `res` as `Res`.
-                if let Type::Closure(expected_parameter_ids, _) = &constraint
+                if let Type::Closure(expected_parameter_ids, _) = constraint.as_ref()
                     && expected_parameter_ids.len() == parameter_ids.len()
                 {
                     let expected = expected_parameter_ids.clone();
@@ -30299,7 +30366,7 @@ impl<'src> Analyzer<'src> {
                 };
                 if target_return_type_id.is_none()
                     && let Type::Closure(expected_parameter_ids, expected_return_type_id) =
-                        &constraint
+                        constraint.as_ref()
                     && expected_parameter_ids.len() == parameter_type_ids.len()
                 {
                     let expected_parameter_ids = expected_parameter_ids.clone();
@@ -32703,15 +32770,15 @@ impl<'src> Analyzer<'src> {
         // [`STALE_TABLE_PLANT`].
         //
         // M19 T1c's enrolment rows ride it too, and its restore CONDITION has to
-        // survive the plant for them to: clearing `drop_nominals` would make the
+        // survive the plant for them to: clearing `drop_nominals_world` would make the
         // gate stand down and re-derive, which is the one thing a plant must not
         // cause — a pass that quietly recomputes can never be caught serving a
         // stale row.
         if stale_table_planted() {
-            let nominals = self.restored_tables.drop_nominals;
+            let nominals = self.restored_tables.drop_nominals_world;
             let agree = self.restored_tables.drop_nominals_agree;
             self.restored_tables = RestoredTables {
-                drop_nominals: nominals,
+                drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
                 ..RestoredTables::default()
             };
@@ -43510,6 +43577,23 @@ pub enum Intrinsic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceId(pub u32);
 
+/// Which library layer one source sits under ([`Program::source_layers`], M53).
+///
+/// Two indices rather than one, because the two questions have two answers: a
+/// base root is recorded with EMPTY patterns (it marks library territory
+/// without seeding a requirement), so the first entry containing a file and the
+/// first entry containing it that also carries patterns need not be the same
+/// entry. Both are `None` for the user's own code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceLayer {
+    /// The first `layer_platforms` entry whose root contains this source —
+    /// `None` exactly when the file is the user's own code.
+    pub containing: Option<u32>,
+    /// The first entry whose root contains this source AND carries platform
+    /// patterns — the requirement its definition site seeds.
+    pub requiring: Option<u32>,
+}
+
 /// The source assigned to `[derive(..)]`-synthesized entities. Their spans are
 /// offsets into a generated template, not any real file, so they get this
 /// sentinel id — outside `sources`, so `source_path` is `None` — and editor
@@ -44263,6 +44347,25 @@ pub struct Program<'src> {
     // canonicalized (see `canonical_sources`) so both sides of the containment
     // test are in one form.
     pub layer_platforms: Vec<(PathBuf, String, String, Vec<PlatformPattern>)>,
+    /// Parallel to `sources` / `canonical_sources`: which [`Self::layer_platforms`]
+    /// entry each source sits under, resolved ONCE (tracker M53).
+    ///
+    /// Platform coloring asks two questions per reachable node — is this file
+    /// the user's own code, and does its layer seed a platform requirement —
+    /// and both were answered by walking every layer root and calling
+    /// `Path::starts_with`. That is a component-by-component path compare per
+    /// root per NODE: 88,452 `arrival_by` calls and 9,634 `requirement_of`
+    /// calls on a cold kolt client check drove 1,559,600 `starts_with`s,
+    /// `Components::next` 2.36% of the whole check and the two questions
+    /// together 4.15% of it — for an answer that is a property of the FILE, of
+    /// which a program has about sixty. Warm, over a base-cache hit, the same
+    /// two questions are ~10% of the analysis, because the walk they drive is
+    /// whole-program and nothing about it is restored.
+    ///
+    /// So it is answered per source instead, here, where the roots and the
+    /// canonical source paths are both in hand and both already canonical
+    /// (`windows-support.md` §5).
+    pub source_layers: Vec<SourceLayer>,
     // Use-site identifier spans for field accesses / method calls (`.x`), keyed
     // by the access expr id — drives rename and go-to-definition on members.
     pub member_name_spans: HashMap<Id, Span>,
@@ -46199,7 +46302,7 @@ pub(crate) fn service_impl_source(
 /// conjunction, and the impl table has to agree with it.
 fn bare_lowered_enum<'a>(
     name: &str,
-    generic_parameters: &Option<GenericParameters<'a>>,
+    generic_parameters: Option<&GenericParameters<'a>>,
     resource: bool,
     variants: &'a [Spanned<EnumVariant<'a>>],
 ) -> Option<EnumBacking<'a>> {
@@ -46325,7 +46428,14 @@ pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
     let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
         return String::new();
     };
-    if bare_lowered_enum(name.0, generic_parameters, *resource, &variants.0).is_none() {
+    if bare_lowered_enum(
+        name.0,
+        generic_parameters.as_deref(),
+        *resource,
+        &variants.0,
+    )
+    .is_none()
+    {
         return String::new();
     }
     let enum_name = name.0;
@@ -46377,9 +46487,13 @@ pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
     // A broken declaration is a hard error the walk reports, and this generator
     // stays silent there rather than emitting source that would report it a
     // second time.
-    let Some(read) = bare_lowered_enum(name.0, generic_parameters, *resource, &variants.0)
-        .filter(EnumBacking::is_clean)
-    else {
+    let Some(read) = bare_lowered_enum(
+        name.0,
+        generic_parameters.as_deref(),
+        *resource,
+        &variants.0,
+    )
+    .filter(EnumBacking::is_clean) else {
         return String::new();
     };
     let backing_type = backing_type_name(&read);
@@ -46500,7 +46614,7 @@ impl<'a> DerivedSubject<'a> {
     /// call every parameter phantom and under-bind.
     fn of(
         name: &'a str,
-        generic_parameters: &'a Option<GenericParameters<'a>>,
+        generic_parameters: Option<&'a GenericParameters<'a>>,
         member_types: &[&Spanned<Node<'a>>],
     ) -> Self {
         let parameters = generic_parameters
@@ -46580,10 +46694,15 @@ fn type_mentions(node: &Node<'_>, parameter: &str) -> bool {
 
 pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> String {
     if let Node::Enum(name, generic_parameters, resource, variants) = &item.0 {
-        let backing_type = enum_backing_type(name.0, generic_parameters, *resource, &variants.0);
+        let backing_type = enum_backing_type(
+            name.0,
+            generic_parameters.as_deref(),
+            *resource,
+            &variants.0,
+        );
         let payloads: Vec<&Spanned<Node>> =
             variants.0.iter().flat_map(|variant| &variant.0.1).collect();
-        let subject = DerivedSubject::of(name.0, generic_parameters, &payloads);
+        let subject = DerivedSubject::of(name.0, generic_parameters.as_deref(), &payloads);
         return derive_enum_impls(derives, &subject, variants, backing_type);
     }
     let Node::Struct(name, generic_parameters, _external, _resource, Some(fields)) = &item.0 else {
@@ -46595,7 +46714,7 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
         .iter()
         .filter_map(|field| field.0.1.as_ref())
         .collect();
-    let subject = DerivedSubject::of(struct_name, generic_parameters, &field_types);
+    let subject = DerivedSubject::of(struct_name, generic_parameters.as_deref(), &field_types);
     let applied = subject.applied();
     let fields: Vec<(&str, String)> = fields
         .0
@@ -46795,14 +46914,19 @@ pub(crate) fn backed_enum_backing_type_of(item: &Spanned<Node<'_>>) -> Option<&'
     let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
         return None;
     };
-    enum_backing_type(name.0, generic_parameters, *resource, &variants.0)
+    enum_backing_type(
+        name.0,
+        generic_parameters.as_deref(),
+        *resource,
+        &variants.0,
+    )
 }
 
 /// The vilan type name of a bare-lowered enum's backing, or `None` when the enum
 /// is not one a member may be synthesized onto.
 fn enum_backing_type<'a>(
     name: &str,
-    generic_parameters: &Option<GenericParameters<'a>>,
+    generic_parameters: Option<&GenericParameters<'a>>,
     resource: bool,
     variants: &'a [Spanned<EnumVariant<'a>>],
 ) -> Option<&'static str> {
@@ -48069,11 +48193,47 @@ thread_local! {
     static BASE_CACHE_CLAIMS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The default retained-world byte budget (M24): generous, because the point
-/// is a BOUND, not a diet — a session that meets a handful of key shapes must
-/// never notice it, and one that walks a large workspace must not grow
-/// without end. Overridable at server start; see [`set_base_cache_budget`].
-pub const BASE_CACHE_DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+/// How much more a retained world WEIGHS than [`base_cache_world_bytes`]
+/// records (M50) — the ratio between the two currencies, measured.
+///
+/// M24 set a 512 MiB budget and compared it against the M11 figure, which is
+/// the world's source TEXTS plus M41's per-`TypeId` census: source-proportional
+/// by design, because an eviction has to be able to recompute exactly what the
+/// store recorded without a heap audit. What that figure is NOT is what the
+/// world weighs. The ~229 analyzer tables the resolve fills — scopes, the
+/// entity and expression maps, the type tables, the registry clone each stored
+/// world carries — are derived state the counter does not try to count, and
+/// they are most of the world.
+///
+/// Measured with `world_cache_spike.rs`'s weighing harness (eight distinct
+/// keys minted through `macro_limits` over one wide-`std` closure, minus a
+/// same-key control that pays the identical per-analysis transient, parse cache
+/// and interner warmed first so nothing process-global is credited to a world):
+/// **4,701,037 B resident per world against 194,843 B recorded — 24.1×**, on a
+/// release build at loadavg 112. So 512 MiB of RECORDED bytes was a bound on
+/// the order of **12 GB resident**: the cache was bounded, and not where M24
+/// thought.
+///
+/// Two things the item suspected are deliberately NOT in this number, and that
+/// is the other half of the finding: the leaked module ASTs and the interned
+/// name tables are process-global (`parse_clean_cached`'s immortal cache, the
+/// display-name interner) — they are paid once, shared by every world, and a
+/// PER-WORLD figure must not carry them. The harness warms both before it
+/// weighs, so neither is in the 4.7 MB either. The gap is the derived tables.
+pub const BASE_CACHE_WEIGHT_FACTOR: usize = 24;
+
+/// The retained-world budget in the currency a session actually has: RESIDENT
+/// bytes (M24's number, M50's unit). Generous, because the point is a BOUND,
+/// not a diet — a session that meets a handful of key shapes must never notice
+/// it, and one that walks a large workspace must not grow without end.
+pub const BASE_CACHE_RESIDENT_BUDGET: usize = 512 * 1024 * 1024;
+
+/// The same bound, expressed in the currency [`BaseCacheState::retained_bytes`]
+/// counts in (M50) — which is what [`BaseCacheState::evict_to_budget`] compares
+/// against, so it is what the budget has to be denominated in. Overridable at
+/// server start; see [`set_base_cache_budget`] and
+/// [`base_cache_budget_for_resident`].
+pub const BASE_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_RESIDENT_BUDGET / BASE_CACHE_WEIGHT_FACTOR;
 
 static BASE_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(BASE_CACHE_DEFAULT_BUDGET);
@@ -48157,6 +48317,31 @@ pub fn set_base_cache_budget(bytes: usize) {
 #[doc(hidden)]
 pub fn base_cache_budget() -> usize {
     BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A resident-byte figure, converted into the currency the budget is spent in
+/// (M50). The front-end knob is in MiB of MEMORY, which is what anyone
+/// reasoning about a language server's footprint means by it, and
+/// [`set_base_cache_budget`] takes recorded bytes — this is the one conversion
+/// between them, so no front end has to know the factor.
+///
+/// `0` survives as `0`: "retain nothing but the world just stored" is a
+/// legitimate way to take the cache out of a measurement (M24), and dividing
+/// it must not turn it into something else.
+pub fn base_cache_budget_for_resident(bytes: usize) -> usize {
+    bytes / BASE_CACHE_WEIGHT_FACTOR
+}
+
+/// What the retained worlds actually WEIGH, in resident bytes (M50): the
+/// recorded figure, re-denominated by the measured factor.
+///
+/// [`base_cache_retained_bytes`] is the budget's own currency and stays exactly
+/// what it was — the M11 tally's number, which an eviction can recompute. This
+/// is the number to put in front of a human, because it is the one in the unit
+/// a machine has.
+#[doc(hidden)]
+pub fn base_cache_retained_weight() -> usize {
+    base_cache_retained_bytes().saturating_mul(BASE_CACHE_WEIGHT_FACTOR)
 }
 
 /// The bytes the retained worlds are recorded as holding right now (M24) —
@@ -48452,19 +48637,26 @@ struct ModuleTables {
     /// it asked about are re-read from the module's own slots rather than
     /// recorded (the T1b/T1c section of `editor-latency.md`).
     drop_roots: Vec<Id>,
-    /// M19 T1c's restore condition, and the reason the enrolment is allowed to
-    /// be a module's own answer at all.
+    /// M19 T1c's restore condition, split by M49: the WORLD-declared half of
+    /// the resource-reaching nominal set, hashed.
     ///
     /// The gate asks each body whether it reaches one of the program's
     /// resource-reaching NOMINALS, and that set is whole-program: it is closed
     /// over every declaration's field types, so a declaration made outside this
-    /// module is in principle able to move the answer. It cannot in practice —
-    /// a module declares no field of an entry type, and a `Generic` names
-    /// nothing ([`Analyzer::type_mentions_nominal`]) — but "cannot in practice"
-    /// is exactly what a belt-and-braces condition is for, and this one costs a
-    /// `u64` compare per analysis. A record whose fingerprint disagrees with the
-    /// world it is replayed into recomputes the gate.
-    drop_nominals: u64,
+    /// module is in principle able to move the answer. Over the WORLD's own
+    /// declarations that is exactly the belt-and-braces a `u64` compare per
+    /// analysis buys, and a record whose fingerprint disagrees with the world
+    /// it is replayed into recomputes the gate.
+    ///
+    /// Over the ENTRY's declarations it bought nothing and cost the record: the
+    /// entry is walked last, over the world, and no module can name a type it
+    /// declares — so two entries of one package that differ in whether they
+    /// declare a `resource` invalidated each other's enrolment for a difference
+    /// no module body could see. The entry half is computed and reported
+    /// ([`crate::drop_plan_stats::nominals_fingerprints`]) and is deliberately
+    /// not in the condition; see
+    /// [`Analyzer::drop_nominals_fingerprints`] for the whole argument.
+    drop_nominals_world: u64,
 }
 
 impl ModuleTables {
@@ -48533,9 +48725,10 @@ struct RestoredTables {
     /// M19 T1c: the restored drop-scan enrolment, merged across every module
     /// whose record carries one.
     drop_roots: HashSet<Id>,
-    /// The fingerprint every restored module agreed on
-    /// ([`ModuleTables::drop_nominals`]); `None` when nothing was restored.
-    drop_nominals: Option<u64>,
+    /// The world-half fingerprint every restored module agreed on
+    /// ([`ModuleTables::drop_nominals_world`]); `None` when nothing was
+    /// restored.
+    drop_nominals_world: Option<u64>,
     /// Whether the records seen so far agreed on that fingerprint.
     drop_nominals_agree: bool,
 }
@@ -48557,7 +48750,7 @@ impl Default for RestoredTables {
             scalar_view_calls: HashSet::default(),
             scalar_view_refs: HashSet::default(),
             drop_roots: HashSet::default(),
-            drop_nominals: None,
+            drop_nominals_world: None,
             drop_nominals_agree: true,
         }
     }
@@ -48588,9 +48781,9 @@ impl RestoredTables {
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
         // enrolment restore stands down rather than serving half an answer.
-        match self.drop_nominals {
-            None => self.drop_nominals = Some(tables.drop_nominals),
-            Some(existing) => self.drop_nominals_agree &= existing == tables.drop_nominals,
+        match self.drop_nominals_world {
+            None => self.drop_nominals_world = Some(tables.drop_nominals_world),
+            Some(existing) => self.drop_nominals_agree &= existing == tables.drop_nominals_world,
         }
     }
 }
@@ -48704,11 +48897,18 @@ const CHECKED_CACHE_KEYS: usize = 256;
 ///
 /// The budget is bytes now, and [`ModuleTables::bytes`] is what counts them.
 /// Sized against M24's retained-world budget rather than invented: one eighth
-/// of [`BASE_CACHE_DEFAULT_BUDGET`], because a record is a fraction of the
-/// world it describes and the two caches are bounded by the same argument.
-/// The row bound is gone rather than kept beside it — two bounds on one thing
-/// is one bound and one number nobody can act on.
-pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_DEFAULT_BUDGET / 8;
+/// of it, because a record is a fraction of the world it describes and the two
+/// caches are bounded by the same argument. The row bound is gone rather than
+/// kept beside it — two bounds on one thing is one bound and one number nobody
+/// can act on.
+///
+/// M50: against [`BASE_CACHE_RESIDENT_BUDGET`] rather than
+/// [`BASE_CACHE_DEFAULT_BUDGET`], and the VALUE is unchanged at 64 MiB.
+/// [`ModuleTables::bytes`] is a structural count of the rows it holds — a
+/// figure in the same units a machine has — so it needs no re-denomination,
+/// while the base cache's does; deriving this from the re-denominated constant
+/// would have silently divided this budget by 24 as well.
+pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_RESIDENT_BUDGET / 8;
 
 static CHECKED_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(CHECKED_CACHE_DEFAULT_BUDGET);
@@ -52649,7 +52849,7 @@ fn analyze_over_world<'src>(
         // writes, the empty ones included — a module that enrolled nothing is
         // exactly the module whose gate cost the most to answer.
         for slice in tables.values_mut() {
-            slice.drop_nominals = analyzer.drop_nominals_digest;
+            slice.drop_nominals_world = analyzer.drop_nominals_world_digest;
         }
         checked_cache_store_tables(key, &source_hashes, tables);
     }
@@ -52971,6 +53171,11 @@ fn analyze_over_world<'src>(
         );
     }
 
+    // Canonicalized once, here, because platform coloring compares against
+    // `layer_platforms`' equally canonicalized roots — and, since M53, because
+    // `source_layers` resolves that comparison per SOURCE rather than per node.
+    let canonical_sources: Vec<PathBuf> = sources.iter().map(crate::util::canonical_path).collect();
+
     Some(Program {
         platform,
         closures: analyzer.closures,
@@ -53047,7 +53252,22 @@ fn analyze_over_world<'src>(
         type_id_to_type_map: analyzer.type_id_to_type_map,
         variables: analyzer.variables,
         parameters: analyzer.parameters,
-        canonical_sources: sources.iter().map(crate::util::canonical_path).collect(),
+        source_layers: canonical_sources
+            .iter()
+            .map(|path| SourceLayer {
+                containing: layer_platforms
+                    .iter()
+                    .position(|(root, ..)| path.starts_with(root))
+                    .map(|index| index as u32),
+                requiring: layer_platforms
+                    .iter()
+                    .position(|(root, _, _, patterns)| {
+                        !patterns.is_empty() && path.starts_with(root)
+                    })
+                    .map(|index| index as u32),
+            })
+            .collect(),
+        canonical_sources,
         sources,
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),

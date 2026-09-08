@@ -21,6 +21,7 @@ thread_local! {
     static PLANNED: Cell<usize> = const { Cell::new(0) };
     static OFFERED: Cell<usize> = const { Cell::new(0) };
     static ASKED: Cell<usize> = const { Cell::new(0) };
+    static NOMINALS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// Record one analysis's enrolment: `planned` roots walked out of `offered`
@@ -58,4 +59,22 @@ pub(crate) fn record_gate(asked: usize) {
 /// The bodies the enrolment gate walked in the last analysis on this thread.
 pub fn asked_roots() -> usize {
     ASKED.with(Cell::get)
+}
+
+/// M49: the last analysis's resource-reaching nominal fingerprints, `(world,
+/// entry)` — the two halves `Analyzer::drop_nominals_fingerprints` splits the
+/// set into.
+///
+/// The world half is the enrolment record's restore condition; the entry half
+/// is in no condition at all and exists so a pin can state the split as the
+/// property it is, rather than as its consequence: two entries of one package
+/// that differ in a `resource` declaration agree on the world half and differ
+/// on the entry half, and the second one's enrolment is restored anyway.
+pub(crate) fn record_nominals(world: u64, entry: u64) {
+    NOMINALS.with(|cell| cell.set((world, entry)));
+}
+
+/// The `(world, entry)` fingerprints of the last analysis on this thread (M49).
+pub fn nominals_fingerprints() -> (u64, u64) {
+    NOMINALS.with(Cell::get)
 }

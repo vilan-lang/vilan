@@ -2410,7 +2410,7 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push_str("struct ");
                 self.out.push_str(name.0);
-                self.print_generic_parameters(generics);
+                self.print_generic_parameters(generics.as_deref());
                 match body {
                     None => self.out.push(';'),
                     Some(fields) if fields.0.is_empty() => self.out.push_str(" {}"),
@@ -2464,7 +2464,7 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
-                self.print_generic_parameters(generics);
+                self.print_generic_parameters(generics.as_deref());
                 if variants.0.is_empty() {
                     self.out.push_str(" {}");
                 } else {
@@ -2531,7 +2531,7 @@ impl<'src> Printer<'src> {
             Node::Trait(name, generics, supertraits, body) => {
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
-                self.print_generic_parameters(generics);
+                self.print_generic_parameters(generics.as_deref());
                 self.print_with_clause(supertraits);
                 self.out.push(' ');
                 self.print_braced_items(body);
@@ -2923,7 +2923,7 @@ impl<'src> Printer<'src> {
 
     /// Prints the `<T, U: Bound = Default>` parameter list of a generic item, or
     /// nothing when there are none.
-    fn print_generic_parameters(&mut self, parameters: &Option<GenericParameters<'src>>) {
+    fn print_generic_parameters(&mut self, parameters: Option<&GenericParameters<'src>>) {
         let Some((parameters, _)) = parameters else {
             return;
         };
@@ -3025,7 +3025,7 @@ impl<'src> Printer<'src> {
         }
         self.out.push_str("fun ");
         self.out.push_str(func.name.0);
-        self.print_generic_parameters(&func.generic_parameters);
+        self.print_generic_parameters(func.generic_parameters.as_ref());
         self.print_parameters(&func.parameters);
         if let Some(return_type) = &func.return_type {
             self.out.push_str(": ");
@@ -5140,7 +5140,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str("::");
                 }
                 self.out.push_str(name.0);
-                if let Some((generic_arguments, _)) = generic_arguments {
+                if let Some((generic_arguments, _)) = generic_arguments.as_deref() {
                     self.out.push('<');
                     for (index, (argument, _)) in generic_arguments.iter().enumerate() {
                         if index > 0 {

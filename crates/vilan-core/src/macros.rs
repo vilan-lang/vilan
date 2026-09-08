@@ -2570,7 +2570,7 @@ fn void_type_expr() -> js::Node<'static> {
 /// (`Handle<T>`) instead of bare (B194): a bare name in an applied position is
 /// an under-supplied application, which only B188's erasure ever let through.
 fn construct_generic_parameters(
-    parameters: &Option<GenericParameters>,
+    parameters: Option<&GenericParameters>,
     text: &str,
 ) -> js::Node<'static> {
     array(
@@ -2627,7 +2627,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                 array(vec![
                     string_literal(name.0),
                     array(fields),
-                    construct_generic_parameters(generics, text),
+                    construct_generic_parameters(generics.as_deref(), text),
                 ]),
             ])
         }
@@ -2665,7 +2665,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                     string_literal(
                         crate::analyzer::backed_enum_backing_type_of(item).unwrap_or_default(),
                     ),
-                    construct_generic_parameters(generics, text),
+                    construct_generic_parameters(generics.as_deref(), text),
                 ]),
             ])
         }

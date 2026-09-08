@@ -1288,11 +1288,18 @@ struct LocalIndex {
 }
 
 impl LocalIndex {
+    /// M53: `Program::source_of` is a LINEAR scan of ~60 source ranges and this
+    /// asks it once per `Expr::Local` in the WHOLE program — kolt's client has
+    /// tens of thousands, and the product was 1.87% of a cold check, all of it
+    /// attributed to `State::new` because the scan inlines into it. M27 built
+    /// the hoisted twin for exactly this shape: one validation of the ranges,
+    /// then a binary search per row, answer-identical by construction.
     fn build(program: &Program) -> Self {
+        let lookup = program.source_lookup();
         let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::default();
         for (id, expr) in &program.entity_map {
             if let Expr::Local(binding) = expr
-                && let Some(source) = program.source_of(*id)
+                && let Some(source) = lookup.of(*id)
                 && let Some(span) = program.span_map.get(id)
             {
                 by_source
@@ -1348,7 +1355,14 @@ struct State<'p, 'src> {
     /// compile-time-known, which is what makes `let a = 1 + 2; let b = a * 2;`
     /// fold both (const-eval.md §9.5).
     inferable: HashSet<Id>,
-    locals: LocalIndex,
+    /// The `Expr::Local` index, built on FIRST USE (M53).
+    ///
+    /// It is a whole-program table — every local reference in every source,
+    /// std included — and its only reader is `free_locals`, which runs per
+    /// `const` root. A program with no `const` expression and no inference
+    /// candidate never asks, and used to build it anyway, twice per build:
+    /// once in the explicit pass and once in the inference sweep.
+    locals: std::cell::OnceCell<LocalIndex>,
     /// The `const` subtrees, as a per-source interval index — see
     /// [`SpanRegions`] and [`State::in_const_subtree`].
     const_regions: SpanRegions,
@@ -1385,7 +1399,7 @@ impl<'p, 'src> State<'p, 'src> {
             mode,
             const_set: program.const_exprs.iter().copied().collect(),
             inferable,
-            locals: LocalIndex::build(program),
+            locals: std::cell::OnceCell::new(),
             const_regions: SpanRegions::of(program, &program.const_exprs),
             results: HashMap::default(),
             assets: Vec::new(),
@@ -1394,6 +1408,11 @@ impl<'p, 'src> State<'p, 'src> {
             errors: Vec::new(),
             reader,
         }
+    }
+
+    /// The `Expr::Local` index, built on first use (M53).
+    fn locals(&self) -> &LocalIndex {
+        self.locals.get_or_init(|| LocalIndex::build(self.program))
     }
 
     /// Records a diagnostic — or, in [`Mode::Inferred`], does not.
@@ -2079,7 +2098,7 @@ impl<'p, 'src> State<'p, 'src> {
             };
         // The index yields references in span order already — the order
         // diagnostics want.
-        self.locals
+        self.locals()
             .references_within(self.program, root)
             .filter(|(_, binding)| !declared_within(*binding))
             .collect()

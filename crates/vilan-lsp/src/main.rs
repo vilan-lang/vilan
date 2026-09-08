@@ -5261,6 +5261,11 @@ mod cross_document_reach_tests {
 /// front end that never sets it gets the bound anyway. A value that does not
 /// parse is a typo, not a policy: it is reported on stderr and the default
 /// stands.
+///
+/// M50: the number here is MEBIBYTES OF MEMORY, and the cache's own budget is
+/// spent in the currency its retained-bytes counter records — 24× smaller.
+/// `base_cache_budget_for_resident` is the one conversion between them; before
+/// it, this knob set a bound 24× looser than the number it printed.
 const BASE_CACHE_BUDGET_ENV: &str = "VILAN_BASE_CACHE_BUDGET_MIB";
 
 fn apply_base_cache_budget_from_env() {
@@ -5274,13 +5279,17 @@ fn apply_base_cache_budget_from_env() {
     match value.parse::<usize>() {
         Ok(mebibytes) => {
             let bytes = mebibytes.saturating_mul(1024 * 1024);
-            vilan_core::analyzer::set_base_cache_budget(bytes);
-            eprintln!("[vilan lsp] base-cache budget set to {mebibytes} MiB ({bytes} bytes)");
+            let recorded = vilan_core::analyzer::base_cache_budget_for_resident(bytes);
+            vilan_core::analyzer::set_base_cache_budget(recorded);
+            eprintln!(
+                "[vilan lsp] base-cache budget set to {mebibytes} MiB resident \
+                 ({recorded} recorded bytes)"
+            );
         }
         Err(_) => eprintln!(
             "[vilan lsp] ignoring {BASE_CACHE_BUDGET_ENV}={value:?}: expected a whole number of \
              mebibytes; the default of {} MiB stands",
-            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET / (1024 * 1024),
+            vilan_core::analyzer::BASE_CACHE_RESIDENT_BUDGET / (1024 * 1024),
         ),
     }
 }
@@ -5324,8 +5333,9 @@ mod base_cache_budget_knob {
             super::apply_base_cache_budget_from_env();
             assert_eq!(
                 vilan_core::analyzer::base_cache_budget(),
-                7 * 1024 * 1024,
-                "the knob is read in MEBIBYTES"
+                vilan_core::analyzer::base_cache_budget_for_resident(7 * 1024 * 1024),
+                "the knob is read in MEBIBYTES of memory, and converted into the \
+                 currency the budget is spent in (M50)"
             );
         });
 
@@ -8256,5 +8266,38 @@ mod dead_item_clock_tests {
             grays(server, &shared),
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// M50: the knob's number is MEMORY, and the cache's budget is not counted in
+/// memory — so the conversion between them is a thing the knob can get wrong
+/// silently, in the loose direction, which is the direction that matters.
+#[cfg(test)]
+mod base_cache_budget_denomination {
+    /// The two constants are the same bound in two currencies, and `0` is the
+    /// one value that must survive the conversion unchanged.
+    #[test]
+    fn the_resident_budget_and_the_recorded_budget_are_one_bound() {
+        assert_eq!(
+            vilan_core::analyzer::base_cache_budget_for_resident(
+                vilan_core::analyzer::BASE_CACHE_RESIDENT_BUDGET
+            ),
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            "the default budget must be the resident bound, converted — not a \
+             second number that happens to be near it"
+        );
+        assert_eq!(
+            vilan_core::analyzer::base_cache_budget_for_resident(0),
+            0,
+            "`0` means retain nothing but the world just stored (M24); the \
+             conversion must not turn it into something else"
+        );
+        let resident = vilan_core::analyzer::BASE_CACHE_RESIDENT_BUDGET;
+        assert!(
+            vilan_core::analyzer::base_cache_budget_for_resident(resident) < resident,
+            "a world weighs MORE than the counter records, so the budget in the \
+             counter's currency must be the SMALLER of the two — this reds if \
+             the factor is ever inverted"
+        );
     }
 }

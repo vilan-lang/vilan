@@ -2376,3 +2376,249 @@ fn checked_cache_bytes_per_world() {
         "every subject recorded nothing — the measurement measured the harness"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M49: the enrolment record's restore condition, split.
+
+/// The shared module — and the world's OWN resource declaration, which is what
+/// makes the world half of the fingerprint non-empty and therefore worth
+/// comparing. Without it both entries agree on the empty digest and the pin
+/// would pass for a reason that has nothing to do with the split.
+/// The FNV-1a offset basis — the digest of an EMPTY nominal half, and the one
+/// value a world-half assertion must not be allowed to agree on vacuously.
+const M49_EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
+
+const M49_MODULE: &str = "resource struct Held { slot: i32 }\n\n\
+                          export fun make(slot: i32): Held {\n\tHeld { slot = slot }\n}\n\n\
+                          export fun value(): i32 {\n\tlet total = 1;\n\ttotal\n}\n\n\
+                          export fun doubled(): i32 {\n\tvalue() * 2\n}\n";
+/// The entry that DECLARES a resource. Its nominal set is std's plus `Handle`.
+const M49_ENTRY_RESOURCE: &str = "import pkg::loaded::value;\n\
+                                  resource struct Handle { slot: i32 }\n\
+                                  fun main() {\n\
+                                  \tlet held = Handle { slot = value() };\n}\n";
+/// The entry that declares NONE. Same world, same key, same world-declared
+/// nominals — and a different whole set, which is what used to reject the
+/// record above.
+const M49_ENTRY_PLAIN: &str = "import pkg::loaded::value;\n\
+                               fun main() {\n\tlet n = value() + 1;\n}\n";
+
+/// M49: **two entries of one package that differ in a `resource` declaration
+/// stop invalidating each other's enrolment record.**
+///
+/// M19 T1c's restore condition was one digest over the WHOLE resource-reaching
+/// nominal set, and that set is whole-program — so an entry that declares a
+/// `resource` and a sibling entry that does not mint different digests over the
+/// same world, and each analysis threw the other's per-module enrolment away
+/// and re-walked every module body in the program. The gate is the drop
+/// planner's whole price (M42: 950–1,230 ms of 1,095–1,385 on kolt's client),
+/// so "rejected" means "paid again".
+///
+/// The condition is the WORLD-declared half now. The pin states the split as a
+/// property rather than as its consequence — the two analyses agree on the
+/// world half and DIFFER on the entry half — and then asserts the consequence
+/// too, because the property alone would still hold if the condition quietly
+/// went back to comparing both halves.
+#[test]
+fn two_entries_differing_in_a_resource_declaration_share_one_enrolment_record() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let root = std::env::temp_dir().join(format!("vilan_m49_split_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("loaded.vl"), M49_MODULE).expect("write module");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // `(diagnostics, bodies the gate walked, (world, entry) fingerprints)` — the
+    // last two are thread-locals written by the analysis, so they are read on
+    // the analysis's own thread.
+    let observe = |entry_name: &'static str, source: &'static str| {
+        let spec = spec.clone();
+        let root = root.clone();
+        on_one_thread(move || {
+            let entry = root.join(entry_name);
+            let (_program, errors) = analyze_source(
+                source,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            (
+                format!("{errors:?}"),
+                vilan_core::drop_plan_stats::asked_roots(),
+                vilan_core::drop_plan_stats::nominals_fingerprints(),
+            )
+        })
+    };
+
+    // 1. The resource-declaring entry, cold: it derives every module's
+    //    enrolment and records it.
+    let first = observe("with_resource.vl", M49_ENTRY_RESOURCE);
+    assert_eq!(first.0, "[]", "the resource entry must analyze clean");
+    assert!(
+        first.1 > 100,
+        "a cold analysis walks the whole world's bodies, not {}",
+        first.1
+    );
+    assert_ne!(
+        first.2.0, M49_EMPTY_DIGEST,
+        "the world must declare a resource of its own, or the world halves \
+         agree vacuously: {:?}",
+        first.2
+    );
+
+    // 2. The sibling entry that declares nothing, over the same world.
+    let second = observe("plain.vl", M49_ENTRY_PLAIN);
+    assert_eq!(second.0, "[]", "the plain entry must analyze clean");
+
+    // The split, stated: same world-declared nominals, different entry-declared
+    // ones. If the halves are ever re-merged, this pair is exactly the input
+    // that makes the merged digest differ.
+    assert_eq!(
+        first.2.0, second.2.0,
+        "the two entries share a world, so the WORLD-declared nominal \
+         fingerprints must agree: {:?} vs {:?}",
+        first.2, second.2
+    );
+    assert_ne!(
+        first.2.1, second.2.1,
+        "one entry declares a resource and the other does not, so the \
+         ENTRY-declared fingerprints must differ — otherwise this fixture is \
+         not testing the split: {:?} vs {:?}",
+        first.2, second.2
+    );
+
+    // The consequence: the second entry's gate walks only what it brought.
+    assert!(
+        second.1 * 10 < first.1,
+        "the plain entry must restore the resource entry's enrolment rather \
+         than re-walking the world: {} bodies asked against {}",
+        second.1,
+        first.1
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// M52: what M44's "under construction" claim reaches, and what it does not.
+
+const M52_MODULE: &str = "export fun value(): i32 {\n\t7\n}\n";
+/// Three legs, ONE seed set: the shape M44 was measured on.
+const M52_SAME_A: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value()); }\n";
+const M52_SAME_B: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value() + 1); }\n";
+const M52_SAME_C: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value() * 2); }\n";
+/// Three legs, THREE seed sets: kolt's shape. Same package, same sibling, and
+/// three different `std::` reference sets — `io`, `math`, and both.
+const M52_DIFFERENT_A: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                               fun main() { print(value()); }\n";
+const M52_DIFFERENT_B: &str = "import std::math::PI;\nimport pkg::shared::value;\n\
+                               fun main() { let x = PI; let y = value(); }\n";
+const M52_DIFFERENT_C: &str = "import std::io::print;\nimport std::math::PI;\n\
+                               import pkg::shared::value;\n\
+                               fun main() { print(value()); let x = PI; }\n";
+
+/// M52: **a package's legs share one base world exactly when their seed sets
+/// agree — which is the whole of what M44 reaches, and why it is inert on
+/// kolt.**
+///
+/// M44 gave the base cache an "under construction" claim so a second member
+/// starting cold WAITS for the first member's world instead of building a
+/// second copy of it, and measured a four-leg generated workspace at Ir −13.5%
+/// with two legs' `base` phase going 31/35 ms → 0. Every leg of that fixture
+/// had one seed set. A real application does not: kolt's three entries
+/// reference `{asset, json, router, rpc, storage}`, `{asset, build, document,
+/// http, json, range, rpc_server}` and `{json, range, rpc, time}` — one module
+/// in common — so they mint three keys and no leg ever waits for another.
+///
+/// A HIT is what "the `base` phase is ~0" means (M21: kolt's `views.vl` went
+/// `base` 156–586 ms miss-every-time to 0.0 ms from the second analysis), so
+/// the pin is stated in retained worlds and hit/miss deltas rather than in
+/// milliseconds: it needs no clock, and it says the same thing.
+///
+/// Both halves are here because either alone is misleading. The first is M44
+/// working; the second is the shape it does not reach, and it must red if a
+/// future coarser key ever makes three seed sets share one world — that would
+/// be a world holding modules a leg never imported, which is a different claim
+/// about observation identity from the one `a_distinct_import_set_misses`
+/// makes, and it should not happen quietly.
+#[test]
+fn a_packages_legs_share_one_world_exactly_when_their_seed_sets_agree() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = std::env::temp_dir().join(format!("vilan_m52_legs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("shared.vl"), M52_MODULE).expect("write module");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let leg = |entry_name: &'static str, source: &'static str| {
+        let spec = spec.clone();
+        let root = root.clone();
+        on_one_thread(move || {
+            let entry = root.join(entry_name);
+            let (_program, errors) = analyze_source(
+                source,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            format!("{errors:?}")
+        })
+    };
+
+    // 1. Three legs, one seed set. The first misses and builds; the other two
+    //    are served its world, which is the `base` phase going to nothing.
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    assert_eq!(leg("same_a.vl", M52_SAME_A), "[]");
+    assert_eq!(leg("same_b.vl", M52_SAME_B), "[]");
+    assert_eq!(leg("same_c.vl", M52_SAME_C), "[]");
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        1,
+        "one seed set is one world, however many legs the package has"
+    );
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (2, 1),
+        "the first leg builds and the other two are served — that is what M44 \
+         measured and what a `base` phase of ~0 means"
+    );
+
+    // 2. Three legs, three seed sets — kolt's shape. Each builds its own world
+    //    and no leg waits for another, so M44's claim never fires.
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    assert_eq!(leg("diff_a.vl", M52_DIFFERENT_A), "[]");
+    assert_eq!(leg("diff_b.vl", M52_DIFFERENT_B), "[]");
+    assert_eq!(leg("diff_c.vl", M52_DIFFERENT_C), "[]");
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        3,
+        "three seed sets are three worlds — M44 is inert here, and a coarser \
+         key that made this 1 would be serving a leg a world holding modules it \
+         never imported"
+    );
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (0, 3),
+        "no leg is served another's world when the seed sets differ"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

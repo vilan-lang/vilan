@@ -2923,7 +2923,12 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }
             };
             Some((
-                Node::StructInitializer(namespace, (name, name_span), generic_arguments, fields),
+                Node::StructInitializer(
+                    namespace,
+                    (name, name_span),
+                    generic_arguments.map(Box::new),
+                    Box::new(fields),
+                ),
                 parser.span_from(start),
             ))
         })
@@ -3607,7 +3612,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             close_tag,
             punctuation,
         };
-        Some((Node::Element(body), self.span_from(start)))
+        Some((Node::Element(Box::new(body)), self.span_from(start)))
     }
 
     /// One head item: a `.method(…)` chain link, an `on:event(handler)`, an
@@ -5224,7 +5229,13 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         Some((
-            Node::Struct(name, generic_parameters, external, resource, body),
+            Node::Struct(
+                name,
+                generic_parameters.map(Box::new),
+                external,
+                resource,
+                body.map(Box::new),
+            ),
             self.span_from(start),
         ))
     }
@@ -5262,7 +5273,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect_ctrl('}')?;
         let variants = (variants, self.span_from(variants_start));
         Some((
-            Node::Enum(name, generic_parameters, resource, variants),
+            Node::Enum(
+                name,
+                generic_parameters.map(Box::new),
+                resource,
+                Box::new(variants),
+            ),
             self.span_from(start),
         ))
     }
@@ -5388,7 +5404,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         let body = self.within_member_body(Self::parse_trait_body)?;
         Some((
-            Node::Trait(name, generic_parameters, supertraits, body),
+            Node::Trait(
+                name,
+                generic_parameters.map(Box::new),
+                supertraits,
+                Box::new(body),
+            ),
             self.span_from(start),
         ))
     }

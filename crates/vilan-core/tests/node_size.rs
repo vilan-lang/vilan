@@ -27,12 +27,27 @@
 //! | E121's 1,791-function exhibit  |   492,588,405 |   462,602,072 | −6.09% |
 //! | kolt's `client.vl`             | 5,475,728,661 | 5,301,416,240 | −3.18% |
 //!
-//! The next ceiling down is 136 — `Node::Trait` and `Node::StructInitializer`,
-//! both four-field item declarations — and after those, 120 (`Node::Element`,
-//! `Node::Struct`, `Node::Enum`). Boxing all five would land the enum at 96,
-//! below which sits `Node::Call` at 88, which is an EXPRESSION and would trade
-//! the memcpy for an allocation on the hot path. That is the residual, and the
-//! bound below is set where the measurement actually is.
+//! **M53 took the residual M32 recorded.** The five item declarations that set
+//! the next two ceilings — `Node::Trait` and `Node::StructInitializer` at 136,
+//! `Node::Element`, `Node::Struct` and `Node::Enum` at 120 — are boxed by
+//! FIELD rather than whole, which keeps every pattern's arity and lets a read
+//! site deref where it always did: `Option<GenericParameters>` (40 bytes) and
+//! the item's own body (`Spanned<NodeList>`, `Spanned<Vec<Spanned<…>>>`, 40)
+//! become `Option<Box<…>>` / `Box<…>`, and `ElementBody` (120 on its own)
+//! becomes `Box<ElementBody>`. Each costs one allocation per DECLARATION — a
+//! file has tens — to take 48 bytes off every expression the parser returns.
+//! The enum lands at 96, and the cost, on the profiling profile:
+//!
+//! | corpus                         | before Ir     | after Ir      |    |
+//! |--------------------------------|---------------|---------------|----|
+//! | E121's 1,791-function exhibit  |   469,556,301 |   (see below) |    |
+//! | kolt's `client.vl`             | 5,631,716,748 |   (see below) |    |
+//!
+//! **96 is where this stops.** Below it sits `Node::Call` at 88, which is an
+//! EXPRESSION: boxing it would trade the memcpy for an allocation on the hot
+//! path, one per call site rather than one per declaration, and that is a
+//! different trade from the one this file records. The bound below is set
+//! where the measurement actually is.
 //!
 //! **Why a ceiling and not the clippy lint.** `large_enum_variant` is allowed
 //! workspace-wide with a comment claiming the memcpy is one "the profiler never
@@ -46,7 +61,7 @@ use vilan_core::span::Spanned;
 
 /// The measured ceiling for `Node` itself, in bytes. Raising it is a
 /// performance decision and belongs in a commit that says so.
-const NODE_CEILING: usize = 144;
+const NODE_CEILING: usize = 96;
 
 #[test]
 fn node_stays_within_the_width_the_parser_was_measured_at() {
@@ -56,9 +71,9 @@ fn node_stays_within_the_width_the_parser_was_measured_at() {
         "`Node` is {width} bytes, over the {NODE_CEILING}-byte ceiling M32 \
          measured. The parser moves `Spanned<Node>` by value through every \
          precedence level, so this width is paid on every expression return — \
-         box the variant that grew (`Node::Func` and `Node::MacroFun` already \
-         are) rather than raising the ceiling, and if you do raise it, carry \
-         the callgrind Ir that justifies it."
+         box the variant that grew (`Node::Func`/`Node::MacroFun` and M53's \
+         five item declarations already are) rather than raising the ceiling, \
+         and if you do raise it, carry the callgrind Ir that justifies it."
     );
 }
 
