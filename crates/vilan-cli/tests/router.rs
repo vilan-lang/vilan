@@ -318,3 +318,258 @@ fn router_swap_link_and_history_semantics() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A62: the READ direction ------------------------------------------------
+
+/// A62's exhibit: kolt's own route space, with the hand-written `parse` over
+/// `segments` replaced by a `FromPath` impl over `parse_path(path).segments` —
+/// and the query, fragment and percent-decoding that were unreachable before.
+const PARSE_APP: &str = r#"import std::io::print;
+import std::router::{
+	FromPath,
+	Routable,
+	from_path,
+	location_url,
+	parse_path,
+	parse_query,
+	percent_decode,
+	segments,
+};
+
+[derive(PartialEq)]
+enum Route {
+	Home,
+	Messages,
+	Workspace(i32, WorkspaceRoute),
+	NotFound,
+}
+
+[derive(PartialEq)]
+enum WorkspaceRoute {
+	Overview,
+	Task(i32),
+}
+
+impl Route with FromPath {
+	fun from_segments(parts: List<str>): Route {
+		match parts.len() {
+			0 => Route::Home,
+			_ => {
+				if parts[0] == "m" {
+					Route::Messages
+				} else if parts[0] == "w" && parts.len() > 1 {
+					match parts[1].parse_i32() {
+						Some(let id) => Route::Workspace(id, WorkspaceRoute::from_segments(parts)),
+						None => Route::NotFound,
+					}
+				} else {
+					Route::NotFound
+				}
+			},
+		}
+	}
+}
+
+impl WorkspaceRoute with FromPath {
+	fun from_segments(parts: List<str>): WorkspaceRoute {
+		match parts.len() {
+			4 => {
+				if parts[2] == "task" {
+					match parts[3].parse_i32() {
+						Some(let task) => WorkspaceRoute::Task(task),
+						None => WorkspaceRoute::Overview,
+					}
+				} else {
+					WorkspaceRoute::Overview
+				}
+			},
+			_ => WorkspaceRoute::Overview,
+		}
+	}
+}
+
+impl Route with Routable {
+	fun to_path(self): str {
+		match self {
+			Route::Home => "/",
+			Route::Messages => "/m",
+			Route::Workspace(let id, let inner) => {
+				let tail = match inner {
+					WorkspaceRoute::Overview => "",
+					WorkspaceRoute::Task(let task) => i"/task/{task}",
+				};
+				i"/w/{id}" + tail
+			},
+			Route::NotFound => "/404",
+		}
+	}
+}
+
+fun name(route: Route): str {
+	match route {
+		Route::Home => "home",
+		Route::Messages => "messages",
+		Route::Workspace(let id, let inner) => {
+			let tail = match inner {
+				WorkspaceRoute::Overview => "overview",
+				WorkspaceRoute::Task(let task) => i"task{task}",
+			};
+			i"ws{id}/" + tail
+		},
+		Route::NotFound => "notfound",
+	}
+}
+
+/// One line per path: what it parses to, and what that route prints back.
+fun report(path: str) {
+	let route: Route = from_path(path);
+	let label = name(route);
+	let printed = route.to_path();
+	print(i"route {path} -> {label} -> {printed}");
+}
+
+fun main() {
+	// The empty-segment rule: a leading, trailing or doubled slash produces no
+	// segment, so every spelling of the same route parses alike and no match
+	// arm has to name the trailing-slash case.
+	report("/");
+	report("");
+	report("/m");
+	report("/w/3");
+	report("/w/3/");
+	report("//w//3//");
+	report("/w/3/task/7");
+	report("/x");
+	// A query and a fragment do not disturb the segments.
+	report("/w/3?tab=open#notes");
+
+	let full = parse_path("/w/acme/tasks/?tag=due%20soon&open&a+b=c+d#notes");
+	let count = full.segments.len();
+	print(i"segments {count} {full.segments[0]}/{full.segments[1]}/{full.segments[2]}");
+	let tag = full.query.get("tag").unwrap();
+	let open = full.query.get("open").unwrap();
+	let plus = full.query.get("a b").unwrap();
+	let size = full.query.len();
+	print(i"query {size} tag={tag} open=[{open}] plus={plus}");
+	let fragment = full.fragment.unwrap();
+	print(i"fragment {fragment}");
+
+	// The fragment is cut FIRST: a `?` after a `#` is fragment text.
+	let hashed = parse_path("/a#b?c");
+	let hashed_fragment = hashed.fragment.unwrap();
+	let hashed_query = hashed.query.len();
+	print(i"hash-first {hashed_fragment} {hashed_query}");
+
+	// `None` (no `#` at all) and `Some("")` (a bare trailing `#`) are different
+	// URLs, and the shape says so.
+	let absent = parse_path("/a").fragment.is_none();
+	let bare = parse_path("/a#").fragment.unwrap();
+	print(i"fragment-absent {absent} bare=[{bare}]");
+
+	// Decoding happens AFTER the split, so an escaped separator stays inside
+	// its segment instead of becoming one.
+	let escaped = parse_path("/hello%20world/a%2Fb");
+	let escaped_count = escaped.segments.len();
+	print(i"decoded {escaped_count} [{escaped.segments[0]}] [{escaped.segments[1]}]");
+	// `segments` stays RAW — the pair is deliberate, and documented.
+	let raw = segments("/hello%20world");
+	print(i"raw [{raw[0]}]");
+
+	let cafe = percent_decode("caf%C3%A9");
+	let malformed = percent_decode("%zz");
+	print(i"decode {cafe} {malformed}");
+
+	let sparse = parse_query("&&a=1&").len();
+	let repeated = parse_query("a=1&a=2").get("a").unwrap();
+	print(i"query-forms {sparse} {repeated}");
+
+	let url = location_url();
+	print(i"url {url}");
+}
+
+main();
+"#;
+
+/// The stub `parse_path` needs: a location for `location_url`, plus the DOM
+/// globals a browser bundle touches at load.
+const PARSE_HARNESS: &str = r##"global.document = {
+    createElement: () => ({ children: [], attributes: {}, style: { setProperty() {} },
+        appendChild() {}, replaceChildren() {}, addEventListener() {} }),
+    getElementById: () => null,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+};
+global.window = { addEventListener: () => {}, removeEventListener: () => {} };
+global.location = { pathname: "/w/acme", search: "?tag=x", hash: "#top" };
+global.history = { pushState() {} };
+require("./app.js");
+"##;
+
+#[test]
+fn a62_parse_path_reads_a_url_and_from_path_round_trips_through_to_path() {
+    let dir = temp_project("parse");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"router_parse\"\nroot = \".\"\nentry = \"app.vl\"\ntarget = \"browser\"\n",
+    );
+    write(&dir, "app.vl", PARSE_APP);
+    write(&dir, "harness.js", PARSE_HARNESS);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new("node")
+        .arg("harness.js")
+        .current_dir(&dir)
+        .output()
+        .expect("run node harness");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "parse harness failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let expected = [
+        // The empty-segment rule: `""`, `"/"`, a trailing slash and doubled
+        // slashes all parse alike, so no match arm names the trailing-slash case.
+        "route / -> home -> /",
+        "route  -> home -> /",
+        "route /m -> messages -> /m",
+        "route /w/3 -> ws3/overview -> /w/3",
+        "route /w/3/ -> ws3/overview -> /w/3",
+        "route //w//3// -> ws3/overview -> /w/3",
+        "route /w/3/task/7 -> ws3/task7 -> /w/3/task/7",
+        "route /x -> notfound -> /404",
+        "route /w/3?tab=open#notes -> ws3/overview -> /w/3",
+        "segments 3 w/acme/tasks",
+        // `%20` decodes, a bare key is present with an empty value, and `+` is a
+        // space in a query (only in a query).
+        "query 3 tag=due soon open=[] plus=c d",
+        "fragment notes",
+        // The fragment is cut FIRST: a `?` after a `#` is fragment text.
+        "hash-first b?c 0",
+        "fragment-absent true bare=[]",
+        // Decoding happens after the split, so `%2F` stays inside its segment.
+        "decoded 2 [hello world] [a/b]",
+        "raw [hello%20world]",
+        "decode café %zz",
+        // Empty pairs are skipped; a repeated key keeps the last value.
+        "query-forms 1 2",
+        "url /w/acme?tag=x#top",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines, expected,
+        "parse_path/from_path output drifted; got:\n{stdout}"
+    );
+}

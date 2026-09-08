@@ -295,9 +295,17 @@ Two things deliberately still ask for the concrete type:
 ```vilan,fragment
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
-fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"]
+fun location_url(): str               // pathname + search + hash — the whole relative URL
+fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
+fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
+fun parse_query(query: str): Map<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
 
-trait Routable { fun to_path(self): str }
+struct PathParts { segments: List<str>, query: Map<str, str>, fragment: Option<str> }
+fun parse_path(path: str): PathParts  // cut, then decode — the READ direction
+
+trait Routable { fun to_path(self): str }              // route → URL
+trait FromPath { fun from_segments(parts: List<str>): Self }   // URL → route
+fun from_path<R: FromPath>(path: str): R               // parse_path, then from_segments
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
 
 // Route chunks (a `split = true` leg) — both are ordinary signals
@@ -309,7 +317,40 @@ fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with t
 the `popstate` listener is wired on first use. `link` renders a real anchor
 (middle-click, ctrl-click, and copy-link keep native behavior) and intercepts
 only a plain left click, calling `prevent_default` + `navigate`. Route
-modelling (`parse`/`href` over enums): the [routing guide](../guide/routing.md).
+modelling (`Routable`/`FromPath` over enums): the
+[routing guide](../guide/routing.md).
+
+**`parse_path` is the read direction, and it cuts before it decodes.** The
+fragment is delimited first (a `?` after a `#` is fragment text), then the
+query, then the path splits on `/` — and only then is every piece
+percent-decoded, so an escaped separator (`%2F`, `%26`) stays inside the
+segment or value it belongs to instead of becoming one. Empty segments do not
+exist, so `"/w/acme"`, `"/w/acme/"` and `"//w//acme"` parse alike and no match
+arm has to name the trailing-slash case. A query key with no `=` is present
+with an empty value (`"?open"` and `"?open="` both give `{ "open": "" }`), a
+repeated key keeps the last, and query keys and values additionally read `+`
+as a space — a path segment's `+` is a literal plus. `fragment` is `None` when
+the URL has no `#` at all and `Some("")` for a bare trailing one, because those
+are different URLs.
+
+`segments` stays **raw** — it is the splitter, not the reader — so
+`segments("/a%20b")` is `["a%20b"]` where `parse_path("/a%20b").segments` is
+`["a b"]`. Route matching wants the decoded form.
+
+`FromPath` is `Routable`'s inverse, and the pair has a law:
+`from_path(route.to_path())` is `route`, for every route the app can reach —
+one round-trip test per route space instead of a drift nobody notices until a
+link 404s. Its member takes segments rather than a path, because that is where
+a route space is decided; `from_path` is a free generic function rather than a
+trait default because an associated function has no receiver to inherit a
+default through (the compiler says exactly that if you try). It is total: an
+unrecognized URL is a route, not an `Option`.
+
+`current_path()` is the **pathname only**, deliberately — a signal that
+advanced on every `#anchor` would re-render the page for a scroll, and a route
+whose `to_path()` prints a pathname would stop comparing equal to the location.
+Reach for `location_url()` where the query matters (on load, and in a
+`popstate` handler) and keep routing on the path.
 
 `pending()` and `chunk_error()` describe a `split = true` leg's route-chunk
 fetches, and are ordinary signals — bind them with `show`, `bind_text` or a

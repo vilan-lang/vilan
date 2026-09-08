@@ -1092,6 +1092,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__dom_bounding_rect",
         "__dom_query_all",
         "__router_path",
+        "__router_url",
+        "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
         "__nursery_run",
@@ -1343,6 +1345,28 @@ fn helper_source(name: &str) -> &'static str {
         // Router glue (std::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // The whole relative URL, for the query and fragment `location.pathname`
+        // leaves out. Deliberately NOT what `current_path()` tracks: a route
+        // signal that advanced on every `#anchor` would re-render the page for a
+        // scroll, so the path signal stays the pathname and this is the reach
+        // for the rest.
+        "__router_url" => {
+            "function __router_url() {\n\treturn location.pathname + location.search + location.hash;\n}"
+        }
+        // `router::percent_decode`: `decodeURIComponent`, made TOTAL. The host
+        // function throws a `URIError` on a malformed escape (`%zz`, a lone
+        // `%`), and a URL is attacker-supplied text — a router that crashes on
+        // one is a denial of service, so an undecodable piece decodes to
+        // itself.
+        "__percent_decode" => {
+            "function __percent_decode(text) {\n\
+             \ttry {\n\
+             \t\treturn decodeURIComponent(text);\n\
+             \t} catch {\n\
+             \t\treturn text;\n\
+             \t}\n\
+             }"
+        }
         // HMR activity guard (std::dev, `hmr.md` §4/§5): true only when a `run
         // --watch` shim installed its `window.__VILAN_HMR__` singleton. A
         // self-contained `typeof` test (safe with no shim, in any host), so the
