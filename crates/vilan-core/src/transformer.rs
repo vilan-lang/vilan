@@ -2374,6 +2374,43 @@ pub fn instance_log() -> Vec<String> {
     INSTANCE_LOG.with(|log| log.borrow().clone())
 }
 
+thread_local! {
+    /// The largest composed substitution any instance emission on this thread
+    /// has walked a body under since [`reset_substitution_peak`] — the entry
+    /// count of `current_substitution`, at its high-water mark.
+    ///
+    /// B244 made `emit_instance` COMPOSE the enclosing substitution with the
+    /// instantiation's own rather than replace it, which is what keeps a
+    /// constructor-headed binding's inner parameter reachable through however
+    /// many constructors sit between it and its concrete type. The composition
+    /// is also the only thing in the transformer that GROWS with monomorphization
+    /// depth: every nested emission clones the map in force and extends it, so a
+    /// chain n deep clones n times and the innermost map carries every outer
+    /// entry the inner ones did not shadow. Nothing measured that (tracker N62),
+    /// which means nothing would notice a program whose chain made the clone the
+    /// dominant cost of its emission.
+    ///
+    /// The peak and not a total, because the question is what the deepest point
+    /// of a compile costs, and a `Cell<usize>` max on a path that already clones
+    /// a `HashMap` is not a cost anyone can measure. Always on, for
+    /// [`INSTANCE_LOG`]'s reason: a `cfg(test)` instrument does not survive
+    /// `vilan-core` being built as a non-test dependency of another crate's test
+    /// binary.
+    static SUBSTITUTION_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The largest composed substitution an instance emission on this thread has
+/// walked a body under since the last [`reset_substitution_peak`]. See
+/// [`SUBSTITUTION_PEAK`].
+pub fn substitution_peak() -> usize {
+    SUBSTITUTION_PEAK.with(std::cell::Cell::get)
+}
+
+/// Puts this thread's [`substitution_peak`] back to zero.
+pub fn reset_substitution_peak() {
+    SUBSTITUTION_PEAK.with(|peak| peak.set(0));
+}
+
 /// Empties this thread's [`instance_log`].
 pub fn reset_instance_log() {
     INSTANCE_LOG.with(|log| log.borrow_mut().clear());
@@ -8876,6 +8913,10 @@ impl<'src> Transformer<'src> {
         // disjoint.
         let mut substitution: HashMap<TypeId, TypeId> = self.current_substitution.clone();
         substitution.extend(entries);
+        // The composition's high-water mark, which is what a deep chain costs
+        // (tracker N62). Recorded here rather than at the install below because
+        // this is the map that was BUILT — the install moves it.
+        SUBSTITUTION_PEAK.with(|peak| peak.set(peak.get().max(substitution.len())));
         // One entry per distinct instance KEY (see [`INSTANCE_LOG`]): the memo
         // hit above returned, so reaching here is a mint.
         if let Some(function) = self.program.functions.get(&function_id) {

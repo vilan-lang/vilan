@@ -613,8 +613,6 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
                 precise
             }
         }
-        // An INHERITED default called on a concrete value carries no trait
-        // either, and the receiver is not `Self`, so it keeps the widest answer.
         // An INHERITED default called on a concrete value: the receiver is
         // KNOWN, and it is narrowed by exactly the same fact as the `self` call
         // below (B254). Recording this dispatch at all means the receiver's own
