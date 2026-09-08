@@ -246,15 +246,18 @@ fn visibility_marker_rule(marker: &str) -> String {
     )
 }
 
-/// The rule a block-like statement followed by an operator breaks (B248).
-/// Curated (diagnostics-standard.md B6): the prohibition explains itself — a
-/// block-like statement is COMPLETE — and names the sanctioned spelling, which
-/// is the parentheses B231 already admits the form inside.
-const BLOCK_LIKE_STATEMENT_IS_COMPLETE: &str = "a statement that begins with `match`, `if`, `for` or `{` is COMPLETE at its \
-     closing brace, so this operator begins a new statement rather than continuing the one above: \
-     parenthesize the block-like form — `(match x { .. }) + 1` — to use its value as an operand. \
-     (The rule is what lets a line beginning `-x` or `*p` mean subtraction or a dereference by \
-     where it sits.)";
+/// The rule a block-like form followed by an operator or a `.` chain breaks
+/// (B248, widened by B259). Curated (diagnostics-standard.md B6): the
+/// prohibition explains itself — a block-like form is COMPLETE — and names the
+/// sanctioned spelling, which is the parentheses B231 already admits the form
+/// inside. One sentence for every position, because the mistake and the fix are
+/// the same in all of them: B259 found the statement head was only where the
+/// refusal FIRED, not where the rule applies.
+const BLOCK_LIKE_STATEMENT_IS_COMPLETE: &str = "a `match`, `if`, `for` or `{` form is COMPLETE at its \
+     closing brace, so the operator or `.` after it does not continue it — in statement position it \
+     begins a new statement instead: parenthesize the block-like form — `(match x { .. }) + 1`, \
+     `(match x { .. }).to_str()` — to use its value as an operand. (The rule is what lets a line \
+     beginning `-x` or `*p` mean subtraction or a dereference by where it sits.)";
 
 /// The rule `let mut x = …` breaks. Curated (diagnostics-standard.md B6): `let`
 /// and `mut` are the two BINDING FORMS, not a keyword and a modifier on it, so
@@ -1056,58 +1059,84 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.note_expected(TERMINATOR_EXPECTED);
     }
 
-    /// B248: refuse an operator that continues an expression the block-like
-    /// statement just parsed has already ENDED, and steer to the parentheses that
-    /// spell what was meant.
+    /// B248/B259: refuse an operator — or a `.` chain — that continues an
+    /// expression the block-like form just parsed has already ENDED, and steer to
+    /// the parentheses that spell what was meant. Called at the four block-bearing
+    /// HEADS of [`Parser::parse_secondary_inner`], so it covers every position a
+    /// block-like form can head an expression from: a statement, a `let`
+    /// initializer, an argument, a `ret` tail.
     ///
     /// B231 admitted a block-like form as an OPERAND (`flag && match p() { .. }`),
     /// where nothing is ambiguous because an operator has already committed the
-    /// position to an expression. As the HEAD of a statement it is a different
-    /// question, and vilan answers it the way Rust does: a statement that begins
-    /// with `match`, `if`, `for` or `{` is COMPLETE at its closing brace, so what
-    /// follows begins a new statement. That rule is what makes a leading `-` or
-    /// `*` on the next line mean subtraction or a dereference by where it sits
-    /// rather than by what the parser felt like — and the language already relies
-    /// on it: `if c { 1 } else { 2 }` followed by `* 3;` parses today as two
-    /// statements, and admitting the tower after a block-like head would silently
-    /// re-read it as one.
+    /// position to an expression. As the HEAD it is a different question, and
+    /// vilan answers it the way Rust does: a statement that begins with `match`,
+    /// `if`, `for` or `{` is COMPLETE at its closing brace, so what follows begins
+    /// a new statement. That rule is what makes a leading `-` or `*` on the next
+    /// line mean subtraction or a dereference by where it sits rather than by what
+    /// the parser felt like — and the language already relies on it:
+    /// `if c { 1 } else { 2 }` followed by `* 3;` parses today as two statements,
+    /// and admitting the tower after a block-like head would silently re-read it
+    /// as one.
     ///
-    /// So the shape is refused, and the refusal is the whole change: the token
-    /// stream is unaltered and the block-like statement still stands, which is
-    /// what keeps the operator's own statement reporting nothing further. Before
-    /// this the author got `found '+' expected an expression` pointed at the
-    /// operator — true, and about a statement they did not know they had written.
+    /// B248 put the refusal at the STATEMENT fork, which is where the shape was
+    /// found; B259 found the other three positions, where the same source got the
+    /// bare parse error the refusal exists to replace (`let y = match x { .. } + 1;`
+    /// reported "expected `;`" and nothing about why, an argument position
+    /// `found '+' expected ',' or ')'`). The rule is about the FORM, not about the
+    /// statement, so it is now stated once where the form is parsed.
     ///
     /// Only an operator that cannot BEGIN an expression is refused. `-`, `!`, `&`
     /// and `*` can, and the two readings of those are exactly the ambiguity the
-    /// rule exists to settle: they begin a new statement, as they always have.
-    fn refuse_block_like_head(&mut self) {
-        // A binary operator, unless it is one of the four PREFIXES. The rest of
-        // the continuation set is deliberately left alone, each for its own
-        // reason: `<` and `>` are control characters here and a statement CAN
-        // begin with `<` (element syntax), and a postfix `.` chain
-        // (`match x { .. }.to_str()`) is a different shape whose recovery would
-        // have to take the member with it.
-        let continues = matches!(
-            self.peek(),
-            Some(Token::Op(symbol)) if !matches!(*symbol, "!" | "-" | "&" | "*")
-        );
-        if !continues {
-            return;
+    /// rule exists to settle: they begin a new statement, as they always have. `<`
+    /// and `>` are control characters here rather than operators, and a statement
+    /// CAN begin with `<` (element syntax), so they are outside the set too — as
+    /// are the `(` and `[` postfixes, which lead a parenthesized expression and a
+    /// list literal.
+    ///
+    /// `=>` is outside it for a different reason, and it is the one B248 could not
+    /// see from the statement fork: it is a SEPARATOR of the enclosing production,
+    /// not a continuation of this expression. A match GUARD is an expression that
+    /// ends where the arrow begins — `Some(let n) if match n { 0 => false, _ => true }
+    /// => …` is a real shape in the tree — so an arrow after a block-like form is
+    /// the arm's, and taking it would eat the arm.
+    ///
+    /// The RECOVERY consumes what it refused, which is what makes this REPLACE the
+    /// bare failure rather than sit above it: the author gets one diagnostic naming
+    /// the shape instead of two, the second of them about a statement they did not
+    /// know they had written (diagnostics-standard B5). A `.` chain is consumed
+    /// WHOLE — skipping only the `.` would leave `to_str()` as a bare name and
+    /// cascade to "cannot find 'to_str'", a second diagnostic about generated
+    /// nonsense.
+    fn refuse_block_like_continuation(&mut self, no_struct: bool) {
+        let mut refused = false;
+        loop {
+            let operator = match self.peek() {
+                Some(Token::Op(symbol)) if !matches!(*symbol, "!" | "-" | "&" | "*" | "=>") => true,
+                Some(Token::Ctrl('.')) => false,
+                _ => return,
+            };
+            if !refused {
+                self.errors.push(ParseError {
+                    span: self.here_span(),
+                    reason: ParseErrorReason::Rule(BLOCK_LIKE_STATEMENT_IS_COMPLETE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+                refused = true;
+            }
+            if operator {
+                // The operator, then the rest of the tower it opened — attempted,
+                // so a right operand that does not parse leaves the position where
+                // the operator left it rather than half-consumed.
+                self.bump();
+                self.attempt(|parser| parser.parse_operators(no_struct));
+                return;
+            }
+            // Every link of the chain. Each consumes at least its own leading
+            // token, so the loop strictly advances; a following operator is then
+            // taken by the arm above, under the refusal already pushed.
+            while matches!(self.parse_one_postfix(), Some(Some(_))) {}
         }
-        self.errors.push(ParseError {
-            span: self.here_span(),
-            reason: ParseErrorReason::Rule(BLOCK_LIKE_STATEMENT_IS_COMPLETE),
-            context: self.context_stack.clone(),
-            hint: None,
-        });
-        // Step over the operator, which is chumsky's skip-then-retry recovery and
-        // is what makes this REPLACE the bare failure rather than sit above it:
-        // the right operand becomes a statement of its own and parses, so the
-        // author gets one diagnostic naming the shape instead of two, the second
-        // of them `found '+' expected an expression` about a statement they did
-        // not know they had written (diagnostics-standard B5).
-        self.bump();
     }
 
     /// Push an `Expected` error for a failure at `position`: the found token, its
@@ -1871,8 +1900,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             if parser.eat_ctrl(';') {
                 return Some(expression);
             }
+            // A block-bearing form needs no `;` (chumsky's `not_block_end`). Its
+            // own continuation rule is stated where the form is parsed
+            // (`refuse_block_like_continuation`), so by here nothing operator-like
+            // is left for this fork to read.
             if is_block_like(&expression.0) && !parser.peek_is_ctrl('}') {
-                parser.refuse_block_like_head();
                 return Some(expression);
             }
             // The expression is complete and its `;` is not there. Record the
@@ -2131,26 +2163,32 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_secondary`]'s body, past the depth bound.
     fn parse_secondary_inner(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        match self.peek() {
+        let block_like = match self.peek() {
             // A closure literal (`|params| body`, `|| body`) — always tried before
             // the tower, so a leading `||` is never a logical-or (which needs a left
             // operand). Nothing else in the grammar leads with `|`/`||` here.
             Some(Token::Op("|") | Token::Op("||")) => return self.parse_closure(),
-            Some(Token::Ctrl('{')) => return self.parse_block_as_expression(),
-            Some(Token::If) => return self.parse_if(),
-            Some(Token::For) => return self.parse_for(),
-            Some(Token::Match) => return self.parse_match(),
             Some(Token::Jump) => return self.parse_jump(),
             Some(Token::Let | Token::Mut) => return self.parse_let(),
             Some(Token::Ret) => return self.parse_return(),
-            _ => {}
-        }
-        // Assignment (an lvalue then `=`/`+=`/…) is tried before the tower; it
-        // backtracks when no assignment operator follows the place.
-        if let Some(assignment) = self.parse_assignment() {
-            return Some(assignment);
-        }
-        self.parse_operators(no_struct)
+            // The four block-bearing heads. They share one rule past their closing
+            // brace — B248/B259's: the form is COMPLETE there, so an operator or a
+            // `.` after it is refused rather than read as a continuation.
+            Some(Token::Ctrl('{')) => self.parse_block_as_expression()?,
+            Some(Token::If) => self.parse_if()?,
+            Some(Token::For) => self.parse_for()?,
+            Some(Token::Match) => self.parse_match()?,
+            _ => {
+                // Assignment (an lvalue then `=`/`+=`/…) is tried before the tower;
+                // it backtracks when no assignment operator follows the place.
+                if let Some(assignment) = self.parse_assignment() {
+                    return Some(assignment);
+                }
+                return self.parse_operators(no_struct);
+            }
+        };
+        self.refuse_block_like_continuation(no_struct);
+        Some(block_like)
     }
 
     /// The operator tower above the postfix/precedence chain: the `is` pattern test,
