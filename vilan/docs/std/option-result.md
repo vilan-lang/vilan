@@ -63,9 +63,32 @@ impl Option<type T: Default> { fun unwrap_or_default(own self): T }
 impl Option<(type T, type U)> { fun unzip(own self): (Option<T>, Option<U>) }
 ```
 
-`str.parse_i32(): Option<i32>` and `str.parse_f64(): Option<f64>` (both
-declared here) are the string→number path, and `bool.then_some(value)` is the
-condition→`Option` one.
+`str.parse_i32(): Option<i32>`, `str.parse_f64(): Option<f64>` and
+`str.parse_bool(): Option<bool>` (all declared here) are the string→value
+path, and `bool.then_some(value)` is the condition→`Option` one. All three
+trim surrounding whitespace and are otherwise **strict**: the whole remaining
+text must be the value. `parse_bool` accepts `"true"` and `"false"` only —
+the exact inverse of `Display::to_string` on a `bool`, and the set
+`std::json`'s bool reader accepts. `"1"`, `"0"`, `"True"` and `"yes"` are
+`None`, because a parse whose accepted set is wider than its writer's output
+silently adopts some other producer's convention; an app with a legacy store
+says so in one line at its own decoder.
+
+That is the whole conversion idiom, and none of it needs hand-writing: out
+through `Display::to_string`, back through `str.parse_*`, and anything
+structured through `std::json`'s `Json` / `FromJson`.
+
+```vilan
+import std::display::Display;
+import std::io::print;
+import std::option::Option;
+
+fun main() {
+	let stored = true.to_string();
+	print(stored.parse_bool().unwrap_or(false));
+	print("1".parse_bool().is_some());
+}
+```
 
 The combinators that hand the payload onward take **`own self`**: they move
 the value out of the `Option`, so they must own it (`docs/spec/memory.md` R3).

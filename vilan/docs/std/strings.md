@@ -33,6 +33,7 @@ impl str {
 	fun strip_suffix(self, suffix: str): Option<str> // likewise
 	fun parse_i32(self): Option<i32>                 // likewise
 	fun parse_f64(self): Option<f64>                 // likewise
+	fun parse_bool(self): Option<bool>               // likewise
 }
 ```
 
