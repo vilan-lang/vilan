@@ -2790,6 +2790,7 @@ const MIXED_BINARIES: &[&str] = &[
     "asset_bundle",
     "split",
     "serve_build",
+    "parallel_build",
 ];
 
 /// The name substrings the filterset's `test(/watch|round/)` matches.

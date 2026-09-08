@@ -104,12 +104,12 @@ wall-clock-waits = { max-threads = 1 }
 
 [[profile.default.overrides]]
 # `hmr`, `hmr_swap`, `hmr_css_matrix`, `watch_lifecycle` and `watch_leg_reuse` are
-# watch sessions end to end, so they join whole. The next five binaries are mostly one-shot
+# watch sessions end to end, so they join whole. The next six binaries are mostly one-shot
 # `build` pins with a watch family inside them, and the family is named the way
 # it is spelled: every one of these tests carries `watch` or `round` in its
 # name. A name filter can rot in silence, so it does not stand alone —
 # `build_hooks`'s `every_test_that_drives_a_watch_session_is_in_the_group`
-# reads all nine files and reds if a test spawns a watcher from outside the set
+# reads all ten files and reds if a test spawns a watcher from outside the set
 # this line selects. It is what found `split` and `serve_build`, whose one
 # watch round each was invisible to a filter written off the HMR suites.
 #
@@ -143,7 +143,7 @@ filter = '''
     binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
     + binary(watch_leg_reuse)
     + ((binary(build_hooks) + binary(assets) + binary(asset_bundle) + binary(split)
-        + binary(serve_build)) & test(/watch|round/))
+        + binary(serve_build) + binary(parallel_build)) & test(/watch|round/))
     + (binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests|watched_files_tests|dead_item_clock_tests/))
 '''
 test-group = 'wall-clock-waits'

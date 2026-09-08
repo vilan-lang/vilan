@@ -4029,6 +4029,19 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
 /// leg's diagnostics and a clean verdict means clean everywhere (E113). One
 /// verdict line either way — the file is the subject, not the number of colors
 /// it took to clear it.
+///
+/// **Sequential, and the blocker is named** (M51). `build` compiles a tier of a
+/// workspace's legs at once and `check_workspace` its members (M35); this loop
+/// stays one thread because of the ledger it arms three lines down.
+/// [`RENDERED_THIS_ROUND`] is process-global and its claim is about THIS
+/// round's ORDER — the first color to raise a diagnostic reports it and the
+/// rest are suppressed — so colors running at once would claim in whatever
+/// order they finished, and a file's report would name a different leg run to
+/// run. M35's answer for the workspace does not carry over: there the ledger is
+/// applied at REPLAY, member by member, because a member is a whole compile
+/// whose diagnostics can be buffered and re-ordered; the same trick here needs
+/// the ledger to be a per-round value the round threads rather than a static
+/// the renderer reaches for, which is B182's own shape to change.
 fn check_single(
     unit: &Unit,
     platforms: &[Platform],
