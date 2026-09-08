@@ -8604,6 +8604,7 @@ impl<'src> Analyzer<'src> {
         // set and the field is written exactly once, at the tail — and put
         // back on the early return, which is a path that decides nothing.
         let restored_structures = std::mem::take(&mut self.reported_container_structures);
+        container_site_census_reset();
         // Nothing is a resource unless something declares itself one, so the
         // whole check — the per-instantiation descent and the inferred sweep
         // included — is dead work for a program with no `resource` declaration
@@ -8630,7 +8631,9 @@ impl<'src> Analyzer<'src> {
             // Its diagnostics are replayed and the keys it contributed above
             // are already in `reported_structures`, so both halves of what this
             // loop would have produced for it are already here.
-            if self.reused_source(source) {
+            let visited = !self.reused_source(source);
+            container_site_offered(visited);
+            if !visited {
                 continue;
             }
             let Some(found) =
@@ -31972,8 +31975,8 @@ impl<'src> Analyzer<'src> {
         self.reused_sources.binary_search(&source).is_ok()
     }
 
-    /// [`Self::reused_source`] asked of the ENTITY that carries an R10 site
-    /// (M19 T1d).
+    /// [`Self::reused_source`] asked of the ENTITY that carries an R10 site,
+    /// counting the site into the census either way (M19 T1d).
     ///
     /// `world_entity` rather than `reused_source(source_of_id(..))` for a
     /// reason that is about the COLD path: with nothing reused `world_ranges`
@@ -31982,7 +31985,9 @@ impl<'src> Analyzer<'src> {
     /// to buy nothing. The two agree — `world_ranges` IS `source_ranges`
     /// filtered by the reused set.
     fn container_site_visited(&self, id: Id) -> bool {
-        !self.world_entity(id)
+        let visited = !self.world_entity(id);
+        container_site_offered(visited);
+        visited
     }
 
     /// The file a diagnostic at `index` will publish under — the same
@@ -44313,6 +44318,36 @@ thread_local! {
 #[doc(hidden)]
 pub fn table_reuse_census() -> usize {
     TABLE_REUSE_CENSUS.with(std::cell::Cell::get)
+}
+
+// M19 T1d's counter, in the same family and for the same reason M28's is
+// (`drop_plan_stats`): what the tranche does is stop VISITING a reused module's
+// R10 sites, and no clock can pin that on a loaded box. `(visited, offered)`
+// over the check's three tiers — the written type applications, the inferred
+// sweep over every typed expression, binding and parameter, and the native
+// receiver calls — reset at the top of the check and read after it.
+thread_local! {
+    static CONTAINER_SITE_CENSUS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Offer one R10 site to the census, and say whether it was visited.
+fn container_site_offered(visited: bool) {
+    CONTAINER_SITE_CENSUS.with(|census| {
+        let (seen, offered) = census.get();
+        census.set((seen + usize::from(visited), offered + 1));
+    });
+}
+
+fn container_site_census_reset() {
+    CONTAINER_SITE_CENSUS.with(|census| census.set((0, 0)));
+}
+
+/// R10's site census for the last analysis on this thread: how many of the
+/// sites the check was offered it actually visited (M19 T1d).
+#[doc(hidden)]
+pub fn container_site_census() -> (usize, usize) {
+    CONTAINER_SITE_CENSUS.with(std::cell::Cell::get)
 }
 
 /// Forces `analyze` to run `build()` twice back-to-back — the S2 pin's

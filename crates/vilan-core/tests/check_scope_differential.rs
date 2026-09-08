@@ -1041,3 +1041,200 @@ fn a_reused_modules_drop_scan_enrolment_is_restored_not_rewalked() {
          destructor and not a formatting difference"
     );
 }
+
+/// M19 T1d's fixture (tracker M48): a module whose R10 report is worth
+/// REMEMBERING. Three of the check's site kinds in one file — a written
+/// container application at a resource, the same container reached only
+/// through inference, and a native receiver — plus the generic body R11 asks
+/// about per instantiation, which is what makes the whole-program report a
+/// thing the record has to carry rather than merely a thing it may.
+const M19_T1D_CONTAINER_MODULE: &str = r#"
+import std::drop::{ Drop, drop };
+
+resource struct T1dGuard { tag: str }
+
+impl T1dGuard with Drop {
+	fun drop(&mut self) {
+	}
+}
+
+fun t1d_written(): i32 {
+	let held: List<T1dGuard> = [];
+	held.len()
+}
+
+fun t1d_inferred(): i32 {
+	let items = [T1dGuard { tag = "a" }];
+	items.len()
+}
+
+fun t1d_stash<T>(own value: T): i32 {
+	let items = [value];
+	items.len()
+}
+
+fun t1d_plain(value: i32): i32 {
+	value + 1
+}
+"#;
+
+/// The entry the container leg uses: it calls the module's plain function (so
+/// the module survives emission and the JavaScript comparison has something in
+/// it) and INSTANTIATES the module's generic at the module's own resource,
+/// which is R11's subject and the one place R10's whole-program report is read
+/// from outside R10.
+fn m19_t1d_entry(revision: u32) -> String {
+    format!(
+        "import pkg::module::{{ T1dGuard, t1d_plain, t1d_stash }};\n\n\
+         fun main() {{\n\tlet revision = {revision};\n\
+         \tlet stashed = t1d_stash(T1dGuard {{ tag = \"entry\" }});\n\
+         \tprint(\"{{t1d_plain(revision)}} {{stashed}}\");\n}}\n"
+    )
+}
+
+/// What the container leg observes: the diagnostics, the warnings with their
+/// per-file attribution, the emitted JavaScript, how many modules were reused,
+/// and R10's own site census — how many of the sites the check was offered it
+/// actually visited.
+fn observe_container_check(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+) -> (String, String, Option<String>, usize, (usize, usize)) {
+    let pkg_root = pkg_root.to_path_buf();
+    let entry_path = entry_path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            let warnings = program
+                .as_ref()
+                .map(|program| {
+                    format!(
+                        "{:?}#{:?}#{:?}",
+                        program.warnings, program.warning_sources, program.diagnostic_sources
+                    )
+                })
+                .unwrap_or_default();
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (
+                diagnostics,
+                warnings,
+                javascript,
+                vilan_core::analyzer::reuse_census().0,
+                vilan_core::analyzer::container_site_census(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// **M19 T1d's pin (tracker M48).** A reused module's R10 report is RESTORED,
+/// not re-scanned — and restoring it changes the work without changing the
+/// answer.
+///
+/// R10 (`check_container_resource_arguments`) was the largest single line left
+/// on the checks phase and it sat outside the Class A window for a reason
+/// sharper than cost: its report doubles as R11's dedup set. R11 is Class C and
+/// keeps running whole-program, so a module whose R10 diagnostics replayed but
+/// whose REPORT did not would leave the set short — and R11 would then report,
+/// at the entry's instantiation, a container R10 had already reported in the
+/// module. That is an extra diagnostic on the reusing analysis and on no other,
+/// which is why the fixture instantiates the module's generic from the entry:
+/// without the structural keys on the record, this pin's first assertion is the
+/// one that fires.
+///
+/// Three claims. The work MOVES (the reusing leg visits strictly fewer of R10's
+/// sites, and the re-deriving leg visits every one it is offered); the answer
+/// does NOT (diagnostics, warnings, their per-file attribution and the emitted
+/// JavaScript are byte-identical); and the leg is not vacuous (the module
+/// really did report a container, and really was reused).
+///
+/// **The corpus replay differential does not cover this**, and that is worth
+/// stating rather than assuming: planting the failure — dropping the restored
+/// keys in `replay_world_diagnostics` — turns this pin red on its first
+/// assertion and leaves `replay_differential` GREEN, because the golden corpus
+/// as modules declares almost no resource and puts none of them in a container,
+/// so there is no R10 report there for a record to lose. It is T1b's blind-leg
+/// shape at a different seam: the differential's subject has to be something
+/// the fixture actually produces.
+#[test]
+fn a_reused_modules_container_report_is_restored_not_rescanned() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (directory, entry) = write_module_package("t1d_container", M19_T1D_CONTAINER_MODULE);
+    let warm = |directory: &Path, entry: &Path| {
+        let _ = observe_container_check(directory, entry, m19_t1d_entry(1));
+        observe_container_check(directory, entry, m19_t1d_entry(2))
+    };
+
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+    let restored = warm(&directory, &entry);
+
+    vilan_core::analyzer::set_world_reuse(false);
+    vilan_core::analyzer::base_cache_clear();
+    let rescanned = warm(&directory, &entry);
+    vilan_core::analyzer::set_world_reuse(true);
+
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+
+    assert_eq!(
+        restored.0, rescanned.0,
+        "restored and re-scanned R10 reports published different diagnostics — \
+         the whole-program report is R11's dedup set, so a short one is an \
+         EXTRA diagnostic at the entry's instantiation and not a missing one"
+    );
+    assert_eq!(
+        restored.1, rescanned.1,
+        "restored and re-scanned R10 reports published different warnings or \
+         per-file attribution"
+    );
+    assert_eq!(
+        restored.2, rescanned.2,
+        "restored and re-scanned R10 reports emitted different JavaScript"
+    );
+    assert!(
+        rescanned.0.contains("cannot hold the resource"),
+        "the fixture must produce an R10 refusal for the record to carry, got: {}",
+        rescanned.0
+    );
+    assert!(
+        restored.3 > 0 && rescanned.3 == 0,
+        "the switch must turn the seam off rather than narrow it: {} modules \
+         reused restored, {} re-scanned",
+        restored.3,
+        rescanned.3
+    );
+    assert_eq!(
+        rescanned.4.0, rescanned.4.1,
+        "without the record R10 must visit every site it is offered — if it \
+         does not, this pin's red half is measuring something else: visited {} \
+         of offered {}",
+        rescanned.4.0, rescanned.4.1
+    );
+    assert!(
+        restored.4.0 < rescanned.4.0,
+        "with the record R10 must visit FEWER sites — the tranche is that sweep \
+         not happening for a reused module: visited {} restored vs {} re-scanned",
+        restored.4.0,
+        rescanned.4.0
+    );
+}
