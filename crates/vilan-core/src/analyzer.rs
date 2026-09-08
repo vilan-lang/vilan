@@ -45185,6 +45185,48 @@ fn bare_lowered_enum<'a>(
 /// a type that is a resource by CONTAINMENT has its root cause in the field, and
 /// `check_wire_boundary` names that field precisely. Two diagnostics for one
 /// mistake is what this gate exists to avoid.
+/// B266: the refusal a GENERIC `[service]` subject takes, or `None` when the
+/// subject declares no parameters.
+///
+/// Refused at the attribute, above the expansion, for B117's reason: nothing is
+/// then generated to fail later inside code the author never wrote. Without it
+/// the attribute expanded anyway and the author got the generated client's own
+/// errors — `'contract_hash' is already defined for 'StoreClient<T>'` first,
+/// then `` `Store` takes 1 type argument, 0 given `` twice, then two "cannot
+/// call method … on unknown" — five diagnostics about a client they never wrote
+/// and none of them naming the parameter that caused it.
+///
+/// The prohibition is A52's structural finding, and the reason is not a gap in
+/// the expansion: a `ServiceItem` carries no generics, and the contract hash is
+/// built from the types AS WRITTEN, so a `Store<Task>` client and a `Store<Note>`
+/// server would hash identically and connect to each other. A53 is the design
+/// that would lift it, which is why the message says "not supported yet" rather
+/// than describing a rule the language means to keep.
+pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String> {
+    let Node::Struct(name, Some(generic_parameters), _external, _resource, _body) = &item.0 else {
+        return None;
+    };
+    if generic_parameters.0.is_empty() {
+        return None;
+    }
+    let subject = name.0;
+    let parameters = generic_parameters
+        .0
+        .iter()
+        .map(|parameter| parameter.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "`[service]` cannot take a generic subject: `{subject}` declares `<{parameters}>`, and the \
+         client this attribute generates is built before any type resolves — a service item \
+         carries no generic parameters, and the contract hash is built from the types AS WRITTEN, \
+         so a `{subject}<A>` client and a `{subject}<B>` server would hash identically and connect \
+         to each other. Generic services are not supported yet: write the service over a concrete \
+         subject, naming the element in the field (`{subject} {{ items: SignalCell<List<Task>> }}`), \
+         which is what an `[expose]`d field names anyway"
+    ))
+}
+
 pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {
     let (kind, name) = match &item.0 {
         Node::Struct(name, _generics, _external, true, _body) => ("struct", name.0),

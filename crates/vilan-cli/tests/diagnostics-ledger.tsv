@@ -434,3 +434,4 @@ row	flagship	key
 403	-	{label} names a key with `[expose(keyed = …)]`, but its collection is not written as a `List<T>` or a `Map<K, V>`: those are the two the keyed exposure can read, and the `[service]` expansion picks between them off the annotation before any type resolves. Write the field as `SignalCell<List<T>>`
 404	-	`[expose(keyed = …)]`'s argument is a TYPE — the key type the mirror is keyed by, as in `[expose(keyed = str)]`. It is written here because a keyed mirror is a `KeyedSource<K, T>` and a `List<T>` names only the element; a `Map<K, V>` element names both, and takes the bare `[expose(keyed)]`
 405	-	`{spelled}` is a directory with no `{leaf}.vl`, so it is a namespace rather than a module: it has no items to import. Import one of its modules instead: {listed}
+NEW	-	`[service]` cannot take a generic subject: `{subject}` declares `<{parameters}>`

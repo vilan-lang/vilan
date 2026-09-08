@@ -3060,11 +3060,13 @@ fn b245_a_defaulted_parameter_the_clause_argument_grounds_reaches_a_supertrait()
     );
 }
 
-/// A generic `[service]` subject. The refusal is a cascade out of the
-/// expansion rather than one curated sentence — the client struct's own
-/// transport parameter is spelled `T` and collides with the subject's — and
-/// this pin records that, because a curated refusal is owed here and cannot be
-/// written without saying what the unfixed shape currently says.
+/// A generic `[service]` subject. A52 pinned the CASCADE out of the expansion
+/// here — `'contract_hash' is already defined for 'StoreClient<T>'` (the client
+/// struct's own transport parameter is spelled `T` and collided with the
+/// subject's) plus `` `Store` takes 1 type argument, 0 given `` — and said in
+/// this comment that a curated refusal was owed and could not be written without
+/// first recording what the unfixed shape said. B266 wrote it: the refusal is at
+/// the attribute now, and this pin is the same exhibit with the debt paid.
 #[test]
 fn a52_a_generic_service_subject_is_refused_by_the_expansion() {
     let source = r#"
@@ -3083,11 +3085,12 @@ fn a52_a_generic_service_subject_is_refused_by_the_expansion() {
         fun main() { print("store"); }
         main();
         "#;
-    assert_fails_with(
+    assert_fails_once_with(source, "`[service]` cannot take a generic subject");
+    assert_fails_without(
         source,
         "'contract_hash' is already defined for 'StoreClient<T>'",
     );
-    assert_fails_with(source, "`Store` takes 1 type argument, 0 given");
+    assert_fails_without(source, "`Store` takes 1 type argument, 0 given");
 }
 
 /// The other spelling: naming the source by TRAIT. B184 made a trait-typed

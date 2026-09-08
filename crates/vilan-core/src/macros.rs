@@ -1664,6 +1664,20 @@ impl Expander<'_, '_> {
             // or the Rust generator when absent. The compiler gathers the
             // same-module [rpc] surface either way.
             Node::Service(client_name, item) => {
+                // B266: a GENERIC subject is refused AT THE ATTRIBUTE, above the
+                // backend split and above the expansion — so nothing is generated
+                // to fail later inside a client the author never wrote (B117's
+                // rule, applied to the other attribute that generates a type).
+                if let Some(refusal) = crate::analyzer::service_generic_refusal(item) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: (node.1.start..item.1.start).into(),
+                        msg: refusal,
+                    });
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
                 match self.scope.get("service") {
                     Some(def) => {
                         self.run_service(def, *client_name, item, siblings, text, depth);
