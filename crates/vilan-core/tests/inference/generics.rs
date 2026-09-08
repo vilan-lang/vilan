@@ -6704,7 +6704,9 @@ fn b233_the_rule_reaches_every_dispatched_operator_not_only_add() {
 #[test]
 fn b233_the_implicit_generic_sugar_is_held_to_the_same_rule() {
     // B186's sugar declares the same two parameters, one per written trait, and
-    // reaches the same site.
+    // reaches the same site. B261 gave the operand its own FACE, so the trait's
+    // bare name here became `impl Display` — the parameter bounded by
+    // `Display`, told apart from the trait `Display` itself.
     assert_fails_with(
         r#"
         import std::operators::Add;
@@ -6712,7 +6714,7 @@ fn b233_the_implicit_generic_sugar_is_held_to_the_same_rule() {
         fun sum(a: Add, b: Display) { let c = a + b; print("{c}"); }
         fun main() { sum(1, "two"); }
         "#,
-        "but the right operand is `Display`",
+        "but the right operand is `impl Display`",
     );
 }
 
@@ -7291,5 +7293,130 @@ fn b246_an_inferable_parameter_is_still_the_call_sites_business() {
         main();
         "#,
         "6\n",
+    );
+}
+
+// --- B261: the FACE of an implicit binder in an operator head ---------------
+//
+// B186's sugar mints the parameter under the TRAIT's name, because that is what
+// the author wrote and there is no other name to register. So ledger row 346 —
+// the operator head — rendered `fun bump(a: Add) { a + 1 }` as
+//
+//     `Add`'s `add` accepts `Add`, but the right operand is `i32`
+//
+// three `Add`s in one line, two of them the parameter and one of them the trait
+// it is bound by, with nothing to tell them apart. B218 closed the same
+// collision one level out, by making a struct's hidden ARGUMENT print (`C<A>`
+// against `C<B>`); the bare binder is the residue it left.
+//
+// The face is `impl Add`: it stands where a type stands, so no head is
+// reworded; it keeps the bound the author wrote, with the `impl` marker
+// carrying what the bare name lost — a type IMPLEMENTING `Add`, not the trait;
+// and it invents no binder name, which is what the mint refuses and what B246's
+// steer already spends (`fun …<P: Add<i32>>(…: P, …)` is the REWRITE, not the
+// face).
+//
+// Scoped to the operand labels, not planted in `pretty_print_type`: two
+// implicit binders of the SAME trait still collide, and that is
+// trait-typed-fields.md revision 2's Q3, the owner's to settle.
+
+#[test]
+fn b261_the_implicit_binders_operator_head_names_the_parameter_not_the_trait() {
+    // The filed shape. Before the face this head read
+    // "`Add`'s `add` accepts `Add`, but the right operand is `i32`".
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun bump(a: Add) { let _ = a + 1; }
+        fun main() {}
+        "#,
+        "`impl Add`'s `add` accepts `impl Add`, but the right operand is `i32`",
+    );
+}
+
+#[test]
+fn b261_the_written_binder_keeps_its_own_name_and_wears_no_face() {
+    // The control: a binder the author NAMED has a name to show, so the face is
+    // not applied — and must not leak into the line anywhere.
+    let source = r#"
+        import std::operators::Add;
+        fun bump<P: Add>(a: P): P { a + 1 }
+        fun main() { print(bump(1)); }
+        "#;
+    assert_fails_with(
+        source,
+        "`P`'s `add` accepts `P`, but the right operand is `i32`",
+    );
+    assert_fails_without(source, "impl Add");
+}
+
+#[test]
+fn b261_the_face_does_not_displace_b246s_steer() {
+    // The steer is B246's, unmoved: the face is not a name, so the message still
+    // offers the written-out rewrite rather than a bound on a spelling the
+    // program does not contain.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        fun bump(a: Add) { let _ = a + 1; }
+        fun main() {}
+        "#,
+        "This parameter was written as a trait annotation, so it has no name to bind: \
+         write it out (`fun …<P: Add<i32>>(…: P, …)`)",
+    );
+}
+
+#[test]
+fn b261_a_generic_right_operand_reaches_the_same_face_and_the_same_steer() {
+    // B233's shape under the sugar. The head names both parameters by their
+    // faces, and the steer no longer spells `<Add: Add<Display>>` — a bound on
+    // a name neither parameter has, which was a steer into a second refusal.
+    // Neither operand has a name, so the rewrite declares BOTH.
+    let source = r#"
+        import std::operators::Add;
+        import std::display::Display;
+        fun sum(a: Add, b: Display) { let c = a + b; print("{c}"); }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        source,
+        "`impl Add`'s `add` accepts `impl Add`, but the right operand is `impl Display`",
+    );
+    assert_fails_with(
+        source,
+        "write it out (`fun …<P: Add<Q>, Q: Display>(…: P, …)`)",
+    );
+}
+
+#[test]
+fn b261_a_nominal_left_operand_is_untouched_by_the_face() {
+    // The counterweight: the face is an implicit BINDER's, so an ordinary
+    // nominal subject renders exactly as it did, steer included.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        struct Meters { n: i32 }
+        impl Meters with Add {
+            fun add(self, b: Meters): Meters { Meters { n = self.n + b.n } }
+        }
+        fun main() { let _ = Meters { n = 1 } + 2; }
+        "#,
+        "`Meters`'s `add` accepts `Meters`, but the right operand is `i32`",
+    );
+}
+
+#[test]
+fn b261_the_written_out_rewrite_the_steer_names_compiles() {
+    // B179's rule for a steer: the spelling it hands back must compile. Both
+    // rewrites do — the one-parameter form B246 names and the two-parameter one
+    // the sugar-on-both-sides case names.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        fun bump<P: Add<i32>>(a: P): P { a + 1 }
+        fun main() { print(bump(1)); }
+        "#,
+        "2\n",
     );
 }

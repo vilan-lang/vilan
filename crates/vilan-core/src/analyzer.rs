@@ -5822,6 +5822,42 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B262: the declaration a written type application binds, whatever its
+    /// SORT — its name, its parameters' constraint ids, and the span the
+    /// "is declared here" note points at.
+    ///
+    /// [`Self::check_written_nominal_bounds`] shipped reading `structs` alone,
+    /// and the drain that feeds it recorded a struct alone, so
+    /// `Held<i32, SignalCell<List<str>>>`'s enum twin — the same parameters,
+    /// the same bound, the same unchecked written arguments — was still
+    /// accepted. An `enum` and a `trait` declare bounded parameters in the same
+    /// grammar and bind them by the same positional rule; there was never a
+    /// reason for the check to know which sort it was looking at, only a lookup
+    /// that did. This is that lookup, in the order B188's arity check reads the
+    /// three.
+    fn nominal_bound_owner(&self, owner_id: Id) -> Option<(&'src str, Vec<TypeId>, Span)> {
+        if let Some(struct_) = self.structs.get(&owner_id) {
+            return Some((
+                struct_.name,
+                struct_.generic_parameter_constraint_ids.clone(),
+                struct_.name_span,
+            ));
+        }
+        if let Some(enum_) = self.enums.get(&owner_id) {
+            return Some((
+                enum_.name,
+                enum_.generic_parameter_constraint_ids.clone(),
+                enum_.name_span,
+            ));
+        }
+        let trait_ = self.traits.get(&owner_id)?;
+        Some((
+            trait_.name,
+            trait_.generic_parameter_constraint_ids.clone(),
+            trait_.name_span,
+        ))
+    }
+
     /// B251: a WRITTEN type application binds a declaration's parameters, so
     /// its arguments owe the same bounds every other binding owes.
     ///
@@ -5841,17 +5877,15 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
-        for (struct_id, written_arguments, span, source_id, type_id) in
+        for (owner_id, written_arguments, span, source_id, type_id) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
-            let Some(struct_) = self.structs.get(&struct_id) else {
+            let Some((owner_name, declared, _)) = self.nominal_bound_owner(owner_id) else {
                 continue;
             };
-            let owner_name = struct_.name;
-            let declared = struct_.generic_parameter_constraint_ids.clone();
             let parameter_names: Vec<&str> = self
                 .declared_generic_parameters
-                .get(&struct_id)
+                .get(&owner_id)
                 .map(|declared| declared.iter().map(|parameter| parameter.name).collect())
                 .unwrap_or_default();
             // A declared bound's arguments may name SIBLING parameters
@@ -5924,14 +5958,13 @@ impl<'src> Analyzer<'src> {
                              '{owner_name}'"
                         ),
                     };
-                    let note = self
-                        .structs
-                        .get(&struct_id)
-                        .map(|struct_| crate::error::Note {
-                            span: struct_.name_span,
+                    let note = self.nominal_bound_owner(owner_id).map(|(_, _, name_span)| {
+                        crate::error::Note {
+                            span: name_span,
                             msg: format!("'{owner_name}' is declared here"),
-                            source: self.source_of_id(struct_id),
-                        });
+                            source: self.source_of_id(owner_id),
+                        }
+                    });
                     self.push_at_written_type(
                         Error {
                             trace: Vec::new(),
@@ -16454,17 +16487,47 @@ impl<'src> Analyzer<'src> {
         if self.compare_type_rigid(&declared, &rhs_type, &HashMap::default(), &rigid) {
             return false;
         }
-        let subject_label = self.pretty_print_type(lhs_type, &HashMap::default());
-        let declared_label = self.pretty_print_type(&declared, &HashMap::default());
-        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+        // B261: the operand faces, not the bare renderings. An IMPLICIT binder
+        // (B186's `fun bump(a: Add)`) is registered under its TRAIT's name, so
+        // this head read "`Add`'s `add` accepts `Add`, but the right operand is
+        // `i32`" — the subject, the declared operand and the trait all spelled
+        // `Add`, with nothing to tell the parameter from the trait it is bound
+        // by. `operand_label` gives it the face `impl Add`; every other type is
+        // unchanged.
+        let subject_label = self.operand_label(lhs_type);
+        let declared_label = self.operand_label(&declared);
+        let rhs_label = self.operand_label(&rhs_type);
         let subject_name = match lhs_type {
             Type::Struct(id, _) => self.structs.get(id).map(|struct_| struct_.name.to_string()),
             Type::Enum(id, _) => self.enums.get(id).map(|enum_| enum_.name.to_string()),
             _ => None,
         }
         .unwrap_or_else(|| subject_label.clone());
-        let steer = if matches!(rhs_type, Type::Generic(_)) && matches!(lhs_type, Type::Generic(_))
-        {
+        // B261: the subject wears `impl Add` now, and a face is not a binder
+        // name — no bound can be written on it. So the implicit binder takes
+        // ONE steer whatever the right operand is: the written-out rewrite that
+        // gives the parameter a name, which is what B246 already offered for a
+        // concrete operand. Before this the generic-operand arms below reached
+        // it too and spelled `<Add: Add<Display>>` — a steer into a second
+        // refusal, and, once the face landed, `<impl Add: Add<impl Display>>`,
+        // which is not even a spelling.
+        let steer = if self.implicit_binder_bound(lhs_type).is_some() {
+            // The rewrite's operand position needs a SPELLING, and `impl Show`
+            // is not one: when the right operand is B186's sugar too, neither
+            // parameter has a name and the rewrite has to declare both.
+            let (operand, second) = match self.implicit_binder_bound(&rhs_type) {
+                Some(rhs_bound) => ("Q".to_string(), format!(", Q: {rhs_bound}")),
+                None => (rhs_label.clone(), String::new()),
+            };
+            format!(
+                "a bound promises a trait's METHODS, never that the parameter ADMITS an \
+                 `{rhs_label}` — every instantiation decides that for itself, and one \
+                 whose `{trait_name}` declares `B = Self` refuses it. This parameter was \
+                 written as a trait annotation, so it has no name to bind: write it out \
+                 (`fun …<P: {trait_name}<{operand}>{second}>(…: P, …)`), or make the \
+                 operand that same parameter"
+            )
+        } else if matches!(rhs_type, Type::Generic(_)) && matches!(lhs_type, Type::Generic(_)) {
             // B233: the left operand is a PARAMETER, so the impl advice above
             // has no subject to name (`impl P<type Q>` is not a declaration).
             // The declaration that works is the bound itself — a parameterized
@@ -16493,15 +16556,11 @@ impl<'src> Analyzer<'src> {
             // the only declaration that can say a `{subject_label}` takes an
             // `{rhs_label}` there, and it must say so for EVERY instantiation.
             //
-            // An IMPLICIT binder (B186's `fun bump(a: Add)`) has no name to put
-            // in a bound: it displays as its trait, which is the trait's name
-            // and not the parameter's (B218's face). So the steer does not
-            // pretend it has one — it names the rewrite that gives it one,
-            // which is the written form of the very sugar the author used.
-            let named = self.generic_constraint_names.get(constraint_id).copied();
-            let implicit = self.implicit_generic_scopes.contains_key(constraint_id);
-            match (named, implicit) {
-                (Some(name), false) => format!(
+            // An IMPLICIT binder has no name to put in a bound, and is handled
+            // by the first arm above (B261); what reaches here is a WRITTEN
+            // parameter, whose name is the one the bound goes on.
+            match self.generic_constraint_names.get(constraint_id).copied() {
+                Some(name) => format!(
                     "a bound promises a trait's METHODS, never that `{name}` ADMITS an \
                      `{rhs_label}` — every instantiation of `{name}` decides that for \
                      itself, and one whose `{trait_name}` declares `B = Self` refuses it. \
@@ -16509,13 +16568,12 @@ impl<'src> Analyzer<'src> {
                      every instantiation must then satisfy, or make the operand a \
                      `{declared_label}`"
                 ),
-                _ => format!(
+                None => format!(
                     "a bound promises a trait's METHODS, never that the parameter ADMITS an \
                      `{rhs_label}` — every instantiation decides that for itself, and one \
-                     whose `{trait_name}` declares `B = Self` refuses it. This parameter was \
-                     written as a trait annotation, so it has no name to bind: write it out \
-                     (`fun …<P: {trait_name}<{rhs_label}>>(…: P, …)`), or make the operand \
-                     that same parameter"
+                     whose `{trait_name}` declares `B = Self` refuses it. This parameter has \
+                     no name to bind: declare it (`fun …<P: {trait_name}<{rhs_label}>>(…: P, \
+                     …)`), or make the operand that same parameter"
                 ),
             }
         } else {
@@ -23639,6 +23697,75 @@ impl<'src> Analyzer<'src> {
         constraint_id
     }
 
+    /// B261: the FACE an implicit binder wears in an operator or dispatch
+    /// head — `impl Add` for the parameter written `a: Add`,
+    /// `impl Signal<List<i32>>` when the bound carries arguments. Every other
+    /// type renders exactly as [`Self::pretty_print_type`] renders it.
+    ///
+    /// [`Self::mint_implicit_generic`] registers the binder under the TRAIT's
+    /// name, because that is what the author wrote and there is no other name
+    /// to register. But a name is not a face. Rendered bare,
+    /// `fun bump(a: Add) { a + 1 }` refused as "`Add`'s `add` accepts `Add`,
+    /// but the right operand is `i32`" — three `Add`s in one line, two of them
+    /// the parameter and one of them the trait, and nothing to tell them
+    /// apart. That head is ledger row 346, and B218 closed the same collision
+    /// one level out by making a struct's hidden ARGUMENT print (`C<A>` against
+    /// `C<B>`); the bare binder is the residue it left.
+    ///
+    /// `impl Add` is the spelling, for three reasons:
+    ///
+    /// - it stands where a TYPE stands, so every head that renders an operand
+    ///   keeps its wording. What was missing is a face, not a reworded message;
+    /// - it keeps the bound the author actually wrote in the line, while the
+    ///   `impl` marker carries the one thing the bare name lost — this is a
+    ///   type IMPLEMENTING `Add`, not the trait `Add`;
+    /// - it invents no binder name. `<P: Add>` reads well, but `P` is a
+    ///   spelling the program does not contain, which is exactly what the mint
+    ///   refuses; and it is already spoken for — B246's steer offers
+    ///   `fun …<P: Add<i32>>(…: P, …)` as the REWRITE that gives this parameter
+    ///   a name. A face that looked like that rewrite would blur the two.
+    ///
+    /// It is deliberately not writable vilan. The parameter has no source
+    /// spelling of its own, and a face that could be pasted back into the
+    /// program would promise one it does not have; the writable spelling
+    /// belongs in the steer, which is where B246 put it.
+    ///
+    /// Scoped to the operand labels rather than planted in
+    /// `pretty_print_type_inner`, because the bare rendering answers a second
+    /// question this one does not: two implicit binders of the SAME trait still
+    /// collide (`Expected X, but got X instead.`), which is
+    /// trait-typed-fields.md revision 2's Q3 and the owner's to settle —
+    /// `impl X` against `impl X` collides just as squarely, so nothing here
+    /// pre-empts it.
+    fn operand_label(&self, type_: &Type) -> String {
+        match self.implicit_binder_bound(type_) {
+            Some(bound) => format!("impl {bound}"),
+            None => self.pretty_print_type(type_, &HashMap::default()),
+        }
+    }
+
+    /// The rendered BOUND of one of B186's implicit binders — `Some("Add")` for
+    /// the parameter written `a: Add` — and `None` for every other type. The
+    /// one predicate behind both halves of B261: [`Self::operand_label`] builds
+    /// the parameter's face out of it, and the operator steer needs it because a
+    /// parameter with a face still has no NAME a bound could be written on.
+    fn implicit_binder_bound(&self, type_: &Type) -> Option<String> {
+        let Type::Generic(constraint_id) = type_ else {
+            return None;
+        };
+        if !self.implicit_generic_scopes.contains_key(constraint_id) {
+            return None;
+        }
+        // The mint interns the constraint AS its bound (`Type::Trait(Add, [])`),
+        // so the bound is the constraint's own type. Anything else means the
+        // bound never resolved to a trait — its own diagnostic — and the name
+        // stands rather than `impl ?`.
+        match constraint_id.get_type(self) {
+            bound @ Type::Trait(..) => Some(self.pretty_print_type(&bound, &HashMap::default())),
+            _ => None,
+        }
+    }
+
     /// B184's pre-pass: gives every struct whose fields name a trait — or name
     /// a struct that already carries one — its HIDDEN generic parameters,
     /// before the `prepped_type_locals` drain resolves a single mention.
@@ -28111,6 +28238,16 @@ impl<'src> Analyzer<'src> {
             || self.primitive_struct_ids.get("Context") == Some(&id)
     }
 
+    /// B263: whether a call's `List`-shaped return already has its element
+    /// determined — by a binder of the declaration the CALL sits in.
+    fn return_element_is_a_caller_binder(&self, return_type: &Type, call_id: Id) -> bool {
+        matches!(return_type, Type::Struct(id, arguments)
+            if self.is_slot_container(*id)
+                && arguments.len() == 1
+                && matches!(arguments[0].get_type(self), Type::Generic(constraint_id)
+                    if self.generic_is_enclosing_binder(constraint_id, call_id)))
+    }
+
     /// If `type_` is a `List` whose element is an unbound generic (i.e. the
     /// result of `List::new()`), replaces the element with a fresh inference
     /// slot stable for this call id, so the element can be unified from later
@@ -29536,7 +29673,11 @@ impl<'src> Analyzer<'src> {
                                 }
                             }
                         }
-                        let return_type = self.freshen_list_element_slots(return_type, id);
+                        let return_type =
+                            match self.return_element_is_a_caller_binder(&return_type, id) {
+                                true => return_type,
+                                false => self.freshen_list_element_slots(return_type, id),
+                            };
                         // Specialize a `Self` return, STRUCTURALLY. A trait
                         // member's `self` parameter is typed as the declaring
                         // trait's abstract self type (`Type::Trait(trait, [])`),
@@ -38733,8 +38874,8 @@ impl<'src> Analyzer<'src> {
                             type_id,
                         );
                     }
-                    // B251: the written arguments of a STRUCT application are
-                    // checked against that struct's declared bounds — the same
+                    // B251: the written arguments of a nominal application are
+                    // checked against that declaration's bounds — the same
                     // question `check_generic_bound_satisfaction` asks of every
                     // binding a CALL records, which a written type application
                     // never reaches (nothing records into
@@ -38748,17 +38889,28 @@ impl<'src> Analyzer<'src> {
                     // application already refused on its arity has nothing left
                     // to check (one report per written spelling, B188), and a
                     // path head applies nothing.
+                    //
+                    // B262: every SORT a written application can name, not just
+                    // structs. An `enum` and a `trait` declare bounded
+                    // parameters in the same grammar, bind them by the same
+                    // positional rule, and drain through this same queue — the
+                    // struct-shaped condition here was the only thing keeping
+                    // them out, so `Held<i32, SignalCell<List<str>>>`'s enum
+                    // twin was still accepted. The sort test is B188's own
+                    // (`written_application_arity_error`), which has held all
+                    // three since the arity check shipped.
                     if !refused_arity
                         && !is_path_head
                         && !argument_type_ids.is_empty()
-                        && let Type::Struct(struct_id, _) = subject_type
-                        && matches!(
-                            self.expr_id_to_expr_map.get(&subject_id),
-                            Some(Expr::Struct(_))
-                        )
+                        && let (
+                            Type::Struct(owner_id, _)
+                            | Type::Enum(owner_id, _)
+                            | Type::Trait(owner_id, _),
+                            Some(Expr::Struct(_) | Expr::Enum(_) | Expr::Trait(_)),
+                        ) = (&subject_type, self.expr_id_to_expr_map.get(&subject_id))
                     {
                         self.written_nominal_bound_sites.push((
-                            struct_id,
+                            *owner_id,
                             argument_type_ids.clone(),
                             span,
                             source_id,
@@ -42667,6 +42819,9 @@ impl<'src> Analyzer<'src> {
                     let concrete = concrete_id.get_type(self);
                     self.pretty_print_type_inner(&concrete, substitution, buf, depth + 1, visiting);
                 } else {
+                    // B261: this is the BARE rendering, and it stays the trait's
+                    // name — an operand's face is `operand_label`'s business,
+                    // and B211's same-trait display question is the owner's.
                     let generic_name = self
                         .generic_constraint_names
                         .get(constraint_id)

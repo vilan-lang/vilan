@@ -8042,3 +8042,363 @@ fn b251_an_unbounded_parameters_written_argument_is_still_free() {
         "#,
     );
 }
+
+// --- B262: the written-argument bound check, over every SORT -----------------
+//
+// B251 shipped `check_written_nominal_bounds` reading `structs` alone, and the
+// drain that feeds it recorded a struct alone. An `enum` and a `trait` declare
+// bounded parameters in the same grammar, bind them by the same positional
+// rule, and drain through the same `prepped_type_locals` queue — so
+// `Held<i32, SignalCell<List<str>>>`'s enum twin was still accepted, with the
+// same consequence: an annotation carrying a `str` list out through a declared
+// `i32` one. The sort test is B188's own, which has held all three since the
+// arity check shipped.
+//
+// The refusal is row 401's, unchanged — same wording, same note, same id. What
+// moved is which declarations reach it.
+//
+// CENSUS of bounded declarations across std, vilan/test, the eleven examples,
+// the benchmarks, macro_std, the CLI templates, the docs fences and the README:
+// four bounded STRUCTS (B251's own: `Map<K: Hashable, V>`, `Set<T: Hashable>`,
+// `Optimistic<T, S: Signal<T>>`, the rpc example's `AccountsClient<T:
+// Transport>`), TWO bounded TRAITS — the tour's `trait Holder<T: Label>` and
+// `types.md`'s `trait Doubler<T: Add>` — and ZERO bounded enums. Every written
+// application of the two traits satisfies its bound (`impl DogBox with
+// Holder<Dog>`, and `Dog` implements `Label`), so the estate refuses NOTHING
+// new: the count is zero, as it was for structs. kolt and the website, counted
+// separately and read-only, declare no bounded struct, enum or trait at all.
+
+const HELD_ENUM: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    enum Held<T, S: Signal<List<T>>> { Full(S), Empty }
+    "#;
+
+const HELD_TRAIT: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    trait Held<T, S: Signal<List<T>>> { fun item(self): S; }
+    "#;
+
+#[test]
+fn b262_an_enums_written_argument_is_checked_against_the_parameters_bound() {
+    // The filed shape: B251's struct exhibit with `enum` in place of `struct`.
+    // It compiled.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b262_the_enum_refusal_notes_the_declaration_the_bound_is_written_on() {
+    // The bound is written on the enum, not here, so the report points at it —
+    // the same note B251's struct half carries, reached through the sort-blind
+    // lookup rather than through `structs`.
+    assert_fails_noting(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "required by the bound on parameter 'S' of 'Held'",
+        "Held",
+        "'Held' is declared here",
+    );
+}
+
+#[test]
+fn b262_a_bounded_and_satisfied_enum_argument_compiles_and_runs() {
+    // The control per kind: the same annotation with an argument that MEETS the
+    // bound is exactly as it was.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<i32>>>): i32 {{
+                match h {{
+                    Held::Full(let s) => s.get().len(),
+                    Held::Empty => 0,
+                }}
+            }}
+            fun main() {{ print(show(Held::Full(SignalCell::new([1, 2])))); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b262_a_traits_written_argument_is_checked_against_the_parameters_bound() {
+    // The third sort, reached where a trait application is written: a BOUND.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_TRAIT}
+            fun show<H: Held<i32, SignalCell<List<str>>>>(h: H): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b262_a_bounded_and_satisfied_trait_argument_compiles_and_runs() {
+    // The satisfied control for the trait sort, in the same BOUND position the
+    // refusal above fires in: an argument that meets the bound is untouched.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_TRAIT}
+            fun show<H: Held<i32, SignalCell<List<i32>>>>(h: H): i32 {{
+                h.item().get().len()
+            }}
+            struct Box {{ inner: SignalCell<List<i32>> }}
+            impl Box with Held<i32, SignalCell<List<i32>>> {{
+                fun item(self): SignalCell<List<i32>> {{ self.inner }}
+            }}
+            fun main() {{ print(show(Box {{ inner = SignalCell::new([1, 2]) }})); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b262_the_estates_own_bounded_trait_still_compiles() {
+    // The census's live shape, run: the tour's `trait Holder<T: Label>` with
+    // `Dog`, which implements `Label`. This is what makes the estate count ZERO
+    // rather than merely untested — the two bounded traits in the tree are this
+    // one and `types.md`'s `Doubler<T: Add>`, and every argument written for
+    // either satisfies its bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> {
+            fun item(self): T;
+            fun describe(self): str { "holding " + self.item().label() }
+        }
+        struct Dog {}
+        impl Dog with Label { fun label(self): str { "a dog" } }
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        fun main() { print(DogBox {}.describe()); }
+        main();
+        "#,
+        "holding a dog\n",
+    );
+}
+
+#[test]
+#[ignore = "B262's boundary: an impl's `with` clause reaches neither the arity \
+            check nor the bound check - a site apart from the \
+            `prepped_type_locals` drain this item widens"]
+fn b262_an_impl_with_clauses_trait_argument_is_still_unchecked() {
+    // The boundary, pinned rather than claimed. An impl's `with` clause writes a
+    // trait APPLICATION, but it does not drain through `prepped_type_locals`:
+    // `impl CatBox with Holder<Cat>` is accepted with `Cat` implementing
+    // nothing, and so is `impl CatBox with Holder<Cat, i32>` — so B188's arity
+    // check misses the position too, which dates the hole well before this item.
+    // `vilan/docs/tour/data-and-traits.md` states the opposite in prose ("Each
+    // impl picks the argument … and is checked against the bound there"), so the
+    // page is ahead of the compiler here.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> { fun item(self): T; }
+        struct Cat {}
+        struct CatBox {}
+        impl CatBox with Holder<Cat> {
+            fun item(self): Cat { Cat {} }
+        }
+        fun main() { print(1); }
+        "#,
+        "'Cat' does not implement trait 'Label', required by the bound on parameter 'T' \
+         of 'Holder'",
+    );
+}
+
+#[test]
+fn b262_an_unbounded_enum_parameters_written_argument_is_still_free() {
+    // The counterweight, per B251's: a parameter with no bound requires nothing
+    // of its argument, and the widened check must not invent a requirement for
+    // one — `Option<T>` and `Result<T, E>` are the estate's own unbounded
+    // enums, written everywhere.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        enum Pair<A, B> { Both(A, B), Neither }
+        fun show(p: Pair<i32, str>): i32 {
+            match p {
+                Pair::Both(let a, _) => a,
+                Pair::Neither => 0,
+            }
+        }
+        fun main() { print(show(Pair::Both(1, "x"))); }
+        "#,
+    );
+}
+
+// --- B263: a determined `List` element, erased on the way out of a call ------
+//
+// `impl Held<type T> { fun first(self): T { self.list.get()[0] } }` over
+// `struct Held<T> { list: Signal<List<T>> }` reported "cannot index this List:
+// its element type is never determined". The bound-driven recovery is not what
+// was missing: `self.list.get()` really does resolve through the bound to
+// `List<T>`, with `T` the enclosing binder. `freshen_list_element_slots` then
+// REPLACED that element with a fresh inference slot.
+//
+// That helper exists for `List::new()`, whose element is a genuine hole to fill
+// from later `push` calls, and its test was "the element is an unbound generic"
+// — true of `List::new()`'s own parameter and equally true of a caller's rigid
+// `T`, which is not a hole at all but the answer. So the one shape that had
+// already been solved was the one it discarded.
+//
+// The guard is B219's family predicate, `generic_is_enclosing_binder`: an
+// element that is a binder of the declaration the CALL sits in is determined,
+// and the call's return keeps it. Only the DECLARED-function return path is
+// guarded; `List::new()` is `external fun new(): List<T>` and reaches the other
+// one, where the element is the callee's own parameter and freshening is right.
+//
+// Not an impl-body rule, though that is where it was found: the same free
+// function `fun first<T, S: Signal<List<T>>>(s: S): T { s.get()[0] }` failed
+// identically, and is pinned below.
+
+#[test]
+fn b263_an_impl_body_reads_the_element_through_a_bounded_siblings_bound() {
+    // The filed exhibit, run. `T` is reachable only through the hidden
+    // parameter's bound (B184's sugar spells `list: Signal<List<T>>`), and the
+    // body indexes what `get()` returns.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T> { list: Signal<List<T>> }
+        impl Held<type T> {
+            fun first(self): T { self.list.get()[0] }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([1, 2, 3]) };
+            print(h.first());
+        }
+        main();
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b263_the_written_sibling_parameter_form_reads_it_too() {
+    // The same shape with the parameter written out rather than hidden — the
+    // two spell one struct (B251's pair), so both had the defect and both are
+    // pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T, S: Signal<List<T>>> { list: S }
+        impl Held<type T, type S: Signal<List<T>>> {
+            fun first(self): T { self.list.get()[0] }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([4, 5]) };
+            print(h.first());
+        }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b263_a_free_function_over_the_same_bound_is_the_same_defect() {
+    // Where the diagnosis parts from the filing: this is not an impl-body rule.
+    // A free function whose parameter carries the same bound indexed the same
+    // `List<unknown>`, and it is the same erasure — there is no impl, no field
+    // and no sibling parameter in it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        fun first<T, S: Signal<List<T>>>(s: S): T { s.get()[0] }
+        fun main() { print(first(SignalCell::new([6, 7]))); }
+        main();
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn b263_a_methods_own_generic_still_binds_from_its_argument() {
+    // The generic-method control: a method declaring its OWN parameter beside
+    // the impl's binder still infers that parameter from the call, and the
+    // impl's binder still reaches the element.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T> { list: Signal<List<T>> }
+        impl Held<type T> {
+            fun first(self): T { self.list.get()[0] }
+            fun tagged<U>(self, tag: U): U { tag }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([8, 9]) };
+            print(h.first());
+            print(h.tagged("x"));
+        }
+        main();
+        "#,
+        "8\nx\n",
+    );
+}
+
+#[test]
+fn b263_the_literal_form_is_unchanged() {
+    // B251's half, re-asked: the recovery AT THE LITERAL still grounds `T` and
+    // still reports it, so the guard has not moved the answer this family
+    // already had.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_HIDDEN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32, SignalCell<List<i32>>> instead.",
+    );
+}
+
+#[test]
+fn b263_an_open_list_element_is_still_filled_from_later_pushes() {
+    // The counterweight, and the reason the guard is not simply "never
+    // freshen": `List::new()`'s element IS a hole, and a later `push` is what
+    // fills it. Inside a generic declaration too, where the guard's predicate
+    // has an enclosing binder to find.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun collect<T>(a: T, b: T): List<T> {
+            mut out = List::new();
+            out.push(a);
+            out.push(b);
+            out
+        }
+        fun main() { print(collect(1, 2).len()); }
+        main();
+        "#,
+        "2\n",
+    );
+}
