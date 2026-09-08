@@ -850,7 +850,9 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 				index = if close < length { close + 1 } else { length };
 			} else {
 				mut end = index;
-				for end < length && !is_space(markup.substring(end, end + 1)) && markup.substring(end, end + 1) != ">" {
+				for end < length
+					&& !is_space(markup.substring(end, end + 1))
+					&& markup.substring(end, end + 1) != ">" {
 					end = end + 1;
 				}
 				value = markup.substring(index, end);

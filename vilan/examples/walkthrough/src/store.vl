@@ -59,7 +59,9 @@ impl NotesStore {
 		if username.len() < 2 || password.len() < 8 {
 			ret AuthOutcome { ok = false, token = "", reason = "username or password too short" };
 		}
-		match db.prepare("SELECT salt, password_hash FROM account WHERE username = ?").first([username]) {
+		match db
+			.prepare("SELECT salt, password_hash FROM account WHERE username = ?")
+			.first([username]) {
 			Some(let row) => {
 				if row.text("password_hash") == hash_password(password, row.text("salt")) {
 					open_session(db, username)

@@ -254,13 +254,7 @@ fun not_found_page(): View {
 // An rpc save outcome as a draft commit outcome (`None` = success).
 fun commit_outcome(outcome: Result<i32, RpcError>, note_id: i32): Option<str> {
 	match outcome {
-		Ok(let id) => {
-			if id == note_id {
-				None
-			} else {
-				Some("save rejected")
-			}
-		},
+		Ok(let id) => { if id == note_id { None } else { Some("save rejected") } },
 		Err(let error) => Some(i"rpc error: {error.debug()}"),
 	}
 }

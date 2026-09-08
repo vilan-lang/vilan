@@ -15,9 +15,7 @@ fun classify(p: Point): i32 {
 			let base = p.y;
 			base
 		}
-		1 => {
-			p.y * 10
-		}
+		1 => { p.y * 10 }
 		let other => other + p.y,
 	}
 }

@@ -145,7 +145,10 @@ fun drive(port: i32, finished: || void) {
 	}
 	// Poll until every session has observed the final value (or 5s).
 	mut waited = 0;
-	for (alice.last_seen.read() != mutations || bob.last_seen.read() != mutations || carol.last_seen.read() != mutations) && waited < 5000 {
+	for (alice.last_seen.read() != mutations
+		|| bob.last_seen.read() != mutations
+		|| carol.last_seen.read() != mutations)
+		&& waited < 5000 {
 		sleep(20);
 		waited += 20;
 	}

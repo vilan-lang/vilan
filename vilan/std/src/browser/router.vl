@@ -169,11 +169,7 @@ fun parse_path(path: str): PathParts {
 			parts.push(percent_decode(part));
 		}
 	}
-	PathParts {
-		segments = parts,
-		query = parse_query(query),
-		fragment = fragment,
-	}
+	PathParts { segments = parts, query = parse_query(query), fragment }
 }
 
 /// A query string — WITHOUT its leading `?` — as key → value, decoded:
@@ -191,10 +187,9 @@ fun parse_query(query: str): Map<str, str> {
 			let equals = pair.split("=");
 			if equals.len() > 1 {
 				let mark = equals[0].len();
-				values.insert(
-					percent_decode(pair.substring(0, mark).replace("+", " ")),
-					percent_decode(pair.substring(mark + 1, pair.len()).replace("+", " ")),
-				);
+				values.insert(percent_decode(pair.substring(0, mark).replace("+", " ")), percent_decode(pair
+					.substring(mark + 1, pair.len())
+					.replace("+", " ")));
 			} else {
 				values.insert(percent_decode(pair.replace("+", " ")), "");
 			}
