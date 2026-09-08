@@ -1573,6 +1573,16 @@ fn a_refused_client_reports_unauthorized_without_burning_the_retry_budget() {
                 "import std::io::print;",
                 "import std::io::print;\nimport std::process::exit;\nimport std::rpc::rpc_protocols;\nimport std::result::Result::{ Ok, Err };",
             )
+            // Every handshake the server sees says so, which is what makes the
+            // retry COUNT observable from outside (tracker N61).
+            .replace(
+                "			.authorize(|handshake: Handshake| match handshake.token() {",
+                "			.authorize(|handshake: Handshake| {\n				print(\"handshake:seen\");\n				match handshake.token() {",
+            )
+            .replace(
+                "				None => Result::Err(Reject::Unauthorized),\n			}))",
+                "				None => Result::Err(Reject::Unauthorized),\n				}\n			}))",
+            )
             .replace(
                 r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
                 "		.on_start(|server| run(server.port()))",
@@ -1587,7 +1597,6 @@ fun run(port: i32) {
 }
 "#),
     );
-    let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .arg("run")
         .arg(".")
@@ -1595,19 +1604,27 @@ fun run(port: i32) {
         .stdin(Stdio::null())
         .output()
         .expect("run the refused-client program");
-    let elapsed = started.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         stdout.contains("refused:Unauthorized"),
         "a refused connect must report RpcError::Unauthorized; stdout was:\n{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // A build is in this measurement, so the bound is on the whole command and
-    // still an order of magnitude under the ~27.75 s of backoff a burned
-    // budget sleeps through.
-    assert!(
-        elapsed < Duration::from_secs(45),
-        "the refusal must not wait out the retry budget; the whole run took {elapsed:?}"
+    // "Stops retrying", asserted as the COUNT and not as the clock (tracker
+    // N61). This used to bound a whole `vilan run .` — build included — at 45 s
+    // WALL: 52.56 s at loadavg 184 and 5.88 s at loadavg 59, which is a gate on
+    // the runner rather than on the program (`diagnostics_budget`'s class, M27's
+    // rule). The server announces every handshake it is asked for, so the
+    // redials are countable directly: a burned budget is ten of them, and the
+    // behaviour this pin exists for is one. No clock at all, and it is the
+    // stronger claim — a machine slow enough to sleep through 27.75 s inside 45
+    // could have passed the old bound while redialing.
+    let handshakes = stdout.matches("handshake:seen").count();
+    assert_eq!(
+        handshakes, 1,
+        "a refusal ends the dial loop, so the server must see exactly ONE \
+         handshake; it saw {handshakes}. Pre-A47 the client redialed ten times \
+         over ~27.75 s of backoff. stdout was:\n{stdout}"
     );
 
     drop(dir);
@@ -1962,6 +1979,12 @@ fn a_client_refused_by_infrastructure_reports_unavailable_and_compares_equal() {
         &dir,
         "src/main.vl",
         &(draining_server()
+            // The same handshake announcement N61 gave A47's pin, for the same
+            // reason: the retry count is the claim, not the clock.
+            .replace(
+                "			.authorize(|_handshake: Handshake| Result::Err(Reject::Unavailable)))",
+                "			.authorize(|_handshake: Handshake| {\n				print(\"handshake:seen\");\n				Result::Err(Reject::Unavailable)\n			}))",
+            )
             .replace(
                 "import std::io::print;",
                 "import std::io::print;\nimport std::process::exit;\nimport std::rpc::RpcError;\nimport std::result::Result::{ Ok, Err };",
@@ -1984,7 +2007,6 @@ fun run(port: i32) {
 }
 "#),
     );
-    let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .arg("run")
         .arg(".")
@@ -1992,7 +2014,6 @@ fun run(port: i32) {
         .stdin(Stdio::null())
         .output()
         .expect("run the unavailable-client program");
-    let elapsed = started.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     for expected in [
         "refused:Unavailable",
@@ -2005,11 +2026,13 @@ fun run(port: i32) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    // The same bound A47's pin carries, and for the same reason: the burned
-    // budget is ~27.75 s of sleeping alone, and a build is inside this figure.
-    assert!(
-        elapsed < Duration::from_secs(45),
-        "the refusal must not wait out the retry budget; the whole run took {elapsed:?}"
+    // The same claim A47's pin carries, counted the same way (tracker N61): a
+    // refusal ends the dial loop, so the server is asked for one handshake.
+    let handshakes = stdout.matches("handshake:seen").count();
+    assert_eq!(
+        handshakes, 1,
+        "an infrastructure refusal ends the dial loop too, so the server must \
+         see exactly ONE handshake; it saw {handshakes}. stdout was:\n{stdout}"
     );
 
     drop(dir);
@@ -2101,9 +2124,7 @@ fun run(port: i32) {
 }
 "#,
     );
-    let started = Instant::now();
     let stdout = vilan_run_with_liveness_bound(&dir);
-    let elapsed = started.elapsed();
     // The bare call offered the protocol, so the server's typed refusal frame
     // reached it and the status is in the sentence.
     assert!(
@@ -2124,10 +2145,26 @@ fun run(port: i32) {
         stdout.contains("explicit:could not reach"),
         "a client that did not name the protocol is not told the status:\n{stdout}"
     );
-    // One burned budget (the explicit leg's) is in this figure, not two.
+    // One burned budget, not two — counted rather than timed (tracker N61).
+    // This used to be an 80 s WALL bound over a whole `vilan run .`, build
+    // included, which is the shape M27 rules out; the server already announces
+    // every handshake it is offered, so the two legs' redials can simply be
+    // counted apart. The explicit leg is the non-vacuity control: it DOES burn
+    // its budget (that is what "a client that did not name the protocol is not
+    // told the status" costs), so a count that could not tell one dial from ten
+    // would be green on both legs.
+    let bare = stdout.matches("offered:vilan-rpc|").count();
+    let explicit = stdout.matches("offered:chat.v1|").count();
+    assert_eq!(
+        bare, 1,
+        "the bare leg is TOLD the refusal, so it dials once; the server was \
+         offered `vilan-rpc` {bare} time(s). stdout was:\n{stdout}"
+    );
     assert!(
-        elapsed < Duration::from_secs(80),
-        "the bare leg must not wait out a retry budget of its own; the run took {elapsed:?}"
+        explicit > 1,
+        "the explicit leg is refused blind and redials, which is what makes the \
+         bare leg's single dial a claim; the server was offered `chat.v1` \
+         {explicit} time(s). stdout was:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
