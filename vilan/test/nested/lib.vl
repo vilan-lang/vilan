@@ -1,0 +1,6 @@
+// The directory's OWN body: `nested/lib.vl` is the module `pkg::nested`, and
+// its items live in one namespace with the submodules its directory holds.
+
+fun surface(): str {
+	"nested::surface"
+}

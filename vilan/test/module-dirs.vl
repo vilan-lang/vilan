@@ -1,0 +1,27 @@
+import std::io::print;
+import pkg::nested::surface;
+import pkg::nested::ui::widget::{ label, width };
+import pkg::nested::ui::widget as widgets;
+import pkg::nested::util;
+import pkg::nested::util::hello;
+
+// Module DIRECTORIES (tracker A65, spec §4.1): a package's modules are a TREE.
+// `a.vl` or `a/lib.vl` is module `a`'s body, and `a/b.vl` is the module `a::b`
+// whether or not `a` has a body — so `nested/lib.vl`, `nested/util.vl` and
+// `nested/ui/widget.vl` are `pkg::nested`, `pkg::nested::util` and
+// `pkg::nested::ui::widget`. `nested/ui` holds no `lib.vl`, which makes it a
+// pure namespace: it is reached only through the module below it.
+//
+// Every import spelling over that tree, in one program: the module itself, a
+// member of it, a brace set at depth, and an `as` alias.
+
+fun main() {
+	print(surface());
+	print(util::hello());
+	print(hello());
+	print(label());
+	print(widgets::label());
+	print(i"width is {width()}");
+}
+
+main();

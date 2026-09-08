@@ -4489,3 +4489,231 @@ fn b250_a_declared_leg_with_no_manifest_is_unchanged() {
         "an ordinary module cycle under a declared entry: {errors:#?}"
     );
 }
+
+// --- A65: module DIRECTORIES ---
+//
+// Rust's rule, arrived at in A65: `a.vl` OR `a/lib.vl` is module `a`'s body
+// (both present stays the ambiguity error), and `a/b.vl` is the module `a::b`
+// whether or not `a` has a body. A directory with no `lib.vl` is a PURE
+// NAMESPACE — importable only through its children. Nesting is unbounded, and
+// every component keeps the byte-exact case rule.
+//
+// The resolution rule the walk implements: the LONGEST module prefix of an
+// import path is resolved against the disk (and the open-document overlay),
+// then the remaining segments are item segments walked in that module's scope.
+
+/// A package whose library files live under `lib/`, with one more level below
+/// it — the shape A65's exhibit (kolt's `src/lib/`) has.
+const A65_NESTED: &[(&str, &str)] = &[
+    ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+    (
+        "lib/ui/widget.vl",
+        "fun a(): i32 { 1 }\nfun b(): i32 { 2 }\n",
+    ),
+];
+
+#[test]
+fn a65_a_nested_module_is_imported_by_its_own_path() {
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::util;\n\nfun main() { let _ = util::hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "`lib/util.vl` is the module `lib::util`: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_member_of_a_nested_module_is_imported_by_its_full_path() {
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "the longest module prefix is `lib::util`, then the item `hello`: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_brace_set_reaches_a_deeper_directorys_members() {
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::ui::widget::{ a, b };\n\nfun main() { let _ = a() + b(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "nesting is unbounded and a set member is an item segment: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_an_alias_renames_a_nested_modules_leaf() {
+    // E142's `as` over a directory path: the path resolves exactly as it would
+    // without one, and the alias is the only thing that changes.
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::util as u;\n\nfun main() { let _ = u::hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(errors.is_empty(), "`as` over a nested path: {errors:#?}");
+}
+
+#[test]
+fn a65_a_directory_with_a_body_keeps_its_own_items_and_gains_its_children() {
+    // `lib/lib.vl` is `lib`'s body. Its items stay reachable as `pkg::lib::…`,
+    // and its directory's children are reachable as `pkg::lib::<child>` — the
+    // two live in one namespace, which is what "a directory holds a module AND
+    // its submodules" means.
+    let mut files = A65_NESTED.to_vec();
+    files.push(("lib/lib.vl", "fun surface(): i32 { 3 }\n"));
+    files.push((
+        "main.vl",
+        "import pkg::lib::surface;\nimport pkg::lib::util::hello;\n\nfun main() { let _ = surface() + \
+         hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a body and a namespace at once: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_pure_namespace_import_is_refused_and_names_its_children() {
+    // `lib/` has no `lib.vl`, so `pkg::lib` names no module body. Importing it
+    // binds nothing anyone can use, so it is refused — and the refusal says
+    // what the directory DOES hold, which is the whole of the fix.
+    let mut files = A65_NESTED.to_vec();
+    files.push(("main.vl", "import pkg::lib;\n\nfun main() {}\n"));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("`pkg::lib`"))
+        .unwrap_or_else(|| panic!("a bodiless directory is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("no `lib.vl`") || refusal.contains("namespace"),
+        "and says why: {refusal}"
+    );
+    assert!(
+        refusal.contains("util") && refusal.contains("ui"),
+        "and names the children it found: {refusal}"
+    );
+}
+
+#[test]
+fn a65_the_ambiguity_error_is_unchanged_inside_a_directory() {
+    // Both forms of ONE module's body, one level down: `lib/util.vl` and
+    // `lib/util/lib.vl`. The rule does not weaken because the module is nested.
+    let files = &[
+        ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        ("lib/util/lib.vl", "fun hello(): i32 { 8 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.iter().any(|error| error.contains("is ambiguous")
+            && error.contains("util.vl")
+            && error.contains("util/lib.vl")),
+        "both forms of a nested module's body is still the ambiguity error: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_parent_import_does_not_bring_the_children_into_scope() {
+    // The scope decision, pinned. `import pkg::lib;` binds `lib`'s OWN items —
+    // a child module is imported by its own path, exactly as in Rust. Writing
+    // `lib::util::hello()` after importing only `pkg::lib` must not resolve.
+    let files = &[
+        ("lib/lib.vl", "fun surface(): i32 { 3 }\n"),
+        ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib;\n\nfun main() { let _ = lib::util::hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        !errors.is_empty(),
+        "a parent import is not a child import: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_wrong_case_directory_component_does_not_resolve() {
+    // Every component carries the byte-exact rule (`windows-support.md` §5), so
+    // a directory spelled `Lib` is not reached by `import pkg::lib::util`. On a
+    // case-sensitive filesystem the resolution simply never happens, which is
+    // the refusal below; the Windows leg is where the mismatch ARM fires, and
+    // this pin declines there rather than asserting the other platform's answer.
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        return;
+    }
+    let files = &[
+        ("Lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        !errors.is_empty(),
+        "`Lib` is not `lib`, in a directory component too: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_nested_file_opened_as_the_entry_resolves_its_siblings_by_pkg() {
+    // File mode (B239's `OpenFile` leg): the editor hands the analysis
+    // `lib/ui/widget.vl`, which is a MODULE of the package. Its siblings are
+    // `pkg::…` from anywhere in the tree — the package root is the root,
+    // not the file's own directory.
+    let files = &[
+        ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        (
+            "lib/ui/widget.vl",
+            "import pkg::lib::util::hello;\n\nfun a(): i32 { hello() }\n",
+        ),
+        ("main.vl", "fun main() {}\n"),
+    ];
+    let (errors, _) = analyze_package_as(files, "lib/ui/widget.vl", open_file(&["main"]));
+    assert!(
+        errors.is_empty(),
+        "a nested module's own `pkg::` imports resolve in file mode: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_an_overlay_only_nested_module_resolves() {
+    // The unsaved-buffer world: `resolve_module_file` asks the open-document
+    // overlay beside the disk, and a directory component changes nothing about
+    // that — a nested module the user has just created and not yet saved must
+    // resolve exactly as a flat one does.
+    let errors = analyze_overlay_package(
+        &[
+            ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+            (
+                "main.vl",
+                "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "an overlay-only nested module resolves: {errors:#?}"
+    );
+}

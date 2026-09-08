@@ -1009,16 +1009,26 @@ pub fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> b
 /// entry deeper than that is not addressable as `pkg::<name>` at all, so it is
 /// not listed.
 pub fn declared_entry_module_names(manifest: &Manifest) -> Vec<String> {
-    /// `foo.vl` -> `foo`, `foo/lib.vl` -> `foo`, anything else -> `None`.
+    /// `foo.vl` -> `foo`, `foo/lib.vl` -> `foo`, and (A65) `a/b.vl` -> `a::b`,
+    /// `a/b/lib.vl` -> `a::b`: a declared entry anywhere under the source root
+    /// is addressable as `pkg::<its path>`, so it is named here at whatever
+    /// depth the manifest puts it. Anything that is not a `.vl` file, or whose
+    /// path has a segment Rust cannot spell in UTF-8 (never a vilan
+    /// identifier), is not addressable at all and is not listed.
     fn module_name(relative: &Path) -> Option<String> {
-        let mut segments = relative.iter();
-        let first = segments.next()?.to_str()?;
-        match segments.next() {
-            None => first.strip_suffix(".vl").map(str::to_string),
-            Some(second) if second == "lib.vl" && segments.next().is_none() => {
-                Some(first.to_string())
-            }
-            Some(_) => None,
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in relative.iter() {
+            segments.push(segment.to_str()?);
+        }
+        let last = segments.pop()?;
+        match last {
+            // `a/lib.vl` is the module `a` — the directory's own body.
+            "lib.vl" if !segments.is_empty() => {}
+            _ => segments.push(last.strip_suffix(".vl")?),
+        }
+        match segments.is_empty() {
+            true => None,
+            false => Some(segments.join("::")),
         }
     }
     let Some(package) = manifest.package.as_ref() else {

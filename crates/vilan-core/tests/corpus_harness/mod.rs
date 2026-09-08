@@ -135,6 +135,7 @@ macro_rules! corpus_manifest {
             match_ergonomics => "match-ergonomics.vl",
             match_patterns => "match-patterns.vl",
             math => "math.vl",
+            module_dirs => "module-dirs.vl",
             multiline_string => "multiline-string.vl",
             mut_parameters => "mut-parameters.vl",
             number_math => "number-math.vl",

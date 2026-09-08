@@ -474,3 +474,209 @@ fn a_cascade_of_macro_definition_failures_names_the_std_that_was_resolved() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- A65: module DIRECTORIES, end to end -------------------------------------
+//
+// The properties below are about bytes on disk under a real binary: a nested
+// tree building through the front end, the byte-exact case rule holding on a
+// DIRECTORY component, and a nested file handed to `vilan check` as the entry
+// resolving its siblings by `pkg::`.
+
+/// Writes `files` (relative paths, subdirectories created) as a single package.
+fn write_nested_package(dir: &Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("vilan.toml"),
+        "[package]\nname = \"paths\"\nroot = \".\"\n",
+    )
+    .unwrap();
+    for (name, contents) in files {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+}
+
+/// The exhibit's shape: library files under `lib/`, one of them one level
+/// deeper, and an entry that reaches all of them by path.
+const A65_TREE: &[(&str, &str)] = &[
+    (
+        "main.vl",
+        "import std::io::print;\nimport pkg::lib::ui::widget::label;\nimport \
+         pkg::lib::util::greet;\n\nfun main() {\n\tprint(greet());\n\tprint(label());\n}\n",
+    ),
+    ("lib/util.vl", "fun greet(): str {\n\t\"hello\"\n}\n"),
+    ("lib/ui/widget.vl", "fun label(): str {\n\t\"widget\"\n}\n"),
+];
+
+#[test]
+fn a65_a_nested_module_tree_builds_through_the_front_end() {
+    let root = temp_root("a65-nested");
+    write_nested_package(&root, A65_TREE);
+    let output = vilan(&root, &["build"]);
+    assert!(
+        output.status.success(),
+        "a package whose modules live under `lib/` builds: {}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a65_a_nested_file_checks_as_a_module_of_its_package() {
+    // File mode over a nested tree (B239's `OpenFile` leg): the file the editor
+    // hands over is a MODULE, so it needs no `main`, and its `pkg::` siblings
+    // resolve against the PACKAGE root rather than its own directory.
+    let root = temp_root("a65-file-mode");
+    write_nested_package(
+        &root,
+        &[
+            ("main.vl", "fun main() {}\n"),
+            ("lib/util.vl", "fun greet(): str {\n\t\"hello\"\n}\n"),
+            (
+                "lib/ui/widget.vl",
+                "import pkg::lib::util::greet;\n\nfun label(): str {\n\tgreet()\n}\n",
+            ),
+        ],
+    );
+    let output = vilan(&root, &["check", "lib/ui/widget.vl"]);
+    assert!(
+        output.status.success(),
+        "a nested module checks on its own: {}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a65_a_wrong_case_directory_component_does_not_resolve() {
+    // The byte-exact rule holds per COMPONENT, directories included: `Lib` is
+    // not `lib`. On a case-sensitive filesystem the resolution simply never
+    // happens (this pin); on a case-INSENSITIVE one it resolves and the
+    // mismatch arm turns it into a diagnostic, which is the Windows CI leg's
+    // to prove — so this declines there rather than asserting its answer.
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        return;
+    }
+    let root = temp_root("a65-case-dir");
+    write_nested_package(
+        &root,
+        &[
+            (
+                "main.vl",
+                "import pkg::Lib::util::greet;\n\nfun main() {\n\tlet _ = greet();\n}\n",
+            ),
+            ("lib/util.vl", "fun greet(): str {\n\t\"hello\"\n}\n"),
+        ],
+    );
+    let output = vilan(&root, &["build"]);
+    assert!(
+        !output.status.success(),
+        "a wrong-case directory component must not build: {}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a65_a_directory_with_no_body_is_refused_and_names_its_children() {
+    // The pure-namespace refusal, through the real binary: `lib/` has no
+    // `lib.vl`, so `import pkg::lib` binds nothing usable — and the message
+    // says what the directory does hold.
+    let root = temp_root("a65-namespace");
+    write_nested_package(
+        &root,
+        &[
+            ("main.vl", "import pkg::lib;\n\nfun main() {}\n"),
+            ("lib/util.vl", "fun greet(): str {\n\t\"hello\"\n}\n"),
+        ],
+    );
+    let output = vilan(&root, &["build"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success(),
+        "a namespace is not a module: {text}"
+    );
+    assert!(
+        text.contains("`pkg::lib::util`"),
+        "the refusal names the child that IS importable: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a65_fmt_walks_a_nested_module_tree() {
+    // `vilan fmt`'s walk already recurses; the pin is that a module directory
+    // is ordinary tree to it — every file under `lib/` is reached, checked, and
+    // (here) already canonical.
+    let root = temp_root("a65-fmt");
+    write_nested_package(&root, A65_TREE);
+    let output = vilan(&root, &["fmt", "--check", "."]);
+    assert!(
+        output.status.success(),
+        "a nested tree is already canonical: {}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a65_a_directory_carries_no_platform_coloring_of_its_own() {
+    // Platform coloring is per FILE, as it always was: a module directory is
+    // not a color. Two children of one `lib/` — one reached only by the browser
+    // entry, one only by the node entry — each take the color of what reaches
+    // them, and the package checks clean.
+    let root = temp_root("a65-coloring");
+    std::fs::create_dir_all(root.join("src/lib")).unwrap();
+    std::fs::write(
+        root.join("vilan.toml"),
+        "[package]\nname = \"colors\"\ndefault-entry = \"server\"\n\n[entry.client]\ntarget = \
+         \"browser\"\n\n[entry.server]\n",
+    )
+    .unwrap();
+    let files = [
+        (
+            "src/client.vl",
+            "import pkg::lib::painted::paint;\n\nfun main() {\n\tpaint();\n}\n",
+        ),
+        (
+            "src/server.vl",
+            "import pkg::lib::served::serve;\n\nfun main() {\n\tserve();\n}\n",
+        ),
+        (
+            "src/lib/painted.vl",
+            "import std::dom::get_element_by_id;\n\nfun paint() {\n\tlet _ = \
+             get_element_by_id(\"app\");\n}\n",
+        ),
+        (
+            "src/lib/served.vl",
+            "import std::fs::read_file_to_str;\n\nfun serve() {\n\tlet _ = \
+             read_file_to_str(\"x\");\n}\n",
+        ),
+    ];
+    for (name, contents) in files {
+        std::fs::write(root.join(name), contents).unwrap();
+    }
+    let output = vilan(&root, &["check", "."]);
+    assert!(
+        output.status.success(),
+        "a browser-colored child sits beside a node-colored sibling: {}",
+        combined(&output)
+    );
+
+    // The non-vacuity control: the coloring is still enforced THROUGH the
+    // directory — the node entry reaching the browser-colored child is refused
+    // exactly as it would be for a flat module.
+    std::fs::write(
+        root.join("src/server.vl"),
+        "import pkg::lib::painted::paint;\n\nfun main() {\n\tpaint();\n}\n",
+    )
+    .unwrap();
+    let output = vilan(&root, &["check", "."]);
+    assert!(
+        !output.status.success(),
+        "a node entry must not reach a browser module through a directory: {}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

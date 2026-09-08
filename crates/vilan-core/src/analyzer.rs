@@ -3281,6 +3281,29 @@ pub struct Analyzer<'src> {
     /// file resolved before the file was opened this way and stops after. The
     /// name is kept so the miss can SAY so rather than only refuse.
     entry_module_package: Option<String>,
+    /// A65: a module's SUBMODULE namespace — the scope holding the child modules
+    /// its directory contributes (`lib/util.vl` puts `util` in `lib`'s), keyed by
+    /// the parent module's entity id.
+    ///
+    /// Deliberately NOT the module's own item scope. A directory's children are
+    /// reachable through the import path that names them (`import
+    /// pkg::lib::util`) and through nothing else: `import pkg::lib` binds `lib`'s
+    /// own items, exactly as Rust's `use a;` does, so writing `lib::util::hello()`
+    /// after it does not resolve. Merged into the item scope, whether a child
+    /// resolved would have depended on whether some OTHER file in the program
+    /// happened to import it — a name whose meaning is an accident of the build's
+    /// import set.
+    ///
+    /// Only nested programs ever populate it; a package with no module directory
+    /// allocates neither an entry nor a scope.
+    module_children_scopes: HashMap<Id, Id>,
+    /// A65: the module paths that name a directory with NO `lib.vl` — a **pure
+    /// namespace** — mapped to the children the directory holds.
+    ///
+    /// `import pkg::lib` where `lib/` holds only `util.vl` binds a name with no
+    /// body behind it, so it is refused; the children ride along because naming
+    /// them is the whole of the fix ("write `pkg::lib::util`").
+    namespace_only_modules: HashMap<Id, Vec<String>>,
     // The prelude (prelude.md §9.2, implementation option 1). `prelude_exports`
     // is every loaded module's importable names by module scope — what a
     // prelude module would publish, read syntactically at load. `prelude_seeds`
@@ -4567,6 +4590,8 @@ impl<'src> Analyzer<'src> {
             packages: Vec::new(),
             package_of_source: HashMap::default(),
             entry_module_package: None,
+            module_children_scopes: HashMap::default(),
+            namespace_only_modules: HashMap::default(),
             prelude_exports: HashMap::default(),
             prelude_seeds: Vec::new(),
             prelude_entry_bindings: Vec::new(),
@@ -22685,6 +22710,28 @@ impl<'src> Analyzer<'src> {
             .copied()
     }
 
+    /// A65: [`Self::member_in_namespace`], then — when the namespace is a MODULE
+    /// — the submodules its directory contributes.
+    ///
+    /// The order is the rule: a module's own items win over a same-named file in
+    /// its directory, so adding `lib/util.vl` beside a `lib.vl` that already
+    /// declares `util` cannot silently re-point an existing import. Only the
+    /// import path walk asks this; ordinary member access
+    /// (`lib::util::hello()` in an expression) asks `member_in_namespace`
+    /// alone, which is what keeps a parent import from bringing children into
+    /// scope.
+    fn member_or_submodule(
+        &self,
+        name: &str,
+        scope_id: Id,
+        namespace_module_id: Option<Id>,
+    ) -> Option<Id> {
+        self.member_in_namespace(name, scope_id).or_else(|| {
+            let children_scope_id = self.module_children_scopes.get(&namespace_module_id?)?;
+            self.member_in_namespace(name, *children_scope_id)
+        })
+    }
+
     fn try_get_expr_id_by_name(&mut self, name: &'src str, scope_id: Id) -> Option<Id> {
         let scope = self.mut_scope_for_scope_id(scope_id);
         let parent_id = scope.parent_id;
@@ -31337,8 +31384,14 @@ impl<'src> Analyzer<'src> {
         // Which scope is `std`'s own root, so the removed-alias steer fires on
         // `std::print` and not on `std::io::print`'s deeper segments.
         let root_scope_id = namespace_scope_id;
+        // A65: the module the walk is currently INSIDE, so the next segment can
+        // also be one of its submodules (`pkg::lib::util` descends `pkg` -> the
+        // module `lib` -> `lib`'s directory child `util`). The root namespace
+        // registers its top-level modules in its own scope and has no submodule
+        // scope, so it starts as `None`.
+        let mut namespace_module_id: Option<Id> = None;
         for (part, part_span) in segments {
-            match self.member_in_namespace(part, namespace_scope_id) {
+            match self.member_or_submodule(part, namespace_scope_id, namespace_module_id) {
                 Some(id) => {
                     target_id = id;
                     self.record_reference(source_id, part_span, id);
@@ -31348,11 +31401,16 @@ impl<'src> Analyzer<'src> {
                     // or `std::option::Option::Some`.
                     let sub_scope_id = match self.expr_id_to_expr_map.get(&id) {
                         Some(Expr::Module(sub_module_id)) => {
+                            namespace_module_id = Some(*sub_module_id);
                             self.modules.get(sub_module_id).map(|module| module.body.1)
                         }
                         Some(Expr::Enum(enum_id)) => {
+                            namespace_module_id = None;
                             self.enums.get(enum_id).map(|enum_| enum_.variants_scope_id)
                         }
+                        // Not a namespace: the walk keeps the scope it is in,
+                        // exactly as it always has, and keeps the module that
+                        // scope belongs to with it.
                         _ => None,
                     };
                     if let Some(sub_scope_id) = sub_scope_id {
@@ -31380,6 +31438,36 @@ impl<'src> Analyzer<'src> {
                     return false;
                 }
             }
+        }
+        // A65: the path landed on a module DIRECTORY with no `lib.vl` — a pure
+        // namespace. There is no body to bind, so an import of it would put a
+        // name in scope that reaches nothing; refuse, and name the children,
+        // because "write the child's own path" is the whole of the fix.
+        if let Some(children) = self.namespace_only_modules.get(&target_id) {
+            if report {
+                let mut spelled: Vec<&str> = path.iter().map(|(segment, _)| *segment).collect();
+                if name != "self" {
+                    spelled.push(name);
+                }
+                let spelled = spelled.join("::");
+                let listed = children
+                    .iter()
+                    .map(|child| format!("`{spelled}::{child}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let leaf = spelled.rsplit("::").next().unwrap_or(&spelled);
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{spelled}` is a directory with no `{leaf}.vl`, so it is a namespace \
+                         rather than a module: it has no items to import. Import one of its \
+                         modules instead: {listed}"
+                    ),
+                });
+            }
+            return false;
         }
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
@@ -45761,6 +45849,44 @@ struct ModuleResolution {
     relative: PathBuf,
 }
 
+/// A module path's directory prefix and its final segment: `lib::ui::widget` is
+/// (`lib/ui`, `widget`), and a single-segment `util` is (``, `util`).
+///
+/// A65: a module is addressed by a PATH, not a name — `a/b.vl` is the module
+/// `a::b` — so every on-disk candidate is built from the segments rather than
+/// from the joined spelling. `None` for a path with an empty segment, which no
+/// import can spell and which must never be joined onto a root.
+fn module_path_prefix(name: &str) -> Option<(PathBuf, &str)> {
+    let mut prefix = PathBuf::new();
+    let mut last: Option<&str> = None;
+    for segment in name.split("::") {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+        if let Some(previous) = last.replace(segment) {
+            prefix.push(previous);
+        }
+    }
+    Some((prefix, last?))
+}
+
+/// A module path's own name — its last segment. `lib::ui::widget` is `widget`,
+/// and a flat `util` is itself. It is what the module is a member of its parent
+/// UNDER, and what every diagnostic that names one module prints.
+fn module_leaf_name(path: &str) -> &str {
+    match path.rfind("::") {
+        Some(cut) => &path[cut + 2..],
+        None => path,
+    }
+}
+
+/// A module path as the RELATIVE FILE PATH the diagnostics spell it with —
+/// always `/`-separated, so the ambiguity message reads the same on every
+/// platform (it always has: the form it replaces interpolated `{name}/lib.vl`).
+fn module_path_display(name: &str) -> String {
+    name.replace("::", "/")
+}
+
 /// Resolves a module `name` under `root` to its source file. A module may be a
 /// flat file (`name.vl`) or a directory with a `lib.vl` (`name/lib.vl`) — the two
 /// are equivalent to an importer. Returns the existing path (the flat form wins
@@ -45776,8 +45902,9 @@ struct ModuleResolution {
 /// screen. The overlay is also the whole filesystem when there is no filesystem,
 /// which is what lets the compiler resolve modules compiled to wasm.
 fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
-    let flat_relative = PathBuf::from(format!("{name}.vl"));
-    let nested_relative = Path::new(name).join("lib.vl");
+    let (prefix, last) = module_path_prefix(name)?;
+    let flat_relative = prefix.join(format!("{last}.vl"));
+    let nested_relative = prefix.join(last).join("lib.vl");
     let flat = root.join(&flat_relative);
     let nested = root.join(&nested_relative);
     let resolution = |relative: PathBuf, path: PathBuf, ambiguous: bool| ModuleResolution {
@@ -45848,6 +45975,62 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
         walk(node, root, &mut modules);
     }
     modules
+}
+
+/// [`collect_module_refs`] with the WHOLE path kept — every segment after the
+/// root, joined by `::` — because A65 made a module an addressable PATH rather
+/// than a name: `import pkg::lib::ui::widget::hello` collects `lib::ui::widget::hello`,
+/// and the loader resolves the longest prefix of that against the disk.
+///
+/// The collector cannot do the resolving itself: it has no root to probe, and
+/// the answer depends on the platform layers the caller is searching. So it
+/// hands over the whole path and the loader decides where the module ends and
+/// the items begin.
+///
+/// The SPAN is still the first module segment's, so every diagnostic built from
+/// this collection lands exactly where it landed before. A multi-segment path is
+/// interned (a `&'static str` that outlives the AST), which is also the rule a
+/// stored base world needs — no entry-text slice may reach the world's maps
+/// (M21/S3c). A single-segment path is the source slice itself, uninterned, so
+/// the flat program that has always been the common case allocates nothing new.
+fn collect_module_paths<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
+    fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, paths: &mut Vec<(&'a str, Span)>) {
+        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+            let mut entries = Vec::new();
+            flatten_namespace_branch(branch, Vec::new(), &mut entries);
+            for (path, leaf, leaf_span, _alias) in entries {
+                if path.first().map(|(name, _)| *name) != Some(root) {
+                    continue;
+                }
+                // A bare `import pkg::views` names its module in the leaf; the
+                // alias an `as` binds is not part of the path (E142: the path
+                // resolves exactly as it would without one), so the leaf is
+                // taken from the entry, never the alias.
+                let Some((module, module_span)) = path.get(1).copied() else {
+                    paths.push((leaf, leaf_span));
+                    continue;
+                };
+                let mut segments: Vec<&str> = path[1..].iter().map(|(name, _)| *name).collect();
+                // `a::b::{ self }` re-binds the namespace it sits in — the path
+                // is `a::b`, and `self` is not a segment of it.
+                if leaf != "self" {
+                    segments.push(leaf);
+                }
+                let joined: &'a str = if segments.len() == 1 {
+                    module
+                } else {
+                    interned_display_name(segments.join("::"))
+                };
+                paths.push((joined, module_span));
+            }
+        }
+        node.0.for_each_child(&mut |child| walk(child, root, paths));
+    }
+    let mut paths = Vec::new();
+    for node in nodes {
+        walk(node, root, &mut paths);
+    }
+    paths
 }
 
 /// [`collect_module_refs`] with the rest of each import kept: `(module, the
@@ -46021,14 +46204,17 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
             };
             render_module_parse_errors(&mut diagnostics, &path, &loaded);
             let ast = loaded.ast;
-            for (module, span) in collect_module_refs(&ast.0, "pkg") {
-                if resolve_module_in_roots(&all_roots, module).is_none() {
+            for (module, span) in collect_module_paths(&ast.0, "pkg") {
+                if longest_module_prefix(&all_roots, module).is_none() {
                     continue; // not a module file anywhere — an item re-export or a typo
                 }
                 let unavailable: Vec<String> = served
                     .iter()
                     .filter(|platform| {
-                        resolve_module_in_roots(&spec.available_roots(**platform), module).is_none()
+                        // A65: the same longest-prefix question the resolution
+                        // above asked — `pkg::util::util` is the module `util`
+                        // and an item of it, not a module `util::util`.
+                        longest_module_prefix(&spec.available_roots(**platform), module).is_none()
                     })
                     .map(|platform| platform.name())
                     .collect();
@@ -46174,6 +46360,165 @@ fn resolve_module_in_roots(roots: &[&Path], name: &str) -> Option<ModuleResoluti
         .find_map(|root| resolve_module_file(root, name))
 }
 
+/// The LONGEST prefix of an import `path` (the segments after the root, joined
+/// by `::`) that names a module under `roots` — A65's rule, and the whole of
+/// what makes `a/b.vl` reachable as `a::b`.
+///
+/// `pkg::lib::ui::widget::hello` arrives here as `lib::ui::widget::hello`; the
+/// probe walks prefixes longest-first, so `lib/ui/widget.vl` wins over
+/// `lib/ui.vl` and the remaining `hello` is left for the import walk to resolve
+/// as an ITEM of that module. A single-segment path probes exactly once and
+/// answers exactly what [`resolve_module_in_roots`] always did, so every flat
+/// program resolves — and loads, and numbers its entities — byte for byte as
+/// before.
+///
+/// Longest-first is deliberate rather than shortest-first: a directory is the
+/// author's own statement that the name below it is a module, and an item of
+/// the parent that happens to share the child's name would otherwise shadow a
+/// file the author can see on disk.
+fn longest_module_prefix(roots: &[&Path], path: &str) -> Option<String> {
+    let mut candidate = path.to_string();
+    loop {
+        if resolve_module_in_roots(roots, &candidate).is_some() {
+            return Some(candidate);
+        }
+        match candidate.rfind("::") {
+            Some(cut) => candidate.truncate(cut),
+            None => return None,
+        }
+    }
+}
+
+/// The longest prefix of `path` that names a module DIRECTORY under `roots`
+/// holding at least one child — a **pure namespace**, a directory with no
+/// `lib.vl` of its own. `import pkg::lib` where `lib/` holds only `util.vl`
+/// names one, and the refusal that answers it needs to know the children.
+///
+/// Only consulted when [`longest_module_prefix`] found no body at all, so a
+/// directory that also has a `lib.vl` never reaches here.
+fn longest_namespace_prefix(roots: &[&Path], path: &str) -> Option<String> {
+    let mut candidate = path.to_string();
+    loop {
+        if roots
+            .iter()
+            .any(|root| !submodules_in_directory(&module_directory(root, &candidate)).is_empty())
+        {
+            return Some(candidate);
+        }
+        match candidate.rfind("::") {
+            Some(cut) => candidate.truncate(cut),
+            None => return None,
+        }
+    }
+}
+
+/// The submodules the module path `path` holds, unioned over `roots` in the
+/// loader's own order — [`submodules_in_directory`] over the directory each
+/// root gives that path.
+///
+/// This is what an editor offers after `pkg::lib::`: the names below a module,
+/// whether the module has a body or is a pure namespace. Sorted and deduped, so
+/// the answer is the same however many roots contribute.
+pub fn submodules_in_roots(roots: &[&Path], path: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for root in roots {
+        for name in submodules_in_directory(&module_directory(root, path)) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// `root` joined with a module path's segments — the directory a module path
+/// names, whether or not it holds a `lib.vl`.
+fn module_directory(root: &Path, path: &str) -> PathBuf {
+    let mut directory = root.to_path_buf();
+    // The empty path is the root itself — what an editor asks for when it wants
+    // the top-level listing.
+    if path.is_empty() {
+        return directory;
+    }
+    for segment in path.split("::") {
+        directory.push(segment);
+    }
+    directory
+}
+
+/// The submodules a module DIRECTORY holds — every name reachable as
+/// `<that module>::<name>` (A65).
+///
+/// A `.vl` file is a module under its stem; `lib.vl` is excluded, because it is
+/// the directory's OWN body rather than a child of it. A subdirectory is a
+/// module when it holds a `lib.vl` and a pure namespace when it holds children
+/// but no body; either way it is a name the path walk can descend through, so
+/// both are listed. A subdirectory holding nothing importable is not.
+///
+/// The listing is sorted, so every diagnostic and completion built from it is
+/// deterministic, and it reads the open-document overlay beside the disk for the
+/// same reason [`modules_in_root`] does: an unsaved sibling is a module.
+pub fn submodules_in_directory(directory: &Path) -> Vec<String> {
+    fn holds_a_module(directory: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.extension() == Some(std::ffi::OsStr::new("vl")) {
+                return true;
+            }
+            path.is_dir() && holds_a_module(&path)
+        })
+    }
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = if path.extension() == Some(std::ffi::OsStr::new("vl")) {
+                path.file_stem().and_then(|stem| stem.to_str())
+            } else if path.is_dir() && holds_a_module(&path) {
+                path.file_name().and_then(|name| name.to_str())
+            } else {
+                None
+            };
+            if let Some(name) = name
+                && name != "lib"
+                && !names.iter().any(|known| known == name)
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    let directory = crate::util::canonical_path(directory);
+    for path in document_overlay_paths() {
+        let Ok(relative) = path.strip_prefix(&directory) else {
+            continue;
+        };
+        let mut components = relative.components();
+        let name = match (components.next(), components.next()) {
+            (Some(first), None) => {
+                let first = Path::new(first.as_os_str());
+                if first.extension() != Some(std::ffi::OsStr::new("vl")) {
+                    continue;
+                }
+                first.file_stem().and_then(|stem| stem.to_str())
+            }
+            (Some(first), Some(_)) => first.as_os_str().to_str(),
+            _ => continue,
+        };
+        if let Some(name) = name
+            && name != "lib"
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names
+}
+
 /// The source file module `name` resolves to under `roots` — the loader's own
 /// resolution ([`resolve_module_in_roots`]), exposed for callers that need the
 /// file without loading the module: the language server's import-path
@@ -46218,14 +46563,19 @@ pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<
         // Names are copied out of the tree before the next iteration, so no
         // borrow of an owned allocation outlives the reclaim below.
         let siblings: Vec<String> = match load_package_module(&path) {
-            Some(loaded) => collect_module_refs(&loaded.ast.0, "pkg")
+            Some(loaded) => collect_module_paths(&loaded.ast.0, "pkg")
                 .into_iter()
                 .map(|(module, _)| module.to_string())
                 .collect(),
             None => Vec::new(),
         };
         for module in siblings {
-            let Some(file) = resolve_module_file(pkg_root, &module) else {
+            // A65: the sibling is an import PATH; the longest prefix of it that
+            // names a module under this root is the file it reaches.
+            let Some(path) = longest_module_prefix(&[pkg_root], &module) else {
+                continue;
+            };
+            let Some(file) = resolve_module_file(pkg_root, &path) else {
                 continue;
             };
             if reached.insert(crate::util::canonical_path(&file.path)) {
@@ -48158,10 +48508,20 @@ fn analyze_inner<'src>(
     // which is a reason to key on them, not a reason to refuse: they are in
     // the key above and content-validated per hit like every other loaded
     // source. Overlays need no bypass — see below.
+    // A65: a collected reference is an import PATH; the seed is the MODULE it
+    // names. Resolving here rather than storing the path is what keeps the key
+    // a property of the reachable set instead of of the text — a half-typed
+    // `import std::io::pri` names the module `io` exactly as the finished line
+    // does, so the keystrokes in between store no world of their own (M11).
+    // An unresolvable path keys as itself, which is what it always did.
+    let seed_module = |roots: &[&Path], path: &str| -> String {
+        longest_module_prefix(roots, path).unwrap_or_else(|| path.to_string())
+    };
     let entry_seed_names: Vec<String> = {
-        let mut names: Vec<String> = collect_module_refs(&nodes.0, "std")
+        let std_roots = std.search_roots(platform);
+        let mut names: Vec<String> = collect_module_paths(&nodes.0, "std")
             .into_iter()
-            .map(|(name, _)| name.to_string())
+            .map(|(name, _)| seed_module(&std_roots, name))
             .collect();
         names.sort();
         names.dedup();
@@ -48176,9 +48536,12 @@ fn analyze_inner<'src>(
             .entry_dependencies
             .iter()
             .flat_map(|(name, index)| {
-                collect_module_refs(&nodes.0, name)
+                let roots = workspace.packages[*index].search_roots(platform);
+                collect_module_paths(&nodes.0, name)
                     .into_iter()
-                    .map(move |(module, _)| (*index, interned_display_name(module.to_string())))
+                    .map(move |(module, _)| {
+                        (*index, interned_display_name(seed_module(&roots, module)))
+                    })
             })
             .collect();
         seeds.sort();
@@ -48189,9 +48552,10 @@ fn analyze_inner<'src>(
     // `std::` and dependency seeds are: they seed the load, so they reach the
     // world's maps, and a STORED world may hold no entry-text slice (M21).
     let entry_pkg_seeds: Vec<&'static str> = {
-        let mut names: Vec<&'static str> = collect_module_refs(&nodes.0, "pkg")
+        let pkg_roots: Vec<&Path> = vec![pkg_root];
+        let mut names: Vec<&'static str> = collect_module_paths(&nodes.0, "pkg")
             .into_iter()
-            .map(|(name, _)| interned_display_name(name.to_string()))
+            .map(|(name, _)| interned_display_name(seed_module(&pkg_roots, name)))
             .collect();
         names.sort_unstable();
         names.dedup();
@@ -48452,6 +48816,97 @@ fn analyze_inner<'src>(
             Origin::Pkg => (2, 0, name),
         }
     }
+    /// A65: the entity a module PATH denotes, created if this analysis has not
+    /// met it yet — the parent chain first, so `lib::ui` exists before
+    /// `lib::ui::widget` registers under it.
+    ///
+    /// A node created here is a bare namespace: an entity, an (empty) item
+    /// scope, and a binding in its parent. Whether it also has a BODY is not
+    /// decided here — the path is requested from the loader on the way out, and
+    /// the loader either finds `lib.vl` and adopts this node for it or reports
+    /// the directory as a pure namespace. That request is idempotent: the drain
+    /// has already recorded the path in `loaded_keys` by the time this runs, or
+    /// records it on the next pass and finds nothing new to do.
+    fn ensure_module_node<'src>(
+        analyzer: &mut Analyzer<'src>,
+        module_nodes: &mut HashMap<(Origin, &'src str), Id>,
+        to_load: &mut Vec<(Origin, &'src str)>,
+        origin: Origin,
+        path: &'src str,
+        origin_scope_id: Id,
+        global_scope_id: Id,
+    ) -> Id {
+        if let Some(module_id) = module_nodes.get(&(origin, path)).copied() {
+            return module_id;
+        }
+        let parent_scope_id = match path.rfind("::") {
+            None => origin_scope_id,
+            Some(cut) => {
+                let parent_id = ensure_module_node(
+                    analyzer,
+                    module_nodes,
+                    to_load,
+                    origin,
+                    &path[..cut],
+                    origin_scope_id,
+                    global_scope_id,
+                );
+                module_children_scope(analyzer, parent_id, global_scope_id)
+            }
+        };
+        let scope = analyzer.create_scope(Some(global_scope_id));
+        let scope_id = analyzer.push_scope(scope);
+        let module_id = analyzer.new_entity_id();
+        let leaf = module_leaf_name(path);
+        analyzer.modules.insert(
+            module_id,
+            Module {
+                id: module_id,
+                name: leaf,
+                body: (Vec::new(), scope_id),
+            },
+        );
+        analyzer.span_map.insert(module_id, &EMPTY_SPAN);
+        // A namespace has no file of its own, so its one-id range is attributed
+        // to the entry — the same answer the `pkg::<entry>` alias arm gives for
+        // the other module entity that names no source of its own.
+        analyzer.source_ranges.push(SourceRange {
+            start: module_id.0,
+            end: module_id.0 + 1,
+            source: SourceId(0),
+        });
+        analyzer
+            .expr_id_to_expr_map
+            .insert(module_id, Expr::Module(module_id));
+        analyzer
+            .mut_scope_for_scope_id(parent_scope_id)
+            .name_to_id_map
+            .insert(leaf, module_id);
+        module_nodes.insert((origin, path), module_id);
+        to_load.push((origin, path));
+        module_id
+    }
+
+    /// A65: the scope holding a module's SUBMODULES, created on demand.
+    ///
+    /// Separate from the module's item scope on purpose: a child is reached by
+    /// the import path that names it and by nothing else, so `import pkg::lib`
+    /// binds `lib`'s own items and leaves `lib::util` to `import
+    /// pkg::lib::util`. Only a package with a module directory ever allocates
+    /// one.
+    fn module_children_scope(
+        analyzer: &mut Analyzer<'_>,
+        module_id: Id,
+        global_scope_id: Id,
+    ) -> Id {
+        if let Some(scope_id) = analyzer.module_children_scopes.get(&module_id).copied() {
+            return scope_id;
+        }
+        let scope = analyzer.create_scope(Some(global_scope_id));
+        let scope_id = analyzer.push_scope(scope);
+        analyzer.module_children_scopes.insert(module_id, scope_id);
+        scope_id
+    }
     // The entry program's package root (`pkg_root`, passed in): the directory its
     // `import pkg::..` siblings live in. When it is one of `std`'s own layer roots
     // we're compiling std itself (or a std file opened in an editor), so every
@@ -48474,7 +48929,7 @@ fn analyze_inner<'src>(
     // code's module references re-enter the loader there, so no pre-pass seeds
     // them here.)
     let mut to_load: Vec<(Origin, &str)> = lib_ast
-        .map(|ast| collect_module_refs(&ast.0, "pkg"))
+        .map(|ast| collect_module_paths(&ast.0, "pkg"))
         .unwrap_or_default()
         .into_iter()
         .map(|(name, _)| (Origin::Std, name))
@@ -48488,7 +48943,7 @@ fn analyze_inner<'src>(
     if contains_service(&nodes.0) {
         to_load.push((Origin::Std, "rpc"));
     }
-    let entry_std_refs = collect_module_refs(&nodes.0, "std");
+    let entry_std_refs = collect_module_paths(&nodes.0, "std");
 
     to_load.extend(
         entry_std_refs
@@ -48678,10 +49133,10 @@ fn analyze_inner<'src>(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "dep".to_string());
-            for (module, _) in collect_module_refs(&lib_ast.0, "pkg") {
-                if resolve_module_file(&spec.base_root, module).is_some() {
+            for (module, _) in collect_module_paths(&lib_ast.0, "pkg") {
+                if longest_module_prefix(&[spec.base_root.as_path()], module).is_some() {
                     to_load.push((Origin::Dep(index), module));
-                } else if resolve_module_in_roots(&spec.search_roots(platform), module).is_some() {
+                } else if longest_module_prefix(&spec.search_roots(platform), module).is_some() {
                     analyzer.diagnostics.push(Error { trace: Vec::new(),
                         note: None,
                         span: EMPTY_SPAN,
@@ -48696,7 +49151,7 @@ fn analyze_inner<'src>(
                 // normal resolution; leave it.
             }
             to_load.extend(
-                collect_module_refs(&lib_ast.0, "std")
+                collect_module_paths(&lib_ast.0, "std")
                     .into_iter()
                     .map(|(module, _)| (Origin::Std, module)),
             );
@@ -48712,7 +49167,7 @@ fn analyze_inner<'src>(
             }
             for (name, dependency_index) in &spec.dependencies {
                 to_load.extend(
-                    collect_module_refs(&lib_ast.0, name)
+                    collect_module_paths(&lib_ast.0, name)
                         .into_iter()
                         .map(|(module, _)| (Origin::Dep(*dependency_index), module)),
                 );
@@ -48755,6 +49210,17 @@ fn analyze_inner<'src>(
     // Dedup is per-package, not by bare name: two packages may each define a
     // module of the same name, and both must load into their own namespace.
     let mut loaded_keys: HashSet<(Origin, &str)> = HashSet::default();
+    // A65: every module PATH this analysis has an entity for — flat and nested
+    // alike — so a child registers under its parent and a parent that loads
+    // after its child adopts the node the child already created rather than
+    // shadowing it. Populated for a flat module too (one insert, no scope, no
+    // id), which is what lets `lib/lib.vl` and `lib/util.vl` mean one `lib`
+    // whichever order the drain reaches them in.
+    let mut module_nodes: HashMap<(Origin, &str), Id> = HashMap::default();
+    // A65: an import path resolved to the module it names, memoized. The drain
+    // is over module paths, not import paths, so this runs before the
+    // minimum-key selection and never inside it.
+    let mut resolved_requests: HashMap<(Origin, &str), Option<&str>> = HashMap::default();
     // Macro expansion state (macro-engine.md Phase 1): the registry is built
     // once every load settles (macro definitions must be reachable WITHOUT
     // expansion); each file's attributes then expand exactly once, and the
@@ -48818,6 +49284,40 @@ fn analyze_inner<'src>(
         // modules (`boolean`, `list`, ...) fold into this rule rather than
         // keeping their seed-list order.
         while !to_load.is_empty() {
+            // A65: each pending entry is an import PATH (`lib::ui::widget::hello`);
+            // the loader loads MODULES. Map every one to the longest prefix that
+            // names a module here — or, failing that, the module DIRECTORY it
+            // addresses — before choosing which to drain, so the canonical
+            // minimum below is taken over module paths rather than over import
+            // paths. A single-segment path answers itself, so a package with no
+            // module directory drains in exactly the order it always did, and
+            // its entity ids and emitted bytes are unmoved.
+            let pending: Vec<(Origin, &str)> = std::mem::take(&mut to_load);
+            for (origin, request) in pending {
+                let resolved = *resolved_requests
+                    .entry((origin, request))
+                    .or_insert_with(|| {
+                        let roots: Vec<&Path> = match origin {
+                            Origin::Std => std.search_roots(platform),
+                            Origin::Pkg => vec![pkg_root],
+                            Origin::Dep(index) => workspace.packages[index].search_roots(platform),
+                        };
+                        longest_module_prefix(&roots, request)
+                            .or_else(|| longest_namespace_prefix(&roots, request))
+                            .map(|path| match path == request {
+                                // The whole request IS the module: keep the caller's
+                                // own slice rather than interning a copy of it.
+                                true => request,
+                                false => interned_display_name(path),
+                            })
+                    });
+                if let Some(resolved) = resolved {
+                    to_load.push((origin, resolved));
+                }
+            }
+            if to_load.is_empty() {
+                break;
+            }
             let next = (0..to_load.len())
                 .min_by(|&left, &right| {
                     load_order_key(to_load[left]).cmp(&load_order_key(to_load[right]))
@@ -48835,11 +49335,40 @@ fn analyze_inner<'src>(
                 Origin::Pkg => vec![pkg_root],
                 Origin::Dep(index) => workspace.packages[index].search_roots(platform),
             };
+            // A65: the origin's own namespace scope — where a top-level module
+            // registers, and where the walk down a nested path starts.
+            let origin_scope_id = match origin {
+                Origin::Std => std_scope_id,
+                Origin::Pkg => pkg_scope_id,
+                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+            };
             // A platform-gated std module (e.g. `std::http` in a browser build) is *not*
             // skipped here: it loads so its signatures bind and the rest of the file
             // types cleanly. The cross-target diagnostic is reported once, at the user's
             // `import`, where the load is seeded (P3/L1).
             let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
+                // A65: no body under any root — but the path may still name a
+                // module DIRECTORY, a **pure namespace** whose children are
+                // importable through it. Register the namespace (so
+                // `pkg::lib::util` can walk through `lib`) and record what the
+                // directory holds, so an `import pkg::lib` that lands on it is
+                // refused with the children named.
+                let children = submodules_in_roots(&search_roots, name);
+                if !children.is_empty() {
+                    let module_id = ensure_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut to_load,
+                        origin,
+                        name,
+                        origin_scope_id,
+                        global_scope_id,
+                    );
+                    analyzer.namespace_only_modules.insert(module_id, children);
+                    if origin == Origin::Pkg {
+                        pkg_module_names.insert(name);
+                    }
+                }
                 // Not a module file here (a non-module name, or a missing import the
                 // resolver below will report) — skip, as the previous loader did.
                 continue;
@@ -48850,10 +49379,13 @@ fn analyze_inner<'src>(
                     trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
-                    msg: format!(
-                        "module `{name}` is ambiguous: both `{name}.vl` and `{name}/lib.vl` \
-                     exist; keep only one"
-                    ),
+                    msg: {
+                        let file = module_path_display(name);
+                        format!(
+                            "module `{name}` is ambiguous: both `{file}.vl` and `{file}/lib.vl` \
+                         exist; keep only one"
+                        )
+                    },
                 });
             }
             // Exact case is part of the resolution (`windows-support.md` §5, call
@@ -48946,9 +49478,16 @@ fn analyze_inner<'src>(
                 // `a_non_entry_self_import_stays_clean` is that control, and the
                 // editor must not invent a warning the build never prints.
                 if matches!(workspace.entry_mode, EntryMode::Declared { .. })
-                    && let Some((_, span)) = collect_module_refs(&nodes.0, "pkg")
+                    && let Some((_, span)) = collect_module_paths(&nodes.0, "pkg")
                         .into_iter()
-                        .find(|(module, _)| *module == name)
+                        // A65: the import names this module, or something under
+                        // it — `pkg::main::Thing` reaches the entry too.
+                        .find(|(module, _)| {
+                            *module == name
+                                || module
+                                    .strip_prefix(name)
+                                    .is_some_and(|rest| rest.starts_with("::"))
+                        })
                 {
                     analyzer.warnings.push(Error {
                         trace: Vec::new(),
@@ -49079,15 +49618,24 @@ fn analyze_inner<'src>(
             analyzer.source_texts.push((module_source_id, module_text));
             let module_scope = analyzer.create_scope(Some(global_scope_id));
             let module_scope_id = analyzer.push_scope(module_scope);
-            let module_id = analyzer.new_entity_id();
+            // A65: a module already has an entity when a CHILD of it loaded
+            // first (`lib/util.vl` before `lib/lib.vl`) — adopt that node, so
+            // the children already registered under it stay reachable and
+            // `pkg::lib` and `pkg::lib::util` name one `lib`. Otherwise this is
+            // the flat path the loader has always taken, id for id.
+            let adopted = module_nodes.get(&(origin, name)).copied();
+            let module_id = adopted.unwrap_or_else(|| analyzer.new_entity_id());
             analyzer.modules.insert(
                 module_id,
                 Module {
                     id: module_id,
-                    name,
+                    name: module_leaf_name(name),
                     body: (Vec::new(), module_scope_id),
                 },
             );
+            // A body: whatever the directory probe concluded before it loaded is
+            // no longer true.
+            analyzer.namespace_only_modules.remove(&module_id);
             // Give the module entity a location (its file, at the top) so a path
             // segment naming it can go-to-definition. A one-id range maps it to its
             // source; the span is the file start.
@@ -49104,15 +49652,30 @@ fn analyze_inner<'src>(
             // `pkg`, `std` modules in `std`, a dependency's in its own — so no
             // package's modules collide with or shadow another's (E.10: a local
             // `ui.vl` and `std::ui` coexist, each reachable through its root).
-            let namespace_scope_id = match origin {
-                Origin::Std => std_scope_id,
-                Origin::Pkg => pkg_scope_id,
-                Origin::Dep(index) => analyzer.packages[1 + index].namespace_scope_id,
+            //
+            // A65: "its package's namespace" is the origin's root scope for a
+            // top-level module and its PARENT module's submodule scope for a
+            // nested one — `lib/util.vl` is a member of `lib`, not of `pkg`.
+            let namespace_scope_id = match name.rfind("::") {
+                None => origin_scope_id,
+                Some(cut) => {
+                    let parent_id = ensure_module_node(
+                        &mut analyzer,
+                        &mut module_nodes,
+                        &mut to_load,
+                        origin,
+                        &name[..cut],
+                        origin_scope_id,
+                        global_scope_id,
+                    );
+                    module_children_scope(&mut analyzer, parent_id, global_scope_id)
+                }
             };
+            module_nodes.insert((origin, name), module_id);
             analyzer
                 .mut_scope_for_scope_id(namespace_scope_id)
                 .name_to_id_map
-                .insert(name, module_id);
+                .insert(module_leaf_name(name), module_id);
             // `module_scopes` indexes std modules by name for the primitive and
             // `panic` captures below; other packages' modules must not enter it (a
             // user or dependency module named `string`/`io`/`json`/... would shadow
@@ -49125,6 +49688,11 @@ fn analyze_inner<'src>(
             // are not `pkg::` from the entry, so they are not in this set.
             if origin == Origin::Pkg {
                 pkg_module_names.insert(name);
+                // A65: and the directory it sits under, which is the segment a
+                // generated `pkg::lib::util` reference is checked by.
+                if let Some(cut) = name.find("::") {
+                    pkg_module_names.insert(&name[..cut]);
+                }
             }
             // Record which package this module's source belongs to, so its imports
             // resolve `pkg::`/`<dep>::` relative to that package. Std sources always
@@ -49153,7 +49721,7 @@ fn analyze_inner<'src>(
             // collecting their `std::` imports would be a no-op — skip it to keep the
             // std load byte-for-byte unchanged.)
             to_load.extend(
-                collect_module_refs(&ast.0, "pkg")
+                collect_module_paths(&ast.0, "pkg")
                     .into_iter()
                     .map(|(sibling, _)| (origin, sibling)),
             );
@@ -49170,14 +49738,14 @@ fn analyze_inner<'src>(
             match origin {
                 Origin::Std => {}
                 Origin::Pkg => {
-                    let std_refs = collect_module_refs(&ast.0, "std");
+                    let std_refs = collect_module_paths(&ast.0, "std");
                     to_load.extend(
                         std_refs
                             .into_iter()
                             .map(|(module, _)| (Origin::Std, module)),
                     );
                     for (name, index) in &workspace.entry_dependencies {
-                        let refs = collect_module_refs(&ast.0, name);
+                        let refs = collect_module_paths(&ast.0, name);
                         to_load.extend(
                             refs.into_iter()
                                 .map(|(module, _)| (Origin::Dep(*index), module)),
@@ -49186,13 +49754,13 @@ fn analyze_inner<'src>(
                 }
                 Origin::Dep(index) => {
                     to_load.extend(
-                        collect_module_refs(&ast.0, "std")
+                        collect_module_paths(&ast.0, "std")
                             .into_iter()
                             .map(|(module, _)| (Origin::Std, module)),
                     );
                     for (name, dependency_index) in &workspace.packages[index].dependencies {
                         to_load.extend(
-                            collect_module_refs(&ast.0, name)
+                            collect_module_paths(&ast.0, name)
                                 .into_iter()
                                 .map(|(module, _)| (Origin::Dep(*dependency_index), module)),
                         );
@@ -49280,18 +49848,18 @@ fn analyze_inner<'src>(
                  to_load: &mut Vec<(Origin, &str)>| {
                     for list in generated.iter().map(|items| items.nodes) {
                         to_load.extend(
-                            collect_module_refs(list, "std")
+                            collect_module_paths(list, "std")
                                 .into_iter()
                                 .map(|(module, _)| (Origin::Std, module)),
                         );
                         to_load.extend(
-                            collect_module_refs(list, "pkg")
+                            collect_module_paths(list, "pkg")
                                 .into_iter()
                                 .map(|(module, _)| (origin, module)),
                         );
                         for (dep_name, index) in &workspace.entry_dependencies {
                             to_load.extend(
-                                collect_module_refs(list, dep_name)
+                                collect_module_paths(list, dep_name)
                                     .into_iter()
                                     .map(|(module, _)| (Origin::Dep(*index), module)),
                             );
