@@ -1,0 +1,10 @@
+// One more level down, under a directory with NO `lib.vl`: `nested/ui` is a
+// pure namespace, importable only through the modules below it.
+
+fun label(): str {
+	"nested::ui::widget::label"
+}
+
+fun width(): i32 {
+	42
+}

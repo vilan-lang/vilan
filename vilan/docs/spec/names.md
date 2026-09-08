@@ -8,6 +8,20 @@ declarations (`fun`, `struct`, `enum`, `trait`, `impl`, module-level
 declaration: a file `routes.vl` in a package's source root is the module
 `routes` of that package.
 
+Modules form a **tree**, and a directory under the source root is a
+module path. `a.vl` **or** `a/lib.vl` is the body of module `a` (both
+present is an ambiguity error, §4.2), and `a/b.vl` is the module `a::b`
+whether or not `a` has a body of its own; nesting is unbounded, so
+`a/b/c.vl` is `a::b::c`. A directory with no body is a **pure
+namespace**: it holds modules but is not one, and an `import` naming it
+is a diagnostic listing the modules it does hold.
+
+A module is reached by its **own** path. `import pkg::a` binds the items
+of `a`'s body and nothing below it; `a::b` is reached by
+`import pkg::a::b`. Item lookup through a module in expression position
+(`a::item`) reads that module's items only, so what a path means never
+depends on which other files a build happens to load.
+
 ## 4.2 The three namespaces
 
 A path's first segment selects a namespace:
@@ -28,16 +42,24 @@ though std has one: `pkg::ui` is always the package's own module,
 **reserved**: a manifest may not declare a dependency — or a
 `[package] name` — as `std`, `pkg`, or `macro_std` (§11.4), so no
 package can shadow a root or vanish behind one; `vilan`, the language's
-own name, is reserved alongside them (§11.4). A module name that
-resolves both as `name.vl` and `name/lib.vl` is an **ambiguity error**.
+own name, is reserved alongside them (§11.4). A module path that
+resolves both as `path.vl` and `path/lib.vl` is an **ambiguity error**.
 
-A module name must match the on-disk directory entry **byte for byte**: a
+A path is resolved by its **longest module prefix**: the segments after
+the root are matched against the tree longest-first, and what is left
+over is looked up as items of the module that answered. So
+`pkg::a::b::c` is the module `a/b/c.vl` when that file exists, and
+otherwise the item `c` of the module `a/b.vl`, and otherwise the item
+path `b::c` under `a.vl`.
+
+Every segment must match the on-disk directory entry **byte for byte**: a
 case-insensitive filesystem that answers `import foo` with `Foo.vl` is a
 **diagnostic naming both spellings**, not a resolution, so that a program
 compiles identically on case-sensitive and case-insensitive filesystems
 ([design notes](https://github.com/vilan-lang/proposals/blob/main/proposal/windows-support.md) §5). Every component of the resolved path
-carries the rule, so `foo/lib.vl` is reached by `import foo` only when the
-directory is spelled `foo`.
+carries the rule — directory components included — so `foo/lib.vl` is
+reached by `import foo` only when the directory is spelled `foo`, and
+`a/b.vl` by `import pkg::a::b` only when both are.
 
 ## 4.3 Imports
 

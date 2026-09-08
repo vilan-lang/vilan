@@ -2385,38 +2385,80 @@ fn origin_completions(roots: &ImportRoots) -> Vec<Completion> {
 }
 
 /// What `origin::module::` offers: the module's own importable names, read on
-/// demand from its source file. `past_module` are the segments beyond it — an
-/// enum name descends into that enum's variants, which is the only descent
-/// `resolve_import` makes past a module; anything deeper offers nothing.
+/// demand from its source file, plus (A65) the SUBMODULES its directory holds.
+///
+/// The segments typed are a PATH, and where the module ends is a question about
+/// the disk — `pkg::lib::ui::widget::` is the module `lib/ui/widget.vl` with
+/// nothing past it, while `pkg::lib::util::Tab::` is `lib/util.vl` with an enum
+/// past it. So the longest prefix that resolves is the module, exactly as the
+/// loader decides it, and what is left is the descent: an enum name descends
+/// into that enum's variants, which is the only descent `resolve_import` makes
+/// past a module; anything deeper offers nothing.
+///
+/// A path that resolves to no module at all may still be a pure NAMESPACE — a
+/// directory with no `lib.vl` — and then the children are the whole answer,
+/// which is also the only thing an import of it could name.
 fn module_member_completions(
     module_roots: &[&Path],
     module: &str,
     past_module: &[&str],
 ) -> Vec<Completion> {
-    let Some(path) = vilan_core::analyzer::module_source_file(module_roots, module) else {
-        return Vec::new();
-    };
-    let importables = vilan_core::analyzer::module_importables(&path);
-    let Some((name, past_enum)) = past_module.split_first() else {
-        return importables.iter().map(importable_completion).collect();
-    };
-    if !past_enum.is_empty() {
-        return Vec::new();
-    }
-    importables
-        .iter()
-        .find(|importable| {
-            importable.name == *name
-                && importable.kind == vilan_core::analyzer::ImportableKind::Enum
-        })
-        .map(|enumeration| {
-            enumeration
-                .variants
+    let mut segments: Vec<&str> = Vec::with_capacity(1 + past_module.len());
+    segments.push(module);
+    segments.extend(past_module.iter().copied());
+    for cut in (1..=segments.len()).rev() {
+        let path = segments[..cut].join("::");
+        let file = vilan_core::analyzer::module_source_file(module_roots, &path);
+        let children = vilan_core::analyzer::submodules_in_roots(module_roots, &path);
+        // A prefix names something when it has a body, or children, or both. A
+        // pure namespace has only children, which is exactly what an import
+        // through it can reach.
+        if file.is_none() && children.is_empty() {
+            continue;
+        }
+        let importables = file
+            .as_deref()
+            .map(vilan_core::analyzer::module_importables)
+            .unwrap_or_default();
+        let Some((name, past_enum)) = segments[cut..].split_first() else {
+            let mut items: Vec<Completion> =
+                importables.iter().map(importable_completion).collect();
+            // The directory's children, after the module's own names: an item
+            // and a submodule can share a spelling, and the module's own item
+            // is what an import of that name binds (the walk asks the item
+            // scope first).
+            let seen: HashSet<&str> = importables
                 .iter()
-                .map(|variant| Completion::bare(variant.to_string(), CompletionKind::EnumVariant))
-                .collect()
-        })
-        .unwrap_or_default()
+                .map(|importable| importable.name)
+                .collect();
+            for child in children {
+                if !seen.contains(child.as_str()) {
+                    items.push(Completion::bare(child, CompletionKind::Module));
+                }
+            }
+            return items;
+        };
+        if !past_enum.is_empty() {
+            return Vec::new();
+        }
+        return importables
+            .iter()
+            .find(|importable| {
+                importable.name == *name
+                    && importable.kind == vilan_core::analyzer::ImportableKind::Enum
+            })
+            .map(|enumeration| {
+                enumeration
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        Completion::bare(variant.to_string(), CompletionKind::EnumVariant)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    Vec::new()
 }
 
 /// One importable name as a completion candidate. Bare by construction — an
@@ -2958,6 +3000,12 @@ struct OriginListing {
     origin: String,
     /// `(module name, source file)`, first root wins, `lib` excluded.
     modules: Vec<(String, PathBuf)>,
+    /// A65: the pure NAMESPACES directly under the origin's roots — module
+    /// directories with no `lib.vl`, which have no source file of their own but
+    /// are the head of every path into what they hold. Captured beside
+    /// `modules` for the same reason those are: it is a `read_dir`, and §2.1
+    /// keeps the keystroke path off the filesystem.
+    namespaces: Vec<String>,
     /// The `lib.vl` this origin publishes, where it has one.
     surface: Option<PathBuf>,
 }
@@ -2979,6 +3027,11 @@ impl OriginListing {
             .map(|(name, _path)| Completion::bare(name.clone(), CompletionKind::Module))
             .collect();
         let mut seen: HashSet<String> = self.modules.iter().map(|(name, _)| name.clone()).collect();
+        for namespace in &self.namespaces {
+            if seen.insert(namespace.clone()) {
+                items.push(Completion::bare(namespace.clone(), CompletionKind::Module));
+            }
+        }
         for importable in self
             .surface
             .as_deref()
@@ -3002,15 +3055,28 @@ impl OriginListing {
                 let mut modules: Vec<(String, PathBuf)> = Vec::new();
                 for root in &module_roots {
                     for (name, path) in vilan_core::analyzer::modules_in_root(root) {
-                        if name == "lib" || modules.iter().any(|(known, _)| *known == name) {
+                        // The package SURFACE is the FLAT `lib.vl` at the root,
+                        // and only that: A65 makes a DIRECTORY called `lib` an
+                        // ordinary module of the package (it is the exhibit's
+                        // own name), so the drop is by path, not by spelling.
+                        let is_surface = name == "lib" && path.parent() == Some(root);
+                        if is_surface || modules.iter().any(|(known, _)| *known == name) {
                             continue;
                         }
                         modules.push((name, path));
                     }
                 }
+                // A65: and the bodiless module directories, which `modules_in_root`
+                // cannot list because it answers with a FILE per name.
+                let namespaces: Vec<String> =
+                    vilan_core::analyzer::submodules_in_roots(&module_roots, "")
+                        .into_iter()
+                        .filter(|name| !modules.iter().any(|(known, _)| known == name))
+                        .collect();
                 Some(OriginListing {
                     origin,
                     modules,
+                    namespaces,
                     surface,
                 })
             })

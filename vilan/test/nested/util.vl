@@ -1,0 +1,6 @@
+// `nested/util.vl` is the module `pkg::nested::util` — a module of the
+// directory, reachable whether or not the directory has a body of its own.
+
+fun hello(): str {
+	"nested::util::hello"
+}
