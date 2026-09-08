@@ -16,6 +16,7 @@ fun create_element_ns(namespace: str, tag: str): Element   // createElementNS
 fun create_text_node(content: str): Text                   // a fresh text node
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
+fun request_animation_frame(callback: || void)             // requestAnimationFrame
 
 struct DomRect { left: f64, top: f64, width: f64, height: f64 }   // a VALUE, not a handle
 impl DomRect {
@@ -41,6 +42,7 @@ impl Element {
 	fun contains(self, other: Element): bool           // other is this element or inside it
 	fun query_selector_all(self, selector: str): List<Element>   // scoped to this subtree
 	fun focus(self)                                    // move keyboard focus here
+	fun matches(self, selector: str): bool             // element.matches(..)
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
 	fun on(self, event: str, handler: || void)
@@ -274,7 +276,7 @@ too.
 | `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
-| `autofocus` | `(): View` | `on_mount(\|element\| element.focus())` — the modal-input form HTML's `autofocus` cannot serve |
+| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).

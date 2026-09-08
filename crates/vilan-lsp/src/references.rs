@@ -321,6 +321,23 @@ impl ReferenceIndex {
         // keystroke. The lookup is hoisted once and answers the identical
         // question.
         let source_of = program.source_lookup();
+        // B264: an alias row whose recorded span is ANCHORED rather than exact.
+        // `import_alias_spans` is keyed by the span the analyzer recorded, and a
+        // struct-literal head (`Spot { x = 1 }`) is recorded as the WHOLE
+        // initializer with the name at its start — so the exact-key lookup below
+        // misses it, `narrow` then takes the TARGET's name length from the
+        // start, and `Spot { … }` under `Point` came out as the five bytes
+        // `Spot ` : a row whose text is not its definition's name (INVARIANT 1,
+        // the exception E145 removed) and, worse, an edit a rename of `Point`
+        // applies, rewriting the alias's use into `zzz{ x = 1 }`. These two
+        // indexes let an anchored span ask the same question the exact one
+        // does: is the identifier at this END of the span an alias's name?
+        let mut alias_at_start: HashMap<(SourceId, usize), Id> = HashMap::new();
+        let mut alias_at_end: HashMap<(SourceId, usize), Id> = HashMap::new();
+        for ((source, span), alias_id) in &program.import_alias_spans {
+            alias_at_start.insert((*source, span.start), *alias_id);
+            alias_at_end.insert((*source, span.end), *alias_id);
+        }
 
         let push = |rows: &mut Vec<Occurrence>,
                     dropped: &mut HashMap<Definition, usize>,
@@ -347,12 +364,38 @@ impl ReferenceIndex {
             // no symbol to rename here". An alias whose name happened to be
             // the same length survived — spelling its target's name back at
             // INVARIANT 1, which is the exception this removes.
-            let (name, anchor, definition) = match program.import_alias_spans.get(&(source, span)) {
-                Some(alias_id) if Definition::Entity(*alias_id) != definition => {
-                    match program.import_aliases.get(alias_id) {
-                        // An alias is always written as a bare identifier, so
-                        // its span is the name exactly.
-                        Some(alias) => (alias.name, Anchor::Exact, Definition::Entity(*alias_id)),
+            //
+            // An ANCHORED span (B264) asks the same question at the END the
+            // name sits at, and answers it only when the alias's target IS the
+            // definition this row claims — a coincidence of offsets can never
+            // relabel an unrelated symbol. The anchor is KEPT there: the row's
+            // span is the whole initializer, and it is the alias's name length
+            // that narrows it correctly.
+            let exact = program.import_alias_spans.get(&(source, span)).copied();
+            let anchored = match anchor {
+                Anchor::Exact => None,
+                Anchor::Start => alias_at_start.get(&(source, span.start)).copied(),
+                Anchor::End => alias_at_end.get(&(source, span.end)).copied(),
+            }
+            .filter(|alias_id| {
+                program
+                    .import_aliases
+                    .get(alias_id)
+                    .is_some_and(|alias| Definition::Entity(alias.target) == definition)
+            });
+            // An exact hit narrows to the alias's own span; an anchored one
+            // keeps the row's anchor and narrows by the alias's name.
+            let (name, anchor, definition) = match exact.or(anchored) {
+                Some(alias_id) if Definition::Entity(alias_id) != definition => {
+                    match program.import_aliases.get(&alias_id) {
+                        Some(alias) => {
+                            let anchor = if exact.is_some() {
+                                Anchor::Exact
+                            } else {
+                                anchor
+                            };
+                            (alias.name, anchor, Definition::Entity(alias_id))
+                        }
                         None => (name, anchor, definition),
                     }
                 }
@@ -2554,5 +2597,265 @@ fun main(): i32 {
             assert!(checked >= 4, "expected the whole file, checked {checked}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // --- B264: an alias in TYPE position, and what a hover at an alias says --
+    //
+    // E145 gave an `as` alias an entity of its own, but only the two tables it
+    // filled from the source knew it: `type_references` (which covers a type
+    // annotation and an import path segment) and the value-position
+    // `Expr::Local`/`Variable`/`Parameter` reads. A STRUCT-LITERAL head is
+    // recorded neither way — the index derives it from
+    // `struct_initializer_to_def`, whose span is the whole `Spot { x = 1 }`
+    // with the name ANCHORED at its start — so the alias remap, which keys on
+    // an exact span, missed it. `narrow` then took the TARGET's name length
+    // from that start, and `Spot { x = 1 }` came out as the five bytes
+    // `Spot ` filed under `Point`: a row whose text is not its definition's
+    // name, which is INVARIANT 1's removed exception walking back in, and an
+    // edit that a rename of `Point` APPLIES — turning `Spot { x = 1 }` into
+    // `zzz{ x = 1 }`, a program that does not parse.
+    //
+    // Ruled 2026-09-07 (the owner): TypeScript is the reference. Driven over
+    // `tsserver`'s own API on `import { foo as bar, Foo as Bar } from "./m"`:
+    //
+    //  - go-to-definition at `bar()` and at `let x: Bar` both answer `m.ts`'s
+    //    DECLARATION — the alias resolves THROUGH;
+    //  - hover answers `(alias) bar(): number` and `(alias) type Bar = {…}` —
+    //    the alias's own name carrying the target's signature;
+    //  - rename at a use rewrites the alias binding and its uses and stops at
+    //    the module boundary; rename at the original's name (in `m.ts`, or the
+    //    `foo` before `as`) rewrites the declaration and the import's own
+    //    segment and leaves the alias standing.
+    //
+    // Vilan already answered the first and the third in VALUE position (E145)
+    // and the first in type position; the second was the target's name, and
+    // the third was the corrupting row above.
+
+    const B264_HELPER: &str = "struct Point {\n\tx: i32,\n}\n\nfun greet(): i32 {\n\t1\n}\n";
+
+    /// One import aliasing a TYPE and one aliasing a FUNCTION, each used twice:
+    /// the type in an annotation and as a struct-literal head (the shape the
+    /// index derives rather than records), the function as a call.
+    const B264_ALIASED: &str = "\
+import pkg::helper::Point as Spot;
+import pkg::helper::greet as hi;
+
+fun make(): Spot {
+\tSpot { x = 1 }
+}
+
+fun main(): i32 {
+\thi();
+\tmake().x
+}
+";
+
+    fn b264_aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[
+            ("main.vl", B264_ALIASED),
+            ("helper.vl", B264_HELPER),
+        ])
+    }
+
+    /// The text a `(source, span)` answer covers, read out of the file it
+    /// indexes into — the definition answers point into `helper.vl`, so the
+    /// entry's text alone cannot render them.
+    fn b264_text(document: &Document, source: SourceId, span: Span) -> String {
+        let text = if source == SourceId(0) {
+            B264_ALIASED.to_string()
+        } else {
+            let program = document.program.as_ref().expect("program");
+            std::fs::read_to_string(&program.canonical_sources[source.0 as usize])
+                .expect("the fixture file")
+        };
+        text.get(span.into_range())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("span {span:?} is outside source {}", source.0))
+    }
+
+    fn b264_at(needle: &str, delta: usize) -> usize {
+        B264_ALIASED
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in the pin source"))
+            + delta
+    }
+
+    /// TypeScript's first answer: go-to-definition at an aliased use resolves
+    /// THROUGH to the target's declaration — in type position and in value
+    /// position, and from the alias's own `as` span too.
+    #[test]
+    fn b264_go_to_definition_at_an_alias_resolves_through_to_the_target() {
+        let (dir, document) = b264_aliased();
+        for (label, offset, expected) in [
+            (
+                "the type alias in an annotation",
+                b264_at("): Spot", 3),
+                "Point",
+            ),
+            (
+                "the type alias as a literal head",
+                b264_at("\tSpot {", 1),
+                "Point",
+            ),
+            (
+                "the type alias's own `as` name",
+                b264_at("as Spot", 3),
+                "Point",
+            ),
+            ("the value alias at a call", b264_at("\thi();", 1), "greet"),
+            (
+                "the value alias's own `as` name",
+                b264_at("as hi", 3),
+                "greet",
+            ),
+        ] {
+            let (source, span) = document
+                .definition(offset)
+                .unwrap_or_else(|| panic!("{label}: an alias has a definition"));
+            assert_ne!(source, SourceId(0), "{label}: the target is in helper.vl");
+            assert_eq!(
+                b264_text(&document, source, span),
+                expected,
+                "{label}: go-to-definition lands on the target's declaration",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TypeScript's second answer: the hover carries the ALIAS's name and the
+    /// TARGET's signature, marked `(alias)`.
+    #[test]
+    fn b264_hover_at_an_alias_shows_the_alias_name_with_the_targets_signature() {
+        let (dir, document) = b264_aliased();
+        for (label, offset, expected) in [
+            (
+                "the type alias in an annotation",
+                b264_at("): Spot", 3),
+                "```vilan\n(alias) struct Spot {\n\tx: i32,\n}\n```",
+            ),
+            (
+                "the type alias as a literal head",
+                b264_at("\tSpot {", 1),
+                "```vilan\n(alias) struct Spot {\n\tx: i32,\n}\n```",
+            ),
+            (
+                "the type alias's own `as` name",
+                b264_at("as Spot", 3),
+                "```vilan\n(alias) struct Spot {\n\tx: i32,\n}\n```",
+            ),
+            (
+                "the value alias at a call",
+                b264_at("\thi();", 1),
+                "```vilan\n(alias) fun hi(): i32\n```",
+            ),
+            (
+                "the value alias's own `as` name",
+                b264_at("as hi", 3),
+                "```vilan\n(alias) fun hi(): i32\n```",
+            ),
+        ] {
+            assert_eq!(document.hover(offset).as_deref(), Some(expected), "{label}",);
+        }
+        // And the ORIGINAL's own name is not an alias: the import's path
+        // segment hovers as the declaration it names.
+        assert_eq!(
+            document.hover(b264_at("::Point", 2)).as_deref(),
+            Some("```vilan\nstruct Point {\n\tx: i32,\n}\n```"),
+            "the path segment spells the target, not the alias",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TypeScript's third answer, the alias side: every spelling of `Spot` —
+    /// its declaration, the annotation and the literal head — and nothing of
+    /// `Point`.
+    #[test]
+    fn b264_references_and_rename_at_a_type_position_alias_answer_the_alias() {
+        let (dir, document) = b264_aliased();
+        for (label, offset) in [
+            ("the annotation", b264_at("): Spot", 3)),
+            ("the literal head", b264_at("\tSpot {", 1)),
+            ("the `as` name", b264_at("as Spot", 3)),
+        ] {
+            let found: Vec<String> = document
+                .references(offset)
+                .into_iter()
+                .map(|(source, span)| b264_text(&document, source, span))
+                .collect();
+            assert_eq!(found, vec!["Spot", "Spot", "Spot"], "{label}: references");
+            let edits: Vec<String> = document
+                .rename_edits(offset, "Dot")
+                .expect("a rename at a type-position alias")
+                .into_iter()
+                .map(|(source, span, text)| {
+                    format!("{}->{text}", b264_text(&document, source, span))
+                })
+                .collect();
+            assert_eq!(
+                edits,
+                vec!["Spot->Dot", "Spot->Dot", "Spot->Dot"],
+                "{label}: rename rewrites the alias and its uses only",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same ruling from the ORIGINAL's side, and the row that made it a
+    /// bug rather than a gap: before the anchored-span remap, a query at
+    /// `::Point` listed a fourth "occurrence" covering the five bytes `Spot `
+    /// — the literal head narrowed by the TARGET's length — and a rename
+    /// applied it, producing `zzz{ x = 1 }`.
+    #[test]
+    fn b264_a_rename_at_the_original_leaves_the_type_alias_standing() {
+        let (dir, document) = b264_aliased();
+        let on_segment = b264_at("::Point", 2);
+        let found: Vec<String> = document
+            .references(on_segment)
+            .into_iter()
+            .map(|(source, span)| b264_text(&document, source, span))
+            .collect();
+        assert_eq!(
+            found,
+            vec!["Point", "Point"],
+            "the import's own segment and the declaration; the alias spells another name",
+        );
+        let edits: Vec<String> = document
+            .rename_edits(on_segment, "Dot")
+            .expect("a rename at the imported type")
+            .into_iter()
+            .map(|(source, span, text)| format!("{}->{text}", b264_text(&document, source, span)))
+            .collect();
+        assert_eq!(
+            edits,
+            vec!["Point->Dot", "Point->Dot"],
+            "no edit touches the alias or the literal head that spells it",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// INVARIANT 1 over the type-position fixture: the literal head was the one
+    /// row it could not describe.
+    #[test]
+    fn b264_every_indexed_span_covers_an_identifier_through_a_type_alias_too() {
+        let (dir, document) = b264_aliased();
+        let program = document.program.as_ref().expect("program");
+        let index = document.reference_index();
+        let mut checked = 0;
+        for row in index.rows() {
+            if row.source != SourceId(0) {
+                continue;
+            }
+            let name = name_of(program, row.definition).expect("a named definition");
+            let covered = B264_ALIASED
+                .get(row.span.into_range())
+                .unwrap_or_else(|| panic!("span {:?} is outside the entry text", row.span));
+            assert_eq!(
+                covered, name,
+                "row {row:?} covers {covered:?}, which is not the identifier {name:?}",
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "expected the whole file, checked {checked}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

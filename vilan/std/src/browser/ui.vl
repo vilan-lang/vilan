@@ -36,6 +36,7 @@ import pkg::dom::{
 	create_element_ns,
 	create_text_node,
 	get_element_by_id,
+	request_animation_frame,
 };
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
@@ -611,6 +612,17 @@ impl View {
 	/// timer dance an app writes otherwise: mint a uuid, set it as the id,
 	/// `set_timeout(1)`, look the element back up. There is nothing to look
 	/// up: the callback is handed the element itself.
+	///
+	/// WHAT THIS GUARANTEES, AND WHAT IT DOES NOT (B271). The element is IN
+	/// THE DOCUMENT when `action` runs, and that is the whole promise. A
+	/// microtask runs BEFORE the frame's rendering step, so at that moment the
+	/// element is connected but not yet rendered: it has no layout, its
+	/// computed style is not resolved, and nothing a `ResizeObserver` or an
+	/// `IntersectionObserver` does in reaction to layout has happened. Any
+	/// action whose precondition is "rendered" or "visible" — `focus()`, a
+	/// measurement, a scroll into view — must ask again on an animation frame
+	/// if the first attempt does not take. `View::autofocus` is that pattern
+	/// written once; `std::dom::request_animation_frame` is the clock.
 	fun on_mount(self, action: sync |Element| void): View {
 		// Capture the ELEMENT, not the view: the closure the host holds must
 		// reach exactly what the callback needs and nothing more
@@ -624,8 +636,40 @@ impl View {
 	/// one-word form of `on_mount(|element| element.focus())`, and the reason
 	/// `on_mount` exists. HTML's `autofocus` attribute fires only on a
 	/// document's initial parse, so it does nothing for a modal opened later.
+	///
+	/// FRAME-AWARE AND BOUNDED (B271). `focus()` is a request with a
+	/// PRECONDITION — the target must be connected, RENDERED, visible and not
+	/// inert at the call — and the platform's answer to a target that is not is
+	/// to do nothing, silently. `on_mount`'s microtask runs before the frame's
+	/// rendering step, so a subtree that becomes focusable only during that
+	/// step is still hidden when the first attempt lands: an overlay panel held
+	/// at `visibility: hidden` until a `ResizeObserver` callback places it and
+	/// flips it visible is exactly this, and it refused focus every time.
+	///
+	/// So: attempt in the microtask; if the element did not take focus, attempt
+	/// again on the next animation frame, and once more on the frame after
+	/// (layout-driven flips land in the rendering step between). Then stop.
+	/// Three attempts on the platform's own clock — no timer, no millisecond,
+	/// nothing to tune. `matches(":focus")` is how the attempt is read back:
+	/// `focus()` returns void and reports nothing.
+	///
+	/// THE CASE NO TIMING FIXES: iOS Safari ignores a programmatic `focus()`
+	/// outside a user gesture, whatever frame it runs on. And the formal shape
+	/// for an overlay is that focus is a consequence of the SHOW — a hook the
+	/// driver runs when it flips visibility, or `<dialog>.showModal()`, whose
+	/// focusing steps run once the dialog is rendered — not a retry.
 	fun autofocus(self): View {
-		self.on_mount(|element| element.focus())
+		self.on_mount(|element| {
+			element.focus();
+			if !element.matches(":focus") {
+				request_animation_frame(|| {
+					element.focus();
+					if !element.matches(":focus") {
+						request_animation_frame(|| element.focus());
+					}
+				});
+			}
+		})
 	}
 
 	/// Show or hide the element on a reactive condition — present when

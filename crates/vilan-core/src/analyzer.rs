@@ -43159,6 +43159,12 @@ pub struct Program<'src> {
     pub bool_enum_id: Option<Id>,
     pub module_id_by_name: HashMap<&'src str, Id>,
     pub modules: IndexMap<Id, Module<'src>>,
+    /// A65: each module's SUBMODULE scope, where a module directory's children
+    /// live — separate from the module's item scope, because `import pkg::lib`
+    /// binds `lib`'s own items and leaves `lib::util` to the path that names
+    /// it. The import walk is what consults it to resolve a path; the editor
+    /// reads it to answer for a module that names no file of its own (E152).
+    pub module_children_scopes: HashMap<Id, Id>,
     pub reference_count: HashMap<Id, u32>,
     pub scopes: IndexMap<Id, Scope<'src>>,
     pub span_map: HashMap<Id, &'src Span>,
@@ -51856,6 +51862,7 @@ fn analyze_over_world<'src>(
         type_references,
         import_aliases: std::mem::take(&mut analyzer.import_aliases),
         import_alias_spans: std::mem::take(&mut analyzer.import_alias_spans),
+        module_children_scopes: std::mem::take(&mut analyzer.module_children_scopes),
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         declaration_labels,

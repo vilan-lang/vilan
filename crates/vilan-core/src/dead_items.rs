@@ -22,9 +22,18 @@
 //! them are handled here or by the passes this module reads:
 //!
 //! - a declared `generated` root (1,815 items — [`is_generated`]);
-//! - a callee reached only from a `const` module-binding initializer (27 —
-//!   `CallGraph`'s paint-only const edges, followed by
-//!   [`crate::platform_color::paint_reachable_nodes`]);
+//! - a callee reached only from a `const` REGION (27 — `CallGraph`'s
+//!   paint-only const edges, followed by
+//!   [`crate::platform_color::paint_reachable_nodes`]). E124 collected those
+//!   edges for a module BINDING's initializer only, so the callee stayed
+//!   reachable through whatever reached the binding — which is nothing at all
+//!   for the three shapes B269 names: an `_`-led binding nobody references, a
+//!   bare `const page_defaults();` at module level, and the `const { … };`
+//!   block kolt now writes. Every const region is a ROOT of the walk now
+//!   (`CallGraph::const_regions`), because `const_eval::evaluate` runs
+//!   `Program::const_exprs` unconditionally rather than a reachable subset: a
+//!   function a const region calls is used at BUILD time however the runtime
+//!   walk arrives, and deleting it breaks the build;
 //! - a binding `context::thread_contexts` rewrites away (1 —
 //!   `Program::context_bindings`);
 //! - every type declaration (all of them — the narrowing above).
@@ -89,7 +98,10 @@ pub struct TopLevelItem {
 /// - **`main`** — the root itself, and a root cannot be unreached.
 /// - **an `_`-led name** — the language's own "I know" marker, exactly as
 ///   E114's locals paint reads it (`let _page_defaults = const …` in kolt is
-///   `_`-led *and* const, and the `_` alone should keep it quiet).
+///   `_`-led *and* const, and the `_` alone should keep it quiet). The `_`
+///   exempts the BINDING and nothing else: its callee was gray until B269 made
+///   every const region a root, because an unreferenced binding is never
+///   arrived at and its const edges were never followed.
 /// - **an ambient context binding** — `Program::context_bindings`, the
 ///   declarations `context::thread_contexts` rewrites out of the graph (§1.7).
 /// - **a trait member and a trait-impl member** — the walk's dispatch
