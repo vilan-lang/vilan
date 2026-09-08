@@ -90,7 +90,7 @@ function $g(value) {
 	return $f(value);
 }
 function $k(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $t(self) {
 	return self.length === 0;

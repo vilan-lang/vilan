@@ -11,7 +11,7 @@ function $a(value) {
 	return [ __shared_new(value) ];
 }
 function $c(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $d(self, value) {
 	self[0].v = __clone(value);

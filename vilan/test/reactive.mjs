@@ -118,7 +118,7 @@ function $a(value) {
 	return $b(value);
 }
 function $f(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $n(self) {
 	return self.length === 0;

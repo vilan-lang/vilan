@@ -7119,8 +7119,12 @@ impl<'src> Transformer<'src> {
             }
             // `shared.clone()` -> the same cell (the receiver, unchanged).
             Intrinsic::SharedClone => args.next().unwrap_or(js::Node::Void),
-            // `shared.read()` / `shared.write()` -> the cell's value, `self.v`.
-            // `write` returns a view of the slot; the write-*through* (rebind vs
+            // `shared.read()` / `shared.write()` -> the cell's slot, `self.v`.
+            // Both name the storage; what separates them is what the ANALYZER
+            // does with it. A `read` in a storing position is wrapped in
+            // `__clone` by the clone pass (B256 — §6.1's value return copies),
+            // and one B267's cell-aware elision admits is not; a `write` is a
+            // view and is never wrapped, and the write-*through* (rebind vs
             // merge) is handled where the assignment is lowered.
             Intrinsic::SharedValue | Intrinsic::SharedWrite => js::Node::Property(
                 Box::new(args.next().unwrap_or(js::Node::Void)),

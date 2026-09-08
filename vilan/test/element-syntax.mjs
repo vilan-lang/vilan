@@ -116,7 +116,7 @@ function $a(value) {
 	return $b(value);
 }
 function $e(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $d(self, parent, name2) {
 	set_attribute(parent[1], name2, $e(self));

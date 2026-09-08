@@ -149,7 +149,7 @@ function $c(self, mutate, $d) {
 	$e(self, $d);
 }
 function $m(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $n(value) {
 	return $b(value);
