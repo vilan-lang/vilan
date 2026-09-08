@@ -9104,6 +9104,130 @@ fn b248_a_block_like_operand_is_untouched() {
     );
 }
 
+// --- B259: the same rule, everywhere the form can head an expression -----------
+//
+// B248 put the refusal at the STATEMENT fork, which is where the shape was found.
+// The rule is about the FORM, though, not about the statement: `let y = match x
+// { .. } + 1;` is the same mistake with the same fix, and it reported "expected
+// `;` to end this statement" and nothing about why; an argument position reported
+// `found '+' expected ',' or ')'`. A `.` chain on a block-like head
+// (`match x { .. }.to_string()`) was outside B248's set entirely and kept the bare
+// `found '.' expected an expression`. All four now take one refusal with the one
+// steer, and the recovery consumes what it refused — a `.` chain WHOLE, since
+// skipping only the `.` would leave `to_string()` as a bare name and cascade.
+
+#[test]
+fn b259_a_let_initializer_with_a_block_like_head_takes_the_refusal() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            let y = match x { 1 => 1, _ => 2 } + 1;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    // The bare terminator demand was the whole of what the author used to get.
+    assert_fails_without(source, "expected `;` to end this statement");
+}
+
+#[test]
+fn b259_an_argument_position_takes_the_refusal() {
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            let x = 1;
+            print(match x { 1 => 1, _ => 2 } + 1);
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "found '+' expected");
+}
+
+#[test]
+fn b259_a_postfix_chain_on_a_block_like_head_is_refused_without_a_cascade() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }.to_string();
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "found '.' expected an expression");
+    // The chain is consumed WHOLE: skipping the `.` alone would leave
+    // `to_string()` standing as a statement of its own.
+    assert_fails_without(source, "to_string");
+}
+
+#[test]
+fn b259_a_postfix_chain_outside_statement_position_is_refused_once() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            let s = match x { 1 => 1, _ => 2 }.to_string();
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "expected `;` to end this statement");
+}
+
+#[test]
+fn b259_the_parenthesized_postfix_spelling_is_accepted() {
+    // The steer has to be a fix for the `.` form too, not only for the operator.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            print((match x { 1 => 10, _ => 20 }).to_string());
+        }
+        "#,
+        "10\n",
+    );
+}
+
+#[test]
+fn b259_a_match_guard_ends_at_the_arms_arrow() {
+    // The boundary the statement fork could not see, and the reason `=>` is
+    // outside the refused set: a guard is an expression that ENDS where the arm's
+    // arrow begins, so an arrow after a block-like guard belongs to the arm and
+    // taking it would eat the leg. `b59`'s own nested-`match` guard is this shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<i32> = Some(3);
+            match held {
+                Some(let n) if match n { 0 => false, _ => true } => print("kept"),
+                _ => print("dropped"),
+            }
+        }
+        "#,
+        "kept\n",
+    );
+}
+
+#[test]
+fn b259_a_block_like_head_before_a_prefix_operator_still_parses_as_two_statements() {
+    // B248's control, restated OUTSIDE the statement fork: the refusal moved to
+    // where the form is parsed, so the four prefixes have to stay outside its set
+    // there too, or `-1;` on the next line would stop being its own statement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let c = true;
+            if c { print("branch"); } else { }
+            -1;
+            print("done");
+        }
+        "#,
+        "branch\ndone\n",
+    );
+}
+
 #[test]
 fn b257_assigning_a_live_list_copies_it() {
     // P1. §6.1 names assignment first — `b = a` installs a second owner of

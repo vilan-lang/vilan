@@ -9809,3 +9809,71 @@ fn b249_a_generic_impl_renaming_the_parameter_takes_its_own_name() {
         "declare `fun on_change(self, observer: |U| void)`",
     );
 }
+
+// --- B260: and the HEAD names the trait the same way ---------------------------
+//
+// B249 fixed the suggested declaration and stopped there: the sentence above it
+// still said `does not implement trait 'Source'` for an `impl Counted with
+// Source<i32>` — the arguments were what the refusal was ABOUT, and the one place
+// they did not appear was the sentence naming the trait. Two impls of one trait at
+// different arguments produced two refusals a reader could not tell apart.
+
+#[test]
+fn b260_the_head_carries_the_with_clauses_arguments() {
+    let source = r#"
+        import std::reactive::Source;
+        struct Counted { n: i32 }
+        impl Counted with Source<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "does not implement trait 'Source<i32>'");
+    assert_fails_without(source, "does not implement trait 'Source'");
+}
+
+#[test]
+fn b260_a_two_parameter_trait_names_both_in_the_head() {
+    let source = r#"
+        trait Pairer<A, B> {
+            fun pair(self, a: A, b: B): A;
+        }
+        struct P { x: i32 }
+        impl P with Pairer<i32, str> { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "does not implement trait 'Pairer<i32, str>'");
+    assert_fails_without(source, "does not implement trait 'Pairer'");
+}
+
+#[test]
+fn b260_an_impl_passing_its_own_binder_names_the_binder() {
+    // The arguments are in the IMPL's terms, so an impl that hands the trait its
+    // own binder reads as the author wrote it — the same leg B249 pins for the
+    // suggested declaration, now for the head above it.
+    assert_fails_with(
+        r#"
+        trait Counted<T> {
+            fun on_change(self, observer: |T| void);
+        }
+        struct Box3<type U> { v: U }
+        impl Box3<type U> with Counted<U> { }
+        fun main() {}
+        "#,
+        "does not implement trait 'Counted<U>'",
+    );
+}
+
+#[test]
+fn b260_a_trait_with_no_arguments_reads_as_it_always_has() {
+    // The non-vacuity control: an elided clause renders the bare name, so nothing
+    // grew an empty `<>`.
+    let source = r#"
+        trait Tagger {
+            fun tag(self, name: str): str;
+        }
+        struct P { x: i32 }
+        impl P with Tagger { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "does not implement trait 'Tagger': missing 'tag'");
+    assert_fails_without(source, "Tagger<");
+}

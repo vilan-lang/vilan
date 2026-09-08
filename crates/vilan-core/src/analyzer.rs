@@ -15937,6 +15937,34 @@ impl<'src> Analyzer<'src> {
         self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
+    /// B260: a trait named in a diagnostic HEAD, carrying the arguments the
+    /// `with` clause gave it — `Source<i32>`, never the bare `Source`.
+    ///
+    /// B249 read those arguments for the SUGGESTED DECLARATION
+    /// ([`trait_argument_substitution`], which is this list zipped onto the
+    /// trait's own parameters); the head above it kept naming the trait
+    /// unparameterized, so `impl Counted with Source<i32>` was told it "does not
+    /// implement trait 'Source'" and then handed a signature written in `i32` —
+    /// the arguments were what the refusal was ABOUT and the sentence naming the
+    /// trait was the one place they did not appear. A program with two impls of
+    /// one trait at different arguments could not tell the two refusals apart.
+    ///
+    /// Rendered with an EMPTY substitution because these arguments are already in
+    /// the impl's own terms: a concrete one prints itself, and an impl passing the
+    /// trait its own binder (`impl SignalCell<type T> with Source<T>`) prints `T`,
+    /// which is what the author wrote. An elided clause renders the bare name, so
+    /// a trait whose parameters are all defaulted reads as it always has.
+    fn trait_label_with_arguments(&self, trait_name: &str, arguments: &[TypeId]) -> String {
+        if arguments.is_empty() {
+            return trait_name.to_string();
+        }
+        let rendered: Vec<String> = arguments
+            .iter()
+            .map(|argument| self.declaration_type_label(*argument))
+            .collect();
+        format!("{trait_name}<{}>", rendered.join(", "))
+    }
+
     /// [`declaration_type_label`] rendered FOR one side of a trait/impl pair
     /// (B206, E128): an ambiguous `Self` / `= Self`-defaulted position renders
     /// as what it means THERE.
@@ -40280,6 +40308,10 @@ impl<'src> Analyzer<'src> {
                         &check.trait_arguments,
                     ),
                 };
+                // B260: and the HEAD names the trait the same way the suggested
+                // declaration is written — with the `with` clause's arguments.
+                let trait_label =
+                    self.trait_label_with_arguments(check.trait_name, &check.trait_arguments);
                 let (signature, note) = self
                     .traits
                     .get(&declaring_trait_id)
@@ -40353,19 +40385,18 @@ impl<'src> Analyzer<'src> {
                         )
                     };
                     format!(
-                        "`impl {subject_name} with {}`{inherited} provides no `{member_name}`: an \
-                         operator trait's method is required at impl time. \
+                        "`impl {subject_name} with {trait_label}`{inherited} provides no \
+                         `{member_name}`: an operator trait's method is required at impl time. \
                          `{declaring_trait_name}` declares a body for it, but that body is \
                          `panic(\"not implemented yet\")` — it exists so `{symbol}=` can derive \
                          from `{symbol}`, not so `{member_name}` can go unwritten — so this impl \
                          compiles clean and the first `{symbol}` on a `{subject_name}` throws at \
-                         runtime, naming neither the type nor the method.{declare}{steer}",
-                        check.trait_name
+                         runtime, naming neither the type nor the method.{declare}{steer}"
                     )
                 } else {
                     format!(
                         "'{}' does not implement trait '{}': missing '{}'{}",
-                        subject_name, check.trait_name, member_name, expected_signature
+                        subject_name, trait_label, member_name, expected_signature
                     )
                 };
                 self.diagnostics.push(Error {
@@ -46122,6 +46153,48 @@ fn bare_lowered_enum<'a>(
 /// a type that is a resource by CONTAINMENT has its root cause in the field, and
 /// `check_wire_boundary` names that field precisely. Two diagnostics for one
 /// mistake is what this gate exists to avoid.
+/// B266: the refusal a GENERIC `[service]` subject takes, or `None` when the
+/// subject declares no parameters.
+///
+/// Refused at the attribute, above the expansion, for B117's reason: nothing is
+/// then generated to fail later inside code the author never wrote. Without it
+/// the attribute expanded anyway and the author got the generated client's own
+/// errors — `'contract_hash' is already defined for 'StoreClient<T>'` first,
+/// then `` `Store` takes 1 type argument, 0 given `` twice, then two "cannot
+/// call method … on unknown" — five diagnostics about a client they never wrote
+/// and none of them naming the parameter that caused it.
+///
+/// The prohibition is A52's structural finding, and the reason is not a gap in
+/// the expansion: a `ServiceItem` carries no generics, and the contract hash is
+/// built from the types AS WRITTEN, so a `Store<Task>` client and a `Store<Note>`
+/// server would hash identically and connect to each other. A53 is the design
+/// that would lift it, which is why the message says "not supported yet" rather
+/// than describing a rule the language means to keep.
+pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String> {
+    let Node::Struct(name, Some(generic_parameters), _external, _resource, _body) = &item.0 else {
+        return None;
+    };
+    if generic_parameters.0.is_empty() {
+        return None;
+    }
+    let subject = name.0;
+    let parameters = generic_parameters
+        .0
+        .iter()
+        .map(|parameter| parameter.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "`[service]` cannot take a generic subject: `{subject}` declares `<{parameters}>`, and the \
+         client this attribute generates is built before any type resolves — a service item \
+         carries no generic parameters, and the contract hash is built from the types AS WRITTEN, \
+         so a `{subject}<A>` client and a `{subject}<B>` server would hash identically and connect \
+         to each other. Generic services are not supported yet: write the service over a concrete \
+         subject, naming the element in the field (`{subject} {{ items: SignalCell<List<Task>> }}`), \
+         which is what an `[expose]`d field names anyway"
+    ))
+}
+
 pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {
     let (kind, name) = match &item.0 {
         Node::Struct(name, _generics, _external, true, _body) => ("struct", name.0),
@@ -51565,6 +51638,43 @@ fn analyze_inner<'src>(
     )
 }
 
+/// B265: the declaration an intrinsic may bind to for `name` on this impl —
+/// the id the compiler-known lowering replaces, but ONLY when the source
+/// declared it `external fun`.
+///
+/// The intrinsic tables are keyed by NAME on a nominal subject, which is how a
+/// built-in lowering finds std's `List::remove` without std having to name the
+/// intrinsic. Keyed by name ALONE it also matched a BODIED declaration: give
+/// `List::remove` a vilan body and the body is dropped on the floor — every call
+/// lowers to `splice` and the code the author wrote never runs, with nothing
+/// said. M47 found it A/B-ing an old std against the new lowering, which is the
+/// only way anyone would: a user's `impl List` cannot redeclare a name std
+/// already declares, so the reach is std authors, who are exactly the people who
+/// would write that body.
+///
+/// An `external fun` has no body BY CONSTRUCTION, so there is nothing for an
+/// intrinsic to drop, and binding to those alone makes the rule what it always
+/// meant — an intrinsic replaces a HOST BINDING, not an implementation. Every
+/// intrinsic name in std today is declared `external fun`, so no lowering moves;
+/// what changes is that a std author who gives one of those names a body gets
+/// the body.
+///
+/// The externality question is the member's own expression: an impl member is an
+/// expr id, and the parser's `external fun` fork is what makes it an
+/// [`Expr::ExternalFunction`] rather than an [`Expr::Function`].
+fn external_intrinsic_declaration(
+    analyzer: &Analyzer<'_>,
+    implementation: &Implementation<'_>,
+    name: &str,
+) -> Option<Id> {
+    let id = implementation.declarations.get(name).copied()?;
+    matches!(
+        analyzer.expr_id_to_expr_map.get(&id),
+        Some(Expr::ExternalFunction(_))
+    )
+    .then_some(id)
+}
+
 /// The entry tail: walks the entry over a resolved [`World`], builds,
 /// checks, and extracts the `Program`. Byte-identical to the former tail
 /// of `analyze` — the destructure below restores its locals.
@@ -52117,15 +52227,11 @@ fn analyze_over_world<'src>(
                 Some(Type::Struct(id, _)) if *id == list_struct_id
             );
             if subject_is_list {
-                list_new_fn_id = implementation
-                    .declarations
-                    .get("new")
-                    .copied()
+                // Both take B265's rule with the intrinsic table below: an
+                // `external fun` declaration and nothing else.
+                list_new_fn_id = external_intrinsic_declaration(&analyzer, implementation, "new")
                     .or(list_new_fn_id);
-                list_push_fn_id = implementation
-                    .declarations
-                    .get("push")
-                    .copied()
+                list_push_fn_id = external_intrinsic_declaration(&analyzer, implementation, "push")
                     .or(list_push_fn_id);
             }
         }
@@ -52158,7 +52264,9 @@ fn analyze_over_world<'src>(
                     ("parse_f64", Intrinsic::ParseF64),
                     ("try_parse_json", Intrinsic::TryParseJson),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -52180,7 +52288,9 @@ fn analyze_over_world<'src>(
                     ("insert", Intrinsic::ListInsert),
                     ("sort_by", Intrinsic::ListSortBy),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -52207,7 +52317,9 @@ fn analyze_over_world<'src>(
                     ("keys", Intrinsic::MapKeys),
                     ("values", Intrinsic::MapValues),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -52228,7 +52340,9 @@ fn analyze_over_world<'src>(
                     ("is_null", Intrinsic::JsonIsNull),
                     ("kind", Intrinsic::JsonKind),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -52248,7 +52362,9 @@ fn analyze_over_world<'src>(
                     ("read", Intrinsic::SharedValue),
                     ("write", Intrinsic::SharedWrite),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -52271,7 +52387,9 @@ fn analyze_over_world<'src>(
                     ("take", Intrinsic::OptionTake),
                     ("replace", Intrinsic::OptionReplace),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
