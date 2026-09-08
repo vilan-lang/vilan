@@ -15,13 +15,13 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use vilan_core::manifest::Manifest;
 
 mod support;
 use support::ladder::documented_legs;
-use support::port::free_port;
+use support::port::{free_port, wait_for_port};
 
 /// A fresh temp directory for one test to scaffold into.
 fn temp_dir(tag: &str) -> PathBuf {
@@ -223,7 +223,7 @@ fn the_fullstack_template_builds_both_entries_and_serves_them() {
             .spawn()
             .expect("spawn node server");
 
-        if !wait_for_port(port, Duration::from_secs(20)) {
+        if !wait_for_port(port) {
             let _ = server.kill();
             let _ = server.wait();
             last_failure = format!(
@@ -583,18 +583,6 @@ fn a_directory_name_that_is_not_an_identifier_is_sanitized() {
 }
 
 // --- process helpers (the ssr_fullstack shape) -----------------------------
-
-/// Poll until the server accepts a connection (or the deadline passes).
-fn wait_for_port(port: u16, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
 
 /// A plain HTTP GET, returning the response body bytes.
 fn http_get(port: u16, path: &str) -> Vec<u8> {

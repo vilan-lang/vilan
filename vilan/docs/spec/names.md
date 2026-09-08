@@ -22,6 +22,21 @@ of `a`'s body and nothing below it; `a::b` is reached by
 (`a::item`) reads that module's items only, so what a path means never
 depends on which other files a build happens to load.
 
+**Loading is not lookup, and a child pulls its parent.** Importing
+`pkg::a::b` LOADS `a`'s body too, when `a` has one — `a` is a node on the
+path to `a::b`, and the tree is built by loading each segment that names a
+file (Rust's model, where `a::b` is reached through `a`'s own `mod b;`).
+Nothing of `a`'s becomes visible by it: the own-path rule above is
+unchanged, and `a::item` after `import pkg::a::b` still does not resolve.
+What is paid is the COMPILE: `a.vl` is parsed and analyzed, and its
+diagnostics are the build's. This is stated because it is payable — a
+directory whose `a.vl` does real work is a cost every one of its children
+imposes on any build that reaches one, so a heavy parent beside light
+children is worth splitting. A directory with no body (the pure namespace
+above) has nothing to load and costs nothing. Emission is unaffected: it
+follows reachability, so a parent body nothing references contributes no
+output.
+
 ## 4.2 The three namespaces
 
 A path's first segment selects a namespace:

@@ -66,7 +66,14 @@ fn temp_package(name: &str) -> PathBuf {
 }
 
 fn cache_file(dir: &Path) -> PathBuf {
-    dir.join("dist").join(".macro-expansions")
+    cache_dir(dir).join("macro-expansions")
+}
+
+/// Where every on-disk cache lives (tracker N63, ruled by the owner
+/// 2026-09-07): one directory inside the build directory, not a leaf beside the
+/// emitted artifacts.
+fn cache_dir(dir: &Path) -> PathBuf {
+    dir.join("dist").join(".cache")
 }
 
 /// How many macro worlds one `vilan check` of `dir` compiled, off the phase
@@ -268,4 +275,79 @@ fn removing_the_build_directory_means_recompile_everything() {
         "`rm -rf dist` must mean recompile everything, macro worlds included"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_check_creates_the_cache_directory_and_writes_nothing_else() {
+    // Tracker N63, the owner's ruling of 2026-09-07: every on-disk cache lives
+    // under `dist/.cache/`, and `check` — which emits no artifacts at all — may
+    // create it and writes nothing else. Before M33, `check` wrote nothing
+    // anywhere; it writes now, and what it writes has to stay ONE directory a
+    // reader can delete without thinking about it, or `dist/` becomes a place
+    // where the build's output and the compiler's memory are interleaved and
+    // `.gitignore` grows a line per cache. The claim is the WHOLE tree, not the
+    // presence of the file: anything else a check ever starts leaving behind
+    // reds here, named.
+    let dir = temp_package("check_writes_only_the_cache");
+    let before = tree_under(&dir);
+    assert_eq!(
+        worlds_compiled(&dir),
+        1,
+        "the fixture must compile a world, or the check under test did nothing"
+    );
+
+    let dist = dir.join("dist");
+    assert!(
+        dist.is_dir(),
+        "a check that fills the expansion table must have created `dist/`"
+    );
+    assert_eq!(
+        tree_under(&dist),
+        vec![
+            ".cache".to_string(),
+            format!(".cache/{}", "macro-expansions"),
+        ],
+        "a `check` may create `dist/.cache/` and writes nothing else"
+    );
+
+    // And nothing OUTSIDE `dist/` moved: the source tree a check reads is a
+    // source tree a check leaves alone.
+    let after: Vec<String> = tree_under(&dir)
+        .into_iter()
+        .filter(|path| path != "dist" && !path.starts_with("dist/"))
+        .collect();
+    assert_eq!(
+        after, before,
+        "a check must not write outside the build directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every path under `root`, relative and `/`-joined, sorted — directories
+/// included, so a directory created and left empty is visible too.
+fn tree_under(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, at: &Path, found: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            found.push(
+                path.strip_prefix(root)
+                    .expect("a path under the root it was read from")
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+            if path.is_dir() {
+                walk(root, &path, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, root, &mut found);
+    found.sort();
+    found
 }

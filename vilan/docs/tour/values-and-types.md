@@ -23,6 +23,29 @@ thing. If that sounds strange coming from JavaScript, start with
 [Coming from JavaScript](coming-from-javascript.md), then read
 [the memory model](memory-model.md) when you're ready for the full story.
 
+## Reserved words
+
+These words are the language's own; none of them can be a binding, a
+parameter, a field or a type name. Most you will meet as you go, but two
+are worth knowing before you hit them: `own` (a parameter that takes
+ownership — see [the memory model](memory-model.md)) and `jump` (the
+prefix on `break` and `continue`), because both are short, ordinary
+English words that make good variable names in every other language.
+
+```text
+async    await    borrows  const    css      else     enum     export
+external false    for      fun      if       impl     import   in
+is       jump     let      macro    match    mod      mut      null
+own      resource ret      struct   trait    true     type     use
+with
+```
+
+A few more words — `self`, `Self`, `void`, `context`, `sync`, `as`, and
+the attribute names in `[...]` — mean something only in one position and
+are ordinary identifiers everywhere else. Spec
+[§2.2](../spec/lexical.md#22-identifiers-and-keywords) lists them, and
+[§A.2](../spec/appendix.md#a2-reserved-words) is the table.
+
 ## Primitives
 
 - `bool`: `true` and `false`.

@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod support;
-use support::port::free_port;
+use support::port::{free_port, wait_for_port};
 
 /// The resource the client bundles. An `.svg` deliberately: it is not a `.js`,
 /// a `.css` or a `.json`, so nothing about it can be confused with an artifact
@@ -150,17 +150,6 @@ fn serve(dir: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the server")
-}
-
-fn wait_for_port(port: u16) -> bool {
-    let deadline = Instant::now() + support::run_liveness();
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// A plain HTTP GET, returning `(status line + headers, body)`.
