@@ -105,7 +105,21 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             // accessor below takes a zero-width anchor.
             let head: Span = (span.start..span.start + KEYWORD.len()).into();
             let chain = build_chain(body, head, source);
-            (chain.0, span)
+            // A68: the chain is wrapped in `const`. A block is a compile-time
+            // asset BY CONSTRUCTION — `Style::raw` calls `emit`, the
+            // compile-time channel — so every block needed the word written in
+            // front of it, and `let b = css { padding: 1rem; };` was refused
+            // with "`raw` … is compile-time-only; evaluate this call inside a
+            // `const` expression". The desugar writes it instead.
+            //
+            // The wrapper takes the block's OWN span, and `const` forwards to
+            // its inner expression in the analyzer, so a written
+            // `const css { … }` nests two markers and means exactly what one
+            // means: the form stays idempotent, and every block already written
+            // with `const` is untouched down to the emitted byte. A hole that
+            // reads a runtime binding is refused by const-eval AT THE HOLE,
+            // which is the diagnostic that was always wanted here.
+            (Node::Const(Box::new((chain.0, span))), span)
         }
         other => descend((other, span), source),
     }
@@ -505,9 +519,14 @@ mod tests {
     /// pins below, and the normalization is a no-op on the chain side, which can
     /// never contain a `StdItem`.
     fn shapes_match(block: &str, chain: &str) -> (String, String) {
+        // The chain side is written in `const`, because A68 made the block
+        // wrap its own chain in one: a block is a compile-time asset by
+        // construction, so the claim is "the chain, in `const`". A written
+        // `const css { … }` therefore nests two markers, which the analyzer's
+        // forwarding makes indistinguishable from one.
         (
             normalize_seed(&strip_spans(&lowered(block))),
-            normalize_seed(&strip_spans(&lowered(chain))),
+            normalize_seed(&strip_spans(&lowered(&format!("const {chain}")))),
         )
     }
 

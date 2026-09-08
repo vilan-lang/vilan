@@ -5501,6 +5501,92 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     );
 }
 
+// --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
+//
+// `Style::raw` calls `emit`, the compile-time channel, so a chain only means
+// anything inside a `const` — and every block had to be written
+// `const css { … }`, with `let b = css { padding: 1rem; };` refused as
+// "`raw` … is compile-time-only; evaluate this call inside a `const`
+// expression". A block IS a compile-time asset by definition, so the desugar
+// writes the word. A hole that reads a runtime binding still gets const-eval's
+// refusal, now at the hole rather than at a `const` nobody wrote.
+
+#[test]
+fn a_block_needs_no_const_written_in_front_of_it() {
+    let css = style_css(
+        r#"
+        let plain = css { padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:1rem}"), "{css}");
+}
+
+#[test]
+fn a_written_const_block_still_compiles_and_means_the_same() {
+    // Idempotence, which is what lets every block already written with `const`
+    // stay exactly as it is: the desugar's marker and the author's nest, and
+    // `const` forwards to its inner expression, so the two spellings are one
+    // tree and one rule on the sheet.
+    let written = style_css(
+        r#"
+        let a = const css { padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    let bare = style_css(
+        r#"
+        let a = css { padding: 1rem; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(written, bare);
+}
+
+#[test]
+fn a_block_in_an_element_head_needs_no_const_either() {
+    // The other everyday position: `.styled(css { … })` on markup, where the
+    // written `const` reads worst of all.
+    assert!(
+        compile_browser(
+            r#"
+        import std::ui::mount_root;
+        fun main() {
+            mount_root("app", || <div .styled(css { display: flex; })>"hi"</div>);
+        }
+        main();
+        "#
+        )
+        .is_ok(),
+        "a bare block inside markup must compile"
+    );
+}
+
+#[test]
+fn a_runtime_hole_is_refused_at_the_hole() {
+    // The half A68 does NOT change: a block is compile-time, so a hole reading
+    // a runtime value cannot be evaluated — and const-eval says so at the hole,
+    // which is the expression that cannot be read.
+    // Occurrence 2 of `width` is the HOLE's read — occurrence 0 is the
+    // parameter and 1 is the CSS property name — so this pins the anchor as
+    // well as the message.
+    assert_fails_spanning_nth(
+        r#"
+        fun styled(width: str) {
+            let _s = css { width: {width}; };
+        }
+        fun main() { styled("10px"); }
+        main();
+        "#,
+        "width",
+        2,
+        "`width` is a runtime value; a `const` expression reads only compile-time-known bindings",
+    );
+}
+
 // --- B270: the seed is a scope-independent reference to std ------------------
 //
 // The block's seed used to be a bare `style` accessor resolved at the SITE,

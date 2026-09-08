@@ -61,7 +61,7 @@ beside the chain, it becomes the chain.
 import std::ui::{ view, View, mount_root };
 import std::style::{ style, space, Style, Color };
 
-let card = const css {
+let card = css {
 	display: flex;
 	gap: {space(2)};
 	padding: {space(4)};
@@ -96,7 +96,7 @@ ones added later, and nesting order is combinator order: media outside,
 then the relation, then the attribute, then the pseudo-class.
 
 ```vilan,fragment
-let panel = const css {
+let panel = css {
 	color: {Color::gray(900)};
 
 	.within("data-theme", "dark") {
@@ -115,6 +115,15 @@ through verbatim — `repeat(3, 1fr)`, `url("tile.png")`, `50%`, `1.5rem`
 *exactly* one hole keeps its type, which is what carries a token's
 `:root` line onto the sheet, so write `gap: {space(4)};` rather than
 `gap: 1rem;` when you mean the scale.
+
+**A block is `const` on its own.** A style is a compile-time asset — the
+chain writes its rules into the stylesheet as it is built — so the chain
+spelling needs `const` in front of it, and the block does not: it writes
+the word for you. `let card = css { … };` is the whole declaration. What
+that does *not* buy you is reading a runtime value: a hole that reads a
+function parameter or a signal is refused at the hole, because there is
+nothing compile-time to put on the sheet. Writing `const css { … }`
+yourself still compiles and means exactly the same thing.
 
 Four things the block does not do, each on purpose:
 
@@ -148,7 +157,7 @@ explaining the wrong declaration.
 
 ```vilan,fragment
 // formats as: display, padding, then `.md` before `.hover`
-let button = const css {
+let button = css {
 	.hover { background-color: {Color::gray(200)}; }
 	padding: {space(2)};
 	.md { padding: {space(4)}; }
