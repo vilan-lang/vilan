@@ -40897,13 +40897,26 @@ impl<'src> Analyzer<'src> {
                             // this very concatenation and is refused here too,
                             // so steering to one would steer into the same
                             // garbage. `.to_string()` is the whole fix.
+                            //
+                            // A34 edits the tail (ledger row 355 keeps its id).
+                            // A `css` block's hole is the ONE hole that is not
+                            // this concatenation any more: it goes through
+                            // `std::style::piece`, which carries the value's
+                            // `:root` line onto the sheet — so a reader who
+                            // met this message while assembling a CSS value by
+                            // hand needs to know that the block has a spelling
+                            // and that `.to_string()` would be the wrong one
+                            // there (it drops the token's declaration).
                             format!(
                                 "`+` on `str` concatenates, and `{rhs_label}` has no string form: \
                                  concatenating it renders the value's runtime shape — a struct is \
                                  a tuple, an enum a tagged array — not the value. Call \
                                  `.to_string()` on it, implementing `Display` for its type if it \
                                  has none; an i-string hole is this same concatenation, so it \
-                                 needs the same call"
+                                 needs the same call — but a `css` block's hole is not, and a \
+                                 typed style value belongs in one: \
+                                 `border: 1px solid {{Color::gray(500)}};` keeps the value typed \
+                                 and carries its `:root` line onto the sheet"
                             )
                         } else if self.is_str_type(&rhs_type) {
                             // The mirror shape, where the numeric steer ("suffix

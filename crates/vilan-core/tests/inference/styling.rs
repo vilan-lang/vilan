@@ -5186,29 +5186,111 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
     assert!(css.contains(":root{--space-4:1rem}"), "{css}");
 }
 
+// --- A34: a typed style token MID-VALUE --------------------------------------
+//
+// A value that MIXES text and holes used to be built to the i-string's shape —
+// `("" + "calc(" + space(4) + " + 2px)")` — so it inherited the
+// concatenation's rules: a `Length` is a two-field struct, and B148 refused it
+// outright, which was the honest state because no correct spelling existed.
+// `.text` reaches the var reference and DROPS the `:root` line the one-hole
+// path carries, which is the exact hazard the block was built to close.
+//
+// Each hole of a mixed value now goes through `std::style::piece`, which
+// returns the text and puts the `:root` line on the sheet. This replaces
+// `a_mixed_css_value_refuses_a_struct_hole`, which pinned the gap.
+
 #[test]
-fn a_mixed_css_value_refuses_a_struct_hole() {
-    // B148's css end. A value that MIXES text and holes is built to the
-    // i-string's shape — `("" + "calc(" + space(4) + " + 2px)")`
-    // (`css::build_value`) — so it inherited the concatenation's hole: a
-    // `Length` is a two-field struct, and the host rendered the tuple straight
-    // into the declaration, sheet fragment and all
-    // (`calc(var(--space-4),:root{--space-4:1rem} + 2px)`). The concatenation
-    // rule refuses it here for the same reason it refuses `"x" + point`.
-    //
-    // A `str` or a number hole in a mixed value is unaffected — those render —
-    // so what this closes is the typed style values (`Length`, `Color`) used
-    // MID-value. There is no correct spelling for that today: `.text` reaches
-    // the var reference but drops the `:root` line the one-hole row above
-    // carries, which is the hazard S1 closed. Refusing is the honest state.
-    assert_fails_with(
+fn a_mid_value_token_carries_its_root_line() {
+    // The item's own exhibit: `border: 1px solid {Color::gray(500)}` emits the
+    // var reference AND the token that declares it.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Color };
+        let _s = const css { border: 1px solid {Color::gray(500)}; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{border:1px solid var(--gray-500)}"), "{css}");
+    assert!(css.contains(":root{--gray-500:"), "{css}");
+}
+
+#[test]
+fn a_mid_value_length_carries_its_root_line_too() {
+    // `space` is the token with a `:root` line to lose; `calc` is the value
+    // shape that forced the mixed path in the first place.
+    let css = style_css(
         r#"
         import std::style::{ style, space };
         let _s = const css { padding: calc({space(4)} + 2px); };
         fun main() {}
         main();
         "#,
-        "`+` on `str` concatenates, and `Length` has no string form",
+    );
+    assert!(
+        css.contains("{padding:calc(var(--space-4) + 2px)}"),
+        "{css}"
+    );
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+}
+
+#[test]
+fn the_single_hole_path_is_unchanged_by_the_mid_value_one() {
+    // The control. A value that is EXACTLY one hole still passes its
+    // expression through untouched — it keeps its TYPE and reaches
+    // `Style::raw`, which is what makes `gap: {space(4)};` a `Length` rather
+    // than a rendered string, and what the emitted-bytes gate compares.
+    let block = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const css { gap: {space(4)}; };
+        fun main() {}
+        main();
+        "#,
+    );
+    let chain = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const style().raw("gap", space(4));
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(block, chain);
+}
+
+#[test]
+fn a_mid_value_hole_of_a_type_with_no_piece_is_still_refused() {
+    // The refusal survives, one trait over: a value assembled from text and
+    // holes still cannot render an arbitrary struct, and now says which trait
+    // would let it.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        struct Point { x: i32, y: i32 }
+        let _s = const css { padding: calc({Point { x = 1, y = 2 }} + 2px); };
+        fun main() {}
+        main();
+        "#,
+        "CssPiece",
+    );
+}
+
+#[test]
+fn a_whole_value_still_demands_a_css_value_and_its_unit() {
+    // Why `CssPiece` is a SECOND trait rather than the same one: a whole value
+    // must carry its own unit, so a bare number is still refused there and the
+    // author is still steered to `space(4)` / `px(4)`. A piece sits inside
+    // text that supplies the unit, which is why a bare number is legal there.
+    assert_fails_with(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style { style().raw("padding", 4) }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+        "CssValue",
     );
 }
 

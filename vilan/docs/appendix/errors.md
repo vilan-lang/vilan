@@ -382,8 +382,13 @@ printed `1,2` for a `Point { x = 1, y = 2 }`. Render it first —
 `point.to_string()`, adding an `impl Point with Display` if the type has
 none. **An interpolated string is this same concatenation** (`i"a{x}b"`
 *is* `("" + "a" + x + "b")`), so a hole gets the identical error and the
-identical fix; the same goes for a `css` block value that mixes text
-with holes. A backed enum is included in the refusal on purpose: its
+identical fix. A `css` block's hole is the one that is NOT this
+concatenation any more (A34): a mixed value passes each hole through
+`std::style::piece`, so `border: 1px solid {Color::gray(500)};` keeps
+the value typed and puts its `:root` line on the sheet — which is why
+the message steers a style token into a block rather than into
+`.to_string()`, whose text would name a custom property nothing
+declares. A backed enum is included in the refusal on purpose: its
 backing is a lowering detail, not a rendering the program chose.
 A **generic parameter** gets the same error worded for its bounds — an
 unbounded one promises nothing, and one bounded to something other than

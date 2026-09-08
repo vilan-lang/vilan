@@ -488,6 +488,128 @@ impl Color with CssValue {
 	}
 }
 
+/// One PIECE of a multi-part CSS value (tracker A34) — `1px solid
+/// {Color::gray(500)}`, `calc({space(4)} + 2px)` — where a value is assembled
+/// from text and holes rather than being one value.
+///
+/// `CssValue`'s twin, and deliberately a SECOND trait rather than the same
+/// one, because the two positions have different rules. A WHOLE value must
+/// carry its own unit, so `raw("padding", 4)` is refused and the author is
+/// steered to `space(4)` or `px(4)`; a PIECE sits inside text that supplies
+/// the unit (`{inset}rem`, `calc({a} + 2px)`), so a bare number is legal
+/// there and always has been — it rode through the string concatenation the
+/// mixed value used to lower to. Keeping one trait would have to give up one
+/// of those two rules.
+///
+/// What the concatenation could not do is carry a token's `:root` line: a
+/// `Length` or a `Color` mid-value emitted `var(--gray-500)` with nothing
+/// declaring it, which is exactly the hazard the single-hole path was built
+/// to close. A piece describes both halves, and [`piece`] puts the line on
+/// the sheet.
+trait CssPiece {
+	/// The piece's text, exactly as it renders into the value.
+	fun piece_text(self): str;
+
+	/// The `:root` line declaring this piece's theme token, or `""`.
+	fun piece_root(self): str;
+}
+
+impl str with CssPiece {
+	fun piece_text(self): str {
+		self
+	}
+
+	fun piece_root(self): str {
+		""
+	}
+}
+
+impl i32 with CssPiece {
+	fun piece_text(self): str {
+		i"{self}"
+	}
+
+	fun piece_root(self): str {
+		""
+	}
+}
+
+impl f64 with CssPiece {
+	fun piece_text(self): str {
+		i"{self}"
+	}
+
+	fun piece_root(self): str {
+		""
+	}
+}
+
+impl u32 with CssPiece {
+	fun piece_text(self): str {
+		i"{self}"
+	}
+
+	fun piece_root(self): str {
+		""
+	}
+}
+
+impl BigInt with CssPiece {
+	fun piece_text(self): str {
+		i"{self}"
+	}
+
+	fun piece_root(self): str {
+		""
+	}
+}
+
+impl bool with CssPiece {
+	fun piece_text(self): str {
+		i"{self}"
+	}
+
+	fun piece_root(self): str {
+		""
+	}
+}
+
+impl Length with CssPiece {
+	fun piece_text(self): str {
+		self.text
+	}
+
+	fun piece_root(self): str {
+		self.root
+	}
+}
+
+impl Color with CssPiece {
+	fun piece_text(self): str {
+		self.text
+	}
+
+	fun piece_root(self): str {
+		self.root
+	}
+}
+
+/// One hole of a multi-piece `css` value: its text, with its `:root` line put
+/// on the sheet on the way past.
+///
+/// This is what a `css` block's mixed value lowers each of its holes to, so
+/// `border: 1px solid {Color::gray(500)};` emits `1px solid var(--gray-500)`
+/// AND `:root{--gray-500:#6b7280}` — the token discipline the single-hole
+/// path has always had, reaching the position that had no correct spelling at
+/// all. Compile-time only, like every other emitter here.
+fun piece<V: CssPiece>(value: V): str {
+	let root = value.piece_root();
+	if root != "" {
+		emit("css", root);
+	}
+	value.piece_text()
+}
+
 // --- keyword properties ---------------------------------------------------------
 
 enum Display {

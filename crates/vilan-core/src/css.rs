@@ -17,7 +17,7 @@
 //! |---|---|
 //! | `css { … }` | `style()` followed by the items in written order |
 //! | `prop: <one hole>;` | `.raw("prop", <the hole's expression>)` |
-//! | `prop: <anything else>;` | `.raw("prop", <the value's source slice as a str, holes interpolated>)` |
+//! | `prop: <anything else>;` | `.raw("prop", <the value's source slice as a str, each hole through `std::style::piece`>)` |
 //! | `.name { … }` | `.name(style() … )` |
 //! | `.name(a, b) { … }` | `.name(a, b, style() … )` |
 //! | `.name(a, b);` | `.name(a, b)` — a chain link, verbatim (A69) |
@@ -208,11 +208,22 @@ fn build_value<'src>(
         return (Node::String(&source[text.into_range()]), *text);
     }
     // Mixed: the i-string's own shape — `("" + part + part + …)`, left
-    // associated, seeded with the empty string (`lexing::emit_interpolated`).
+    // associated, seeded with the empty string (`lexing::emit_interpolated`)
+    // — with every HOLE wrapped in `std::style::piece` (A34), which returns
+    // the hole's text and puts its `:root` line on the sheet on the way past.
+    //
+    // That wrapper is the whole of A34. Without it a mixed value was a plain
+    // string concatenation, so `border: 1px solid {Color::gray(500)};` had no
+    // correct spelling: `+` refuses a struct outright, and reaching for
+    // `.text` emits `var(--gray-500)` with nothing declaring it — the exact
+    // hazard the single-hole path exists to close. The single-hole path is
+    // untouched: a value that is EXACTLY one hole still passes its expression
+    // through, keeps its type, and reaches `Style::raw`, which does the same
+    // job for a whole value.
     let mut concatenation: Spanned<Node<'src>> = (Node::String(""), value_span);
     for piece in pieces {
         let part = match piece {
-            CssValuePiece::Hole(expression, _) => expression,
+            CssValuePiece::Hole(expression, _) => wrap_piece(expression),
             CssValuePiece::Text(text) => (Node::String(&source[text.into_range()]), text),
         };
         let span: Span = (concatenation.1.start..part.1.end).into();
@@ -222,6 +233,26 @@ fn build_value<'src>(
         );
     }
     (concatenation.0, value_span)
+}
+
+/// One hole of a MIXED value, wrapped in `std::style::piece` (A34): the call
+/// returns the hole's text and emits its `:root` line, so a typed style token
+/// mid-value carries its token exactly as a whole-value one does.
+///
+/// The callee is a `StdItem`, so it means std's `piece` whatever the site
+/// binds — the same hygiene B270 gave the seed, and for the same reason: this
+/// is a call nobody wrote. Its span is the hole's own expression span, which
+/// is where a `CssPiece` failure should underline.
+fn wrap_piece<'src>(expression: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
+    let span = expression.1;
+    (
+        Node::Call(
+            Box::new((Node::StdItem("style", "piece"), span)),
+            None,
+            (vec![expression], span),
+        ),
+        span,
+    )
 }
 
 /// `.name(a, b) { … }` → `.name(a, b, style() … )`: a dotted head lowers to a
@@ -650,15 +681,32 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_value_lowers_to_the_i_string_it_reads_as() {
+    fn a_mixed_value_lowers_to_the_i_string_shape_with_each_hole_through_piece() {
         // Text, hole, text — the same parenthesized concatenation
-        // `lexing::emit_interpolated` builds, whitespace included: the space
-        // before `+` belongs to the text run, not to the hole.
-        let (block, chain) = shapes_match(
-            "css { padding: calc({a} + 2px); }",
-            r#"style().raw("padding", i"calc({a} + 2px)")"#,
-        );
+        // `lexing::emit_interpolated` builds, whitespace included (the space
+        // before `+` belongs to the text run, not to the hole), with every
+        // HOLE wrapped in `std::style::piece` (A34), which returns the hole's
+        // text and puts its `:root` line on the sheet.
+        //
+        // The chain side spells the wrapper out, so the two sides are the same
+        // tree and the claim stays "the lowering IS the chain". `piece` is a
+        // hygienic reference in the block, and the normalization below reads
+        // it as the name a hand-written chain would import.
+        let block = strip_spans(&peeled("css { padding: calc({a} + 2px); }"))
+            .replace("StdItem(\"style\", \"piece\")", "Accessor(\"piece\")");
+        let chain = strip_spans(&peeled(
+            r#"style().raw("padding", "" + "calc(" + piece(a) + " + 2px)")"#,
+        ));
         assert_eq!(block, chain);
+    }
+
+    #[test]
+    fn a_single_hole_value_never_goes_through_piece() {
+        // The control A34 rests on: exactly one hole and nothing else still
+        // passes its expression through untouched, so the value keeps its TYPE
+        // and reaches `Style::raw`, which carries the `:root` line itself.
+        let tree = lowered("css { gap: {space(4)}; }");
+        assert!(!tree.contains("piece"), "{tree}");
     }
 
     #[test]
