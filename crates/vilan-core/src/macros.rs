@@ -1359,7 +1359,17 @@ pub(crate) fn flush_expansion_cache(build_dir: &Path) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let temporary = parent.join(format!("macro-expansions.{}.tmp", std::process::id()));
+    // Per-THREAD, not merely per-process: a workspace's legs compile on threads
+    // of their own (M35 for `check`, M51 for `build`) and several of them share
+    // one package's build directory, so two flushes of one table can be in
+    // flight at once. One temporary name between them would have the two writes
+    // interleave into the file the rename then publishes.
+    static FLUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = parent.join(format!(
+        "macro-expansions.{}.{}.tmp",
+        std::process::id(),
+        FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     if std::fs::write(&temporary, rendered).is_err() {
         let _ = std::fs::remove_file(&temporary);
         return;
