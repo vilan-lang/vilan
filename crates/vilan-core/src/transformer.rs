@@ -1089,7 +1089,11 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__local_get",
         "__session_get",
         "__dom_window",
+        "__dom_bounding_rect",
+        "__dom_query_all",
         "__router_path",
+        "__router_url",
+        "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
         "__nursery_run",
@@ -1316,9 +1320,53 @@ fn helper_source(name: &str) -> &'static str {
         // `__router_path` exists. This is what makes `window` a listen TARGET
         // with the same verbs `Element` carries (`proposal/router.md` §5.1).
         "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
+        // `Element::bounding_rect`: ONE `getBoundingClientRect()` (which forces
+        // layout) read into the four numbers `std::dom`'s `DomRect` carries.
+        // The array IS the struct's runtime form — a struct is an array in
+        // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
+        // builds an `Option`. Its order is `left, top, width, height`, and
+        // `DomRect`'s field order in `vilan/std/src/browser/dom.vl` must match;
+        // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
+        // four values by name, so a reorder is a red test rather than silence.
+        "__dom_bounding_rect" => {
+            "function __dom_bounding_rect(element) {\n\
+             \tconst rect = element.getBoundingClientRect();\n\
+             \treturn [ rect.left, rect.top, rect.width, rect.height ];\n\
+             }"
+        }
+        // `Element::query_selector_all`: the scoped twin of the document-level
+        // `Intrinsic::QuerySelectorAll`, and `Array.from` for the same reason —
+        // `querySelectorAll` yields a NodeList, which a `List` would mishandle.
+        "__dom_query_all" => {
+            "function __dom_query_all(element, selector) {\n\
+             \treturn Array.from(element.querySelectorAll(selector));\n\
+             }"
+        }
         // Router glue (std::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // The whole relative URL, for the query and fragment `location.pathname`
+        // leaves out. Deliberately NOT what `current_path()` tracks: a route
+        // signal that advanced on every `#anchor` would re-render the page for a
+        // scroll, so the path signal stays the pathname and this is the reach
+        // for the rest.
+        "__router_url" => {
+            "function __router_url() {\n\treturn location.pathname + location.search + location.hash;\n}"
+        }
+        // `router::percent_decode`: `decodeURIComponent`, made TOTAL. The host
+        // function throws a `URIError` on a malformed escape (`%zz`, a lone
+        // `%`), and a URL is attacker-supplied text — a router that crashes on
+        // one is a denial of service, so an undecodable piece decodes to
+        // itself.
+        "__percent_decode" => {
+            "function __percent_decode(text) {\n\
+             \ttry {\n\
+             \t\treturn decodeURIComponent(text);\n\
+             \t} catch {\n\
+             \t\treturn text;\n\
+             \t}\n\
+             }"
+        }
         // HMR activity guard (std::dev, `hmr.md` §4/§5): true only when a `run
         // --watch` shim installed its `window.__VILAN_HMR__` singleton. A
         // self-contained `typeof` test (safe with no shim, in any host), so the

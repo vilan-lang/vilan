@@ -13,7 +13,8 @@
 // available when building for the browser.
 
 import pkg::dom::{ Event, window };
-import pkg::option::Option;
+import pkg::map::Map;
+import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ FlushPolicy, SignalCell, turn };
 import pkg::shared::Shared;
 import pkg::ui::{ View, chunk_failure, chunk_pending, view };
@@ -25,6 +26,28 @@ external fun history_push(state: str, title: str, path: str): void;
 /// `location.pathname` (via a helper — a global property has no function form).
 [extern("__router_path")]
 external fun location_path(): str;
+
+/// `location.pathname + location.search + location.hash` — the whole relative
+/// URL, which is what `parse_path` needs to see a query or a fragment at all.
+///
+/// Deliberately NOT what `current_path()` tracks. A signal that advanced on
+/// every `#anchor` would re-render a page for a scroll, and a route enum whose
+/// `to_path` prints a pathname would then never compare equal to what the
+/// location says. Read this where the query matters — on load, and in a
+/// `popstate` handler — and keep routing on the path.
+[extern("__router_url")]
+external fun location_url(): str;
+
+/// Decodes percent-escapes (`decodeURIComponent`): `"hello%20world"` is
+/// `"hello world"`, `"caf%C3%A9"` is `"café"`.
+///
+/// TOTAL, unlike the host function it wraps: a malformed escape (`%zz`, a
+/// trailing `%`) decodes to ITSELF rather than throwing. A URL is text a
+/// stranger chose, so a decoder that can crash is a route that a link can take
+/// down — and the useful answer for a piece that is not an escape sequence is
+/// the piece.
+[extern("__percent_decode")]
+external fun percent_decode(text: str): str;
 
 /// The path-signal singleton (the `std::reactive` module-state pattern) —
 /// created empty at load, wired to the real location on first use.
@@ -63,9 +86,14 @@ fun navigate(path: str) {
 	path_signal.set(path);
 }
 
-/// A path's non-empty segments: `"/w/acme/tasks"` → `["w", "acme", "tasks"]`.
-/// The raw material for an app's `parse` (trailing and duplicate slashes are
-/// forgiven — they produce no segment).
+/// A path's non-empty segments, RAW: `"/w/acme/tasks"` → `["w", "acme",
+/// "tasks"]`. Trailing and duplicate slashes are forgiven — they produce no
+/// segment — and a query or fragment is not recognized, so `"/a?b=1"` is one
+/// segment `"a?b=1"`.
+///
+/// `parse_path` is the form that reads a whole URL: same segment rule, plus the
+/// query and the fragment, and every piece percent-DECODED. This one stays raw
+/// so that a caller who wants the URL's own bytes still has them.
 fun segments(path: str): List<str> {
 	mut parts: List<str> = [];
 	for part in path.split("/") {
@@ -76,10 +104,159 @@ fun segments(path: str): List<str> {
 	parts
 }
 
+/// A URL taken apart: what `parse_path` reads out of a path string.
+///
+/// Every piece is percent-DECODED, which is why the parts exist as a value
+/// rather than as three calls over the same string — decoding before splitting
+/// would turn an escaped separator into a real one (`%2F` is a slash INSIDE a
+/// segment, `%26` an ampersand inside a query value), so the order is: cut, then
+/// decode, once, here.
+struct PathParts {
+	/// The path's non-empty segments, decoded — `segments`'s rule, so
+	/// `"/w//acme/"` is `["w", "acme"]` and `"/"` is `[]`.
+	segments: List<str>,
+	/// The query string as key → value, decoded. An empty or absent query is an
+	/// empty map; a repeated key keeps the LAST value.
+	query: Map<str, str>,
+	/// The fragment, decoded and without its `#` — `None` when the URL carries
+	/// no `#` at all, `Some("")` for a bare trailing `#`. The distinction is
+	/// real: `"/a"` and `"/a#"` are different URLs.
+	fragment: Option<str>,
+}
+
+/// Takes a path apart: `"/w/acme/tasks?tag=due%20soon&open#notes"` →
+/// segments `["w", "acme", "tasks"]`, query `{ "tag": "due soon", "open": "" }`,
+/// fragment `Some("notes")`.
+///
+/// The READ direction of the module, and the raw material for a route enum's
+/// `from_segments`. Three rules decide the corners:
+///
+/// - **The fragment is cut FIRST.** Everything after the first `#` is fragment
+///   text, a `?` in it included (RFC 3986 §3.5) — cutting the query first would
+///   read `"/a#b?c"` as having a query.
+/// - **Empty segments do not exist.** A leading, trailing or doubled slash
+///   produces no segment, so `"/w/acme"`, `"/w/acme/"` and `"//w//acme"` all
+///   parse alike and a route match never has to spell the trailing-slash case.
+///   `"/"` and `""` both have zero segments, which is the home route.
+/// - **A key with no `=` is present with an empty value.** `"?open"` and
+///   `"?open="` both yield `{ "open": "" }`; asking `contains_key` is how you
+///   ask whether a flag is there.
+///
+/// Query keys and values additionally read `+` as a space, which is the form a
+/// submitted HTML form produces; a `+` in a path SEGMENT is a literal plus,
+/// because no encoder ever meant it otherwise there.
+fun parse_path(path: str): PathParts {
+	mut rest = path;
+	mut fragment: Option<str> = None;
+	let hash = rest.split("#");
+	if hash.len() > 1 {
+		// The cut index is the first piece's length: `split` alone would lose a
+		// second `#`, and both marks here are one code unit wide.
+		let mark = hash[0].len();
+		fragment = Some(percent_decode(rest.substring(mark + 1, rest.len())));
+		rest = rest.substring(0, mark);
+	}
+	mut query = "";
+	let question = rest.split("?");
+	if question.len() > 1 {
+		let mark = question[0].len();
+		query = rest.substring(mark + 1, rest.len());
+		rest = rest.substring(0, mark);
+	}
+	mut parts: List<str> = [];
+	for part in rest.split("/") {
+		if part != "" {
+			parts.push(percent_decode(part));
+		}
+	}
+	PathParts {
+		segments = parts,
+		query = parse_query(query),
+		fragment = fragment,
+	}
+}
+
+/// A query string — WITHOUT its leading `?` — as key → value, decoded:
+/// `"tag=due%20soon&open"` → `{ "tag": "due soon", "open": "" }`.
+///
+/// `parse_path` calls this; it is public because a query arrives from other
+/// places too (a form's serialization, a link's `href`, `location.search`). An
+/// empty pair is skipped, so `"&&a=1&"` is `{ "a": "1" }`, and a repeated key
+/// keeps the last value — a map, not a multimap, because a route reads one
+/// value per key and the alternative is a `List` at every call site.
+fun parse_query(query: str): Map<str, str> {
+	mut values: Map<str, str> = Map::new();
+	for pair in query.split("&") {
+		if pair != "" {
+			let equals = pair.split("=");
+			if equals.len() > 1 {
+				let mark = equals[0].len();
+				values.insert(
+					percent_decode(pair.substring(0, mark).replace("+", " ")),
+					percent_decode(pair.substring(mark + 1, pair.len()).replace("+", " ")),
+				);
+			} else {
+				values.insert(percent_decode(pair.replace("+", " ")), "");
+			}
+		}
+	}
+	values
+}
+
 /// A value that prints as a history-API path — implement it on the app's
 /// route enum (usually delegating to the app's `href`). What `link` accepts.
 trait Routable {
 	fun to_path(self): str;
+}
+
+/// `Routable`'s inverse: a value the URL can be READ back into, declared once
+/// beside the one that writes it. A type implementing both states its wire
+/// format in both directions, and the pair has a law — `from_path(r.to_path())
+/// == r` for every route the app can reach — which is one round-trip test per
+/// route space instead of a drift nobody notices until a link 404s.
+///
+/// The member is over SEGMENTS, not over the path, because that is where a
+/// route space is actually decided: `parse_path` has already cut, decoded, and
+/// dropped the empty segments, so an implementation is a `match` on `len()`
+/// and a few string comparisons with no index arithmetic to get wrong.
+///
+/// A total function, deliberately — no `Option`. A URL a route space does not
+/// recognize is a route (`NotFound`), and an app that models it as one gets to
+/// render it; the alternative pushes an `unwrap_or` into every call site.
+///
+/// ```vilan,fragment
+/// impl Route with FromPath {
+///     fun from_segments(parts: List<str>): Route {
+///         match parts.len() {
+///             0 => Route::Home,
+///             _ => if parts[0] == "m" { Route::Messages } else { Route::NotFound },
+///         }
+///     }
+/// }
+/// ```
+trait FromPath {
+	fun from_segments(parts: List<str>): Self;
+}
+
+/// The route a whole path names: `parse_path`, then the type's own
+/// `from_segments`. The counterpart to `to_path`, and the call an app makes.
+///
+/// It is a FREE function rather than a `from_path` default on the trait
+/// because the language admits neither half of that shape — `Self::` cannot
+/// dispatch inside a trait default (an associated function without a body has
+/// nothing to call), and an associated function with a default body is not
+/// inherited by an impl (there is no receiver to inherit it through). Both are
+/// diagnosed, both are deliberate; a generic function over the bound is the
+/// spelling that works, and it monomorphizes the same way.
+///
+/// The route type comes from context — an annotation, a parameter, or a
+/// return:
+///
+/// ```vilan,fragment
+/// let route: Route = from_path(current_path().get());
+/// ```
+fun from_path<R: FromPath>(path: str): R {
+	R::from_segments(parse_path(path).segments)
 }
 
 /// A navigation link: a real `<a href=..>` (middle-click / ctrl-click /

@@ -17,16 +17,29 @@ fun create_text_node(content: str): Text                   // a fresh text node
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
 
+struct DomRect { left: f64, top: f64, width: f64, height: f64 }   // a VALUE, not a handle
+impl DomRect {
+	fun right(self): f64                               // left + width
+	fun bottom(self): f64                              // top + height
+}
+
 impl Element {
 	fun set_text(self, text: str)                      // textContent =
 	fun set_class(self, name: str)                     // className =
 	fun set_attribute(self, name: str, value: str)
+	fun remove_attribute(self, name: str)              // set_attribute's other half
 	fun set_style_property(self, name: str, value: str) // style.setProperty (CSS custom props)
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
+	fun bounding_rect(self): DomRect                   // getBoundingClientRect — forces layout
+	fun offset_width(self): f64                        // offsetWidth — laid out, rounded
+	fun offset_height(self): f64                       // offsetHeight
+	fun is_connected(self): bool                       // attached to the document?
+	fun contains(self, other: Element): bool           // other is this element or inside it
+	fun query_selector_all(self, selector: str): List<Element>   // scoped to this subtree
 	fun focus(self)                                    // move keyboard focus here
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
@@ -34,6 +47,17 @@ impl Element {
 	fun on_event(self, event: str, handler: |Event| void)
 	fun off_event(self, event: str, handler: |Event| void)   // listen's teardown
 	fun listen(self, event: str, handler: |Event| void): Subscription   // must_use
+	fun on_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun off_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun listen_capture(self, event: str, handler: |Event| void): Subscription   // must_use
+	fun observe_resize(self, on_resize: || void): Subscription           // must_use
+}
+
+external struct ResizeObserver;      // the raw class behind observe_resize
+impl ResizeObserver {
+	fun new(callback: || void): ResizeObserver
+	fun observe(self, target: Element)
+	fun disconnect(self)
 }
 
 external struct Window;              // the window — a listen target, like Element
@@ -43,6 +67,9 @@ impl Window {
 	fun on_event(self, event: str, handler: |Event| void)
 	fun off_event(self, event: str, handler: |Event| void)
 	fun listen(self, event: str, handler: |Event| void): Subscription   // must_use
+	fun on_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun off_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun listen_capture(self, event: str, handler: |Event| void): Subscription   // must_use
 }
 
 external struct Text;                // a text node — text only, no attributes
@@ -60,6 +87,7 @@ impl Event {
 	fun alt_key(self): bool
 	fun key(self): str           // "Enter", "Escape", "a", …
 	fun target_value(self): str  // event.target.value — the input's text
+	fun target(self): Element    // event.target — what contains() is asked about
 	fun pointer_x(self): f64     // clientX — where the pointer is, in the viewport
 	fun pointer_y(self): f64     // clientY
 }
@@ -106,6 +134,65 @@ handler should be too:
 
 ```vilan,fragment
 view("input").on_event("input", |event| query.set(event.target_value()))
+```
+
+**Measurement is a value, and it forces layout.** `bounding_rect` returns a
+`DomRect` — four numbers copied out of the host box, so it compares, parks in a
+signal, and does not change under whoever is holding it. Reading it costs a
+layout, so measure once and pass the value on. `offset_width`/`offset_height`
+are the cheap, rounded pair for "how big is it" where the rect is the
+fractional "where is it".
+
+A **detached** element measures 0×0 whatever its styles say, which is why
+`is_connected` exists: positioning that runs before the node is in the tree
+positions against nothing, and reads as a layout bug rather than a timing one.
+
+```vilan,fragment
+if panel.is_connected() {
+	let anchor = button.bounding_rect();
+	panel.set_style_property("--x", i"{anchor.left}px");
+	panel.set_style_property("--y", i"{anchor.bottom()}px");
+}
+```
+
+**`listen_capture` is `listen` in the other phase.** Capture runs the
+ancestors' listeners on the way *down* to the target, before the target's own;
+bubble runs them on the way back up. Two things need the downward pass: events
+that do not bubble at all (`scroll`, `focus`, `blur`) are heard from an
+ancestor only in capture — which is how an anchored menu hears every scrolling
+ancestor at once and stays on its element while the page moves under it — and a
+listener that must run *before* the target's own (a dismiss guard, a modal's
+key trap) has nowhere else to be. The phase is part of the identity the host
+matches on, so a capture listener is not removable by the bubble-phase
+`off_event`; that is why there is a second raw pair rather than a flag.
+
+`observe_resize` is the wrapper over `ResizeObserver`, and the form to reach
+for: it fires **once when observation starts** — so the first layout and every
+later one run through the same callback — and its `Subscription` disconnects
+the observer. The bare class is there for what the wrapper doesn't cover, and
+leaks unless you disconnect it yourself.
+
+```vilan,fragment
+let sizing = get_owner().take(panel.observe_resize(|| reposition(panel)));
+let scrolls = get_owner().take(window().listen_capture("scroll", |_| reposition(panel)));
+let outside = get_owner().take(window().listen_capture("pointerdown", |event| {
+	if !panel.contains(event.target()) {
+		dismiss();
+	}
+}));
+```
+
+`remove_attribute` is `set_attribute`'s other half, and the half a **boolean**
+attribute needs: `disabled`, `open`, `aria-hidden` and the rest are read by
+their presence, so the false state is the attribute being gone, not
+`="false"`.
+
+```vilan,fragment
+if is_open {
+	panel.set_attribute("open", "");
+} else {
+	panel.remove_attribute("open");
+}
 ```
 
 ## std::ui
@@ -208,9 +295,17 @@ Two things deliberately still ask for the concrete type:
 ```vilan,fragment
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
-fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"]
+fun location_url(): str               // pathname + search + hash — the whole relative URL
+fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
+fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
+fun parse_query(query: str): Map<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
 
-trait Routable { fun to_path(self): str }
+struct PathParts { segments: List<str>, query: Map<str, str>, fragment: Option<str> }
+fun parse_path(path: str): PathParts  // cut, then decode — the READ direction
+
+trait Routable { fun to_path(self): str }              // route → URL
+trait FromPath { fun from_segments(parts: List<str>): Self }   // URL → route
+fun from_path<R: FromPath>(path: str): R               // parse_path, then from_segments
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
 
 // Route chunks (a `split = true` leg) — both are ordinary signals
@@ -222,7 +317,40 @@ fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with t
 the `popstate` listener is wired on first use. `link` renders a real anchor
 (middle-click, ctrl-click, and copy-link keep native behavior) and intercepts
 only a plain left click, calling `prevent_default` + `navigate`. Route
-modelling (`parse`/`href` over enums): the [routing guide](../guide/routing.md).
+modelling (`Routable`/`FromPath` over enums): the
+[routing guide](../guide/routing.md).
+
+**`parse_path` is the read direction, and it cuts before it decodes.** The
+fragment is delimited first (a `?` after a `#` is fragment text), then the
+query, then the path splits on `/` — and only then is every piece
+percent-decoded, so an escaped separator (`%2F`, `%26`) stays inside the
+segment or value it belongs to instead of becoming one. Empty segments do not
+exist, so `"/w/acme"`, `"/w/acme/"` and `"//w//acme"` parse alike and no match
+arm has to name the trailing-slash case. A query key with no `=` is present
+with an empty value (`"?open"` and `"?open="` both give `{ "open": "" }`), a
+repeated key keeps the last, and query keys and values additionally read `+`
+as a space — a path segment's `+` is a literal plus. `fragment` is `None` when
+the URL has no `#` at all and `Some("")` for a bare trailing one, because those
+are different URLs.
+
+`segments` stays **raw** — it is the splitter, not the reader — so
+`segments("/a%20b")` is `["a%20b"]` where `parse_path("/a%20b").segments` is
+`["a b"]`. Route matching wants the decoded form.
+
+`FromPath` is `Routable`'s inverse, and the pair has a law:
+`from_path(route.to_path())` is `route`, for every route the app can reach —
+one round-trip test per route space instead of a drift nobody notices until a
+link 404s. Its member takes segments rather than a path, because that is where
+a route space is decided; `from_path` is a free generic function rather than a
+trait default because an associated function has no receiver to inherit a
+default through (the compiler says exactly that if you try). It is total: an
+unrecognized URL is a route, not an `Option`.
+
+`current_path()` is the **pathname only**, deliberately — a signal that
+advanced on every `#anchor` would re-render the page for a scroll, and a route
+whose `to_path()` prints a pathname would stop comparing equal to the location.
+Reach for `location_url()` where the query matters (on load, and in a
+`popstate` handler) and keep routing on the path.
 
 `pending()` and `chunk_error()` describe a `split = true` leg's route-chunk
 fetches, and are ordinary signals — bind them with `show`, `bind_text` or a

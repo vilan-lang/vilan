@@ -9,7 +9,7 @@ When you add a page, the compiler points at every `match` that now needs to
 handle it. A pattern-string router can't promise any of that.
 
 `std::router` supplies the primitives: the live path signal, `navigate`,
-the `link` helper, and `segments` for parsing.
+the `link` helper, and `parse_path` / `FromPath` for reading a URL back.
 
 ## The route model
 
@@ -94,6 +94,86 @@ That's the whole pattern. Yes, `parse` is more code than a pattern
 string. In exchange it's ordinary code: type-checked, debuggable, and
 free to do things pattern strings can't (validation, aliases, redirects).
 Now the pieces one at a time.
+
+## Reading the URL back
+
+`parse` above is one half of a pair the compiler cannot hold together, so
+`std::router` gives it a shape: `Routable` writes a route to a URL,
+`FromPath` reads one back, and a type implementing both states its wire
+format once in each direction.
+
+`FromPath`'s member takes SEGMENTS, not a path — `parse_path` has already
+cut the URL, dropped the empty segments, and percent-decoded every piece,
+so what's left is a `match` on `len()` and a few string comparisons. The
+free `from_path` is the call: it runs `parse_path` and hands the segments
+on. It's a free function rather than a trait default because an associated
+function can't be inherited through a receiver that doesn't exist — the
+compiler says so if you try.
+
+```vilan,browser
+import std::io::print;
+import std::router::{ FromPath, PathParts, Routable, from_path, parse_path };
+
+[derive(PartialEq)]
+enum Route {
+	Home,
+	Workspace(i32),
+	NotFound,
+}
+
+impl Route with FromPath {
+	fun from_segments(parts: List<str>): Route {
+		match parts.len() {
+			0 => Route::Home,
+			_ => {
+				if parts[0] == "w" && parts.len() > 1 {
+					match parts[1].parse_i32() {
+						Some(let id) => Route::Workspace(id),
+						None => Route::NotFound,
+					}
+				} else {
+					Route::NotFound
+				}
+			},
+		}
+	}
+}
+
+impl Route with Routable {
+	fun to_path(self): str {
+		match self {
+			Route::Home => "/",
+			Route::Workspace(let id) => i"/w/{id}",
+			Route::NotFound => "/404",
+		}
+	}
+}
+
+fun main() {
+	// The law the pair has: `from_path(route.to_path())` is `route`.
+	let route: Route = from_path("/w/12/");
+	print(route.to_path());
+
+	// The query and the fragment, which `segments` never saw.
+	let parts: PathParts = parse_path("/w/12?tab=due%20soon&open#notes");
+	match parts.query.get("tab") {
+		Some(let tab) => print(tab),
+		None => print("no tab"),
+	}
+	// A key with no `=` is PRESENT with an empty value, so a flag is a
+	// `contains_key` question.
+	let flagged = parts.query.contains_key("open");
+	print(i"open={flagged}");
+	match parts.fragment {
+		Some(let anchor) => print(anchor),
+		None => print("no fragment"),
+	}
+}
+```
+
+`from_path` is total — there is no `Option`. A URL your route space
+doesn't recognize is a route (`NotFound`), and modelling it as one means
+you get to render it.
 
 ## The live path becomes a route signal
 
@@ -188,7 +268,13 @@ does (see [Services & RPC](services.md)).
   Their agreement is the one thing the type system can't check for you.
   A `parse` that drops a segment silently turns a working deep link into
   a NotFound.
-- `segments` already forgives trailing and duplicate slashes (they
-  produce no segment). Don't special-case them in `parse`.
-- Query strings and hash fragments aren't modelled yet (a deliberate
-  deferral). `segments` sees only the pathname.
+- `parse_path` already forgives trailing and duplicate slashes (they
+  produce no segment). Don't special-case them in `from_segments`.
+- `segments` is the RAW splitter and `parse_path` is the decoding one:
+  `segments("/a%20b")` is `["a%20b"]`, `parse_path("/a%20b").segments` is
+  `["a b"]`. Route matching wants the decoded form.
+- `current_path()` is `location.pathname` — the query and the fragment are
+  deliberately not in it, so a `#anchor` doesn't re-render the page and a
+  route's `to_path()` still compares equal to where you are. Read the whole
+  URL with `location_url()` when the query matters, on load and in a
+  `popstate` handler.
