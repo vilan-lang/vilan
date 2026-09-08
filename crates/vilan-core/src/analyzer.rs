@@ -8598,11 +8598,18 @@ impl<'src> Analyzer<'src> {
     ///   — one mistake, so one diagnostic.
     fn check_container_resource_arguments(&mut self) {
         let applications = std::mem::take(&mut self.generic_type_applications);
+        // M19 T1d: the report starts life holding what the REUSED modules put
+        // in it, spliced back by `replay_world_diagnostics` before any check
+        // ran. Taken rather than read so the working set below is the whole
+        // set and the field is written exactly once, at the tail — and put
+        // back on the early return, which is a path that decides nothing.
+        let restored_structures = std::mem::take(&mut self.reported_container_structures);
         // Nothing is a resource unless something declares itself one, so the
         // whole check — the per-instantiation descent and the inferred sweep
         // included — is dead work for a program with no `resource` declaration
         // anywhere.
         if !self.declares_a_resource() {
+            self.reported_container_structures = restored_structures;
             return;
         }
         let containers = self.resource_rejecting_containers();
@@ -8617,14 +8624,25 @@ impl<'src> Analyzer<'src> {
         // keys on: an inferred type has no spelling to point at, so it is one
         // fact reported once however many ids carry it.
         let mut reported_instantiations: HashSet<TypeId> = HashSet::default();
-        let mut reported_structures: HashSet<String> = HashSet::default();
+        let mut reported_structures: HashSet<String> = restored_structures;
         for (type_id, span, source) in applications {
+            // M19 T1d: a reused module's written applications are not visited.
+            // Its diagnostics are replayed and the keys it contributed above
+            // are already in `reported_structures`, so both halves of what this
+            // loop would have produced for it are already here.
+            if self.reused_source(source) {
+                continue;
+            }
             let Some(found) =
                 self.container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
             else {
                 continue;
             };
-            reported_structures.insert(self.container_structure_key(found.container_type));
+            let key = self.container_structure_key(found.container_type);
+            let key_is_new = reported_structures.insert(key.clone());
+            if key_is_new {
+                self.note_container_structure(source, key);
+            }
             if !reported_instantiations.insert(found.container_type) {
                 continue;
             }
@@ -8649,9 +8667,11 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            if !reported_structures.insert(self.container_structure_key(found.container_type)) {
+            let key = self.container_structure_key(found.container_type);
+            if !reported_structures.insert(key.clone()) {
                 continue;
             }
+            self.note_container_structure(source, key);
             reported_instantiations.insert(found.container_type);
             self.report_container_resource(&found, type_id, span, source, None);
         }
@@ -8670,9 +8690,11 @@ impl<'src> Analyzer<'src> {
             ) else {
                 continue;
             };
-            if !reported_structures.insert(self.container_structure_key(found.container_type)) {
+            let key = self.container_structure_key(found.container_type);
+            if !reported_structures.insert(key.clone()) {
                 continue;
             }
+            self.note_container_structure(source, key);
             self.report_container_resource(&found, container_type, span, source, None);
         }
         self.reported_container_structures = reported_structures;
@@ -8693,6 +8715,12 @@ impl<'src> Analyzer<'src> {
             let Some(span) = self.span_map.get(call_id) else {
                 continue;
             };
+            // M19 T1d: a reused module's native receiver sites are its own — the
+            // call is in its body and the diagnostic publishes to its file — so
+            // they are skipped with the rest of its tier.
+            if !self.container_site_visited(*call_id) {
+                continue;
+            }
             let source = self.source_of_id(*call_id).unwrap_or(SourceId(0));
             for (container_id, _) in containers.iter().copied() {
                 let constraints = self.declared_parameter_constraint_ids(container_id);
@@ -8728,6 +8756,34 @@ impl<'src> Analyzer<'src> {
             )
         });
         sites
+    }
+
+    /// M19 T1d: files one structural key under the module whose site put it
+    /// into R10's whole-program report, for the analysis that will REPLAY that
+    /// module instead of re-deriving it.
+    ///
+    /// Only a key whose insertion RETURNED TRUE is filed, and that condition is
+    /// what makes the union on restore exact rather than merely generous. A
+    /// site whose key was already in the set contributed nothing: recording it
+    /// anyway would pre-seed, on the next analysis, a key some OTHER file's
+    /// site inserted first — and that file's diagnostic would then be
+    /// deduplicated away, which is a diagnostic lost rather than a diagnostic
+    /// remembered. The tiers that key their dedup on the string report exactly
+    /// when the insertion is new, so "the module put this key here" and "the
+    /// module reported this container" are the same set.
+    ///
+    /// The entry and derived code are not filed: the entry is not part of the
+    /// base-cache key (`reaches_outside_the_world`'s reason), and both re-run
+    /// on every analysis anyway.
+    fn note_container_structure(&mut self, source: SourceId, key: String) {
+        if source == SourceId(0) || source == DERIVED_SOURCE {
+            return;
+        }
+        self.reuse_derived
+            .entry(source.0)
+            .or_default()
+            .container_structures
+            .push(key);
     }
 
     /// A container instantiation's STRUCTURAL identity, for a dedup that has to
@@ -8790,6 +8846,22 @@ impl<'src> Analyzer<'src> {
     /// comparable (E38, diagnostics-standard.md C1).
     fn inferred_container_sites(&self) -> Vec<(Id, TypeId, Span, SourceId)> {
         let mut sites: Vec<(Id, TypeId, Span, SourceId)> = Vec::new();
+        // M19 T1d: a REUSED module's sites are dropped BEFORE anything is read
+        // from them. This tier is the check's whole cost — a sweep over every
+        // typed expression, binding and parameter in the program — and on a
+        // warm keystroke almost all of them belong to modules whose answer is
+        // already recorded.
+        //
+        // The question is asked of the ENTITY here rather than of the file, and
+        // it is the same question: `world_ranges` is `source_ranges` filtered
+        // by the reused set, so [`Self::world_entity`] and
+        // [`Self::reused_source`] agree wherever both can be asked (an id
+        // inside no range resolves to the entry, which is in neither). Asking
+        // the entity is what makes the skip free on a COLD analysis: with
+        // nothing reused the ranges are empty and the binary search returns on
+        // its first branch, where resolving the file would cost a real search
+        // per entity to buy nothing. The file is then resolved only for a site
+        // that survives, exactly as before.
         let push = |sites: &mut Vec<_>, id: Id, type_id: TypeId, span: Span| {
             sites.push((
                 id,
@@ -8799,6 +8871,9 @@ impl<'src> Analyzer<'src> {
             ));
         };
         for expr_id in self.expr_id_to_expr_map.keys().copied() {
+            if !self.container_site_visited(expr_id) {
+                continue;
+            }
             if let Some(type_id) = self.resolved_type_id_of(expr_id)
                 && let Some(span) = self.span_map.get(&expr_id)
             {
@@ -8806,6 +8881,9 @@ impl<'src> Analyzer<'src> {
             }
         }
         for variable in self.variables.values() {
+            if !self.container_site_visited(variable.id) {
+                continue;
+            }
             push(
                 &mut sites,
                 variable.id,
@@ -8814,6 +8892,9 @@ impl<'src> Analyzer<'src> {
             );
         }
         for parameter in self.parameters.values() {
+            if !self.container_site_visited(parameter.id) {
+                continue;
+            }
             if let Some(span) = self.span_map.get(&parameter.id) {
                 push(&mut sites, parameter.id, parameter.type_id, **span);
             }
@@ -31866,6 +31947,44 @@ impl<'src> Analyzer<'src> {
         self.frozen_entity(id) || self.world_entity(id)
     }
 
+    /// [`Self::reusable_entity`] asked of a FILE rather than an entity (M19
+    /// T1d): whether this analysis is reusing `source`'s Class A output.
+    ///
+    /// R10's first tier is the one that needs it. A written type application is
+    /// collected at `walk_type_node` as `(TypeId, Span, SourceId)` and has no
+    /// entity id of its own to ask [`Self::world_entity`] about; the two other
+    /// tiers do have one and ask that instead
+    /// ([`Self::container_site_visited`]). Asking the file is the same claim:
+    /// `world_ranges` is exactly `source_ranges` filtered by
+    /// [`Self::reused_sources`], so the two predicates agree wherever both can
+    /// be asked.
+    ///
+    /// Deliberately NOT `frozen_entity`'s half. A std module is in
+    /// `reused_sources` on a base-cache hit like any other module of the
+    /// world, and is then covered by a RECORD; the S1 freeze is a different
+    /// and stronger claim ("std's diagnostics are known absent") that R10
+    /// cannot make, because its inferred tier reads the resolved type of every
+    /// expression and a std expression's type can be ground by user code.
+    /// This predicate is therefore false whenever reuse is off, the full-scan
+    /// override is on, or the world was not served from the cache — the three
+    /// cases in which `reused_sources` is empty.
+    fn reused_source(&self, source: SourceId) -> bool {
+        self.reused_sources.binary_search(&source).is_ok()
+    }
+
+    /// [`Self::reused_source`] asked of the ENTITY that carries an R10 site
+    /// (M19 T1d).
+    ///
+    /// `world_entity` rather than `reused_source(source_of_id(..))` for a
+    /// reason that is about the COLD path: with nothing reused `world_ranges`
+    /// is empty and the search returns on its first branch, while resolving the
+    /// file would be a real binary search per entity, paid on every cache miss
+    /// to buy nothing. The two agree — `world_ranges` IS `source_ranges`
+    /// filtered by the reused set.
+    fn container_site_visited(&self, id: Id) -> bool {
+        !self.world_entity(id)
+    }
+
     /// The file a diagnostic at `index` will publish under — the same
     /// resolution `analyze`'s tail runs over `diagnostic_source_marks` when it
     /// materializes `Program::diagnostic_sources`. Read here so a record is
@@ -31977,7 +32096,13 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
-            record.insert(index, derived.get(&index).cloned().unwrap_or_default());
+            let mut module = derived.get(&index).cloned().unwrap_or_default();
+            // M19 T1d: the keys arrive in the order R10's three tiers reached
+            // them, which is a fact about the walk. Sorted and deduplicated so
+            // the record is a function of the module (C1, determinism).
+            module.container_structures.sort_unstable();
+            module.container_structures.dedup();
+            record.insert(index, module);
         }
         (record, unrecordable)
     }
@@ -32006,6 +32131,14 @@ impl<'src> Analyzer<'src> {
             for warning in &record.warnings {
                 self.warnings.push(warning.clone());
                 self.warning_sources.push(source);
+            }
+            // M19 T1d: R10's whole-program state, unioned back in from the
+            // module that put it there. It lands in the field R11 reads
+            // directly, and `check_container_resource_arguments` seeds its own
+            // working set from that field — so a module whose sites are
+            // skipped is indistinguishable, to both checks, from one that ran.
+            for key in &record.container_structures {
+                self.reported_container_structures.insert(key.clone());
             }
         }
     }
@@ -47270,6 +47403,28 @@ struct ModuleDiagnostics {
     /// looks like. Such a module replays its diagnostics and recomputes its
     /// tables, which is exactly T1's behaviour and is always sound.
     tables: Option<ModuleTables>,
+    /// M19 T1d: the structural container keys THIS module put into R10's
+    /// whole-program report (`Analyzer::reported_container_structures`) — the
+    /// ones whose insertion at one of the module's sites returned `true`, so
+    /// the module is what made the set contain them.
+    ///
+    /// R10's diagnostics are recorded like any other Class A check's, but the
+    /// check also carries whole-program STATE, and the state is what R11 reads
+    /// (`check_instantiation_container_resources` dedups against it and
+    /// `instantiated_signature_reported_parameters` asks it whether the caller
+    /// was already told). R11 is Class C and keeps running over every module on
+    /// every analysis, so a reused module whose diagnostics replayed but whose
+    /// keys did not would leave the set short and R11 would report a structure
+    /// R10 had already reported — an extra diagnostic on the reusing analysis
+    /// and on no other. The keys are the reason R10 can be in the window at
+    /// all.
+    ///
+    /// Strings, not ids: the key is `render_type_canonical`'s STRUCTURAL
+    /// rendering, so nothing minted per occurrence crosses the record
+    /// (`editor-latency.md` §3.6's boundary). Sorted and deduplicated by
+    /// [`Analyzer::take_reuse_record`] so a record is a function of the module
+    /// and not of the walk.
+    container_structures: Vec<String>,
 }
 
 /// One reused module's rows in the class D tables, kept in ascending id order
@@ -50953,20 +51108,31 @@ fn analyze_over_world<'src>(
         // INERT unless `std::dev` is loaded, so most programs pay nothing for
         // it at all. It stays live and stays honest.
         analyzer.check_hmr_transfer_bounds();
-        // The observable half of C4 resource classification (destruction.md §4):
-        // R10 (container/external-generic resource arguments) and R12 (no coercion
-        // to `any`). R1–R9 (moves, loans, conditional/loop moves, captures) follow;
-        // then R11 (per-instantiation move-clean generics). Destructors come later.
-        //
-        // R10 is NOT in the Class A window either, and for a sharper reason:
-        // its report doubles as R11's DEDUP SET
-        // (`reported_container_structures`, read at
-        // `check_instantiation_container_resources`). R11 is Class C and keeps
-        // running whole-program, so a frozen R10 would leave the set short and
-        // R11 would report a structure R10 had already reported — an extra
-        // diagnostic on the reusing analysis and on no other. §3.3's Class A
-        // list misses that this check carries whole-program state; freezing it
-        // means freezing the set with it.
+    }
+    // The observable half of C4 resource classification (destruction.md §4):
+    // R10 (container/external-generic resource arguments) and R12 (no coercion
+    // to `any`). R1–R9 (moves, loans, conditional/loop moves, captures) follow;
+    // then R11 (per-instantiation move-clean generics). Destructors come later.
+    //
+    // M19 T1d moved R10 INTO the window, and moving it is the tranche. It was
+    // left out for a sharper reason than the passes above: its report doubles
+    // as R11's dedup set (`reported_container_structures`, read at
+    // `check_instantiation_container_resources`), and R11 is Class C and keeps
+    // running whole-program — so a frozen R10 whose diagnostics replayed but
+    // whose SET did not would leave the set short, and R11 would report a
+    // structure R10 had already reported: an extra diagnostic on the reusing
+    // analysis and on no other. What makes the window legal is that the set is
+    // recordable. It is keyed on `render_type_canonical`'s structural
+    // rendering, so nothing minted per occurrence crosses the record — the
+    // boundary `editor-latency.md` §3.6 states — and the module that put a key
+    // there is the module that reported the container, so each key has exactly
+    // one owner to be filed under (`note_container_structure`).
+    //
+    // A second window rather than the first, in place, because the sequence
+    // between them is Class B and Class C work that must keep running: the
+    // window is per call, and one that swallowed a neighbour would replay a
+    // diagnostic the next analysis also re-derives.
+    class_a_checks! {
         analyzer.check_container_resource_arguments();
     }
     class_a_checks! {
