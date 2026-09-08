@@ -2376,3 +2376,132 @@ fn checked_cache_bytes_per_world() {
         "every subject recorded nothing — the measurement measured the harness"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M49: the enrolment record's restore condition, split.
+
+/// The shared module — and the world's OWN resource declaration, which is what
+/// makes the world half of the fingerprint non-empty and therefore worth
+/// comparing. Without it both entries agree on the empty digest and the pin
+/// would pass for a reason that has nothing to do with the split.
+/// The FNV-1a offset basis — the digest of an EMPTY nominal half, and the one
+/// value a world-half assertion must not be allowed to agree on vacuously.
+const M49_EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
+
+const M49_MODULE: &str = "resource struct Held { slot: i32 }\n\n\
+                          export fun make(slot: i32): Held {\n\tHeld { slot = slot }\n}\n\n\
+                          export fun value(): i32 {\n\tlet total = 1;\n\ttotal\n}\n\n\
+                          export fun doubled(): i32 {\n\tvalue() * 2\n}\n";
+/// The entry that DECLARES a resource. Its nominal set is std's plus `Handle`.
+const M49_ENTRY_RESOURCE: &str = "import pkg::loaded::value;\n\
+                                  resource struct Handle { slot: i32 }\n\
+                                  fun main() {\n\
+                                  \tlet held = Handle { slot = value() };\n}\n";
+/// The entry that declares NONE. Same world, same key, same world-declared
+/// nominals — and a different whole set, which is what used to reject the
+/// record above.
+const M49_ENTRY_PLAIN: &str = "import pkg::loaded::value;\n\
+                               fun main() {\n\tlet n = value() + 1;\n}\n";
+
+/// M49: **two entries of one package that differ in a `resource` declaration
+/// stop invalidating each other's enrolment record.**
+///
+/// M19 T1c's restore condition was one digest over the WHOLE resource-reaching
+/// nominal set, and that set is whole-program — so an entry that declares a
+/// `resource` and a sibling entry that does not mint different digests over the
+/// same world, and each analysis threw the other's per-module enrolment away
+/// and re-walked every module body in the program. The gate is the drop
+/// planner's whole price (M42: 950–1,230 ms of 1,095–1,385 on kolt's client),
+/// so "rejected" means "paid again".
+///
+/// The condition is the WORLD-declared half now. The pin states the split as a
+/// property rather than as its consequence — the two analyses agree on the
+/// world half and DIFFER on the entry half — and then asserts the consequence
+/// too, because the property alone would still hold if the condition quietly
+/// went back to comparing both halves.
+#[test]
+fn two_entries_differing_in_a_resource_declaration_share_one_enrolment_record() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let root = std::env::temp_dir().join(format!("vilan_m49_split_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("loaded.vl"), M49_MODULE).expect("write module");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // `(diagnostics, bodies the gate walked, (world, entry) fingerprints)` — the
+    // last two are thread-locals written by the analysis, so they are read on
+    // the analysis's own thread.
+    let observe = |entry_name: &'static str, source: &'static str| {
+        let spec = spec.clone();
+        let root = root.clone();
+        on_one_thread(move || {
+            let entry = root.join(entry_name);
+            let (_program, errors) = analyze_source(
+                source,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            (
+                format!("{errors:?}"),
+                vilan_core::drop_plan_stats::asked_roots(),
+                vilan_core::drop_plan_stats::nominals_fingerprints(),
+            )
+        })
+    };
+
+    // 1. The resource-declaring entry, cold: it derives every module's
+    //    enrolment and records it.
+    let first = observe("with_resource.vl", M49_ENTRY_RESOURCE);
+    assert_eq!(first.0, "[]", "the resource entry must analyze clean");
+    assert!(
+        first.1 > 100,
+        "a cold analysis walks the whole world's bodies, not {}",
+        first.1
+    );
+    assert_ne!(
+        first.2.0, M49_EMPTY_DIGEST,
+        "the world must declare a resource of its own, or the world halves \
+         agree vacuously: {:?}",
+        first.2
+    );
+
+    // 2. The sibling entry that declares nothing, over the same world.
+    let second = observe("plain.vl", M49_ENTRY_PLAIN);
+    assert_eq!(second.0, "[]", "the plain entry must analyze clean");
+
+    // The split, stated: same world-declared nominals, different entry-declared
+    // ones. If the halves are ever re-merged, this pair is exactly the input
+    // that makes the merged digest differ.
+    assert_eq!(
+        first.2.0, second.2.0,
+        "the two entries share a world, so the WORLD-declared nominal \
+         fingerprints must agree: {:?} vs {:?}",
+        first.2, second.2
+    );
+    assert_ne!(
+        first.2.1, second.2.1,
+        "one entry declares a resource and the other does not, so the \
+         ENTRY-declared fingerprints must differ — otherwise this fixture is \
+         not testing the split: {:?} vs {:?}",
+        first.2, second.2
+    );
+
+    // The consequence: the second entry's gate walks only what it brought.
+    assert!(
+        second.1 * 10 < first.1,
+        "the plain entry must restore the resource entry's enrolment rather \
+         than re-walking the world: {} bodies asked against {}",
+        second.1,
+        first.1
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

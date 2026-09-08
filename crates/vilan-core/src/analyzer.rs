@@ -3085,9 +3085,10 @@ pub struct Analyzer<'src> {
     /// [`Analyzer::resource_reaching_roots`] answered, restored rows included.
     /// Kept so the class D store can partition it per module.
     drop_scan_roots: HashSet<Id>,
-    /// M19 T1c: the digest of the resource-reaching nominal set that enrolment
-    /// was decided against ([`ModuleTables::drop_nominals`]).
-    drop_nominals_digest: u64,
+    /// M19 T1c / M49: the digest of the WORLD-declared half of the
+    /// resource-reaching nominal set that enrolment was decided against
+    /// ([`ModuleTables::drop_nominals_world`]).
+    drop_nominals_world_digest: u64,
     // M19 T1b / T0's free fix: `source_ranges` sorted by start, for a binary
     // search instead of `source_of_id`'s linear scan. Sealed beside
     // `frozen_ranges`, from the same ranges, and empty until then — the scan
@@ -4557,7 +4558,7 @@ impl<'src> Analyzer<'src> {
             reused_table_sources: Vec::new(),
             restored_tables: RestoredTables::default(),
             drop_scan_roots: HashSet::default(),
-            drop_nominals_digest: 0,
+            drop_nominals_world_digest: 0,
             sorted_source_ranges: Vec::new(),
             type_id_sources: Vec::new(),
             reuse_derived: HashMap::default(),
@@ -9930,13 +9931,16 @@ impl<'src> Analyzer<'src> {
     /// An unresolved callee is selected outright: "this signature reaches no
     /// resource" is a claim about a signature, and one nobody could read is not
     /// a claim this predicate is allowed to make.
-    fn resource_reaching_roots(&self) -> (HashSet<Id>, u64) {
+    fn resource_reaching_roots(&self) -> (HashSet<Id>, u64, u64) {
         let mut roots: HashSet<Id> = HashSet::default();
         let nominals = self.resource_reaching_nominals();
-        let digest = Self::drop_nominals_fingerprint(&nominals);
+        // M49: the WORLD half is the restore condition; the entry half rides
+        // along for the pin (`drop_plan_stats::nominals_fingerprints`) and for
+        // nothing else — see `drop_nominals_fingerprints`.
+        let (world_digest, entry_digest) = self.drop_nominals_fingerprints(&nominals);
         if nominals.is_empty() {
             crate::drop_plan_stats::record_gate(0);
-            return (roots, digest);
+            return (roots, world_digest, entry_digest);
         }
         // M19 T1c: a reused module's enrolment is RESTORED rather than
         // re-derived. This gate is the drop planner's whole price — it walks
@@ -9946,7 +9950,7 @@ impl<'src> Analyzer<'src> {
         // `Id`s: the gate's answer is one bit per body, so nothing here has to
         // cross the TypeId boundary.
         let restored_enrolment = self.restored_tables.drop_nominals_agree
-            && self.restored_tables.drop_nominals == Some(digest);
+            && self.restored_tables.drop_nominals_world == Some(world_digest);
         if restored_enrolment {
             roots.extend(self.restored_tables.drop_roots.iter().copied());
         }
@@ -10001,18 +10005,62 @@ impl<'src> Analyzer<'src> {
             }
         }
         crate::drop_plan_stats::record_gate(asked);
-        (roots, digest)
+        (roots, world_digest, entry_digest)
     }
 
-    /// [`ModuleTables::drop_nominals`]: the resource-reaching nominal set,
-    /// hashed. Sorted first — the set is a `HashSet`, and two analyses have to
-    /// agree on the digest of the same MEMBERSHIP, never on an iteration order.
-    fn drop_nominals_fingerprint(nominals: &HashSet<Id>) -> u64 {
-        let mut ids: Vec<u32> = nominals.iter().map(|id| id.0).collect();
+    /// [`ModuleTables::drop_nominals_world`] and its entry-declared twin: the
+    /// resource-reaching nominal set, hashed in TWO halves split by the source
+    /// that declared each nominal (M49).
+    ///
+    /// M19 T1c hashed the whole set into one digest, and that made the restore
+    /// condition read a fact about the ENTRY. Two entries of one package that
+    /// differ in whether they declare a `resource` — kolt's `server.vl` and its
+    /// `probe.vl`, and every application that has a data entry beside a UI one
+    /// — mint different sets over the same world, so each one's analysis
+    /// rejected the other's enrolment record and re-walked every module body.
+    /// The record survives the split because the half it is compared on cannot
+    /// move: the world's own declarations.
+    ///
+    /// **Why the entry half is not in the condition.** The gate asks a module
+    /// body whether it reaches one of the program's resource-reaching nominals,
+    /// and a module body can only name what the module can SEE — the world.
+    /// It declares no field of an entry type (the entry is walked last, over
+    /// the world, and nothing in the world imports it) and a `Generic` names
+    /// nothing ([`Self::type_mentions_nominal`]), so the containment closure
+    /// cannot carry an entry declaration into a world nominal either. The
+    /// belt-and-braces the single digest was there for is kept, whole, over
+    /// exactly the half that can move.
+    ///
+    /// Split by DECLARING SOURCE rather than by [`Self::table_entity`]: the
+    /// world ranges are empty on the analysis that WRITES a record (nothing was
+    /// restored into it), so a range-based split would record an empty world
+    /// half and disagree with every warm reader of it. `SourceId(0)` is the
+    /// entry; [`DERIVED_SOURCE`] and an unattributed id go in the WORLD half,
+    /// which is the conservative side — an id whose origin is not plainly the
+    /// entry's file goes on being compared.
+    ///
+    /// Each half is sorted first: the set is a `HashSet`, and two analyses have
+    /// to agree on the digest of the same MEMBERSHIP, never on an iteration
+    /// order.
+    fn drop_nominals_fingerprints(&self, nominals: &HashSet<Id>) -> (u64, u64) {
+        let mut world: Vec<u32> = Vec::new();
+        let mut entry: Vec<u32> = Vec::new();
+        for id in nominals {
+            if self.source_of_id(*id) == Some(SourceId(0)) {
+                entry.push(id.0);
+            } else {
+                world.push(id.0);
+            }
+        }
+        (Self::fnv1a_ids(&mut world), Self::fnv1a_ids(&mut entry))
+    }
+
+    /// One half of [`Self::drop_nominals_fingerprints`], sorted and hashed.
+    fn fnv1a_ids(ids: &mut [u32]) -> u64 {
         ids.sort_unstable();
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for id in ids {
-            hash ^= u64::from(id);
+        for id in ids.iter() {
+            hash ^= u64::from(*id);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
@@ -10302,7 +10350,9 @@ impl<'src> Analyzer<'src> {
         // must be found.
         if !self.declares_a_resource() {
             self.drop_scan_roots = HashSet::default();
-            self.drop_nominals_digest = Self::drop_nominals_fingerprint(&HashSet::default());
+            let (world_digest, entry_digest) = self.drop_nominals_fingerprints(&HashSet::default());
+            self.drop_nominals_world_digest = world_digest;
+            crate::drop_plan_stats::record_nominals(world_digest, entry_digest);
             crate::drop_plan_stats::record(0, self.offered_drop_scan_roots());
             crate::drop_plan_stats::record_gate(0);
             return;
@@ -10312,12 +10362,13 @@ impl<'src> Analyzer<'src> {
         // true for every program that loads a std module declaring one, so it
         // enrolled EVERY body; this asks the same question of each body's own
         // types and enrolls the ones that can reach a resource.
-        let (roots, nominals_digest) = self.resource_reaching_roots();
+        let (roots, world_digest, entry_digest) = self.resource_reaching_roots();
         // M19 T1c: kept for the record the class D store writes at the end of
         // the analysis — the gate's answer per body is what a reused module
         // serves instead of having every one of them re-walked.
         self.drop_scan_roots = roots.clone();
-        self.drop_nominals_digest = nominals_digest;
+        self.drop_nominals_world_digest = world_digest;
+        crate::drop_plan_stats::record_nominals(world_digest, entry_digest);
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
         // reachability (it lowers transformer-side to the `__drop` helper), so its
@@ -31820,15 +31871,15 @@ impl<'src> Analyzer<'src> {
         // [`STALE_TABLE_PLANT`].
         //
         // M19 T1c's enrolment rows ride it too, and its restore CONDITION has to
-        // survive the plant for them to: clearing `drop_nominals` would make the
+        // survive the plant for them to: clearing `drop_nominals_world` would make the
         // gate stand down and re-derive, which is the one thing a plant must not
         // cause — a pass that quietly recomputes can never be caught serving a
         // stale row.
         if stale_table_planted() {
-            let nominals = self.restored_tables.drop_nominals;
+            let nominals = self.restored_tables.drop_nominals_world;
             let agree = self.restored_tables.drop_nominals_agree;
             self.restored_tables = RestoredTables {
-                drop_nominals: nominals,
+                drop_nominals_world: nominals,
                 drop_nominals_agree: agree,
                 ..RestoredTables::default()
             };
@@ -47306,19 +47357,26 @@ struct ModuleTables {
     /// it asked about are re-read from the module's own slots rather than
     /// recorded (the T1b/T1c section of `editor-latency.md`).
     drop_roots: Vec<Id>,
-    /// M19 T1c's restore condition, and the reason the enrolment is allowed to
-    /// be a module's own answer at all.
+    /// M19 T1c's restore condition, split by M49: the WORLD-declared half of
+    /// the resource-reaching nominal set, hashed.
     ///
     /// The gate asks each body whether it reaches one of the program's
     /// resource-reaching NOMINALS, and that set is whole-program: it is closed
     /// over every declaration's field types, so a declaration made outside this
-    /// module is in principle able to move the answer. It cannot in practice —
-    /// a module declares no field of an entry type, and a `Generic` names
-    /// nothing ([`Analyzer::type_mentions_nominal`]) — but "cannot in practice"
-    /// is exactly what a belt-and-braces condition is for, and this one costs a
-    /// `u64` compare per analysis. A record whose fingerprint disagrees with the
-    /// world it is replayed into recomputes the gate.
-    drop_nominals: u64,
+    /// module is in principle able to move the answer. Over the WORLD's own
+    /// declarations that is exactly the belt-and-braces a `u64` compare per
+    /// analysis buys, and a record whose fingerprint disagrees with the world
+    /// it is replayed into recomputes the gate.
+    ///
+    /// Over the ENTRY's declarations it bought nothing and cost the record: the
+    /// entry is walked last, over the world, and no module can name a type it
+    /// declares — so two entries of one package that differ in whether they
+    /// declare a `resource` invalidated each other's enrolment for a difference
+    /// no module body could see. The entry half is computed and reported
+    /// ([`crate::drop_plan_stats::nominals_fingerprints`]) and is deliberately
+    /// not in the condition; see
+    /// [`Analyzer::drop_nominals_fingerprints`] for the whole argument.
+    drop_nominals_world: u64,
 }
 
 impl ModuleTables {
@@ -47387,9 +47445,10 @@ struct RestoredTables {
     /// M19 T1c: the restored drop-scan enrolment, merged across every module
     /// whose record carries one.
     drop_roots: HashSet<Id>,
-    /// The fingerprint every restored module agreed on
-    /// ([`ModuleTables::drop_nominals`]); `None` when nothing was restored.
-    drop_nominals: Option<u64>,
+    /// The world-half fingerprint every restored module agreed on
+    /// ([`ModuleTables::drop_nominals_world`]); `None` when nothing was
+    /// restored.
+    drop_nominals_world: Option<u64>,
     /// Whether the records seen so far agreed on that fingerprint.
     drop_nominals_agree: bool,
 }
@@ -47411,7 +47470,7 @@ impl Default for RestoredTables {
             scalar_view_calls: HashSet::default(),
             scalar_view_refs: HashSet::default(),
             drop_roots: HashSet::default(),
-            drop_nominals: None,
+            drop_nominals_world: None,
             drop_nominals_agree: true,
         }
     }
@@ -47442,9 +47501,9 @@ impl RestoredTables {
         // Two records under one world key disagreeing about the world's own
         // nominal set is not a shape this can reach; if it ever does, the whole
         // enrolment restore stands down rather than serving half an answer.
-        match self.drop_nominals {
-            None => self.drop_nominals = Some(tables.drop_nominals),
-            Some(existing) => self.drop_nominals_agree &= existing == tables.drop_nominals,
+        match self.drop_nominals_world {
+            None => self.drop_nominals_world = Some(tables.drop_nominals_world),
+            Some(existing) => self.drop_nominals_agree &= existing == tables.drop_nominals_world,
         }
     }
 }
@@ -51441,7 +51500,7 @@ fn analyze_over_world<'src>(
         // writes, the empty ones included — a module that enrolled nothing is
         // exactly the module whose gate cost the most to answer.
         for slice in tables.values_mut() {
-            slice.drop_nominals = analyzer.drop_nominals_digest;
+            slice.drop_nominals_world = analyzer.drop_nominals_world_digest;
         }
         checked_cache_store_tables(key, &source_hashes, tables);
     }
