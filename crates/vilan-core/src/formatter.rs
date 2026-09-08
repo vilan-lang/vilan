@@ -5347,6 +5347,9 @@ impl<'src> Printer<'src> {
     /// no slot on the inline line and would be relocated), and a tail that
     /// renders on ONE line — a tail that is itself a `match` or an element tree
     /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not an inline arm.
+    ///
+    /// Shared with a `match` leg body written `{ expr }` (E150 rule A), so the
+    /// two constructs judge "an expression wearing braces" by one definition.
     fn arm_is_an_expression(
         &mut self,
         block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
@@ -5359,7 +5362,8 @@ impl<'src> Printer<'src> {
             && !self.expr_spans_lines(tail)
     }
 
-    /// One arm, in whichever form the chain chose.
+    /// One arm, in whichever form the chain chose — or one `match` leg body
+    /// written `{ expr }` (E150 rule A), which reaches the same two forms.
     fn print_arm_body(
         &mut self,
         block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
@@ -5382,6 +5386,21 @@ impl<'src> Printer<'src> {
     /// `split` is handed to the BODY and to nothing else: a pattern and a guard
     /// have no layout of their own, so a leg whose line is over budget can only
     /// break in its body.
+    ///
+    /// A body WRITTEN `=> { expr }` stays an expression on the leg's line
+    /// (E150 rule A) — E146 rule 2's shape one construct over. A leg's `=> ` is
+    /// a mid-line position by construction, exactly the position that keeps an
+    /// `if`'s arms inline, and the same argument applies: a body that is one
+    /// expression wearing braces buys nothing by expanding, and the three lines
+    /// it spends come off whatever the leg sits inside. The braces themselves
+    /// stay — dropping them would drift the token stream the safety net
+    /// compares — so this is a layout choice and not a rewrite.
+    ///
+    /// The escape hatches are E146 rule 2's, unchanged: an armed `split` (the
+    /// leg's line measured over budget and rolled back) takes the block form,
+    /// and so does a body that is legitimately a block —
+    /// [`Self::arm_is_an_expression`] is the one judge of that, shared with the
+    /// `if` arms so the two constructs cannot disagree.
     fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>, split: Split) {
         let (patterns, guard, body) = leg;
         for (index, pattern) in patterns.iter().enumerate() {
@@ -5395,6 +5414,13 @@ impl<'src> Printer<'src> {
             self.print_expr(guard);
         }
         self.out.push_str(" => ");
+        if split == Split::Off
+            && let Node::Block(block) = &body.0
+            && self.arm_is_an_expression(block)
+        {
+            self.print_arm_body(block, true);
+            return;
+        }
         self.split = split;
         self.print_expr(body);
     }
@@ -10911,6 +10937,259 @@ mod if_arm_layout {
              \tlabel\n\
              }\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod match_leg_layout {
+    //! E150 rule A — a `match` leg body WRITTEN `=> { expr }` stays an
+    //! expression on the leg's line: E146 rule 2's shape one construct over.
+    //!
+    //! A leg's `=> ` is a mid-line position by construction — there is no
+    //! reading of it where the body owns the lines below — so the argument that
+    //! keeps an `if`'s arms inline mid-line applies to a leg body without
+    //! qualification, and E146 rule 2 left the gap only because it was written
+    //! for `if`. Before this rule every braced leg body expanded to three lines
+    //! whatever it held, which is what N55's reformat did to the tree.
+    //!
+    //! The braces stay: dropping them would drift the token stream the
+    //! formatter's safety net compares, and the rule is a layout choice, not a
+    //! rewrite. `{ expr }` and a bare `expr` are two spellings the formatter
+    //! keeps apart, each canonical on one line.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+    use super::format;
+
+    /// The item's own shape. Before: three lines per leg, whatever the body
+    /// held. After: the leg is one line, the braces intact.
+    #[test]
+    fn a_braced_leg_body_stays_an_expression() {
+        assert_construct(
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => {\n\
+             \t\t\t\"more\"\n\
+             \t\t},\n\
+             \t}\n\
+             }\n",
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => { \"zero\" },\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The braces are not dropped: the unbraced spelling is its own canonical
+    /// form, and the two round-trip to themselves rather than to each other —
+    /// which is what keeps the reprint token-identical to the source.
+    #[test]
+    fn the_braces_are_kept_not_dropped() {
+        let braced = "fun label(n: i32): str {\n\
+                      \tmatch n {\n\
+                      \t\t0 => { \"zero\" },\n\
+                      \t\t_ => { \"more\" },\n\
+                      \t}\n\
+                      }\n";
+        let bare = "fun label(n: i32): str {\n\
+                    \tmatch n {\n\
+                    \t\t0 => \"zero\",\n\
+                    \t\t_ => \"more\",\n\
+                    \t}\n\
+                    }\n";
+        assert_construct(braced, braced);
+        assert_construct(bare, bare);
+        assert_ne!(format(braced), format(bare));
+    }
+
+    /// The point of the rule, in the shape it costs the most: a leg body inside
+    /// a builder ladder. Expanded, the three lines land in the middle of the
+    /// chain and the chain's own first line measures short enough never to
+    /// break — the same inversion E146 rule 2 was written for.
+    #[test]
+    fn a_braced_leg_body_keeps_a_ladder_its_shape() {
+        assert_construct(
+            "fun view_for(route: Route): Element {\n\
+             \tview(\"main\").child(match route {\n\
+             \t\tRoute::Home => {\n\
+             \t\t\thome()\n\
+             \t\t},\n\
+             \t\tRoute::About => {\n\
+             \t\t\tabout()\n\
+             \t\t},\n\
+             \t})\n\
+             }\n",
+            "fun view_for(route: Route): Element {\n\
+             \tview(\"main\").child(match route {\n\
+             \t\tRoute::Home => { home() },\n\
+             \t\tRoute::About => { about() },\n\
+             \t})\n\
+             }\n",
+        );
+    }
+
+    /// A body that is legitimately a block STAYS one, by the same three tests
+    /// an `if` arm answers — a statement, a comment with no slot on the inline
+    /// line, and a `Void` tail (a leg written for its effect).
+    #[test]
+    fn a_body_that_is_a_block_stays_a_block() {
+        // A statement: not an expression wearing braces.
+        assert_construct(
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+        );
+        // A comment inside the body has no slot on the inline line, so the
+        // block form is what keeps it where it was written.
+        assert_construct(
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\t// the only interesting case\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\t// the only interesting case\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+        );
+        // A `Void` tail — a leg written for its effect — is not an expression
+        // either, so the statement keeps its own line.
+        assert_construct(
+            "fun note(n: i32) {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t},\n\
+             \t\t_ => {\n\
+             \t\t\tlog(\"more\");\n\
+             \t\t},\n\
+             \t}\n\
+             }\n",
+            "fun note(n: i32) {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t},\n\
+             \t\t_ => {\n\
+             \t\t\tlog(\"more\");\n\
+             \t\t},\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// A body whose own rendering spans lines is not an inline body: the tail
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not one expression on
+    /// one line.
+    #[test]
+    fn a_body_whose_tail_spans_lines_expands() {
+        let source = "fun pick(n: i32, k: i32): str {\n\
+                      \tmatch n {\n\
+                      \t\t0 => {\n\
+                      \t\t\tmatch k {\n\
+                      \t\t\t\t0 => \"zero\",\n\
+                      \t\t\t\t_ => \"more\",\n\
+                      \t\t\t}\n\
+                      \t\t},\n\
+                      \t\t_ => { \"other\" },\n\
+                      \t}\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// The width rule still decides. A leg's line is a measured line, so a leg
+    /// whose inline body puts it over the budget rolls back and reprints with
+    /// the split armed — and an armed split is exactly what the inline form
+    /// yields to, so the body expands again.
+    #[test]
+    fn a_leg_over_the_budget_expands_its_body_again() {
+        let inline = "\t\tDialFailure::Refused(let status) => { RpcError::Transport(i\"the server refused the connection ({status})\") },";
+        assert_over_budget(inline);
+        assert_construct(
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => {\n\
+             \t\t\tRpcError::Transport(i\"the server refused the connection ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => { RpcError::Transport(\"other\") },\n\
+             \t}\n\
+             }\n",
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => {\n\
+             \t\t\tRpcError::Transport(i\"the server refused the connection ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => { RpcError::Transport(\"other\") },\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check`, so a two-pass rule is a red gate on a tree nobody
+    /// edited. Asserted from the UNFORMATTED side, which is where it would show.
+    #[test]
+    fn every_leg_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(n: i32): str {\n\tmatch n {\n\t\t0 => {\n\t\t\t\"zero\"\n\t\t},\n\
+                 \t\t_ => {\n\t\t\t\"more\"\n\t\t},\n\t}\n}\n",
+                true,
+            ),
+            (
+                "fun b(n: i32): str {\n\tmatch n {\n\t\t0 => { \"zero\" },\n\
+                 \t\t_ => { \"more\" },\n\t}\n}\n",
+                false,
+            ),
+            (
+                "fun c(n: i32): str {\n\tmatch n {\n\t\t0 => {\n\t\t\tlog(\"zero\");\n\
+                 \t\t\t\"zero\"\n\t\t},\n\t\t_ => { \"more\" },\n\t}\n}\n",
+                false,
+            ),
+            (
+                "fun d(status: str): RpcError {\n\tmatch dial(status) {\n\
+                 \t\tDialFailure::Refused(let status) => { RpcError::Transport(\
+                 i\"the server refused the connection ({status})\") },\n\
+                 \t\tDialFailure::Other => { RpcError::Transport(\"other\") },\n\t}\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
     }
 }
 
