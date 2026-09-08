@@ -1089,6 +1089,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__local_get",
         "__session_get",
         "__dom_window",
+        "__dom_bounding_rect",
+        "__dom_query_all",
         "__router_path",
         "__nursery_new",
         "__nursery_new_detached",
@@ -1316,6 +1318,28 @@ fn helper_source(name: &str) -> &'static str {
         // `__router_path` exists. This is what makes `window` a listen TARGET
         // with the same verbs `Element` carries (`proposal/router.md` §5.1).
         "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
+        // `Element::bounding_rect`: ONE `getBoundingClientRect()` (which forces
+        // layout) read into the four numbers `std::dom`'s `DomRect` carries.
+        // The array IS the struct's runtime form — a struct is an array in
+        // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
+        // builds an `Option`. Its order is `left, top, width, height`, and
+        // `DomRect`'s field order in `vilan/std/src/browser/dom.vl` must match;
+        // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
+        // four values by name, so a reorder is a red test rather than silence.
+        "__dom_bounding_rect" => {
+            "function __dom_bounding_rect(element) {\n\
+             \tconst rect = element.getBoundingClientRect();\n\
+             \treturn [ rect.left, rect.top, rect.width, rect.height ];\n\
+             }"
+        }
+        // `Element::query_selector_all`: the scoped twin of the document-level
+        // `Intrinsic::QuerySelectorAll`, and `Array.from` for the same reason —
+        // `querySelectorAll` yields a NodeList, which a `List` would mishandle.
+        "__dom_query_all" => {
+            "function __dom_query_all(element, selector) {\n\
+             \treturn Array.from(element.querySelectorAll(selector));\n\
+             }"
+        }
         // Router glue (std::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",

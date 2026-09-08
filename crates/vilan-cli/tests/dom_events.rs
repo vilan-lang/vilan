@@ -509,8 +509,9 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
     };
 
     // Registration: the host STORES the vilan closure and calls it later, which
-    // is the audit table's own sentence for `browser/dom.vl`.
-    for name in ["on", "on_event"] {
+    // is the audit table's own sentence for `browser/dom.vl`. `on_event_capture`
+    // (A59) is the same sentence in the other phase and carries the same mark.
+    for name in ["on", "on_event", "on_event_capture"] {
         let (binding, retains) = marking(name);
         assert!(
             binding.contains("addEventListener"),
@@ -522,17 +523,20 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
              the call. Declared as `[extern({binding})]`"
         );
     }
-    // Both targets declare both verbs — `Element` and `Window` each contribute a
-    // pair, so four registrations in total, and a missing one would silently
-    // shrink the surface `listen` is built on.
+    // Both targets declare every verb — `Element` and `Window` each contribute
+    // `on`, `on_event` and (A59) `on_event_capture`, so six registrations in
+    // total, and a missing one would silently shrink the surface `listen` and
+    // `listen_capture` are built on. The number is spelled by the names, so a
+    // future verb is added here rather than absorbed by a bumped count.
     let registrations = externs
         .iter()
         .filter(|(_, binding, _)| binding.contains("addEventListener"))
         .count();
     assert_eq!(
-        registrations, 4,
-        "both targets must declare `on` and `on_event`; found {registrations} \
-         addEventListener bindings"
+        registrations,
+        2 * ["on", "on_event", "on_event_capture"].len(),
+        "both targets must declare `on`, `on_event` and `on_event_capture`; \
+         found {registrations} addEventListener bindings"
     );
     assert!(
         externs
@@ -545,25 +549,27 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
     // Removal: nothing is kept past the call, so marking it would be the
     // over-marking the §S4 audit caught on `appendChild` (proposal/router.md
     // §5.2). kolt's hand-roll marks both; this surface deliberately does not.
-    let (binding, retains) = marking("off_event");
-    assert!(
-        binding.contains("removeEventListener"),
-        "`off_event` should bind removeEventListener; got `{binding}`"
-    );
-    assert!(
-        !retains,
-        "`off_event` must NOT be marked `retains` — removal keeps nothing past \
-         the call. Declared as `[extern({binding})]`"
-    );
+    for name in ["off_event", "off_event_capture"] {
+        let (binding, retains) = marking(name);
+        assert!(
+            binding.contains("removeEventListener"),
+            "`{name}` should bind removeEventListener; got `{binding}`"
+        );
+        assert!(
+            !retains,
+            "`{name}` must NOT be marked `retains` — removal keeps nothing past \
+             the call. Declared as `[extern({binding})]`"
+        );
+    }
     let removals = externs
         .iter()
         .filter(|(_, binding, _)| binding.contains("removeEventListener"))
         .collect::<Vec<_>>();
     assert_eq!(
         removals.len(),
-        2,
-        "both targets must declare the removal twin `listen` is built on; found \
-         {}",
+        2 * ["off_event", "off_event_capture"].len(),
+        "both targets must declare the removal twins `listen` and \
+         `listen_capture` are built on; found {}",
         removals.len()
     );
     assert!(

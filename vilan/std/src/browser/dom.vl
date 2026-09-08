@@ -42,6 +42,65 @@ external fun query_selector(selector: str): Element;
 /// as a `List` (a real array, so `map`/`for`-in/`len` all work).
 external fun query_selector_all(selector: str): List<Element>;
 
+/// An element's box in VIEWPORT coordinates — what `Element::bounding_rect`
+/// measures, and the one thing in this module that is a VALUE rather than a
+/// handle. That is deliberate: a measurement is a fact about a moment, so it
+/// copies, compares, and can be parked in a signal, where a live host rect
+/// would keep changing under whoever held it.
+///
+/// The host's `DOMRect` carries `right`/`bottom` too; they are `left + width`
+/// and `top + height`, so they are methods here rather than fields that could
+/// disagree with the pair they are derived from.
+struct DomRect {
+	/// Distance from the viewport's left edge to the box's left edge.
+	left: f64,
+	/// Distance from the viewport's top edge to the box's top edge.
+	top: f64,
+	/// The box's width, borders included; fractional, unlike `offset_width`.
+	width: f64,
+	/// The box's height, borders included.
+	height: f64,
+}
+
+impl DomRect {
+	/// The box's right edge (`left + width`).
+	fun right(self): f64 {
+		self.left + self.width
+	}
+
+	/// The box's bottom edge (`top + height`).
+	fun bottom(self): f64 {
+		self.top + self.height
+	}
+}
+
+/// The host `ResizeObserver` — the raw class, in the same relation to
+/// `Element::observe_resize` that `on_event`/`off_event` are to `listen`: it is
+/// what the wrapper is built on, and reaching for it means holding the
+/// disconnect yourself. An observer the host holds a callback for outlives
+/// every vilan value that mentions it until `disconnect` runs, so an
+/// unmanaged one is a leak by construction.
+external struct ResizeObserver;
+
+impl ResizeObserver {
+	/// `new ResizeObserver(callback)`. The host calls `callback` once when
+	/// observation of an element begins and again on every size change; it
+	/// carries no argument here, because the element whose size changed is the
+	/// one the caller passed to `observe`.
+	[extern(new, "ResizeObserver", retains)]
+	external fun new(callback: || void): ResizeObserver;
+
+	/// `observer.observe(target)` — start watching `target`'s size.
+	[extern(method, "observe")]
+	external fun observe(self, target: Element): void;
+
+	/// `observer.disconnect()` — stop watching everything. Idempotent in the
+	/// host, which is what lets `observe_resize`'s `Subscription` be disposed
+	/// twice safely.
+	[extern(method, "disconnect")]
+	external fun disconnect(self): void;
+}
+
 impl Element {
 	/// Sets the element's text content (`element.textContent = text`).
 	[extern(set, "textContent")]
@@ -54,6 +113,14 @@ impl Element {
 	/// Sets an attribute (`element.setAttribute(name, value)`).
 	[extern(method, "setAttribute")]
 	external fun set_attribute(self, name: str, value: str): void;
+
+	/// Removes an attribute (`element.removeAttribute(name)`) — the other half
+	/// of `set_attribute`, and the half a BOOLEAN attribute needs: `disabled`,
+	/// `open`, `aria-hidden` and the rest are read by their PRESENCE, so the
+	/// false state is the attribute being gone, not `="false"`. Removing an
+	/// attribute that is not there is a no-op, not an error.
+	[extern(method, "removeAttribute")]
+	external fun remove_attribute(self, name: str): void;
 
 	/// Sets a CSS custom property (`element.style.setProperty(name, value)`) —
 	/// the DOM end of the styling system's dynamic-value channel
@@ -81,6 +148,57 @@ impl Element {
 	/// Shows or hides the element (`element.hidden = hidden`).
 	[extern(set, "hidden")]
 	external fun set_hidden(self, hidden: bool): void;
+
+	/// The element's box in VIEWPORT coordinates
+	/// (`element.getBoundingClientRect()`) — where an anchored overlay reads
+	/// its anchor, and where a drag reads the frame it is dragging inside.
+	///
+	/// Reading it FORCES LAYOUT, so measure once and pass the `DomRect` value
+	/// around rather than re-measuring per field. A DETACHED element measures
+	/// 0×0 — ask `is_connected` first, or position on a rect that says the
+	/// element is nowhere.
+	[extern("__dom_bounding_rect")]
+	external fun bounding_rect(self): DomRect;
+
+	/// The element's laid-out width in CSS pixels, borders and scrollbar
+	/// included and ROUNDED to an integer (`element.offsetWidth`) — the cheap
+	/// measurement beside `bounding_rect`'s fractional box, and the one to
+	/// reach for when the question is "how wide is it" rather than "where is
+	/// it". 0 for a detached element and for `display: none`.
+	[extern(get, "offsetWidth")]
+	external fun offset_width(self): f64;
+
+	/// The element's laid-out height (`element.offsetHeight`), rounded exactly
+	/// as `offset_width` is.
+	[extern(get, "offsetHeight")]
+	external fun offset_height(self): f64;
+
+	/// Whether the element is attached to the document (`element.isConnected`).
+	///
+	/// The guard measurement waits on: a detached element measures 0×0, so
+	/// positioning that runs before the node is in the tree positions against
+	/// nothing and reads as a bug about the layout rather than about the
+	/// timing.
+	[extern(get, "isConnected")]
+	external fun is_connected(self): bool;
+
+	/// Whether `other` IS this element or lies inside it
+	/// (`element.contains(other)`).
+	///
+	/// The outside-click question: a dismiss handler asks it of the event's
+	/// `target` — "did this click land in my panel" — which is the one question
+	/// a document-level listener cannot answer from coordinates.
+	[extern(method, "contains")]
+	external fun contains(self, other: Element): bool;
+
+	/// Every DESCENDANT matching a CSS selector
+	/// (`element.querySelectorAll(selector)`), as a `List` — the scoped form of
+	/// the module-level `query_selector_all`, which searches the whole
+	/// document. A real array like its document twin, so `map`/`for`-in/`len`
+	/// all work; empty when nothing matches, which is why it is the list form
+	/// and not a nullable one.
+	[extern("__dom_query_all")]
+	external fun query_selector_all(self, selector: str): List<Element>;
 
 	/// Moves keyboard focus to the element (`element.focus()`). HTML's
 	/// `autofocus` attribute only fires on a document's initial parse, so
@@ -135,6 +253,58 @@ impl Element {
 			self.off_event(event, handler);
 		})
 	}
+
+	/// `element.addEventListener(event, handler, true)` — the CAPTURE-phase
+	/// registration. `listen_capture` is the form that holds the pairing;
+	/// this and its `off` twin are the raw halves, exactly as
+	/// `on_event`/`off_event` are for the bubble phase.
+	[extern(method, "addEventListener", retains)]
+	external fun on_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
+
+	/// `element.removeEventListener(event, handler, true)` — capture's
+	/// teardown. The PHASE is part of the identity the host matches on, so a
+	/// capture listener cannot be removed by the bubble-phase `off_event` and
+	/// vice versa; that is why this is a second pair rather than a flag.
+	[extern(method, "removeEventListener")]
+	external fun off_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
+
+	/// `listen`, in the CAPTURE phase — same `[must_use]` `Subscription`
+	/// contract, opposite direction of travel.
+	///
+	/// Capture runs the ancestors' listeners on the way DOWN to the target,
+	/// before the target's own; bubble runs them on the way back up. Two things
+	/// need the downward pass. Events that do not bubble at all — `scroll`,
+	/// `focus`, `blur` — are only heard from an ancestor in capture, which is
+	/// how an anchored menu hears every scrolling ancestor at once and stays on
+	/// its element while the page moves under it. And a listener that must run
+	/// BEFORE the target's own (a dismiss guard, a modal's key trap) has to be
+	/// in capture, because bubble is by definition too late.
+	[must_use]
+	fun listen_capture(self, event: str, handler: |Event| void): Subscription {
+		self.on_event_capture(event, handler, true);
+		Subscription::teardown(|| {
+			self.off_event_capture(event, handler, true);
+		})
+	}
+
+	/// Runs `on_resize` whenever this element's size changes — and ONCE when
+	/// observation starts, which is what makes it a first-layout hook as well
+	/// as a change hook: an overlay can position itself from the same callback
+	/// that will re-position it later, instead of racing the first render.
+	///
+	/// The wrapper, not the raw `ResizeObserver`, is the form to reach for
+	/// (`[must_use]`, and owned exactly as `listen`'s subscription is): hand it
+	/// to a scope with `get_owner().take(element.observe_resize(..))`, or
+	/// `dispose` it by hand. Disposing disconnects the observer, and disposing
+	/// twice is safe.
+	[must_use]
+	fun observe_resize(self, on_resize: || void): Subscription {
+		let observer = ResizeObserver::new(on_resize);
+		observer.observe(self);
+		Subscription::teardown(|| {
+			observer.disconnect();
+		})
+	}
 }
 
 /// The host `window` — a listen TARGET, opaque exactly as `Element` is
@@ -172,6 +342,29 @@ impl Window {
 		self.on_event(event, handler);
 		Subscription::teardown(|| {
 			self.off_event(event, handler);
+		})
+	}
+
+	/// `window.addEventListener(event, handler, true)` — the raw capture-phase
+	/// registration, `Element::on_event_capture`'s twin on the window.
+	[extern(method, "addEventListener", retains)]
+	external fun on_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
+
+	/// `window.removeEventListener(event, handler, true)` — capture's teardown,
+	/// phase-matched exactly as `Element::off_event_capture` is.
+	[extern(method, "removeEventListener")]
+	external fun off_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
+
+	/// `listen`, in the CAPTURE phase. On the WINDOW this is the form that
+	/// hears `scroll` from every scrolling ancestor at once: `scroll` does not
+	/// bubble, so a bubble-phase window listener hears only the document's own
+	/// scrolling and an anchored overlay drifts off its element the moment the
+	/// page's inner panel is what moved.
+	[must_use]
+	fun listen_capture(self, event: str, handler: |Event| void): Subscription {
+		self.on_event_capture(event, handler, true);
+		Subscription::teardown(|| {
+			self.off_event_capture(event, handler, true);
 		})
 	}
 }
@@ -242,4 +435,17 @@ impl Event {
 	/// capture no element at all.
 	[extern(get, "target.value")]
 	external fun target_value(self): str;
+
+	/// The element the event was dispatched to (`event.target`) — what an
+	/// outside-click guard hands to `Element::contains`, and the only reason
+	/// this exists: a listener on the document or the window is told WHERE the
+	/// event happened by nothing else.
+	///
+	/// Read `target_value` instead when the question is what an input holds.
+	/// The element is the sharp end of the same read (`proposal/lifetimes.md`
+	/// §5, V3): holding it past the handler re-opens the element ↔ listener
+	/// cycle that straddles the language/host boundary, which no vilan-side
+	/// disposal can see both halves of. Ask it a question and drop it.
+	[extern(get, "target")]
+	external fun target(self): Element;
 }

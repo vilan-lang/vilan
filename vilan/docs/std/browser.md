@@ -17,16 +17,29 @@ fun create_text_node(content: str): Text                   // a fresh text node
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
 
+struct DomRect { left: f64, top: f64, width: f64, height: f64 }   // a VALUE, not a handle
+impl DomRect {
+	fun right(self): f64                               // left + width
+	fun bottom(self): f64                              // top + height
+}
+
 impl Element {
 	fun set_text(self, text: str)                      // textContent =
 	fun set_class(self, name: str)                     // className =
 	fun set_attribute(self, name: str, value: str)
+	fun remove_attribute(self, name: str)              // set_attribute's other half
 	fun set_style_property(self, name: str, value: str) // style.setProperty (CSS custom props)
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
+	fun bounding_rect(self): DomRect                   // getBoundingClientRect — forces layout
+	fun offset_width(self): f64                        // offsetWidth — laid out, rounded
+	fun offset_height(self): f64                       // offsetHeight
+	fun is_connected(self): bool                       // attached to the document?
+	fun contains(self, other: Element): bool           // other is this element or inside it
+	fun query_selector_all(self, selector: str): List<Element>   // scoped to this subtree
 	fun focus(self)                                    // move keyboard focus here
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
@@ -34,6 +47,17 @@ impl Element {
 	fun on_event(self, event: str, handler: |Event| void)
 	fun off_event(self, event: str, handler: |Event| void)   // listen's teardown
 	fun listen(self, event: str, handler: |Event| void): Subscription   // must_use
+	fun on_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun off_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun listen_capture(self, event: str, handler: |Event| void): Subscription   // must_use
+	fun observe_resize(self, on_resize: || void): Subscription           // must_use
+}
+
+external struct ResizeObserver;      // the raw class behind observe_resize
+impl ResizeObserver {
+	fun new(callback: || void): ResizeObserver
+	fun observe(self, target: Element)
+	fun disconnect(self)
 }
 
 external struct Window;              // the window — a listen target, like Element
@@ -43,6 +67,9 @@ impl Window {
 	fun on_event(self, event: str, handler: |Event| void)
 	fun off_event(self, event: str, handler: |Event| void)
 	fun listen(self, event: str, handler: |Event| void): Subscription   // must_use
+	fun on_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun off_event_capture(self, event: str, handler: |Event| void, capture: bool)
+	fun listen_capture(self, event: str, handler: |Event| void): Subscription   // must_use
 }
 
 external struct Text;                // a text node — text only, no attributes
@@ -60,6 +87,7 @@ impl Event {
 	fun alt_key(self): bool
 	fun key(self): str           // "Enter", "Escape", "a", …
 	fun target_value(self): str  // event.target.value — the input's text
+	fun target(self): Element    // event.target — what contains() is asked about
 	fun pointer_x(self): f64     // clientX — where the pointer is, in the viewport
 	fun pointer_y(self): f64     // clientY
 }
@@ -106,6 +134,65 @@ handler should be too:
 
 ```vilan,fragment
 view("input").on_event("input", |event| query.set(event.target_value()))
+```
+
+**Measurement is a value, and it forces layout.** `bounding_rect` returns a
+`DomRect` — four numbers copied out of the host box, so it compares, parks in a
+signal, and does not change under whoever is holding it. Reading it costs a
+layout, so measure once and pass the value on. `offset_width`/`offset_height`
+are the cheap, rounded pair for "how big is it" where the rect is the
+fractional "where is it".
+
+A **detached** element measures 0×0 whatever its styles say, which is why
+`is_connected` exists: positioning that runs before the node is in the tree
+positions against nothing, and reads as a layout bug rather than a timing one.
+
+```vilan,fragment
+if panel.is_connected() {
+	let anchor = button.bounding_rect();
+	panel.set_style_property("--x", i"{anchor.left}px");
+	panel.set_style_property("--y", i"{anchor.bottom()}px");
+}
+```
+
+**`listen_capture` is `listen` in the other phase.** Capture runs the
+ancestors' listeners on the way *down* to the target, before the target's own;
+bubble runs them on the way back up. Two things need the downward pass: events
+that do not bubble at all (`scroll`, `focus`, `blur`) are heard from an
+ancestor only in capture — which is how an anchored menu hears every scrolling
+ancestor at once and stays on its element while the page moves under it — and a
+listener that must run *before* the target's own (a dismiss guard, a modal's
+key trap) has nowhere else to be. The phase is part of the identity the host
+matches on, so a capture listener is not removable by the bubble-phase
+`off_event`; that is why there is a second raw pair rather than a flag.
+
+`observe_resize` is the wrapper over `ResizeObserver`, and the form to reach
+for: it fires **once when observation starts** — so the first layout and every
+later one run through the same callback — and its `Subscription` disconnects
+the observer. The bare class is there for what the wrapper doesn't cover, and
+leaks unless you disconnect it yourself.
+
+```vilan,fragment
+let sizing = get_owner().take(panel.observe_resize(|| reposition(panel)));
+let scrolls = get_owner().take(window().listen_capture("scroll", |_| reposition(panel)));
+let outside = get_owner().take(window().listen_capture("pointerdown", |event| {
+	if !panel.contains(event.target()) {
+		dismiss();
+	}
+}));
+```
+
+`remove_attribute` is `set_attribute`'s other half, and the half a **boolean**
+attribute needs: `disabled`, `open`, `aria-hidden` and the rest are read by
+their presence, so the false state is the attribute being gone, not
+`="false"`.
+
+```vilan,fragment
+if is_open {
+	panel.set_attribute("open", "");
+} else {
+	panel.remove_attribute("open");
+}
 ```
 
 ## std::ui

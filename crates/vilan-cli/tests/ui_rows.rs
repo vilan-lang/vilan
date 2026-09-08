@@ -48,6 +48,10 @@ class StubElement {
         this.children = [];
         this.parent = null;
         this.listeners = {};
+        // A59: capture-phase registrations are a SEPARATE table, because the
+        // host matches on the phase as part of a listener's identity — a
+        // capture listener is not removable by a bubble-phase `off_event`.
+        this.captureListeners = {};
         this._text = "";
         this.value = "";
         this.attributes = {};
@@ -57,6 +61,7 @@ class StubElement {
     set textContent(text) { this._text = text; this.children = []; }
     get textContent() { return this._text; }
     setAttribute(name, value) { this.attributes[name] = value; }
+    removeAttribute(name) { delete this.attributes[name]; }
     appendChild(child) {
         if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
         child.parent = this;
@@ -69,8 +74,48 @@ class StubElement {
         }
     }
     replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
+    addEventListener(event, handler, capture) {
+        const table = capture ? this.captureListeners : this.listeners;
+        (table[event] = table[event] || []).push(handler);
+    }
+    removeEventListener(event, handler, capture) {
+        const table = capture ? this.captureListeners : this.listeners;
+        table[event] = (table[event] || []).filter(registered => registered !== handler);
+    }
     focus() { this.focused = true; global.focusLog.push(describe(this)); }
+    // A59: the stub has no layout engine, so a measured box comes from
+    // `global.boxes` keyed by tag — a harness sets it before requiring the
+    // bundle. The rule that IS modelled is the one the binding exists to let a
+    // caller wait on: a DETACHED element measures 0x0, whatever the table says.
+    getBoundingClientRect() {
+        const zero = { left: 0, top: 0, width: 0, height: 0 };
+        return inDocument(this) ? ((global.boxes || {})[this.tagName] || zero) : zero;
+    }
+    get offsetWidth() { return Math.round(this.getBoundingClientRect().width); }
+    get offsetHeight() { return Math.round(this.getBoundingClientRect().height); }
+    get isConnected() { return inDocument(this); }
+    contains(other) {
+        for (let walk = other; walk; walk = walk.parent) if (walk === this) return true;
+        return false;
+    }
+    // Tag-name selectors only — enough to ask "which of my descendants", which
+    // is the whole question the scoped binding answers.
+    querySelectorAll(selector) {
+        const found = [];
+        const walk = (node) => {
+            for (const child of node.children) {
+                if (child.tagName === selector) found.push(child);
+                walk(child);
+            }
+        };
+        walk(this);
+        return found;
+    }
+    find(predicate) {
+        if (predicate(this)) return this;
+        for (const child of this.children) { const hit = child.find(predicate); if (hit) return hit; }
+        return null;
+    }
 }
 const documentRoot = new StubElement("root");
 global.focusLog = [];
@@ -81,7 +126,47 @@ global.document = {
     querySelector: () => null,
     querySelectorAll: () => [],
 };
-global.window = { addEventListener: () => {} };
+const windowListeners = { bubble: {}, capture: {} };
+global.window = {
+    addEventListener: (event, handler, capture) => {
+        const table = capture ? windowListeners.capture : windowListeners.bubble;
+        (table[event] = table[event] || []).push(handler);
+    },
+    removeEventListener: (event, handler, capture) => {
+        const table = capture ? windowListeners.capture : windowListeners.bubble;
+        table[event] = (table[event] || []).filter(registered => registered !== handler);
+    },
+};
+/// A59: dispatch the way the host does — the window's and every ancestor's
+/// CAPTURE listeners on the way DOWN to the target, then the target's own and
+/// every ancestor's on the way back UP. The order is the whole point of the
+/// capture surface, so the stub has to get it right rather than fire a list.
+function dispatchEvent(target, type, extra = {}) {
+    const chain = [];
+    for (let walk = target; walk; walk = walk.parent) chain.unshift(walk);
+    const event = { target, type, preventDefault() { this.prevented = true; }, ...extra };
+    for (const handler of (windowListeners.capture[type] || [])) handler(event);
+    for (const node of chain) for (const handler of (node.captureListeners[type] || [])) handler(event);
+    for (const node of chain.slice().reverse()) for (const handler of (node.listeners[type] || [])) handler(event);
+    for (const handler of (windowListeners.bubble[type] || [])) handler(event);
+    return event;
+}
+/// A59: the host `ResizeObserver`. `observe` fires the callback ONCE straight
+/// away, as the real one does — that is what makes `observe_resize` a
+/// first-layout hook — and `disconnect` forgets every target, so a disconnected
+/// observer is silent for `resize(..)` below.
+const resizeObservers = [];
+global.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; this.targets = []; resizeObservers.push(this); }
+    observe(target) { this.targets.push(target); this.callback(); }
+    disconnect() { this.targets = []; }
+};
+/// Fire every observer still watching `element` — a size change.
+global.resize = (element) => {
+    for (const observer of resizeObservers) {
+        if (observer.targets.includes(element)) observer.callback();
+    }
+};
 /// Whether `node` is reachable from the document root by parent links — the
 /// question `on_mount` exists to answer.
 function inDocument(node) {
@@ -104,6 +189,8 @@ global.inDocument = inDocument;
 global.describe = describe;
 global.flatten = flatten;
 global.documentRoot = documentRoot;
+global.dispatchEvent = dispatchEvent;
+global.windowListeners = windowListeners;
 "##;
 
 /// Builds `app.vl` for the browser with the real CLI and runs `harness.js`
@@ -761,5 +848,229 @@ fn b255_an_in_place_remove_under_bind_each_by_keeps_the_surviving_rows() {
     assert_eq!(
         identities, expected,
         "the surviving rows must keep their elements, in order; got:\n{stdout}"
+    );
+}
+
+// --- A59: measurement, observation, and un-setting ---------------------------
+
+/// The measurement surface over one mounted panel and one detached element:
+/// `bounding_rect` (and its derived edges), the rounded `offset_*` pair,
+/// `is_connected`, `contains`, the element-scoped `query_selector_all`, and
+/// `remove_attribute` — every binding kolt's overlay hand-declared.
+const MEASURE: &str = r#"import std::dom::{ create_element, get_element_by_id };
+import std::io::print;
+import std::ui::{ mount_root, view };
+
+fun main() {
+	let _root = mount_root("app", || {
+		view("section")
+			.attr("data-open", "")
+			.attr("data-tag", "kept")
+			.child(view("li").text("a"))
+			.child(view("li").text("b"))
+	});
+	let root = get_element_by_id("app");
+	let panels = root.query_selector_all("section");
+	let found = panels.len();
+	print(i"panels={found}");
+
+	let panel = panels[0];
+	let box = panel.bounding_rect();
+	print(i"rect={box.left},{box.top},{box.width},{box.height}");
+	let right = box.right();
+	let bottom = box.bottom();
+	print(i"edges={right},{bottom}");
+	let width = panel.offset_width();
+	let height = panel.offset_height();
+	print(i"offset={width},{height}");
+	let connected = panel.is_connected();
+	print(i"connected={connected}");
+
+	// A DETACHED element measures 0x0 whatever the layout would say — the rule
+	// `is_connected` exists to let a caller wait on.
+	let loose = create_element("section");
+	let loose_box = loose.bounding_rect();
+	let loose_width = loose.offset_width();
+	let loose_connected = loose.is_connected();
+	print(i"detached={loose_box.width},{loose_box.height},{loose_width},{loose_connected}");
+
+	let items = panel.query_selector_all("li");
+	let item_count = items.len();
+	print(i"items={item_count}");
+	let has_child = panel.contains(items[0]);
+	let has_self = panel.contains(panel);
+	let has_loose = panel.contains(loose);
+	print(i"contains={has_child},{has_self},{has_loose}");
+
+	panel.remove_attribute("data-open");
+	// Removing what is not there is a no-op, not an error.
+	panel.remove_attribute("data-never-set");
+}
+
+main();
+"#;
+
+#[test]
+fn a59_measurement_reads_the_host_box_and_a_detached_element_reads_zero() {
+    let harness = format!(
+        "{DOM_STUB}\n\
+         global.boxes = {{ section: {{ left: 12, top: 30, width: 200.5, height: 40.25 }} }};\n\
+         require(\"./app.js\");\n\
+         const panel = documentRoot.find(node => node.tagName === \"section\");\n\
+         console.log(\"attributes=\" + Object.keys(panel.attributes).join(\",\"));\n"
+    );
+    let stdout = build_and_run("a59_measure", MEASURE, &harness);
+    let expected = [
+        "panels=1",
+        // The rect is FRACTIONAL and the offsets are rounded — the reason both
+        // exist, and the one difference a caller has to know about.
+        "rect=12,30,200.5,40.25",
+        "edges=212.5,70.25",
+        "offset=201,40",
+        "connected=true",
+        "detached=0,0,0,false",
+        "items=2",
+        // contains: a descendant, the element ITSELF (the host says yes, and an
+        // outside-click guard depends on it), and an unrelated element.
+        "contains=true,true,false",
+        // `remove_attribute` unset the one it names and left the other alone.
+        "attributes=data-tag",
+    ];
+    for line in expected {
+        assert!(
+            stdout.lines().any(|printed| printed == line),
+            "expected the line `{line}`; got:\n{stdout}"
+        );
+    }
+}
+
+/// The capture phase: a listener registered with `listen_capture` runs on the
+/// way DOWN — before the target's own — and a disposed one is gone from the
+/// capture table rather than from the bubble table it never joined.
+const CAPTURE: &str = r#"import std::dom::{ get_element_by_id, window };
+import std::io::print;
+import std::ui::{ mount_root, view };
+
+fun main() {
+	let _root = mount_root("app", || {
+		view("section").child(view("button").text("go"))
+	});
+	let root = get_element_by_id("app");
+	let panel = root.query_selector_all("section")[0];
+	let button = root.query_selector_all("button")[0];
+
+	let _kept = panel.listen_capture("click", |event| {
+		let inside = panel.contains(event.target());
+		print(i"panel-capture inside={inside}");
+	});
+	let _bubble = panel.listen("click", |_event| print("panel-bubble"));
+	button.on_event("click", |_event| print("button-target"));
+
+	// Disposed before anything is dispatched: the capture registration must be
+	// gone, and the phase is part of the identity the host matches on.
+	let dropped = panel.listen_capture("click", |_event| print("panel-capture-dropped"));
+	dropped.dispose();
+
+	// `scroll` does not bubble, so the window hears an inner panel's scrolling
+	// only in capture.
+	let _scroll = window().listen_capture("scroll", |_event| print("window-capture-scroll"));
+	let scroll_dropped = window().listen_capture("scroll", |_event| print("window-scroll-dropped"));
+	scroll_dropped.dispose();
+	print("armed");
+}
+
+main();
+"#;
+
+#[test]
+fn a59_capture_listeners_run_before_the_target_and_dispose_by_phase() {
+    let harness = format!(
+        "{DOM_STUB}\n\
+         require(\"./app.js\");\n\
+         const panel = documentRoot.find(node => node.tagName === \"section\");\n\
+         const button = documentRoot.find(node => node.tagName === \"button\");\n\
+         console.log(\"capture-registered=\" + panel.captureListeners.click.length);\n\
+         console.log(\"bubble-registered=\" + panel.listeners.click.length);\n\
+         console.log(\"window-capture-registered=\" + windowListeners.capture.scroll.length);\n\
+         dispatchEvent(button, \"click\");\n\
+         dispatchEvent(panel, \"scroll\");\n"
+    );
+    let stdout = build_and_run("a59_capture", CAPTURE, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Exactly one of each survived: disposing a capture subscription removed the
+    // capture registration and touched no bubble one.
+    for line in [
+        "capture-registered=1",
+        "bubble-registered=1",
+        "window-capture-registered=1",
+    ] {
+        assert!(
+            lines.contains(&line),
+            "expected the line `{line}`; got:\n{stdout}"
+        );
+    }
+    let order: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("panel-") || line.starts_with("button-"))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["panel-capture inside=true", "button-target", "panel-bubble"],
+        "capture must run on the way DOWN (before the target), bubble on the way back up; got:\n{stdout}"
+    );
+    assert!(
+        lines.contains(&"window-capture-scroll"),
+        "a window capture listener must hear a scroll that never bubbles; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("dropped"),
+        "a disposed capture subscription must fire nothing; got:\n{stdout}"
+    );
+}
+
+/// Resize observation: `observe_resize` fires ONCE when observation starts (the
+/// first-layout hook), fires again on a size change, and its `Subscription`
+/// disconnects the observer.
+const RESIZE: &str = r#"import std::dom::get_element_by_id;
+import std::io::print;
+import std::ui::{ mount_root, view };
+
+fun main() {
+	let _root = mount_root("app", || view("section"));
+	let panel = get_element_by_id("app").query_selector_all("section")[0];
+	print("observing");
+	let _watch = panel.observe_resize(|| print("resized"));
+	let dropped = panel.observe_resize(|| print("dropped-resize"));
+	dropped.dispose();
+	print("armed");
+}
+
+main();
+"#;
+
+#[test]
+fn a59_observe_resize_fires_on_first_layout_and_stops_with_its_subscription() {
+    let harness = format!(
+        "{DOM_STUB}\n\
+         require(\"./app.js\");\n\
+         const panel = documentRoot.find(node => node.tagName === \"section\");\n\
+         resize(panel);\n"
+    );
+    let stdout = build_and_run("a59_resize", RESIZE, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "observing",
+            // Once at `observe` — the first-layout hook.
+            "resized",
+            // The second observer also fires once, then is disposed.
+            "dropped-resize",
+            "armed",
+            // The size change: only the LIVE observer hears it.
+            "resized",
+        ],
+        "observe fires once on start and again on a change, and a disposed observer is silent; got:\n{stdout}"
     );
 }
