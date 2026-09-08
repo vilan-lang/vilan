@@ -291,6 +291,14 @@ pub fn paint_reachable_nodes(program: &Program) -> Option<HashSet<Id>> {
     traversal.collect_nodes = true;
     traversal.follow_const_initializers = true;
     traversal.walk(entry, &SubstitutionContext::default(), None);
+    // B269: every `const` region is a root of its own. The compile-time
+    // interpreter evaluates `Program::const_exprs` unconditionally, so a
+    // function a const region calls is used at BUILD time however the runtime
+    // walk arrives — or never arrives, which is the case for the three shapes
+    // `CallGraph::const_regions` names.
+    for root in graph.const_regions().to_vec() {
+        traversal.walk_const_region(root);
+    }
     Some(traversal.reached_nodes)
 }
 
@@ -362,6 +370,49 @@ impl<'a, 'src> Traversal<'a, 'src> {
             collect_nodes: false,
             follow_const_initializers: false,
             origin: Origin::Entry,
+        }
+    }
+
+    /// B269: the edges OUT of one `const` region, without the region itself.
+    ///
+    /// `walk` would do the traversal, but it would also record the region as
+    /// reached — and a region's key is a module-level BINDING for the
+    /// initializer shape, which is a paintable item. A binding nothing
+    /// references is dead by the paint's own definition whatever its
+    /// initializer calls, and this walk exists to answer for the CALLEES.
+    fn walk_const_region(&mut self, region: Id) {
+        for call in self.graph.const_initializer_calls_of(region).to_vec() {
+            match call.target {
+                CallTarget::Function(callee)
+                | CallTarget::Closure(callee)
+                | CallTarget::External(callee) => {
+                    self.walk(callee, &SubstitutionContext::default(), None);
+                }
+                // A const region's dispatch is resolved by the interpreter, not
+                // by a type substitution this walk could supply; every
+                // candidate is kept, which is the over-approximation the paint
+                // wants (§1.4, determination 2).
+                CallTarget::Indirect(_) => {
+                    let candidates = crate::async_infer::dispatch_candidates_for(
+                        self.program,
+                        call.call_id,
+                        None,
+                    );
+                    for candidate in candidates {
+                        self.walk(candidate, &SubstitutionContext::default(), None);
+                    }
+                }
+                CallTarget::Variant(_) => {}
+            }
+        }
+        for (_, global) in self.graph.const_global_references_of(region).to_vec() {
+            self.walk(global, &SubstitutionContext::default(), None);
+        }
+        for (_, function) in self.graph.const_function_references_of(region).to_vec() {
+            self.walk(function, &SubstitutionContext::default(), None);
+        }
+        for closure in self.graph.const_initializer_closures_of(region).to_vec() {
+            self.walk(closure, &SubstitutionContext::default(), None);
         }
     }
 

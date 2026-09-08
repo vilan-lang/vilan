@@ -439,3 +439,109 @@ fn a_trait_impl_member_paints_in_neither_state_and_an_inherent_one_paints_in_bot
         );
     }
 }
+
+// --- B269: a `const` call is a use ---------------------------------------
+//
+// E124 collected the const edges of a module BINDING's initializer, and a
+// callee stayed reachable only through whatever reached that binding. Measured
+// against f0f4e301's own analysis, three of the four shapes painted the callee:
+//
+//   let p = const page_defaults();     // main reads `p`  — NOT gray
+//   let _p = const page_defaults();    // `_`-led          — GRAY
+//   const page_defaults();             // bare statement   — GRAY
+//   const { page_defaults(); };        // block            — GRAY
+//
+// The `_` exempts the BINDING and nothing references it, so the walk never
+// arrives to follow its const edges; the other two are not bindings at all, so
+// `CallGraph::build`'s binding loop never sees them. The block is what kolt now
+// writes at module level (`const { bundle(..); style::preflight(); .. };`).
+//
+// All four run: `const_eval::evaluate` walks `Program::const_exprs`
+// unconditionally, not a reachable subset, so a function a `const` region calls
+// is used at BUILD time however the runtime walk arrives — and deleting it
+// breaks the build. Every const region is a root of the paint now
+// (`CallGraph::const_regions`, `Traversal::walk_const_region`).
+
+/// Pin 11 — the three shapes whose callee the paint used to gray.
+#[test]
+fn b269_a_callee_reached_only_from_a_const_region_is_not_gray() {
+    for (label, source) in [
+        (
+            "an `_`-led const binding, which nothing references",
+            "fun page_defaults(): i32 {\n\t1\n}\n\n\
+             let _p: i32 = const page_defaults();\n\n\
+             fun main() { print(\"x\"); }\n",
+        ),
+        (
+            "a bare module-level `const` statement",
+            "fun page_defaults(): i32 {\n\t1\n}\n\n\
+             const page_defaults();\n\n\
+             fun main() { print(\"x\"); }\n",
+        ),
+        (
+            "a module-level `const` BLOCK, which is what kolt writes",
+            "fun page_defaults(): i32 {\n\t1\n}\n\n\
+             const { page_defaults(); };\n\n\
+             fun main() { print(\"x\"); }\n",
+        ),
+    ] {
+        assert_eq!(
+            grays(source),
+            Vec::<String>::new(),
+            "{label}: the const region is evaluated at build time, so its \
+             callee's deletion breaks the build",
+        );
+    }
+}
+
+/// The non-vacuity control, beside it: the same function with no `const`
+/// anywhere is still gray, so the pin above is about the const region and not
+/// about the paint having stopped.
+#[test]
+fn b269_a_function_called_from_nowhere_is_still_gray() {
+    assert_eq!(
+        grays(
+            "fun page_defaults(): i32 {\n\t1\n}\n\n\
+             fun main() { print(\"x\"); }\n",
+        ),
+        vec!["page_defaults".to_string()],
+    );
+}
+
+/// And the half that must NOT move: the paint is not the pruner. A callee the
+/// const interpreter runs at build time is still absent from the emitted
+/// program — the const region folds to its value, and following its calls into
+/// the bundle is exactly what `CallGraph`'s paint-only maps exist to prevent.
+#[test]
+fn b269_the_emission_still_omits_a_const_only_callee() {
+    let source = "fun page_defaults(): i32 {\n\t1\n}\n\n\
+                  const page_defaults();\n\n\
+                  fun main() { print(\"x\"); }\n";
+    let javascript = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = vilan_core::manifest::resolve_std(&std_root());
+            let options = vilan_core::options::BuildOptions::default();
+            let (program, errors) = analyze_source(
+                source,
+                &std,
+                Path::new("."),
+                Path::new("dead_items_probe.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let mut program = program.expect("the probe analyzes");
+            assert!(errors.is_empty(), "the probe compiles cleanly: {errors:?}");
+            program
+                .const_results
+                .extend(vilan_core::const_eval::infer(&program, &options));
+            vilan_core::transform(&program, &options).expect("the probe emits")
+        })
+        .expect("spawn the probe thread")
+        .join()
+        .expect("the probe thread joins");
+    assert!(
+        !javascript.contains("page_defaults"),
+        "the const region folds to a value; its callee is not emitted:\n{javascript}",
+    );
+}

@@ -137,6 +137,31 @@ pub struct CallGraph {
     const_initializer_closures: HashMap<Id, Vec<Id>>,
     const_global_references: HashMap<Id, Vec<(Id, Id)>>,
     const_function_references: HashMap<Id, Vec<(Id, Id)>>,
+    /// B269: every `const` REGION of the program, as a key into the four maps
+    /// above — the paint's roots beside `main`.
+    ///
+    /// E124 collected the const edges of a module BINDING's initializer and
+    /// left it at that, so a callee stayed reachable only through whatever
+    /// reached the binding. Three shapes have no such thing:
+    ///
+    ///  - `let _page_defaults = const page_defaults();` — the `_` exempts the
+    ///    BINDING from the paint and nothing references it, so the walk never
+    ///    arrives and never follows its const edges;
+    ///  - `const page_defaults();` at module level — a bare statement, not a
+    ///    binding, so `CallGraph::build`'s binding loop never sees it;
+    ///  - `const { bundle(..); style::preflight(); };` — the same, with a
+    ///    block, which is what kolt now writes.
+    ///
+    /// All three run: `const_eval::evaluate` walks `Program::const_exprs`
+    /// unconditionally — not a reachable subset — so a function a `const`
+    /// region calls is used at BUILD time whatever the runtime walk says, and
+    /// deleting it breaks the build. That is the whole of B269: a `const` call
+    /// is a use.
+    ///
+    /// Paint-only, exactly as the four maps are. Emission and admission ask
+    /// what RUNS on the target, and their answer about a const region — data,
+    /// not code — is right.
+    const_regions: Vec<Id>,
 }
 
 thread_local! {
@@ -264,6 +289,56 @@ impl CallGraph {
                 .insert(binding, collector.function_references);
         }
 
+        // B269: the const REGIONS, which are the paint's roots beside `main`.
+        // A module binding's initializer already has its edges above, so the
+        // binding itself is the key; every other `const` expression is
+        // collected here under its own id. `const_exprs` holds the marked
+        // expression ids in the order the walk found them (innermost first for
+        // a nest), and re-walking an outer region that contains an inner one
+        // costs a second visit of a subtree the const interpreter evaluates
+        // twice over anyway.
+        let const_initializers: HashSet<Id> = bindings
+            .iter()
+            .filter_map(|binding| {
+                let initial = program.variables.get(binding)?.initial?;
+                const_exprs.contains(&initial).then_some(initial)
+            })
+            .collect();
+        for &binding in &bindings {
+            if graph.const_initializer_calls.contains_key(&binding) {
+                graph.const_regions.push(binding);
+            }
+        }
+        for &region in &program.const_exprs {
+            if const_initializers.contains(&region) || graph.const_regions.contains(&region) {
+                continue;
+            }
+            let mut collector = Collector {
+                program,
+                globals: &module_bindings,
+                calls: Vec::new(),
+                nested_closures: Vec::new(),
+                global_references: Vec::new(),
+                function_references: Vec::new(),
+                await_sites: Vec::new(),
+                visited: HashSet::default(),
+            };
+            collector.walk(region);
+            graph
+                .const_initializer_calls
+                .insert(region, collector.calls);
+            graph
+                .const_initializer_closures
+                .insert(region, collector.nested_closures);
+            graph
+                .const_global_references
+                .insert(region, collector.global_references);
+            graph
+                .const_function_references
+                .insert(region, collector.function_references);
+            graph.const_regions.push(region);
+        }
+
         graph.build_reverse_edges();
         graph
     }
@@ -380,6 +455,12 @@ impl CallGraph {
             .get(&id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// B269: every `const` region of the program — the paint's roots beside
+    /// `main`. See [`CallGraph::const_regions`].
+    pub fn const_regions(&self) -> &[Id] {
+        &self.const_regions
     }
 
     /// E124: the module-level bindings a `const` initializer references.
