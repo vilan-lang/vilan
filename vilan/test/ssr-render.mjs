@@ -148,7 +148,7 @@ function $c(value) {
 	return $b(value);
 }
 function $h(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $g(self, source) {
 	self[3].v = $h(source);

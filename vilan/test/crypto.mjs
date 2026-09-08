@@ -248,7 +248,7 @@ function top(self) {
 	if (!(ok(self)) || $J(self[0].v)) {
 		$K = JSON.parse("null");
 	} else {
-		const values = self[0].v;
+		const values = __clone(self[0].v);
 		$K = __at(values, values.length - 1);
 	}
 	return $K;

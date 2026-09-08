@@ -573,7 +573,7 @@ function top(self) {
 	if (!(ok2(self)) || $z(self[0].v)) {
 		$A = JSON.parse("null");
 	} else {
-		const values = self[0].v;
+		const values = __clone(self[0].v);
 		$A = __at(values, values.length - 1);
 	}
 	return $A;

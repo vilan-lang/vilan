@@ -9256,13 +9256,6 @@ fn b257_a_bare_parameter_stored_by_an_assignment_copies() {
 }
 
 #[test]
-#[ignore = "B256 held on cost: implemented and measured this cycle — +20% node \
-            process CPU on a 500-row `bind_each` under 200 in-place updates, \
-            +25% on a 200-subscriber batch drain, +12% on A44's 1000-row \
-            selector, +344% on `SignalCell::get()` of a 1000-element list \
-            (medians of nine alternating runs at loadavg 101-104); and \
-            `bind_each` copies `row_views`/`row_owners` per notify, which the \
-            landing bar forbade. Awaiting the owner's ruling."]
 fn b256_a_binding_fed_by_a_shared_read_copies() {
     // `Shared.read(self): T` is declared a value return, and §6.1 says a
     // signature that hands back a value hands back a value. The intrinsic
@@ -9284,7 +9277,6 @@ fn b256_a_binding_fed_by_a_shared_read_copies() {
 }
 
 #[test]
-#[ignore = "B256 held on cost — see `b256_a_binding_fed_by_a_shared_read_copies`."]
 fn b256_a_mutable_binding_fed_by_a_shared_read_does_not_grow_the_cell() {
     // The other direction of the same alias: `mut c = h.read(); c.push(10)`
     // pushed into the CELL, so the cell read 6.
@@ -9304,7 +9296,6 @@ fn b256_a_mutable_binding_fed_by_a_shared_read_does_not_grow_the_cell() {
 }
 
 #[test]
-#[ignore = "B256 held on cost — see `b256_a_binding_fed_by_a_shared_read_copies`."]
 fn b256_a_value_returning_body_copies_the_shared_read_it_hands_back() {
     // `SignalCell::get`'s shape: a by-value signature whose tail is a shared
     // read. The frame does not own the cell — it reached it through a bare
@@ -9459,9 +9450,6 @@ fn b267_a_read_of_one_cell_survives_a_write_to_a_different_cell() {
 }
 
 #[test]
-#[ignore = "B267's elision is only OBSERVABLE once B256's place treatment makes \
-            a shared read a copy site — until then nothing copies here to elide. \
-            Un-ignored in the commit that lands B256."]
 fn b267_an_in_place_write_before_the_rebind_refuses_the_elision() {
     // The hazard the ordering test exists to catch: the in-place write reaches
     // the read's storage FIRST, and the rebind that follows is too late to
@@ -9489,9 +9477,6 @@ fn b267_an_in_place_write_before_the_rebind_refuses_the_elision() {
 }
 
 #[test]
-#[ignore = "B267's elision is only OBSERVABLE once B256's place treatment makes \
-            a shared read a copy site — see \
-            `b267_an_in_place_write_before_the_rebind_refuses_the_elision`."]
 fn b267_a_read_whose_binding_a_closure_captures_copies() {
     // A closure captures BINDINGS (§6.9), so a captured binding is read from a
     // region the last-use walk cannot survey — it says so by refusing to answer

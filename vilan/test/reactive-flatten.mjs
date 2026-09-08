@@ -132,7 +132,7 @@ function $c(value) {
 	return $b(value);
 }
 function $h(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $w(self) {
 	return self.length === 0;

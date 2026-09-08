@@ -138,7 +138,7 @@ function $g(self, observer, $h, $i) {
 	$m(get_owner($i), $k(self, observer), $h);
 }
 function $t(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $d(self, observer, $e, $f) {
 	$g(self, observer, $e, $f);

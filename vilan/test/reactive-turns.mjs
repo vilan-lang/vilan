@@ -122,7 +122,7 @@ function $d(signal, observer) {
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
 function $e(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $c(self, observer) {
 	const subscription = $d(self, observer);

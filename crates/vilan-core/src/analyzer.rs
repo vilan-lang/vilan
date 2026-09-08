@@ -3681,6 +3681,11 @@ pub struct Analyzer<'src> {
     /// 2's move elision must then refuse to move OUT of them — like B53's
     /// shared captures, a binding that owns nothing has nothing to donate.
     shared_read_bindings: HashSet<Id>,
+    /// B267, read from the other end: the `Shared` READ expressions whose
+    /// binding the rule admits. `compute_clone_sites` asks by expression (it is
+    /// standing on the initializer, not on the binding), rule 2 asks by binding
+    /// — one pass fills both.
+    elided_shared_reads: HashSet<Id>,
     resolved_types: HashMap<Id, TypeId>,
     // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
     // construction, keyed by the element's expr id — the type the tuple rule
@@ -4685,6 +4690,7 @@ impl<'src> Analyzer<'src> {
             last_use: liveness::LastUse::default(),
             shared_cells: SharedCells::default(),
             shared_read_bindings: HashSet::default(),
+            elided_shared_reads: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             scope_id: 0,
@@ -17733,6 +17739,20 @@ impl<'src> Analyzer<'src> {
         )
     }
 
+    /// B256: whether `expr_id` is a `Shared.read()` — a call that hands back the
+    /// CELL'S OWN STORAGE rather than a value of its own, and so is a place for
+    /// every purpose [`Self::is_place_expr`] serves.
+    ///
+    /// The intrinsic lowers to the bare slot `self.v`, which is why the premise
+    /// `compute_clone_sites` rests on — *a call owns its result*, spec §6.1 —
+    /// is false at exactly this call and nowhere else in std. `read(self): T`
+    /// is a value-returning signature and §6.1 says a signature that hands back
+    /// a value hands back a value; only `write(self): &mut T borrows self`, one
+    /// line down in `shared.vl`, names the cell's storage on purpose.
+    fn is_shared_read(&self, expr_id: Id) -> bool {
+        self.shared_cells.reads.contains_key(&expr_id)
+    }
+
     /// Whether a pattern's subject names existing storage, so its captures bind
     /// pieces of something with another owner — [`Self::is_place_expr`] plus
     /// **`*view`**.
@@ -17798,6 +17818,17 @@ impl<'src> Analyzer<'src> {
         match self.expr_id_to_expr_map.get(&leaf_id) {
             Some(Expr::Reference(operand, _)) => places.push(*operand),
             Some(Expr::Call(call_id)) => {
+                // B256: a `Shared.read()` leaf names the CELL's storage, so the
+                // place it hands back is the handle it was read through —
+                // `SignalCell::get`'s `self.value.read()` is `self.value`,
+                // rooted at a bare parameter, and a by-value return of a loaned
+                // place copies like any other (§6.1's return clause).
+                if self.is_shared_read(leaf_id)
+                    && let Some((_, receiver_id)) = self.call_callee_and_receiver(leaf_id)
+                {
+                    places.push(receiver_id);
+                    return;
+                }
                 for projected in self.projected_argument_ids(*call_id) {
                     self.returned_value_places(projected, places);
                 }
@@ -17825,7 +17856,11 @@ impl<'src> Analyzer<'src> {
             }
             Some(Expr::Call(call_id)) => {
                 let call_id = *call_id;
-                self.place_value_type_id(leaf_id)
+                // B256: a shared read's value is the cell's payload, and the
+                // receiver is what says which one — asked first, because the
+                // leaf's own recorded type is silent for a bodiless callee.
+                self.shared_read_value_type_id(leaf_id)
+                    .or_else(|| self.place_value_type_id(leaf_id))
                     .or_else(|| self.call_declared_return_type_id(call_id))
             }
             _ => self.place_value_type_id(leaf_id),
@@ -17841,6 +17876,28 @@ impl<'src> Analyzer<'src> {
             return None;
         };
         self.functions.get(callee_id)?.return_type_id
+    }
+
+    /// B256: the type of the VALUE a `Shared.read()` hands back — the cell's
+    /// PAYLOAD, read off the receiver's `Shared<T>`.
+    ///
+    /// A bodiless callee interns no type at the call site, and `Shared::read`'s
+    /// own declared return is the abstract `T` of `Shared`'s impl — which the
+    /// type filter admits as a generic, so every scalar read would collect a
+    /// `__clone` that is identity by construction. The RECEIVER carries the
+    /// instantiation, so this answers `i64` for a `Shared<i64>` and `List<T>`
+    /// for a `Shared<List<T>>`: the concrete question the filter is asking, at
+    /// the one call whose result is a place.
+    fn shared_read_value_type_id(&self, expr_id: Id) -> Option<TypeId> {
+        if !self.is_shared_read(expr_id) {
+            return None;
+        }
+        let (_, receiver_id) = self.call_callee_and_receiver(expr_id)?;
+        let shared_struct_id = self.primitive_struct_ids.get("Shared").copied()?;
+        match self.place_value_type_id(receiver_id)?.borrow_type(self) {
+            Type::Struct(id, arguments) if *id == shared_struct_id => arguments.first().copied(),
+            _ => None,
+        }
     }
 
     /// Whether a returned place is storage the returning frame does not own, so
@@ -21910,7 +21967,15 @@ impl<'src> Analyzer<'src> {
         // aliased its source, while `b = a[0]` (an `Index`, which does intern)
         // copied one line away.
         let mut consider = |analyzer: &Self, value_id: Id, declared_type: Option<TypeId>| {
-            if analyzer.is_place_expr(value_id)
+            // B256: a `Shared.read()` is admitted beside a place, because it IS
+            // one — the intrinsic hands back `self.v`. B267's cell-aware
+            // elision is what takes the reads back out again, and it is asked
+            // here rather than inside `is_elidable_copy` because its answer is
+            // about the BINDING this read initializes, not about a dying
+            // source.
+            if (analyzer.is_place_expr(value_id)
+                || (analyzer.is_shared_read(value_id)
+                    && !analyzer.elided_shared_reads.contains(&value_id)))
                 // Rule 3: a VIEW is an alias on purpose. A `&mut` parameter
                 // forwarded into a construction (`Some(p)`) must stay the same
                 // view, or the write through the capture lands on a detached
@@ -21920,8 +21985,9 @@ impl<'src> Analyzer<'src> {
                 && !analyzer.assignment_target_is_view(value_id)
                 && !analyzer.resource_value_places.contains(&value_id)
                 && !analyzer.is_elidable_copy(value_id, shared_captures)
-                && let Some(type_id) =
-                    declared_type.or_else(|| analyzer.place_value_type_id(value_id))
+                && let Some(type_id) = declared_type
+                    .or_else(|| analyzer.shared_read_value_type_id(value_id))
+                    .or_else(|| analyzer.place_value_type_id(value_id))
             {
                 candidates.push((value_id, type_id));
             }
@@ -22793,14 +22859,15 @@ impl<'src> Analyzer<'src> {
     /// holds through it and the wave list is never deep-copied per drain
     /// iteration. What the elision cannot survive is an in-place write reaching
     /// the storage first, which is exactly what the ordering test refuses.
-    fn compute_shared_read_bindings(&self) -> HashSet<Id> {
+    fn compute_shared_read_bindings(&self) -> (HashSet<Id>, HashSet<Id>) {
         if self.shared_cells.reads.is_empty() {
-            return HashSet::default();
+            return (HashSet::default(), HashSet::default());
         }
         let written_roots = self.collect_written_roots();
         let seam_roots = self.value_seam_roots();
         let sequences = self.statement_sequences();
         let mut bindings = HashSet::default();
+        let mut reads = HashSet::default();
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             let Expr::Variable(variable_id) = expr else {
                 continue;
@@ -22825,9 +22892,10 @@ impl<'src> Analyzer<'src> {
                 || self.rebind_orphans_the_read(*expr_id, cell, &sequences)
             {
                 bindings.insert(*variable_id);
+                reads.insert(value_id);
             }
         }
-        bindings
+        (bindings, reads)
     }
 
     /// B267's ordering test: whether a REBIND of `cell` is reached, on the
@@ -42950,7 +43018,12 @@ pub enum Intrinsic {
     SharedNew,
     // `Shared.clone()` -> the same cell (identity): just the receiver.
     SharedClone,
-    // `Shared.read()` -> a copy of the cell's value, `self.v`.
+    // `Shared.read()` -> the cell's slot, `self.v`. The slot itself, not a copy
+    // of it: rule 1's copy is the CLONE PASS's business (B256 — a read is a
+    // place, so a binding, assignment, construction slot or `own` argument fed
+    // by one copies, and B267's cell-aware elision takes it back where nothing
+    // can observe the sharing), and a temporary — `for x in cell.read()`,
+    // `cell.read().len()` — is no position at all and stays free.
     SharedValue,
     // `Shared.write()` -> a mutable view of the cell's slot, `self.v`. Same JS as
     // `SharedValue`, but distinguished so a write *through* it rebinds the slot
@@ -51893,7 +51966,8 @@ fn analyze_over_world<'src>(
     // feeds every elision below — a binding it admits copies nothing at its
     // read and may donate nothing at its own.
     analyzer.shared_cells = analyzer.compute_shared_cells();
-    analyzer.shared_read_bindings = analyzer.compute_shared_read_bindings();
+    (analyzer.shared_read_bindings, analyzer.elided_shared_reads) =
+        analyzer.compute_shared_read_bindings();
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.

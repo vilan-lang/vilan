@@ -1,7 +1,7 @@
 # Emitted `__clone` call sites per corpus golden — the copy-elision
 # census (lifetimes.md §11, slice S2). Regenerate with
 # VILAN_REGENERATE_COPY_ELISION_CENSUS=1 cargo test -p vilan-cli --test copy_elision_census
-# total	305
+# total	319
 adapt	0
 arena	8
 asset_bundle	0
@@ -9,7 +9,7 @@ async-await	0
 async-promise-all	0
 await-postfix	0
 backed-enum-keys	6
-blanket-impl	4
+blanket-impl	5
 bool	0
 borrows	0
 borrows-inferred	0
@@ -19,7 +19,7 @@ compound-index	0
 const	0
 copy-elision	0
 copy-in-loop	1
-crypto	2
+crypto	3
 css-block	9
 db	0
 default	0
@@ -32,7 +32,7 @@ derive-json	2
 destructuring	0
 display	0
 element-clones	13
-element-syntax	7
+element-syntax	8
 enum-discriminant	0
 equality	0
 estate	0
@@ -50,7 +50,7 @@ generic-dispatch	0
 generic-equality	0
 generic-inference	0
 generic-method-return	2
-generic-methods	1
+generic-methods	2
 interpolated-multiline-string	0
 iterator	0
 iterator-adapters	18
@@ -89,13 +89,13 @@ preflight	1
 prelude	1
 process-env	2
 range	0
-reactive	9
-reactive-flatten	10
+reactive	10
+reactive-flatten	11
 reactive-keyed	0
-reactive-on-change	9
-reactive-owner	7
-reactive-selector	11
-reactive-turns	4
+reactive-on-change	10
+reactive-owner	8
+reactive-selector	12
+reactive-turns	5
 recursion	0
 remainder	0
 resource	0
@@ -107,9 +107,9 @@ self-return	0
 set	1
 shared	0
 side-effect-let	0
-signal-update	9
-spread-parameters	7
-ssr-render	13
+signal-update	10
+spread-parameters	8
+ssr-render	14
 string-interpolation	0
 string-methods	0
 struct-literal-call	0
@@ -117,7 +117,7 @@ style	9
 style-when	11
 subscript	1
 theme	1
-time	4
+time	5
 trait-default	0
 transparent-references	1
 try-assert	4

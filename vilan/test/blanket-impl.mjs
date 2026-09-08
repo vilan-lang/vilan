@@ -84,7 +84,7 @@ function $j(signal, observer) {
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
 function $k(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $i(self, observer) {
 	const subscription = $j(self, observer);

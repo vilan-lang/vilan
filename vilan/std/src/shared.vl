@@ -6,8 +6,12 @@
 //
 // `Shared` is `external` (an opaque cell): unlike an ordinary aggregate it is
 // *not* deep-copied, so `clone()` and ordinary binding share the one underlying
-// cell rather than snapshotting it. `read()`/`write()` project the cell's value;
-// a write through one is visible through every other handle to the same cell.
+// cell rather than snapshotting it. `read()`/`write()` both reach the cell's
+// slot, and their SIGNATURES say what happens there: `read(self): T` hands back
+// a value, so storing one copies (spec §6.1) and a temporary — `for x in
+// cell.read()`, `cell.read().len()` — copies nothing; `write(self): &mut T
+// borrows self` hands back a view, and a write through it is visible through
+// every other handle to the same cell.
 
 external struct Shared<T>;
 
@@ -18,7 +22,10 @@ impl Shared<type T> {
 	/// Another handle to the *same* cell (shared, not copied).
 	external fun clone(self): Shared<T>;
 
-	/// The cell's value for reading.
+	/// The cell's value, for reading. A value return (§6.1): binding one,
+	/// assigning it, storing it in an aggregate or handing it to an `own`
+	/// parameter takes a COPY, so the cell cannot be grown through it — a
+	/// temporary reads the cell's storage directly and copies nothing.
 	external fun read(self): T;
 
 	/// A mutable view of the cell's value, for in-place mutation: `a.write() = x`

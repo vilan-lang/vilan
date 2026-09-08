@@ -548,7 +548,7 @@ function $q(policy, body) {
 	return result;
 }
 function $x(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $A(self, $i) {
 	const $B = $i;
