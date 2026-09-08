@@ -146,7 +146,7 @@ function $i(self, content) {
 }
 const name = $a("world & <you>");
 console.log(render($i($g($h($g($f($c(view("p"), "data-live", name), "title", "hi"), "Take "), $g(view("code"), "vilan upgrade")), " & enjoy. "), name)));
-console.log(render($f($f($f(view("input"), "type", "checkbox"), "disabled", ""), "aria-label", "Done")));
+console.log(render($f($f($f(view("input"), "type", "checkbox"), "aria-label", "Done"), "disabled", "")));
 console.log(render($h($h(view("ul"), row("alpha")), row("beta"))));
 console.log(render($h($f(view("svg"), "viewBox", "0 0 24 24"), $f(view("path"), "d", "M5 12h14"))));
 console.log(render($h(view("div"), $g(view("span"), "chained"))));
