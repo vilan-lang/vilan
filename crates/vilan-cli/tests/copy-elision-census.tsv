@@ -75,6 +75,7 @@ map	14
 match-ergonomics	0
 match-patterns	0
 math	4
+module-dirs	0
 multiline-string	0
 mut-parameters	3
 number-math	0
