@@ -253,16 +253,34 @@ retry API because a link is one. Worked example:
 
 ## std::storage
 
-`localStorage` / `sessionStorage`, string-keyed strings. A missing key reads
-as `""`.
+`localStorage` / `sessionStorage`, string-keyed strings, in **two forms**: six
+free functions for the site that touches one key, and a `Storage` handle for
+the site whose subject is the store.
 
 ```vilan,fragment
+// The one-key form. A missing key reads as "".
 fun get(key: str): str
 fun set(key: str, value: str)
 fun remove(key: str)
 fun session_get(key: str): str
 fun session_set(key: str, value: str)
 fun session_remove(key: str)
+
+// The handle.
+impl Window {
+	fun local_storage(self): Storage     // window.localStorage
+	fun session_storage(self): Storage   // window.sessionStorage
+}
+external struct Storage;
+impl Storage {
+	fun len(self): i32
+	fun key_at(self, index: i32): Option<str>   // None past the end
+	fun get(self, key: str): Option<str>        // None when ABSENT
+	fun has(self, key: str): bool
+	fun set(self, key: str, value: str)
+	fun remove(self, key: str)
+	fun clear(self)                             // every key on the origin
+}
 ```
 
 ```vilan,browser
@@ -276,3 +294,54 @@ fun main() {
 	}
 }
 ```
+
+**The free functions are not deprecated by the handle.** They are shorter where
+only one key is in play, and the flattening `""` means nothing has to be
+unwrapped. The handle is what a store-shaped job needs — and its `get` is the
+one that can tell an ABSENT key from a key whose stored value is legitimately
+`""`, which `!get(key).is_empty()` cannot. That difference is not academic: an
+"initialize this key if it is unset" pass rewrites a legitimately-empty value on
+every run when presence is spelled as non-emptiness.
+
+Counting **down** is the shape an enumerating sweep wants, because removing a
+key renumbers everything above it — and the host's key order is unspecified
+anyway, so a pass that both reads and removes must not assume it is stable.
+
+The two reader verbs live on `Window`, so a module that calls them imports
+**both** `std::dom`'s `window` and `std::storage` — the `impl Window` block is
+declared in `std::storage`, and an impl is in scope only where its module is.
+
+```vilan,browser
+import std::dom::window;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::storage;
+
+fun main() {
+	let store = window().local_storage();
+	mut index = store.len();
+	for index > 0 {
+		match store.key_at(index - 1) {
+			Some(let key) => {
+				if !key.starts_with("app.") {
+					store.remove(key);
+				}
+			}
+			None => print("the store shrank under the walk"),
+		}
+		index -= 1;
+	}
+	if !store.has("app.theme") {
+		store.set("app.theme", "");
+	}
+}
+```
+
+**Browser-only, with no process twin, deliberately.** An SSR leg has no
+`window` and no per-user store, so a twin could only be a stub that touches
+`window` (a crash on the server) or an in-memory map answering reads with
+values the browser never wrote — and the second turns a layer mistake into a
+silent divergence between the two renders of one component. Importing
+`std::storage` from a process module is a cross-platform error at analysis
+instead. Server-side persistence is [`std::db`](process.md); state that must
+reach the browser rides the render or an rpc call.
