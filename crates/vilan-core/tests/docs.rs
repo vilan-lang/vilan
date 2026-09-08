@@ -12,6 +12,7 @@
 //! Failures report `file — nearest heading` so a broken example is a one-jump
 //! fix.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
@@ -293,6 +294,58 @@ fn the_sidebar_covers_every_page() {
     assert!(
         listed.is_empty(),
         "SUMMARY.md entries with no file behind them: {listed:?}"
+    );
+}
+
+/// The tour's reserved-word list is the LEXER's, held both ways (tracker N64).
+///
+/// `own` was a keyword documented nowhere in the tour and cost a lane a debug
+/// cycle on a fixture that used it as a name — which is the failure a reader of
+/// the tour is set up for, since the tour teaches by example and an example
+/// never shows the word you cannot use. So the tour names them, and the list is
+/// gated rather than trusted: a hand-copied word list is one commit from being
+/// wrong (the three-place rule's own history, and N60's "nine" one file over).
+///
+/// The spec's two lists (§2.2, §A.2) are outside this gate deliberately: they
+/// are prose-formatted with the boolean and null literals called out separately,
+/// and `grammar_sync.rs` already holds the machine-read grammars to the same
+/// table. This is the reader-facing list, held to the same source.
+#[test]
+fn the_tours_reserved_words_are_the_lexers_keywords() {
+    let page = docs_root().join("tour/values-and-types.md");
+    let text = std::fs::read_to_string(&page)
+        .unwrap_or_else(|error| panic!("{}: {error}", page.display()));
+    let heading = "## Reserved words";
+    let after = text
+        .split_once(heading)
+        .unwrap_or_else(|| panic!("`{heading}` is gone from {}", page.display()))
+        .1;
+    let fence = after
+        .split_once("```text\n")
+        .expect("the reserved-word section opens a `text` fence")
+        .1
+        .split_once("```")
+        .expect("that fence closes")
+        .0;
+    let listed: BTreeSet<&str> = fence.split_whitespace().collect();
+    let lexed: BTreeSet<&str> = vilan_core::lexing::KEYWORDS
+        .iter()
+        .map(|(word, _)| *word)
+        .collect();
+
+    let missing: Vec<&&str> = lexed.difference(&listed).collect();
+    assert!(
+        missing.is_empty(),
+        "the tour's reserved-word list is missing {missing:?}. A reader who \
+         cannot see the word cannot avoid it — add it to `## Reserved words` in \
+         `vilan/docs/tour/values-and-types.md`, alphabetically."
+    );
+    let unknown: Vec<&&str> = listed.difference(&lexed).collect();
+    assert!(
+        unknown.is_empty(),
+        "the tour lists {unknown:?} as reserved, and the lexer does not. A word \
+         that stopped being a keyword is a word the tour is telling readers not \
+         to use for nothing."
     );
 }
 
