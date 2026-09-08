@@ -13643,6 +13643,103 @@ pub(crate) mod tests {
             "a complete analysis must serve exactly its own tokens"
         );
     }
+
+    // --- A65: module DIRECTORIES in the editor -----------------------------
+    //
+    // A package's modules are a tree: `a/b.vl` is `a::b`, and a directory with
+    // no `lib.vl` is a pure namespace reached only through what it holds. Three
+    // surfaces have to know that — the import-path completion at each depth,
+    // and go-to-definition on a module segment of a nested path.
+
+    /// The exhibit's shape, as a workspace: `lib/` with a body and a module,
+    /// and `lib/ui/` with no body at all.
+    const A65_TREE: &[(&str, &str)] = &[
+        ("lib/lib.vl", "fun surface(): i32 {\n\t3\n}\n"),
+        ("lib/util.vl", "fun hello(): i32 {\n\t7\n}\n"),
+        ("lib/ui/widget.vl", "fun label(): str {\n\t\"w\"\n}\n"),
+    ];
+
+    fn a65_workspace(entry: &str) -> Vec<(&str, &str)> {
+        let mut files: Vec<(&str, &str)> = vec![("main.vl", entry)];
+        files.extend_from_slice(A65_TREE);
+        files
+    }
+
+    #[test]
+    fn a65_pkg_completion_offers_a_module_directory() {
+        let labels =
+            workspace_completions_at_cursor(&a65_workspace("import pkg::|;\n\nfun main() {}\n"));
+        assert!(
+            labels.iter().any(|label| label == "lib"),
+            "a directory holding a `lib.vl` is a module of the package: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a65_a_module_directorys_completion_offers_its_children_and_its_own_items() {
+        // `lib/` has a body AND submodules, and they live in one namespace as
+        // far as an import path is concerned — so `pkg::lib::` offers both.
+        let labels = workspace_completions_at_cursor(&a65_workspace(
+            "import pkg::lib::|;\n\nfun main() {}\n",
+        ));
+        assert!(
+            labels.iter().any(|label| label == "surface"),
+            "its own items: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "util"),
+            "and the modules its directory holds: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "ui"),
+            "including a bodiless directory, which is a path head: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a65_a_pure_namespaces_completion_offers_what_it_holds() {
+        // `lib/ui` has no `lib.vl`, so it has no items of its own and nothing
+        // to import directly. What it holds is the whole answer.
+        let labels = workspace_completions_at_cursor(&a65_workspace(
+            "import pkg::lib::ui::|;\n\nfun main() {}\n",
+        ));
+        assert_eq!(
+            labels,
+            vec!["widget".to_string()],
+            "a pure namespace offers its children and nothing else"
+        );
+    }
+
+    #[test]
+    fn a65_a_nested_modules_completion_offers_its_members() {
+        let labels = workspace_completions_at_cursor(&a65_workspace(
+            "import pkg::lib::ui::widget::|;\n\nfun main() {}\n",
+        ));
+        assert!(
+            labels.iter().any(|label| label == "label"),
+            "the deepest module's own importables: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a65_definition_on_a_nested_paths_module_segment_lands_in_that_module() {
+        // Every segment of an import path records a reference to what it names,
+        // and a nested path's segments name modules — so go-to-definition on
+        // `util` in `pkg::lib::util::hello` lands in `lib/util.vl`, not in the
+        // entry.
+        let entry = "import pkg::lib::util::hello;\n\nfun main() {\n\tlet _ = hello();\n}\n";
+        let (directory, document) = analyze_workspace(&a65_workspace(entry));
+        let segment = entry.find("util").expect("the `util` segment");
+        let (source_id, _span) = document
+            .definition(segment + 1)
+            .expect("definition on a module segment");
+        assert_ne!(
+            source_id,
+            vilan_core::analyzer::SourceId(0),
+            "`util` is a module of its own, not a name in the entry"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }
 
 /// M7 (`leak-soak.md` §7): the entry text and tree an analysis leaks are given
