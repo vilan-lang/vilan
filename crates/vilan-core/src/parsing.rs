@@ -211,9 +211,24 @@ const CSS_BLOCK_IS_BRACE_INITIAL: &str = "a `css { … }` block is brace-initial
      `(css { … })`";
 
 /// What a `css` block's body admits — the dot rule, spelled for the reader
-/// (proposal/css-block.md §3).
-const CSS_ITEM_EXPECTED: &str =
-    "a declaration (`property: value;`) or a nested rule (`.name { … }`)";
+/// (proposal/css-block.md §3), chain links included (A69).
+const CSS_ITEM_EXPECTED: &str = "a declaration (`property: value;`), a nested rule (`.name { … }`) or a chain link \
+     (`.name();`)";
+
+/// The rule a CSS pseudo-class written CSS-style breaks (tracker E153).
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself and
+/// names the sanctioned spelling.
+///
+/// `:hover { … }` is the single most likely thing for a CSS writer to type
+/// inside a block, and it reported the bare `found ':' expected a declaration
+/// …` — true, and no help at all, because the reader has to guess that the
+/// answer is a DOT. The dotted rule is deliberate: one name-blind form covers
+/// pseudo-classes, breakpoints, `within` and `divide`, so the grammar never
+/// consults a method list. The message says that, and names the fix.
+const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as a DOTTED rule: `.hover { … }`, not `:hover { … }`. \
+     One name-blind form covers pseudo-classes, breakpoints (`.md`), ancestor guards \
+     (`.within(…)`) and `.divide` — so the grammar never consults a method list, and a \
+     method added to `Style` cannot change what a block means";
 
 /// The rule `!important` breaks inside a `css` block. Curated
 /// (diagnostics-standard.md B6): the prohibition explains itself and names the
@@ -3242,6 +3257,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_css_item(&mut self) -> Option<CssItem<'src>> {
         if self.peek_is_ctrl('.') {
             return self.parse_css_dotted();
+        }
+        // E153: an item that STARTS with `:` is a CSS pseudo-class selector,
+        // the one thing a CSS writer is most likely to reach for here. Steered
+        // rather than reported as a missing declaration — the answer is a dot,
+        // and nothing in "expected a declaration" says so.
+        if self.peek_is_op(":") {
+            let context = self.context_stack.clone();
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(CSS_PSEUDO_CLASS_IS_DOTTED),
+                context,
+                hint: None,
+            });
+            return None;
         }
         self.parse_css_declaration().map(CssItem::Declaration)
     }

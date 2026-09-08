@@ -607,3 +607,65 @@ fn every_breakpoint_width_is_the_one_std_delegates_to() {
         );
     }
 }
+
+// --- E153: the CSS property index, held in the one direction that matters ----
+//
+// `css_properties::CSS_PROPERTIES` is a hand-refreshed table with a stated
+// provenance and date, feeding ONE editor affordance (property-name completion
+// inside a `css` block). Nothing in the compiler consults it, so a name missing
+// from it costs a completion entry and no program is wrong — which is why it is
+// admissible where E67 refused an invented HTML attribute list.
+//
+// One direction is still checkable and worth checking: every property some
+// `Style` method WRITES is a real CSS property, so std can never grow a slot
+// this table has not heard of. The other direction (a CSS property with no
+// `Style` method) is the normal state and always will be — `raw` is the whole
+// point.
+
+#[test]
+fn every_style_slot_is_in_the_css_property_index() {
+    let index: std::collections::HashSet<&str> = vilan_core::css_properties::CSS_PROPERTIES
+        .iter()
+        .copied()
+        .collect();
+    for method in STYLE_PROPERTY_METHODS {
+        for property in method.properties {
+            // A custom property (`--x`) is not in the standard index by
+            // construction; no std method writes one today, and the carve-out
+            // is written down rather than discovered.
+            if property.starts_with("--") {
+                continue;
+            }
+            assert!(
+                index.contains(property),
+                "`{}` writes `{property}`, which is not in the CSS property index — either the \
+                 slot is misspelled or `css_properties.rs` needs a refresh",
+                method.name
+            );
+        }
+    }
+}
+
+#[test]
+fn the_css_property_index_is_sorted_and_free_of_duplicates() {
+    // Sorted so a binary search is available and a diff of the file reads as a
+    // set difference; deduped so a completion list built from it needs no pass
+    // of its own.
+    let properties = vilan_core::css_properties::CSS_PROPERTIES;
+    for pair in properties.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "the CSS property index is out of order at `{}` / `{}`",
+            pair[0],
+            pair[1]
+        );
+    }
+    // Vendor prefixes are deliberately absent: unbounded, dated, and already
+    // covered by `raw` plus the formatter's barrier rule.
+    for property in properties {
+        assert!(
+            !property.starts_with('-') || property.starts_with("--"),
+            "`{property}` is vendor-prefixed and has no place in the index"
+        );
+    }
+}
