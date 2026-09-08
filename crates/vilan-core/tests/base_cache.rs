@@ -2505,3 +2505,120 @@ fn two_entries_differing_in_a_resource_declaration_share_one_enrolment_record() 
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// M52: what M44's "under construction" claim reaches, and what it does not.
+
+const M52_MODULE: &str = "export fun value(): i32 {\n\t7\n}\n";
+/// Three legs, ONE seed set: the shape M44 was measured on.
+const M52_SAME_A: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value()); }\n";
+const M52_SAME_B: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value() + 1); }\n";
+const M52_SAME_C: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value() * 2); }\n";
+/// Three legs, THREE seed sets: kolt's shape. Same package, same sibling, and
+/// three different `std::` reference sets — `io`, `math`, and both.
+const M52_DIFFERENT_A: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                               fun main() { print(value()); }\n";
+const M52_DIFFERENT_B: &str = "import std::math::PI;\nimport pkg::shared::value;\n\
+                               fun main() { let x = PI; let y = value(); }\n";
+const M52_DIFFERENT_C: &str = "import std::io::print;\nimport std::math::PI;\n\
+                               import pkg::shared::value;\n\
+                               fun main() { print(value()); let x = PI; }\n";
+
+/// M52: **a package's legs share one base world exactly when their seed sets
+/// agree — which is the whole of what M44 reaches, and why it is inert on
+/// kolt.**
+///
+/// M44 gave the base cache an "under construction" claim so a second member
+/// starting cold WAITS for the first member's world instead of building a
+/// second copy of it, and measured a four-leg generated workspace at Ir −13.5%
+/// with two legs' `base` phase going 31/35 ms → 0. Every leg of that fixture
+/// had one seed set. A real application does not: kolt's three entries
+/// reference `{asset, json, router, rpc, storage}`, `{asset, build, document,
+/// http, json, range, rpc_server}` and `{json, range, rpc, time}` — one module
+/// in common — so they mint three keys and no leg ever waits for another.
+///
+/// A HIT is what "the `base` phase is ~0" means (M21: kolt's `views.vl` went
+/// `base` 156–586 ms miss-every-time to 0.0 ms from the second analysis), so
+/// the pin is stated in retained worlds and hit/miss deltas rather than in
+/// milliseconds: it needs no clock, and it says the same thing.
+///
+/// Both halves are here because either alone is misleading. The first is M44
+/// working; the second is the shape it does not reach, and it must red if a
+/// future coarser key ever makes three seed sets share one world — that would
+/// be a world holding modules a leg never imported, which is a different claim
+/// about observation identity from the one `a_distinct_import_set_misses`
+/// makes, and it should not happen quietly.
+#[test]
+fn a_packages_legs_share_one_world_exactly_when_their_seed_sets_agree() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = std::env::temp_dir().join(format!("vilan_m52_legs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("shared.vl"), M52_MODULE).expect("write module");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let leg = |entry_name: &'static str, source: &'static str| {
+        let spec = spec.clone();
+        let root = root.clone();
+        on_one_thread(move || {
+            let entry = root.join(entry_name);
+            let (_program, errors) = analyze_source(
+                source,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            format!("{errors:?}")
+        })
+    };
+
+    // 1. Three legs, one seed set. The first misses and builds; the other two
+    //    are served its world, which is the `base` phase going to nothing.
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    assert_eq!(leg("same_a.vl", M52_SAME_A), "[]");
+    assert_eq!(leg("same_b.vl", M52_SAME_B), "[]");
+    assert_eq!(leg("same_c.vl", M52_SAME_C), "[]");
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        1,
+        "one seed set is one world, however many legs the package has"
+    );
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (2, 1),
+        "the first leg builds and the other two are served — that is what M44 \
+         measured and what a `base` phase of ~0 means"
+    );
+
+    // 2. Three legs, three seed sets — kolt's shape. Each builds its own world
+    //    and no leg waits for another, so M44's claim never fires.
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    assert_eq!(leg("diff_a.vl", M52_DIFFERENT_A), "[]");
+    assert_eq!(leg("diff_b.vl", M52_DIFFERENT_B), "[]");
+    assert_eq!(leg("diff_c.vl", M52_DIFFERENT_C), "[]");
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        3,
+        "three seed sets are three worlds — M44 is inert here, and a coarser \
+         key that made this 1 would be serving a leg a world holding modules it \
+         never imported"
+    );
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (0, 3),
+        "no leg is served another's world when the seed sets differ"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
