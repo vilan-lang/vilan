@@ -15,13 +15,14 @@ vilan/examples/**/*.chunks.json
 # The benchmark bundle (`vilan run vilan/benchmarks` writes it beside the source).
 vilan/benchmarks/src/main.mjs
 
-# Every package's BUILD directory, wherever one is checked in beside sources.
-# `dist/` holds emitted artifacts, the build hooks' stamp file, and — since M33
-# — the macro expansion table a `check` writes, so any `vilan check` run inside
-# the tree creates one. The examples' own `dist/` is already ignored above; this
-# covers the packages the suite itself compiles in place.
-vilan/benchmarks/dist/
-vilan/test/dist/
+# Every package's BUILD directory, wherever one sits beside checked-in sources.
+# `dist/` holds emitted artifacts, the build hooks' stamp file, and — under
+# `dist/.cache/` since N63 — every on-disk cache the compiler keeps, so any
+# `vilan check` run inside the tree creates one even though it emits nothing.
+# ONE line rather than the two compile-perf-29 added for `vilan/benchmarks/` and
+# `vilan/test/`: the next package the suite compiles in place would have wanted a
+# third, and nothing named `dist` is tracked anywhere in this repository.
+dist/
 vilan/docs/book/
 
 # The union-suite log every integration writes beside the tree (three

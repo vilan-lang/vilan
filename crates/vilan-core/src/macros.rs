@@ -1190,12 +1190,21 @@ fn disk_tables() -> &'static Mutex<HashMap<PathBuf, DiskTable>> {
 /// `rm -rf dist` means *recompile everything, macro worlds included*, which is
 /// a sentence a user already believes.
 ///
+/// **Under `dist/.cache/`, which is where every on-disk cache lives** (tracker
+/// N63, ruled by the owner 2026-09-07). M33 wrote it as `dist/.macro-expansions`,
+/// one leaf beside the emitted artifacts, and the second cache would have been
+/// another leaf beside those — a `dist/` a reader has to sort by hand into "the
+/// build's output" and "something the compiler kept". One directory instead:
+/// `rm -rf dist/.cache` is *forget everything remembered and rebuild nothing*,
+/// one ignore line covers it, and `vilan check` — which emits no artifacts at
+/// all — creates `dist/.cache/` and writes nothing else, which is pinned.
+///
 /// Canonical at the source (the house rule for a path that will be compared):
 /// the file does not exist yet on a first run, so it goes through
 /// `canonical_path_of_unwritten`, and two spellings of one package share one
 /// table instead of racing two.
 pub(crate) fn expansion_cache_file(build_dir: &Path) -> PathBuf {
-    crate::util::canonical_path_of_unwritten(build_dir.join(".macro-expansions"))
+    crate::util::canonical_path_of_unwritten(build_dir.join(".cache").join("macro-expansions"))
 }
 
 /// The header this compiler writes and will read back: the format line, the
@@ -1350,7 +1359,7 @@ pub(crate) fn flush_expansion_cache(build_dir: &Path) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let temporary = parent.join(format!(".macro-expansions.{}.tmp", std::process::id()));
+    let temporary = parent.join(format!("macro-expansions.{}.tmp", std::process::id()));
     if std::fs::write(&temporary, rendered).is_err() {
         let _ = std::fs::remove_file(&temporary);
         return;
