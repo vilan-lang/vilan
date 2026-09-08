@@ -50606,6 +50606,43 @@ fn analyze_inner<'src>(
     )
 }
 
+/// B265: the declaration an intrinsic may bind to for `name` on this impl —
+/// the id the compiler-known lowering replaces, but ONLY when the source
+/// declared it `external fun`.
+///
+/// The intrinsic tables are keyed by NAME on a nominal subject, which is how a
+/// built-in lowering finds std's `List::remove` without std having to name the
+/// intrinsic. Keyed by name ALONE it also matched a BODIED declaration: give
+/// `List::remove` a vilan body and the body is dropped on the floor — every call
+/// lowers to `splice` and the code the author wrote never runs, with nothing
+/// said. M47 found it A/B-ing an old std against the new lowering, which is the
+/// only way anyone would: a user's `impl List` cannot redeclare a name std
+/// already declares, so the reach is std authors, who are exactly the people who
+/// would write that body.
+///
+/// An `external fun` has no body BY CONSTRUCTION, so there is nothing for an
+/// intrinsic to drop, and binding to those alone makes the rule what it always
+/// meant — an intrinsic replaces a HOST BINDING, not an implementation. Every
+/// intrinsic name in std today is declared `external fun`, so no lowering moves;
+/// what changes is that a std author who gives one of those names a body gets
+/// the body.
+///
+/// The externality question is the member's own expression: an impl member is an
+/// expr id, and the parser's `external fun` fork is what makes it an
+/// [`Expr::ExternalFunction`] rather than an [`Expr::Function`].
+fn external_intrinsic_declaration(
+    analyzer: &Analyzer<'_>,
+    implementation: &Implementation<'_>,
+    name: &str,
+) -> Option<Id> {
+    let id = implementation.declarations.get(name).copied()?;
+    matches!(
+        analyzer.expr_id_to_expr_map.get(&id),
+        Some(Expr::ExternalFunction(_))
+    )
+    .then_some(id)
+}
+
 /// The entry tail: walks the entry over a resolved [`World`], builds,
 /// checks, and extracts the `Program`. Byte-identical to the former tail
 /// of `analyze` — the destructure below restores its locals.
@@ -51147,15 +51184,11 @@ fn analyze_over_world<'src>(
                 Some(Type::Struct(id, _)) if *id == list_struct_id
             );
             if subject_is_list {
-                list_new_fn_id = implementation
-                    .declarations
-                    .get("new")
-                    .copied()
+                // Both take B265's rule with the intrinsic table below: an
+                // `external fun` declaration and nothing else.
+                list_new_fn_id = external_intrinsic_declaration(&analyzer, implementation, "new")
                     .or(list_new_fn_id);
-                list_push_fn_id = implementation
-                    .declarations
-                    .get("push")
-                    .copied()
+                list_push_fn_id = external_intrinsic_declaration(&analyzer, implementation, "push")
                     .or(list_push_fn_id);
             }
         }
@@ -51188,7 +51221,9 @@ fn analyze_over_world<'src>(
                     ("parse_f64", Intrinsic::ParseF64),
                     ("try_parse_json", Intrinsic::TryParseJson),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -51210,7 +51245,9 @@ fn analyze_over_world<'src>(
                     ("insert", Intrinsic::ListInsert),
                     ("sort_by", Intrinsic::ListSortBy),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -51237,7 +51274,9 @@ fn analyze_over_world<'src>(
                     ("keys", Intrinsic::MapKeys),
                     ("values", Intrinsic::MapValues),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -51258,7 +51297,9 @@ fn analyze_over_world<'src>(
                     ("is_null", Intrinsic::JsonIsNull),
                     ("kind", Intrinsic::JsonKind),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -51278,7 +51319,9 @@ fn analyze_over_world<'src>(
                     ("read", Intrinsic::SharedValue),
                     ("write", Intrinsic::SharedWrite),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
@@ -51301,7 +51344,9 @@ fn analyze_over_world<'src>(
                     ("take", Intrinsic::OptionTake),
                     ("replace", Intrinsic::OptionReplace),
                 ] {
-                    if let Some(id) = implementation.declarations.get(name).copied() {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
                         intrinsics.insert(id, intrinsic);
                     }
                 }
