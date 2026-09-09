@@ -434,3 +434,4 @@ row	flagship	key
 404	-	`[expose(keyed = …)]`'s argument is a TYPE — the key type the mirror is keyed by, as in `[expose(keyed = str)]`. It is written here because a keyed mirror is a `KeyedSource<K, T>` and a `List<T>` names only the element; a `Map<K, V>` element names both, and takes the bare `[expose(keyed)]`
 405	-	`{spelled}` is a directory with no `{leaf}.vl`, so it is a namespace rather than a module: it has no items to import. Import one of its modules instead: {listed}
 406	-	`[service]` cannot take a generic subject: `{subject}` declares `<{parameters}>`
+NEW	-	`[rpc]` method `{method_name}` returns a signal handle whose element `{rendered}` is not Wire: the source itself stays on the server and the client mirrors it over a channel, so it is the ELEMENT that crosses the wire and it must be Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a `[derive(Wire)]` type)

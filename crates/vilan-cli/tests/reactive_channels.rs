@@ -1169,3 +1169,321 @@ fn the_generated_keyed_list_exposure_is_the_hand_wired_one_frame_for_frame() {
         "both mirrors must hold the same collection:\n{stdout}"
     );
 }
+
+// --- §9.2 / R3: the DYNAMIC mirror, in process and frame by frame -----------
+//
+// The generated end of this lives in `service_layer.rs` over a real socket
+// (`a_handle_returning_method…`, `a_hundred_handles…`). What belongs HERE is
+// what a socket can only blur: the exact frames a dispose-and-remount costs,
+// which is R3's whole subject. `Origin` and `ReactiveClient::minted_source`
+// are the public seam the generated stub calls, so a hand-written origin over
+// a `duplex_pair` exercises the same code the macro emits.
+
+/// A dispose and a remount, inside one turn and then across two — the frame
+/// count is the whole measurement, so the link counts frames in both
+/// directions rather than bytes.
+const MINTED_REMOUNT: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ FlushPolicy, Signal, SignalCell, turn };
+import std::result::Result::{ self, Ok };
+import std::rpc::{ DuplexEnd, Origin, ReactiveClient, ReactiveServer, RemoteSource, RpcError, duplex_pair };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Serializer, Wire };
+
+/// A duplex pair with both legs counted, one FRAME at a time.
+fun counted_link(up: Shared<i32>, down: Shared<i32>): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		up.write() = up.read() + 1;
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		down.write() = down.read() + 1;
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun main() {
+	let up: Shared<i32> = Shared::new(0);
+	let down: Shared<i32> = Shared::new(0);
+	let (client_end, server_end) = counted_link(up, down);
+	let session = ReactiveServer::new(server_end, json_codec());
+	let client = ReactiveClient::new(client_end, json_codec());
+	let cell: SignalCell<i32> = Signal::new(1);
+	let mints: Shared<i32> = Shared::new(0);
+
+	// The origin a generated stub would carry: the call that minted the
+	// channel, and the seam that issues it again. In process, "issuing" it is
+	// exposing the same source afresh — which is exactly what the server route
+	// does for a real one.
+	let origin = Origin {
+		method = "get_message",
+		describers = [],
+		reissue = |name: str, args: List<|Serializer| void>| {
+			mints.write() = mints.read() + 1;
+			let fresh: Result<i32, RpcError> = Ok(session.expose_dynamic(cell));
+			fresh
+		},
+	};
+	mints.write() = mints.read() + 1;
+	let mirror: RemoteSource<i32> = client.minted_source(session.expose_dynamic(cell), origin);
+
+	// Lazy: a minted handle nothing watches has sent nothing at all.
+	print(i"minted:up={up.read()} down={down.read()} sources={session.sources.read().len()}");
+	let held = mirror.sub(|value| print(i"held:{value}"));
+	print(i"leased:up={up.read()} down={down.read()} live={session.live.read().len()}");
+
+	// (c) A dispose and a rebuild inside ONE turn: the close never leaves the
+	// turn, `acquire` cancels it, and nothing crosses.
+	up.write() = 0;
+	down.write() = 0;
+	turn(FlushPolicy::AtEnd, || {
+		held.dispose();
+		let refreshed = mirror.sub(|value| print(i"same-turn:{value}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"same-turn:up={up.read()} down={down.read()} sources={session.sources.read().len()}");
+
+	// (d) A dispose in one turn and a mount in ANOTHER — two event handlers, a
+	// route change, a `bind_each` rebuilding rows. Different turns, one
+	// MACROTASK: the settle is the first look and the microtask hop is the
+	// second, so this costs nothing either.
+	up.write() = 0;
+	down.write() = 0;
+	turn(FlushPolicy::AtEnd, || {
+		mirror.release();
+	});
+	turn(FlushPolicy::AtEnd, || {
+		mirror.acquire();
+	});
+	sleep_for(Duration::millis(0));
+	print(i"cross-turn:up={up.read()} down={down.read()} sources={session.sources.read().len()} mints={mints.read()}");
+
+	// And the close that IS real: past the settle and past the hop, the
+	// `Unsubscribe` goes out and the server revokes the dynamic channel.
+	up.write() = 0;
+	down.write() = 0;
+	mirror.release();
+	sleep_for(Duration::millis(0));
+	print(i"closed:up={up.read()} down={down.read()} sources={session.sources.read().len()}");
+
+	// Demand returns: the mirror re-issues its origin and rebinds.
+	cell.set(7);
+	let again = mirror.sub(|value| print(i"again:{value}"));
+	sleep_for(Duration::millis(0));
+	print(i"re-minted:sources={session.sources.read().len()} live={session.live.read().len()} mints={mints.read()}");
+	again.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"#;
+
+/// R3, point 1 — the microtask second look — measured in frames.
+///
+/// The shipped rule is that a 1→0 defers its `Unsubscribe` to the ambient
+/// turn's settle, so a dispose and a rebuild INSIDE one turn churn nothing.
+/// That covers a `bind_each` row refreshing and nothing else: a dispose in one
+/// event handler and a mount in the next are two turns, and the settle of the
+/// first has already fired by the time the second runs. Both are one
+/// MACROTASK, and R3 makes the whole macrotask free by taking one microtask
+/// hop before the frame goes out.
+///
+/// It is the DYNAMIC mirror's hop and not every mirror's, and the asymmetry
+/// is the reason: on a dynamic channel the server revokes on `Unsubscribe`,
+/// so a spurious one costs a whole re-mint round trip — a call, a fresh
+/// capability, a fresh `Subscribe`, a fresh seed — where a field channel would
+/// only re-`Subscribe`, and would pay for the hop with the promptness
+/// `remote-sources.md` §2 ratified (four A25 pins in `vilan-core` record it: a
+/// write after the last dispose puts nothing on the wire).
+///
+/// **Red without the hop, and redder than expected.** With `flush_close`
+/// sending inline (its shipped body), the plant reads
+/// `same-turn:up=2 down=1 sources=1` and
+/// `cross-turn:up=2 down=1 sources=1 mints=3` — an `Unsubscribe` and a
+/// re-`Subscribe` up, a seed down, and a re-mint, in BOTH cases. The
+/// cross-turn red is R3's own subject. The same-TURN red is the finding
+/// underneath it: `release` runs from the subscription's stored release hook,
+/// so the turn `at_settle` reads is the one that closure captured AT CREATION
+/// — none, for a lease taken outside a turn — and the settle-deferral never
+/// applied to it at all. The hop is what makes the shipped same-turn promise
+/// true for a lease whose subscription was born anywhere.
+#[test]
+fn a_minted_mirror_remounting_inside_one_macrotask_sends_nothing() {
+    let stdout = run_program("mintedremount", MINTED_REMOUNT);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // Minted and unwatched: a capability exists, and not one frame has
+            // crossed in either direction.
+            "minted:up=0 down=0 sources=1",
+            // The lease is one `Subscribe` up and one seeding `Update` down.
+            "held:1",
+            "leased:up=1 down=1 live=1",
+            // Same turn: the re-`sub` fires immediately from the cache — a
+            // local read, not a frame.
+            "same-turn:1",
+            "same-turn:up=0 down=0 sources=1",
+            // Different turns, one macrotask: still nothing, and the
+            // capability is untouched, so no re-mint was needed.
+            "cross-turn:up=0 down=0 sources=1 mints=1",
+            // The real close: one `Unsubscribe` up, and the dynamic
+            // capability is withdrawn by it.
+            "closed:up=1 down=0 sources=0",
+            // Demand returns. The new observer fires at once from the CACHE
+            // — `again:1`, the value the mirror was last told, painted before
+            // the round trip rather than a `Waiting` for its duration — and
+            // the re-issued origin's seed then carries the value as of NOW to
+            // every observer the mirror has, the earlier `same-turn` lease
+            // included.
+            "again:1",
+            "same-turn:7",
+            "again:7",
+            "re-minted:sources=1 live=1 mints=2",
+            "done",
+        ],
+        "the minted mirror's remount economy went differently:\n{stdout}"
+    );
+}
+
+/// The owner hook (R3, point 4) and the reconnect replay (§9.2's `origin`),
+/// both in process.
+const MINTED_OWNER_AND_REPLAY: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, comp };
+import std::result::Result::{ self, Ok };
+import std::rpc::{ Origin, ReactiveClient, ReactiveServer, RemoteSource, RpcError, duplex_pair };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Serializer, Wire };
+
+fun main() {
+	let (app_end, wire_end) = duplex_pair();
+	let cell: SignalCell<str> = Signal::new("first");
+	let session: Shared<ReactiveServer> = Shared::new(ReactiveServer::new(wire_end, json_codec()));
+	let client = ReactiveClient::new(app_end, json_codec());
+	let mints: Shared<i32> = Shared::new(0);
+
+	// One origin, three mirrors minted through it — the seam re-exposes on
+	// whichever session is live, which is what a reconnect makes true.
+	let origin = Origin {
+		method = "get_message",
+		describers = [],
+		reissue = |name: str, args: List<|Serializer| void>| {
+			mints.write() = mints.read() + 1;
+			let fresh: Result<i32, RpcError> = Ok(session.read().expose_dynamic(cell));
+			fresh
+		},
+	};
+
+	// (f) THE OWNER HOOK. A mirror minted inside an owner scope that nothing
+	// ever leased: its owner's disposal is the only event that can free the
+	// capability, and it does.
+	let (orphan, scope) = comp(|| {
+		let inner: RemoteSource<str> = client.minted_source(session.read().expose_dynamic(cell), origin);
+		inner
+	});
+	print(i"under-owner:sources={session.read().sources.read().len()}");
+	scope.dispose();
+	print(i"owner-disposed:sources={session.read().sources.read().len()}");
+
+	// A mirror minted with NO ambient owner lives with the connection — the
+	// documented case, and the reason the read is owner-optional.
+	let ownerless: RemoteSource<str> = client.minted_source(session.read().expose_dynamic(cell), origin);
+	print(i"ownerless:sources={session.read().sources.read().len()}");
+
+	// (g) THE RECONNECT REPLAY. One WATCHED minted mirror, one unwatched, and
+	// one hand-wired mirror with no origin at all.
+	let watched: RemoteSource<str> = client.minted_source(session.read().expose_dynamic(cell), origin);
+	let lease = watched.sub(|value| print(i"watched:{value}"));
+	let hand: RemoteSource<str> = client.source(session.read().expose_dynamic(cell));
+	print(i"before-drop:sources={session.read().sources.read().len()} mints={mints.read()}");
+
+	// The connection is replaced: the old session dies with every channel it
+	// ever minted, and a fresh one takes the wire.
+	session.read().dispose();
+	session.write() = ReactiveServer::new(wire_end, json_codec());
+	cell.set("second");
+	print(i"while-down:{watched.get().unwrap_or("?")}");
+
+	// What `reattach_mirrors` runs after the positional `__attach` rebind.
+	client.replay_dynamic();
+	sleep_for(Duration::millis(0));
+	print(i"replayed:sources={session.read().sources.read().len()} live={session.read().live.read().len()} mints={mints.read()}");
+	print(i"after:{watched.get().unwrap_or("?")}");
+	cell.set("third");
+	print(i"following:{watched.get().unwrap_or("?")}");
+
+	// The origin-less mirror is nobody's to replay, and `invalidate_dynamic`
+	// is still its answer.
+	client.invalidate_dynamic();
+	print(i"hand:{hand.status().get().debug()}");
+	lease.dispose();
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"#;
+
+/// The two lifetimes a dynamic mirror can end with that its own lease cannot
+/// decide: an OWNER disposing, and a CONNECTION being replaced.
+///
+/// **The owner hook (R3, point 4).** A handle a call handed out and nothing
+/// ever leased has no `Unsubscribe` owed — the lease machinery never ran — so
+/// without this it holds a server capability until the socket closes. Minted
+/// under an ambient owner, that owner's disposal is the honest end of its
+/// life. The read is owner-OPTIONAL (`defer_to_owner`, `register_with_owner`'s
+/// shape), so the ownerless case is not refused: a handle fetched at the top
+/// of `main` lives with the connection, which frees every channel it ever
+/// minted in one act, and that is documented rather than diagnosed.
+///
+/// **The replay (§9.2's `origin`).** A41 recorded that a mirror minted from a
+/// runtime channel id could not be rebound after a reconnect, "because the
+/// fresh session never minted it, and no protocol form exists yet to ask for
+/// it again". The origin IS that form: the call and its arguments, re-issued
+/// after the fresh session is attached. Only a WATCHED mirror is replayed —
+/// an unwatched one would cost a call nobody asked for, and its next lease
+/// re-mints anyway — and a mirror with NO origin (the hand-wired
+/// `ReactiveClient::source`) is left to `invalidate_dynamic`, which is what
+/// "retired for generated mirrors, kept for origin-less ones" means.
+#[test]
+fn an_owner_and_a_reconnect_each_end_a_minted_mirror_the_lease_cannot() {
+    let stdout = run_program("mintedowner", MINTED_OWNER_AND_REPLAY);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "under-owner:sources=1",
+            // The owner disposed a mirror nothing had leased, and the
+            // capability went with it.
+            "owner-disposed:sources=0",
+            // No ambient owner: the mirror lives with the connection.
+            "ownerless:sources=1",
+            "watched:first",
+            // Three capabilities on the doomed session: the ownerless one,
+            // the watched one, and the hand-wired one. `mints` counts REPLAYS
+            // — the initial exposures went through `expose_dynamic` directly,
+            // exactly as a server route does.
+            "before-drop:sources=3 mints=0",
+            // The session is gone; the mirror still holds what it was last
+            // told.
+            "while-down:first",
+            // The replay re-issues exactly the WATCHED mirror's origin — one
+            // call, not three — and the mirror rebinds onto the fresh
+            // session's channel and re-subscribes, so the seed lands before
+            // the replay call has even returned.
+            "watched:second",
+            "replayed:sources=1 live=1 mints=1",
+            "after:second",
+            "watched:third",
+            "following:third",
+            // The origin-less mirror was not replayed, and invalidation is
+            // still what says so.
+            "hand:Waiting",
+            "done",
+        ],
+        "the owner hook or the replay went differently:\n{stdout}"
+    );
+}

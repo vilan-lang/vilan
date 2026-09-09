@@ -14762,6 +14762,37 @@ impl<'src> Analyzer<'src> {
         let checks = std::mem::take(&mut self.rpc_signatures_to_check);
         for (method_name, method_id, members) in checks {
             for (label, type_node, span) in members {
+                // A RETURN that is a signal HANDLE is not a Wire type and is
+                // not meant to be (`transport-rpc.md` §9.2): the source stays
+                // on the server, a `ChannelId` crosses in its place, and the
+                // client's stub answers a `RemoteSource<T>`. What must be Wire
+                // is the ELEMENT — that is what the channel's `Update` frames
+                // carry — so the rule moves inward by one type argument rather
+                // than standing down.
+                if label == "return type"
+                    && let Some(element) = type_node.and_then(handle_return_element)
+                {
+                    if !self.is_wire_type(element) {
+                        let rendered = render_type(element);
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "`[rpc]` method `{method_name}` returns a signal handle \
+                                         whose element `{rendered}` is not Wire: the source \
+                                         itself stays on the server and the client mirrors it \
+                                         over a channel, so it is the ELEMENT that crosses the \
+                                         wire and it must be Wire (a scalar, `str`, `bool`, \
+                                         `List`/`Option` of Wire, or a `[derive(Wire)]` type)"
+                                ),
+                            },
+                            method_id,
+                        );
+                    }
+                    continue;
+                }
                 match type_node {
                     Some(type_node) if self.is_wire_type(type_node) => {}
                     Some(type_node) => {
@@ -46057,6 +46088,35 @@ fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
         Node::AccessorWithGenerics(head, key_and_value)
             if *head == "Map" && key_and_value.0.len() == 2
     )
+}
+
+/// The ELEMENT of an `[rpc]` return type the `[service]` expansion reads as a
+/// signal HANDLE — `SignalCell<T>` and `Option<SignalCell<T>>`
+/// (`transport-rpc.md` §9.2) — or `None` for an ordinary value return.
+///
+/// The RULE IS THE WRITTEN SPELLING, and it is the macro's rule read back
+/// here: the expansion runs before any type resolves, so it cannot reconcile a
+/// return against `Source` the way `check_expose_fields` reconciles a field,
+/// and it maps what it can name. `std/src/rpc.vl`'s `handle_element` is the
+/// other half of this pair and the two must agree — a return this function
+/// admits and the macro does not would be permitted here and generated as a
+/// plain value, which is the one outcome neither side wants.
+fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
+    match node {
+        Node::AccessorWithGenerics(name, arguments) if *name == "SignalCell" => {
+            match arguments.0.as_slice() {
+                [element] => Some(&element.0),
+                _ => None,
+            }
+        }
+        Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
+            match arguments.0.as_slice() {
+                [inner] => handle_return_element(&inner.0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// A stable fingerprint of a service's surface (Q6 v2): method names, parameter
