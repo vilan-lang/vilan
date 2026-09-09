@@ -98,12 +98,20 @@ receives a `Patch` of `Delta` ops and applies them in order — and it can lease
 ```vilan,fragment
 struct KeyedSource<K, T> { … }
 
-impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
 	fun get(self): Option<List<T>>                            // passive: what this client subscribed to
+	[must_use]
+	fun on_change(self, observer: |Option<List<T>>| void): Subscription   // counted, lazy
+	[must_use]
+	fun sub(self, observer: |Option<List<T>>| void): Subscription         // counted, eager
+	fun effect(self, observer: |Option<List<T>>| void)                    // counted, eager, owner-scoped
+	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U>
+}
+
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun status(self): SignalCell<Status>                      // passive: `Waiting` until the first patch
 	fun fault(self): Option<str>                              // passive: the first protocol fault, sticky
 	fun or(self, initial: List<T>): SignalCell<List<T>>       // counted, owner-scoped: the whole collection
-	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U>
 	[must_use]
 	fun sub(self, observer: |List<T>| void): Subscription     // counted, manual: the whole collection
 	fun of(self, key: K): SignalCell<Option<T>>               // counted per KEY, owner-scoped
@@ -112,6 +120,15 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun rebind(self, channel: i32)                            // reconnect: re-subscribe every demand held
 }
 ```
+
+A keyed mirror is a **`Source<Option<List<T>>>`** (tracker A55), on the same
+counted lease and with the same reading as `RemoteSource`'s: the trait argument
+is the `Option` because a mirror that has been told nothing is not an empty
+collection, so a `KeyedSource<K, T>` is *not* a `Source<List<T>>` and
+`bind_each` takes `mirror.or([])`. `sub` has one spelling per view of the
+value — the inherent one hands the observer a present `List<T>`, the trait's
+hands it the `Option<List<T>>`, and the observer's own parameter type picks
+between them.
 
 The counted lease is `RemoteSource`'s, applied **per demand** rather than
 per channel: a per-key 0→1 sends `Subscribe(channel, Some(key))` and the
@@ -141,6 +158,63 @@ collection names it in the attribute — `[expose(keyed = str)] items:
 SignalCell<List<Task>>`. The generated wiring is the hand-written call, frame
 for frame, and the two spellings are one contract: same `Patch` frames, same
 `KeyedSource<K, T>`, same contract hash.
+
+## Keyed cells: `KeyedCell<K, T>`
+
+The SERVER-side twin of `KeyedSource`, and the cheap way to hold a keyed
+collection (tracker A54). Exposing a `SignalCell<List<T>>` keyed makes the
+server DIFF two snapshots on every change — it re-keys both and compares every
+retained element — so a keyed channel costs O(N) per change *per subscribed
+connection*, however small the change is. That is irreducible while the source
+is `List`-valued, because only the mutation knows what changed. A `KeyedCell`
+is the mutation saying so: each write appends the `Delta<K, T>` it is, and a
+subscriber's forward sends the ops since it last looked.
+
+```vilan,fragment
+struct KeyedCell<K, T> { … }
+
+impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
+	fun new(initial: List<T>): KeyedCell<K, T>
+	fun insert(self, value: T)                        // append, or replace what is held under its key
+	fun remove(self, key: K)                          // a key it does not hold is a no-op
+	fun update(self, key: K, mutate: sync |&mut T| void)   // in place, and the `Update` op it is
+	fun set(self, value: List<T>)                     // the wholesale write: one `Reset`
+	fun locate(self, key: K): Option<(i32, T)>        // the element and where it sits, by lookup
+}
+
+impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
+	fun get(self): List<T>
+	[must_use]
+	fun on_change(self, observer: |List<T>| void): Subscription
+}
+```
+
+It is a `Source<List<T>>` with no `Option` in it — a cell always holds a
+collection, where a mirror may not have been told one yet — so
+`bind_each(cell, …)` takes it directly and the `or([])` a `KeyedSource` needs
+has nothing to say here.
+
+`[expose] items: KeyedCell<str, Task>` is a keyed channel. The cell names both
+its key and its element in its own type, so `keyed` is redundant on it (writing
+`[expose(keyed)]` is the same thing) and there is nothing for `keyed = K` to
+add. **The wire does not change**: the same `Reset` seed and the same
+element-grained `Patch` per change, the same `KeyedSource<K, T>` on the client,
+and the same contract hash as `[expose(keyed = str)] items:
+SignalCell<List<Task>>` — a service may swap one field for the other without
+moving its contract. What changes is the cost: measured per change on one
+connection, 0.0078 ms at 1,000 rows and 0.0103 at 10,000 where the diffing
+exposure is 0.315 and 3.814 (children CPU, `getrusage`).
+
+The hand-wired form is `ReactiveServer::expose_keyed_cell(cell)`, which takes
+no `key_of` — `KeyedCell<K, T>` names `K` in its own type, so `Keyed` is a real
+bound there. It is a distinct name rather than an overload of `expose_keyed`
+because a cell *is* a `Source<List<T>>` and would otherwise satisfy that
+bound and take the diffing path silently. `expose_keyed` over a cell is still
+correct, just O(N).
+
+`T: PartialEq` is a bound of the diffing exposure and not of the cell: a diff
+can only learn that an element changed by comparing it, and a cell whose writes
+are the ops never compares anything.
 
 ## Errors
 

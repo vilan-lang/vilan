@@ -14877,11 +14877,12 @@ impl<'src> Analyzer<'src> {
                 // said HERE, in the vocabulary of the field, or the exposure
                 // would simply not happen and nothing would say so.
                 Some(_)
-                    if !matches!(
-                        type_node,
-                        Some(Node::AccessorWithGenerics(_, arguments))
-                            if arguments.0.len() == 1
-                    ) =>
+                    if !annotation_is_keyed_cell(type_node)
+                        && !matches!(
+                            type_node,
+                            Some(Node::AccessorWithGenerics(_, arguments))
+                                if arguments.0.len() == 1
+                        ) =>
                 {
                     self.expose_refused_field_slots.insert(field_type_id);
                     self.push_anchored(
@@ -14916,7 +14917,8 @@ impl<'src> Analyzer<'src> {
                 Some(_)
                     if exposure.is_keyed()
                         && exposure.key_type().is_empty()
-                        && !sole_argument_is_map(type_node) =>
+                        && !sole_argument_is_map(type_node)
+                        && !annotation_is_keyed_cell(type_node) =>
                 {
                     self.expose_refused_field_slots.insert(field_type_id);
                     self.push_anchored(
@@ -14945,7 +14947,8 @@ impl<'src> Analyzer<'src> {
                     if exposure.is_keyed()
                         && !exposure.key_type().is_empty()
                         && !sole_argument_is_map(type_node)
-                        && !sole_argument_is_list(type_node) =>
+                        && !sole_argument_is_list(type_node)
+                        && !annotation_is_keyed_cell(type_node) =>
                 {
                     self.expose_refused_field_slots.insert(field_type_id);
                     self.push_anchored(
@@ -46042,6 +46045,24 @@ fn sole_argument_is_list(type_node: Option<&Node<'_>>) -> bool {
         &element.0,
         Node::AccessorWithGenerics(head, item)
             if *head == "List" && item.0.len() == 1
+    )
+}
+
+/// Whether an exposed field is written as a `KeyedCell<K, T>` (A54) — the one
+/// source type that names BOTH the key and the element in its own arguments,
+/// so the keyed exposure needs nothing from the attribute to read them.
+///
+/// Written as a NAME test for the same reason the two helpers above are:
+/// `check_expose_fields` runs after resolution, but the `[service]` expansion
+/// that has to agree with it runs before ANY type resolves and can only read
+/// the annotation. A local alias for `KeyedCell` would therefore be missed
+/// here and by the expansion alike — one refusal, said once, rather than two
+/// halves disagreeing.
+fn annotation_is_keyed_cell(type_node: Option<&Node<'_>>) -> bool {
+    matches!(
+        type_node,
+        Some(Node::AccessorWithGenerics(head, arguments))
+            if *head == "KeyedCell" && arguments.0.len() == 2
     )
 }
 

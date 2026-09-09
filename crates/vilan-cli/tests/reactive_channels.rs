@@ -1341,3 +1341,706 @@ fn a_keyed_mirror_is_a_source_over_the_shipped_counted_lease() {
         "the owner's dispose must release every lease the extent took:\n{stdout}"
     );
 }
+
+// --- A54: the delta-producing cell -----------------------------------------
+
+/// `keyed_forward` over a `SignalCell<List<T>>` can only learn what changed by
+/// comparing two snapshots, so a keyed channel costs O(N) per change per
+/// SUBSCRIBED CONNECTION however small the change is (A51's measurement: 1.08
+/// ms per change at 1,000 rows, 8.83 at 10,000). A54's answer is a cell whose
+/// WRITES are the deltas.
+///
+/// The whole claim of the cell is that it changes the COST and nothing else, so
+/// the pin is an identity: one program, two channels over the same edits — one
+/// fed by a `SignalCell<List<Task>>` through `expose_keyed`, one by a
+/// `KeyedCell<str, Task>` through `expose_keyed_cell` — and every frame the two
+/// put on their relays compared after the channel id (a fresh counter, not a
+/// shape) is normalized away. Both demands are covered: the whole collection,
+/// and one key. The `SignalCell` half is also the CONTROL — it must keep
+/// patching exactly as A39 pinned it.
+const KEYED_CELL_AGAINST_THE_DIFF: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, batch };
+import std::rpc::{ DuplexEnd, KeyedCell, KeyedSource, ReactiveClient, ReactiveServer, duplex_pair };
+import std::wire::{ Frame, Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Task { id: str, label: str }
+
+impl Task with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+fun text_of(frame: Frame): str {
+	match frame {
+		Frame::Text(let text) => text,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun logged_pair(label: str): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| server_relay.send(frame));
+	server_relay.on_frame(|frame| {
+		print(i"{label} {text_of(frame)}");
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun seed(): List<Task> {
+	[Task { id = "a", label = "alpha" }, Task { id = "b", label = "beta" }]
+}
+
+fun main() {
+	// (1) the DIFF path — the shipped `SignalCell<List<T>>` exposure.
+	let store: SignalCell<List<Task>> = Signal::new(seed());
+	let (diff_client_end, diff_server_end) = logged_pair("diff");
+	let diff_session = ReactiveServer::new(diff_server_end, json_codec());
+	let diff_channel = diff_session.expose_keyed(store, |task: Task| task.key());
+	print(i"diff-channel:{diff_channel}");
+	let diff_client = ReactiveClient::new(diff_client_end, json_codec());
+	let diff_mirror: KeyedSource<str, Task> = diff_client.keyed_source(diff_channel);
+	let diff_lease = diff_mirror.sub(|_list| {});
+
+	// (2) the CELL path — the same edits, said as ops.
+	let cell: KeyedCell<str, Task> = KeyedCell::new(seed());
+	let (cell_client_end, cell_server_end) = logged_pair("cell");
+	let cell_session = ReactiveServer::new(cell_server_end, json_codec());
+	let cell_channel = cell_session.expose_keyed_cell(cell);
+	print(i"cell-channel:{cell_channel}");
+	let cell_client = ReactiveClient::new(cell_client_end, json_codec());
+	let cell_mirror: KeyedSource<str, Task> = cell_client.keyed_source(cell_channel);
+	let cell_lease = cell_mirror.sub(|_list| {});
+
+	// Edit, append, delete — the three A39 pinned for the keyed shape.
+	store.update(|&mut list| { list[0] = Task { id = "a", label = "edited" }; });
+	cell.update("a", |&mut task| { task.label = "edited"; });
+
+	store.update(|&mut list| { list.push(Task { id = "c", label = "gamma" }); });
+	cell.insert(Task { id = "c", label = "gamma" });
+
+	store.update(|&mut list| { let _gone = list.remove(1); });
+	cell.remove("b");
+
+	// Two writes in ONE turn must coalesce into ONE patch on both paths.
+	batch(|| {
+		store.update(|&mut list| { list.push(Task { id = "d", label = "delta" }); });
+		store.update(|&mut list| { list.push(Task { id = "e", label = "epsilon" }); });
+	});
+	batch(|| {
+		cell.insert(Task { id = "d", label = "delta" });
+		cell.insert(Task { id = "e", label = "epsilon" });
+	});
+
+	print(i"held diff={diff_mirror.get().unwrap_or([]).len()} cell={cell_mirror.get().unwrap_or([]).len()}");
+	print(i"faults diff={diff_mirror.fault().is_some()} cell={cell_mirror.fault().is_some()}");
+	diff_lease.dispose();
+	cell_lease.dispose();
+	batch(|| {});
+
+	// (3) PER-KEY demand on both channels, through the same lifecycle the A39
+	// pin walks: seed, follow, release, remount, and the key leaving.
+	let diff_key = diff_mirror.sub_key("d", |value| match value {
+		Some(let task) => print(i"diff-d:{task.label}"),
+		None => print("diff-d:absent"),
+	});
+	let cell_key = cell_mirror.sub_key("d", |value| match value {
+		Some(let task) => print(i"cell-d:{task.label}"),
+		None => print("cell-d:absent"),
+	});
+	// `d` sits at index 2 of [a, c, d, e] — the diff path is told the change
+	// positionally and the cell path by key, which is exactly the difference
+	// under test, so the two must name the same element.
+	store.update(|&mut list| { list[2] = Task { id = "d", label = "edited-d" }; });
+	cell.update("d", |&mut task| { task.label = "edited-d"; });
+	store.update(|&mut list| { let _gone = list.remove(2); });
+	cell.remove("d");
+	diff_key.dispose();
+	cell_key.dispose();
+	print(i"key-faults diff={diff_mirror.fault().is_some()} cell={cell_mirror.fault().is_some()}");
+	print("done");
+}
+"#;
+
+/// Split the relayed frames of one label out of the exhibit's stdout, with the
+/// channel id — a process-wide counter, not a shape — normalized away.
+fn relayed_frames(stdout: &str, label: &str, channel: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix(label))
+        .map(|frame| frame.replace(&format!("[{channel},"), "[C,"))
+        .collect()
+}
+
+fn labelled_value(stdout: &str, label: &str) -> String {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(label).map(str::to_string))
+        .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+}
+
+#[test]
+fn a_keyed_cell_patches_the_wire_exactly_as_the_diff_does() {
+    let stdout = run_program("keyedcell", KEYED_CELL_AGAINST_THE_DIFF);
+    let diff_channel = labelled_value(&stdout, "diff-channel:");
+    let cell_channel = labelled_value(&stdout, "cell-channel:");
+    assert_ne!(
+        diff_channel, cell_channel,
+        "the two channels must be distinct, or the comparison is vacuous"
+    );
+    let diff = relayed_frames(&stdout, "diff ", &diff_channel);
+    let cell = relayed_frames(&stdout, "cell ", &cell_channel);
+    assert!(
+        !cell.is_empty(),
+        "the cell's channel put nothing on the wire:\n{stdout}"
+    );
+    assert_eq!(
+        cell, diff,
+        "the cell exposure and the diff exposure must be the same channel, \
+         frame for frame:\n{stdout}"
+    );
+    // And they are the frames A39 pinned for the keyed shape — ONE frame per
+    // change, carrying only what moved, with two writes in one turn coalescing
+    // into one patch of two ops. This half is the CONTROL: it is what the
+    // `SignalCell<List<T>>` field still costs and still says.
+    assert_eq!(
+        diff,
+        vec![
+            "{\"Patch\":[C,[{\"Reset\":[{\"id\":\"a\",\"label\":\"alpha\"},{\"id\":\"b\",\"label\":\"beta\"}]}]]}",
+            "{\"Patch\":[C,[{\"Update\":[\"a\",{\"id\":\"a\",\"label\":\"edited\"}]}]]}",
+            "{\"Patch\":[C,[{\"Insert\":[\"c\",{\"id\":\"c\",\"label\":\"gamma\"},2]}]]}",
+            "{\"Patch\":[C,[{\"Remove\":\"b\"}]]}",
+            "{\"Patch\":[C,[{\"Insert\":[\"d\",{\"id\":\"d\",\"label\":\"delta\"},2]},{\"Insert\":[\"e\",{\"id\":\"e\",\"label\":\"epsilon\"},3]}]]}",
+            // Per-key demand: the seed is an `Insert` (never a `Reset`), then
+            // this key's changes and no other key's.
+            "{\"Patch\":[C,[{\"Insert\":[\"d\",{\"id\":\"d\",\"label\":\"delta\"},2]}]]}",
+            "{\"Patch\":[C,[{\"Update\":[\"d\",{\"id\":\"d\",\"label\":\"edited-d\"}]}]]}",
+            "{\"Patch\":[C,[{\"Remove\":\"d\"}]]}",
+        ],
+        "the keyed frames moved:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("held diff=4 cell=4"),
+        "both mirrors must hold the same collection:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("faults diff=false cell=false")
+            && stdout.contains("key-faults diff=false cell=false"),
+        "neither mirror may report a protocol fault:\n{stdout}"
+    );
+}
+
+/// `[expose(keyed)] tasks: KeyedCell<str, Task>` — the macro form. A
+/// `KeyedCell<K, T>` names BOTH types in its own arguments, so it is keyed by
+/// its TYPE and needs nothing from the attribute (where a `SignalCell<List<T>>`
+/// names only the element and A51 gave the key to `keyed = K`).
+///
+/// The claim is that the two field spellings are the SAME channel: the same
+/// contract entry, therefore the same hash, and the same frames. The hash is
+/// the load-bearing half — a service that swaps its field for a cell must not
+/// break every deployed client — and it holds because the surface entry is
+/// built from the written key and element, which both spellings supply.
+const GENERATED_KEYED_CELL: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{
+	DuplexEnd,
+	KeyedCell,
+	KeyedSource,
+	ReactiveClient,
+	ReactiveServer,
+	RpcError,
+	call,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::wire::{ Frame, Keyed, Serializer, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Task { id: str, label: str }
+
+impl Task with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(CellStoreClient)]
+struct CellStore {
+	[expose(keyed)] tasks: KeyedCell<str, Task>,
+}
+
+impl CellStore {
+	[rpc]
+	fun touch(self): i32 {
+		1
+	}
+}
+
+[service(ListStoreClient)]
+struct ListStore {
+	[expose(keyed = str)] tasks: SignalCell<List<Task>>,
+}
+
+impl ListStore {
+	[rpc]
+	fun touch(self): i32 {
+		1
+	}
+}
+
+let cell: KeyedCell<str, Task> = KeyedCell::new([Task { id = "a", label = "alpha" }]);
+let cell_store: CellStore = CellStore { tasks = cell };
+let list: SignalCell<List<Task>> = Signal::new([Task { id = "a", label = "alpha" }]);
+let list_store: ListStore = ListStore { tasks = list };
+
+fun text_of(frame: Frame): str {
+	match frame {
+		Frame::Text(let text) => text,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+fun logged_pair(label: str): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| server_relay.send(frame));
+	server_relay.on_frame(|frame| {
+		print(i"{label} {text_of(frame)}");
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun main() {
+	print(i"cell-hash:{cell_store.contract_hash()}");
+	print(i"list-hash:{list_store.contract_hash()}");
+
+	let (client_end, server_end) = logged_pair("gen");
+	register_session(1, server_end, json_codec());
+	let transport = local_rpc(cell_store.dispatcher().into_protocol(json_codec()));
+	let attached: Result<List<i32>, RpcError> = call(transport, json_codec(), "__attach", [|serializer: Serializer| 1.describe(serializer)]);
+	let channels = attached.unwrap_or([]);
+	print(i"gen-channel:{channels[0]}");
+	let client = ReactiveClient::new(client_end, json_codec());
+	let mirror: KeyedSource<str, Task> = client.keyed_source(channels[0]);
+	let lease = mirror.sub(|_list| {});
+	cell.insert(Task { id = "b", label = "beta" });
+	cell.update("a", |&mut task| { task.label = "edited"; });
+	cell.remove("a");
+	print(i"held:{mirror.get().unwrap_or([]).len()}");
+	print(i"fault:{mirror.fault().is_some()}");
+	lease.dispose();
+	print("done");
+}
+"#;
+
+#[test]
+fn a_generated_keyed_cell_field_is_the_list_form_s_channel_and_hash() {
+    let stdout = run_program("keyedcellmacro", GENERATED_KEYED_CELL);
+    let cell_hash = labelled_value(&stdout, "cell-hash:");
+    let list_hash = labelled_value(&stdout, "list-hash:");
+    assert_eq!(
+        cell_hash, list_hash,
+        "a `KeyedCell<K, T>` field and a `[expose(keyed = K)] SignalCell<List<T>>` \
+         field are the same contract entry, so they must hash the same — a service \
+         that swaps one for the other would otherwise break every deployed \
+         client:\n{stdout}"
+    );
+    let channel = labelled_value(&stdout, "gen-channel:");
+    assert_eq!(
+        relayed_frames(&stdout, "gen ", &channel),
+        vec![
+            "{\"Patch\":[C,[{\"Reset\":[{\"id\":\"a\",\"label\":\"alpha\"}]}]]}",
+            "{\"Patch\":[C,[{\"Insert\":[\"b\",{\"id\":\"b\",\"label\":\"beta\"},1]}]]}",
+            "{\"Patch\":[C,[{\"Update\":[\"a\",{\"id\":\"a\",\"label\":\"edited\"}]}]]}",
+            "{\"Patch\":[C,[{\"Remove\":\"a\"}]]}",
+        ],
+        "the generated cell exposure must patch element by element:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("held:1") && stdout.contains("fault:false"),
+        "the mirror must follow the cell without a fault:\n{stdout}"
+    );
+}
+
+/// What the cell actually removes, counted rather than timed: `Keyed::key`
+/// calls per change.
+///
+/// `keyed_diff` re-keys BOTH snapshots and compares every retained element, so
+/// the projection runs a fixed multiple of N times per change per connection;
+/// the cell's writes carry the key already, so it runs ZERO times. Counting the
+/// calls is the complexity claim stated exactly — no clock, no load, nothing to
+/// be flaky about — and it is what the CPU measurement below is measuring.
+const KEYED_COST_IN_KEY_CALLS: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, ReactiveServer, duplex_pair };
+import std::shared::Shared;
+import std::wire::{ Keyed, Wire };
+
+let key_calls: Shared<i32> = Shared::new(0);
+
+[derive(Wire, PartialEq)]
+struct Row { id: str, value: i32 }
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		key_calls.write() = key_calls.read() + 1;
+		self.id
+	}
+}
+
+fun corpus(count: i32): List<Row> {
+	mut all: List<Row> = [];
+	mut index = 0;
+	for index < count {
+		all.push(Row { id = i"row-{index}", value = index });
+		index += 1;
+	}
+	all
+}
+
+fun through_cell(rows: i32, changes: i32): i32 {
+	let cell: KeyedCell<str, Row> = KeyedCell::new(corpus(rows));
+	let (client_end, server_end) = duplex_pair();
+	let session = ReactiveServer::new(server_end, json_codec());
+	let client = ReactiveClient::new(client_end, json_codec());
+	let channel = session.expose_keyed_cell(cell);
+	let mirror: KeyedSource<str, Row> = client.keyed_source(channel);
+	let lease = mirror.sub(|_list| {});
+	// Zeroed AFTER the wiring: the corpus and the seed are setup, not change.
+	key_calls.write() = 0;
+	mut made = 0;
+	for made < changes {
+		cell.update("row-0", |&mut row| {
+			row.value = made;
+		});
+		made += 1;
+	}
+	lease.dispose();
+	key_calls.read()
+}
+
+fun through_diff(rows: i32, changes: i32): i32 {
+	let store: SignalCell<List<Row>> = Signal::new(corpus(rows));
+	let (client_end, server_end) = duplex_pair();
+	let session = ReactiveServer::new(server_end, json_codec());
+	let client = ReactiveClient::new(client_end, json_codec());
+	let channel = session.expose_keyed(store, |row: Row| row.key());
+	let mirror: KeyedSource<str, Row> = client.keyed_source(channel);
+	let lease = mirror.sub(|_list| {});
+	key_calls.write() = 0;
+	mut made = 0;
+	for made < changes {
+		store.update(|&mut list| {
+			list[0] = Row { id = "row-0", value = made };
+		});
+		made += 1;
+	}
+	lease.dispose();
+	key_calls.read()
+}
+
+fun main() {
+	let changes = 20;
+	print(i"cell:200:{through_cell(200, changes)}");
+	print(i"cell:2000:{through_cell(2000, changes)}");
+	print(i"diff:200:{through_diff(200, changes)}");
+	print(i"diff:2000:{through_diff(2000, changes)}");
+	print("done");
+}
+"#;
+
+#[test]
+fn a_keyed_cell_re_keys_nothing_where_the_diff_re_keys_the_whole_collection() {
+    let stdout = run_program("keyedcellwork", KEYED_COST_IN_KEY_CALLS);
+    let count = |label: &str| -> i64 {
+        labelled_value(&stdout, label)
+            .parse()
+            .unwrap_or_else(|_| panic!("`{label}` is not a count in:\n{stdout}"))
+    };
+    let (cell_small, cell_large) = (count("cell:200:"), count("cell:2000:"));
+    let (diff_small, diff_large) = (count("diff:200:"), count("diff:2000:"));
+    // The diff path is the CONTROL, and it must still be linear: ten times the
+    // rows, ten times the projection calls. (If this ever stops holding, the
+    // cell's number below has nothing to be compared against.)
+    assert!(
+        diff_small > 0 && diff_large >= diff_small * 8,
+        "the diff path must re-key the collection on every change \
+         (200 rows: {diff_small}, 2000 rows: {diff_large}):\n{stdout}"
+    );
+    // The cell path re-keys NOTHING: its writes carry the key already, and
+    // both ends look it up by hash rather than by projection.
+    assert_eq!(
+        (cell_small, cell_large),
+        (0, 0),
+        "a `KeyedCell` change must not project a single element's key \
+         (200 rows: {cell_small}, 2000 rows: {cell_large}):\n{stdout}"
+    );
+}
+
+/// The cell twin of `KEYED_DIFF_COST` above: the same program, the same
+/// parameters, the same single-element edit — said as `cell.update(key, ..)`
+/// instead of as a whole-list write, so the exposure forwards the op the
+/// mutation recorded instead of diffing two snapshots.
+const KEYED_CELL_COST: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Subscription };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, ReactiveServer, duplex_pair };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Row {
+	id: str,
+	value: i32,
+	body: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+fun corpus(count: i32): List<Row> {
+	mut all: List<Row> = [];
+	mut index = 0;
+	for index < count {
+		all.push(Row {
+			id = i"row-{index}",
+			value = index,
+			body = "the quick brown fox jumps over the lazy dog, repeatedly and at length",
+		});
+		index += 1;
+	}
+	all
+}
+
+fun main() {
+	let rows = __ROWS__;
+	let connections = __CONNECTIONS__;
+	let changes = __CHANGES__;
+	let store: KeyedCell<str, Row> = KeyedCell::new(corpus(rows));
+
+	mut leases: List<Subscription> = [];
+	mut opened = 0;
+	for opened < connections {
+		let (client_end, server_end) = duplex_pair();
+		let session = ReactiveServer::new(server_end, json_codec());
+		let client = ReactiveClient::new(client_end, json_codec());
+		let channel = session.expose_keyed_cell(store);
+		let mirror: KeyedSource<str, Row> = client.keyed_source(channel);
+		leases.push(mirror.sub(|_list| {}));
+		opened += 1;
+	}
+
+	mut made = 0;
+	for made < changes {
+		// The same smallest change there is, said by key.
+		store.update("row-0", |&mut row| {
+			row.value = made;
+		});
+		made += 1;
+	}
+
+	for lease in leases {
+		lease.dispose();
+	}
+	print(i"rows={rows} connections={connections} changes={changes}");
+}
+"#;
+
+/// Build `template` with its three parameters substituted, run it under `node`,
+/// and return the CHILD's CPU (user + system) for the run alone — the compile
+/// is never inside a measured span. `repeats` runs of each shape, MINIMUM
+/// taken: the minimum is the run that was least preempted, which is the right
+/// estimator for a machine that is also doing something else.
+fn measured_cpu(
+    dir: &Path,
+    template: &str,
+    rows: i32,
+    connections: i32,
+    changes: i32,
+    repeats: usize,
+) -> Duration {
+    write(
+        dir,
+        "src/main.vl",
+        &template
+            .replace("__ROWS__", &rows.to_string())
+            .replace("__CONNECTIONS__", &connections.to_string())
+            .replace("__CHANGES__", &changes.to_string()),
+    );
+    let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("build the measured program");
+    assert!(
+        built.status.success(),
+        "the measured program did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let bundle = dir.join("src").join("main.mjs");
+    (0..repeats)
+        .map(|_| {
+            let before = children_cpu_now().expect("a children-CPU clock");
+            let ran = Command::new("node")
+                .arg(&bundle)
+                .output()
+                .expect("run the measured program");
+            let after = children_cpu_now().expect("a children-CPU clock");
+            assert!(
+                ran.status.success(),
+                "the measured program did not run:\n{}",
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            after.saturating_sub(before)
+        })
+        .min()
+        .expect("at least one repeat")
+}
+
+/// A54's claim, as a GATE: the cell's cost per change does not grow with the
+/// collection.
+///
+/// Pinned as a RATIO and never as a wall bound — the absolute number is a
+/// property of the machine, the ratio is a property of the algorithm. Ten times
+/// the rows must cost less than THREE times as much; measured at 1.32x
+/// (0.0078 ms/change at 1,000 rows, 0.0103 at 10,000, one connection,
+/// `getrusage(RUSAGE_CHILDREN)`, loadavg 14.8-17.3) and again at 1.10x on a box
+/// at loadavg 45-50, against 12.1x for the diffing path on the same box in the
+/// same minute (0.315 -> 3.814 ms); at eight connections the same step is
+/// 0.299 -> 5.033 for the diff and 0.0048 -> 0.0148 for the cell. The bound
+/// has 2.3x of headroom over the
+/// measured slope and refuses the regression it exists for: restoring the
+/// `get`/`set` pair `apply` used to copy the whole mirror through reads 4.52x.
+///
+/// The idle run subtracts the corpus build, the process start and the node
+/// runtime, so what is left is the changes alone; two repeats of each shape and
+/// the MINIMUM of them keeps a preempted run from being read as a slow one.
+#[test]
+fn a_keyed_cell_s_cost_per_change_does_not_grow_with_the_collection() {
+    let Some(_probe) = children_cpu_now() else {
+        eprintln!("PERF declined: this host exposes no children-CPU clock");
+        return;
+    };
+    let dir = temp_project("keyed_cell_cost");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    // Enough changes that the measured span DOMINATES the idle baseline at
+    // both sizes, which is the whole difficulty here: building the 10,000-row
+    // corpus is 1-1.8 s of the idle run and varies by ~150 ms between runs, so
+    // a measured span of the same order reads as noise — at 50,000 changes on
+    // a box at loadavg 13 an unlucky pair once came out NEGATIVE, which the
+    // non-degeneracy assertion below caught. 200,000 puts ~1.5 s of
+    // attributable work against that baseline at 10,000 rows.
+    const CHANGES: i32 = 200_000;
+    const REPEATS: usize = 2;
+    println!("PERF loadavg-before {}", loadavg_1m());
+    let per_change = |rows: i32| -> f64 {
+        let idle = measured_cpu(&dir, KEYED_CELL_COST, rows, 1, 0, REPEATS);
+        let busy = measured_cpu(&dir, KEYED_CELL_COST, rows, 1, CHANGES, REPEATS);
+        let attributable = busy.saturating_sub(idle);
+        let per = attributable.as_secs_f64() * 1000.0 / f64::from(CHANGES);
+        println!(
+            "PERF {{\"section\":\"a54-keyed-cell\",\"rows\":{rows},\"connections\":1,\
+             \"changes\":{CHANGES},\"idle_ms\":{:.1},\"busy_ms\":{:.1},\
+             \"attributable_ms\":{:.1},\"ms_per_change\":{per:.5},\
+             \"clock\":\"children-cpu\",\"load\":\"{}\"}}",
+            idle.as_secs_f64() * 1000.0,
+            busy.as_secs_f64() * 1000.0,
+            attributable.as_secs_f64() * 1000.0,
+            loadavg_1m()
+        );
+        per
+    };
+    let small = per_change(1_000);
+    let large = per_change(10_000);
+    println!("PERF loadavg-after {}", loadavg_1m());
+    let _ = std::fs::remove_dir_all(&dir);
+    // Non-degenerate: a measurement that read zero (or negative) work would
+    // pass any ratio bound while measuring nothing.
+    assert!(
+        small > 0.0 && large > 0.0,
+        "the measurement read no attributable work at all \
+         (1,000 rows: {small} ms/change, 10,000 rows: {large} ms/change) — \
+         raise CHANGES or run it on a quieter machine"
+    );
+    let ratio = large / small;
+    assert!(
+        ratio < 3.0,
+        "a `KeyedCell` change must not cost more as the collection grows: \
+         ten times the rows cost {ratio:.2}x (1,000 rows: {small:.5} ms/change, \
+         10,000 rows: {large:.5}). The diffing exposure this replaces is 12x \
+         over the same step; anything near that means the op path is not being \
+         taken."
+    );
+}
+
+/// The reporting harness beside `keyed_diff_cpu_per_change_per_connection`:
+/// both exposures, both scales, both connection counts, one run each of the
+/// changing and unchanging shape so the seed and the runtime subtract out.
+/// `#[ignore]`d for its sibling's reason — it is a measurement, not a gate, and
+/// it spawns sixteen node processes. Run it with:
+///
+/// ```text
+/// cargo nextest run -p vilan-cli --test reactive_channels --run-ignored \
+///     ignored-only -E 'test(keyed_cell_against)' --no-capture
+/// ```
+#[test]
+#[ignore = "A54: a measurement, not a gate — it spawns sixteen node processes and reports numbers"]
+fn keyed_cell_against_the_diff_cpu_per_change_per_connection() {
+    let Some(_probe) = children_cpu_now() else {
+        eprintln!("PERF declined: this host exposes no children-CPU clock");
+        return;
+    };
+    let dir = temp_project("keyed_cell_report");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    println!("PERF loadavg-before {}", loadavg_1m());
+    // The two paths need different change counts to clear the same baseline:
+    // the diff is milliseconds per change and the cell is microseconds.
+    for (section, template, changes) in [
+        ("a51-keyed-diff", KEYED_DIFF_COST, 2_000),
+        ("a54-keyed-cell", KEYED_CELL_COST, 50_000),
+    ] {
+        for rows in [1_000, 10_000] {
+            for connections in [1, 8] {
+                let idle = measured_cpu(&dir, template, rows, connections, 0, 1);
+                let busy = measured_cpu(&dir, template, rows, connections, changes, 1);
+                let attributable = busy.saturating_sub(idle);
+                let per = attributable.as_secs_f64() * 1000.0
+                    / f64::from(changes)
+                    / f64::from(connections);
+                println!(
+                    "PERF {{\"section\":\"{section}\",\"rows\":{rows},\
+                     \"connections\":{connections},\"changes\":{changes},\
+                     \"idle_ms\":{:.1},\"busy_ms\":{:.1},\"attributable_ms\":{:.1},\
+                     \"ms_per_change_per_connection\":{per:.5},\
+                     \"clock\":\"children-cpu\",\"load\":\"{}\"}}",
+                    idle.as_secs_f64() * 1000.0,
+                    busy.as_secs_f64() * 1000.0,
+                    attributable.as_secs_f64() * 1000.0,
+                    loadavg_1m()
+                );
+            }
+        }
+    }
+    println!("PERF loadavg-after {}", loadavg_1m());
+    let _ = std::fs::remove_dir_all(&dir);
+}
