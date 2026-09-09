@@ -469,6 +469,14 @@ Three things that table says out loud:
   a keeping mirror could hold an element deleted while the connection was
   down and no later op would ever name it. The keys you still hold are
   re-subscribed and re-seeded.
+- **A key written twice has to agree.** A `Map<K, V>` element names the key
+  and takes the bare `[expose(keyed)]`; writing the argument beside it as
+  well is redundant but fine — *while the two spellings agree*. A
+  `[expose(keyed = i32)]` over a `SignalCell<Map<str, Message>>` is
+  **refused at the attribute**, naming both spellings. Neither is knowably
+  the intended one, and the expansion reads `K` off the annotation before
+  any type resolves, so it has nothing to pick between them with: drop the
+  argument, or write the map with the key the argument names.
 - **The contract hash moves — and only for services that use the form.**
   A keyed exposure is its own surface entry, so a client built against
   `[expose]` will not connect to a server that has since made the field

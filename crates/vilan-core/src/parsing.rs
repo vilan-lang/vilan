@@ -5739,6 +5739,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `List<T>` names only the element. It is parsed with the ordinary type
     /// grammar and kept as the SOURCE TEXT it spans — the macro engine takes it
     /// as a string and the formatter reprints it, and nothing here resolves it.
+    /// Its SPAN rides with the text (tracker A56): the analyzer's refusal of an
+    /// argument that disagrees with a `Map<K, V>` element's own key is about
+    /// the ARGUMENT, and has to point at it.
     fn eat_expose_attribute(&mut self) -> Exposure<'src> {
         let form = self.attempt(|parser| {
             parser.expect_ctrl('[')?;
@@ -5756,7 +5759,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let key = if parser.eat_op("=") {
                     let key_start = parser.position;
                     match parser.parse_type() {
-                        Some((_node, span)) => Some(Ok(&parser.source[span.start..span.end])),
+                        Some((_node, span)) => {
+                            Some(Ok((&parser.source[span.start..span.end], span)))
+                        }
                         None => {
                             // Skip to the closing paren so the attribute still
                             // CONSUMES, and the refusal below is what the

@@ -138,7 +138,11 @@ The attribute generates whichever of the two the field's collection calls for,
 and the key type comes from wherever it is written (tracker A51): a `Map<K, V>`
 element names it and takes the bare `[expose(keyed)]`, and every other
 collection names it in the attribute — `[expose(keyed = str)] items:
-SignalCell<List<Task>>`. The generated wiring is the hand-written call, frame
+SignalCell<List<Task>>`. Naming it in both places is redundant rather than
+wrong, but the two spellings must AGREE: an argument that disagrees with the
+`Map`'s own key is refused at the attribute (tracker A56), because the
+expansion reads `K` from the annotation before any type resolves and cannot
+pick between them. The generated wiring is the hand-written call, frame
 for frame, and the two spellings are one contract: same `Patch` frames, same
 `KeyedSource<K, T>`, same contract hash.
 

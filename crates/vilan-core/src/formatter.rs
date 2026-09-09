@@ -2816,7 +2816,7 @@ impl<'src> Printer<'src> {
                                 // — it is source text, and normalizing it here
                                 // would be the formatter deciding a type's
                                 // spelling from a string it never parsed.
-                                Exposure::Keyed(Some(key)) => {
+                                Exposure::Keyed(Some((key, _))) => {
                                     self.out.push_str("[expose(keyed = ");
                                     self.out.push_str(key);
                                     self.out.push_str(")] ");

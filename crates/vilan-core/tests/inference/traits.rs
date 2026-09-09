@@ -3252,6 +3252,100 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
     );
 }
 
+/// A56 / R6: the field names its key TWICE — once in the attribute, once in the
+/// `Map` element — and the two disagree.
+///
+/// The argument used to simply win, which made this silent at the attribute and
+/// loud one layer down: before this refusal the program below reported
+/// `'Task' does not implement trait 'Keyed<i32>'` FOUR times, each at a call the
+/// `[service]` expansion wrote and the author never did. Neither spelling is
+/// knowably the intended one, so the refusal names both and offers the two ways
+/// out rather than preferring one.
+#[test]
+fn a56_an_expose_keyed_argument_that_disagrees_with_the_map_key_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = i32)] tasks: SignalCell<Map<str, Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "names its key twice and the two disagree",
+    );
+}
+
+/// A56's covering half, stated as its own claim: the refusal above STANDS ALONE.
+/// The generated subscription is handed the same field and fails the same
+/// `Keyed<K>` bound for the same reason, and B189's covered set is what keeps it
+/// from saying so four more times at a span the author never wrote.
+#[test]
+fn a56_the_disagreeing_key_refusal_stands_down_the_generated_bound_failures() {
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = i32)] tasks: SignalCell<Map<str, Task>>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "required by a generic bound of this call",
+    );
+}
+
+/// A56's control: an argument written BESIDE a `Map` element is still accepted
+/// when the two agree. The refusal is about the disagreement and nothing else —
+/// writing the key in both places is redundant, not wrong, and a `[service]`
+/// that did it before this landed keeps compiling and keeps its hash.
+#[test]
+fn a56_an_expose_keyed_argument_that_agrees_with_the_map_key_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = str)] tasks: SignalCell<Map<str, Task>>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { self.tasks.get().len() }
+        }
+        fun main() {
+            print(Store { tasks = Signal::new(Map::new()) }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}
+
 // --- B258: overriding a trait DEFAULT the receiver's own FIELD type inherits
 // ------------------------------------------------------------------------
 // A miscompile of the `context` pass's flavor propagation, not of dispatch:
