@@ -140,6 +140,36 @@ pub struct Func<'src> {
     pub body: Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>>,
 }
 
+impl<'src> Func<'src> {
+    /// The RECEIVER this function declares, as written — `"self"`,
+    /// `"mut self"`, `"&self"`, `"&mut self"`, `"own self"` — or `None` for an
+    /// associated function that takes none.
+    ///
+    /// Rebuilt from the parsed convention rather than sliced out of the source
+    /// so it is one canonical spelling per receiver kind: the macro surface
+    /// (`meta::FunctionItem::receiver`) compares it against literals, and a
+    /// generator that branches on it must not have to normalize whitespace.
+    ///
+    /// It is a receiver only in the first position and only under the name
+    /// `self`, which is what the language means by one.
+    pub fn receiver_spelling(&self) -> Option<&'static str> {
+        let parameter = self.parameters.0.first()?;
+        let Pattern::Binding(name, _, _) = &parameter.pattern else {
+            return None;
+        };
+        if *name != "self" {
+            return None;
+        }
+        Some(match (parameter.convention, parameter.mutable) {
+            (Convention::Ref, _) => "&self",
+            (Convention::RefMut, _) => "&mut self",
+            (Convention::Own, _) => "own self",
+            (Convention::Bare, true) => "mut self",
+            (Convention::Bare, false) => "self",
+        })
+    }
+}
+
 /// A parsed parameter: binder, optional declared type, how it receives its
 /// argument (rule 3 conventions), binder mutability, spread-ness, and the
 /// binder's span (for go-to-definition / hover in the language server).

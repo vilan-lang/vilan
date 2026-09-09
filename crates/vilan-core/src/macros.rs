@@ -1697,6 +1697,24 @@ impl Expander<'_, '_> {
                     self.sweep_expressions(item, text, depth);
                     return;
                 }
+                // B272: an `[rpc]` method taking `mut self` is refused here for
+                // the same reason, spanned on the METHOD — the receiver is what
+                // has to change, and the expansion is not where that is legible.
+                // `&mut self` is honoured by the generator instead (R-A38b(a)),
+                // so this is the only receiver a service refuses.
+                let mut_self_refusals = crate::analyzer::service_mut_self_refusals(item, siblings);
+                if !mut_self_refusals.is_empty() {
+                    for (span, msg) in mut_self_refusals {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg,
+                        });
+                    }
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
                 match self.scope.get("service") {
                     Some(def) => {
                         self.run_service(def, *client_name, item, siblings, text, depth);
@@ -2684,6 +2702,11 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
 /// A `FunctionItem` value: name, parameters (as never-exposed `Field`s, `self`
 /// included — consumers skip it by name), and the written return type
 /// (`void` when omitted).
+///
+/// A parameter renders as a `Field` with all five slots written — `exposed`,
+/// `keyed` and `key` are meaningless on a parameter and are the false/empty
+/// constants. They used to be omitted, which left the last two slots `undefined`
+/// in the macro world: harmless only for as long as no macro read them.
 fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
     let parameters = function
         .parameters
@@ -2702,6 +2725,8 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),
                 js::Node::Bool(false),
+                js::Node::Bool(false),
+                string_literal(""),
             ])
         })
         .collect();
