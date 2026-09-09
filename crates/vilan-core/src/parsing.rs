@@ -59,8 +59,8 @@ use crate::node::{
     BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration, CssItem, CssNested,
     CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, Exposure,
     ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If, ImportBranch,
-    ImportTail, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField,
-    TupleBound,
+    ImportTail, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr,
+    StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -701,6 +701,7 @@ fn extern_binding_from_args<'src>(args: &[ExternArg<'src>]) -> ExternBinding<'sr
 pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "derive",
     "service",
+    "client_service",
     "extern",
     "must_use",
     "rpc",
@@ -5641,36 +5642,102 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((name, self.span_from(start)))
     }
 
-    /// `[service(Client)?] struct …` — a service struct; the argument names the
-    /// generated client type (default `<Struct>Client`).
+    /// `[service(Client)?]` / `[client_service]` (either order, or both) `struct …`
+    /// — a service struct. `[service]`'s first argument names the generated client
+    /// type (default `<Struct>Client`); its `client = H` argument names the
+    /// `[client_service]` struct this server may call back into (§9.3, R1).
     fn parse_service_item(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let client_name = self.parse_service_attribute()?;
+        let mut attribute = ServiceAttr::default();
+        // Either attribute may lead, and a peer-to-peer struct writes both.
+        loop {
+            if let Some((client_name, handler_name)) = self.parse_service_attribute() {
+                if attribute.server_side {
+                    return None;
+                }
+                attribute.server_side = true;
+                attribute.client_name = client_name;
+                attribute.handler_name = handler_name;
+            } else if self.parse_client_service_attribute().is_some() {
+                if attribute.client_side {
+                    return None;
+                }
+                attribute.client_side = true;
+            } else {
+                break;
+            }
+        }
+        if !attribute.server_side && !attribute.client_side {
+            return None;
+        }
         let item = self.parse_struct()?;
         Some((
-            Node::Service(client_name, Box::new(item)),
+            Node::Service(attribute, Box::new(item)),
             self.span_from(start),
         ))
     }
 
-    /// `[service(Name)?]` — a service attribute. The outer `Option` is whether this
-    /// is a service attribute at all (`None` ⇒ not one); the inner `Option<&str>` is
-    /// the optional `(Name)` client name.
-    fn parse_service_attribute(&mut self) -> Option<Option<&'src str>> {
+    /// `[service(Name?, client = Handler?)?]` — a service attribute. The outer
+    /// `Option` is whether this is a service attribute at all (`None` ⇒ not one);
+    /// the pair is the optional client name and the optional `client = H` handler
+    /// name.
+    #[allow(clippy::type_complexity)]
+    fn parse_service_attribute(&mut self) -> Option<(Option<&'src str>, Option<&'src str>)> {
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("service")) {
                 return None;
             }
             parser.bump();
-            let client_name = parser.attempt(|parser| {
+            let arguments = parser.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let name = parser.eat_ident()?;
+                let mut client_name = None;
+                let mut handler_name = None;
+                while !parser.peek_is_ctrl(')') {
+                    // `client = Handler` — the one named argument; anything else
+                    // is the positional client name, which leads or not at all.
+                    let named = parser.attempt(|parser| {
+                        if parser.peek() != Some(&Token::Ident("client")) {
+                            return None;
+                        }
+                        parser.bump();
+                        if !parser.eat_op("=") {
+                            return None;
+                        }
+                        parser.eat_ident()
+                    });
+                    match named {
+                        Some(name) => handler_name = Some(name),
+                        None => {
+                            if client_name.is_some() || handler_name.is_some() {
+                                return None;
+                            }
+                            client_name = Some(parser.eat_ident()?);
+                        }
+                    }
+                    if !parser.eat_ctrl(',') {
+                        break;
+                    }
+                }
                 parser.expect_ctrl(')')?;
-                Some(name)
+                Some((client_name, handler_name))
             });
             parser.expect_ctrl(']')?;
-            Some(client_name)
+            Some(arguments.unwrap_or((None, None)))
+        })
+    }
+
+    /// `[client_service]` — the handler-side attribute (§9.3, R1). No arguments:
+    /// the proxy the server calls through is always `<Struct>Proxy`.
+    fn parse_client_service_attribute(&mut self) -> Option<()> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("client_service")) {
+                return None;
+            }
+            parser.bump();
+            parser.expect_ctrl(']')?;
+            Some(())
         })
     }
 
@@ -7163,14 +7230,67 @@ mod tests {
         }
         // `[service(Client)] struct` names its generated client type.
         match only_item("[service(RoomClient)] struct Room { }") {
-            Node::Service(Some("RoomClient"), item) => assert!(matches!(item.0, Node::Struct(..))),
-            other => panic!("expected Service(Some), got {other:?}"),
+            Node::Service(attribute, item) => {
+                assert_eq!(attribute.client_name, Some("RoomClient"));
+                assert_eq!(attribute.handler_name, None);
+                assert!(attribute.server_side && !attribute.client_side);
+                assert!(matches!(item.0, Node::Struct(..)));
+            }
+            other => panic!("expected Service, got {other:?}"),
         }
         // Bare `[service]` defaults the client name to `None`.
-        assert!(matches!(
-            only_item("[service] struct Room { }"),
-            Node::Service(None, _)
-        ));
+        match only_item("[service] struct Room { }") {
+            Node::Service(attribute, _) => {
+                assert_eq!(attribute.client_name, None);
+                assert!(attribute.server_side && !attribute.client_side);
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_service_attributes_ride_the_service_node() {
+        // §9.3, R1: `client = H` is a NAMED argument beside the positional
+        // client name, `[client_service]` is its own attribute, and a struct
+        // carrying both is peer-to-peer on ONE node.
+        match only_item("[service(RoomClient, client = RoomHandlers)] struct Room { }") {
+            Node::Service(attribute, _) => {
+                assert_eq!(attribute.client_name, Some("RoomClient"));
+                assert_eq!(attribute.handler_name, Some("RoomHandlers"));
+                assert!(attribute.server_side && !attribute.client_side);
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+        // `client = H` alone, with the client name defaulted.
+        match only_item("[service(client = RoomHandlers)] struct Room { }") {
+            Node::Service(attribute, _) => {
+                assert_eq!(attribute.client_name, None);
+                assert_eq!(attribute.handler_name, Some("RoomHandlers"));
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+        match only_item("[client_service] struct RoomHandlers { }") {
+            Node::Service(attribute, item) => {
+                assert!(!attribute.server_side && attribute.client_side);
+                assert_eq!(attribute.client_name, None);
+                assert!(matches!(item.0, Node::Struct(..)));
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+        // Peer-to-peer: both attributes, either order, one node.
+        for source in [
+            "[service(PeerClient, client = Peer)] [client_service] struct Peer { }",
+            "[client_service] [service(PeerClient, client = Peer)] struct Peer { }",
+        ] {
+            match only_item(source) {
+                Node::Service(attribute, _) => {
+                    assert!(attribute.server_side && attribute.client_side);
+                    assert_eq!(attribute.client_name, Some("PeerClient"));
+                    assert_eq!(attribute.handler_name, Some("Peer"));
+                }
+                other => panic!("expected Service, got {other:?}"),
+            }
+        }
     }
 
     #[test]

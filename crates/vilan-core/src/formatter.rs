@@ -2926,16 +2926,34 @@ impl<'src> Printer<'src> {
                 self.line();
                 self.print_item(derived);
             }
-            // `[service]` / `[service(Client)]` likewise sits above its struct.
-            Node::Service(client_name, item) => {
-                self.out.push_str("[service");
-                if let Some(client_name) = client_name {
-                    self.out.push('(');
-                    self.out.push_str(client_name);
-                    self.out.push(')');
+            // `[service]` / `[service(Client, client = H)]` / `[client_service]`
+            // likewise sit above their struct, in the order they are written
+            // (`[service]` first, `[client_service]` under it for a peer).
+            Node::Service(attribute, item) => {
+                if attribute.server_side {
+                    self.out.push_str("[service");
+                    let arguments: Vec<String> = attribute
+                        .client_name
+                        .map(str::to_string)
+                        .into_iter()
+                        .chain(
+                            attribute
+                                .handler_name
+                                .map(|handler| format!("client = {handler}")),
+                        )
+                        .collect();
+                    if !arguments.is_empty() {
+                        self.out.push('(');
+                        self.out.push_str(&arguments.join(", "));
+                        self.out.push(')');
+                    }
+                    self.out.push(']');
+                    self.line();
                 }
-                self.out.push(']');
-                self.line();
+                if attribute.client_side {
+                    self.out.push_str("[client_service]");
+                    self.line();
+                }
                 self.print_item(item);
             }
             Node::Export(exported) => {

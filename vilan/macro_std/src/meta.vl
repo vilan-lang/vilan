@@ -278,6 +278,17 @@ export struct ServiceItem {
 	client_name: str,
 	fields: List<Field>,
 	methods: List<FunctionItem>,
+	// `[client_service]` (§9.3, R1): this struct's `[rpc]` methods are the ones
+	// a SERVER may call, so it generates a dispatcher and a `<Name>Proxy` rather
+	// than a transport client. A struct carrying both attributes is
+	// peer-to-peer and has both halves — and one dispatcher.
+	client_side: bool,
+	// `[service(.., client = H)]`'s argument: the `[client_service]` struct this
+	// server may call back into, and its gathered `[rpc]` surface. `""` and `[]`
+	// when the service declares none. The handler must be a same-module sibling
+	// — the compiler's reflection reaches this module's impls and no others.
+	handler_name: str,
+	handler_methods: List<FunctionItem>,
 }
 
 // The item a macro attribute annotates — what `[derive(X)]`-style macros

@@ -18,17 +18,21 @@ import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ FlushPolicy, batch, turn };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::rpc::{
+	ClientProxy,
 	Dispatcher,
 	DuplexEnd,
 	RpcError,
 	RpcOutcome,
 	RpcProtocol,
 	RpcService,
+	drop_client_channel,
 	drop_session,
 	duplex_pair,
 	encode_reply,
+	register_client_channel,
 	register_session,
 	rpc_subprotocol,
+	tag_client_bytes,
 	tag_duplex_bytes,
 	tag_rpc_bytes,
 };
@@ -113,6 +117,34 @@ struct Connection {
 	id: i32,
 	session: Session,
 	remote_addr: str,
+}
+
+impl Connection {
+	/// The typed proxy for the `[client_service]` this connection's server may
+	/// call back into (`transport-rpc.md` §9.3, R1) — the value a service struct
+	/// holds as a field and reaches as `self.client`:
+	///
+	/// ```text
+	/// [service(KoltClient, client = KoltHandlers)]
+	/// struct KoltStore { user: str, client: KoltHandlersProxy }
+	///
+	/// Service::factory(|connection: Connection| KoltStore {
+	///     user = connection.session.identity,
+	///     client = connection.client(),
+	/// }, json_codec())
+	/// ```
+	///
+	/// `P` is resolved by the FIELD's declared type, which is what the attribute
+	/// named — so the call needs no annotation and std learns no generated name.
+	/// The alternative, a `fun client(self): KoltHandlersProxy` generated onto
+	/// `Connection` itself, collides the moment a program runs two services with
+	/// different handler types, and teaches a std type members from user code.
+	///
+	/// Nothing is sent here: the proxy is this connection's id, and it is dead
+	/// (a silent drop) once the connection is.
+	fun client<P: ClientProxy>(self): P {
+		P::for_connection(self.id)
+	}
 }
 
 /// The upgrade request, as `authorize` sees it — everything the client could
@@ -1064,6 +1096,21 @@ fun accept_socket(
 	// before A40 because it echoed nothing at all.
 	write_upgrade_101(socket, headers);
 	let id = fresh_connection();
+	// The reverse lane (§9.3), registered BEFORE the instance is built: the
+	// factory closure calls `connection.client()`, and a proxy minted against an
+	// unregistered id would be a silent no-op for the life of the connection.
+	// It rides here rather than through `service.on_connect` because an app that
+	// replaces the connection lifecycle must not thereby lose the ability to be
+	// called back — `on_connect` is the app's seam, and this is the transport's.
+	//
+	// The SSE leg has no twin: `s:` is a socket lane, and every generated
+	// `Client::connect` dials the socket transport.
+	register_client_channel(id, service.codec, |frame| {
+		match frame {
+			Frame::Text(let body) => socket.write_bytes(text_frame(i"s:0:{body}")),
+			Frame::Binary(let bytes) => socket.write_bytes(binary_frame(tag_client_bytes(0, bytes))),
+		}
+	});
 	// The connection's OWN protocol: under `Service::factory` this builds the
 	// instance that answers for this client and nothing else (A38), and every
 	// `respond` below routes through it. `session` is what `authorize` proved
@@ -1091,6 +1138,7 @@ fun accept_socket(
 			closed.write() = true;
 			service.live.write() = service.live.read() - 1;
 			drop_connection(id);
+			drop_client_channel(id);
 			on_disconnect(id);
 		}
 	};

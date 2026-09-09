@@ -2764,7 +2764,15 @@ type WireTypeCheck<'src> = (&'src str, Id, Vec<(String, &'src Node<'src>, TypeId
 /// later because it runs after `build()` (B112) — plus each parameter and the
 /// return as `(label, declared type node, span)`, `None` for a parameter that
 /// declares no type (see `check_rpc_signatures`).
-type RpcSignatureCheck<'src> = (&'src str, Id, Vec<(String, Option<&'src Node<'src>>, Span)>);
+/// One `[rpc]` method awaiting the Wire-signature check: the method name, the
+/// name of the impl subject it was declared on (`""` outside an impl), its id,
+/// and one entry per checked member.
+type RpcSignatureCheck<'src> = (
+    &'src str,
+    &'src str,
+    Id,
+    Vec<(String, Option<&'src Node<'src>>, Span)>,
+);
 
 /// An `[expose]`d struct field awaiting its `Signal`-of-Wire check: a label
 /// naming the struct + field, its declared type node (`None` if missing), the
@@ -2928,6 +2936,15 @@ pub struct Analyzer<'src> {
     /// `[rpc]` methods awaiting the Wire-signature check (`check_rpc_signatures`),
     /// collected as each is walked, validated once `wire_names` is complete.
     rpc_signatures_to_check: Vec<RpcSignatureCheck<'src>>,
+    /// Structs carrying `[client_service]` (`transport-rpc.md` §9.3, R1) — the
+    /// reverse direction's handler structs. Their `[rpc]` methods are
+    /// NOTIFICATIONS (R4): a declared return type is refused, and the absence of
+    /// one is legal, which it is nowhere else. Collected across every module,
+    /// read by `check_rpc_signatures` once all are walked.
+    client_service_subjects: HashSet<&'src str>,
+    /// The name of the `impl` subject currently being walked, so an `[rpc]`
+    /// method records which struct declared it.
+    current_impl_subject_name: Option<&'src str>,
     /// `[expose]`d fields awaiting the `Signal`-of-Wire check
     /// (`check_expose_fields`), collected at the struct walk.
     expose_fields_to_check: Vec<ExposeFieldCheck<'src>>,
@@ -4547,6 +4564,8 @@ impl<'src> Analyzer<'src> {
             drop_owned_types_by_root: HashMap::default(),
             drop_call_edges: HashMap::default(),
             rpc_signatures_to_check: Vec::new(),
+            client_service_subjects: HashSet::default(),
+            current_impl_subject_name: None,
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
@@ -14750,8 +14769,12 @@ impl<'src> Analyzer<'src> {
             // declared Wire return (fire-and-forget needs its own design).
             None => members.push(("return type".to_string(), None, function.name.1)),
         }
-        self.rpc_signatures_to_check
-            .push((function.name.0, function_id, members));
+        self.rpc_signatures_to_check.push((
+            function.name.0,
+            self.current_impl_subject_name.unwrap_or_default(),
+            function_id,
+            members,
+        ));
     }
 
     /// Enforce the `[rpc]` Wire-signature rule (`proposal/transport-rpc.md`
@@ -14760,8 +14783,17 @@ impl<'src> Analyzer<'src> {
     /// crosses the wire. Runs after all modules are walked.
     fn check_rpc_signatures(&mut self) {
         let checks = std::mem::take(&mut self.rpc_signatures_to_check);
-        for (method_name, method_id, members) in checks {
+        for (method_name, subject_name, method_id, members) in checks {
+            // §9.3/R4: on a `[client_service]` struct every `[rpc]` method is a
+            // NOTIFICATION, so the two return-type rules invert — a declared
+            // return is refused, and its absence is the only legal spelling.
+            // Parameters are checked exactly as they are anywhere else: they
+            // still cross the wire.
+            let notifies = self.client_service_subjects.contains(subject_name);
             for (label, type_node, span) in members {
+                if notifies && label == "return type" {
+                    continue;
+                }
                 match type_node {
                     Some(type_node) if self.is_wire_type(type_node) => {}
                     Some(type_node) => {
@@ -25347,7 +25379,12 @@ impl<'src> Analyzer<'src> {
             // `[service(..)]` is transparent to analysis: walk the wrapped
             // struct; the generated dispatcher/client are appended separately
             // (`service_impl_source`).
-            Node::Service(_client_name, inner) => {
+            Node::Service(attribute, inner) => {
+                if let Node::Struct(name, ..) = &inner.0
+                    && attribute.client_side
+                {
+                    self.client_service_subjects.insert(name.0);
+                }
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
                 None
@@ -26589,10 +26626,20 @@ impl<'src> Analyzer<'src> {
                     self.impl_subject_args
                         .insert(body_scope_id, (subject_type_id, argument_type_ids));
                 }
+                // Which struct an `[rpc]` method was declared on, for the
+                // notification rule (§9.3): the check runs after every module is
+                // walked, so the name is banked here rather than looked up.
+                let outer_impl_subject = self.current_impl_subject_name;
+                self.current_impl_subject_name = match &subject.0 {
+                    Node::Accessor(name) => Some(*name),
+                    Node::AccessorWithGenerics(name, _) => Some(*name),
+                    _ => None,
+                };
                 let subject = subject_type_id;
                 let was_walking_member_body = self.walking_member_body;
                 self.walking_member_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
+                self.current_impl_subject_name = outer_impl_subject;
                 self.walking_member_body = was_walking_member_body;
                 let declared_members = self.collect_declared_members(body_scope_id);
                 let declarations: IndexMap<&'src str, Id> =

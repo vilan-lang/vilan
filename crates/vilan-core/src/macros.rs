@@ -30,7 +30,7 @@ use crate::error::Error;
 use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::interpreter::{self, Limits};
-use crate::node::{Func, GenericParameters, ImportBranch, Node, NodeList, Pattern};
+use crate::node::{Func, GenericParameters, ImportBranch, Node, NodeList, Pattern, ServiceAttr};
 use crate::options::BuildOptions;
 use crate::span::{Span, Spanned};
 use crate::transformer::{JsProgram, js, transform_functions};
@@ -1682,7 +1682,7 @@ impl Expander<'_, '_> {
             // `[service(Client)]`: the std `service` macro (in the prelude) —
             // or the Rust generator when absent. The compiler gathers the
             // same-module [rpc] surface either way.
-            Node::Service(client_name, item) => {
+            Node::Service(attribute, item) => {
                 // B266: a GENERIC subject is refused AT THE ATTRIBUTE, above the
                 // backend split and above the expansion — so nothing is generated
                 // to fail later inside a client the author never wrote (B117's
@@ -1699,7 +1699,7 @@ impl Expander<'_, '_> {
                 }
                 match self.scope.get("service") {
                     Some(def) => {
-                        self.run_service(def, *client_name, item, siblings, text, depth);
+                        self.run_service(def, *attribute, item, siblings, text, depth);
                     }
                     None => {
                         // The Rust generator exists for FIXTURE stds that have
@@ -1721,8 +1721,11 @@ impl Expander<'_, '_> {
                                     .to_string(),
                             });
                         } else {
-                            let source =
-                                crate::analyzer::service_impl_source(*client_name, item, siblings);
+                            let source = crate::analyzer::service_impl_source(
+                                attribute.client_name,
+                                item,
+                                siblings,
+                            );
                             let fallback = self.fallback();
                             fallback.any_service = true;
                             fallback.source.push_str(&source);
@@ -1821,13 +1824,13 @@ impl Expander<'_, '_> {
     fn run_service(
         &mut self,
         def: &MacroDef,
-        client_name: Option<&str>,
+        attribute: ServiceAttr,
         item: &Spanned<Node>,
         siblings: &NodeList,
         text: &str,
         depth: u32,
     ) {
-        let Some((literal, input)) = construct_service(client_name, item, siblings, text) else {
+        let Some((literal, input)) = construct_service(attribute, item, siblings, text) else {
             return; // a bodyless struct generates nothing, like the Rust path
         };
         // The input text (struct + gathered methods) is only `expand_call`'s
@@ -2723,7 +2726,7 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
 /// expansion cache keys on: the output depends on the sibling impls, so the
 /// struct's own text alone would go stale when a method changes.
 pub(crate) fn construct_service(
-    client_name: Option<&str>,
+    attribute: ServiceAttr,
     item: &Spanned<Node>,
     nodes: &NodeList,
     text: &str,
@@ -2732,9 +2735,17 @@ pub(crate) fn construct_service(
         return None;
     };
     let service_name = name.0;
-    let client = client_name
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{service_name}Client"));
+    // A struct carrying only `[client_service]` generates no transport client,
+    // so it names none — the empty string is what the macro reads as "none"
+    // (§9.3). `[service]`, with or without an argument, always names one.
+    let client = if attribute.server_side {
+        attribute
+            .client_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{service_name}Client"))
+    } else {
+        String::new()
+    };
     let field_values = fields
         .0
         .iter()
@@ -2755,22 +2766,61 @@ pub(crate) fn construct_service(
             ])
         })
         .collect();
-    let mut methods = Vec::new();
     let mut input = String::new();
     input.push_str(&slice(text, item.1));
     input.push('\u{0}');
     input.push_str(&client);
+    let methods = gather_rpc_methods(service_name, nodes, text, &mut input);
+    // `client = H`'s surface: the handler struct's own `[rpc]` methods, gathered
+    // the same way. They are the `client:` entries of THIS service's contract
+    // surface, which is why `H` must be a same-module sibling — the reflection
+    // that reaches them is the one the compiler already does for the service
+    // itself, and cross-module reflection stays future work (§9.3).
+    let handler_name = attribute.handler_name.unwrap_or_default();
+    input.push('\u{0}');
+    input.push_str(handler_name);
+    let handler_methods = if attribute.handler_name.is_some() {
+        gather_rpc_methods(handler_name, nodes, text, &mut input)
+    } else {
+        Vec::new()
+    };
+    let literal = array(vec![
+        discriminant(3),
+        array(vec![
+            string_literal(service_name),
+            string_literal(&client),
+            array(field_values),
+            array(methods),
+            js::Node::Bool(attribute.client_side),
+            string_literal(handler_name),
+            array(handler_methods),
+        ]),
+    ]);
+    Some((literal, input))
+}
+
+/// Every `[rpc]` method declared on `subject` by an inherent impl in `nodes`,
+/// as `FunctionItem` literals — and each one's source text appended to `input`,
+/// the expansion cache's key (a method's signature changing must invalidate the
+/// expansion that hashed it).
+fn gather_rpc_methods(
+    subject: &str,
+    nodes: &NodeList,
+    text: &str,
+    input: &mut String,
+) -> Vec<js::Node<'static>> {
+    let mut methods = Vec::new();
     for (node, _span) in nodes {
-        let Node::Impl(subject, impl_traits, body) = node else {
+        let Node::Impl(impl_subject, impl_traits, body) = node else {
             continue;
         };
         if !impl_traits.is_empty() {
             continue;
         }
-        let Node::Accessor(subject_name) = &subject.0 else {
+        let Node::Accessor(subject_name) = &impl_subject.0 else {
             continue;
         };
-        if *subject_name != service_name {
+        if *subject_name != subject {
             continue;
         }
         for (member, member_span) in &body.0 {
@@ -2785,16 +2835,7 @@ pub(crate) fn construct_service(
             input.push_str(&slice(text, *member_span));
         }
     }
-    let literal = array(vec![
-        discriminant(3),
-        array(vec![
-            string_literal(service_name),
-            string_literal(&client),
-            array(field_values),
-            array(methods),
-        ]),
-    ]);
-    Some((literal, input))
+    methods
 }
 
 /// `Arguments { values }` — the invocation's argument source texts.

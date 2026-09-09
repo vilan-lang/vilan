@@ -326,7 +326,7 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         Node::Export(inner) => Node::Export(seal_boxed(inner)),
         Node::Const(inner) => Node::Const(seal_boxed(inner)),
         Node::Derive(names, inner) => Node::Derive(names, seal_boxed(inner)),
-        Node::Service(name, inner) => Node::Service(name, seal_boxed(inner)),
+        Node::Service(attribute, inner) => Node::Service(attribute, seal_boxed(inner)),
         Node::MacroAttribute(name, name_span, arguments, inner) => {
             Node::MacroAttribute(name, name_span, arguments, seal_boxed(inner))
         }

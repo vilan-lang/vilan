@@ -418,6 +418,30 @@ pub enum ImportTail<'src> {
 
 pub type NodeList<'src> = Vec<Spanned<Node<'src>>>;
 
+/// What a `[service(..)]` / `[client_service]` attribute pair says about the
+/// struct it annotates (`proposal/transport-rpc.md` §9.3, R1).
+///
+/// Both attributes ride ONE node so that a struct carrying both — the
+/// peer-to-peer spelling — expands once and generates one dispatcher rather
+/// than two colliding ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServiceAttr<'src> {
+    /// `[service(Name)]`'s argument: the generated client type's name.
+    /// `None` on a bare `[service]` (the name defaults to `<Struct>Client`)
+    /// AND on a struct that carries only `[client_service]`, which generates no
+    /// transport client at all — `client_side` tells the two apart.
+    pub client_name: Option<&'src str>,
+    /// `[service(.., client = H)]`'s argument: the `[client_service]` struct
+    /// whose `[rpc]` methods this server may call. `None` when none is declared.
+    pub handler_name: Option<&'src str>,
+    /// Whether `[service(..)]` was written at all. `false` means the struct
+    /// carries only `[client_service]`.
+    pub server_side: bool,
+    /// Whether `[client_service]` was written: this struct's `[rpc]` methods are
+    /// callable BY a server, and it generates a `<Struct>Proxy`.
+    pub client_side: bool,
+}
+
 #[derive(Debug)]
 pub enum Node<'src> {
     Accessor(&'src str),
@@ -612,7 +636,11 @@ pub enum Node<'src> {
     // pre-analysis pass generates its dispatcher, its client sibling (named by
     // the argument, defaulting to `<Struct>Client`), and the contract hash from
     // the struct's `[rpc]` impl methods and `[expose]`d fields.
-    Service(Option<&'src str>, Box<Spanned<Self>>),
+    //
+    // `[client_service]` rides the SAME node (`ServiceAttr::client_side`): the
+    // generator is direction-agnostic, and a struct carrying both attributes is
+    // peer-to-peer with ONE dispatcher (§9.3, R1).
+    Service(ServiceAttr<'src>, Box<Spanned<Self>>),
     // `let`/`mut` binding: name, type annotation, value, mutability.
     Let(
         Spanned<&'src str>,
