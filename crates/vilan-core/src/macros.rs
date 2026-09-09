@@ -1697,6 +1697,24 @@ impl Expander<'_, '_> {
                     self.sweep_expressions(item, text, depth);
                     return;
                 }
+                // B272: an `[rpc]` method taking `mut self` is refused here for
+                // the same reason, spanned on the METHOD — the receiver is what
+                // has to change, and the expansion is not where that is legible.
+                // `&mut self` is honoured by the generator instead (R-A38b(a)),
+                // so this is the only receiver a service refuses.
+                let mut_self_refusals = crate::analyzer::service_mut_self_refusals(item, siblings);
+                if !mut_self_refusals.is_empty() {
+                    for (span, msg) in mut_self_refusals {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg,
+                        });
+                    }
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
                 match self.scope.get("service") {
                     Some(def) => {
                         self.run_service(def, *client_name, item, siblings, text, depth);

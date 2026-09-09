@@ -46458,6 +46458,75 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
     ))
 }
 
+/// The refusals a `[service]` subject's `mut self` `[rpc]` methods take — one
+/// per offending method, spanned on the METHOD's name (B272 / R-A38b).
+///
+/// `mut self` is a parameter-local copy (`proposal/mut-parameters.md`): the
+/// handler mutates it, the reply carries the new value, and the copy is
+/// discarded when the call returns — so the NEXT call on the same connection
+/// reads the old field. Nothing said so. The generated dispatcher admitted the
+/// receiver, the program compiled, and the write was lost in silence; that
+/// third state is what this refuses.
+///
+/// It is refused at the ATTRIBUTE, above the backend split and above the
+/// expansion, for B117's reason and B266's: nothing is then generated to fail
+/// later inside code the author never wrote. It also replaces a diagnostic —
+/// before this, `&mut self` reached the expansion and failed there with
+/// "cannot mutate immutable 'self'; declare it `mut self` …" spanned on the
+/// STRUCT, recommending the very receiver that loses the write. `&mut self` is
+/// now honoured by the generator, so that message no longer fires for a service
+/// at all, and `mut self` gets a sentence about the copy instead of one about
+/// mutability.
+///
+/// Keyed on the receiver the parser recorded, never on the method body: a
+/// `mut self` method that mutates nothing is refused too, because the receiver
+/// is the claim being made and a body that grows one write later would
+/// otherwise turn silent.
+pub(crate) fn service_mut_self_refusals(
+    item: &Spanned<Node<'_>>,
+    nodes: &NodeList<'_>,
+) -> Vec<(Span, String)> {
+    let Node::Struct(name, _generics, _external, _resource, _body) = &item.0 else {
+        return Vec::new();
+    };
+    let service_name = name.0;
+    let mut refusals = Vec::new();
+    for (node, _span) in nodes {
+        let Node::Impl(subject, impl_traits, body) = node else {
+            continue;
+        };
+        if !impl_traits.is_empty() {
+            continue;
+        }
+        let Node::Accessor(subject_name) = &subject.0 else {
+            continue;
+        };
+        if *subject_name != service_name {
+            continue;
+        }
+        for (member, _member_span) in &body.0 {
+            let Node::Func(function) = member else {
+                continue;
+            };
+            if !function.rpc || function.receiver_spelling() != Some("mut self") {
+                continue;
+            }
+            let method_name = function.name.0;
+            refusals.push((
+                function.name.1,
+                format!(
+                    "`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` method's \
+                     `mut self` copy is discarded after the call: the handler mutates it, the \
+                     reply carries the new value, and the next call on this connection reads the \
+                     old one. Write `&mut self` to mutate this connection's instance, or hold \
+                     the state in a `Shared<T>` field"
+                ),
+            ));
+        }
+    }
+    refusals
+}
+
 pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {
     let (kind, name) = match &item.0 {
         Node::Struct(name, _generics, _external, true, _body) => ("struct", name.0),

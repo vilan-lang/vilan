@@ -784,6 +784,59 @@ no connection to build an instance for, so a factory service **refuses it**
 (`501`, with the reason in the body). A factory service is reached over the
 WebSocket transport — which is what every generated `Client::connect` uses.
 
+### Mutable session state
+
+That instance is the connection's session, so its fields are ordinary
+mutable state — and the **receiver** you write on the method decides where
+the write goes.
+
+`&mut self` is the idiomatic one. The connection's dispatcher is built once,
+around that connection's instance, and a `&mut self` method writes to it in
+place — so the write is still there on the next call over the same socket, and
+no other connection can see it:
+
+```vilan,fragment
+[service(GateClient)]
+struct Gate {
+	is_authenticated: bool,
+}
+
+impl Gate {
+	[rpc]
+	fun login(&mut self, password: str): bool {
+		if password == "hunter2" {
+			self.is_authenticated = true;
+		}
+		self.is_authenticated
+	}
+
+	[rpc]
+	fun secret(self): str {
+		if self.is_authenticated { "the answer is 42" } else { "sign in first" }
+	}
+}
+```
+
+`mut self` is **refused** on an `[rpc]` method, naming the method. It reads
+like the same thing and is not: `mut self` is a copy the handler may write,
+so the reply carries the new value and the next call reads the old field —
+a write lost in silence. The compiler says so instead:
+
+```text
+`[rpc]` method `login` takes `mut self`, and an `[rpc]` method's `mut self`
+copy is discarded after the call: the handler mutates it, the reply carries
+the new value, and the next call on this connection reads the old one. Write
+`&mut self` to mutate this connection's instance, or hold the state in a
+`Shared<T>` field
+```
+
+`Shared<T>` is the third spelling, and it is not merely the older one: reach
+for it when something *other than a method body* must reach the state — a
+callback the service stored, a timer, a task that outlives the call. A
+`&mut self` borrow lasts for the call; a `Shared<T>` handle is the instance's
+own cell and can be captured. A `[expose]`d `SignalCell` is the same idea
+with a wire behind it.
+
 ## Growing past one service
 
 That chain is the whole layer — `Service::new(protocol)`, installed with

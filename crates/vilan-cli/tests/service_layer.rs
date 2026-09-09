@@ -2549,3 +2549,87 @@ fun run(port: i32) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `mut self` on an `[rpc]` method is REFUSED, at the attribute, naming the
+/// method (B272, ruling R-A38b: the generator honours `&mut self`, and `mut
+/// self` is refused).
+///
+/// `mut self` is a parameter-local copy: the handler mutates it, the reply
+/// carries the new value, and the copy dies with the call — so the next call on
+/// the same connection reads the old field. It compiled, and nothing said so;
+/// the deleted pin measured the loss. There is now no receiver a service admits
+/// that silently discards a write.
+///
+/// The refusal is spanned on the METHOD's name, not on the struct: the receiver
+/// is what has to change. It also stands ALONE — the expansion is skipped, so a
+/// service written this way does not additionally collect the generated client's
+/// own errors, and in particular the old struct-span message ("in code generated
+/// by this attribute: cannot mutate immutable 'self'; declare it `mut self` …",
+/// which recommended the receiver that loses the write) cannot fire for a
+/// service any more.
+#[test]
+fn an_rpc_method_taking_mut_self_is_refused_at_the_attribute_naming_the_method() {
+    let dir = temp_project("mut_self_refused");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(GateClient)]
+struct Gate {
+	is_authenticated: bool,
+}
+
+impl Gate {
+	[rpc]
+	fun login(mut self, password: str): bool {
+		self.is_authenticated = password == "hunter2";
+		self.is_authenticated
+	}
+}
+
+fun main() {}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "`mut self` on an `[rpc]` method must not compile:\n{report}"
+    );
+    for expected in [
+        "`[rpc]` method `login` takes `mut self`",
+        "copy is discarded after the call",
+        "Write `&mut self` to mutate this connection's instance",
+        "hold the state in a `Shared<T>` field",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{report}"
+        );
+    }
+    // One mistake, one message: the expansion is skipped, so nothing downstream
+    // complains about a client the author never wrote.
+    assert_eq!(
+        report.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{report}"
+    );
+    assert!(
+        !report.contains("cannot mutate immutable 'self'"),
+        "the struct-span diagnostic B272 recorded must be gone — it recommended \
+         `mut self`, the receiver that loses the write:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
