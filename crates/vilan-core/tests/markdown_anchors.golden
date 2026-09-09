@@ -102,6 +102,7 @@ guide/services.md h2 naming-server-entities-handlet
 guide/services.md h2 what-rpc-calls-do
 guide/services.md h2 mirrors
 guide/services.md h3 reading-a-mirror
+guide/services.md h3 handles-a-method-that-returns-a-source
 guide/services.md h3 keyed-mirrors-exposekeyed
 guide/services.md h3 reading-a-keyed-mirror
 guide/services.md h3 what-it-costs

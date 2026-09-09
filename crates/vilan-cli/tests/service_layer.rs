@@ -3384,3 +3384,625 @@ fn the_reverse_lane_carries_a_notification_over_the_binary_codec_too() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- §9.2: return-typed signal handles (Order 31, lane handles-31) ----------
+
+/// THE EXHIBIT, in the owner's own words (`transport-rpc.md` §9.2, the sketch
+/// of 2026-09-07): `get_messages(conversation, amount): List<MessageId>` plus
+/// `get_message(id): SignalCell<MessageBody>`, so a client can hold a hundred
+/// ids and subscribe to the handful on screen.
+///
+/// Three services, and the two that are not the exhibit are there for the
+/// hashes. `PlainChat` is the shape measured at `c3ed9239` before any of this
+/// existed; `ValueChat` is `HandleChat` with the one return type written as a
+/// plain value.
+const HANDLE_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::Wire;
+
+[derive(Wire, PartialEq, Debug)]
+struct MessageBody {
+	id: str,
+	author: str,
+	body: str,
+}
+
+// The exhibit. `get_message` returns a SOURCE, so the client's stub answers a
+// `RemoteSource<MessageBody>` and the wire carries a channel id.
+[service(HandleChatClient)]
+struct HandleChat {
+	[expose] topic: SignalCell<str>,
+	bodies: Shared<List<(str, SignalCell<MessageBody>)>>,
+}
+
+impl HandleChat {
+	fun cell_for(self, id: str): SignalCell<MessageBody> {
+		for entry in self.bodies.read() {
+			let (key, cell) = entry;
+			if key == id {
+				ret cell;
+			}
+		}
+		let fresh: SignalCell<MessageBody> =
+			Signal::new(MessageBody { id, author = "reed", body = "" });
+		self.bodies.write().push((id, fresh));
+		fresh
+	}
+
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		mut ids: List<str> = [];
+		mut index = 0;
+		for index < amount {
+			ids.push(i"{conversation}-m{index}");
+			index += 1;
+		}
+		ids
+	}
+
+	[rpc]
+	fun get_message(self, id: str): SignalCell<MessageBody> {
+		self.cell_for(id)
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		self.cell_for(id).set(MessageBody { id, author = "reed", body });
+		true
+	}
+}
+
+// The hash control measured at c3ed9239: two methods, one exposed field, and
+// not a source in a return position anywhere.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		[]
+	}
+
+	[rpc]
+	fun get_message(self, id: str): MessageBody {
+		MessageBody { id, author = "", body = "" }
+	}
+}
+
+// `HandleChat` with the handle return written as a plain value — the twin that
+// says the mapping is what moved the hash, and not the method list.
+[service(ValueChatClient)]
+struct ValueChat {
+	[expose] topic: SignalCell<str>,
+}
+
+impl ValueChat {
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		[]
+	}
+
+	[rpc]
+	fun get_message(self, id: str): MessageBody {
+		MessageBody { id, author = "", body = "" }
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: HandleChat = HandleChat { topic = Signal::new("general"), bodies = Shared::new([]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match HandleChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let plain = PlainChat { topic = Signal::new("") };
+			let value = ValueChat { topic = Signal::new("") };
+			print(i"handle-hash:{client.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"value-hash:{value.contract_hash()}");
+
+			// A hundred ids, one subscription: the lease rule does the rest.
+			let ids = client.get_messages("general", 100).unwrap_or([]);
+			print(i"ids:{ids.len()}");
+			match client.get_message(ids[3]) {
+				Ok(let mirror) => {
+					// Passive before anything watches: the mirror holds
+					// nothing, because nothing asked.
+					print(i"before:{mirror.status().get().debug()}");
+					let watch = mirror.sub(|value| print(i"m3:{value.body}"));
+					print(i"edit:{client.edit(ids[3], "hello").unwrap_or(false)}");
+					print(i"after:{mirror.status().get().debug()}");
+					let missing = MessageBody { id = "?", author = "?", body = "?" };
+					print(i"held:{mirror.get().unwrap_or(missing).body}");
+					watch.dispose();
+				},
+				Err(let error) => print(i"mirror-err:{error.debug()}"),
+			}
+			print("done");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// djb2 over a contract surface, as `service_hash` computes it (`std/src/rpc.vl`,
+/// and `service_contract_hash` in the analyzer's fallback). Written out here so
+/// a hash pin can state the SURFACE it expects rather than a magic number: what
+/// is being pinned is the rendering, and a number alone cannot say which
+/// rendering it came from.
+fn contract_hash_of(surface: &str) -> String {
+    let mut hash: u32 = 5381;
+    for byte in surface.bytes() {
+        hash = hash.wrapping_mul(33) ^ (byte as u32);
+    }
+    format!("{hash:08x}")
+}
+
+/// §9.2's plain half, end to end over a real WebSocket: an `[rpc]` method
+/// returning a `SignalCell<T>` hands the client a live `RemoteSource<T>`, and
+/// the contract hash covers the MAPPED type.
+///
+/// Three claims, and the two hash ones are the reason the other two services
+/// are in the program:
+///
+/// 1. **The round trip.** `get_message(id)` puts a `ChannelId` on the wire —
+///    the reply is an `i32` and the codec sees nothing else — and the stub
+///    mints the mirror from it. The mirror is LAZY (`before:Waiting`: a handle
+///    nothing watches has opened no channel), seeds from the server's first
+///    `Update` the moment something leases it (`m3:`, the empty body the cell
+///    was minted with), and follows every later write (`m3:hello`). The
+///    `Ready` is read AFTER the edit's round trip and not before it: over a
+///    real socket the seeding `Update` is a frame, not a return value, so a
+///    status read in the same synchronous extent as the `sub` would be pinning
+///    the transport rather than the mirror.
+/// 2. **A handle-free service's hash did not move.** `PlainChat` is written
+///    exactly as it was measured at `c3ed9239`, before any of this existed, and
+///    `78bdada7` is that measurement frozen. This is the promise the whole
+///    mapping is written around: no shipped service is touched.
+/// 3. **The mapped rendering is what the hash covers.** `HandleChat` hashes as
+///    djb2 of the surface with `get_message(str)->RemoteSource<MessageBody>;`
+///    in it — the CLIENT's type, because the hash exists to protect the client
+///    — and its twin with that one return written as a plain `MessageBody`
+///    hashes differently. A server that turns a handle into a value is refused
+///    at connect instead of feeding a `ChannelId` to a `MessageBody` decoder.
+#[test]
+fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_type() {
+    let dir = temp_project("handle_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", HANDLE_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let line_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        line_of("ids:"),
+        "100",
+        "the id list came back short:\n{stdout}"
+    );
+    // Lazy: the handle exists, and nothing is subscribed until something reads
+    // it through a lease.
+    assert_eq!(
+        line_of("before:"),
+        "Waiting",
+        "a minted mirror opened its channel before anything watched it:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("after:"),
+        "Ready",
+        "the lease did not seed the mirror from the server's updates:\n{stdout}"
+    );
+    for expected in ["m3:", "m3:hello", "edit:true", "held:hello"] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the handle service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("mirror-err:"),
+        "the handle call failed:\n{stdout}"
+    );
+
+    // The hash halves.
+    let handle_surface = "get_messages(str,i32)->List<str>;\
+                          get_message(str)->RemoteSource<MessageBody>;\
+                          edit(str,str)->bool;\
+                          expose:topic:str;";
+    let value_surface = "get_messages(str,i32)->List<str>;\
+                         get_message(str)->MessageBody;\
+                         edit(str,str)->bool;\
+                         expose:topic:str;";
+    let plain_surface = "get_messages(str,i32)->List<str>;\
+                         get_message(str)->MessageBody;\
+                         expose:topic:str;";
+    assert_eq!(
+        line_of("plain-hash:"),
+        "78bdada7",
+        "a service with no handle return must hash byte-identically to what it \
+         hashed at c3ed9239 — this number was measured there:\n{stdout}"
+    );
+    assert_eq!(
+        contract_hash_of(plain_surface),
+        "78bdada7",
+        "the frozen number and the surface it was measured from disagree"
+    );
+    assert_eq!(
+        line_of("handle-hash:"),
+        contract_hash_of(handle_surface),
+        "the contract surface must name the MAPPED type — the hash protects the \
+         client, so it says what the client will see:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("value-hash:"),
+        contract_hash_of(value_surface),
+        "the plain-value twin's surface is not what it hashed:\n{stdout}"
+    );
+    assert_ne!(
+        line_of("handle-hash:"),
+        line_of("value-hash:"),
+        "turning a handle return into a plain value must move the hash, or a \
+         stale client decodes a ChannelId as a MessageBody:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The demand rules, read off the SERVER's own tables (R3, and the lease rule
+/// `remote-sources.md` states). A `Service::factory` instance knows its
+/// connection id, so a `stats` route can answer with
+/// `[sources.len(), live.len(), getter calls]` — the capability table and the
+/// live forwards, per connection, as the client drives them.
+const HANDLE_DEMAND: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Subscription };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ RemoteSource, session_of };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::Wire;
+
+[derive(Wire, PartialEq, Debug)]
+struct Body {
+	id: str,
+	text: str,
+}
+
+let bodies: Shared<List<(str, SignalCell<Body>)>> = Shared::new([]);
+let getter_calls: Shared<i32> = Shared::new(0);
+
+fun cell_for(id: str): SignalCell<Body> {
+	for entry in bodies.read() {
+		let (key, cell) = entry;
+		if key == id {
+			ret cell;
+		}
+	}
+	let fresh: SignalCell<Body> = Signal::new(Body { id, text = "first" });
+	bodies.write().push((id, fresh));
+	fresh
+}
+
+[service(DemandClient)]
+struct Demand {
+	[expose] topic: SignalCell<str>,
+	connection: i32,
+}
+
+impl Demand {
+	[rpc]
+	fun get_message(self, id: str): SignalCell<Body> {
+		getter_calls.write() = getter_calls.read() + 1;
+		cell_for(id)
+	}
+
+	[rpc]
+	fun edit(self, id: str, text: str): bool {
+		cell_for(id).set(Body { id, text });
+		true
+	}
+
+	// The OPTION form: a handle for a row that may not exist. `None` mints no
+	// channel at all, so an absent row retains nothing.
+	[rpc]
+	fun find(self, id: str): Option<SignalCell<Body>> {
+		for entry in bodies.read() {
+			let (key, cell) = entry;
+			if key == id {
+				ret Option::Some(cell);
+			}
+		}
+		Option::None
+	}
+
+	// This connection's capability table and live forwards, as the server
+	// holds them. `Service::factory` is what makes the id knowable.
+	[rpc]
+	fun stats(self): List<i32> {
+		match session_of(self.connection) {
+			Option::Some(let session) => [
+				session.sources.read().len(),
+				session.live.read().len(),
+				getter_calls.read(),
+			],
+			Option::None => [0 - 1, 0 - 1, 0 - 1],
+		}
+	}
+}
+
+let topic: SignalCell<str> = Signal::new("general");
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(
+			|connection| Demand { topic, connection = connection.id },
+			json_codec(),
+		))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun body_text(mirror: RemoteSource<Body>): str {
+	let missing = Body { id = "?", text = "?" };
+	mirror.get().unwrap_or(missing).text
+}
+
+fun show(label: str, stats: List<i32>) {
+	print(i"{label}:sources={stats[0]} live={stats[1]} calls={stats[2]}");
+}
+
+fun run(port: i32) {
+	match DemandClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let empty: List<i32> = [0 - 1, 0 - 1, 0 - 1];
+			// One channel, and it is the `[expose]`d field's.
+			show("attached", client.stats().unwrap_or(empty));
+
+			// A HUNDRED handles minted, and not one forward started.
+			mut mirrors: List<RemoteSource<Body>> = [];
+			mut index = 0;
+			for index < 100 {
+				match client.get_message(i"m{index}") {
+					Ok(let mirror) => mirrors.push(mirror),
+					Err(let error) => print(i"mint-err:{error.debug()}"),
+				}
+				index += 1;
+			}
+			show("minted", client.stats().unwrap_or(empty));
+
+			// TEN of them watched.
+			mut leases: List<Subscription> = [];
+			mut watched = 0;
+			for watched < 10 {
+				leases.push(mirrors[watched].sub(|_value| {}));
+				watched += 1;
+			}
+			show("leased", client.stats().unwrap_or(empty));
+
+			// Every lease released. The `Unsubscribe` rides the turn's settle
+			// and then one microtask; the round trip below is what lets both
+			// happen before the reading call is even sent.
+			for lease in leases {
+				lease.dispose();
+			}
+			let _pause = client.stats();
+			show("released", client.stats().unwrap_or(empty));
+
+			// The source moved while nothing was watching.
+			print(i"edit:{client.edit("m0", "second").unwrap_or(false)}");
+
+			// Demand returns on a mirror whose channel the server withdrew:
+			// the mirror re-issues its own origin call. The cached value is
+			// what it paints until the fresh channel's first `Update` lands.
+			let again = mirrors[0].sub(|_value| {});
+			print(i"seed:{body_text(mirrors[0])}");
+			let _settle = client.stats();
+			show("re-acquired", client.stats().unwrap_or(empty));
+			print(i"fresh:{body_text(mirrors[0])}");
+			again.dispose();
+			let _drain = client.stats();
+			show("re-released", client.stats().unwrap_or(empty));
+
+			// The CONTROL: a `[expose]`d field channel's `Unsubscribe` is
+			// demand-only. Its capability survives (A41), where a dynamic
+			// one's does not — and a remount finds it on the same id.
+			let field = client.topic.sub(|_value| {});
+			field.dispose();
+			let _quiet = client.stats();
+			show("field-released", client.stats().unwrap_or(empty));
+			let again_field = client.topic.sub(|_value| {});
+			let _seeded = client.stats();
+			print(i"field-remount:{client.topic.get().unwrap_or("?")}");
+			again_field.dispose();
+
+			// The OPTION form, both answers. A `None` mints nothing — the
+			// absence IS the reply — and a `Some` is an ordinary mirror.
+			match client.find("nobody") {
+				Ok(let missing) => print(i"find-missing:{missing.is_some()}"),
+				Err(let error) => print(i"find-err:{error.debug()}"),
+			}
+			let _quiet_again = client.stats();
+			show("after-missing", client.stats().unwrap_or(empty));
+			match client.find("m0") {
+				Ok(let found) => match found {
+					Option::Some(let mirror) => {
+						let reading = mirror.sub(|_value| {});
+						let _flush = client.stats();
+						print(i"find-found:{body_text(mirror)}");
+						reading.dispose();
+					},
+					Option::None => print("find-found:absent"),
+				},
+				Err(let error) => print(i"find-err:{error.debug()}"),
+			}
+			print("done");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// R3 as ruled, over a real socket and read off the server's own tables.
+///
+/// - **A hundred handles cost nothing until they are watched.** `minted`
+///   reports 101 capabilities (a hundred handles plus the `[expose]`d field)
+///   and ZERO live forwards; `leased` reports the same 101 with TEN forwards.
+///   That is the shipped lease rule doing the whole of the owner's "a server
+///   subscription is only triggered once the client maps the handle to a local
+///   Signal" — no new mechanism, and it is what makes the exhibit's shape
+///   (a hundred ids, ten on screen) affordable.
+/// - **Demand decides the channel's life.** The ten leases reach zero, the
+///   `Unsubscribe`s go out past the turn's settle and the microtask hop, and
+///   the server REVOKES: `released` reports 91 capabilities. §9.2 proposed a
+///   `Release(channel)` frame for this; R3 spends the `Unsubscribe` instead,
+///   because the server already knows which channels it minted dynamically.
+/// - **Re-acquiring re-mints.** A lease returns on a mirror whose channel is
+///   gone, the mirror re-issues its own `origin` call — the getter runs a
+///   SECOND time, `calls` goes from 100 to 101 — the capability table grows
+///   back to 92, and the mirror rebinds. The `seed` line is the cached value
+///   painted before the round trip; `fresh` is what the fresh channel's first
+///   `Update` carried, which is the edit made while nothing was watching.
+/// - **The `Option` form mints on presence only.** `find("nobody")` answers
+///   `None` and leaves the capability table exactly where it was; `find("m0")`
+///   answers a mirror like any other.
+/// - **The `[expose]` field channel is the control.** Its `Unsubscribe` is
+///   demand-only, its capability survives the release (`sources` does not
+///   move) and the remount finds it on the same id and re-seeds
+///   (`field-remount:general`) — A41's rule, unchanged: a field channel has no
+///   origin to re-issue, so revoking it would make every remount silently
+///   dead. That is the one behavioural difference between the two kinds of
+///   mirror, and it is exactly the difference A41 identified.
+#[test]
+fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_minted() {
+    let dir = temp_project("handle_demand");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", HANDLE_DEMAND);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let line_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        line_of("attached:"),
+        "sources=1 live=0 calls=0",
+        "the attach should mint exactly the exposed field's channel:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("minted:"),
+        "sources=101 live=0 calls=100",
+        "a hundred minted handles must start no forward at all:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("leased:"),
+        "sources=101 live=10 calls=100",
+        "ten leases must be ten forwards, and no more:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("released:"),
+        "sources=91 live=0 calls=100",
+        "a dynamic channel's Unsubscribe must revoke it — the capability, the \
+         starter and the source it captured all go:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("edit:"),
+        "true",
+        "the edit while nothing watched did not land:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("seed:"),
+        "first",
+        "the mirror must paint its cached value while the re-mint is in \
+         flight, not go back to Waiting:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("re-acquired:"),
+        "sources=92 live=1 calls=101",
+        "demand returning must re-issue the origin call — one fresh capability, \
+         one fresh forward, and the getter run a second time:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("fresh:"),
+        "second",
+        "the re-minted channel's first update must carry what the source says \
+         NOW, not what the mirror was holding:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("re-released:"),
+        "sources=91 live=0 calls=101",
+        "the re-minted channel is revoked at its own lease-zero exactly like \
+         the first one:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("field-released:"),
+        "sources=91 live=0 calls=101",
+        "an `[expose]`d field channel's Unsubscribe is demand-only: its \
+         capability must survive, or every remount is silently dead (A41):\n{stdout}"
+    );
+    assert_eq!(
+        line_of("field-remount:"),
+        "general",
+        "the field channel's capability survived its Unsubscribe, so the \
+         remount re-subscribes on the same id and re-seeds:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-missing:"),
+        "false",
+        "the Option form's `None` must arrive as a `None`:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("after-missing:"),
+        "sources=91 live=0 calls=101",
+        "a `None` from an Option-returning handle method must mint no channel \
+         at all — the absence is the whole reply:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-found:"),
+        "second",
+        "the Option form's `Some` must be an ordinary mirror:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("mint-err:") && !stdout.contains("find-err:"),
+        "a handle call failed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

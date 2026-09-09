@@ -329,6 +329,101 @@ opened the channel — the mirror stays `Waiting` until something that
 renders the value (`or`, `map`, `sub`) subscribes. That is the passive
 read being honest, and the count is what makes the active ones cheap.
 
+### Handles: a method that returns a source
+
+`[expose]` names its channels at compile time, one per field per
+connection, and that is right for state the whole client watches — a
+task list, a topic. It is wrong for state the client watches a
+*fraction* of. A chat with a hundred thousand messages cannot expose
+them all and cannot expose them one field at a time.
+
+An `[rpc]` method whose **return type is a source** is the other half.
+The server hands back a `SignalCell<T>`; what crosses the wire is a
+channel id, and what the client's stub answers is a mirror:
+
+| the server writes | the client's stub returns |
+| --- | --- |
+| `SignalCell<T>` | `Result<RemoteSource<T>, RpcError>` |
+| `Option<SignalCell<T>>` | `Result<Option<RemoteSource<T>>, RpcError>` |
+
+```vilan,fragment
+[service(ChatClient)]
+struct Chat {
+	[expose] topic: SignalCell<str>,
+	bodies: Shared<List<(str, SignalCell<MessageBody>)>>,
+}
+
+impl Chat {
+	// The index: cheap, plain, and a hundred of them is one reply.
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> { … }
+
+	// The detail: a handle per message. The client subscribes to the ones
+	// on screen and to no others.
+	[rpc]
+	fun get_message(self, id: str): SignalCell<MessageBody> {
+		self.cell_for(id)
+	}
+}
+
+// At the client — one call, one mirror, read like any other:
+let ids = client.get_messages("general", 100)!;
+let body = client.get_message(ids[3])!;
+view("p").bind_text(body.map(|value| match value {
+	Some(let message) => message.body,
+	None => "loading…",
+}))
+```
+
+Everything you already know about a mirror applies to this one: it is a
+`RemoteSource<T>`, you read it with `or` / `map` / `sub` / `get` /
+`status`, and **subscription follows demand**. That last rule is what
+makes the shape affordable — a hundred handles minted and ten leased is
+a hundred capabilities on the server and **ten forwards**. A handle
+nothing watches costs one table entry and sends no frames at all.
+
+**The element must be Wire, not the source.** The `SignalCell` never
+crosses; its values do, one `Update` frame at a time. So the Wire rule
+lands on `T`, and a handle over a non-Wire element is refused naming the
+element rather than the wrapper.
+
+**The contract hash covers the mapped type.** `get_message`'s surface
+entry is written `get_message(str)->RemoteSource<MessageBody>;` — what
+the *client* will see, because the hash exists to protect the client. A
+server that changes a handle return to a plain value moves the hash and
+a stale client is refused at connect, instead of decoding a channel id
+as a message.
+
+**A handle-returning method must be safe to re-run.** Its return type is
+the declaration that it is a *getter*: the runtime re-issues the call
+when a released mirror is watched again, and again after a reconnect.
+Write it as a lookup — `self.cell_for(id)` — not as something that
+counts, charges, or appends.
+
+**When the server frees it.** Demand decides. A mirror's last lease
+going away sends `Unsubscribe`, and for a channel a reply minted that
+withdraws the capability whole: the forward stops, the starter is
+dropped, and the source it captured is released. Nothing accumulates
+over a long session. The mirror remembers the call it came from, so the
+next lease re-issues it, rebinds to the fresh channel, and paints its
+last known value until the first update lands. (An `[expose]`d field
+channel does *not* work this way: its `Unsubscribe` is demand-only and
+its capability survives, because it is minted once per connection and a
+remount must find it on the same id.)
+
+Two consequences worth having in mind. A dispose and a remount anywhere
+inside one macrotask — two event handlers, a route change, a `bind_each`
+rebuilding rows — send **nothing**: a handle's close waits for the
+turn's settle and then one microtask, and a lease returning in that
+window cancels it. (A `[expose]`d field mirror keeps the prompter
+cadence: its close is due at the settle and goes then, because its
+channel survives it and there is nothing to buy by waiting.) And a
+handle minted inside a view — anywhere an owner is ambient — that
+nothing ever leases is released when that owner is disposed; minted with
+no ambient owner (at the top of `main`, say) it lives with the
+connection, which frees every channel it ever minted when the socket
+closes.
+
 ### Keyed mirrors: `[expose(keyed)]`
 
 A plain `[expose]` sends the **whole value** on every change. That is the

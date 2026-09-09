@@ -478,7 +478,12 @@ impl Service {
 	/// moment a method needs to know who called.
 	fun new(protocol: RpcProtocol): Service {
 		Service {
-			build_protocol = |_connection| protocol,
+			// One protocol for every client (the stateless shorthand), stamped
+			// per connection: a source-returning route exports through THIS
+			// connection's capability table, and the stamp is how it finds it
+			// (`transport-rpc.md` §9.2). The dispatcher is still shared —
+			// only the connection id differs between the copies.
+			build_protocol = |connection| protocol.for_connection(connection.id),
 			shared = Some(protocol),
 			codec = protocol.codec,
 			mount = "/",
@@ -522,7 +527,10 @@ impl Service {
 	/// `Client::connect` uses.
 	fun factory<S: RpcService>(build: |Connection| S, codec: Codec): Service {
 		Service {
-			build_protocol = |connection| build(connection).dispatcher_for().into_protocol(codec),
+			build_protocol = |connection| build(connection)
+				.dispatcher_for()
+				.into_protocol(codec)
+				.for_connection(connection.id),
 			shared = None,
 			codec,
 			mount = "/",

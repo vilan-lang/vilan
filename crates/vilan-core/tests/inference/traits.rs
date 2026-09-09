@@ -3479,3 +3479,104 @@ fn b258_the_override_still_fences_on_its_own_receiver() {
         "context `scope` is read here, but this code can be reached without an enclosing `run`",
     );
 }
+
+// --- §9.2: a signal HANDLE in a return position (Order 31, handles-31) ------
+
+/// The `[rpc]` Wire rule moves inward by one type argument when the return is
+/// a handle, and this is where it lands.
+///
+/// A `SignalCell<T>` return is not meant to be Wire and never crosses: the
+/// source stays on the server, a `ChannelId` goes on the wire, and the client
+/// mirrors it. What DOES cross is the element, in every `Update` frame the
+/// channel carries — so the refusal names the element, in the return type's own
+/// vocabulary, rather than saying `SignalCell<Secret>` "is not Wire", which
+/// would be true and useless (nothing about the wrapper is the problem).
+#[test]
+fn a_handle_return_whose_element_is_not_wire_is_refused_at_the_element() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Secret { token: str }
+        [service(StoreClient)]
+        struct Store {
+            secret: SignalCell<Secret>,
+        }
+        impl Store {
+            [rpc]
+            fun watch(self): SignalCell<Secret> { self.secret }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "returns a signal handle whose element `Secret` is not Wire",
+    );
+}
+
+/// The control, and the two shapes the mapping admits: `SignalCell<T>` becomes
+/// `RemoteSource<T>` at the client and `Option<SignalCell<T>>` becomes
+/// `Option<RemoteSource<T>>`, both over a Wire element.
+#[test]
+fn a_handle_return_over_a_wire_element_compiles_in_both_forms() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        [service(StoreClient)]
+        struct Store {
+            task: SignalCell<Task>,
+        }
+        impl Store {
+            [rpc]
+            fun watch(self, id: i32): SignalCell<Task> { self.task }
+
+            [rpc]
+            fun find(self, id: i32): Option<SignalCell<Task>> {
+                if id == 0 { Some(self.task) } else { None }
+            }
+        }
+        fun main() { print(Store { task = Signal::new(Task { id = 1 }) }.contract_hash()); }
+        main();
+        "#,
+    );
+}
+
+/// The recognition boundary, said out loud. The expansion reads a handle
+/// return off the WRITTEN spelling — it runs before any type resolves, exactly
+/// as `[expose]` does — so a user type that implements `Source<T>` in a return
+/// position is NOT read as a handle. It is not silently mis-generated either:
+/// it falls to the ordinary `[rpc]` Wire rule, which refuses it by name. The
+/// same type is still exposable as a FIELD (`a52_an_expose_of_a_user_source_
+/// type_is_accepted` is the other half), because there the `[expose]` marker
+/// is what declares the intent and the analyzer reconciles the impl.
+#[test]
+fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: i32 }
+        struct Stored<T> { inner: SignalCell<T> }
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+        }
+        [service(StoreClient)]
+        struct Store {
+            items: Stored<Task>,
+        }
+        impl Store {
+            [rpc]
+            fun items(self): Stored<Task> { self.items }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "which is not Wire",
+    );
+}
