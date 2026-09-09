@@ -2684,6 +2684,11 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
 /// A `FunctionItem` value: name, parameters (as never-exposed `Field`s, `self`
 /// included — consumers skip it by name), and the written return type
 /// (`void` when omitted).
+///
+/// A parameter renders as a `Field` with all five slots written — `exposed`,
+/// `keyed` and `key` are meaningless on a parameter and are the false/empty
+/// constants. They used to be omitted, which left the last two slots `undefined`
+/// in the macro world: harmless only for as long as no macro read them.
 fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
     let parameters = function
         .parameters
@@ -2702,6 +2707,8 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),
                 js::Node::Bool(false),
+                js::Node::Bool(false),
+                string_literal(""),
             ])
         })
         .collect();
