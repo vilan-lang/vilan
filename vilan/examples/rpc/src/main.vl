@@ -34,7 +34,9 @@ import std::rpc::{
 	decode_failed,
 	duplex_pair,
 	local_rpc,
+	register_session,
 	reply,
+	session_of,
 };
 import std::shared::Shared;
 import std::wire::{ Codec, Serializer };
@@ -183,6 +185,9 @@ impl AccountsClient<type T> {
 struct Session {
 	[expose] status: SignalCell<str>,
 	user_id: Shared<Option<i32>>,
+	// One cell per note, minted on first ask. `[expose]` cannot name these:
+	// there is a field per exposure and the set is not known at compile time.
+	notes: Shared<List<(str, SignalCell<str>)>>,
 }
 
 impl Session {
@@ -204,6 +209,40 @@ impl Session {
 			},
 			None => false,
 		}
+	}
+
+	// A method whose RETURN TYPE is a source (transport-rpc.md §9.2) — the other
+	// half of `[expose]`, and the one that scales to state the client watches a
+	// FRACTION of. The reply carries a channel id and nothing else; the generated
+	// stub answers `Result<RemoteSource<str>, RpcError>`, so the caller reads it
+	// like any other mirror. Subscription still follows demand: a thousand notes
+	// asked for and three watched is three forwards.
+	//
+	// It must be safe to RE-RUN — the runtime re-issues the call when a released
+	// mirror is watched again, and after a reconnect — so it is a lookup and
+	// nothing else.
+	[rpc]
+	fun note(self, id: str): SignalCell<str> {
+		self.note_cell(id)
+	}
+
+	[rpc]
+	fun edit_note(self, id: str, text: str): bool {
+		self.note_cell(id).set(text);
+		true
+	}
+
+	// Not `[rpc]`: an ordinary helper the two above share.
+	fun note_cell(self, id: str): SignalCell<str> {
+		for entry in self.notes.read() {
+			let (key, cell) = entry;
+			if key == id {
+				ret cell;
+			}
+		}
+		let fresh: SignalCell<str> = Signal::new("(empty)");
+		self.notes.write().push((id, fresh));
+		fresh
 	}
 
 	// Manual auth (Q4): ordinary body logic over the state `login` populated — no
@@ -316,15 +355,41 @@ fun session_demo() {
 	// Server, on connect: ONE session per connection; the dispatcher's handlers share its
 	// handles. The exposed `status` is exported under a channel id (§8) — the id is what
 	// a connect handshake would carry; in-process we just hand it over.
-	let session = Session { status = Signal::new("offline"), user_id = Shared::new(None) };
-	let rpc_transport = local_rpc(session.dispatcher().into_protocol(json_codec()));
+	let session = Session {
+		status = Signal::new("offline"),
+		user_id = Shared::new(None),
+		notes = Shared::new([]),
+	};
 	let (client_end, server_end) = duplex_pair();
-	let status_channel = ReactiveServer::new(server_end, json_codec()).expose(session.status);
 
-	// Client: what `Client::connect` assembles — the RPC transport plus a typed mirror
-	// for each exposed field (the annotated `let` binds the mirror's type).
-	let status_mirror: RemoteSource<str> = ReactiveClient::new(client_end, json_codec()).source(status_channel);
-	let client = Client { transport = rpc_transport, codec = json_codec(), status = status_mirror };
+	// The CONNECTION. A real server registers one reactive session per upgraded
+	// socket and stamps it on the protocol; in-process we do both by hand, because
+	// a method that returns a source exports into THIS connection's capability
+	// table and has to be able to find it.
+	let connection = 0;
+	register_session(connection, server_end, json_codec());
+	let reactive_server = match session_of(connection) {
+		Some(let found) => found,
+		None => ReactiveServer::new(server_end, json_codec()),
+	};
+	let status_channel = reactive_server.expose(session.status);
+	let rpc_transport = local_rpc(session
+		.dispatcher()
+		.into_protocol(json_codec())
+		.for_connection(connection));
+
+	// Client: what `Client::connect` assembles — the RPC transport, a typed mirror
+	// for each exposed field (the annotated `let` binds the mirror's type), and the
+	// reactive client itself, which a service handing out handles keeps so a minted
+	// mirror has somewhere to be routed.
+	let reactive = ReactiveClient::new(client_end, json_codec());
+	let status_mirror: RemoteSource<str> = reactive.source(status_channel);
+	let client = Client {
+		transport = rpc_transport,
+		codec = json_codec(),
+		status = status_mirror,
+		reactive,
+	};
 
 	// Observe the mirrored session state: "offline" now, "online" once login lands —
 	// delivered in the same wire turn as login's reply.
@@ -336,6 +401,20 @@ fun session_demo() {
 	show_login(client.login("ada", "wrong")); // bad password -> false, status unchanged
 	show_login(client.login("ada", "hunter2")); // -> true; "status = online" in the same turn
 	show_whoami(client.whoami()); // the session remembers -> ada (@ada)
+
+	// The handle: one call, one mirror. `note` returns a `SignalCell<str>` on the
+	// server, so the client gets a `RemoteSource<str>` over a channel the reply
+	// minted — and `edit_note`'s write reaches it in that call's own wire turn.
+	match client.note("welcome") {
+		Ok(let note) => {
+			let reading = note.sub(|text| print(i"note = {text}"));
+			print(i"edit -> {client.edit_note("welcome", "hello, ada").unwrap_or(false)}");
+			// The last lease going away withdraws the channel server-side; asking
+			// again re-issues the call, which is why `note` is a lookup.
+			reading.dispose();
+		},
+		Err(let error) => print(i"note rpc error: {error.debug()}"),
+	}
 
 	watching.dispose();
 }

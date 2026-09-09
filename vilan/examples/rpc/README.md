@@ -28,6 +28,9 @@ login -> false
 status = online
 login -> true
 whoami -> ada (@ada)
+note = (empty)
+note = hello, ada
+edit -> true
 ```
 
 Everything runs in-process over a local transport — no network, no server to
@@ -150,6 +153,18 @@ are checked: an `[rpc]` signature must be Wire and declare a return; an
   `login -> true` (the failed login changes nothing). The mirror is typed
   (`RemoteSource<str>`): observers receive decoded values, and the codec
   chosen at wiring time is the only (de)serialization anywhere on the path.
+- **A returned handle.** `Session.note(id)` returns a `SignalCell<str>`, and
+  the reply carries nothing but the **channel id** the runtime exported it
+  under: the client's stub is `Result<RemoteSource<str>, RpcError>` and reads
+  like any other mirror. This is the half `[expose]` cannot do — there is one
+  field per exposure, and a per-note channel is not a set the compiler knows.
+  Subscription still follows demand, so a thousand notes asked for and three
+  watched is three forwards on the server. The demo runs it in process, which
+  is why the connection is registered by hand (`register_session`) and stamped
+  on the protocol (`for_connection`): a handle-returning route exports into
+  *that* connection's capability table, and a real server does both at the
+  upgrade. And the method is a lookup on purpose — the runtime re-issues it
+  when a released mirror is watched again, so it must be safe to re-run.
 
 ## A language note the runtime leans on
 

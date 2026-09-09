@@ -150,6 +150,13 @@ fn post_build(directory: &str) -> PostBuild {
                 "status = online\n",
                 "login -> true\n",
                 "whoami -> ada (@ada)\n",
+                // The handle half (transport-rpc.md §9.2): `note` returns a
+                // `SignalCell<str>`, so the reply is a channel id and the
+                // client reads a `RemoteSource<str>` — seeded by the server's
+                // first update, then following `edit_note`'s write.
+                "note = (empty)\n",
+                "note = hello, ada\n",
+                "edit -> true\n",
             ),
         },
         "browser" => PostBuild::Artifacts(&["client.js"]),
