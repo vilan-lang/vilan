@@ -784,6 +784,112 @@ no connection to build an instance for, so a factory service **refuses it**
 (`501`, with the reason in the body). A factory service is reached over the
 WebSocket transport — which is what every generated `Client::connect` uses.
 
+## The other direction: calling the client
+
+Sometimes the server is the one with news. A session was revoked, a
+background job finished, another user moved something on the screen you
+are looking at — facts the client cannot poll for without asking a
+hundred times to hear once.
+
+Declare the functions the server may call on a struct in the browser half
+and mark it `[client_service]`:
+
+```vilan,fragment
+[client_service]
+struct KoltHandlers {
+	revoked: SignalCell<str>,
+}
+
+impl KoltHandlers {
+	[rpc]
+	fun session_revoked(self, reason: str) {
+		self.revoked.set(reason);
+	}
+}
+```
+
+Then name it on the service, and hold the generated proxy as a field:
+
+```vilan,fragment
+[service(KoltClient, client = KoltHandlers)]
+struct KoltStore {
+	user: str,
+	client: KoltHandlersProxy,
+}
+
+impl KoltStore {
+	[rpc]
+	fun sign_out(self): bool {
+		self.client.session_revoked("signed out elsewhere");
+		true
+	}
+}
+
+Service::factory(|connection: Connection| KoltStore {
+	user = connection.session.identity,
+	client = connection.client(),
+}, json_codec())
+```
+
+`connection.client()` needs no annotation: the FIELD's declared type is
+what the attribute named, and that is what resolves it. The proxy is the
+connection's id and nothing else, so it is cheap to copy into as many
+places as want it, and it goes quiet the moment the connection closes.
+
+On the browser side, mount the handler instance on the connected client:
+
+```vilan,fragment
+let handlers = KoltHandlers { revoked = Signal::new("") };
+let client = KoltClient::connect(url, json_codec())!.with_handlers(handlers);
+```
+
+**Notifications only, in this version.** A `[client_service]` method
+declares no return type and is refused if it does. A server→client
+notification has no reply lane to settle on and no pending table to
+correlate with, so there is nothing for a value to come back through —
+`self.client.session_revoked(reason)` is synchronous, returns nothing,
+and cannot fail visibly. If the client must answer, have its handler call
+back on the connection it already holds.
+
+Both attributes on one struct is peer-to-peer, and needs no new spelling:
+one dispatcher, a transport client, and a proxy, all from the same
+`[rpc]` method set.
+
+### What the turn model owes you here
+
+Three sentences, and they are the same three whichever direction a
+handler runs in.
+
+1. **The router never blocks on a handler.** A chunk off the socket is
+   parsed into its events and every handler's turn is STARTED before any
+   of them is awaited. Two frames that TCP coalesced into one read are
+   two handlers in flight, not a queue.
+2. **A held turn is per handler, not per connection.** Each dispatch
+   establishes its own turn, so two handlers on one connection settle
+   independently. Signal writes inside one handler coalesce into one
+   wave, exactly as they do for a client→server call.
+3. **Reply order within a chunk is not promised.** Replies carry their
+   request id and arrive when their handler is done — a slow first frame
+   does not hold a fast second one behind it. Nothing in the protocol
+   ever depended on the order; this only makes it visible.
+
+### What happens to a peer that has not heard of any of this
+
+The contract hash covers BOTH directions. A service that declares
+`client = KoltHandlers` appends the handler surface to its own, so its
+hash moves — and a client generated against that surface is refused at
+`__contract` by a server that declares no handler, before it has a client
+value to mount handlers on and therefore before any reverse frame could
+be dispatched. A service that declares no `client = …` hashes exactly as
+it always did.
+
+(The reverse lane is a `s:<id>:<payload>` text frame, or a `0x73` tag
+byte, beside the `r:`/`d:` lanes that were already there. Both routers
+ignore prefixes and tags they do not know, so a client too old to have a
+router arm for it drops the frame instead of failing — but the hash check
+above is what is meant to catch that case, and the silent drop is only
+the floor under it.)
+
 ## Growing past one service
 
 That chain is the whole layer — `Service::new(protocol)`, installed with
