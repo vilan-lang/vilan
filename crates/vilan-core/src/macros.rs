@@ -1687,7 +1687,16 @@ impl Expander<'_, '_> {
                 // backend split and above the expansion — so nothing is generated
                 // to fail later inside a client the author never wrote (B117's
                 // rule, applied to the other attribute that generates a type).
-                if let Some(refusal) = crate::analyzer::service_generic_refusal(item) {
+                // §9.3/R1: `client = H` where `H` is not a `[client_service]`
+                // sibling is refused here too — an unseen handler would fold an
+                // EMPTY reverse surface into the hash, which is a silent
+                // agreement about nothing rather than a loud disagreement.
+                let refusal = crate::analyzer::service_generic_refusal(item).or_else(|| {
+                    attribute.handler_name.and_then(|handler| {
+                        crate::analyzer::client_handler_refusal(handler, siblings)
+                    })
+                });
+                if let Some(refusal) = refusal {
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,

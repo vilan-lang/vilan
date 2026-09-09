@@ -14792,6 +14792,27 @@ impl<'src> Analyzer<'src> {
             let notifies = self.client_service_subjects.contains(subject_name);
             for (label, type_node, span) in members {
                 if notifies && label == "return type" {
+                    if let Some(type_node) = type_node {
+                        let rendered = render_type(type_node);
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "return type of `[rpc]` method `{method_name}` is \
+                                     `{rendered}`, but a `[client_service]` method is a \
+                                     NOTIFICATION: notifications only in v1 — a \
+                                     server→client call has no reply lane to settle on and \
+                                     no pending table to correlate with, so the value could \
+                                     never come back. Drop the return type; if the client \
+                                     must answer, have the handler call back on the \
+                                     connection it already holds"
+                                ),
+                            },
+                            method_id,
+                        );
+                    }
                     continue;
                 }
                 match type_node {
@@ -46502,6 +46523,35 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
          to each other. Generic services are not supported yet: write the service over a concrete \
          subject, naming the element in the field (`{subject} {{ items: SignalCell<List<Task>> }}`), \
          which is what an `[expose]`d field names anyway"
+    ))
+}
+
+/// `[service(.., client = H)]` where `H` is not a `[client_service]` sibling —
+/// refused AT THE ATTRIBUTE (`transport-rpc.md` §9.3, R1), above the expansion,
+/// like `service_generic_refusal` and for the same reason: what follows would be
+/// an empty reverse surface silently folded into the contract hash, and two
+/// peers agreeing on nothing.
+pub(crate) fn client_handler_refusal(handler_name: &str, nodes: &NodeList<'_>) -> Option<String> {
+    let declared = nodes.iter().any(|(node, _)| {
+        let Node::Service(attribute, item) = node else {
+            return false;
+        };
+        let Node::Struct(name, ..) = &item.0 else {
+            return false;
+        };
+        attribute.client_side && name.0 == handler_name
+    });
+    if declared {
+        return None;
+    }
+    Some(format!(
+        "`[service(.., client = {handler_name})]` names `{handler_name}` as the struct this \
+         server may call, but no `[client_service] struct {handler_name}` is declared in this \
+         module. The reverse surface is read off that struct's `[rpc]` methods AT EXPANSION and \
+         folded into this service's contract hash, so a handler the expansion cannot see would \
+         hash as no handler at all and both peers would agree on nothing. Write `[client_service] \
+         struct {handler_name} {{ .. }}` beside this service — the handler is a same-module \
+         sibling because same-module impls are the reflection the compiler does"
     ))
 }
 

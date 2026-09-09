@@ -2858,6 +2858,148 @@ fn the_client_surface_moves_the_contract_hash_and_only_for_a_service_that_declar
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A build that must FAIL: returns the combined output of `vilan build`, having
+/// asserted the build did not succeed.
+fn vilan_build_refusal(dir: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "the build should have failed:\n{text}"
+    );
+    text
+}
+
+/// R4, refused rather than silently truncated: v1 has no reverse reply lane, so
+/// a `[client_service]` method that declares a return type describes a value
+/// that could never come back.
+#[test]
+fn a_client_service_method_that_declares_a_return_type_is_refused() {
+    let dir = temp_project("reverse_returns");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[client_service]
+struct Handlers {
+	who: str,
+}
+
+impl Handlers {
+	[rpc]
+	fun ask(self, question: str): i32 {
+		1
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("notifications only in v1"),
+        "a `[client_service]` method's return type must be refused in the \
+         attribute's own vocabulary:\n{text}"
+    );
+    // The same struct with the return type dropped compiles — the refusal is
+    // about the return, not about the attribute.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[client_service]
+struct Handlers {
+	who: str,
+}
+
+impl Handlers {
+	[rpc]
+	fun ask(self, question: str) {
+		print(question);
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a void `[client_service]` method must compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R1: `client = X` names the struct whose `[rpc]` methods this server may call,
+/// and the reverse surface is read off X's same-module impls AT EXPANSION. An X
+/// the expansion cannot see would fold an EMPTY reverse surface into the hash —
+/// two peers agreeing about nothing — so it is refused at the attribute.
+#[test]
+fn a_client_handler_the_module_does_not_declare_is_refused() {
+    let dir = temp_project("reverse_no_handler");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+struct Handlers {
+	who: str,
+}
+
+[service(StoreClient, client = Handlers)]
+struct Store {
+	who: str,
+}
+
+impl Store {
+	[rpc]
+	fun kick(self): i32 {
+		1
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("no `[client_service] struct Handlers` is declared in this module"),
+        "`client = X` where X carries no `[client_service]` must be refused at \
+         the attribute:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Peer-to-peer (§9.3's "both attributes on one struct is peer-to-peer, and
 /// needs no new spelling"): ONE struct, ONE dispatcher, both halves generated.
 /// `bounce` travels client→server through the generated stub; the server's
