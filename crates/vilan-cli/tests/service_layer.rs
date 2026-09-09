@@ -3244,3 +3244,46 @@ fn two_frames_coalesced_into_one_read_are_not_serialized_by_the_receive_loop() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The reverse lane's BYTE twin (`0x73`), which is a different arm of a
+/// different router from `s:` and had no pin of its own.
+///
+/// One codec deployment-wide (§6.2, Q6), so the same program under
+/// `binary_codec()` exercises `tag_client_bytes` on the way out and
+/// `route_socket_bytes`' `0x73` arm on the way in. Everything else — the turn,
+/// the wave count, the contract refusal — is the text pin's, and must hold
+/// identically: the lane is a framing choice, not a semantics one.
+#[test]
+fn the_reverse_lane_carries_a_notification_over_the_binary_codec_too() {
+    let dir = temp_project("reverse_binary");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &REVERSE_SERVER
+            .replace(
+                "import std::json::json_codec;",
+                "import std::binary::binary_codec;",
+            )
+            .replace("json_codec()", "binary_codec()"),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("seen:revoked"),
+        "the `0x73` lane did not deliver the notification:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("waves:2") && !stdout.contains(":pending"),
+        "the byte lane's dispatch must run inside a turn, exactly as the text \
+         lane's does:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mismatch:contract"),
+        "the contract check does not depend on the codec:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
