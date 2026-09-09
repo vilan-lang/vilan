@@ -488,6 +488,47 @@ snapshots by key and sends a **`Patch`** of `Delta` ops (`Reset`,
 `Insert`, `Update`, `Remove`) instead of an `Update` carrying the whole
 map.
 
+### A third spelling that skips the diff: `KeyedCell<K, T>`
+
+Diffing is what a `SignalCell` forces: the channel is handed two snapshots
+and has to work out what moved, which re-keys the whole collection on every
+change — and pays for it once per subscribed connection. Only the *mutation*
+knows what changed, so `KeyedCell<K, T>` is the field type that says it:
+
+```vilan,fragment
+import std::rpc::KeyedCell;
+
+[service(ChatClient2)]
+struct Chat2 {
+	[expose] messages: KeyedCell<str, Message>,
+}
+```
+
+```vilan,fragment
+fun edit(messages: KeyedCell<str, Message>) {
+	messages.insert(Message { id = "m9", channel = 1, body = "hello" });
+	messages.update("m9", |&mut message| {
+		message.body = "hello again";
+	});
+	messages.remove("m9");
+}
+```
+
+Each write appends the `Delta` op it *is*, and a subscriber's forward sends
+the ops since it last looked. The cell names both its key and its element in
+its own type, so `keyed` is redundant on it and there is nothing for
+`keyed = K` to add; and `PartialEq` is no longer required of the element,
+because nothing is compared.
+
+**Nothing on the wire changes** — the same `Patch` frames, the same
+`KeyedSource<K, T>` on the client, the same contract hash as the
+`[expose(keyed = str)] SignalCell<List<Message>>` spelling, so a service may
+swap one field for the other without breaking a deployed client. What changes
+is the cost per change per connection: 0.0078 ms at 1,000 rows and 0.0103 at
+10,000, where diffing the same edits costs 0.315 and 3.814 (children CPU).
+Bind it locally with `bind_each(messages, …)` — it is a `Source<List<T>>` with
+no `Option` in it, because a cell always holds a collection.
+
 ### Reading a keyed mirror
 
 The mirror is a `KeyedSource<K, T>`, and it holds **exactly what this
@@ -579,13 +620,15 @@ Three things that table says out loud:
   A keyed exposure is its own surface entry, so a client built against
   `[expose]` will not connect to a server that has since made the field
   keyed. That is the point: the frames differ.
-- **Hand-wired exposures have the same two shapes.**
-  `ReactiveServer::expose_keyed(source, key_of)` for a `List<T>` and
-  `expose_keyed_map(source, key_of)` for a `Map<K, V>`, with
-  `ReactiveClient::attached_keyed_source` / `keyed_source` on the other
-  end. `[expose(keyed = K)]` generates the first of those and
-  `[expose(keyed)]` the second, frame for frame — the hand-wired form is
-  the escape for a source neither attribute can name, not for the `List`.
+- **Hand-wired exposures have the same three shapes.**
+  `ReactiveServer::expose_keyed(source, key_of)` for a `List<T>`,
+  `expose_keyed_map(source, key_of)` for a `Map<K, V>` and
+  `expose_keyed_cell(cell)` for a `KeyedCell<K, T>` (no `key_of` — the cell
+  names its key), with `ReactiveClient::attached_keyed_source` /
+  `keyed_source` on the other end. `[expose(keyed = K)]` generates the first,
+  `[expose(keyed)]` over a map the second and `[expose]` over a cell the
+  third, frame for frame — the hand-wired form is the escape for a source
+  none of the three attributes can name, not for the `List`.
 
 ## Connection state and reconnection
 

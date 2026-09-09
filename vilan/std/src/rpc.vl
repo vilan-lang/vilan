@@ -1789,6 +1789,12 @@ impl ReactiveServer {
 	/// vilan infers a type parameter from the call's types, not from its
 	/// bounds. The client half has no such problem — `KeyedSource<K, T>` names
 	/// `K` in the subject — so `Keyed` is a real bound there.
+	///
+	/// COST: the forward this starts diffs two snapshots per change and pays
+	/// that once per subscribed connection (`keyed_diff`). A source that can
+	/// be a `KeyedCell<K, T>` should be one — `expose_keyed_cell` forwards the
+	/// ops the writes recorded and costs the change rather than the collection
+	/// (A54). This call is still correct over a cell; it is just the slow way.
 	fun expose_keyed<K: Wire + Hashable, T: Wire + PartialEq, S: Source<List<T>>>(
 		self,
 		source: S,
@@ -1827,6 +1833,42 @@ impl ReactiveServer {
 			KeySubscription {
 				key = key.hash(),
 				start = || keyed_key_forward(transport, codec, channel, source, elements, key_of, key),
+			}
+		};
+		self.sources
+			.write()
+			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false }));
+		channel
+	}
+
+	/// Export a `KeyedCell<K, T>` (A54): the same channel shape as
+	/// `expose_keyed`, fed by the cell's OP LOG instead of a diff.
+	///
+	/// The wire is identical — a `Reset` seed and one element-grained `Patch`
+	/// per change, per demand — so the contract entry, the mirror and the
+	/// bytes are the same as the `SignalCell<List<T>>` form's, and a service
+	/// that swaps one field for the other does not move its hash. What changes
+	/// is the cost: `keyed_forward` re-keys two whole snapshots on every
+	/// change and pays it once per SUBSCRIBED CONNECTION, where this forward
+	/// copies the ops the mutation already recorded.
+	///
+	/// It is a distinct NAME rather than an overload because a `KeyedCell` is
+	/// a `Source<List<T>>` and would otherwise satisfy `expose_keyed`'s bound
+	/// and take the diff path silently. `expose_keyed` is still correct over
+	/// one — just O(N) — so the mistake is a cost, not a bug.
+	fun expose_keyed_cell<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		cell: KeyedCell<K, T>,
+	): i32 {
+		let channel = fresh_channel();
+		let transport = self.transport;
+		let codec = self.codec;
+		let start = || keyed_cell_forward(transport, codec, channel, cell);
+		let resolve = |deserializer: Deserializer| {
+			let key: K = K::rebuild(deserializer);
+			KeySubscription {
+				key = key.hash(),
+				start = || keyed_cell_key_forward(transport, codec, channel, cell, key),
 			}
 		};
 		self.sources
@@ -2146,6 +2188,137 @@ fun keyed_key_forward<K: Wire + Hashable, T: Wire + PartialEq, C, S: Source<C>>(
 	})
 }
 
+/// The whole-collection forward over a `KeyedCell` (A54): `keyed_forward`'s
+/// contract, answered from the op log.
+///
+/// Same shape as its diffing twin — a `Reset` seed, then one `Patch` per
+/// change carrying only what moved — and the previous state is per FORWARD in
+/// the same way, as a cursor into the cell's log rather than a snapshot of the
+/// collection. A client that subscribes late still gets a seed rather than
+/// someone else's delta, because the cursor is minted at the sequence the seed
+/// was taken at.
+///
+/// The cursor is minted, the observer attached and the seed sent with nothing
+/// able to run in between (no await, no callback), so the seed is exactly the
+/// state the cursor names.
+fun keyed_cell_forward<K: Wire + Hashable, T: Wire + Keyed<K>>(
+	transport: DuplexEnd,
+	codec: Codec,
+	channel: i32,
+	cell: KeyedCell<K, T>,
+): Subscription {
+	let cursor = cell.cursor();
+	let subscription = cell.on_change(|_published| {
+		let ops = cell.since(cursor);
+		if ops.len() > 0 {
+			send_patch(transport, codec, channel, ops);
+		}
+	});
+	subscription.release.write() = Some(|| cell.drop_cursor(cursor));
+	mut seed: List<Delta<K, T>> = [];
+	seed.push(Delta::Reset(cell.get()));
+	send_patch(transport, codec, channel, seed);
+	subscription
+}
+
+/// The per-key forward over a `KeyedCell`: everything this subscriber is owed
+/// about ONE key, and nothing about any other — `keyed_key_forward`'s
+/// contract, answered from the op log instead of a scan.
+///
+/// The seed is an `Insert` (never a `Reset`), because a mirror may hold several
+/// independently subscribed keys and a `Reset` would throw the others away —
+/// and it goes even when the key is absent and the op list is empty, which is
+/// what tells the mirror it is in sync (`status` leaves `Waiting`) without
+/// inventing an element. Both sentences are `keyed_key_forward`'s, kept
+/// verbatim because the two paths must be indistinguishable on the wire.
+///
+/// `held` is what makes the ops well-formed for a mirror that holds only this
+/// key: an `Update` on a key the subscriber has not been sent is promoted to
+/// the `Insert` it needs (an `Update` naming an unheld key is a protocol
+/// fault), and a `Remove` for a key it never held is dropped. A `Reset` in the
+/// log says nothing about one key, so it is answered the way the seed is —
+/// with what the cell holds under this key NOW.
+///
+/// This is the one place `T: PartialEq` would still be needed by the diffing
+/// path and is not needed here: the cell already knows the element changed,
+/// so nothing is compared.
+fun keyed_cell_key_forward<K: Wire + Hashable, T: Wire + Keyed<K>>(
+	transport: DuplexEnd,
+	codec: Codec,
+	channel: i32,
+	cell: KeyedCell<K, T>,
+	key: K,
+): Subscription {
+	let wanted = key.hash();
+	let held: Shared<bool> = Shared::new(false);
+	let cursor = cell.cursor();
+	let subscription = cell.on_change(|_published| {
+		mut ops: List<Delta<K, T>> = [];
+		for op in cell.since(cursor) {
+			match op {
+				Delta::Reset(let _items) => match cell.locate(key) {
+					Some(let found) => {
+						let (at, element) = found;
+						if held.read() {
+							ops.push(Delta::Update(key, element));
+						} else {
+							held.write() = true;
+							ops.push(Delta::Insert(key, element, at));
+						}
+					},
+					None => {
+						if held.read() {
+							held.write() = false;
+							ops.push(Delta::Remove(key));
+						}
+					},
+				},
+				Delta::Insert(let op_key, let value, let at) => {
+					if op_key.hash().eq(wanted) {
+						if held.read() {
+							ops.push(Delta::Update(op_key, value));
+						} else {
+							held.write() = true;
+							ops.push(Delta::Insert(op_key, value, at));
+						}
+					}
+				},
+				Delta::Update(let op_key, let value) => {
+					if op_key.hash().eq(wanted) {
+						if held.read() {
+							ops.push(Delta::Update(op_key, value));
+						} else {
+							held.write() = true;
+							ops.push(Delta::Insert(op_key, value, 0));
+						}
+					}
+				},
+				Delta::Remove(let op_key) => {
+					if op_key.hash().eq(wanted) && held.read() {
+						held.write() = false;
+						ops.push(Delta::Remove(op_key));
+					}
+				},
+			}
+		}
+		if ops.len() > 0 {
+			send_patch(transport, codec, channel, ops);
+		}
+	});
+	subscription.release.write() = Some(|| cell.drop_cursor(cursor));
+	mut seed: List<Delta<K, T>> = [];
+	match cell.locate(key) {
+		Some(let found) => {
+			let (at, element) = found;
+			held.write() = true;
+			seed.push(Delta::Insert(key, element, at));
+		},
+		None => {},
+	}
+	send_patch(transport, codec, channel, seed);
+	subscription
+}
+
 /// The keyed diff: what a subscriber must apply to turn `previous` into
 /// `current`. Removals first, then insertions in ascending FINAL index, then
 /// updates — the order the ops must be applied in for the indices to name the
@@ -2159,6 +2332,11 @@ fun keyed_key_forward<K: Wire + Hashable, T: Wire + PartialEq, C, S: Source<C>>(
 ///
 /// A duplicate key keeps the FIRST occurrence, matching `Keyed`'s contract; the
 /// later ones are invisible to the diff and to the mirror.
+///
+/// This is O(N) in the collection and it is paid per change per subscribed
+/// connection — irreducible HERE, because two snapshots are all a
+/// `Source<List<T>>` can offer. `KeyedCell<K, T>` is the source that offers
+/// more (A54); this stays for every source that is not one.
 fun keyed_diff<K: Wire + Hashable, T: Wire + PartialEq>(
 	previous: List<T>,
 	current: List<T>,
@@ -2441,6 +2619,7 @@ impl ReactiveClient {
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
 			leases = Shared::new([]),
+			positions = Shared::new(Map::new()),
 		};
 		let codec = self.codec;
 		// Deliver one routed `Patch`: re-open the frame (the envelope was only
@@ -2479,8 +2658,10 @@ impl ReactiveClient {
 		let mirror: KeyedSource<K, T> = self.attached_keyed_source(channel);
 		let cell = mirror.channel;
 		let cache = mirror.cache;
+		let positions = mirror.positions;
 		self.dynamic.write().push(|| {
 			cell.write() = 0 - 1;
+			positions.write() = Map::new();
 			cache.set(None);
 		});
 		mirror
@@ -2977,6 +3158,295 @@ impl RemoteSource<type T> {
 	}
 }
 
+// --- Server side: the delta-producing cell (A54) -----------------------------
+
+/// How many ops a `KeyedCell` will hold for a forward that has stopped
+/// draining. Past it the history is dropped and every lagging cursor falls
+/// back to a `Reset` — bounded memory, at the cost of one whole-collection
+/// frame to a subscriber that could not keep up. In practice nothing reaches
+/// it: a forward drains at the settle of the turn that wrote, so the log is
+/// as long as one turn's writes and no longer.
+let keyed_log_limit: i32 = 1024;
+
+/// One forward's place in a `KeyedCell`'s op log: the sequence number it has
+/// been told through. Identified rather than compared, because two forwards on
+/// the same channel may legitimately sit at the same sequence.
+struct KeyedCursor {
+	id: i32,
+	at: Shared<i32>,
+}
+
+/// The SERVER-side twin of `KeyedSource`: a keyed collection whose WRITES are
+/// the deltas (tracker A54).
+///
+/// `keyed_forward` over a `SignalCell<List<T>>` can only ask what changed by
+/// comparing two snapshots — `keyed_diff` re-keys both, hashes every element
+/// and compares every retained one — so a keyed channel costs O(N) per change,
+/// per subscribed connection, however small the change is. That is irreducible
+/// while the source is `List`-valued, because only the MUTATION knows what
+/// changed. This cell is the mutation saying so: `insert`, `remove`, `update`
+/// and `set` each APPEND the `Delta<K, T>` they are, and a forward sends the
+/// ops since it last looked. The per-connection cost stops depending on the
+/// size of the collection.
+///
+/// It is a `Source<List<T>>` as well, so the same cell drives a local
+/// `bind_each` with no ceremony — the value view and the op view are one
+/// notification, which is what keeps them from ever disagreeing.
+///
+/// **Where it lives.** Beside `KeyedSource` rather than in `std::reactive`,
+/// for two reasons that point the same way: its whole product is `Delta<K, T>`,
+/// a `std::wire` type whose reason for existing is the `Patch` frame, and
+/// `std::reactive` imports nothing from `std::wire` today — the cell would be
+/// the edge that inverts that layering, for a type with one consumer. And it
+/// is exactly `KeyedSource`'s counterpart: the same `Keyed<K>` bound, the same
+/// delta vocabulary, the same ordering discipline, read best together.
+///
+/// **`PartialEq` is not a bound**, and that is the point. `expose_keyed` needs
+/// `T: PartialEq` because a diff can only learn that an element CHANGED by
+/// comparing it; a cell whose writes are the ops never compares anything.
+struct KeyedCell<K, T> {
+	/// The collection, and the one notification every observer rides — the
+	/// `Source<List<T>>` view and the op forwards alike. One signal, so a
+	/// forward that wakes always sees the list the ops it is about to drain
+	/// produced.
+	elements: SignalCell<List<T>>,
+	/// Where each held key sits in `elements`, by hash. What makes
+	/// `update(key, …)` and `remove(key)` a lookup instead of a scan.
+	positions: Shared<Map<Hash, i32>>,
+	/// The ops still worth keeping, oldest first: sequence numbers
+	/// `base + 1 ..= version`.
+	log: Shared<List<Delta<K, T>>>,
+	/// The sequence number of the newest op the cell has produced.
+	version: Shared<i32>,
+	/// The sequence number BEFORE the oldest op the log still holds. A cursor
+	/// left behind it has lost history and is answered with a `Reset`.
+	base: Shared<i32>,
+	/// One per live op forward. The cell trims its log to the laggiest of
+	/// them, so a channel nobody is watching keeps no history at all.
+	cursors: Shared<List<KeyedCursor>>,
+}
+
+impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
+	/// A cell holding `initial`. The elements are indexed once here, and the
+	/// index is maintained by the writers from then on.
+	fun new(initial: List<T>): KeyedCell<K, T> {
+		let cell = KeyedCell {
+			elements = SignalCell::new(initial),
+			positions = Shared::new(Map::new()),
+			log = Shared::new([]),
+			version = Shared::new(0),
+			base = Shared::new(0),
+			cursors = Shared::new([]),
+		};
+		cell.reindex(initial, 0);
+		cell
+	}
+
+	/// Add `value`, or REPLACE what is held under its key. The two cases are
+	/// the two ops: an `Insert` at the end, or an `Update` in place — which is
+	/// exactly what a mirror applying them will do, so the journal and the
+	/// collection cannot drift.
+	fun insert(self, value: T) {
+		let key = value.key();
+		let wanted = key.hash();
+		match self.positions.read().get(wanted) {
+			Some(let at) => self.elements.update(|&mut list| {
+				list[at] = value;
+				self.record(Delta::Update(key, value));
+			}),
+			None => self.elements.update(|&mut list| {
+				let at = list.len();
+				list.push(value);
+				self.positions.write().insert(wanted, at);
+				self.record(Delta::Insert(key, value, at));
+			}),
+		}
+	}
+
+	/// Drop the element under `key`. A key the cell does not hold is a no-op —
+	/// no op is recorded, so nothing crosses the wire and no mirror is told
+	/// about a removal that did not happen.
+	fun remove(self, key: K) {
+		let wanted = key.hash();
+		match self.positions.read().get(wanted) {
+			None => {},
+			Some(let at) => self.elements.update(|&mut list| {
+				let _dropped = list.remove(at);
+				self.positions.write().remove(wanted);
+				// Everything after the hole moved one place left.
+				self.reindex(list, at);
+				self.record(Delta::Remove(key));
+			}),
+		}
+	}
+
+	/// Mutate the element under `key` IN PLACE and record the `Update` it is —
+	/// the whole reason the cell exists, and the case a diff pays a whole
+	/// re-key for. A key the cell does not hold is a no-op.
+	///
+	/// `mutate` is `sync`: the view may not be live across an `await`
+	/// (`SignalCell::update` carries the same rule and the same reason).
+	fun update(self, key: K, mutate: sync |&mut T| void) {
+		let wanted = key.hash();
+		match self.positions.read().get(wanted) {
+			None => {},
+			Some(let at) => self.elements.update(|&mut list| {
+				mutate(list[at]);
+				self.record(Delta::Update(key, list[at]));
+			}),
+		}
+	}
+
+	/// Replace the whole collection — the wholesale write, and the one op that
+	/// is not incremental. O(N), which is what replacing N elements costs;
+	/// every mirror is told `Reset`.
+	fun set(self, value: List<T>) {
+		self.positions.write() = Map::new();
+		self.reindex(value, 0);
+		self.record(Delta::Reset(value));
+		self.elements.set(value);
+	}
+
+	/// The element held under `key` and where it sits, if the cell holds one —
+	/// a lookup, not a scan. What a per-key forward seeds from.
+	fun locate(self, key: K): Option<(i32, T)> {
+		match self.positions.read().get(key.hash()) {
+			None => None,
+			Some(let at) => match self.elements.get().get(at) {
+				None => None,
+				Some(let element) => Some((at, element)),
+			},
+		}
+	}
+
+	/// Re-record the position of every element from `from` onward.
+	fun reindex(self, list: List<T>, from: i32) {
+		mut index = from;
+		let length = list.len();
+		for index < length {
+			// `list[index]` rather than `list.get(index)`: the bound is the
+			// loop's, and `get` hands back a COPY of the element where the
+			// index expression hands back the element.
+			self.positions.write().insert(list[index].key().hash(), index);
+			index += 1;
+		}
+	}
+
+	/// Append one op to the log and bump the sequence. The trim comes FIRST,
+	/// so a cell whose forwards are all current keeps a log of length one and
+	/// a cell with no forwards keeps none.
+	///
+	/// Past `keyed_log_limit` the history is dropped instead of appended and
+	/// `base` jumps to the new sequence: every cursor behind it now reads as
+	/// lagging, and is answered with a `Reset` on its next drain. The op is
+	/// not lost — it is IN the collection, which is what the `Reset` carries.
+	fun record(self, op: Delta<K, T>) {
+		self.trim();
+		let next = self.version.read() + 1;
+		self.version.write() = next;
+		if self.log.read().len() >= keyed_log_limit {
+			self.log.write() = [];
+			self.base.write() = next;
+		} else {
+			self.log.write().push(op);
+		}
+	}
+
+	/// Drop the ops every live cursor has already been told. With no cursors
+	/// the whole log goes: nothing is watching, so nothing is owed.
+	fun trim(self) {
+		mut lowest = self.version.read();
+		for cursor in self.cursors.read() {
+			let at = cursor.at.read();
+			if at < lowest {
+				lowest = at;
+			}
+		}
+		let base = self.base.read();
+		if lowest > base {
+			let dropped = lowest - base;
+			mut kept: List<Delta<K, T>> = [];
+			mut index = dropped;
+			let held = self.log.read();
+			let length = held.len();
+			for index < length {
+				match held.get(index) {
+					Some(let op) => kept.push(op),
+					None => {},
+				}
+				index += 1;
+			}
+			self.log.write() = kept;
+			self.base.write() = lowest;
+		}
+	}
+
+	/// Register a forward's cursor, at the sequence the cell is at NOW — the
+	/// forward is about to seed from the current collection, so it is owed
+	/// nothing before this point.
+	fun cursor(self): KeyedCursor {
+		let minted = KeyedCursor { id = fresh_id(), at = Shared::new(self.version.read()) };
+		self.cursors.write().push(minted);
+		minted
+	}
+
+	/// Retire a cursor: its forward is gone, so the log no longer has to hold
+	/// anything for it. Called from the forward's `Subscription::release`.
+	fun drop_cursor(self, cursor: KeyedCursor) {
+		mut kept: List<KeyedCursor> = [];
+		for held in self.cursors.read() {
+			if held.id != cursor.id {
+				kept.push(held);
+			}
+		}
+		self.cursors.write() = kept;
+	}
+
+	/// Everything `cursor` has not been told, and advance it. A cursor that
+	/// has fallen behind the log's `base` is answered with a single `Reset` —
+	/// the collection itself, which subsumes every op it missed.
+	fun since(self, cursor: KeyedCursor): List<Delta<K, T>> {
+		let at = cursor.at.read();
+		let version = self.version.read();
+		mut ops: List<Delta<K, T>> = [];
+		if at >= version {
+			ret ops;
+		}
+		cursor.at.write() = version;
+		let base = self.base.read();
+		if at < base {
+			ops.push(Delta::Reset(self.elements.get()));
+			ret ops;
+		}
+		mut index = at - base;
+		let held = self.log.read();
+		let length = held.len();
+		for index < length {
+			match held.get(index) {
+				Some(let op) => ops.push(op),
+				None => {},
+			}
+			index += 1;
+		}
+		ops
+	}
+}
+
+/// The cell IS a `Source<List<T>>` — the local half, with no `Option` in it:
+/// a cell always holds a collection, where a MIRROR may not have been told one
+/// yet. So `bind_each(cell, …)` takes it directly and the `or([])` that a
+/// `KeyedSource` needs (R5) has nothing to say here.
+impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
+	fun get(self): List<T> {
+		self.elements.get()
+	}
+
+	[must_use]
+	fun on_change(self, observer: |List<T>| void): Subscription {
+		self.elements.on_change(observer)
+	}
+}
+
 // --- Client side: the keyed mirror (A39) ------------------------------------
 
 /// One key's demand on a keyed mirror — `RemoteSource`'s count, closing cell
@@ -3028,15 +3498,102 @@ struct KeyedSource<K, T> {
 	settle_id: i32,
 	/// Per-key demand — one entry per key ever leased on this mirror.
 	leases: Shared<List<KeyLease>>,
+	/// Where each held key sits in `cache`, by hash — the CLIENT half of A54.
+	/// `apply` reached `index_of` once per op and `index_of` was a linear scan
+	/// of the mirror, so applying one element-grained patch to a 10,000-row
+	/// mirror cost 10,000 comparisons: O(N) per change on the receiving end of
+	/// a protocol whose whole point is that a change is O(change). The index
+	/// is maintained by `apply` alone (nothing else writes the cache's
+	/// contents) and cleared wherever the cache is.
+	positions: Shared<Map<Hash, i32>>,
 }
 
-impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
+/// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
+/// exactly what it holds: `None` until the first patch lands, the collection
+/// after. A52 gave `RemoteSource` the impl and left the keyed twin bare, so a
+/// keyed channel could be observed only through its own inherent members: A49's
+/// `on_change` was not on it, `effect` was not on it, and no generic
+/// `S: Source<…>` function could take one, which is what a return-typed keyed
+/// handle needs. Every observing path still goes through the SHIPPED counted
+/// lease (`acquire`/`release`); the impl adds no second mechanism, it names the
+/// one there is.
+///
+/// The trait argument is `Option<List<T>>` and not `List<T>` for
+/// `RemoteSource`'s reason: `get` cannot invent a collection before the first
+/// patch, and a keyed mirror that has been told nothing is not an empty one.
+/// So a `KeyedSource<K, T>` does NOT satisfy `bind_each`'s `Source<List<T>>`
+/// and the seam into a list binding stays `or([])` — ruling R5, and the same
+/// sentence `RemoteSource`'s impl carries: `or([])` is the binding SAYING what
+/// an unseeded list renders as. What the impl buys is everything that reads a
+/// source without flattening it.
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
 	/// The mirror's current contents: `None` until the first patch lands.
 	/// Passive — no lease, no frame.
 	fun get(self): Option<List<T>> {
 		self.cache.get()
 	}
 
+	/// The trait's subscription primitive, counted like every other observing
+	/// path: attach WITHOUT the immediate call, and hold the channel open
+	/// until the subscription is disposed.
+	///
+	/// ORDER is forced here exactly as it is on `RemoteSource`: attach FIRST,
+	/// then take the lease. Taking the lease is what sends `Subscribe`, and
+	/// over an in-process transport the server's seeding `Patch` comes back
+	/// INSIDE that call — so acquiring first would drop the seed on a
+	/// `duplex_pair` and deliver it over a socket. Attached first, the seed is
+	/// a change from the `None` the mirror held when the observer was
+	/// registered, on every transport.
+	[must_use]
+	fun on_change(self, observer: |Option<List<T>>| void): Subscription {
+		let subscription = self.cache.on_change(observer);
+		subscription.release.write() = Some(|| self.release());
+		self.acquire();
+		subscription
+	}
+
+	/// The trait's `sub` default, OVERRIDDEN — the default is `on_change` plus
+	/// one call with `get()`, and on a mirror `on_change` itself delivers the
+	/// seeding patch, so the default would make the immediate call TWICE.
+	/// `lease` is the honest eager form.
+	///
+	/// It shares its name with the inherent `sub` below, which takes `|List<T>|`
+	/// and outranks it on a concrete receiver. The two are told apart by the
+	/// observer's own parameter type: `mirror.sub` reaches the inherent one —
+	/// the shape every caller was written against, and the one a view wants —
+	/// while a generic `S: Source<Option<List<T>>>` reaches this one.
+	[must_use]
+	fun sub(self, observer: |Option<List<T>>| void): Subscription {
+		self.lease(observer)
+	}
+
+	/// `effect` for the same reason as `sub`, and by the same body plus the
+	/// ambient owner.
+	fun effect(self, observer: |Option<List<T>>| void) {
+		get_owner().take(self.lease(observer));
+	}
+
+	/// Observe through `transform`, as a plain `SignalCell<U>` — the seam into
+	/// the ordinary reactive world. Counted and owner-released exactly like
+	/// `RemoteSource::map`, and with the same static requirement: an enclosing
+	/// `owner_scope.run`.
+	///
+	/// An OVERRIDE of the trait's `map` rather than an inherent member, for
+	/// B258's reason (`RemoteSource::map` carries it at length): an inherent
+	/// override would promote `status`'s own `self.cache.map(…)` — a call on a
+	/// `SignalCell` field, which inherits the owner-OPTIONAL default — to this
+	/// strict body's flavor, and `register_with_owner` would run with an
+	/// undefined owner.
+	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
+		get_owner().take(self.lease(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+}
+
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>` —
 	/// `RemoteSource::status`'s sentence, unchanged: it reports, it does not
 	/// ask.
@@ -3073,18 +3630,6 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		let subscription = self.cache.sub(observer);
 		subscription.release.write() = Some(|| self.release());
 		subscription
-	}
-
-	/// Observe through `transform`, as a plain `SignalCell<U>` — the seam into
-	/// the ordinary reactive world. Counted and owner-released exactly like
-	/// `RemoteSource::map`, and with the same static requirement: an enclosing
-	/// `owner_scope.run`.
-	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
-		let derived = SignalCell::new(transform(self.get()));
-		get_owner().take(self.lease(|value| {
-			derived.set(transform(value));
-		}));
-		derived
 	}
 
 	/// `map` for the same-type case: `initial` until the first patch.
@@ -3192,6 +3737,7 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				}
 			}
 			if resumed {
+				self.positions.write() = Map::new();
 				self.cache.set(Some([]));
 			}
 			for lease in self.leases.read() {
@@ -3243,82 +3789,115 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	}
 
 	/// The element under a key hash in the mirror's contents, if it holds one.
+	/// A lookup, not a scan (A54): `value` is always the cache's own current
+	/// contents — every caller passes `self.get()` or the value the cache's
+	/// own subscription handed it — so the position index describes it.
 	fun pick(self, value: Option<List<T>>, key: Hash): Option<T> {
 		match value {
 			None => None,
-			Some(let list) => {
-				for element in list {
-					if element.key().hash().eq(key) {
-						ret Some(element);
-					}
-				}
-				None
+			Some(let list) => match self.positions.read().get(key) {
+				None => None,
+				Some(let at) => list.get(at),
 			},
 		}
 	}
 
-	/// Where `key` sits in the mirror's list, if at all.
+	/// Where `key` sits in the mirror's list, if at all — the index, in O(1).
 	fun index_of(self, list: List<T>, key: K): Option<i32> {
-		let wanted = key.hash();
-		mut index = 0;
-		for element in list {
-			if element.key().hash().eq(wanted) {
-				ret Some(index);
-			}
+		match self.positions.read().get(key.hash()) {
+			None => None,
+			Some(let at) => match list.get(at) {
+				Some(let _element) => Some(at),
+				None => None,
+			},
+		}
+	}
+
+	/// Re-record the position of every element from `from` onward — what an
+	/// insertion or a removal owes the index, and nothing more: an op at the
+	/// END of the collection (the append a message platform does) costs one
+	/// entry, not N.
+	fun reindex(self, list: List<T>, from: i32) {
+		mut index = from;
+		let length = list.len();
+		for index < length {
+			// `list[index]` rather than `list.get(index)`: the bound is the
+			// loop's, and `get` hands back a COPY of the element where the
+			// index expression hands back the element.
+			self.positions.write().insert(list[index].key().hash(), index);
 			index += 1;
 		}
-		None
 	}
 
 	/// Apply one patch's ops IN ORDER (`std::wire`'s `Delta` documents each
 	/// arm's semantics). The whole patch lands as one write to the cache, so a
 	/// multi-op change is one notification rather than one per op.
 	fun apply(self, ops: List<Delta<K, T>>) {
-		mut list: List<T> = [];
-		match self.cache.get() {
-			Some(let held) => list = held,
-			None => {},
-		}
-		mut fault: Option<str> = None;
-		for op in ops {
-			match op {
-				Delta::Reset(let items) => list = items,
-				Delta::Insert(let key, let value, let index) => {
-					match self.index_of(list, key) {
-						// A key already held is REPLACED, not duplicated: that
-						// is the re-seed a per-key subscription sends when
-						// demand returns to it.
-						Some(let at) => list[at] = value,
-						None => {
-							mut bounded = index;
-							if bounded < 0 {
-								bounded = 0;
-							}
-							if bounded > list.len() {
-								bounded = list.len();
-							}
-							list.insert(bounded, value);
-						},
-					}
-				},
-				Delta::Update(let key, let value) => {
-					match self.index_of(list, key) {
-						Some(let at) => list[at] = value,
-						None => fault = first_fault(fault, "an Update named a key the mirror does not hold"),
-					}
-				},
-				Delta::Remove(let key) => {
-					match self.index_of(list, key) {
-						Some(let at) => {
-							let _dropped = list.remove(at);
-						},
-						None => fault = first_fault(fault, "a Remove named a key the mirror does not hold"),
-					}
-				},
+		let fault: Shared<Option<str>> = Shared::new(None);
+		// `update` + `take`/`replace`, not `get`/`set` (A54). A `SignalCell`'s
+		// `get` COPIES its value and its `set` copies it back, so this used to
+		// deep-copy the whole mirror twice per patch — O(N) on the RECEIVING
+		// end of a protocol whose whole point is that a change costs the
+		// change, and the half of A54's measurement the server-side cell does
+		// not touch. `update` hands over the storage itself (that is what it
+		// exists for, A18), and `Option::take`/`replace` are how a
+		// `&mut Option<T>` yields a mutable `T` where vilan has no mutable
+		// pattern binding. The whole patch is still ONE write, so a multi-op
+		// change is one notification rather than one per op.
+		self.cache.update(|&mut held| {
+			mut list: List<T> = [];
+			match held.take() {
+				Some(let current) => list = current,
+				None => {},
 			}
-		}
-		self.cache.set(Some(list));
-		match fault {
+			for op in ops {
+				match op {
+					Delta::Reset(let items) => {
+						list = items;
+						self.positions.write() = Map::new();
+						self.reindex(list, 0);
+					},
+					Delta::Insert(let key, let value, let index) => {
+						match self.index_of(list, key) {
+							// A key already held is REPLACED, not duplicated: that
+							// is the re-seed a per-key subscription sends when
+							// demand returns to it. The position does not move.
+							Some(let at) => list[at] = value,
+							None => {
+								mut bounded = index;
+								if bounded < 0 {
+									bounded = 0;
+								}
+								if bounded > list.len() {
+									bounded = list.len();
+								}
+								list.insert(bounded, value);
+								self.reindex(list, bounded);
+							},
+						}
+					},
+					Delta::Update(let key, let value) => {
+						match self.index_of(list, key) {
+							Some(let at) => list[at] = value,
+							None => fault.write() = first_fault(fault.read(), "an Update named a key the mirror does not hold"),
+						}
+					},
+					Delta::Remove(let key) => {
+						match self.index_of(list, key) {
+							Some(let at) => {
+								let _dropped = list.remove(at);
+								self.positions.write().remove(key.hash());
+								// Everything after the hole moved one place left.
+								self.reindex(list, at);
+							},
+							None => fault.write() = first_fault(fault.read(), "a Remove named a key the mirror does not hold"),
+						}
+					},
+				}
+			}
+			let _replaced = held.replace(list);
+		});
+		match fault.read() {
 			None => {},
 			Some(let reason) => match self.fault.get() {
 				None => self.fault.set(Some(reason)),
@@ -3340,6 +3919,7 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// ever name.
 	fun rebind(self, channel: i32) {
 		self.channel.write() = channel;
+		self.positions.write() = Map::new();
 		self.cache.set(None);
 		self.closing.write() = false;
 		if self.count.read() > 0 {
@@ -3724,9 +4304,37 @@ macro fun service(item: Item): Source {
 	// call differs; the wire, the mirror and the contract entry do not, which
 	// is why the two forms hash identically and patch identically.
 	mut exposed_maps: List<bool> = [];
+	// Whether the field is a `KeyedCell<K, T>` (A54), whose exposure forwards
+	// the ops the MUTATION recorded instead of diffing two snapshots. Same
+	// third clause as `exposed_maps`': only the call differs, so a service
+	// that swaps a `SignalCell<List<T>>` field for a `KeyedCell<K, T>` one
+	// does not move its contract hash.
+	mut exposed_cells: List<bool> = [];
 	for field in target.fields {
 		if field.exposed {
-			if field.type_.arguments.len() == 1 {
+			// A `KeyedCell<K, T>` names BOTH types itself, so it is keyed by
+			// its TYPE and needs nothing from the attribute — `[expose]` and
+			// `[expose(keyed)]` over one mean the same channel. A written
+			// `keyed = K` is redundant rather than authoritative here (where
+			// over a `Map<K, V>` it wins): the cell's own `K` is what its
+			// `expose_keyed_cell` and its mirror are typed at, so preferring
+			// a disagreeing written one could only generate code that does
+			// not compile.
+			if field.type_.name == "KeyedCell" && field.type_.arguments.len() == 2 {
+				match field.type_.arguments.get(0) {
+					Some(let key) => match field.type_.arguments.get(1) {
+						Some(let element) => {
+							exposed_names.push(field.name);
+							exposed_elements.push(element.render());
+							exposed_keys.push(key.render());
+							exposed_maps.push(false);
+							exposed_cells.push(true);
+						},
+						None => {},
+					},
+					None => {},
+				}
+			} else if field.type_.arguments.len() == 1 {
 				match field.type_.arguments.get(0) {
 					Some(let element) => {
 						if field.keyed {
@@ -3754,6 +4362,7 @@ macro fun service(item: Item): Source {
 												field.key
 											});
 											exposed_maps.push(true);
+											exposed_cells.push(false);
 										},
 										None => {},
 									},
@@ -3766,6 +4375,7 @@ macro fun service(item: Item): Source {
 										exposed_elements.push(value.render());
 										exposed_keys.push(field.key);
 										exposed_maps.push(false);
+										exposed_cells.push(false);
 									},
 									None => {},
 								}
@@ -3775,6 +4385,7 @@ macro fun service(item: Item): Source {
 							exposed_elements.push(element.render());
 							exposed_keys.push("");
 							exposed_maps.push(false);
+							exposed_cells.push(false);
 						}
 					},
 					None => {},
@@ -3990,14 +4601,27 @@ macro fun service(item: Item): Source {
 				Some(let found) => found,
 				None => true,
 			};
+			let is_cell = match exposed_cells.get(exposure_index) {
+				Some(let found) => found,
+				None => false,
+			};
 			// The key projection is a value parameter (`std::rpc`'s
 			// `expose_keyed_map` documents why); `Keyed` is what makes
 			// `element.key()` resolve on the element type. The `List` form is
 			// the same call one layer down — `expose_keyed` is
 			// `expose_keyed_map` without the `values()` projection — which is
 			// what makes the two forms one channel shape.
-			let exposer = if is_map { "expose_keyed_map" } else { "expose_keyed" };
-			exposures.push(i"session.{exposer}(self.{field_name}, |element: {element}| element.key())");
+			//
+			// A `KeyedCell<K, T>` takes neither: it names `K` in its own type,
+			// so `Keyed` is a real bound on `expose_keyed_cell` and there is
+			// no projection to pass. Same channel, same frames, ops instead of
+			// a diff (A54).
+			if is_cell {
+				exposures.push(i"session.expose_keyed_cell(self.{field_name})");
+			} else {
+				let exposer = if is_map { "expose_keyed_map" } else { "expose_keyed" };
+				exposures.push(i"session.{exposer}(self.{field_name}, |element: {element}| element.key())");
+			}
 		}
 		exposure_index = exposure_index + 1;
 	}
