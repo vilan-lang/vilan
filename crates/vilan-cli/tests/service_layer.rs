@@ -3092,3 +3092,155 @@ fn a_peer_to_peer_struct_carries_both_halves_and_both_directions_work() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The receive loop, driven by a RAW socket so that the coalescing is the
+/// test's and not the kernel's: two masked text frames in ONE `write_all`, so
+/// the server's `data` handler is called once with a chunk holding both.
+///
+/// `hold` waits for a flag that only `release` sets. Awaiting each event's
+/// `respond` before parsing the next of the same chunk held `release` behind
+/// `hold` — a deadlock on a fast local link, which is where frames coalesce.
+/// The wait is bounded in RETRIES, not in wall time (M27): the red run answers
+/// `-1` after 400 attempts, the green one answers the attempt it saw the flag on.
+const RECEIVE_LOOP_GATE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(GateClient)]
+struct Gate {
+	flag: Shared<bool>,
+}
+
+impl Gate {
+	[rpc]
+	fun hold(self): i32 {
+		mut attempts = 0;
+		for attempts < 400 {
+			if self.flag.read() {
+				ret attempts;
+			}
+			sleep(1);
+			attempts += 1;
+		}
+		0 - 1
+	}
+
+	[rpc]
+	fun release(self): i32 {
+		self.flag.write() = true;
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Gate {
+			flag = Shared::new(false),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// One masked client text frame — the shape a browser puts on the wire, built
+/// by hand so two of them can share one `write_all`.
+fn masked_text_frame(text: &str) -> Vec<u8> {
+    let payload = text.as_bytes();
+    assert!(
+        payload.len() < 126,
+        "the pin's frames stay inside the 7-bit length"
+    );
+    let mask = [0x01u8, 0x02, 0x03, 0x04];
+    let mut frame = vec![0x81u8, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % 4]),
+    );
+    frame
+}
+
+#[test]
+fn two_frames_coalesced_into_one_read_are_not_serialized_by_the_receive_loop() {
+    let dir = temp_project("receive_loop");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", RECEIVE_LOOP_GATE);
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set a read timeout");
+    socket
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let mut buffer = [0u8; 4096];
+    let handshake = socket.read(&mut buffer).expect("read the 101");
+    assert!(
+        String::from_utf8_lossy(&buffer[..handshake]).starts_with("HTTP/1.1 101 "),
+        "the handshake must succeed before the lanes are exercised"
+    );
+
+    // ONE write, TWO frames: the server reads them as one chunk, which is what
+    // TCP does on a fast link and what the old loop serialized.
+    let mut both = masked_text_frame(r#"r:1:{"method":"hold","args":[]}"#);
+    both.extend(masked_text_frame(r#"r:2:{"method":"release","args":[]}"#));
+    socket.write_all(&both).expect("send both frames at once");
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        match socket.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                seen.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if seen.contains("r:1:") && seen.contains("r:2:") {
+                    break;
+                }
+            }
+            Err(_timeout) => break,
+        }
+    }
+    drop(server);
+
+    assert!(
+        seen.contains(r#"r:2:{"Success":1}"#),
+        "the second frame of the chunk was never dispatched:\n{seen}"
+    );
+    assert!(
+        seen.contains("r:1:{\"Success\":"),
+        "the first frame of the chunk never answered:\n{seen}"
+    );
+    assert!(
+        !seen.contains(r#"r:1:{"Success":-1}"#),
+        "the first handler exhausted its retry budget waiting for a flag the \
+         SECOND frame of its own chunk sets — the receive loop is awaiting each \
+         handler before parsing the next event (§9.3: the router never blocks on \
+         a handler):\n{seen}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
