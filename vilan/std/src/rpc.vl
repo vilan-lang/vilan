@@ -3570,8 +3570,7 @@ macro fun service(item: Item): Source {
 		// This is what lets a peer-to-peer struct — both attributes, one method
 		// set — be called from either end without a second spelling.
 		if method.return_type.render() == "void" {
-			stub = stub
-				.expr(i"send_notification(self.transport, self.codec, {label}, [{describer_list}])");
+			stub = stub.expr(i"send_notification(self.transport, self.codec, {label}, [{describer_list}])");
 		} else {
 			stub = stub
 				.returns(i"Result<{method.return_type.render()}, RpcError>")
@@ -3688,8 +3687,7 @@ macro fun service(item: Item): Source {
 		.parameter("self")
 		.parameter("handlers: H")
 		.returns(i"{target.client_name}<SocketTransport>")
-		.line("install_client_handlers("
-			+ "self.transport.duplex, handlers.dispatcher_for().into_protocol(self.codec));")
+		.line("install_client_handlers(self.transport.duplex," + " handlers.dispatcher_for().into_protocol(self.codec));")
 		.expr("self");
 	let connect_impl = impl_of(target.client_name)
 		.generics("<SocketTransport>")
@@ -3731,8 +3729,7 @@ macro fun service(item: Item): Source {
 			// SYNC and void, by R4: a notification has no reply to await, so
 			// calling one is not a suspension point and cannot hold the
 			// caller's wire turn open for a round trip.
-			proxy_impl = proxy_impl.method(stub
-				.expr(i"notify(self.connection, {label}, [{describer_list}])"));
+			proxy_impl = proxy_impl.method(stub.expr(i"notify(self.connection, {label}, [{describer_list}])"));
 		}
 		proxy_source = proxy_struct + proxy_ctor + proxy_impl.render();
 	}
@@ -3750,9 +3747,5 @@ macro fun service(item: Item): Source {
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"
 		+ "import std::reactive::{ turn, FlushPolicy };\n";
-	source(imports
-		+ service_impl
-		+ service_trait_impl
-		+ client_source
-		+ proxy_source)
+	source(imports + service_impl + service_trait_impl + client_source + proxy_source)
 }
