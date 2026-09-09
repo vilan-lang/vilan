@@ -573,12 +573,27 @@ Service::factory(|connection: Connection| Store {
 	})
 ```
 
-`Err` answers the socket `401`/`403`/`429` and destroys it: no
-connection id, no reactive session, no service instance — nothing of the
-service is built for a client it refused. `Ok(session)` becomes
-`Connection.session`, which the [factory](#one-instance-per-connected-client)
-reads to build that client's instance. So identity arrives **on the
-handshake**, and the methods lose their token parameter.
+`Err` answers the socket a status and destroys it: no connection id, no
+reactive session, no service instance — nothing of the service is built
+for a client it refused. `Ok(session)` becomes `Connection.session`, which
+the [factory](#one-instance-per-connected-client) reads to build that
+client's instance. So identity arrives **on the handshake**, and the
+methods lose their token parameter.
+
+Four arms, and the line they are drawn on is **who decided**:
+
+| `Reject` | Status | The refusal it makes |
+| --- | --- | --- |
+| `Unauthorized` | `401` | no credential, or one that did not verify |
+| `Forbidden` | `403` | a good credential for someone who may not have this |
+| `TooMany` | `429` | a **limit**, not a judgement — `max_connections`, the handshake rate, `authorize_timeout`, or your own |
+| `Unavailable` | `503` | the app's own "not now": the token may be perfect and the client the only one asking, and the database is down or the node is draining |
+
+`503` is the one arm that reports a judgement **the app made**, which is
+why std never answers it on your behalf: a verifier `authorize_timeout`
+cut off said nothing at all, so reporting its silence as the app's
+judgement would be a claim std cannot make. That refusal is a `429` —
+[below](#cheap-limits-with-or-without-a-gate).
 
 The mechanism is yours. Vilan verifies nothing and knows no token
 format — `authorize` may await, so signing checks (`std::jwt`, WebCrypto)
@@ -645,7 +660,10 @@ often than the rate limiter admits.
 
 `401` and `403` both arrive as `RpcError::Unauthorized`; the client's
 answer to either is the same, and this credential will not open this
-connection.
+connection. `503` arrives as its own arm, `RpcError::Unavailable`,
+because the answer to it is a different one: not "not with this
+credential" but "not now" — retry later, and re-authenticating is beside
+the point.
 
 ### Cheap limits, with or without a gate
 
@@ -675,10 +693,16 @@ hook is awaited **inside** the upgrade handler, so a verifier that hangs
 holds an unanswered socket for as long as it hangs, one per client trying
 to connect. That is a denial of service the server inflicts on itself,
 reached without a single malformed byte from anyone. `handshake_rate`
-caps how fast the pile grows; only this caps how big it gets. The refusal
-is `429`, not `503`: it says nothing about the credential, and it is the
-one refusal a client should retry. A hook that answers late is not raced
-back in — the socket is already gone.
+caps how fast the pile grows; only this caps how big it gets. A hook that
+answers late is not raced back in — the socket is already gone.
+
+Its refusal is `429`, **not** `503`, and the reason is the line the
+[table above](#authorizing-the-connection) draws. `503` is the app's own
+judgement, given from its own `authorize` as `Reject::Unavailable`; a
+verifier that ran out of time gave no judgement at all, and std answering
+`503` on its behalf would report a decision the app never made. A timeout
+is std's limit — which is also the reading the client wants: it says
+nothing about the credential, and it is the one refusal to retry.
 
 **Behind a proxy**, every client shares the proxy's socket address, so a
 per-address `handshake_rate` becomes a global one that refuses everybody
