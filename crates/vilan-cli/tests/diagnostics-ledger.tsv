@@ -436,3 +436,5 @@ row	flagship	key
 406	-	`[service]` cannot take a generic subject: `{subject}` declares `<{parameters}>`
 407	-	{label} names its key twice and the two disagree: `[expose(keyed = {written})]` says `{written}`, and its `Map` element says `{map_key}`. A keyed mirror is a `KeyedSource<K, T>` and the `[service]` expansion reads `K` off the annotation before any type resolves, so it cannot pick between them. Drop the argument — a `Map<K, V>` names both types and takes the bare `[expose(keyed)]` — or write the map with `{written}` as its key
 408	-	`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` method's `mut self` copy is discarded after the call
+409	-	return type of `[rpc]` method `{method_name}` is `{rendered}`, but a `[client_service]` method is a
+410	-	`[service(.., client = {handler_name})]` names `{handler_name}` as the struct this

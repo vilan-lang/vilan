@@ -2633,3 +2633,754 @@ fun main() {}
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- §9.3 / R1 / R4: client-declared functions, the `s:` lane ----------------
+
+/// The reverse-direction server: `[client_service] struct Handlers` in the
+/// browser half, `[service(.., client = Handlers)]` on the server half, and the
+/// notification that crosses between them. `Quiet` is the "old server" control
+/// — the same OWN surface, no handler surface — mounted beside it so the
+/// compatibility refusal can be taken against a live peer rather than asserted
+/// about one.
+const REVERSE_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::RpcError;
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun session_revoked(self, reason: str) {
+		// TWO writes to ONE signal: the handler runs inside its own turn, so
+		// they settle as ONE wave and `pending` is never published.
+		self.seen.set("pending");
+		self.seen.set(reason);
+	}
+}
+
+[service(StoreClient, client = Handlers)]
+struct Store {
+	client: HandlersProxy,
+}
+
+impl Store {
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		self.client.session_revoked(reason);
+		1
+	}
+}
+
+[service(QuietClient)]
+struct Quiet {
+	label: str,
+}
+
+impl Quiet {
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| {
+			let store = Store { client = connection.client() };
+			print(i"server-hash:{store.contract_hash()}");
+			store
+		}, json_codec()))
+		.with_service(Service::factory(|connection: Connection| Quiet {
+			label = "quiet",
+		}, json_codec()).at("/quiet/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let handlers = Handlers { seen = Signal::new("") };
+			let client = raw.with_handlers(handlers);
+			print(i"client-hash:{client.contract_hash()}");
+			mut waves = 0;
+			let watch = handlers.seen.sub(|value| {
+				waves += 1;
+				print(i"wave:{waves}:{value}");
+			});
+			match client.kick("revoked") {
+				Ok(let count) => print(i"kick:{count}"),
+				Err(let _e) => print("kick-error"),
+			}
+			mut attempts = 0;
+			for attempts < 200 {
+				if handlers.seen.get() == "revoked" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"seen:{handlers.seen.get()}");
+			print(i"waves:{waves}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	// The compatibility hazard, taken live: a client generated against the
+	// handler-declaring surface dialling a server that declares none.
+	match StoreClient::connect(i"ws://localhost:{port}/quiet/", json_codec()) {
+		Ok(let _wrong) => print("mismatch:accepted"),
+		Err(let error) => {
+			match error {
+				RpcError::Contract(let _reason) => print("mismatch:contract"),
+				_ => print("mismatch:other"),
+			}
+		},
+	}
+	exit(0);
+}
+"#;
+
+/// §9.3 (R1, R4): a server calls a function the CLIENT declared.
+///
+/// `[client_service] struct Handlers` generates the same dispatcher the server
+/// half gets (the generator is direction-agnostic) plus `HandlersProxy`;
+/// `[service(.., client = Handlers)]` gives the service a typed proxy through
+/// `connection.client()`; `self.client.session_revoked(reason)` puts one
+/// `s:0:<payload>` frame on the socket; and the client's router runs the handler
+/// under `turn(FlushPolicy::AtEnd, ..)` — which is what the wave count pins,
+/// since the handler writes the same signal twice and only the last value is
+/// ever published.
+#[test]
+fn a_server_calls_a_client_declared_function_and_the_handler_runs_under_a_turn() {
+    let dir = temp_project("reverse_roundtrip");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", REVERSE_SERVER);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("seen:revoked"),
+        "the notification never reached the browser handler:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("kick:1"),
+        "the forward call that triggered the notification did not answer:\n{stdout}"
+    );
+    // One wave for the subscription's own seed, one for the handler — and none
+    // carrying the intermediate value. Two writes inside one turn are one wave.
+    assert!(
+        stdout.contains("waves:2"),
+        "the handler's two writes did not settle as one wave — the `s:` lane's \
+         dispatch must run inside `turn(FlushPolicy::AtEnd, ..)`:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(":pending"),
+        "the handler's intermediate write was published, so it did not run \
+         inside a turn:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §9.3's compatibility answer: the two ends agree about BOTH directions or
+/// they do not connect. A client generated against a service that declares
+/// `client = Handlers` dials a server that declares no handler surface at all —
+/// the shape of an old server meeting a new client — and is refused with
+/// `RpcError::Contract` at `__contract`, which is BEFORE `with_handlers` exists
+/// to be called and therefore before any `s:` frame could be dispatched. The
+/// silent-drop path (`route_socket_frame` ignores unknown prefixes) is the
+/// fallback for a peer this check cannot reach, not the mechanism.
+#[test]
+fn a_contract_that_disagrees_about_the_reverse_direction_refuses_the_connection() {
+    let dir = temp_project("reverse_mismatch");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", REVERSE_SERVER);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("mismatch:contract"),
+        "a server declaring no client surface must refuse a client that declares \
+         one:\n{stdout}"
+    );
+    // Both ends of the LIVE connection computed the same string — the client
+    // stub's baked hash and the server instance's are one value, which is what
+    // makes the check above a check about the surface and not about the build.
+    let hash_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("`{label}` is missing from the run:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        hash_of("server-hash:"),
+        hash_of("client-hash:"),
+        "the two sides of one connection must compute the same contract \
+         surface:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The hash program: a plain service, its `client = Handlers` twin with the SAME
+/// own surface, and the handler struct's own hash. No server — this is about the
+/// string, not the wire.
+const CLIENT_SURFACE_HASHES: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun session_revoked(self, reason: str) {
+		self.seen.set(reason);
+	}
+}
+
+[service(LedgerClient)]
+struct Ledger {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Ledger {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+
+// The same surface with `client = Handlers` as its ONLY difference. The proxy
+// field is not `[expose]`d, so it contributes nothing of its own.
+[service(TalkingLedgerClient, client = Handlers)]
+struct TalkingLedger {
+	who: str,
+	client: HandlersProxy,
+	[expose] count: SignalCell<i32>,
+}
+
+impl TalkingLedger {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+
+fun main() {
+	let plain = Ledger { who = "a", count = Signal::new(0) };
+	let talking = TalkingLedger {
+		who = "a",
+		client = HandlersProxy::for_connection(0),
+		count = Signal::new(0),
+	};
+	let handlers = Handlers { seen = Signal::new("") };
+	print(i"plain-hash:{plain.contract_hash()}");
+	print(i"talking-hash:{talking.contract_hash()}");
+	print(i"handlers-hash:{handlers.contract_hash()}");
+}
+"#;
+
+/// §9.4's contract-hash rule, both halves.
+///
+/// `Ledger`'s surface is `add(i32)->i32;whoami()->str;expose:count:i32;` — the
+/// surface `Notes` has in `a_factory_service_builds_one_instance_per_connection`,
+/// whose hash `d1d5fba0` was recorded before this order existed. It must still
+/// be that value: a service that declares no `client = …` hashes BYTE-IDENTICALLY
+/// to what it hashed before the `client:` entries were a thing, which is the
+/// whole reason they are a suffix rather than a field of the envelope.
+///
+/// The twin, whose only difference is `client = Handlers`, must NOT — the two
+/// sides have to agree about both directions, and a hash that ignored the
+/// reverse surface would let them disagree silently.
+#[test]
+fn the_client_surface_moves_the_contract_hash_and_only_for_a_service_that_declares_one() {
+    let dir = temp_project("reverse_hashes");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", CLIENT_SURFACE_HASHES);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("plain-hash:d1d5fba0"),
+        "a service that declares no client surface must hash exactly as it did \
+         before §9.3 — `d1d5fba0` is the value recorded for this surface at \
+         c3ed9239:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("talking-hash:c6c3956e"),
+        "the `client = Handlers` twin's hash moved unexpectedly:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("talking-hash:d1d5fba0"),
+        "declaring a client surface must MOVE the hash — the two ends agree \
+         about both directions or they do not connect:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("handlers-hash:c5156948"),
+        "the handler struct's own contract hash moved:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build that must FAIL: returns the combined output of `vilan build`, having
+/// asserted the build did not succeed.
+fn vilan_build_refusal(dir: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "the build should have failed:\n{text}"
+    );
+    text
+}
+
+/// R4, refused rather than silently truncated: v1 has no reverse reply lane, so
+/// a `[client_service]` method that declares a return type describes a value
+/// that could never come back.
+#[test]
+fn a_client_service_method_that_declares_a_return_type_is_refused() {
+    let dir = temp_project("reverse_returns");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[client_service]
+struct Handlers {
+	who: str,
+}
+
+impl Handlers {
+	[rpc]
+	fun ask(self, question: str): i32 {
+		1
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("notifications only in v1"),
+        "a `[client_service]` method's return type must be refused in the \
+         attribute's own vocabulary:\n{text}"
+    );
+    // The same struct with the return type dropped compiles — the refusal is
+    // about the return, not about the attribute.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[client_service]
+struct Handlers {
+	who: str,
+}
+
+impl Handlers {
+	[rpc]
+	fun ask(self, question: str) {
+		print(question);
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a void `[client_service]` method must compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R1: `client = X` names the struct whose `[rpc]` methods this server may call,
+/// and the reverse surface is read off X's same-module impls AT EXPANSION. An X
+/// the expansion cannot see would fold an EMPTY reverse surface into the hash —
+/// two peers agreeing about nothing — so it is refused at the attribute.
+#[test]
+fn a_client_handler_the_module_does_not_declare_is_refused() {
+    let dir = temp_project("reverse_no_handler");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+struct Handlers {
+	who: str,
+}
+
+[service(StoreClient, client = Handlers)]
+struct Store {
+	who: str,
+}
+
+impl Store {
+	[rpc]
+	fun kick(self): i32 {
+		1
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("no `[client_service] struct Handlers` is declared in this module"),
+        "`client = X` where X carries no `[client_service]` must be refused at \
+         the attribute:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Peer-to-peer (§9.3's "both attributes on one struct is peer-to-peer, and
+/// needs no new spelling"): ONE struct, ONE dispatcher, both halves generated.
+/// `bounce` travels client→server through the generated stub; the server's
+/// handler calls `tell` back through its proxy; the browser instance's own
+/// dispatcher answers it. Both directions, one method set.
+const PEER_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[service(PeerClient, client = Peer)]
+[client_service]
+struct Peer {
+	label: str,
+	client: PeerProxy,
+	heard: SignalCell<str>,
+}
+
+impl Peer {
+	[rpc]
+	fun tell(self, what: str) {
+		self.heard.set(i"{self.label}:{what}");
+	}
+
+	[rpc]
+	fun bounce(self, what: str) {
+		self.client.tell(i"bounced-{what}");
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Peer {
+			label = "server",
+			client = connection.client(),
+			heard = Signal::new(""),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match PeerClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let browser = Peer {
+				label = "browser",
+				client = PeerProxy::for_connection(0 - 1),
+				heard = Signal::new(""),
+			};
+			let client = raw.with_handlers(browser);
+			print(i"peer-hash:{client.contract_hash()}");
+			client.bounce("ping");
+			mut attempts = 0;
+			for attempts < 200 {
+				if browser.heard.get() != "" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"heard:{browser.heard.get()}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a_peer_to_peer_struct_carries_both_halves_and_both_directions_work() {
+    let dir = temp_project("reverse_peer");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", PEER_SERVER);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("heard:browser:bounced-ping"),
+        "the round trip through both halves of one peer struct did not \
+         complete:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The receive loop, driven by a RAW socket so that the coalescing is the
+/// test's and not the kernel's: two masked text frames in ONE `write_all`, so
+/// the server's `data` handler is called once with a chunk holding both.
+///
+/// `hold` waits for a flag that only `release` sets. Awaiting each event's
+/// `respond` before parsing the next of the same chunk held `release` behind
+/// `hold` — a deadlock on a fast local link, which is where frames coalesce.
+/// The wait is bounded in RETRIES, not in wall time (M27): the red run answers
+/// `-1` after 400 attempts, the green one answers the attempt it saw the flag on.
+const RECEIVE_LOOP_GATE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(GateClient)]
+struct Gate {
+	flag: Shared<bool>,
+}
+
+impl Gate {
+	[rpc]
+	fun hold(self): i32 {
+		mut attempts = 0;
+		for attempts < 400 {
+			if self.flag.read() {
+				ret attempts;
+			}
+			sleep(1);
+			attempts += 1;
+		}
+		0 - 1
+	}
+
+	[rpc]
+	fun release(self): i32 {
+		self.flag.write() = true;
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Gate {
+			flag = Shared::new(false),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// One masked client text frame — the shape a browser puts on the wire, built
+/// by hand so two of them can share one `write_all`.
+fn masked_text_frame(text: &str) -> Vec<u8> {
+    let payload = text.as_bytes();
+    assert!(
+        payload.len() < 126,
+        "the pin's frames stay inside the 7-bit length"
+    );
+    let mask = [0x01u8, 0x02, 0x03, 0x04];
+    let mut frame = vec![0x81u8, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % 4]),
+    );
+    frame
+}
+
+#[test]
+fn two_frames_coalesced_into_one_read_are_not_serialized_by_the_receive_loop() {
+    let dir = temp_project("receive_loop");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", RECEIVE_LOOP_GATE);
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set a read timeout");
+    socket
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let mut buffer = [0u8; 4096];
+    let handshake = socket.read(&mut buffer).expect("read the 101");
+    assert!(
+        String::from_utf8_lossy(&buffer[..handshake]).starts_with("HTTP/1.1 101 "),
+        "the handshake must succeed before the lanes are exercised"
+    );
+
+    // ONE write, TWO frames: the server reads them as one chunk, which is what
+    // TCP does on a fast link and what the old loop serialized.
+    let mut both = masked_text_frame(r#"r:1:{"method":"hold","args":[]}"#);
+    both.extend(masked_text_frame(r#"r:2:{"method":"release","args":[]}"#));
+    socket.write_all(&both).expect("send both frames at once");
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        match socket.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                seen.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if seen.contains("r:1:") && seen.contains("r:2:") {
+                    break;
+                }
+            }
+            Err(_timeout) => break,
+        }
+    }
+    drop(server);
+
+    assert!(
+        seen.contains(r#"r:2:{"Success":1}"#),
+        "the second frame of the chunk was never dispatched:\n{seen}"
+    );
+    assert!(
+        seen.contains("r:1:{\"Success\":"),
+        "the first frame of the chunk never answered:\n{seen}"
+    );
+    assert!(
+        !seen.contains(r#"r:1:{"Success":-1}"#),
+        "the first handler exhausted its retry budget waiting for a flag the \
+         SECOND frame of its own chunk sets — the receive loop is awaiting each \
+         handler before parsing the next event (§9.3: the router never blocks on \
+         a handler):\n{seen}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reverse lane's BYTE twin (`0x73`), which is a different arm of a
+/// different router from `s:` and had no pin of its own.
+///
+/// One codec deployment-wide (§6.2, Q6), so the same program under
+/// `binary_codec()` exercises `tag_client_bytes` on the way out and
+/// `route_socket_bytes`' `0x73` arm on the way in. Everything else — the turn,
+/// the wave count, the contract refusal — is the text pin's, and must hold
+/// identically: the lane is a framing choice, not a semantics one.
+#[test]
+fn the_reverse_lane_carries_a_notification_over_the_binary_codec_too() {
+    let dir = temp_project("reverse_binary");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &REVERSE_SERVER
+            .replace(
+                "import std::json::json_codec;",
+                "import std::binary::binary_codec;",
+            )
+            .replace("json_codec()", "binary_codec()"),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("seen:revoked"),
+        "the `0x73` lane did not deliver the notification:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("waves:2") && !stdout.contains(":pending"),
+        "the byte lane's dispatch must run inside a turn, exactly as the text \
+         lane's does:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mismatch:contract"),
+        "the contract check does not depend on the codec:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2764,7 +2764,15 @@ type WireTypeCheck<'src> = (&'src str, Id, Vec<(String, &'src Node<'src>, TypeId
 /// later because it runs after `build()` (B112) — plus each parameter and the
 /// return as `(label, declared type node, span)`, `None` for a parameter that
 /// declares no type (see `check_rpc_signatures`).
-type RpcSignatureCheck<'src> = (&'src str, Id, Vec<(String, Option<&'src Node<'src>>, Span)>);
+/// One `[rpc]` method awaiting the Wire-signature check: the method name, the
+/// name of the impl subject it was declared on (`""` outside an impl), its id,
+/// and one entry per checked member.
+type RpcSignatureCheck<'src> = (
+    &'src str,
+    &'src str,
+    Id,
+    Vec<(String, Option<&'src Node<'src>>, Span)>,
+);
 
 /// An `[expose]`d struct field awaiting its `Signal`-of-Wire check: a label
 /// naming the struct + field, its declared type node (`None` if missing), the
@@ -2928,6 +2936,15 @@ pub struct Analyzer<'src> {
     /// `[rpc]` methods awaiting the Wire-signature check (`check_rpc_signatures`),
     /// collected as each is walked, validated once `wire_names` is complete.
     rpc_signatures_to_check: Vec<RpcSignatureCheck<'src>>,
+    /// Structs carrying `[client_service]` (`transport-rpc.md` §9.3, R1) — the
+    /// reverse direction's handler structs. Their `[rpc]` methods are
+    /// NOTIFICATIONS (R4): a declared return type is refused, and the absence of
+    /// one is legal, which it is nowhere else. Collected across every module,
+    /// read by `check_rpc_signatures` once all are walked.
+    client_service_subjects: HashSet<&'src str>,
+    /// The name of the `impl` subject currently being walked, so an `[rpc]`
+    /// method records which struct declared it.
+    current_impl_subject_name: Option<&'src str>,
     /// `[expose]`d fields awaiting the `Signal`-of-Wire check
     /// (`check_expose_fields`), collected at the struct walk.
     expose_fields_to_check: Vec<ExposeFieldCheck<'src>>,
@@ -4556,6 +4573,8 @@ impl<'src> Analyzer<'src> {
             drop_owned_types_by_root: HashMap::default(),
             drop_call_edges: HashMap::default(),
             rpc_signatures_to_check: Vec::new(),
+            client_service_subjects: HashSet::default(),
+            current_impl_subject_name: None,
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
@@ -14774,8 +14793,12 @@ impl<'src> Analyzer<'src> {
             // declared Wire return (fire-and-forget needs its own design).
             None => members.push(("return type".to_string(), None, function.name.1)),
         }
-        self.rpc_signatures_to_check
-            .push((function.name.0, function_id, members));
+        self.rpc_signatures_to_check.push((
+            function.name.0,
+            self.current_impl_subject_name.unwrap_or_default(),
+            function_id,
+            members,
+        ));
     }
 
     /// Enforce the `[rpc]` Wire-signature rule (`proposal/transport-rpc.md`
@@ -14784,8 +14807,38 @@ impl<'src> Analyzer<'src> {
     /// crosses the wire. Runs after all modules are walked.
     fn check_rpc_signatures(&mut self) {
         let checks = std::mem::take(&mut self.rpc_signatures_to_check);
-        for (method_name, method_id, members) in checks {
+        for (method_name, subject_name, method_id, members) in checks {
+            // §9.3/R4: on a `[client_service]` struct every `[rpc]` method is a
+            // NOTIFICATION, so the two return-type rules invert — a declared
+            // return is refused, and its absence is the only legal spelling.
+            // Parameters are checked exactly as they are anywhere else: they
+            // still cross the wire.
+            let notifies = self.client_service_subjects.contains(subject_name);
             for (label, type_node, span) in members {
+                if notifies && label == "return type" {
+                    if let Some(type_node) = type_node {
+                        let rendered = render_type(type_node);
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "return type of `[rpc]` method `{method_name}` is \
+                                     `{rendered}`, but a `[client_service]` method is a \
+                                     NOTIFICATION: notifications only in v1 — a \
+                                     server→client call has no reply lane to settle on and \
+                                     no pending table to correlate with, so the value could \
+                                     never come back. Drop the return type; if the client \
+                                     must answer, have the handler call back on the \
+                                     connection it already holds"
+                                ),
+                            },
+                            method_id,
+                        );
+                    }
+                    continue;
+                }
                 match type_node {
                     Some(type_node) if self.is_wire_type(type_node) => {}
                     Some(type_node) => {
@@ -25434,7 +25487,12 @@ impl<'src> Analyzer<'src> {
             // `[service(..)]` is transparent to analysis: walk the wrapped
             // struct; the generated dispatcher/client are appended separately
             // (`service_impl_source`).
-            Node::Service(_client_name, inner) => {
+            Node::Service(attribute, inner) => {
+                if let Node::Struct(name, ..) = &inner.0
+                    && attribute.client_side
+                {
+                    self.client_service_subjects.insert(name.0);
+                }
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
                 None
@@ -26676,10 +26734,20 @@ impl<'src> Analyzer<'src> {
                     self.impl_subject_args
                         .insert(body_scope_id, (subject_type_id, argument_type_ids));
                 }
+                // Which struct an `[rpc]` method was declared on, for the
+                // notification rule (§9.3): the check runs after every module is
+                // walked, so the name is banked here rather than looked up.
+                let outer_impl_subject = self.current_impl_subject_name;
+                self.current_impl_subject_name = match &subject.0 {
+                    Node::Accessor(name) => Some(*name),
+                    Node::AccessorWithGenerics(name, _) => Some(*name),
+                    _ => None,
+                };
                 let subject = subject_type_id;
                 let was_walking_member_body = self.walking_member_body;
                 self.walking_member_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
+                self.current_impl_subject_name = outer_impl_subject;
                 self.walking_member_body = was_walking_member_body;
                 let declared_members = self.collect_declared_members(body_scope_id);
                 let declarations: IndexMap<&'src str, Id> =
@@ -46645,6 +46713,35 @@ pub(crate) fn service_mut_self_refusals(
         }
     }
     refusals
+}
+
+/// `[service(.., client = H)]` where `H` is not a `[client_service]` sibling —
+/// refused AT THE ATTRIBUTE (`transport-rpc.md` §9.3, R1), above the expansion,
+/// like `service_generic_refusal` and for the same reason: what follows would be
+/// an empty reverse surface silently folded into the contract hash, and two
+/// peers agreeing on nothing.
+pub(crate) fn client_handler_refusal(handler_name: &str, nodes: &NodeList<'_>) -> Option<String> {
+    let declared = nodes.iter().any(|(node, _)| {
+        let Node::Service(attribute, item) = node else {
+            return false;
+        };
+        let Node::Struct(name, ..) = &item.0 else {
+            return false;
+        };
+        attribute.client_side && name.0 == handler_name
+    });
+    if declared {
+        return None;
+    }
+    Some(format!(
+        "`[service(.., client = {handler_name})]` names `{handler_name}` as the struct this \
+         server may call, but no `[client_service] struct {handler_name}` is declared in this \
+         module. The reverse surface is read off that struct's `[rpc]` methods AT EXPANSION and \
+         folded into this service's contract hash, so a handler the expansion cannot see would \
+         hash as no handler at all and both peers would agree on nothing. Write `[client_service] \
+         struct {handler_name} {{ .. }}` beside this service — the handler is a same-module \
+         sibling because same-module impls are the reflection the compiler does"
+    ))
 }
 
 pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {

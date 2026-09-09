@@ -447,6 +447,25 @@ fun tag_rpc_bytes(request: i32, payload: Bytes): Bytes {
 	Bytes::concat(header, payload)
 }
 
+/// The REVERSE lane's tag frame (`transport-rpc.md` §9.3): `0x73` (`'s'`) + a
+/// 4-byte LE request id, then the payload — the byte twin of `s:<id>:<payload>`.
+///
+/// The id is 0 in v1 and nothing reads it: a NOTIFICATION correlates with
+/// nothing (R4), and there is no reverse reply lane for it to settle. It is on
+/// the wire anyway because the alternative — a bare `0x73` + payload — is a
+/// DIFFERENT frame shape, and adding correlation later would then have to move
+/// every byte of every existing recording. Four zero bytes now is the price of
+/// v2 being a change to the handler and not to the format.
+fun tag_client_bytes(request: i32, payload: Bytes): Bytes {
+	let header = Bytes::alloc(5);
+	header.set(0, 0x73);
+	header.set(1, request);
+	header.set(2, request >> 8);
+	header.set(3, request >> 16);
+	header.set(4, request >> 24);
+	Bytes::concat(header, payload)
+}
+
 /// The true duplex transport (§5): one WebSocket carrying BOTH protocols and
 /// BOTH frame kinds — text messages use the `d:<frame>`/`r:<id>:<frame>`
 /// prefixes, binary messages the tag bytes above. The server side is the
@@ -482,6 +501,17 @@ struct SocketDuplex {
 	// closure TYPE lives only at parameter/`let` seams, J2 v1); the runner
 	// re-marks each entry at a `let` so the calls await.
 	on_reconnect: Shared<List<|| void>>,
+	// The handler dispatcher this client answers the SERVER's `s:` requests
+	// with (§9.3), installed by the generated `with_handlers` after `connect`
+	// has verified the contract. `None` until then — and on a client that
+	// declares no handlers at all, which is every client shipped before R1.
+	handlers: Shared<Option<RpcProtocol>>,
+	// `s:` frames that arrived before a handler was installed — the `early`
+	// queue's twin for the reverse lane. `connect` verifies the contract and
+	// attaches BEFORE the app can call `with_handlers`, so a server that
+	// notifies at `on_connect` would otherwise be talking into a window the
+	// client cannot close.
+	early_serve: Shared<List<Frame>>,
 	// Run when the duplex reaches the terminal `Closed` — `on_reconnect`'s
 	// mirror for the connection that never comes back (backlog A31). The
 	// duplex is BUILT BEFORE the client that will hold its mirrors, which is
@@ -545,6 +575,42 @@ fun settle_pending(pending: Shared<List<PendingCall>>, request: i32, reply: Fram
 		}
 	}
 	pending.write() = kept;
+}
+
+/// Run one server→client request (§9.3's `s:` lane) on this client's handler
+/// dispatcher — or hold it until one is installed.
+///
+/// The handler runs inside its OWN turn (`FlushPolicy::AtEnd`), exactly like a
+/// server-side `[rpc]` handler: the signal writes one notification makes settle
+/// as one wave. The turn is STARTED, not awaited — "the router never blocks on
+/// a handler" is §9.3's first sentence, and v1 has no reverse reply lane for the
+/// outcome to travel on anyway (R4: notifications only), so the frame `respond`
+/// encodes is deliberately dropped.
+fun serve_client_request(
+	handlers: Shared<Option<RpcProtocol>>,
+	early: Shared<List<Frame>>,
+	payload: Frame,
+) {
+	match handlers.read() {
+		Some(let protocol) => {
+			let _running = async {
+				let _outcome = turn(FlushPolicy::AtEnd, || protocol.respond(payload));
+			};
+		},
+		None => early.write().push(payload),
+	}
+}
+
+/// Mount the handler dispatcher a `[client_service]` generated on this duplex,
+/// and drain what arrived before it existed. The generated
+/// `Client::with_handlers` is the spelling; this is what it calls.
+fun install_client_handlers(duplex: SocketDuplex, protocol: RpcProtocol) {
+	duplex.handlers.write() = Some(protocol);
+	let held = duplex.early_serve.read();
+	duplex.early_serve.write() = [];
+	for payload in held {
+		serve_client_request(duplex.handlers, duplex.early_serve, payload);
+	}
 }
 
 /// Route one duplex frame to the handler, or the early queue before one is set.
@@ -628,10 +694,32 @@ impl SocketTransport {
 }
 
 /// Route one inbound TEXT socket message by its channel prefix. `r:<id>:<frame>`
-/// settles the pending call; `d:<frame>` goes to the duplex handler (or the
-/// early queue); anything else is ignored (forward compatibility).
-fun route_socket_frame(frame: str, pending_settle: |i32, Frame| void, dispatch: |Frame| void) {
-	if frame.starts_with("r:") {
+/// settles the pending call; `s:<id>:<frame>` is a request the SERVER minted and
+/// goes to this client's own handler dispatcher (§9.3); `d:<frame>` goes to the
+/// duplex handler (or the early queue); anything else is ignored (forward
+/// compatibility).
+///
+/// The two request lanes are told apart by PREFIX rather than by a direction
+/// bit, because `fresh_id()` runs on both ends: `r:7:` minted by the client and
+/// `r:7:` minted by the server would be one id in two namespaces. `r:` is always
+/// the client's namespace, `s:` always the server's, and each side reads its
+/// role off the prefix.
+fun route_socket_frame(
+	frame: str,
+	pending_settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+	serve: |Frame| void,
+) {
+	if frame.starts_with("s:") {
+		let rest = frame.substring(2, frame.len());
+		let parts = rest.split(":");
+		let id_text = parts[0];
+		// Same well-formedness rule as `r:` — `s:<id>` with no second `:`
+		// carries no request at all and is ignored.
+		if id_text.len() < rest.len() {
+			serve(Frame::Text(rest.substring(id_text.len() + 1, rest.len())));
+		}
+	} else if frame.starts_with("r:") {
 		let rest = frame.substring(2, frame.len());
 		let parts = rest.split(":");
 		let id_text = parts[0];
@@ -652,12 +740,19 @@ fun route_socket_frame(frame: str, pending_settle: |i32, Frame| void, dispatch: 
 
 /// Route one inbound BINARY socket message by its tag byte — the byte mirror of
 /// `route_socket_frame`. An unknown tag is ignored (forward compatibility).
-fun route_socket_bytes(message: Bytes, pending_settle: |i32, Frame| void, dispatch: |Frame| void) {
+fun route_socket_bytes(
+	message: Bytes,
+	pending_settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+	serve: |Frame| void,
+) {
 	if message.len() == 0 {
 		ret;
 	}
 	let tag = message.get(0);
-	if tag == 0x72 && message.len() >= 5 {
+	if tag == 0x73 && message.len() >= 5 {
+		serve(Frame::Binary(message.slice(5, message.len())));
+	} else if tag == 0x72 && message.len() >= 5 {
 		let request = message.get(1)
 			| message.get(2) << 8
 			| message.get(3) << 16
@@ -721,6 +816,7 @@ fun dial(
 	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
+	serve: |Frame| void,
 ): Result<(WebSocket, i32), DialFailure> {
 	let socket = new_web_socket(url, protocols);
 	socket.set_binary_type("arraybuffer");
@@ -731,7 +827,7 @@ fun dial(
 		socket.set_on_error(|| finish(false));
 		socket.set_on_message(|message| {
 			if host_kind(message.data_value()) == "[object ArrayBuffer]" {
-				route_socket_bytes(bytes_of_buffer(message.data_buffer()), settle, dispatch);
+				route_socket_bytes(bytes_of_buffer(message.data_buffer()), settle, dispatch, serve);
 				ret;
 			}
 			let frame = message.data();
@@ -745,7 +841,7 @@ fun dial(
 				socket.close();
 				finish(false);
 			} else {
-				route_socket_frame(frame, settle, dispatch);
+				route_socket_frame(frame, settle, dispatch, serve);
 			}
 		});
 	});
@@ -773,6 +869,7 @@ fun dial_with_backoff(
 	protocols: List<str>,
 	settle: |i32, Frame| void,
 	dispatch: |Frame| void,
+	serve: |Frame| void,
 ): Result<(WebSocket, i32), DialFailure> {
 	mut outcome: Result<(WebSocket, i32), DialFailure> = Err(DialFailure::Unreachable(i"could not reach {url}"));
 	mut attempt = 0;
@@ -782,7 +879,7 @@ fun dial_with_backoff(
 			sleep_for(Duration::millis(delay));
 			delay = if delay * 2i53 > 4000i53 { 4000i53 } else { delay * 2i53 };
 		}
-		outcome = dial(url, protocols, settle, dispatch);
+		outcome = dial(url, protocols, settle, dispatch, serve);
 		if outcome is Ok(let _opened) {
 			jump break;
 		}
@@ -855,9 +952,12 @@ fun handle_drop(duplex: SocketDuplex) {
 		let pending = duplex.pending;
 		let inbound = duplex.inbound;
 		let early = duplex.early;
+		let handlers = duplex.handlers;
+		let early_serve = duplex.early_serve;
 		let settle = |request: i32, reply: Frame| settle_pending(pending, request, reply);
 		let dispatch = |payload: Frame| deliver_inbound(inbound, early, payload);
-		match dial_with_backoff(duplex.url, duplex.protocols, settle, dispatch) {
+		let serve = |payload: Frame| serve_client_request(handlers, early_serve, payload);
+		match dial_with_backoff(duplex.url, duplex.protocols, settle, dispatch, serve) {
 			Ok(let opened) => {
 				let (socket, connection) = opened;
 				duplex.socket.write() = socket;
@@ -917,9 +1017,12 @@ fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailur
 	let inbound: Shared<Option<|Frame| void>> = Shared::new(None);
 	let early: Shared<List<Frame>> = Shared::new([]);
 	let pending: Shared<List<PendingCall>> = Shared::new([]);
+	let handlers: Shared<Option<RpcProtocol>> = Shared::new(None);
+	let early_serve: Shared<List<Frame>> = Shared::new([]);
 	let settle = |request: i32, reply: Frame| settle_pending(pending, request, reply);
 	let dispatch = |payload: Frame| deliver_inbound(inbound, early, payload);
-	match dial_with_backoff(url, protocols, settle, dispatch) {
+	let serve = |payload: Frame| serve_client_request(handlers, early_serve, payload);
+	match dial_with_backoff(url, protocols, settle, dispatch, serve) {
 		Err(let reason) => Err(reason),
 		Ok(let opened) => {
 			let (socket, connection) = opened;
@@ -933,6 +1036,8 @@ fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailur
 				early,
 				pending,
 				next_request = Shared::new(0),
+				handlers,
+				early_serve,
 				on_reconnect = Shared::new([]),
 				on_terminal = Shared::new([]),
 			};
@@ -1154,6 +1259,39 @@ fun reply<T: Wire>(value: T): RpcOutcome {
 	RpcOutcome::Success(|serializer: Serializer| value.describe(serializer))
 }
 
+/// A NOTIFICATION route's outcome (`transport-rpc.md` §9.3, R4): run the
+/// handler, then answer with the ack envelope its `void` return has no payload
+/// for.
+///
+/// The protocol always replies (`RpcProtocol::respond`), so a notification needs
+/// SOMETHING to encode; `true` is the smallest honest thing — "it ran". Nothing
+/// reads it on the `s:` lane, which has no reverse reply lane at all; the
+/// forward lane's `send_notification` drops it too, and it exists so that a
+/// method's route shape does not depend on which direction called it.
+fun notified(run: async || void): RpcOutcome {
+	run();
+	RpcOutcome::Success(|serializer: Serializer| true.describe(serializer))
+}
+
+/// A forward-direction NOTIFICATION: the request `call` would send, started and
+/// never awaited — the client-side twin of `notify`.
+///
+/// The reply still arrives and still settles the transport's pending entry, so
+/// dropping the VALUE is not dropping the correlation and nothing leaks. What
+/// the caller gives up is the ability to see a failure, which is exactly what
+/// fire-and-forget means, and why a method with something to say declares a
+/// return type.
+fun send_notification<Tx: Transport>(
+	transport: Tx,
+	codec: Codec,
+	method: str,
+	args: List<|Serializer| void>,
+) {
+	let _sent = async {
+		let _outcome: Result<bool, RpcError> = call(transport, codec, method, args);
+	};
+}
+
 /// One route: a method name and the handler that consumes the request handle
 /// and produces an outcome.
 struct Route {
@@ -1316,6 +1454,80 @@ fun session_of(connection: i32): Option<ReactiveServer> {
 		}
 	}
 	None
+}
+
+// --- Server side: the reverse lane (§9.3) -----------------------------------
+
+/// One connection's reverse channel: how a server-side proxy puts a frame on
+/// the `s:` lane, and the codec that frame is encoded with.
+///
+/// The codec rides here rather than on `Connection` because it is the SERVICE's
+/// choice, not the connection's — `Service::factory(build, codec)` names it once
+/// for every client the service accepts, and a `Connection` that carried one
+/// would be a second place for the two to disagree.
+struct ClientChannel {
+	send: |Frame| void,
+	codec: Codec,
+}
+
+/// Per-connection reverse channels, keyed by connection id — the `s:` lane's
+/// twin of `reactive_sessions`. Registered by the socket layer at accept, so a
+/// service that replaces `on_connect` still has one.
+let client_channels: Shared<List<(i32, ClientChannel)>> = Shared::new([]);
+
+fun register_client_channel(connection: i32, codec: Codec, send: |Frame| void) {
+	client_channels.write().push((connection, ClientChannel { send, codec }));
+}
+
+/// The connection closed: forget its reverse channel, so a proxy the app kept
+/// hold of writes into nothing rather than into a dead socket.
+fun drop_client_channel(connection: i32) {
+	mut kept: List<(i32, ClientChannel)> = [];
+	for entry in client_channels.read() {
+		let (id, channel) = entry;
+		if id != connection {
+			kept.push((id, channel));
+		}
+	}
+	client_channels.write() = kept;
+}
+
+fun client_channel_of(connection: i32): Option<ClientChannel> {
+	for entry in client_channels.read() {
+		let (id, channel) = entry;
+		if id == connection {
+			ret Some(channel);
+		}
+	}
+	None
+}
+
+/// Send one server→client NOTIFICATION (§9.3, R4): the request envelope `call`
+/// would build, put on the `s:` lane and never awaited.
+///
+/// There is no pending table and no correlation id, because there is nothing to
+/// correlate: a notification has no reply, cannot fail visibly, and cannot
+/// deadlock a handler's turn. A connection that has already closed silently
+/// drops it — the same treatment a `d:` frame gets while disconnected, and the
+/// only honest one for a message whose whole contract is "if you are there,
+/// here is a fact".
+fun notify(connection: i32, method: str, args: List<|Serializer| void>) {
+	match client_channel_of(connection) {
+		Some(let channel) => (channel.send)(encode_request(channel.codec, method, args)),
+		None => {},
+	}
+}
+
+/// What a `[client_service]`'s generated `<Name>Proxy` implements, and the seam
+/// `Connection::client()` is generic over (§9.3).
+///
+/// The proxy is a connection id and nothing else: a value the factory closure
+/// stores in a field, cheap to copy, and dead the moment its connection is.
+/// `Connection::client()` resolves `Self` from the field's declared type, which
+/// is what makes `client = connection.client()` type without an annotation
+/// while std learns no generated name.
+trait ClientProxy {
+	fun for_connection(connection: i32): Self;
 }
 
 /// Channel ids — module-level, one counter for the program (mirrors reactive's
@@ -3017,6 +3229,17 @@ macro fun nibble_char(digit: u32): str {
 	"f"
 }
 
+/// A route's outcome expression: `reply(<call>)`, or `notified(|| <call>)` when
+/// the method returns `void` (§9.3, R4 — a notification has no reply payload,
+/// and a `void` call is not an argument).
+macro fun route_outcome(returns_void: bool, called: str): str {
+	if returns_void {
+		i"notified(|| {called})"
+	} else {
+		i"reply({called})"
+	}
+}
+
 /// `.on("name", |request| { ..statements.. })` — a dispatcher route whose
 /// handler decodes arguments from `request` in a block closure.
 macro fun route_block(name: str, statements: List<str>): str {
@@ -3044,7 +3267,15 @@ macro fun service(item: Item): Source {
 
 	let target = match item.as_service() {
 		Some(let found) => found,
-		None => ServiceItem { name = "?", client_name = "?", fields = [], methods = [] },
+		None => ServiceItem {
+			name = "?",
+			client_name = "?",
+			fields = [],
+			methods = [],
+			client_side = false,
+			handler_name = "",
+			handler_methods = [],
+		},
 	};
 	// The [expose]d fields: each source's SOLE type argument is its element —
 	// `SignalCell<Note>`, `StorageSignal<str>`. Whether the field is exposable is
@@ -3171,6 +3402,32 @@ macro fun service(item: Item): Source {
 		}
 		expose_index = expose_index + 1;
 	}
+	// `client = H` (§9.3, R1): the handler surface this server may CALL,
+	// appended to its own so the one hash covers both directions. A service
+	// that declares no handler appends nothing and hashes byte-identically to
+	// what it hashed before R1 — which is the whole reason this is a suffix and
+	// not a new field in the envelope.
+	//
+	// The rendering is deliberately its own loop rather than a share of the
+	// method loop above: a handler method's return type is `void` by refusal
+	// (notifications only, R4), so this entry can never drift with the mapped
+	// return types the method loop grows.
+	for handler_method in target.handler_methods {
+		surface = surface + "client:" + handler_method.name + "(";
+		mut handler_first = true;
+		for parameter in handler_method.parameters {
+			if parameter.name == "self" {
+				jump continue;
+			}
+			if handler_first {
+				handler_first = false;
+			} else {
+				surface = surface + ",";
+			}
+			surface = surface + parameter.type_.render();
+		}
+		surface = surface + ")->" + handler_method.return_type.render() + ";";
+	}
 	let hash = service_hash(surface);
 
 	// --- The dispatcher: one route per [rpc] method, every handler capturing
@@ -3206,17 +3463,23 @@ macro fun service(item: Item): Source {
 			arguments.push(parameter.name);
 			arity = arity + 1;
 		}
+		// A `void` [rpc] method is a NOTIFICATION (§9.3, R4) and has no reply
+		// payload to encode, so its route runs the handler and answers with the
+		// ack envelope instead. `reply` cannot serve it — `void` is not Wire,
+		// and making it so would put a payload-less value in every reply
+		// envelope in the system to serve the one shape with nothing to say.
+		let returns_void = method.return_type.render() == "void";
 		// Every method route goes through `route_block`, so every handler runs
 		// inside the wire turn — a no-arg method's signal writes coalesce
 		// exactly like an arg-taking one's (a bare `.on(...)` fast path here
 		// once skipped the turn, leaking one update per write).
 		if arity == 0 {
-			statements.push(i"reply(self.{method.name}())");
+			statements.push(route_outcome(returns_void, i"self.{method.name}()"));
 		} else {
 			let argument_list = join(arguments, ", ");
 			statements.push(match_of("decode_failed(request)")
 				.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
-				.arm("Option::None", i"reply(self.{method.name}({argument_list}))")
+				.arm("Option::None", route_outcome(returns_void, i"self.{method.name}({argument_list})"))
 				.render());
 		}
 		routes.push(route_block(method.name, statements));
@@ -3267,7 +3530,13 @@ macro fun service(item: Item): Source {
 		.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
 		.arm("Option::None", attach_reply)
 		.render());
-	routes.push(route_block("__attach", attach_statements));
+	// `__attach` mints this connection's exposed channels, so it belongs to the
+	// SERVER half only: a struct carrying `[client_service]` alone has no
+	// reactive session to mint them from, and nothing on the server end ever
+	// calls it.
+	if target.client_name != "" {
+		routes.push(route_block("__attach", attach_statements));
+	}
 	mut chain = "Dispatcher::new()";
 	for route in routes {
 		chain = chain + "\n" + indent(route, 1);
@@ -3327,9 +3596,18 @@ macro fun service(item: Item): Source {
 		}
 		let label = quote(method.name);
 		let describer_list = join(describers, ", ");
-		stub = stub
-			.returns(i"Result<{method.return_type.render()}, RpcError>")
-			.expr(i"call(self.transport, self.codec, {label}, [{describer_list}])");
+		// A `void` [rpc] method is a NOTIFICATION in both directions (R4): the
+		// forward stub starts the request and drops the reply, so it is sync and
+		// void exactly like the reverse proxy's method for the same declaration.
+		// This is what lets a peer-to-peer struct — both attributes, one method
+		// set — be called from either end without a second spelling.
+		if method.return_type.render() == "void" {
+			stub = stub.expr(i"send_notification(self.transport, self.codec, {label}, [{describer_list}])");
+		} else {
+			stub = stub
+				.returns(i"Result<{method.return_type.render()}, RpcError>")
+				.expr(i"call(self.transport, self.codec, {label}, [{describer_list}])");
+		}
 		client_impl = client_impl.method(stub);
 	}
 	let verify = fun_of("verify")
@@ -3428,21 +3706,78 @@ macro fun service(item: Item): Source {
 	for line in body {
 		connect_with = connect_with.line(line);
 	}
+	// The handler seam (§9.3, item 4): mount the `[client_service]` instance
+	// this connection's server may call back into. It is a step AFTER `connect`
+	// rather than a fourth argument to it because `connect` VERIFIES THE
+	// CONTRACT first — a hash mismatch refuses the connection, and a refused
+	// connection has no client for handlers to hang off, which is exactly the
+	// compatibility guarantee §9.3 asked for: no `s:` frame is ever dispatched
+	// by a client that disagreed about the surface. Frames that land in the
+	// window between the two are held by the duplex and drained here.
+	let with_handlers = fun_of("with_handlers")
+		.generics("<H: RpcService>")
+		.parameter("self")
+		.parameter("handlers: H")
+		.returns(i"{target.client_name}<SocketTransport>")
+		.line("install_client_handlers(self.transport.duplex," + " handlers.dispatcher_for().into_protocol(self.codec));")
+		.expr("self");
 	let connect_impl = impl_of(target.client_name)
 		.generics("<SocketTransport>")
 		.method(connect.expr(client_value))
 		.method(connect_with.expr(client_value))
+		.method(with_handlers)
 		.render();
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, call, arg, reply, decode_failed, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n"
+	// --- The client-service half (§9.3, R1): `<Name>Proxy`, the typed value a
+	// --- server-side factory stores in a field and calls its notifications on.
+	mut proxy_source = "";
+	if target.client_side {
+		let proxy_name = target.name + "Proxy";
+		let proxy_struct = struct_of(proxy_name).field("connection: i32").render();
+		// The proxy is a connection id and nothing else. `ClientProxy` is what
+		// lets `Connection::client()` mint one without std knowing this name:
+		// the FIELD's declared type resolves `Self`, so
+		// `client = connection.client()` types with no annotation.
+		let proxy_ctor = impl_of(proxy_name)
+			.implements("ClientProxy")
+			.method(fun_of("for_connection")
+				.parameter("connection: i32")
+				.returns(proxy_name)
+				.expr(proxy_name + " { connection }"))
+			.render();
+		mut proxy_impl = impl_of(proxy_name);
+		for method in target.methods {
+			mut stub = fun_of(method.name).parameter("self");
+			mut describers: List<str> = [];
+			for parameter in method.parameters {
+				if parameter.name == "self" {
+					jump continue;
+				}
+				stub = stub.parameter(i"{parameter.name}: {parameter.type_.render()}");
+				describers.push(i"|serializer: Serializer| {parameter.name}.describe(serializer)");
+			}
+			let label = quote(method.name);
+			let describer_list = join(describers, ", ");
+			// SYNC and void, by R4: a notification has no reply to await, so
+			// calling one is not a suspension point and cannot hold the
+			// caller's wire turn open for a round trip.
+			proxy_impl = proxy_impl.method(stub.expr(i"notify(self.connection, {label}, [{describer_list}])"));
+		}
+		proxy_source = proxy_struct + proxy_ctor + proxy_impl.render();
+	}
+	// A struct carrying only `[client_service]` names no transport client, so
+	// the server half above described one nobody asked for; it is built either
+	// way (the builders are strings) and emitted only here.
+	let client_source = if target.client_name != "" {
+		client_struct.render() + client_impl.render() + connect_impl
+	} else {
+		""
+	};
+
+	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, ClientProxy, call, send_notification, arg, reply, notified, decode_failed, notify, install_client_handlers, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"
 		+ "import std::reactive::{ turn, FlushPolicy };\n";
-	source(imports
-		+ service_impl
-		+ service_trait_impl
-		+ client_struct.render()
-		+ client_impl.render()
-		+ connect_impl)
+	source(imports + service_impl + service_trait_impl + client_source + proxy_source)
 }

@@ -307,7 +307,7 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Export(inner) => Node::Export(desugar_boxed(inner, source)),
         Node::Const(inner) => Node::Const(desugar_boxed(inner, source)),
         Node::Derive(names, inner) => Node::Derive(names, desugar_boxed(inner, source)),
-        Node::Service(name, inner) => Node::Service(name, desugar_boxed(inner, source)),
+        Node::Service(attribute, inner) => Node::Service(attribute, desugar_boxed(inner, source)),
         Node::MacroAttribute(name, name_span, arguments, inner) => {
             Node::MacroAttribute(name, name_span, arguments, desugar_boxed(inner, source))
         }
