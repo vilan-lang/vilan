@@ -270,7 +270,10 @@ optionally, each element (`T: (2..)`, `T: (..: Display)`); see §5.9.
 ```text
 derived-item   = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]"
                  ( struct | enum ) ;
-service-item   = "[" "service" [ "(" IDENT ")" ] "]" struct ;
+service-item   = { service-attr | client-service-attr }- struct ;
+service-attr   = "[" "service" [ "(" service-args ")" ] "]" ;
+service-args   = IDENT [ "," "client" "=" IDENT ] | "client" "=" IDENT ;
+client-service-attr = "[" "client_service" "]" ;
 macro-attributed-item = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]"
                         ( struct | enum | function ) ;
 macro-fun        = "macro" function ;
@@ -280,9 +283,13 @@ macro-block      = "macro" block ;
 
 A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
-attribute names (`derive`, `service`, `extern`, `must_use`, `rpc`,
-`trait_only`, `doc`, `expose`, `platform`, `deprecated`) are not
-available as user macro-attribute names.
+attribute names (`derive`, `service`, `client_service`, `extern`,
+`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated`) are not available as user macro-attribute names.
+
+`[service(..)]` and `[client_service]` may be written in either order
+on one struct; a struct carrying both is peer-to-peer and expands
+once (`proposal/transport-rpc.md` §9.3).
 
 ## 3.4 Bindings and assignment
 

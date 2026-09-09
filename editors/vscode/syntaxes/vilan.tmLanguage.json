@@ -205,7 +205,7 @@
     {
      "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
      "name": "meta.attribute.vilan",
-     "begin": "(\\[)(?=\\s*(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
+     "begin": "(\\[)(?=\\s*(derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
      "beginCaptures": {
       "1": {
        "name": "punctuation.definition.attribute.begin.vilan"
@@ -223,7 +223,7 @@
      "patterns": [
       {
        "name": "keyword.other.attribute.vilan",
-       "match": "\\b(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b"
+       "match": "\\b(derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b"
       },
       {
        "comment": "The form words and the `retains` flag inside `[extern(..)]`.",
