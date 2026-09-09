@@ -3848,6 +3848,15 @@ pub struct Analyzer<'src> {
     // says "'List<Workspace>' does not implement trait 'Wire'" and the refusal
     // says "its element `List<Workspace>` is not Wire" — one fact, one report.
     expose_refused_elements: HashSet<String>,
+    // A56's grain of the same idea. The disagreeing-key refusal is NOT about
+    // the element — `Task` is Wire, is `Keyed<str>`, and is exposable — it is
+    // about the one trait APPLICATION the written argument produced: the
+    // client's mirror is minted as a `KeyedSource<i32, Task>` and every one of
+    // those calls fails `T: Keyed<K>` with `K` the key nothing implements.
+    // Keyed on the trait LABEL rather than the element for exactly that reason:
+    // silencing every generated bound failure about `Task` would silence
+    // sentences this refusal never said, and `Keyed<i32>` is the one it did.
+    expose_refused_key_bounds: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -4730,6 +4739,7 @@ impl<'src> Analyzer<'src> {
             expose_refused_field_slots: HashSet::default(),
             entry_cycle_refused_imports: Vec::new(),
             expose_refused_elements: HashSet::default(),
+            expose_refused_key_bounds: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             field_annotation_type_ids: HashMap::default(),
@@ -5330,6 +5340,20 @@ impl<'src> Analyzer<'src> {
                     else {
                         continue;
                     };
+                    // A56's stand-down: generated code failing exactly the
+                    // `Keyed<K>` application a refused `[expose(keyed = K)]`
+                    // argument named. The mirror the expansion writes is a
+                    // `KeyedSource<K, T>` built from that argument, so every one
+                    // of those calls restates the disagreement already reported
+                    // at the attribute — four times over, at spans the author
+                    // never wrote. Generated only, and only for the one trait
+                    // application the refusal named.
+                    if !self.expose_refused_key_bounds.is_empty()
+                        && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                        && self.expose_refused_key_bounds.contains(&trait_label)
+                    {
+                        continue;
+                    }
                     let type_label = self.pretty_print_type(&value_type, &HashMap::default());
                     // A generic argument fails by MISSING the bound on its own
                     // declaration — name that fix; a concrete one by missing
@@ -14939,8 +14963,9 @@ impl<'src> Analyzer<'src> {
                 }
                 // The key was named, and the collection has to be one the
                 // exposure can read: `expose_keyed` takes a `Source<List<T>>`.
-                // A `Map<K, V>` with an argument beside it is fine — the
-                // argument simply wins as the written key type.
+                // A `Map<K, V>` with an argument beside it is fine as long as
+                // the two agree on what a key is — the arm below is where they
+                // do not.
                 Some(_)
                     if exposure.is_keyed()
                         && !exposure.key_type().is_empty()
@@ -14959,6 +14984,68 @@ impl<'src> Analyzer<'src> {
                              are the two the keyed exposure can read, and the `[service]` \
                              expansion picks between them off the annotation before any type \
                              resolves. Write the field as `SignalCell<List<T>>`"
+                            ),
+                        },
+                        declaration_id,
+                    );
+                }
+                // A56 / ruling R6: the `Map<K, V>` element names a key, the
+                // attribute argument names one too, and they DISAGREE.
+                //
+                // The argument used to simply win (`std/src/rpc.vl`, the keyed
+                // arm of the exposed-field loop: "A written argument wins: it
+                // is what the author said the key is"), which made the mistake
+                // silent here and loud later — the expansion built the mirror
+                // and the server-side exposure around the written `K`, and the
+                // author read `'Task' does not implement trait 'Keyed<i32>'`
+                // four times over, at a call the `[service]` attribute wrote.
+                // Neither spelling is knowably the intended one, so neither can
+                // be preferred; what CAN be said, here and once, is that the
+                // field names its key twice and the two do not agree. Same
+                // standard as the arms above (B202) and the same reason: this
+                // is the layer that holds both spellings before any type
+                // resolves.
+                //
+                // The comparison is on the two SPELLINGS with whitespace
+                // removed, because that is all either layer has: the macro
+                // engine takes the argument as source text and the expansion
+                // reads the element off the annotation. An alias and its target
+                // are two spellings and read as a disagreement, which is the
+                // rule R6 states — the mirror needs one written `K`, so the two
+                // places that write it have to write the same thing.
+                Some(_)
+                    if exposure.is_keyed()
+                        && !exposure.key_type().is_empty()
+                        && sole_argument_map_key(type_node).is_some_and(|written| {
+                            without_spaces(&written) != without_spaces(exposure.key_type())
+                        }) =>
+                {
+                    let written = exposure.key_type();
+                    let map_key = sole_argument_map_key(type_node).unwrap_or_default();
+                    // Covers the generated subscription the same way the arms
+                    // above do: the calls the expansion writes around this
+                    // field fail the `Keyed<K>` bound precisely because of the
+                    // disagreement this sentence is about.
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.expose_refused_key_bounds
+                        .insert(format!("Keyed<{written}>"));
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            // The argument is the half under discussion, and
+                            // the field's type is not wrong — so the span is
+                            // the argument's, not the annotation's.
+                            span: exposure.key_span().unwrap_or(span),
+                            msg: format!(
+                                "{label} names its key twice and the two disagree: \
+                             `[expose(keyed = {written})]` says `{written}`, and its \
+                             `Map` element says `{map_key}`. A keyed mirror is a \
+                             `KeyedSource<K, T>` and the `[service]` expansion reads `K` \
+                             off the annotation before any type resolves, so it cannot \
+                             pick between them. Drop the argument — a `Map<K, V>` names \
+                             both types and takes the bare `[expose(keyed)]` — or write \
+                             the map with `{written}` as its key"
                             ),
                         },
                         declaration_id,
@@ -46057,6 +46144,39 @@ fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
         Node::AccessorWithGenerics(head, key_and_value)
             if *head == "Map" && key_and_value.0.len() == 2
     )
+}
+
+/// The KEY a `[expose]`d field's `Map<K, V>` element names, as written (tracker
+/// A56). [`sole_argument_is_map`]'s reader: the shape check answers whether the
+/// element is a `Map` at all, this answers what it says the key is, so the
+/// refusal of a disagreeing `[expose(keyed = K)]` argument can quote both
+/// spellings. `None` for every other written shape.
+fn sole_argument_map_key(type_node: Option<&Node<'_>>) -> Option<String> {
+    let Some(Node::AccessorWithGenerics(_, arguments)) = type_node else {
+        return None;
+    };
+    let [element] = arguments.0.as_slice() else {
+        return None;
+    };
+    let Node::AccessorWithGenerics(head, key_and_value) = &element.0 else {
+        return None;
+    };
+    if *head != "Map" {
+        return None;
+    }
+    let [key, _value] = key_and_value.0.as_slice() else {
+        return None;
+    };
+    Some(render_type(&key.0))
+}
+
+/// A type spelling with its whitespace removed — how two written types are
+/// compared when neither has resolved (tracker A56). `Pair<i32, str>` reaches
+/// the attribute as the author's own source slice and the annotation through
+/// [`render_type`]'s `", "` join, and the difference between those is not a
+/// disagreement about the key.
+fn without_spaces(spelling: &str) -> String {
+    spelling.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// A stable fingerprint of a service's surface (Q6 v2): method names, parameter

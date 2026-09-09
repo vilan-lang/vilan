@@ -1207,7 +1207,13 @@ pub enum Exposure<'src> {
     /// key comes from the attribute (`Some("str")`). It is source text rather
     /// than a node because it is handed to the macro engine as a string and to
     /// the formatter as one; nothing here resolves it.
-    Keyed(Option<&'src str>),
+    ///
+    /// Its SPAN rides with it (tracker A56) because the one refusal that is
+    /// about the argument itself — an argument that disagrees with the key a
+    /// `Map<K, V>` element already names — has to point at the argument, not
+    /// at the field's type: the type is not the half that is wrong, and there
+    /// are two ways out, only one of which touches it.
+    Keyed(Option<Spanned<&'src str>>),
 }
 
 impl<'src> Exposure<'src> {
@@ -1228,8 +1234,18 @@ impl<'src> Exposure<'src> {
     /// service both already read for "no key here".
     pub fn key_type(self) -> &'src str {
         match self {
-            Self::Keyed(Some(written)) => written,
+            Self::Keyed(Some((written, _))) => written,
             _ => "",
+        }
+    }
+
+    /// Where the key type was written, when one was — the span a refusal
+    /// ABOUT the argument anchors on (tracker A56). `None` for every other
+    /// exposure, which has no argument to point at.
+    pub fn key_span(self) -> Option<Span> {
+        match self {
+            Self::Keyed(Some((_, span))) => Some(span),
+            _ => None,
         }
     }
 }

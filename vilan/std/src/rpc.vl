@@ -3087,8 +3087,18 @@ macro fun service(item: Item): Source {
 										Some(let value) => {
 											exposed_names.push(field.name);
 											exposed_elements.push(value.render());
-											// A written argument wins: it is
-											// what the author said the key is.
+											// A written argument wins, and it
+											// can only ever agree: an argument
+											// that disagrees with the map's own
+											// key is refused at the attribute,
+											// in the field's vocabulary, before
+											// this ever runs (A56/R6,
+											// `check_expose_fields`). It used
+											// to silently win over a `Map` that
+											// said otherwise, and the author
+											// read the disagreement as a
+											// `Keyed<K>` bound failure at the
+											// mirror this loop generates.
 											exposed_keys.push(if field.key == "" {
 												key.render()
 											} else {

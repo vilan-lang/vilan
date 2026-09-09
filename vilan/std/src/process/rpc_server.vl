@@ -646,6 +646,15 @@ impl Service {
 	/// app said nothing at all, and reporting it as the app's judgement would
 	/// be a claim std cannot make.
 	///
+	/// A48 chose 429 before `Unavailable` existed, when "a limit, not a
+	/// judgement" was the whole argument and there was no other arm to weigh
+	/// it against. A52 built the arm, and the question was re-asked of it
+	/// (A56): the eligibility rule A52 landed is `tells_the_client` = did the
+	/// APP decide, and by that rule the timeout is not the app's to report.
+	/// So the answer is unchanged and no longer merely chosen — the
+	/// distinction A52 drew is what keeps 429 correct here. **RULED: keep 429**
+	/// (owner, R6, `transport-rpc.md` §9.2, 2026-09-09).
+	///
 	/// A hook that answers LATE is not raced back in: the socket is already
 	/// destroyed and the timeout is one-way, so a straggling verifier's reply
 	/// is discarded rather than written to a socket that is gone.
