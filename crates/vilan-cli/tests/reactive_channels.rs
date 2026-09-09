@@ -1169,3 +1169,175 @@ fn the_generated_keyed_list_exposure_is_the_hand_wired_one_frame_for_frame() {
         "both mirrors must hold the same collection:\n{stdout}"
     );
 }
+
+// --- A55: a keyed mirror IS a `Source<Option<List<T>>>` ---------------------
+
+/// A52 gave `RemoteSource` its `Source` impl and left the keyed twin bare, so a
+/// `KeyedSource<K, T>` could be observed only through its own inherent members:
+/// A49's `on_change` was not on it, `effect` was not on it, and no generic
+/// `S: Source<…>` function could take one — which is what a keyed handle in a
+/// return position needs. A55 closes that seam on the SHIPPED counted lease
+/// (`acquire`/`release`), and no second mechanism: the proof that it is the
+/// same lease is BYTES on the wire, exactly as the per-key pin above measures
+/// them.
+///
+/// Four claims: (1) two generic functions bounded on
+/// `Source<Option<List<Row>>>` take the mirror at all — the call that did not
+/// compile before A55; (2) the trait's own primitive `on_change` opens the
+/// channel and its dispose closes it, measured by the bytes a later change
+/// costs; (3) `effect_on_change`, a trait DEFAULT nothing on `KeyedSource`
+/// declares, works through it; (4) R5's seam — `or([])` is still what a list
+/// binding says, because the trait argument is the `Option` and a mirror told
+/// nothing is not an empty collection.
+const KEYED_MIRROR_IS_A_SOURCE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, Source, Subscription, batch, owner_scope, Owner };
+import std::rpc::{ DuplexEnd, KeyedSource, ReactiveClient, ReactiveServer, duplex_pair };
+import std::shared::Shared;
+import std::wire::{ Frame, Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	value: i32,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+fun frame_bytes(frame: Frame): i32 {
+	match frame {
+		Frame::Text(let value) => value.len(),
+		Frame::Binary(let bytes) => bytes.len(),
+	}
+}
+
+fun metered_link(down: Shared<i32>): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| server_relay.send(frame));
+	server_relay.on_frame(|frame| {
+		down.write() = down.read() + frame_bytes(frame);
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+/// Generic over the READ trait — the call that did not compile before A55.
+fun held_by<S: Source<Option<List<Row>>>>(source: S): i32 {
+	match source.get() {
+		Some(let list) => list.len(),
+		None => -1,
+	}
+}
+
+/// The lazy attach, generically: `on_change` is the trait's primitive, so a
+/// generic consumer reaches the mirror's counted one.
+fun watch<S: Source<Option<List<Row>>>>(source: S, seen: SignalCell<i32>): Subscription {
+	source.on_change(|value| match value {
+		Some(let list) => seen.set(list.len()),
+		None => seen.set(-1),
+	})
+}
+
+fun main() {
+	let down: Shared<i32> = Shared::new(0);
+	let (client_end, server_end) = metered_link(down);
+	let session = ReactiveServer::new(server_end, json_codec());
+	let client = ReactiveClient::new(client_end, json_codec());
+	let store: SignalCell<List<Row>> = Signal::new([Row { id = "a", value = 1 }]);
+	let channel = session.expose_keyed(store, |row: Row| row.key());
+	let mirror: KeyedSource<str, Row> = client.keyed_source(channel);
+
+	// Passive: the trait's `get` opens nothing, exactly like the inherent one.
+	print(i"unopened:{held_by(mirror)}");
+
+	let seen: SignalCell<i32> = Signal::new(-2);
+	let held = watch(mirror, seen);
+	// The lease is the shipped one, so the seeding `Patch` came back INSIDE
+	// the acquire — which is why `on_change` attaches before it takes it.
+	print(i"watched:{held_by(mirror)}:{seen.get()}");
+
+	store.update(|&mut list| { list.push(Row { id = "b", value = 2 }); });
+	print(i"changed:{held_by(mirror)}:{seen.get()}");
+
+	// Releasing the trait's subscription releases the same count: after the
+	// settle the forward is gone, and a change costs NOTHING on the wire.
+	held.dispose();
+	batch(|| {});
+	down.write() = 0;
+	store.update(|&mut list| { list.push(Row { id = "c", value = 3 }); });
+	print(i"after-release-bytes:{down.read()}");
+
+	// `effect_on_change` is a trait DEFAULT nothing on `KeyedSource` declares:
+	// it reaches the mirror only because the impl exists, and it dies with the
+	// owner rather than with the tab.
+	let scope = Owner::new();
+	owner_scope.run(scope, || {
+		mirror.effect_on_change(|value| match value {
+			Some(let list) => print(i"effect:{list.len()}"),
+			None => print("effect:none"),
+		});
+		// R5: the seam into a list binding is still `or([])` — the trait
+		// argument is the Option, which is the truth about a mirror that has
+		// been told nothing.
+		let rendered = mirror.or([]);
+		print(i"or-len:{rendered.get().len()}");
+	});
+	store.update(|&mut list| { list.push(Row { id = "d", value = 4 }); });
+	scope.dispose();
+	batch(|| {});
+	down.write() = 0;
+	store.update(|&mut list| { list.push(Row { id = "e", value = 5 }); });
+	print(i"after-owner-dispose-bytes:{down.read()}");
+	print("done");
+}
+"#;
+
+#[test]
+fn a_keyed_mirror_is_a_source_over_the_shipped_counted_lease() {
+    let stdout = run_program("keyedsource", KEYED_MIRROR_IS_A_SOURCE);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert!(
+        lines.contains(&"done"),
+        "the program did not finish:\n{stdout}"
+    );
+    // Passive before anything asks: no value, and no forward to pay for.
+    assert!(
+        lines.contains(&"unopened:-1"),
+        "the trait's `get` must open nothing:\n{stdout}"
+    );
+    // The trait's own primitive took the lease, and the seed came back inside
+    // it — so the generic observer already saw the collection.
+    assert!(
+        lines.contains(&"watched:1:1"),
+        "`on_change` through the trait must take the shipped lease and seed:\n{stdout}"
+    );
+    assert!(
+        lines.contains(&"changed:2:2"),
+        "a change must reach a generic `Source` observer:\n{stdout}"
+    );
+    // The same lease, released: nothing on the wire for the next change.
+    assert!(
+        lines.contains(&"after-release-bytes:0"),
+        "disposing the trait's subscription must release the SHIPPED count \
+         (a later change would otherwise still be forwarded):\n{stdout}"
+    );
+    // A trait default nothing on `KeyedSource` declares, reaching the mirror.
+    assert!(
+        lines.contains(&"effect:4") || lines.contains(&"effect:3"),
+        "`effect_on_change` (a `Source` default) must reach a keyed mirror:\n{stdout}"
+    );
+    // R5: `or([])` is what an unseeded list binding says, and it is a lease.
+    assert!(
+        lines.iter().any(|line| line.starts_with("or-len:")),
+        "`or([])` must still be the list-binding seam:\n{stdout}"
+    );
+    assert!(
+        lines.contains(&"after-owner-dispose-bytes:0"),
+        "the owner's dispose must release every lease the extent took:\n{stdout}"
+    );
+}

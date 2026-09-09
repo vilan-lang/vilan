@@ -2437,13 +2437,92 @@ struct KeyedSource<K, T> {
 	leases: Shared<List<KeyLease>>,
 }
 
-impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
+/// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
+/// exactly what it holds: `None` until the first patch lands, the collection
+/// after. A52 gave `RemoteSource` the impl and left the keyed twin bare, so a
+/// keyed channel could be observed only through its own inherent members: A49's
+/// `on_change` was not on it, `effect` was not on it, and no generic
+/// `S: Source<…>` function could take one, which is what a return-typed keyed
+/// handle needs. Every observing path still goes through the SHIPPED counted
+/// lease (`acquire`/`release`); the impl adds no second mechanism, it names the
+/// one there is.
+///
+/// The trait argument is `Option<List<T>>` and not `List<T>` for
+/// `RemoteSource`'s reason: `get` cannot invent a collection before the first
+/// patch, and a keyed mirror that has been told nothing is not an empty one.
+/// So a `KeyedSource<K, T>` does NOT satisfy `bind_each`'s `Source<List<T>>`
+/// and the seam into a list binding stays `or([])` — ruling R5, and the same
+/// sentence `RemoteSource`'s impl carries: `or([])` is the binding SAYING what
+/// an unseeded list renders as. What the impl buys is everything that reads a
+/// source without flattening it.
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
 	/// The mirror's current contents: `None` until the first patch lands.
 	/// Passive — no lease, no frame.
 	fun get(self): Option<List<T>> {
 		self.cache.get()
 	}
 
+	/// The trait's subscription primitive, counted like every other observing
+	/// path: attach WITHOUT the immediate call, and hold the channel open
+	/// until the subscription is disposed.
+	///
+	/// ORDER is forced here exactly as it is on `RemoteSource`: attach FIRST,
+	/// then take the lease. Taking the lease is what sends `Subscribe`, and
+	/// over an in-process transport the server's seeding `Patch` comes back
+	/// INSIDE that call — so acquiring first would drop the seed on a
+	/// `duplex_pair` and deliver it over a socket. Attached first, the seed is
+	/// a change from the `None` the mirror held when the observer was
+	/// registered, on every transport.
+	[must_use]
+	fun on_change(self, observer: |Option<List<T>>| void): Subscription {
+		let subscription = self.cache.on_change(observer);
+		subscription.release.write() = Some(|| self.release());
+		self.acquire();
+		subscription
+	}
+
+	/// The trait's `sub` default, OVERRIDDEN — the default is `on_change` plus
+	/// one call with `get()`, and on a mirror `on_change` itself delivers the
+	/// seeding patch, so the default would make the immediate call TWICE.
+	/// `lease` is the honest eager form.
+	///
+	/// It shares its name with the inherent `sub` below, which takes `|List<T>|`
+	/// and outranks it on a concrete receiver. The two are told apart by the
+	/// observer's own parameter type: `mirror.sub` reaches the inherent one —
+	/// the shape every caller was written against, and the one a view wants —
+	/// while a generic `S: Source<Option<List<T>>>` reaches this one.
+	[must_use]
+	fun sub(self, observer: |Option<List<T>>| void): Subscription {
+		self.lease(observer)
+	}
+
+	/// `effect` for the same reason as `sub`, and by the same body plus the
+	/// ambient owner.
+	fun effect(self, observer: |Option<List<T>>| void) {
+		get_owner().take(self.lease(observer));
+	}
+
+	/// Observe through `transform`, as a plain `SignalCell<U>` — the seam into
+	/// the ordinary reactive world. Counted and owner-released exactly like
+	/// `RemoteSource::map`, and with the same static requirement: an enclosing
+	/// `owner_scope.run`.
+	///
+	/// An OVERRIDE of the trait's `map` rather than an inherent member, for
+	/// B258's reason (`RemoteSource::map` carries it at length): an inherent
+	/// override would promote `status`'s own `self.cache.map(…)` — a call on a
+	/// `SignalCell` field, which inherits the owner-OPTIONAL default — to this
+	/// strict body's flavor, and `register_with_owner` would run with an
+	/// undefined owner.
+	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
+		get_owner().take(self.lease(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+}
+
+impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>` —
 	/// `RemoteSource::status`'s sentence, unchanged: it reports, it does not
 	/// ask.
@@ -2480,18 +2559,6 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		let subscription = self.cache.sub(observer);
 		subscription.release.write() = Some(|| self.release());
 		subscription
-	}
-
-	/// Observe through `transform`, as a plain `SignalCell<U>` — the seam into
-	/// the ordinary reactive world. Counted and owner-released exactly like
-	/// `RemoteSource::map`, and with the same static requirement: an enclosing
-	/// `owner_scope.run`.
-	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
-		let derived = SignalCell::new(transform(self.get()));
-		get_owner().take(self.lease(|value| {
-			derived.set(transform(value));
-		}));
-		derived
 	}
 
 	/// `map` for the same-type case: `initial` until the first patch.
