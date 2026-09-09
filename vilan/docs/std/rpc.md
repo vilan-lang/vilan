@@ -155,7 +155,8 @@ enum RpcError {
 	Decode(str),      // reply didn't parse
 	Remote(str),      // the handler failed
 	Contract(str),    // connect-time shape mismatch (old client vs new server)
-	Unauthorized,
+	Unauthorized,     // 401/403 at the handshake: not with this credential
+	Unavailable,      // 503 at the handshake: not now — the app's own refusal
 }
 ```
 
@@ -274,7 +275,7 @@ impl Service {
 	fun on_disconnect(own self, handler: |i32| void): Service
 	// the handshake gate and its limits
 	fun authorize(own self, check: async |Handshake| Result<Session, Reject>): Service
-	fun authorize_timeout(own self, millis: i32): Service   // 429 if the hook does not answer
+	fun authorize_timeout(own self, millis: i32): Service   // 429 if the hook does not answer — std's limit, never the app's 503
 	fun max_connections(own self, limit: i32): Service      // upgraded sockets on this mount only
 	fun handshake_rate(own self, attempts: i32, window_millis: f64): Service
 	fun handshake_timeout(own self, millis: i32): Service   // bounds the greeting, not idleness

@@ -124,8 +124,9 @@ the full shape.
 
 ## What can cross the wire: `Wire`
 
-Everything that travels (rpc parameters, return types, mirrored
-payloads) must be serializable, which Vilan calls **Wire**. The scalars
+Everything that travels — an rpc's parameters, the values a call answers
+with, mirrored payloads — must be serializable, which Vilan calls
+**Wire**. The scalars
 are Wire (`bool`, the integers including `i53`, floats, `str`). `List`
 and `Option` of Wire types are Wire. And your own types opt in with a
 derive:
@@ -202,11 +203,13 @@ check is still what decides who may act.
 
 - On the client they return `Result<T, RpcError>` and are implicitly
   awaited, like any async call.
-- `RpcError` tells you what went wrong, in five variants:
+- `RpcError` tells you what went wrong, in six variants:
   `Transport(str)` (couldn't reach the server), `Decode(str)`,
   `Remote(str)` (the handler failed), `Contract(str)` (the connect-time
-  check below refused a drifted server), and `Unauthorized`. Errors are
-  values. Look at them and decide.
+  check below refused a drifted server), `Unauthorized` (the credential
+  will not open this connection) and `Unavailable` (the server is up and
+  refusing for now — retry later, and re-authenticating is beside the
+  point). Errors are values. Look at them and decide.
 - At connect time, both sides compare a hash of the service's shape. If
   a stale client meets a redeployed server, the connect fails cleanly —
   as `Contract(reason)` — instead of calls corrupting halfway. This is
@@ -880,14 +883,16 @@ anything else about the chain.
 - An rpc handler's reply is its return value, so the handler runs to
   completion before the client hears back. Long work belongs in spawned
   tasks that write signals when done.
-- Minting channels at runtime (an rpc that calls `session_of` +
-  `ReactiveServer::expose`, rather than `[expose]`) is hand-wiring, and it
-  owns two things `[expose]` gets for free. Withdraw a channel you are
-  done with — `ReactiveServer::revoke(channel)`; an `Unsubscribe` only
-  stops the forward, because the client re-subscribes on the same id when
-  a view remounts. And register
-  `invalidate_on_reconnect(socket, client)` beside your
-  `ReactiveClient`, because a reconnect mints a fresh session that has
-  never heard of a channel your method minted: the mirror is invalidated
-  (`status` back to `Waiting`) and your app re-runs the rpc that minted
-  it.
+- Minting channels at runtime — an rpc that calls `session_of` +
+  `ReactiveServer::expose`, with `ReactiveClient::source(channel)` on the
+  other end, rather than `[expose]` — is hand-wiring, and what makes it
+  hand-wiring is that the mirror has **no origin**: nothing on the client
+  side records which call minted that channel, so nothing but your own
+  code can decide when it is finished or bring it back. Two things follow,
+  and `[expose]` gets both for free. Withdraw a channel you are done with,
+  explicitly — `ReactiveServer::revoke(channel)` — rather than reading a
+  client that stopped watching as a client that is done. And register
+  `invalidate_on_reconnect(socket, client)` beside your `ReactiveClient`,
+  because a reconnect mints a fresh session that has never heard of a
+  channel your method minted: the mirror is invalidated (`status` back to
+  `Waiting`), and re-running the rpc that minted it is your app's job.
