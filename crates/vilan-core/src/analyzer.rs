@@ -35212,8 +35212,31 @@ impl<'src> Analyzer<'src> {
                             &substitution_context,
                         ) {
                             Some((_unified, bindings)) => {
+                                // B296: keep only what THIS callee is entitled
+                                // to bind, the rule the method path's
+                                // `bind_callee_own_generics` has always applied.
+                                // Reconciling a parameter against an argument
+                                // whose own type is still abstract reports the
+                                // ARGUMENT's generics too — `take(Bag::new([]),
+                                // ..)` against `a: Bag<str, Task>` binds `Bag`'s
+                                // OWN impl binders `K`/`T`, which have nothing
+                                // to do with `take` — and this context is the
+                                // one every LATER argument of the same call is
+                                // then inferred under. The second
+                                // `Bag::new([])` therefore read the first's
+                                // instantiation: at two different
+                                // instantiations it was reported as
+                                // "Expected Bag<i32, Row>, but got
+                                // Bag<str, Task>", and at the SAME one it
+                                // compiled and monomorphized with the callee's
+                                // own `T` never bound — a call to the trait's
+                                // body-less requirement, and B55's internal
+                                // error.
+                                let bindable = self.callee_bindable_generics(target_id);
                                 for (constraint_id, type_id) in bindings {
-                                    substitution_context.insert(constraint_id, type_id);
+                                    if bindable.contains(&constraint_id) {
+                                        substitution_context.insert(constraint_id, type_id);
+                                    }
                                 }
                             }
                             None => {
@@ -39133,8 +39156,20 @@ impl<'src> Analyzer<'src> {
                     break;
                 }
                 FieldValueVerdict::Accepted(bindings) => {
+                    // B296: only the LITERAL's own parameters, the set
+                    // `inferable_generics` above already says this
+                    // reconciliation is entitled to bind — and the set the
+                    // field-first second chance below has always filtered by.
+                    // A field VALUE whose own type is still abstract reports
+                    // ITS generics too (`Store { active = Bag::new([]) }`
+                    // against `active: Bag<str, Task>` reports `Bag`'s impl
+                    // binders `K`/`T`), and this context is what every LATER
+                    // field of the same literal is then checked under: the
+                    // second `Bag::new([])` read the first's instantiation.
                     for (constraint_id, type_id) in bindings {
-                        substitution_context.insert(constraint_id, type_id);
+                        if literal_param_ids.contains(&constraint_id) {
+                            substitution_context.insert(constraint_id, type_id);
+                        }
                     }
                     initializer_fields.insert(struct_field_index, *field_value);
                 }

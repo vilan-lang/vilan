@@ -5584,3 +5584,72 @@ fn the_wire_boundary_admits_every_sized_scalar_in_an_rpc_signature() {
         "#,
     );
 }
+
+/// B296's own exhibit, in the vocabulary it was found in: a `[service]` struct
+/// with TWO exposed `KeyedCell<str, Task>` fields, both `KeyedCell::new([])`.
+/// It stopped the build with
+/// `internal: a call resolved to 'Keyed's requirement 'key', which has no body`
+/// — a `please report this program` over a program that is simply two fields.
+/// Neither `[service]` nor `KeyedCell` was load-bearing (a plain struct with
+/// two such fields did the same), but this is the spelling the item carries and
+/// the one an app writes.
+#[test]
+fn b296_two_exposed_keyed_cells_seeded_empty_both_compile() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str, label: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] active: KeyedCell<str, Task>,
+            [expose(keyed)] done: KeyedCell<str, Task>,
+        }
+        fun main() {
+            let store = Store {
+                active = KeyedCell::new([]),
+                done = KeyedCell::new([]),
+            };
+            print("store");
+        }
+        main();
+        "#,
+    );
+}
+
+/// B296's mixed face, named in the item: `[expose(keyed)]` beside a plain
+/// `[expose]`, both cells built empty.
+#[test]
+fn b296_a_keyed_and_a_plain_exposed_cell_seeded_empty_both_compile() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str, label: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] active: KeyedCell<str, Task>,
+            [expose] labels: SignalCell<List<str>>,
+        }
+        fun main() {
+            let store = Store {
+                active = KeyedCell::new([]),
+                labels = Signal::new([]),
+            };
+            print("store");
+        }
+        main();
+        "#,
+    );
+}

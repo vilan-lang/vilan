@@ -7885,3 +7885,180 @@ fn b280_list_new_inside_a_sibling_member_still_takes_a_fresh_element_slot() {
         "1,2\n",
     );
 }
+
+// --- B296: one call's bindings do not leak onto its SIBLING arguments --------
+//
+// Reconciling a parameter against an argument whose own type is still abstract
+// reports the ARGUMENT's generics too, and both the call-argument loop and the
+// struct-literal field loop recorded every binding they were handed into the
+// context the NEXT argument is checked under. Two sibling calls to one generic
+// static that binds nothing from its arguments (`Bag::new([])` — the empty
+// literal grounds no element) therefore shared ONE instantiation: at two
+// different ones the second was reported against the first's type, and at the
+// SAME one it compiled with the callee's own parameter never bound and
+// monomorphized into the trait's body-less requirement (B55's internal error).
+// `std::rpc::KeyedCell::new([])` in two exposed fields is the shape this was
+// found in.
+
+/// The shared source for B296's faces: a generic static whose parameter is
+/// reachable only through the argument's ELEMENT, so an empty list binds
+/// nothing, plus a bound (`T: Named<K>`) whose requirement call is what an
+/// unbound `T` monomorphizes into.
+fn b296_bag_source(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+
+        trait Named<K> {{ fun name(self): K; }}
+
+        struct Task {{ id: str }}
+        impl Task with Named<str> {{
+            fun name(self): str {{ self.id }}
+        }}
+        struct Row {{ n: i32 }}
+        impl Row with Named<i32> {{
+            fun name(self): i32 {{ self.n }}
+        }}
+
+        struct Bag<K, T> {{ items: List<T>, tags: List<K> }}
+
+        impl Bag<type K, type T: Named<K>> {{
+            fun new(initial: List<T>): Bag<K, T> {{
+                mut tags = [];
+                for item in initial {{
+                    tags.push(item.name());
+                }}
+                Bag {{ items = initial, tags = tags }}
+            }}
+        }}
+
+        {body}
+
+        main();
+        "#
+    )
+}
+
+#[test]
+fn b296_two_sibling_struct_literal_fields_do_not_share_one_instantiation() {
+    // The filed shape, at ONE instantiation: both fields the same type, both
+    // `Bag::new([])`. It compiled and then stopped the emitter with
+    // "a call resolved to `Named`'s requirement `name`, which has no body".
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task>, done: Bag<str, Task> }
+
+        fun main() {
+            let store = Store { active = Bag::new([]), done = Bag::new([]) };
+            print(i"{store.active.items.len()}{store.done.items.len()}");
+        }
+        "#,
+        ),
+        "00\n",
+    );
+}
+
+#[test]
+fn b296_two_sibling_struct_literal_fields_keep_their_own_instantiations() {
+    // The same shape at TWO instantiations, which is what made the leak
+    // legible: the second field was reported as
+    // "Expected Bag<i32, Row>, but got Bag<str, Task>" — the FIRST field's
+    // type, read out of the literal's shared context.
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task>, done: Bag<i32, Row> }
+
+        fun main() {
+            let store = Store { active = Bag::new([]), done = Bag::new([]) };
+            print(i"{store.active.items.len()}{store.done.items.len()}");
+        }
+        "#,
+        ),
+        "00\n",
+    );
+}
+
+#[test]
+fn b296_two_sibling_call_arguments_do_not_share_one_instantiation() {
+    // The same defect through the CALL-argument loop rather than the literal's
+    // — the filed item names only the struct literal, and the two loops had
+    // the identical unfiltered record.
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        fun take(a: Bag<str, Task>, b: Bag<i32, Row>) {
+            print(i"{a.items.len()}{b.items.len()}");
+        }
+
+        fun main() { take(Bag::new([]), Bag::new([])); }
+        "#,
+        ),
+        "00\n",
+    );
+}
+
+#[test]
+fn b296_one_such_field_was_always_fine() {
+    // The control the item names: ONE field compiles, which is why the defect
+    // read as "two of them" rather than as "the empty literal".
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task> }
+
+        fun main() {
+            let store = Store { active = Bag::new([]) };
+            print(i"{store.active.items.len()}");
+        }
+        "#,
+        ),
+        "0\n",
+    );
+}
+
+#[test]
+fn b296_a_seeded_sibling_pair_was_always_fine() {
+    // The other control: seeding either list binds the callee's parameter from
+    // the argument, so nothing abstract is ever reported into the shared
+    // context.
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task>, done: Bag<str, Task> }
+
+        fun main() {
+            let store = Store {
+                active = Bag::new([Task { id = "a" }]),
+                done = Bag::new([Task { id = "b" }]),
+            };
+            print(i"{store.active.tags[0]}{store.done.tags[0]}");
+        }
+        "#,
+        ),
+        "ab\n",
+    );
+}
+
+#[test]
+fn b296_a_sibling_field_still_binds_the_structs_own_parameter() {
+    // The narrowing must not cost the bindings that ARE the literal's: a
+    // generic struct whose parameter is inferred from one field still types
+    // the rest of the literal by it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair<T> { left: T, right: T }
+
+        fun main() {
+            let pair = Pair { left = 7, right = 9 };
+            print(pair.left + pair.right);
+        }
+
+        main();
+        "#,
+        "16\n",
+    );
+}
