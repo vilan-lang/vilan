@@ -15180,6 +15180,56 @@ impl<'src> Analyzer<'src> {
                         declaration_id,
                     );
                 }
+                // B285: the `KeyedCell<K, T>` twin of the arm above, and the
+                // same family R6 settled for the `Map` form — the field names
+                // its key twice and the two do not agree.
+                //
+                // Here one spelling really is authoritative: the cell's own
+                // `K` is what `expose_keyed_cell` and the `KeyedSource<K, T>`
+                // mirror are typed at, so a disagreeing argument could only
+                // generate code that does not compile, and the expansion
+                // ignores it (`std/src/rpc.vl`'s exposed-field loop: "A
+                // written `keyed = K` is redundant rather than authoritative
+                // here"). Ignoring it SILENTLY is the defect: the field
+                // compiled, hashed byte-identically to the agreeing spelling,
+                // and mirrored by a key the author had written otherwise two
+                // lines up. Said at the argument, which is the half that is
+                // wrong — the cell's type is not.
+                //
+                // The comparison is on the two SPELLINGS with whitespace
+                // removed, for the `Map` arm's reason: the attribute reaches
+                // the macro engine as source text and the annotation through
+                // `render_type`, and neither has resolved.
+                Some(_)
+                    if exposure.is_keyed()
+                        && !exposure.key_type().is_empty()
+                        && keyed_cell_key(type_node).is_some_and(|written| {
+                            without_spaces(&written) != without_spaces(exposure.key_type())
+                        }) =>
+                {
+                    let written = exposure.key_type();
+                    let cell_key = keyed_cell_key(type_node).unwrap_or_default();
+                    self.expose_refused_field_slots.insert(field_type_id);
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: exposure.key_span().unwrap_or(span),
+                            msg: format!(
+                                "{label} names its key twice and the two disagree: \
+                             `[expose(keyed = {written})]` says `{written}`, and its \
+                             `KeyedCell` says `{cell_key}`. A `KeyedCell<K, T>` names \
+                             both of its types itself and is keyed by the one it names: \
+                             `expose_keyed_cell` and the `KeyedSource<K, T>` mirror are \
+                             typed at `{cell_key}`, so the argument cannot be honoured \
+                             and is not read. Drop it — a `KeyedCell` takes the bare \
+                             `[expose(keyed)]` — or write the cell with `{written}` as \
+                             its key"
+                            ),
+                        },
+                        declaration_id,
+                    );
+                }
                 Some(_) => {}
                 None => {
                     // Same covering, same reason: the field cannot be exposed
@@ -46334,6 +46384,25 @@ fn sole_argument_map_key(type_node: Option<&Node<'_>>) -> Option<String> {
         return None;
     }
     let [key, _value] = key_and_value.0.as_slice() else {
+        return None;
+    };
+    Some(render_type(&key.0))
+}
+
+/// The KEY a `[expose]`d `KeyedCell<K, T>` field names, as written (tracker
+/// B285). [`sole_argument_map_key`]'s twin for the one source type that names
+/// both of its types itself: the shape check [`annotation_is_keyed_cell`]
+/// answers whether the field is a cell at all, this answers what the cell says
+/// its key is, so a disagreeing `[expose(keyed = K)]` argument can be refused
+/// quoting both spellings. `None` for every other written shape.
+fn keyed_cell_key(type_node: Option<&Node<'_>>) -> Option<String> {
+    let Some(Node::AccessorWithGenerics(head, arguments)) = type_node else {
+        return None;
+    };
+    if *head != "KeyedCell" {
+        return None;
+    }
+    let [key, _element] = arguments.0.as_slice() else {
         return None;
     };
     Some(render_type(&key.0))

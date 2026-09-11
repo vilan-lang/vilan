@@ -3694,3 +3694,131 @@ fn b284_a_client_service_only_struct_without_an_expose_still_compiles() {
         "#,
     );
 }
+
+// --- B285: `[expose(keyed = K)]` over a `KeyedCell<K2, T>` ------------------
+
+/// B285: the `KeyedCell<K, T>` twin of A56/R6 — the field names its key twice
+/// and the two disagree.
+///
+/// The cell's own `K` won, and had to: `expose_keyed_cell` and the
+/// `KeyedSource<K, T>` mirror are typed at it, so a disagreeing argument could
+/// only generate code that does not compile. What was wrong was winning
+/// SILENTLY — the program below hashed byte-identically to the one that writes
+/// `keyed = str`, and mirrored by a key the author had spelled otherwise on the
+/// same line.
+#[test]
+fn b285_an_expose_keyed_argument_that_disagrees_with_the_cells_key_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = i32)] tasks: KeyedCell<str, Task>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "names its key twice and the two disagree",
+    );
+}
+
+/// B285's span, stated as its own claim: the ARGUMENT is the half under
+/// discussion — the cell's type is not wrong, and one of the two ways out does
+/// not touch it — so the refusal points there and not at the annotation. A56's
+/// rule, applied to the second spelling that carries a key.
+#[test]
+fn b285_the_disagreeing_cell_key_refusal_spans_the_attribute_argument() {
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = i32)] tasks: KeyedCell<str, Task>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "i32",
+        "names its key twice and the two disagree",
+    );
+}
+
+/// B285's control: an argument that AGREES with the cell's key is redundant,
+/// not wrong. It compiles, and it hashes exactly as the bare form does — the
+/// surface entry is built from the cell's own written key either way.
+#[test]
+fn b285_an_expose_keyed_argument_that_agrees_with_the_cells_key_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = str)] tasks: KeyedCell<str, Task>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { 1 }
+        }
+        fun main() {
+            print(Store { tasks = KeyedCell::new([]) }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}
+
+/// B285's other two controls, which are the shapes the refusal must NOT reach:
+/// the bare `[expose(keyed)]` over a cell (A54's spelling), and the bare
+/// `[expose]` over one — which is the SAME keyed channel, because the cell
+/// names both types itself and there is nothing for the attribute to add.
+#[test]
+fn b285_a_keyed_cell_exposed_without_an_argument_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] keyed_tasks: KeyedCell<str, Task>,
+            [expose] bare_tasks: KeyedCell<str, Task>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { 1 }
+        }
+        fun main() {
+            let keyed: KeyedCell<str, Task> = KeyedCell::new([Task { id = "a" }]);
+            let bare: KeyedCell<str, Task> = KeyedCell::new([Task { id = "b" }]);
+            print(Store { keyed_tasks = keyed, bare_tasks = bare }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}

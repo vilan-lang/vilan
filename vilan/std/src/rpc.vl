@@ -4331,6 +4331,11 @@ macro fun service(item: Item): Source {
 			// `expose_keyed_cell` and its mirror are typed at, so preferring
 			// a disagreeing written one could only generate code that does
 			// not compile.
+			//
+			// Redundant is admitted; DISAGREEING is refused at the attribute
+			// before this runs (B285, `check_expose_fields`, A56/R6's shape
+			// for the second spelling that carries a key), so the argument
+			// this loop ignores can only ever have agreed.
 			if field.type_.name == "KeyedCell" && field.type_.arguments.len() == 2 {
 				match field.type_.arguments.get(0) {
 					Some(let key) => match field.type_.arguments.get(1) {

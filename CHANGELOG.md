@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**`[expose(keyed = K)]` over a `KeyedCell<K2, T>` whose written key disagrees with the cell's own is refused at the attribute, instead of the argument being silently ignored.** A `KeyedCell<K, T>` names both of its types itself, and its `K` has to win — `expose_keyed_cell` and the `KeyedSource<K, T>` mirror are typed at it, so honouring a disagreeing argument could only generate code that does not compile. Winning silently was the defect: the field compiled, hashed byte-identically to the agreeing spelling, and mirrored by a key the author had written otherwise on the same line. Same family A56/R6 closed for the `Map<K, V>` form and the same shape — both spellings quoted, both ways out offered, and the span on the argument, which is the half that is wrong. Redundant agreement stays admitted, and so do the bare `[expose(keyed)]` and bare `[expose]` spellings over a cell, which mean the same channel.
+
+<!-- family: diagnostics -->
 **`[expose]` on a struct carrying only `[client_service]` is refused at the attribute instead of compiling into a channel nothing ever mints.** `[client_service] struct Handlers { [expose] tally: SignalCell<i32> }` built, printed a contract hash — the `expose:` surface entry is in it, so both peers had to agree about the field — and exported nothing: a client-side struct has no reactive session to export out of, and the expansion emits no `__attach` route for it at all. The refusal is said in the field's own vocabulary, for the reason every arm of that check exists (B202): the expansion silently declines to generate for such a field, so without this nothing said why. A peer struct — `[service(..)]` and `[client_service]` together — serves as well as handles and keeps its exposures, which is why the refusal is keyed on the declaration rather than on `[client_service]` being present.
 
 <!-- family: fix -->
