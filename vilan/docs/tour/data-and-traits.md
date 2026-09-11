@@ -418,7 +418,8 @@ fun main() {
 ```
 
 The standard shape for a type that crosses the wire is
-`[derive(Wire, PartialEq, Debug)]`.
+`[derive(Wire, PartialEq, Debug)]`. `Wire` is the wire codec alone —
+add `Json` to the list when the type also needs `to_json`/`from_json`.
 
 > **Going deeper.** Derives are ordinary macros, and you can write your
 > own; see [Macros & const](macros-and-const.md). `Wire` and `Json`

@@ -46800,6 +46800,13 @@ fn derive_enum_impls(
                     subject.binders("Debug"),
                 ));
             }
+            // B301: `Json` emits the JSON pair, `Wire` the §6.1 visitor, and
+            // `[derive(Json, Wire)]` — two derives, two passes of this loop —
+            // emits both. The arm is shared because the two codecs read the
+            // same declaration, never because either implies the other; `Wire`
+            // used to emit the JSON pair beside its visitor ("additive until
+            // the codec re-plumb consumes it") and the residue made a Wire
+            // type's fields have to be Json as well.
             "Json" | "Wire" => {
                 // §3.9's backed form: the value on the wire IS the backing
                 // value, and it round-trips through the synthesized `parse`.
@@ -46807,20 +46814,21 @@ fn derive_enum_impls(
                 // and `<backing>::to_json` already escapes correctly — so
                 // neither direction re-implements JSON quoting here.
                 if let Some(backing_type) = backing_type {
-                    out.push_str(&format!(
-                        "impl {enum_name}{} with Json {{\n\
+                    if *derive == "Json" {
+                        out.push_str(&format!(
+                            "impl {enum_name}{} with Json {{\n\
                          \tfun to_json(self): str {{\n\
                          \t\tself.value().to_json()\n\
                          \t}}\n\
                          }}\n",
-                        subject.binders("Json"),
-                    ));
-                    let coerce = match backing_type {
-                        "str" => "coerce_str",
-                        "i53" => "coerce_i53",
-                        _ => "coerce_i32",
-                    };
-                    out.push_str(&format!(
+                            subject.binders("Json"),
+                        ));
+                        let coerce = match backing_type {
+                            "str" => "coerce_str",
+                            "i53" => "coerce_i53",
+                            _ => "coerce_i32",
+                        };
+                        out.push_str(&format!(
                         "impl {enum_name}{} with FromJson {{\n\
                          \tfun from_json(text: str): Result<{applied}, str> {{\n\
                          \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
@@ -46831,6 +46839,7 @@ fn derive_enum_impls(
                          }}\n",
                         subject.binders("FromJson"),
                     ));
+                    }
                     if *derive == "Wire" {
                         let first_variant =
                             variants.first().map(|(name, _)| *name).unwrap_or(enum_name);
@@ -46844,60 +46853,61 @@ fn derive_enum_impls(
                 }
                 // Externally tagged: no payload -> `"V"`; one -> `{"V":<p>}`;
                 // many -> `{"V":[<p0>,<p1>]}`.
-                let mut arms = String::new();
-                for (name, payload_types) in &variants {
-                    let arity = payload_types.len();
-                    if arity == 0 {
-                        arms.push_str(&format!(
-                            "\t\t\t{enum_name}::{name} => \"\\\"{name}\\\"\",\n"
-                        ));
-                    } else if arity == 1 {
-                        arms.push_str(&format!(
+                if *derive == "Json" {
+                    let mut arms = String::new();
+                    for (name, payload_types) in &variants {
+                        let arity = payload_types.len();
+                        if arity == 0 {
+                            arms.push_str(&format!(
+                                "\t\t\t{enum_name}::{name} => \"\\\"{name}\\\"\",\n"
+                            ));
+                        } else if arity == 1 {
+                            arms.push_str(&format!(
                             "\t\t\t{enum_name}::{name}(let p0) => \"{{\\\"{name}\\\":\" + p0.to_json() + \"}}\",\n"
                         ));
-                    } else {
-                        let binds = (0..arity)
-                            .map(|i| format!("let p{i}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let parts = (0..arity)
-                            .map(|i| format!("p{i}.to_json()"))
-                            .collect::<Vec<_>>()
-                            .join(" + \",\" + ");
-                        arms.push_str(&format!(
+                        } else {
+                            let binds = (0..arity)
+                                .map(|i| format!("let p{i}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let parts = (0..arity)
+                                .map(|i| format!("p{i}.to_json()"))
+                                .collect::<Vec<_>>()
+                                .join(" + \",\" + ");
+                            arms.push_str(&format!(
                             "\t\t\t{enum_name}::{name}({binds}) => \"{{\\\"{name}\\\":[\" + {parts} + \"]}}\",\n"
                         ));
+                        }
                     }
-                }
-                out.push_str(&format!(
-                    "impl {enum_name}{} with Json {{\n\
+                    out.push_str(&format!(
+                        "impl {enum_name}{} with Json {{\n\
                      \tfun to_json(self): str {{\n\
                      \t\tmatch self {{\n{arms}\t\t}}\n\
                      \t}}\n\
                      }}\n",
-                    subject.binders("Json"),
-                ));
-                // The reverse direction: read the externally-tagged discriminator,
-                // then rebuild that variant from the host value. A no-payload tag is
-                // the bare string; a single payload is `value.field(tag)`; several
-                // are positional elements of the tagged array. Each payload is
-                // coerced via its own type's `from_json_value`.
-                // Decoding is fallible (I3): validate the tag (unknown = a decode
-                // error, not a panic) and thread each payload leaf with `!`.
-                let mut arms = String::new();
-                for (name, payload_types) in &variants {
-                    let arity = payload_types.len();
-                    if arity == 0 {
-                        arms.push_str(&format!(
-                            "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}),\n"
-                        ));
-                    } else if arity == 1 {
-                        let payload_type = &payload_types[0];
-                        arms.push_str(&format!(
+                        subject.binders("Json"),
+                    ));
+                    // The reverse direction: read the externally-tagged discriminator,
+                    // then rebuild that variant from the host value. A no-payload tag is
+                    // the bare string; a single payload is `value.field(tag)`; several
+                    // are positional elements of the tagged array. Each payload is
+                    // coerced via its own type's `from_json_value`.
+                    // Decoding is fallible (I3): validate the tag (unknown = a decode
+                    // error, not a panic) and thread each payload leaf with `!`.
+                    let mut arms = String::new();
+                    for (name, payload_types) in &variants {
+                        let arity = payload_types.len();
+                        if arity == 0 {
+                            arms.push_str(&format!(
+                                "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}),\n"
+                            ));
+                        } else if arity == 1 {
+                            let payload_type = &payload_types[0];
+                            arms.push_str(&format!(
                             "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({payload_type}::from_json_value(value.field(\"{name}\"))!)),\n"
                         ));
-                    } else {
-                        let elements = payload_types
+                        } else {
+                            let elements = payload_types
                             .iter()
                             .enumerate()
                             .map(|(index, payload_type)| {
@@ -46907,15 +46917,15 @@ fn derive_enum_impls(
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
-                        arms.push_str(&format!(
-                            "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({elements})),\n"
-                        ));
+                            arms.push_str(&format!(
+                                "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({elements})),\n"
+                            ));
+                        }
                     }
-                }
-                arms.push_str(&format!(
+                    arms.push_str(&format!(
                     "\t\t\t_ => Result::Err(\"unknown variant in JSON for enum {enum_name}\"),\n"
                 ));
-                out.push_str(&format!(
+                    out.push_str(&format!(
                     "impl {enum_name}{} with FromJson {{\n\
                      \tfun from_json(text: str): Result<{applied}, str> {{\n\
                      \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
@@ -46926,8 +46936,7 @@ fn derive_enum_impls(
                      }}\n",
                     subject.binders("FromJson"),
                 ));
-                // `[derive(Wire)]` also targets the §6.1 visitor (see the
-                // struct arm's note).
+                }
                 if *derive == "Wire" {
                     out.push_str(&enum_wire_visitor_impls(subject, &variants));
                 }
@@ -47804,49 +47813,52 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                      }}\n"
                 ));
             }
+            // B301: `Json` emits the JSON pair, `Wire` the §6.1 visitor,
+            // `[derive(Json, Wire)]` both (see the enum arm's note).
             "Json" | "Wire" => {
-                // `"{" + "\"a\":" + self.a.to_json() + "," + "\"b\":" +
-                // self.b.to_json() + "}"` — a JSON object with the real field
-                // names; each value serializes via its own `to_json`.
-                let mut body = String::from("\"{\"");
-                for (index, (field, _)) in fields.iter().enumerate() {
-                    if index > 0 {
-                        body.push_str(" + \",\"");
+                if *derive == "Json" {
+                    // `"{" + "\"a\":" + self.a.to_json() + "," + "\"b\":" +
+                    // self.b.to_json() + "}"` — a JSON object with the real field
+                    // names; each value serializes via its own `to_json`.
+                    let mut body = String::from("\"{\"");
+                    for (index, (field, _)) in fields.iter().enumerate() {
+                        if index > 0 {
+                            body.push_str(" + \",\"");
+                        }
+                        body.push_str(" + \"\\\"");
+                        body.push_str(field);
+                        body.push_str("\\\":\" + self.");
+                        body.push_str(field);
+                        body.push_str(".to_json()");
                     }
-                    body.push_str(" + \"\\\"");
-                    body.push_str(field);
-                    body.push_str("\\\":\" + self.");
-                    body.push_str(field);
-                    body.push_str(".to_json()");
-                }
-                body.push_str(" + \"}\"");
-                out.push_str(&format!(
-                    "impl {struct_name}{} with Json {{\n\
+                    body.push_str(" + \"}\"");
+                    out.push_str(&format!(
+                        "impl {struct_name}{} with Json {{\n\
                      \tfun to_json(self): str {{\n\
                      \t\t{body}\n\
                      \t}}\n\
                      }}\n",
-                    subject.binders("Json"),
-                ));
-                // The reverse direction (I3): decoding is fallible, so `from_json`
-                // yields a `Result`. Each field is checked present (naming a
-                // missing one), then coerced via the field type's own
-                // `from_json_value` (nested structs recurse), threading a leaf
-                // failure with `!`.
-                let mut presence = String::new();
-                for (field, _) in &fields {
-                    presence.push_str(&format!(
+                        subject.binders("Json"),
+                    ));
+                    // The reverse direction (I3): decoding is fallible, so `from_json`
+                    // yields a `Result`. Each field is checked present (naming a
+                    // missing one), then coerced via the field type's own
+                    // `from_json_value` (nested structs recurse), threading a leaf
+                    // failure with `!`.
+                    let mut presence = String::new();
+                    for (field, _) in &fields {
+                        presence.push_str(&format!(
                         "\t\tif !value.has_field(\"{field}\") {{ ret Result::Err(\"missing field {field}\") }}\n"
                     ));
-                }
-                let initializers = fields
-                    .iter()
-                    .map(|(field, type_)| {
-                        format!("{field} = {type_}::from_json_value(value.field(\"{field}\"))!")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                out.push_str(&format!(
+                    }
+                    let initializers = fields
+                        .iter()
+                        .map(|(field, type_)| {
+                            format!("{field} = {type_}::from_json_value(value.field(\"{field}\"))!")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
                     "impl {struct_name}{} with FromJson {{\n\
                      \tfun from_json(text: str): Result<{applied}, str> {{\n\
                      \t\t{struct_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
@@ -47857,8 +47869,7 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                      }}\n",
                     subject.binders("FromJson"),
                 ));
-                // `[derive(Wire)]` also targets the §6.1 visitor — additive
-                // beside the JSON impls until the codec re-plumb consumes it.
+                }
                 if *derive == "Wire" {
                     out.push_str(&struct_wire_visitor_impls(&subject, &fields));
                 }

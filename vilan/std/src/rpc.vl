@@ -1105,7 +1105,14 @@ enum RpcOutcome {
 /// for a `match` with an arm per variant or read `debug()` back as text. The
 /// payload arms compare their sentences, which is what a `Transport(reason)`
 /// against a literal means.
-[derive(Wire, Debug, PartialEq)]
+///
+/// `Json` is WRITTEN now rather than ridden in on `Wire`'s coat-tails (B301):
+/// `[derive(Wire)]` used to emit the JSON pair beside the visitor impls, so
+/// every Wire type was a Json type by accident. It stops doing that, and
+/// `RpcError::to_json()` is a shipped surface — `vilan/benchmarks`' rpc legs
+/// print a failed call with it, and a `Result<T, RpcError>` is the value every
+/// generated stub answers — so the derive says so.
+[derive(Wire, Json, Debug, PartialEq)]
 enum RpcError {
 	Transport(str),
 	Decode(str),

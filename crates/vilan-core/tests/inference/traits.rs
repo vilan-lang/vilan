@@ -4158,19 +4158,16 @@ fn a_wire_impl_whose_binder_carries_no_bound_admits_any_argument() {
 /// was refused before B289 for the same reason the signature was — the field's
 /// SPELLING was the test.
 ///
-/// What it does NOT yet do is compile, and the reason is a PRE-EXISTING
-/// coupling the allowlist was hiding: `[derive(Wire)]` still emits
-/// `Json`/`FromJson` beside the §6.1 visitor ("additive beside the JSON impls
-/// until the codec re-plumb consumes it", `derive_impl_source`), so a field
-/// type needs a `Json` impl as well as a `Wire` one — and the generated body
-/// says so in `to_json`'s vocabulary, not the boundary's. `Map` has been
-/// admitted by the Wire boundary since A39 and walks into the same wall
-/// (`[derive(Wire)] struct Row {{ tags: Map<str, i32> }}` — the sibling pin), so
-/// the defect is the derive's, not this change's, and it is filed as its own
-/// item. This pin holds the half B289 owns and names the half it does not.
+/// B289 left it compiling no further than the boundary, because of a coupling
+/// the allowlist had been hiding: `[derive(Wire)]` also emitted `Json`/`FromJson`
+/// ("additive beside the JSON impls until the codec re-plumb consumes it"), so
+/// a field type needed a `Json` impl as well as a `Wire` one and the generated
+/// body said so in `to_json`'s vocabulary rather than the boundary's. B301
+/// finished the re-plumb: this ADMITS now, which is the face B289 meant it to
+/// have.
 #[test]
 fn a_derive_wire_field_may_be_a_hand_implemented_wire_type() {
-    let source = format!(
+    assert_compiles(&format!(
         r#"
         import std::io::print;
         import std::wire::{{ Deserialize, Serialize, Wire }};
@@ -4180,29 +4177,90 @@ fn a_derive_wire_field_may_be_a_hand_implemented_wire_type() {
         fun main() {{ print("row"); }}
         main();
         "#
-    );
-    assert_fails_without(&source, "which is not Wire");
-    assert_fails_with(&source, "has no method 'to_json'");
+    ));
 }
 
-/// The sibling that proves the residue above is the DERIVE's and not the
+/// The sibling that showed the residue was the DERIVE's and not the
 /// hand-written impl's: `Map` is Wire by std's own `impl Map<type K: Hashable +
-/// Wire, type V: Wire> with Wire` (A39), the Wire boundary has admitted it by
-/// name since, and `[derive(Wire)]`'s JSON half has never been able to
-/// generate for it — on `next` at 65af4be0, with nothing in this change
-/// reaching it.
+/// Wire, type V: Wire> with Wire` (A39) and the Wire boundary has admitted it
+/// by name since, while `[derive(Wire)]`'s JSON half never could generate for
+/// it. With the codec re-plumb done (B301) the derive asks only for Wire, and
+/// the `Map` field is as ordinary as the `i53` beside it.
 #[test]
-fn a_derive_wire_field_typed_map_meets_the_same_pre_existing_json_residue() {
-    let source = r#"
+fn a_derive_wire_field_may_be_a_map() {
+    assert_compiles(
+        r#"
         import std::io::print;
         import std::map::Map;
         [derive(Wire)]
         struct Row { id: i53, tags: Map<str, i32> }
         fun main() { print("row"); }
         main();
-        "#;
-    assert_fails_without(source, "which is not Wire");
-    assert_fails_with(source, "has no method 'to_json'");
+        "#,
+    );
+}
+
+/// B301's third shape, and kolt's own (`store.vl:184`): `Result` has been Wire
+/// since A82 and is not Json, so a derived struct could not hold one either.
+#[test]
+fn a_derive_wire_field_may_be_a_result() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::result::Result;
+        [derive(Wire)]
+        struct Outcome { id: i53, value: Result<i32, str> }
+        fun main() { print("outcome"); }
+        main();
+        "#,
+    );
+}
+
+/// The control that keeps the split honest in the other direction: a type that
+/// wants BOTH codecs asks for both, and gets both. `[derive(Json, Wire)]` is
+/// one declaration, two derives, two passes of the generator — the JSON pair
+/// and the §6.1 visitor, each over the same fields.
+#[test]
+fn a_derive_json_wire_type_carries_both_codecs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result::{ self, Ok, Err };
+        import std::wire::Wire;
+        [derive(Json, Wire)]
+        struct Point { x: i32, y: i32 }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            print(point.to_json());
+            match Point::from_json(point.to_json()) {
+                Ok(let back) => print(back.x + back.y),
+                Err(let reason) => print(reason),
+            }
+        }
+        main();
+        "#,
+        "{\"x\":1,\"y\":2}\n3\n",
+    );
+}
+
+/// And the face the split creates: `[derive(Wire)]` ALONE does not hand its
+/// subject a JSON codec. `to_json` is not a method on a Wire type any more,
+/// and the refusal says so in the ordinary missing-method vocabulary rather
+/// than from inside generated code.
+#[test]
+fn a_derive_wire_type_has_no_json_codec_of_its_own() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::wire::Wire;
+        [derive(Wire)]
+        struct Point { x: i32, y: i32 }
+        fun main() { print(Point { x = 1, y = 2 }.to_json()); }
+        main();
+        "#,
+        "to_json",
+    );
 }
 
 /// And its refuse face at the same boundary, for the same reason as the

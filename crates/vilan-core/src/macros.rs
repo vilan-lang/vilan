@@ -1918,7 +1918,10 @@ impl Expander<'_, '_> {
         if fallback.traits.contains("Default") {
             prelude.push_str("import std::default::Default;\n");
         }
-        if fallback.traits.contains("Json") || fallback.traits.contains("Wire") {
+        // B301: `Wire` no longer emits the JSON pair, so only `Json` needs
+        // the JSON prelude. A module deriving both carries both preludes,
+        // exactly as it carries both sets of impls.
+        if fallback.traits.contains("Json") {
             // Mirrors the `Json`/`Wire` macro entry points: the validating
             // `from_json` yields a `Result` (I3), so the output needs `Result`
             // in scope; it reads JSON through methods (`try_parse_json`,

@@ -1143,22 +1143,28 @@ macro fun Json(item: Item): Source {
 	source("")
 }
 
+// `[derive(Wire)]` emits the §6.1 VISITOR impls and nothing else (B301).
+//
+// It used to emit the JSON pair beside them — "additive until the codec
+// re-plumb consumes it" — and the residue was not additive at all: it made
+// every field of a Wire type have to be JSON as well, at a time when `Map` had
+// been Wire since A39 and `Result` since A82 and neither is Json. `[derive(Wire)]
+// struct Row { tags: Map<str, i32> }` failed with "`Map<str, i32>` has no method
+// 'to_json'" and "cannot find 'from_json_value' in Map<str, i32>" — two
+// diagnostics about a codec the author did not ask for, naming a trait the
+// attribute does not mention. A hand-written `impl .. with Wire` type and a
+// `Result` field met the identical wall.
+//
+// A type that wants both codecs asks for both: `[derive(Json, Wire)]`.
 macro fun Wire(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	if item.as_struct() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n"
-			+ "import std::result::Result;\n"
-			+ "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n"
-			+ struct_json_impls(target)
-			+ struct_wire_impls(target));
+		ret source("import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + struct_wire_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n"
-			+ "import std::result::Result;\n"
-			+ "import std::option::Option;\n"
+		ret source("import std::option::Option;\n"
 			+ "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n"
-			+ enum_json_impls(target)
 			+ enum_wire_impls(target));
 	}
 	source("")

@@ -2459,17 +2459,20 @@ fn generic_call_over_a_bounded_transport_decodes() {
 
 #[test]
 fn wire_derives_the_json_round_trip() {
-    // `[derive(Wire)]` reuses the Json round-trip: a Wire struct/enum encodes and decodes,
-    // including nested Wire structs, `List<Wire>`, and Wire enums.
+    // `[derive(Json, Wire)]` carries both codecs: the Json round-trip below is
+    // the JSON half's, over a nested Wire struct, a `List<Wire>` and a Wire
+    // enum. The derive list is where the two are asked for SEPARATELY since
+    // B301 — `Wire` alone emits the §6.1 visitor and no `to_json` — so this pin
+    // writes both, which is what it was always testing.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::result::Result::{ self, Ok, Err };
-        [derive(Wire)]
+        [derive(Json, Wire)]
         struct Point { x: i32, y: i32 }
-        [derive(Wire)]
+        [derive(Json, Wire)]
         struct Line { from: Point, to: Point, tags: List<str> }
-        [derive(Wire)]
+        [derive(Json, Wire)]
         enum Shape { Seg(Line), Empty }
         fun main() {
             let line = Line { from = Point { x = 1, y = 2 }, to = Point { x = 3, y = 4 }, tags = ["a"] };
@@ -3859,11 +3862,16 @@ fn qualified_generic_static_resolves_inner_trait_statics() {
 
 #[test]
 fn derived_wire_visitor_matches_to_json_and_round_trips() {
-    // `[derive(Wire)]` now also emits the §6.1 visitor impls: the described
-    // output must equal the derived `to_json` byte-for-byte, rebuild must
-    // round-trip (scalars, List, Option, a nested derived enum), and
-    // structural failures surface as sticky decode errors through the
-    // GENERATED rebuilds.
+    // The §6.1 visitor's described output must equal the derived `to_json`
+    // byte-for-byte, rebuild must round-trip (scalars, List, Option, a nested
+    // derived enum), and structural failures must surface as sticky decode
+    // errors through the GENERATED rebuilds.
+    //
+    // Both codecs are written in the derive list since B301, because the
+    // comparison is BETWEEN them: `Wire` gives the visitor, `Json` gives the
+    // `to_json` it is held against. It read `[derive(Wire)]` while that one
+    // derive emitted both, which made the two sides look like one derive's
+    // internal consistency rather than two codecs agreeing.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -3871,14 +3879,14 @@ fn derived_wire_visitor_matches_to_json_and_round_trips() {
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, encode_json, decode_json };
 
-        [derive(Wire)]
+        [derive(Json, Wire)]
         enum Status {
             Offline,
             Away(str),
             Busy(str, i32),
         }
 
-        [derive(Wire)]
+        [derive(Json, Wire)]
         struct Profile {
             id: i32,
             name: str,
