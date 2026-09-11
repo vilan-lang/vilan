@@ -7,22 +7,20 @@ function __clone(value) {
 function __map_values(map) {
 	return [ ...map.values() ].map(__clone);
 }
-function key_is_marked(key) {
-	return key.startsWith(":!:") || key.startsWith(":! ");
+function token_is_negated(token) {
+	return token.startsWith("!");
 }
 function class_list(self) {
-	for (const key of $a(self[0])) {
-		if (key_is_marked(key)) {
+	let out = "";
+	for (const entry of $a(self[0])) {
+		const $b = entry;
+		const class2 = $b[0];
+		const _declaration = $b[1];
+		if (token_is_negated(class2)) {
 			(() => {
 				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
 			})();
 		}
-	}
-	let out = "";
-	for (const entry of $b(self[0])) {
-		const $c = entry;
-		const class2 = $c[0];
-		const _declaration = $c[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -32,13 +30,6 @@ function class_list(self) {
 	return out;
 }
 function $a(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
-	}
-	return result;
-}
-function $b(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
 		result.push(__clone(entry[1]));

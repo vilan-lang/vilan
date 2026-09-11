@@ -869,17 +869,6 @@ fun condition_unmarked(condition: str): str {
 	}
 }
 
-/// `condition_is_marked` read off a whole SLOT KEY (`media:condition:property`)
-/// without splitting it, which is what keeps the check `class_list` runs on
-/// every application free of an allocation. Sound because a pending mark forces
-/// an empty media field — `not` refuses a media-conditioned inner — so a marked
-/// key opens with `:` and then the mark's own token, and an APPLIED negation
-/// (`:![data-open="true"]:…`) is excluded by the same two prefixes that
-/// `condition_is_marked` tests.
-fun key_is_marked(key: str): bool {
-	key.starts_with(":!:") || key.starts_with(":! ")
-}
-
 /// `condition_unmarked`'s inverse: the condition with a pending mark on it.
 fun condition_marked(condition: str): str {
 	if condition == "" {
@@ -1517,9 +1506,19 @@ impl Style {
 					if parts[0] != "" {
 						panic("a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead");
 					}
+					let (class, declaration) = entry;
 					let condition = condition_marked(parts[1]);
 					rules = without_covered(rules, parts[0], condition, parts[2]);
-					rules.insert(parts[0] + ":" + condition + ":" + parts[2], entry);
+					// The mark is written TWICE, deliberately, and `not` is the only
+					// writer of either. On the CONDITION it is the slot's identity, so
+					// a negated slot and its plain twin coexist and the enclosing
+					// combinator can read which it is. On the CLASS it is the same fact
+					// placed where `class_list` already walks: application runs once per
+					// element per render, and a second walk to read the keys cost 3.1 us
+					// per call on a 25-slot style (78% of `class_list`) when it was
+					// measured. The class of a marked slot is never used for anything
+					// else — the enclosing combinator re-mints it through `rule`.
+					rules.insert(parts[0] + ":" + condition + ":" + parts[2], ("!" + class, declaration));
 				}
 				None => {}
 			}
@@ -1811,19 +1810,16 @@ impl Style {
 	/// sheet, and applying the style would be silence rather than a wrong
 	/// colour. Application is the last place that can still say so: every path
 	/// that dresses an element (`styled`, `bind_styled`, the element syntax's
-	/// class attribute) renders its classes through here. The scan is its own
-	/// pass over `keys()` and costs one prefix test per slot — `entries()` would
-	/// walk both halves at once, but it hands a `Map<K, (A, B)>`'s pairs out in
-	/// the GENERIC tuple layout, which a caller that knows the types reads flat.
+	/// class attribute) renders its classes through here. It costs one prefix
+	/// test per slot inside the walk that was already happening, which is why
+	/// `not` marks the class as well as the condition.
 	fun class_list(self): str {
-		for key in self.rules.keys() {
-			if key_is_marked(key) {
-				panic("this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style — attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))");
-			}
-		}
 		mut out = "";
 		for entry in self.rules.values() {
 			let (class, _declaration) = entry;
+			if token_is_negated(class) {
+				panic("this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style — attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))");
+			}
 			if out == "" {
 				out = class;
 			} else {
