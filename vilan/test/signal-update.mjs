@@ -89,7 +89,8 @@ function dispose(self, $L) {
 		}
 	}
 	self[0].v = kept;
-	const $M = $L;
+	const ambient = $L;
+	const $M = ambient;
 	let $N = null;
 	if ($M[0] === 0) {
 		const turn = $M[1];
@@ -111,7 +112,11 @@ function dispose(self, $L) {
 	if ($O[0] === 0) {
 		const release = $O[1];
 		self[2].v = [ 1 ];
-		release();
+		releasing_turns.v.push(ambient);
+		__with_finally(release, () => {
+			__list_pop(releasing_turns.v);
+			return;
+		});
 		$P = undefined;
 	} else {
 		$P = undefined;
@@ -273,6 +278,7 @@ function $V(self, transform, $W) {
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
+const releasing_turns = __shared_new([  ]);
 const owner = new4();
 const todos = $a([ 1, 2 ]);
 $c(todos, (list) => {

@@ -2460,3 +2460,103 @@ fn b291_a_lease_taken_after_its_owner_died_leaves_the_server_forwarding_nothing(
         "the late mirror lease went differently:\n{stdout}"
     );
 }
+
+/// B283: a lease taken OUTSIDE every turn and disposed-and-rebuilt inside one.
+const OUTSIDE_IN_LEASE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Disposable, FlushPolicy, Signal, SignalCell, turn };
+import std::rpc::{ DuplexEnd, ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+
+fun counted_link(up: Shared<i32>, down: Shared<i32>): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		up.write() = up.read() + 1;
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| {
+		down.write() = down.read() + 1;
+		client_relay.send(frame);
+	});
+	(client_end, server_end)
+}
+
+fun main() {
+	let up: Shared<i32> = Shared::new(0);
+	let down: Shared<i32> = Shared::new(0);
+	let (client_end, server_end) = counted_link(up, down);
+	let session = ReactiveServer::new(server_end, json_codec());
+	let client = ReactiveClient::new(client_end, json_codec());
+	let cell: SignalCell<i32> = Signal::new(1);
+	// A HAND-WIRED mirror, deliberately: it has no origin, so `flush_close`
+	// sends at the settle with no microtask hop behind it. The hop is what
+	// hides this defect on a dynamic mirror; this measures the settle itself.
+	let mirror: RemoteSource<i32> = client.source(session.expose(cell));
+
+	// The lease is taken outside every turn — the top of `main`, a
+	// module-level binding, a handle fetched before the first event.
+	let outside = mirror.sub(|value| print(i"outside:{value}"));
+	print(i"leased:up={up.read()} down={down.read()} live={session.live.read().len()}");
+
+	// ... and disposed-and-rebuilt INSIDE one, which the guide promises churns
+	// nothing.
+	up.write() = 0;
+	down.write() = 0;
+	turn(FlushPolicy::AtEnd, || {
+		outside.dispose();
+		let refreshed = mirror.sub(|value| print(i"same-turn:{value}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"same-turn:up={up.read()} down={down.read()} live={session.live.read().len()}");
+
+	// The CONTROL: a lease born INSIDE a turn and rebuilt inside another has
+	// always been free, and must stay so.
+	up.write() = 0;
+	down.write() = 0;
+	mut inside_handle = turn(FlushPolicy::AtEnd, || mirror.sub(|value| print(i"inside:{value}")));
+	turn(FlushPolicy::AtEnd, || {
+		inside_handle.dispose();
+		let again = mirror.sub(|value| print(i"inside-again:{value}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"control:up={up.read()} down={down.read()} live={session.live.read().len()}");
+	print("done");
+}
+"#;
+
+#[test]
+fn b283_a_lease_born_outside_a_turn_still_rebuilds_inside_one_for_free() {
+    // B283. `release` is reached through the subscription's stored release
+    // hook, and a stored closure reads the turn it captured AT CREATION (spec
+    // §8.4's context rule). A lease born outside every turn therefore deferred
+    // its `Unsubscribe` against NO turn, sent it inline, and the re-`sub` a
+    // line later re-opened the channel: `same-turn:up=2 down=1` for a rebuild
+    // the guide promises churns nothing. The promise held only for a
+    // subscription that happened to be born inside the turn it is rebuilt in —
+    // the `control` line, which was already free and still is.
+    //
+    // The fix is the narrow one: `Subscription::dispose` publishes the turn
+    // ambient at the RELEASE (`releasing_turns`), and the mirror's release path
+    // says `at_release_settle` instead of `at_settle`. `at_settle`'s own rule
+    // is untouched, which is what keeps the four A25 markdown pins and the
+    // captured-at-creation rule for a `set` from a stored callback intact.
+    let stdout = run_program("outsidein", OUTSIDE_IN_LEASE);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "outside:1",
+            "leased:up=1 down=1 live=1",
+            "same-turn:1",
+            // Was `up=2 down=1`.
+            "same-turn:up=0 down=0 live=1",
+            "inside:1",
+            "inside-again:1",
+            "control:up=0 down=0 live=1",
+            "done",
+        ],
+        "the outside-in lease's same-turn rebuild went differently:\n{stdout}"
+    );
+}

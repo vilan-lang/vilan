@@ -87,7 +87,8 @@ function dispose(self, $q) {
 		}
 	}
 	self[0].v = kept;
-	const $r = $q;
+	const ambient = $q;
+	const $r = ambient;
 	let $s = null;
 	if ($r[0] === 0) {
 		const turn = $r[1];
@@ -109,7 +110,11 @@ function dispose(self, $q) {
 	if ($t[0] === 0) {
 		const release = $t[1];
 		self[2].v = [ 1 ];
-		release();
+		releasing_turns.v.push(ambient);
+		__with_finally(release, () => {
+			__list_pop(releasing_turns.v);
+			return;
+		});
 		$u = undefined;
 	} else {
 		$u = undefined;
@@ -301,6 +306,7 @@ function $ad(self, observer) {
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
+const releasing_turns = __shared_new([  ]);
 const count = $a(1);
 const eager = $c(count, (value) => {
 	return console.log("sub " + value);

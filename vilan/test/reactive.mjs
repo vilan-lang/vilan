@@ -79,7 +79,8 @@ function dispose(self, $z) {
 		}
 	}
 	self[0].v = kept;
-	const $A = $z;
+	const ambient = $z;
+	const $A = ambient;
 	let $B = null;
 	if ($A[0] === 0) {
 		const turn = $A[1];
@@ -101,7 +102,11 @@ function dispose(self, $z) {
 	if ($C[0] === 0) {
 		const release = $C[1];
 		self[2].v = [ 1 ];
-		release();
+		releasing_turns.v.push(ambient);
+		__with_finally(release, () => {
+			__list_pop(releasing_turns.v);
+			return;
+		});
 		$D = undefined;
 	} else {
 		$D = undefined;
@@ -231,6 +236,7 @@ function $L(self, transform, $M) {
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
+const releasing_turns = __shared_new([  ]);
 const owner = new2();
 const count = $a(0);
 const doubled = $c(count, (n) => {

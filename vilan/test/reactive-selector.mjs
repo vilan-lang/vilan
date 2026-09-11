@@ -93,7 +93,8 @@ function dispose(self, $C) {
 		}
 	}
 	self[0].v = kept;
-	const $D = $C;
+	const ambient = $C;
+	const $D = ambient;
 	let $E = null;
 	if ($D[0] === 0) {
 		const turn = $D[1];
@@ -115,7 +116,11 @@ function dispose(self, $C) {
 	if ($F[0] === 0) {
 		const release = $F[1];
 		self[2].v = [ 1 ];
-		release();
+		releasing_turns.v.push(ambient);
+		__with_finally(release, () => {
+			__list_pop(releasing_turns.v);
+			return;
+		});
 		$G = undefined;
 	} else {
 		$G = undefined;
@@ -348,6 +353,7 @@ function $aj(body, $ak) {
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
+const releasing_turns = __shared_new([  ]);
 const current = $a(1);
 const selected = $c(current, [ 1 ], [ 1 ]);
 const rows = new3();

@@ -479,6 +479,7 @@ fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T
 fun batch<T>(body: (sync || T) context turn_scope): T   // join or create
 fun flush()                                             // drain the ambient turn now
 fun at_settle(id: i32, action: || void)                 // run `action` at the ambient settle; now if none
+fun at_release_settle(id: i32, action: || void)          // the same, from a subscription's release hook
 ```
 
 Inside a turn, signal writes are recorded and each subscriber runs once with
@@ -496,6 +497,14 @@ called from inside a settle, and runs inline when no turn is ambient. It is
 the primitive under a remote mirror's deferred `Unsubscribe`
 (`std::rpc`); library code that wants "after this turn, once" uses it with
 an id that cannot collide with a subscriber's (`fresh_id()` mints one).
+
+"Ambient" is the context rule's: reached through a **stored closure** — an
+owner's cleanup, a subscription's release hook — the turn `at_settle` sees is
+the one that closure captured when it was created. That is right for a write
+from a stored callback and wrong for a RELEASE, which belongs to whoever
+disposed the subscription and not to whoever took it; `at_release_settle` is
+the release hook's spelling, and it resolves against the turn ambient at the
+`dispose`. Outside a release hook the two are the same function.
 
 **If an observer throws**, the settle is abandoned at that observer — the rest
 of the wave does not run — and the error keeps unwinding out of the write that
