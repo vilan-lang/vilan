@@ -41,7 +41,20 @@
 //!    from its target could not be narrowed at all, so every use of it was
 //!    dropped and the symbol vanished from the editor. An alias is a
 //!    definition of its own now (`Program::import_aliases`), and the invariant
-//!    has no exception left.
+//!    has no LICENSED exception left.
+//!
+//!    It has two known BREACHES, which is a different thing and is E158's
+//!    find. The invariant's pin used to check only the entry file's rows,
+//!    because the entry's text was the only one it had in hand; it reads every
+//!    loaded module now, and over std's closure it turns up two texts that are
+//!    not their definition's name — `pkg` recorded against the package root
+//!    module, and `Self` recorded against its trait. Both are KEYWORDS, both
+//!    survive `narrow`'s exact check by being the same LENGTH as the name they
+//!    are attributed to (`pkg`/`std`, `Self`/`Wire`), and both would be
+//!    rewritten by a rename. They are enumerated at `KEYWORD_SPELLED_ROWS` so
+//!    a third reds, and the fix is at the analyzer's recording site rather
+//!    than here: this index has no source text at build time and deliberately
+//!    pays for none, so it cannot tell a keyword from an identifier.
 //! 2. **No two rows share a span IN A FILE.** The analyzer records some
 //!    references more than once (a struct's constructor name lands in both
 //!    `type_references` and `struct_initializer_to_def`; a match pattern's
@@ -1109,6 +1122,38 @@ fun main(): i32 {
         found.into_iter().map(|(_, text)| text).collect()
     }
 
+    /// The two texts a row is allowed to cover that are NOT its definition's
+    /// name, and they are a DEFECT this sweep found rather than a licence
+    /// (E158, from B264's ask).
+    ///
+    /// Both are the same mistake: a KEYWORD recorded as a reference to the
+    /// entity it denotes, surviving [`narrow`]'s exact check because it happens
+    /// to be the same LENGTH as that entity's name. E145 named this hazard
+    /// exactly — "an alias whose name happened to be the same length survived,
+    /// spelling its target's name back at INVARIANT 1" — and these two are it,
+    /// in the analyzer's recording rather than in the alias table:
+    ///
+    /// - **`pkg`**, the origin segment of an import inside a package's own
+    ///   sources, recorded against the package ROOT module, whose name is the
+    ///   package's (`std`, 3 bytes, exactly `pkg`'s). Forty-odd rows across
+    ///   `vilan/std/src`.
+    /// - **`Self`**, recorded against the trait it stands for — `Wire`, 4
+    ///   bytes, exactly `Self`'s. One row in `wire.vl`.
+    ///
+    /// Neither is an identifier anybody declared, so neither may ever be
+    /// rewritten: a rename of a 3-letter package or a 4-letter trait would
+    /// rewrite `pkg` and `Self` into the new name and break the build — B264's
+    /// class, reached by a different road. A package or trait of any other
+    /// length is merely INCOMPLETE instead: the length check drops the row, the
+    /// drop is counted, and rename refuses.
+    ///
+    /// The fix is at the RECORDING site (`analyzer.rs`), not here — the index
+    /// has no source text at build time and by design pays for none, so it
+    /// cannot tell a keyword from an identifier. Listed rather than skipped
+    /// silently so that a THIRD such text reds this pin, which is the whole
+    /// point of a sweep.
+    const KEYWORD_SPELLED_ROWS: &[&str] = &["pkg", "Self"];
+
     // --- The invariants ------------------------------------------------
 
     // INVARIANT 1. Every row covers exactly an identifier — its text is the
@@ -1124,21 +1169,120 @@ fun main(): i32 {
         let index = document.reference_index();
         assert!(!index.rows().is_empty(), "the pin needs a populated index");
         let mut checked = 0;
+        let mut keyword_spelled = 0;
+        // EVERY source, not only the entry (E158). The entry's text was the
+        // only one "on hand" while this read `MATRIX` directly — but every
+        // other module the program loaded is a file on disk, `source_path`
+        // names it, and the rows that come from those files are the ones the
+        // derived-span tables produce most of. Reading them turns a
+        // one-fixture check into a sweep over the whole std closure: ~30k rows
+        // instead of ~70, and every `Anchor::Start` / `Anchor::End` narrowing
+        // in it verified against the bytes it claims.
+        let mut texts: HashMap<SourceId, String> = HashMap::new();
         for row in index.rows() {
-            if row.source != SourceId(0) {
-                continue; // only the entry file's text is on hand here
+            // A derive-generated row indexes a TEMPLATE no file holds (E144),
+            // so there are no bytes to check it against — the same boundary
+            // invariant 2 stops at.
+            if row.source == DERIVED_SOURCE {
+                continue;
             }
+            let text = match texts.get(&row.source) {
+                Some(text) => text,
+                None => {
+                    let Some(path) = program.source_path(row.source) else {
+                        continue;
+                    };
+                    let Ok(read) = std::fs::read_to_string(path) else {
+                        continue;
+                    };
+                    texts.entry(row.source).or_insert(read)
+                }
+            };
             let name = name_of(program, row.definition).expect("a named definition");
-            let text = MATRIX
-                .get(row.span.into_range())
-                .unwrap_or_else(|| panic!("span {:?} is outside the entry text", row.span));
+            let text = text.get(row.span.into_range()).unwrap_or_else(|| {
+                panic!(
+                    "span {:?} is outside {:?}'s text",
+                    row.span,
+                    program.source_path(row.source)
+                )
+            });
+            if text != name && KEYWORD_SPELLED_ROWS.contains(&text) {
+                keyword_spelled += 1;
+                continue;
+            }
             assert_eq!(
                 text, name,
                 "row {row:?} covers {text:?}, which is not the identifier {name:?}",
             );
             checked += 1;
         }
-        assert!(checked > 20, "expected a broad sample, checked {checked}");
+        assert!(
+            checked > 1000,
+            "expected the whole loaded closure, checked {checked}"
+        );
+        assert!(
+            keyword_spelled > 0,
+            "no keyword-spelled row was found at all — either the defect below \
+             was fixed (delete KEYWORD_SPELLED_ROWS and this assertion with it) \
+             or the sweep stopped reaching std's import heads"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The DERIVED-span sweep, by name (E158, the enumeration B264 asked for).
+    ///
+    /// Every row's span comes from a table, and the tables fall into two kinds.
+    /// Most store a span that IS the identifier — a declaration's `name_span`,
+    /// `member_name_spans`, `type_references`, `struct_initializer_field_spans`
+    /// — and those rows are [`Anchor::Exact`]. Three DERIVE their identifier
+    /// from a longer span by arithmetic on a guaranteed syntactic shape, and
+    /// those are where a wrong assumption cannot be caught by a length check:
+    ///
+    ///   1. a payload variant DECLARATION (`Box2(i32, i32)`), whose `span_map`
+    ///      entry covers the payload — [`Anchor::Start`];
+    ///   2. a qualified reference (`Point::origin`, `Shape::Dot`), whose node
+    ///      ends at the member's own end token — [`Anchor::End`];
+    ///   3. a struct-initializer head (`Point { x = 1 }`), whose span is the
+    ///      whole initializer — [`Anchor::Start`].
+    ///
+    /// B264 was (3) getting an alias's bytes and a target's name length. This
+    /// pin is the record that the list is THREE and that each one lands on its
+    /// identifier, so a fourth derived table added later has an obvious place
+    /// to be added and an obvious pin to fail. The bytes themselves are checked
+    /// by [`every_indexed_span_covers_exactly_an_identifier`] above, over the
+    /// whole loaded closure; this one says WHICH SHAPES exist.
+    #[test]
+    fn every_derived_span_shape_lands_on_its_identifier() {
+        let (dir, document) = matrix();
+        let index = document.reference_index();
+        // (text, is_declaration) for the row at the offset `needle` + `delta`.
+        let row_at = |needle: &str, delta: usize| -> (String, bool) {
+            let offset = at(needle, delta);
+            let row = index
+                .at(SourceId(0), offset)
+                .unwrap_or_else(|| panic!("no row at {needle:?} + {delta}"));
+            (
+                MATRIX
+                    .get(row.span.into_range())
+                    .expect("a span inside the entry")
+                    .to_string(),
+                row.is_declaration,
+            )
+        };
+        // 1. The payload variant declaration: the name leads a span that runs
+        //    to the closing paren.
+        assert_eq!(row_at("Box2(i32, i32)", 1), ("Box2".to_string(), true));
+        // 2. The qualified reference: the identifier is the tail of the path,
+        //    and the segment BEFORE it is its own exact row.
+        assert_eq!(row_at("Point::origin()", 8), ("origin".to_string(), false));
+        assert_eq!(row_at("Point::origin()", 1), ("Point".to_string(), false));
+        assert_eq!(row_at("Shape::Dot;", 7), ("Dot".to_string(), false));
+        // 3. The struct-initializer head: the name leads a span that runs to
+        //    the closing brace — B264's own shape.
+        assert_eq!(
+            row_at("Point { x = 1, y = 2 }", 1),
+            ("Point".to_string(), false)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

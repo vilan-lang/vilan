@@ -2621,6 +2621,20 @@ impl Document {
     /// which names the entry file and holds no children, so the submodule
     /// scope is what separates them. A directory node exists BECAUSE a child
     /// path asked for it, so a namespace always has one.
+    ///
+    /// **E158 asked whether a third such entity had appeared, and the
+    /// enumeration answers better than "no".** Over both package shapes — a
+    /// single-file package and one with nested bodiless directories — the
+    /// entry-attributed set is EXACTLY the bodiless namespaces, with no second
+    /// member at all, and the origin roots (`pkg`, `std`, a dependency's name)
+    /// are excluded because they carry NO source rather than by the
+    /// children-scope clause. So the thin discriminator currently discriminates
+    /// against nothing, which is the safest state it can be in and not one to
+    /// disturb with an invented marker. The answer is a GATE rather than a
+    /// sentence that was true once:
+    /// `every_entry_attributed_module_is_a_bodiless_namespace` reds the moment
+    /// a second kind appears, and whoever adds it decides the marker with the
+    /// real case in hand.
     fn is_namespace_module(&self, program: &Program, id: Id) -> bool {
         program.modules.contains_key(&id)
             && program.module_children_scopes.contains_key(&id)
@@ -14429,6 +14443,86 @@ fun main() {
                 "fun label(): str {\n\t\"w\"\n}\n\nfun wide(): i32 {\n\t1\n}\n",
             ),
         ])
+    }
+
+    /// E158's half of the namespace question. `is_namespace_module`
+    /// discriminates on "a module attributed to `SourceId(0)` that has a
+    /// children scope and an empty span", which is thin — it separates its
+    /// subject from the rest by facts each happens to have rather than by a
+    /// marker either one carries. The sweep asked whether a THIRD such entity
+    /// had appeared and wants a marker if so.
+    ///
+    /// It has not, and the enumeration turned up something better than a
+    /// "no": over both package shapes — a single-file package and one with
+    /// nested bodiless directories — the entry-attributed set is EXACTLY the
+    /// bodiless namespaces, with no second member at all, and the origin roots
+    /// (`pkg`, `std`, a dependency's name) are excluded by carrying NO source
+    /// at all rather than by the children-scope clause. So the thin
+    /// discriminator is not currently discriminating against anything, which
+    /// is the safest state it can be in and not one to disturb with an
+    /// invented marker.
+    ///
+    /// This runs on every suite instead of being a sentence that was true
+    /// once: a second kind of entry-attributed module reds here, and whoever
+    /// adds it decides the marker with the real case in hand.
+    #[test]
+    fn every_entry_attributed_module_is_a_bodiless_namespace() {
+        // (label, workspace, the bodiless namespaces it should produce)
+        let single = analyze_workspace(&[("main.vl", "fun main() {}\n")]);
+        let nested = e152_workspace();
+        for (label, (dir, document), expected) in [
+            ("a single-file package", single, Vec::new()),
+            ("nested bodiless directories", nested, vec!["lib", "ui"]),
+        ] {
+            let program = document.program.as_ref().expect("program");
+            let mut namespaces: Vec<&str> = Vec::new();
+            let mut origin_roots: Vec<&str> = Vec::new();
+            for (id, module) in &program.modules {
+                match program.source_of(*id) {
+                    // An ORIGIN root names no file and holds no span: it is
+                    // the head of a path, not a module anyone wrote.
+                    None => {
+                        assert!(
+                            !program.module_children_scopes.contains_key(id)
+                                && !program.span_map.contains_key(id),
+                            "{label}: the origin root {:?} grew a children scope or a \
+                             span, so `source_of` is no longer what excludes it from \
+                             `is_namespace_module`",
+                            module.name
+                        );
+                        origin_roots.push(module.name);
+                    }
+                    Some(SourceId(0)) => {
+                        assert!(
+                            program.module_children_scopes.contains_key(id)
+                                && program
+                                    .span_map
+                                    .get(id)
+                                    .is_none_or(|span| span.start == span.end),
+                            "{label}: a SECOND kind of entry-attributed module appeared \
+                             — {:?} is attributed to the entry but is not a bodiless \
+                             namespace. `is_namespace_module`'s discriminator now has \
+                             something to get wrong: give the namespace a real marker, \
+                             with this case in hand",
+                            module.name
+                        );
+                        namespaces.push(module.name);
+                    }
+                    // A module loaded from its own file: not this pin's subject.
+                    Some(_) => {}
+                }
+            }
+            namespaces.sort();
+            assert_eq!(namespaces, expected, "{label}: the bodiless namespaces");
+            origin_roots.sort();
+            assert_eq!(
+                origin_roots,
+                vec!["pkg", "std"],
+                "{label}: the origin roots, which carry no source and are excluded \
+                 by that and not by the children clause"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
