@@ -9638,3 +9638,137 @@ fn b267_a_read_whose_binding_a_closure_captures_copies() {
     }
     assert_compiles_and_runs(source, "3\n");
 }
+
+// --- E157: `::` after a block-like form is its own refusal ---------------------
+//
+// B248/B259's message earns its keep with its STEER, and a steer has to be a
+// fix. `(match x { .. }) + 1` and `(match x { .. }).to_str()` parse — B231
+// admits the form inside parentheses — and `(match x { .. })::foo` does not,
+// because `::` reaches into a NAMESPACE and what stands to its left is a name,
+// not a value. So the one continuation with no parenthesized spelling was the
+// one being sent to parentheses, and the author's next keystroke bought them a
+// second parse error.
+
+#[test]
+fn e157_a_path_after_a_match_head_says_a_path_cannot_start_at_a_value() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    // The steer that is not a fix here is gone from this shape specifically.
+    assert_fails_without(source, "is COMPLETE at its closing brace");
+}
+
+#[test]
+fn e157_the_same_refusal_after_an_if_head() {
+    let source = r#"
+        fun main() {
+            let c = true;
+            if c { 1 } else { 2 }::Bar::baz();
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    assert_fails_without(source, "is COMPLETE at its closing brace");
+}
+
+#[test]
+fn e157_the_same_refusal_after_a_bare_block_head() {
+    let source = r#"
+        fun main() {
+            { 1 }::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    assert_fails_without(source, "is COMPLETE at its closing brace");
+}
+
+// B259's other three positions take the `::` rule too — the rule is about the
+// FORM, not about the statement, which is the whole of what B259 established.
+#[test]
+fn e157_a_let_initializer_takes_the_path_refusal() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            let y = match x { 1 => 1, _ => 2 }::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    assert_fails_without(source, "expected `;` to end this statement");
+}
+
+#[test]
+fn e157_an_argument_position_takes_the_path_refusal() {
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            let x = 1;
+            print(match x { 1 => 1, _ => 2 }::foo);
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+}
+
+// The counterweight, and the reason this is a SECOND rule rather than a reworded
+// first: every other continuation still gets the parenthesize steer, which is
+// still a fix for it.
+#[test]
+fn e157_an_operator_after_a_block_like_head_keeps_the_parenthesize_steer() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 } + 1;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "`::` reaches into a NAMESPACE");
+}
+
+#[test]
+fn e157_a_dot_chain_after_a_block_like_head_keeps_the_parenthesize_steer() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }.to_string();
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "`::` reaches into a NAMESPACE");
+}
+
+// One diagnostic, not two: a `.` chain followed by a `::` is refused once, by
+// the rule the FIRST continuation earned.
+#[test]
+fn e157_a_chain_then_a_path_is_refused_exactly_once() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }.to_string()::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "`::` reaches into a NAMESPACE");
+}
+
+// The path spelling the refusal points at, running: a `match` that ENDED the
+// statement before, and an ordinary path on the line after it.
+#[test]
+fn e157_the_separated_spelling_is_accepted() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        enum Colour { Red, Green }
+        fun main() {
+            let x = 1;
+            match x { 1 => print("one"), _ => print("other") }
+            let c = Colour::Green;
+            match c { Colour::Red => print("red"), Colour::Green => print("green") }
+        }
+        "#,
+        "one\ngreen\n",
+    );
+}
