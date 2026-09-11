@@ -162,6 +162,27 @@ impl Element {
 	[extern(method, "appendChild")]
 	external fun append_text(self, child: Text): void;
 
+	/// Inserts `child` immediately BEFORE `anchor`, which must be a child of
+	/// this element (`element.insertBefore(child, anchor)`) — the positional
+	/// counterpart to `append`, and what `std::ui`'s `Region` is built on.
+	///
+	/// Like `append`, this MOVES a node that is already in the document
+	/// rather than copying it, so re-inserting a live element is how a run of
+	/// children is re-ordered.
+	///
+	/// The anchor is a `Text` because that is the marker std plants — an
+	/// EMPTY text node, never a comment. The reasons are both about what the
+	/// node is worth outside the DOM: an empty text node serializes to
+	/// nothing, so a browser tree and the `@process` twin's HTML string stay
+	/// byte-comparable (a `<!---->` would not), and the `Source<str>` child
+	/// arm has planted empty text nodes since it shipped, so this is the
+	/// marker the estate already has rather than a second kind. A comment
+	/// would read better in devtools; if hydration ever needs to FIND the
+	/// markers in served markup, that is the trade to revisit and the one
+	/// argument that would win.
+	[extern(method, "insertBefore")]
+	external fun insert_before(self, child: Element, anchor: Text): void;
+
 	/// Removes the element from the document (`element.remove()`).
 	[extern(method, "remove")]
 	external fun remove(self): void;
@@ -419,6 +440,12 @@ impl Text {
 	/// Replaces the node's text (`node.textContent = text`).
 	[extern(set, "textContent")]
 	external fun set_text(self, text: str): void;
+
+	/// Removes the node from the document (`node.remove()`) — `Element`'s
+	/// `remove` for a text node, which is what a `std::ui` `Region` does with
+	/// its anchor when the boundary holding it is disposed.
+	[extern(method, "remove")]
+	external fun remove(self): void;
 }
 
 /// A DOM event, as delivered to an `on_event` handler — an opaque handle like

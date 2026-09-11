@@ -151,7 +151,7 @@ fun main() {
 /// The DOM/history stub plus the behavioral assertions, run under node against
 /// the compiled bundle. Prints one `ok - ..` line per assertion; exits 1 on
 /// any failure.
-const HARNESS: &str = r#"class StubElement {
+const HARNESS: &str = r##"class StubElement {
     constructor(tag) {
         this.tagName = tag;
         this.children = [];
@@ -176,6 +176,16 @@ const HARNESS: &str = r#"class StubElement {
         child.parent = this;
         this.children.push(child);
     }
+    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
+    // plants an empty text node and inserts its content BEFORE it, so a
+    // reactive run keeps its place among static siblings.
+    insertBefore(child, anchor) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        const at = this.children.lastIndexOf(anchor);
+        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+        return child;
+    }
     remove() {
         if (this.parent) {
             this.parent.children = this.parent.children.filter(c => c !== this);
@@ -192,20 +202,38 @@ const HARNESS: &str = r#"class StubElement {
         for (const h of (this.listeners.click || [])) h(event);
         return event;
     }
+    // The walk skips TEXT nodes: a `Region`'s anchor (A71) is one, and this
+    // asks an element question.
     find(predicate) {
         if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
+        for (const c of this.children) { const hit = c.find && c.find(predicate); if (hit) return hit; }
         return null;
     }
     render() {
-        const kids = this.children.map(c => c.render()).join("");
+        const kids = this.children.map(c => (c.render ? c.render() : c.textContent)).join("");
         return `<${this.tagName}>${this._text}${kids}</${this.tagName}>`;
+    }
+}
+
+/// A text node — a real sibling of the element children: what a `str` or a
+/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
+/// the anchor it inserts before (A71).
+class StubText {
+    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
+    set textContent(text) { this._text = text; }
+    get textContent() { return this._text; }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
     }
 }
 
 const root = new StubElement("div");
 global.document = {
     createElement: (tag) => new StubElement(tag),
+    createTextNode: (text) => new StubText(text),
     getElementById: (id) => (id === "app" ? root : null),
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -226,7 +254,10 @@ const assert = (cond, msg) => {
 };
 
 const main = root.children[0];
-const page = () => main.children[main.children.length - 1];
+// A71: `swap` now renders at its OWN position in the chain — before the
+// region's empty text anchor, which is what the chain appended last. The page
+// is therefore the last ELEMENT child, not the last child.
+const page = () => main.children.filter(c => c.tagName !== "#text").pop();
 
 assert(page().tagName === "section" && page().textContent === "home", "initial route renders home");
 
@@ -280,7 +311,7 @@ for (const h of popstateHandlers) h({});
 assert(page().textContent === "/login", "popstate (back/forward) drives the same route signal");
 
 process.exit(failures === 0 ? 0 : 1);
-"#;
+"##;
 
 #[test]
 fn router_swap_link_and_history_semantics() {

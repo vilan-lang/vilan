@@ -137,7 +137,7 @@ main();
 "#;
 
 /// The DOM/history stub plus the canonical serializer (see the module doc).
-const HARNESS: &str = r#"const VOID = new Set(["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"]);
+const HARNESS: &str = r##"const VOID = new Set(["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"]);
 const escapeText = s => s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
 const escapeAttr = s => s.replaceAll("&","&amp;").replaceAll('"',"&quot;");
 
@@ -191,11 +191,42 @@ class StubElement {
         if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
         child.parent = this; this.children.push(child);
     }
+    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
+    // plants an empty text node and inserts its content BEFORE it, so a
+    // reactive run keeps its place among static siblings.
+    insertBefore(child, anchor) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        const at = this.children.lastIndexOf(anchor);
+        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+        return child;
+    }
     remove() { if (this.parent) { this.parent.children = this.parent.children.filter(c => c !== this); this.parent = null; } }
     replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
     addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
 }
+/// A text node — a real sibling of the element children: what a `str` or a
+/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
+/// the anchor it inserts before (A71).
+class StubText {
+    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
+    set textContent(text) { this._text = text; }
+    get textContent() { return this._text; }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
+    }
+}
+
 function serialize(el) {
+    // A71: a text node serializes as its text. A `Region`'s anchor is the
+    // EMPTY one, so it serializes to nothing — which is exactly what the
+    // process twin, which plants no anchor at all, writes there. That is the
+    // whole reason the anchor is an empty text node and not a comment: a
+    // `<!---->` would break this byte equality.
+    if (el instanceof StubText) return escapeText(el.textContent);
     let out = "<" + el.tagName;
     for (const [name, value] of el.attributes) out += ` ${name}="${escapeAttr(value)}"`;
     out += ">";
@@ -209,6 +240,7 @@ const root = new StubElement("app-root");
 global.document = {
     createElement: (tag) => new StubElement(tag),
     createElementNS: (ns, tag) => new StubElement(tag, ns),
+    createTextNode: (text) => new StubText(text),
     getElementById: (id) => (id === "app" ? root : null),
     querySelector: () => null, querySelectorAll: () => [],
 };
@@ -234,7 +266,9 @@ console.log(serialize(root.children[0]));
 // design, so this line sits deliberately OUTSIDE the tree comparison above.
 // Fire the theme button's handler and re-read the styled paragraph's class: the
 // binding is an ambient `effect`, so the attribute must follow the signal.
-const byId = (el, id) => el.attributes.some(([n, v]) => n === "id" && v === id)
+// `el.attributes &&`: the walk now meets TEXT nodes — a `Region`'s empty
+// anchor (A71) is one — and they carry no attribute list.
+const byId = (el, id) => el.attributes && el.attributes.some(([n, v]) => n === "id" && v === id)
     ? el
     : el.children.map(c => byId(c, id)).find(Boolean);
 const themed = byId(root, "themed");
@@ -245,7 +279,7 @@ if (!themed || !button) {
 }
 for (const handler of button.listeners.click || []) handler();
 console.log("AFTER " + themed.attributes.find(([n]) => n === "class")[1]);
-"#;
+"##;
 
 fn build(dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))

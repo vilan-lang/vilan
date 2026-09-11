@@ -367,6 +367,46 @@ impl View {
 	}
 }
 
+/// A POSITIONAL REGION, server side: the parent and the position, with NO
+/// ANCHOR — the marker node the browser twin plants renders as nothing here,
+/// which is the whole of the SSR story for A71.
+///
+/// It reads as a no-op and is not one: it is the SERVER'S ANSWER to the
+/// browser twin's anchor. The browser has to plant a node because its content
+/// arrives LATER, after siblings the chain added further down; a server render
+/// is one synchronous pass in source order, so the position a region opens at
+/// is still the end of the parent when the content is written — appending IS
+/// inserting before the anchor, and the served markup carries no marker for a
+/// client to trip over.
+///
+/// It is DECLARED here and not called from the methods below, deliberately.
+/// The twin-surface gate (E34, `std_twin_parity.rs`) holds the two halves to
+/// one set of names, so a `Region` in the browser twin is a `Region` here; and
+/// routing this file's `when`/`swap`/`bind_each` through it would change the
+/// bytes they emit — a corpus golden — to say in a second way exactly what
+/// `self.children.write().push(..)` already says. A85 (positional slots) is
+/// where the server side grows a reason to call it: its value forms `place`
+/// into a region on both twins.
+/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+struct Region {
+	parent: View,
+}
+
+impl Region {
+	/// Opens a region at `parent`'s current end.
+	fun open(parent: View): Region {
+		Region { parent }
+	}
+
+	/// Puts `child` at the end of the region.
+	fun insert(self, child: View) {
+		self.parent.children.write().push(Child::Element(child));
+	}
+
+	/// Drops the anchor — there is none to drop.
+	fun close(self) {}
+}
+
 /// Something that can fill a child position (proposal/element-syntax.md §5) —
 /// the type-directed half of `child`: the value's type carries the
 /// static-vs-tracked distinction; on this twin every arm reads once.
@@ -414,7 +454,9 @@ impl List<View> with Slot {
 
 /// A reactive element child, READ ONCE: the view the source holds at render
 /// time is the one served (B268). The browser twin replaces it on every
-/// change; here there is no later change to follow.
+/// change — through a `Region`, so the replacement keeps the hole's position
+/// (A71) — and here there is no later change to follow, so the value is
+/// written at its position directly and no anchor is served.
 impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Element(self.get()));
@@ -422,7 +464,9 @@ impl type S: Source<View> with Slot {
 }
 
 /// A reactive run of element children, read once — the `List<View>` arm's
-/// server end. KEEP IN STEP with the browser twin.
+/// server end, with the single-view arm's story above: the browser twin keeps
+/// the run in place through a `Region`, and a one-pass render needs no anchor
+/// to do the same. KEEP IN STEP with the browser twin.
 impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
 		let items: List<View> = self.get();

@@ -32,6 +32,7 @@ import pkg::dev::{ hmr_active, on_teardown };
 import pkg::dom::{
 	Element,
 	Event,
+	Text,
 	create_element,
 	create_element_ns,
 	create_text_node,
@@ -345,17 +346,21 @@ impl View {
 		key: sync |T| K,
 		render: (sync |T| View) context owner_scope,
 	): View {
-		let element = self.element;
+		// The rows keep THIS position among the parent's children (A71): the
+		// call sits where they belong, so the anchor goes down now and every
+		// row is inserted before it.
+		let region = Region::open(self);
 		let row_keys: Shared<List<K>> = Shared::new([]);
 		let row_items: Shared<List<T>> = Shared::new([]);
 		let row_views: Shared<List<View>> = Shared::new([]);
 		let row_owners: Shared<List<Owner>> = Shared::new([]);
 		// Whichever rows are live when the enclosing boundary is disposed go
-		// with it.
+		// with it, and the anchor goes with them.
 		get_owner().defer(|| {
 			for owner in row_owners.read() {
 				owner.dispose();
 			}
+			region.close();
 		});
 		source.effect(|list: List<T>| {
 			let plan = reconcile(row_keys.read(), row_items.read(), list, key, |before, after| {
@@ -392,10 +397,11 @@ impl View {
 				}
 				position += 1;
 			}
-			// The order pass: append each row in the new order — appending a
-			// kept element moves it; a fresh one inserts.
+			// The order pass: place each row in the new order, before the
+			// region's anchor — re-inserting a kept element moves it; a fresh
+			// one inserts.
 			for row in next_views {
-				element.append(row.element);
+				region.insert(row);
 			}
 			mut next_keys: List<K> = [];
 			for item in list {
@@ -455,7 +461,8 @@ impl View {
 		key: sync |T| K,
 		render: (sync |SignalCell<T>| View) context owner_scope,
 	): View {
-		let element = self.element;
+		// A region at this position, exactly as `bind_each` opens one (A71).
+		let region = Region::open(self);
 		let row_keys: Shared<List<K>> = Shared::new([]);
 		let row_items: Shared<List<T>> = Shared::new([]);
 		let row_cells: Shared<List<SignalCell<T>>> = Shared::new([]);
@@ -467,6 +474,7 @@ impl View {
 			for owner in row_owners.read() {
 				owner.dispose();
 			}
+			region.close();
 		});
 		source.effect(|list: List<T>| {
 			// A surviving key is ALWAYS kept: the row's cell carries the new
@@ -515,10 +523,10 @@ impl View {
 				}
 				position += 1;
 			}
-			// The order pass: appending a kept element moves it; a fresh one
-			// inserts.
+			// The order pass, before the region's anchor: re-inserting a kept
+			// element moves it; a fresh one inserts.
 			for row in next_views {
-				element.append(row.element);
+				region.insert(row);
 			}
 			mut next_keys: List<K> = [];
 			for item in list {
@@ -538,12 +546,18 @@ impl View {
 	/// false the owner is disposed and the content removed. Toggling back on
 	/// re-renders from scratch. (For a state-PRESERVING toggle, use `show`.)
 	fun when<S: Source<bool>>(self, condition: S, body: (sync || View) context owner_scope): View {
-		let element = self.element;
+		// The body lands at THIS position among the parent's children (A71),
+		// not at the end: the call sits where the conditional content
+		// belongs, so a `when` between two static siblings toggles on between
+		// them however the chain continues afterwards.
+		let region = Region::open(self);
 		let live_view: Shared<Option<View>> = Shared::new(None);
 		let live_owner: Shared<Option<Owner>> = Shared::new(None);
-		// Live content dies with the enclosing boundary.
+		// Live content dies with the enclosing boundary, and the anchor with
+		// it.
 		get_owner().defer(|| {
 			live_owner.read()?.dispose();
+			region.close();
 		});
 		condition.effect(|on| {
 			if on {
@@ -552,7 +566,7 @@ impl View {
 					None => {
 						let owner = Owner::new();
 						let built = run_with_owner(owner, body);
-						element.append(built.element);
+						region.insert(built);
 						live_view.write() = Some(built);
 						live_owner.write() = Some(owner);
 					},
@@ -594,13 +608,18 @@ impl View {
 		source: S,
 		render: (sync |T| View) context owner_scope,
 	): View {
-		let element = self.element;
+		// The rendered subtree keeps THIS position among the parent's
+		// children (A71): a page container between a header and a footer
+		// stays between them across every navigation.
+		let region = Region::open(self);
 		let last_value: Shared<Option<T>> = Shared::new(None);
 		let live_view: Shared<Option<View>> = Shared::new(None);
 		let live_owner: Shared<Option<Owner>> = Shared::new(None);
-		// The live subtree dies with the enclosing boundary.
+		// The live subtree dies with the enclosing boundary, and the anchor
+		// with it.
 		get_owner().defer(|| {
 			live_owner.read()?.dispose();
+			region.close();
 		});
 		source.effect(|value: T| {
 			let unchanged = match last_value.read() {
@@ -615,7 +634,7 @@ impl View {
 				}
 				let owner = Owner::new();
 				let built = run_with_owner(owner, || render(value));
-				element.append(built.element);
+				region.insert(built);
 				last_value.write() = Some(value);
 				live_view.write() = Some(built);
 				live_owner.write() = Some(owner);
@@ -916,6 +935,61 @@ fun clear_chunk_error() {
 	}
 }
 
+/// A POSITIONAL REGION: a run of sibling nodes that keeps its place among a
+/// parent's other children (A71). Everything reactive in this module owns
+/// such a run — `when`'s instantiation, `swap`'s subtree, `bind_each`'s rows,
+/// a `Source<View>` child's current view — and before this each of them
+/// APPENDED, so the first change moved the run behind whatever static
+/// siblings had been added after it.
+///
+/// The mechanism is one empty text node. `open` appends it at the parent's
+/// current end, which is the position the caller is standing at — the `when`
+/// / `swap` / `bind_each` call sits in the chain exactly where its content
+/// belongs, and a `Slot::place` runs at the `{hole}` it fills. Every later
+/// insertion goes BEFORE that anchor, so the run stays put however the
+/// parent grows afterwards.
+///
+/// A region does NOT own the views in it. Each form already tracks what it
+/// has live and disposes it (rows with their owners, a `when` body with
+/// its own), and duplicating that here would be a second copy of the same
+/// bookkeeping; `insert` is the one thing they share. What the region owns is
+/// the ANCHOR, and `close` removes it — called from the `defer` each form
+/// already registers with the enclosing boundary, so the marker dies with the
+/// content rather than outliving it as a stray node.
+///
+/// A85 (positional slots) is the design this serves: there, `when(..)` /
+/// `swap(..)` / `each(..)` become VALUES that create their region in
+/// `Slot::place`, and the parent methods below become one-line sugar over
+/// them. Nothing in this order changes a signature.
+/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+struct Region {
+	parent: Element,
+	anchor: Text,
+}
+
+impl Region {
+	/// Opens a region at `parent`'s current end — the caller's position in
+	/// the chain.
+	fun open(parent: View): Region {
+		let anchor = create_text_node("");
+		parent.element.append_text(anchor);
+		Region { parent = parent.element, anchor }
+	}
+
+	/// Puts `child` at the end of the region, before the anchor. A child that
+	/// is already in the document MOVES, which is what makes this the order
+	/// pass for a reconciled run as well as the insert for a fresh one.
+	fun insert(self, child: View) {
+		self.parent.insert_before(child.element, self.anchor);
+	}
+
+	/// Drops the anchor. The content is the caller's to dispose — see the
+	/// ownership note above.
+	fun close(self) {
+		self.anchor.remove();
+	}
+}
+
 /// Something that can fill a child position (proposal/element-syntax.md §5) —
 /// the type-directed half of `child`: the value's type carries the
 /// static-vs-tracked distinction, and ordinary trait dispatch decides what
@@ -1001,19 +1075,21 @@ impl List<View> with Slot {
 /// must be built and disposed per value; reach for this when the views are
 /// values the app already holds.
 ///
-/// POSITION: the replacement is APPENDED, like `when`'s and `swap`'s, so a
-/// `{signal}` followed by static siblings re-orders itself behind them on the
-/// first change. Put it last, or wrap it in an element of its own.
+/// POSITION: the view keeps the `{signal}`'s own place among its siblings
+/// (A71). The arm opens a `Region` where it is placed and inserts every
+/// replacement before that anchor, so a reactive element child in the middle
+/// of a chain stays in the middle — which is what `{expr}` means the same
+/// thing either way requires.
 impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
-		let element = parent.element;
+		let region = Region::open(parent);
 		let live: Shared<Option<View>> = Shared::new(None);
 		self.effect(|next: View| {
 			match live.read() {
 				Some(let previous) => previous.element.remove(),
 				None => {},
 			}
-			element.append(next.element);
+			region.insert(next);
 			live.write() = Some(next);
 		});
 	}
@@ -1028,17 +1104,18 @@ impl type S: Source<View> with Slot {
 /// surviving rows and rebuilds only what changed, and it is what a list of DATA
 /// wants. This one takes a list of VIEWS, which carries no key and no item to
 /// compare, so there is nothing to reconcile against; it is the grouping arm,
-/// with the same ownership story as the single-view arm above.
+/// with the same ownership story as the single-view arm above — and, with it,
+/// the same `Region`, so the whole run keeps the hole's position (A71).
 impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
-		let element = parent.element;
+		let region = Region::open(parent);
 		let live: Shared<List<View>> = Shared::new([]);
 		self.effect(|next: List<View>| {
 			for previous in live.read() {
 				previous.element.remove();
 			}
 			for item in next {
-				element.append(item.element);
+				region.insert(item);
 			}
 			live.write() = next;
 		});

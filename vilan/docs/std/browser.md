@@ -33,6 +33,7 @@ impl Element {
 	fun style_property(self, name: str): str           // style.getPropertyValue
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
+	fun insert_before(self, child: Element, anchor: Text)   // insertBefore — the positional append
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
@@ -78,6 +79,7 @@ impl Window {
 external struct Text;                // a text node — text only, no attributes
 impl Text {
 	fun set_text(self, text: str)                      // textContent =
+	fun remove(self)                                   // detach from the document
 }
 
 external struct Event;
@@ -282,6 +284,31 @@ too.
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
+
+**`Region` — how a reactive child keeps its place.**
+
+```vilan,fragment
+struct Region { parent: Element, anchor: Text }
+impl Region {
+	fun open(parent: View): Region   // plant the anchor at the parent's current end
+	fun insert(self, child: View)    // before the anchor — a live child MOVES
+	fun close(self)                  // drop the anchor
+}
+```
+
+Everything reactive above owns a *run* of sibling nodes: `when`'s
+instantiation, `swap`'s subtree, `bind_each`'s rows, a `Source<View>` child's
+current view. Each opens a region where it is **called** — an empty text node
+planted at that moment — and inserts its content before that anchor, so the
+run keeps its position however the chain grows afterwards. You rarely name
+this type; it is documented because the anchor is real, and because a walk
+over `element.children` will meet it.
+
+The anchor is an empty text node rather than a comment deliberately: it
+serializes to nothing, so a browser tree and the `@process` twin's HTML string
+stay byte-comparable. On the process side a `Region` plants no node at all — a
+server render is one pass in source order, so appending already *is* inserting
+before the anchor.
 
 ### A binding takes a `Source`, not a `Signal`
 

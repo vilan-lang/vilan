@@ -73,9 +73,15 @@ replacing anything when the row is disposed — but the views themselves
 arrive already built, so each one's own bindings belong to the scope
 that *constructed* it. Reach for `.swap(source, |value| …)` when every
 subtree must be built and disposed per value; reach for a `Source<View>`
-child when the views are values the app already holds. (A replacement is
-appended, like `when`'s and `swap`'s, so put a reactive element child
-last or wrap it in an element of its own.)
+child when the views are values the app already holds.
+
+**A reactive child keeps its place.** The replacement lands where the
+`{expr}` is written, not at the end of the parent — and so do `when`'s
+body, `swap`'s subtree and `bind_each`'s rows. Each plants an empty text
+node where it is called and inserts before it, so
+`<nav>{brand}{when(..)}{footer}</nav>` puts the conditional between the
+two, and it is still between them after it toggles off and on. No
+wrapper element, and nothing to remember about ordering.
 
 A `Source<List<View>>` is not a reconciler: it replaces the run rather
 than moving surviving rows. `bind_each` is the keyed form, and it is

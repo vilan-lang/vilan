@@ -80,6 +80,16 @@ class StubElement {
         child.parent = this;
         this.children.push(child);
     }
+    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
+    // plants an empty text node and inserts its content BEFORE it, so a
+    // reactive run keeps its place among static siblings.
+    insertBefore(child, anchor) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        const at = this.children.lastIndexOf(anchor);
+        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+        return child;
+    }
     remove() {
         if (this.parent) {
             this.parent.children = this.parent.children.filter(c => c !== this);
@@ -1757,5 +1767,363 @@ fn a60_the_ssr_twin_serves_a_hidden_element_with_the_inline_display_too() {
          <div style=\"--w:3rem;display:none\" hidden=\"\"></div>\n",
         "a hidden element must be served with both writes, and the inline \
          declaration must join whatever `style_var` already wrote"
+    );
+}
+
+// --- A71: every reactive child keeps its POSITION ---------------------------
+//
+// Before this, each reactive form APPENDED what it built, so the first change
+// moved its content behind whatever static siblings the chain added after it.
+// Each form now opens a `Region` where it is called — an empty text node
+// planted at that moment — and inserts before it. The claim these pins make is
+// always the same one: a document-order readout of the tree is UNCHANGED by
+// the change that rebuilt the content.
+
+/// The tree a flattened line names, in document order, as `tag'text'` tokens.
+///
+/// Empty text nodes are dropped, which is exactly the `Region` anchors: they
+/// are the mechanism, not the claim, and a pin that named them would fail the
+/// day the marker changes shape without anything a user can see having moved.
+/// `a71_the_anchor_is_an_empty_text_node` is where the mechanism itself is
+/// asserted.
+fn nodes(line: &str) -> Vec<String> {
+    line.split(' ')
+        .filter_map(|token| {
+            let text = token
+                .split_once('\'')
+                .map(|(_, rest)| rest.trim_end_matches('\''))
+                .unwrap_or("");
+            let tag = if token.starts_with("#text") {
+                "#text"
+            } else {
+                token.split('#').next().unwrap_or("")
+            };
+            if tag.is_empty() || (tag == "#text" && text.is_empty()) {
+                return None;
+            }
+            Some(if text.is_empty() {
+                tag.to_string()
+            } else {
+                format!("{tag}'{text}'")
+            })
+        })
+        .collect()
+}
+
+/// The `key=value` readouts a positional app prints, in order.
+fn readouts(stdout: &str) -> Vec<(String, Vec<String>)> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, tree)| (name.to_string(), nodes(tree)))
+        .collect()
+}
+
+const POSITION_HARNESS_TAIL: &str =
+    "\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n";
+
+/// A `{signal}` carrying a `View`, between two static siblings.
+const A71_ELEMENT_CHILD: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let mark: SignalCell<i32> = Signal::new(1);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("header").text("head"))
+			.child(mark.map(|n: i32| view("b").text(i"m{n}")))
+			.child(view("footer").text("foot"))
+	});
+	print(i"start={tree()}");
+	mark.set(2);
+	print(i"once={tree()}");
+	mark.set(3);
+	print(i"twice={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A71: the `Source<View>` child arm. The view the signal holds is replaced in
+/// place — twice, because the first replacement is the one that used to move
+/// it and the second is the one that would prove a marker had been consumed.
+#[test]
+fn a71_a_reactive_element_child_keeps_its_position_when_it_is_replaced() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a71_element_child", A71_ELEMENT_CHILD, &harness);
+    let seen = readouts(&stdout);
+    let expected = |mark: &str| {
+        vec![
+            "root".to_string(),
+            "main".to_string(),
+            "header'head'".to_string(),
+            format!("b'{mark}'"),
+            "footer'foot'".to_string(),
+        ]
+    };
+    assert_eq!(
+        seen,
+        vec![
+            ("start".to_string(), expected("m1")),
+            ("once".to_string(), expected("m2")),
+            ("twice".to_string(), expected("m3")),
+        ],
+        "a `{{signal}}` element child must stay between its siblings across \
+         every replacement; got:\n{stdout}"
+    );
+}
+
+/// A71's MECHANISM, asserted once: the marker a region keeps its place with is
+/// an EMPTY TEXT NODE, not a comment and not a wrapper element. An empty text
+/// node serializes to nothing, which is what keeps a browser tree and the
+/// `@process` twin's markup byte-comparable (`ssr_differential`).
+#[test]
+fn a71_the_anchor_is_an_empty_text_node() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a71_anchor", A71_ELEMENT_CHILD, &harness);
+    let start = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("start="))
+        .expect("the start line");
+    let raw: Vec<&str> = start.split(' ').collect();
+    let anchors: Vec<&&str> = raw
+        .iter()
+        .filter(|token| token.starts_with("#text#") && !token.contains('\''))
+        .collect();
+    assert_eq!(
+        anchors.len(),
+        1,
+        "exactly one empty text node — the region's anchor — should be in the \
+         tree; got {raw:?}"
+    );
+    let main_start = raw
+        .iter()
+        .position(|token| token.starts_with("main#"))
+        .expect("the main element");
+    let footer = raw
+        .iter()
+        .position(|token| token.starts_with("footer#"))
+        .expect("the footer");
+    let anchor = raw
+        .iter()
+        .position(|token| token.starts_with("#text#") && !token.contains('\''))
+        .expect("the anchor");
+    assert!(
+        main_start < anchor && anchor < footer,
+        "the anchor must sit at the hole's position, before the footer the \
+         chain appended after it; got {raw:?}"
+    );
+}
+
+/// `when` between two static siblings.
+const A71_WHEN: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let show: SignalCell<bool> = Signal::new(false);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("header").text("head"))
+			.when(show, || view("aside").text("cond"))
+			.child(view("footer").text("foot"))
+	});
+	print(i"off={tree()}");
+	show.set(true);
+	print(i"on={tree()}");
+	show.set(false);
+	print(i"off2={tree()}");
+	show.set(true);
+	print(i"on2={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A71: a `when` whose body used to land after every sibling the chain added
+/// later — the wrapper `<span>` A85 names as the cost — instantiates at its
+/// own place, and does so again after a full off/on cycle.
+#[test]
+fn a71_when_toggles_on_between_the_siblings_it_sits_between() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a71_when", A71_WHEN, &harness);
+    let off = vec![
+        "root".to_string(),
+        "main".to_string(),
+        "header'head'".to_string(),
+        "footer'foot'".to_string(),
+    ];
+    let on = vec![
+        "root".to_string(),
+        "main".to_string(),
+        "header'head'".to_string(),
+        "aside'cond'".to_string(),
+        "footer'foot'".to_string(),
+    ];
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("off".to_string(), off.clone()),
+            ("on".to_string(), on.clone()),
+            ("off2".to_string(), off),
+            ("on2".to_string(), on),
+        ],
+        "a `when` must mount its body at its own position, every time; \
+         got:\n{stdout}"
+    );
+}
+
+/// `bind_each` between a header row and a footer row, under every edit the
+/// reconciler distinguishes.
+const A71_ROWS: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+[derive(PartialEq)]
+struct Row {
+	id: i32,
+	label: str,
+}
+
+fun main() {
+	let rows: SignalCell<List<Row>> = Signal::new([
+		Row { id = 1, label = "a" },
+		Row { id = 2, label = "b" },
+	]);
+	let _root = mount_root("app", || {
+		view("ul")
+			.child(view("li").text("H"))
+			.bind_each(rows, |row: Row| row.id, |row: Row| view("li").text(row.label))
+			.child(view("li").text("F"))
+	});
+	print(i"start={tree()}");
+	rows.set([
+		Row { id = 1, label = "a" },
+		Row { id = 2, label = "b" },
+		Row { id = 3, label = "c" },
+	]);
+	print(i"insert={tree()}");
+	rows.set([Row { id = 1, label = "a" }, Row { id = 3, label = "c" }]);
+	print(i"remove={tree()}");
+	rows.set([Row { id = 3, label = "c" }, Row { id = 1, label = "a" }]);
+	print(i"reorder={tree()}");
+	rows.set([Row { id = 3, label = "C" }, Row { id = 1, label = "a" }]);
+	print(i"refresh={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A71: keyed rows stay between the header row and the footer row through an
+/// insert, a remove, a reorder and a value refresh — the four things the
+/// reconciler's order pass can do, each of which used to re-append the whole
+/// run after the footer.
+#[test]
+fn a71_bind_each_rows_stay_between_the_header_and_the_footer() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a71_rows", A71_ROWS, &harness);
+    let tree = |labels: &[&str]| {
+        let mut expected = vec!["root".to_string(), "ul".to_string(), "li'H'".to_string()];
+        for label in labels {
+            expected.push(format!("li'{label}'"));
+        }
+        expected.push("li'F'".to_string());
+        expected
+    };
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("start".to_string(), tree(&["a", "b"])),
+            ("insert".to_string(), tree(&["a", "b", "c"])),
+            ("remove".to_string(), tree(&["a", "c"])),
+            ("reorder".to_string(), tree(&["c", "a"])),
+            ("refresh".to_string(), tree(&["C", "a"])),
+        ],
+        "`bind_each`'s rows must stay between the header and the footer under \
+         every edit; got:\n{stdout}"
+    );
+}
+
+/// A `{signal}` carrying a `List<View>` — the reactive RUN arm — and a `swap`,
+/// each between two static siblings.
+const A71_RUN_AND_SWAP: &str = r#"import std::io::print;
+import std::range::Range;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let count: SignalCell<i32> = Signal::new(1);
+	let page: SignalCell<i32> = Signal::new(1);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("header").text("head"))
+			.child(count.map(|n: i32| {
+				mut run: List<View> = [];
+				for index in Range::new(0, n) {
+					run.push(view("i").text(i"g{index}"));
+				}
+				run
+			}))
+			.child(view("hr"))
+			.swap(page, |n: i32| view("section").text(i"p{n}"))
+			.child(view("footer").text("foot"))
+	});
+	print(i"start={tree()}");
+	count.set(3);
+	print(i"grown={tree()}");
+	page.set(2);
+	print(i"swapped={tree()}");
+	count.set(2);
+	page.set(3);
+	print(i"both={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A71: the `Source<List<View>>` arm and `swap`, in one tree, so the two
+/// regions have to keep their places from each other as well as from the
+/// static siblings around them.
+#[test]
+fn a71_a_reactive_run_and_a_swap_each_keep_their_own_place() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a71_run_swap", A71_RUN_AND_SWAP, &harness);
+    let tree = |run: usize, page: &str| {
+        let mut expected = vec![
+            "root".to_string(),
+            "main".to_string(),
+            "header'head'".to_string(),
+        ];
+        for index in 0..run {
+            expected.push(format!("i'g{index}'"));
+        }
+        expected.push("hr".to_string());
+        expected.push(format!("section'{page}'"));
+        expected.push("footer'foot'".to_string());
+        expected
+    };
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("start".to_string(), tree(1, "p1")),
+            ("grown".to_string(), tree(3, "p1")),
+            ("swapped".to_string(), tree(3, "p2")),
+            ("both".to_string(), tree(2, "p3")),
+        ],
+        "a reactive run and a `swap` must each stay where they were written; \
+         got:\n{stdout}"
     );
 }
