@@ -4510,13 +4510,22 @@ impl<'a, 'src> Parser<'a, 'src> {
         if !self.eat(&Token::Type) && !self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
             return None;
         }
+        let name_start = self.position;
         let name = self.eat_ident()?;
+        // The NAME's own span, the way `GenericParameter` carries one: the
+        // node's span reaches from the `type` keyword to the end of the bounds,
+        // and what the binder's ENTITY must be spanned by is the thing an
+        // editor selects for it (E161).
+        let name_span = self.span_from(name_start);
         let bounds = if self.eat_op(":") {
             self.parse_type_bounds()?
         } else {
             Vec::new()
         };
-        Some((Node::TypeBinder(name, bounds), self.span_from(start)))
+        Some((
+            Node::TypeBinder((name, name_span), bounds),
+            self.span_from(start),
+        ))
     }
 
     /// `A + B + …` — a `+`-separated bound list (≥1).
@@ -7170,7 +7179,7 @@ mod tests {
                     .0
                     .into_iter()
                     .map(|argument| match argument.0 {
-                        Node::TypeBinder(name, bounds) => (name, bounds.len()),
+                        Node::TypeBinder(name, bounds) => (name.0, bounds.len()),
                         other => panic!("expected a TypeBinder argument, got {other:?}"),
                     })
                     .collect::<Vec<_>>(),
@@ -7203,9 +7212,11 @@ mod tests {
         match only_item("fun f(value: _) { }") {
             Node::Func(function) => {
                 match &function.parameters.0[0].declared_type.as_ref().unwrap().0 {
-                    Node::TypeBinder(name, bounds) => {
+                    Node::TypeBinder((name, name_span), bounds) => {
                         assert_eq!(*name, "_");
                         assert!(bounds.is_empty());
+                        // The NAME's own span (E161), not the whole binder's.
+                        assert_eq!(name_span.into_range().len(), 1);
                     }
                     other => panic!("expected a TypeBinder annotation, got {other:?}"),
                 }

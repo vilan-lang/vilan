@@ -3249,7 +3249,7 @@ impl<'src> Printer<'src> {
             // read as. A NAMED binder keeps its keyword; there the keyword is
             // the only thing saying "this introduces a name" in a position that
             // otherwise reads a type.
-            Node::TypeBinder(name, bounds) => {
+            Node::TypeBinder((name, _name_span), bounds) => {
                 if *name != ANONYMOUS_TYPE_BINDER {
                     self.out.push_str("type ");
                 }

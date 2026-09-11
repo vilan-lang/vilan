@@ -24569,19 +24569,19 @@ impl<'src> Analyzer<'src> {
     /// they constrain registers, so the nested ones register FIRST.
     fn register_subject_binders(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) {
         match &node.0 {
-            Node::TypeBinder(name, bounds) => {
+            Node::TypeBinder((name, name_span), bounds) => {
                 for bound in bounds {
                     self.register_subject_binders(bound, scope_id);
                 }
-                let constraint_type_id = self.register_binder(name, &node.1, bounds, scope_id);
-                self.withdraw_anonymous_binder_name(name, &node.1, constraint_type_id, scope_id);
+                let constraint_type_id = self.register_binder(name, name_span, bounds, scope_id);
+                self.withdraw_anonymous_binder_name(name, name_span, constraint_type_id, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
                 let inherited = self.declared_generic_constraint_ids(subject_name, scope_id);
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
-                    if let Node::TypeBinder(binder_name, bounds) = &argument.0
+                    if let Node::TypeBinder((binder_name, binder_span), bounds) = &argument.0
                         && bounds.is_empty()
                     {
                         if let Some(constraint_id) = inherited
@@ -24590,13 +24590,13 @@ impl<'src> Analyzer<'src> {
                         {
                             self.register_generic_parameter(
                                 binder_name,
-                                &argument.1,
+                                binder_span,
                                 constraint_id,
                                 scope_id,
                             );
                             self.withdraw_anonymous_binder_name(
                                 binder_name,
-                                &argument.1,
+                                binder_span,
                                 constraint_id,
                                 scope_id,
                             );
@@ -24606,10 +24606,10 @@ impl<'src> Analyzer<'src> {
                             // unbounded and retrofit the inherited bound just
                             // before solving, when every declaration exists.
                             let fresh =
-                                self.register_binder(binder_name, &argument.1, &[], scope_id);
+                                self.register_binder(binder_name, binder_span, &[], scope_id);
                             self.withdraw_anonymous_binder_name(
                                 binder_name,
-                                &argument.1,
+                                binder_span,
                                 fresh,
                                 scope_id,
                             );
@@ -28046,10 +28046,10 @@ impl<'src> Analyzer<'src> {
             // annotation, a field, a parameter): it falls through to the same
             // name resolution every other type spelling takes, which refuses it
             // and says what `_` is for.
-            Node::TypeBinder(name, _bounds) => {
+            Node::TypeBinder((name, name_span), _bounds) => {
                 match self
                     .anonymous_binder_parameters
-                    .get(&(self.current_source_id, node.1))
+                    .get(&(self.current_source_id, *name_span))
                     .copied()
                     .filter(|_| *name == ANONYMOUS_TYPE_BINDER)
                 {
@@ -28059,7 +28059,7 @@ impl<'src> Analyzer<'src> {
                             type_id,
                             name,
                             scope_id,
-                            node.1,
+                            *name_span,
                             Vec::new(),
                             self.current_source_id,
                         ));

@@ -3,7 +3,7 @@
  "information_for_contributors": [
   "The word-list halves of this grammar (the keyword, primitive-type, attribute-marker and operator lists) are GENERATED from the compiler's exported tables by crates/vilan-cli/tests/grammar_sync.rs, which byte-gates them on every suite run. Do not hand-edit a generated `match`/`begin` value; change the compiler table (or grammar_sync.rs's role tables) and regenerate:",
   "VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated",
-  "The structural rules (strings, number shapes, elements, `css` blocks, captures, the contextual `context`/`sync` anchors) are hand-written."
+  "The structural rules (strings, number shapes, elements, generic argument lists, `css` blocks, captures, the contextual `context`/`sync` anchors) are hand-written."
  ],
  "name": "Vilan",
  "scopeName": "source.vilan",
@@ -19,6 +19,9 @@
   },
   {
    "include": "#attributes"
+  },
+  {
+   "include": "#generics"
   },
   {
    "include": "#elements"
@@ -381,11 +384,52 @@
     }
    ]
   },
+  "generics": {
+   "patterns": [
+    {
+     "comment": "A generic argument list (E161). Structured as begin/end rather than matched, for two reasons a `match` cannot serve: a TextMate `match` sees ONE LINE, so a head wrapped across lines lost its closing `>` to the operator fallback (and, at the start of a line, to E115's element terminator); and the list NESTS, so one rule including itself is what makes `Source<Option<_: Source<type U>>>` close three lists with `>>>` instead of reading them as a shift. The begin is a `<` glued to a type-name character \u2014 element syntax's own atom-position rule (S2) read from the other side: a tag `<` opens an atom, so a `<` that does NOT is an argument list. The end is `>`, plus three bail-outs (`{`, `}`, `;`) that give the list back at a statement boundary, so the one shape that could run away \u2014 a glued comparison, which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book \u2014 costs the rest of its own statement rather than the rest of the file. The bail-outs cost one honest form in return: a FIXED-ARRAY argument (`SignalCell<[i32; 4]>`) ends the list at its `;` and the tail falls back to the top-level rules, which is what the whole head did before this rule existed.",
+     "name": "meta.generic.vilan",
+     "begin": "(?<=[A-Za-z0-9_])<",
+     "end": ">|(?=[{};])",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.definition.generic.begin.vilan"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.definition.generic.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "comment": "The `type` BINDER keyword inside a head (`impl Option<type T>`) \u2014 it introduces a parameter, where the declaration-keyword rule's `type` names an item. Scoped `keyword.other.*`, which VS Code's own dark_vs/light_vs (and so Dark+/Light+/Dark Modern/Light Modern, which include them) colour from the base `keyword` rule \u2014 the keyword colour, and the one `storage.modifier` already resolves to in those themes. Guarded by a following NAME, which is the only shape a binder has.",
+       "name": "keyword.other.type-binder.vilan",
+       "match": "\\b(type)\\b(?=\\s+[A-Za-z_])"
+      },
+      {
+       "comment": "The ANONYMOUS binder `_` (B294) \u2014 a parameter the author declined to name, and a language-defined spelling rather than a type name, so it takes the scope `self` takes.",
+       "name": "variable.language.wildcard.vilan",
+       "match": "(?<![A-Za-z0-9_])_(?![A-Za-z0-9_])"
+      },
+      {
+       "include": "#generics"
+      },
+      {
+       "include": "#keywords"
+      },
+      {
+       "include": "#types"
+      }
+     ]
+    }
+   ]
+  },
   "elements": {
    "patterns": [
     {
-     "comment": "Element syntax (element-syntax S2): a tag name glued to `<` or `</` \u2014 the grammar's own atom-position rule; a spaced comparison never matches.",
-     "match": "(</?)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(/?>)?",
+     "comment": "Element syntax (element-syntax S2): a tag name glued to `<` or `</` \u2014 the grammar's own atom-position rule; a spaced comparison never matches. The `<` may NOT follow an identifier character (E161): S2 says a tag `<` starts an ATOM, so `Option<type _>` and `SignalCell<str>` open a generic argument list and never a tag named `type` or `str` \u2014 this is the grammar catching up with the spec, not a new rule.",
+     "match": "(?<![A-Za-z0-9_])(</?)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(/?>)?",
      "captures": {
       "1": {
        "name": "punctuation.definition.tag.vilan"
@@ -399,7 +443,7 @@
      }
     },
     {
-     "comment": "A multi-line element head's terminator (E115). The rule above is a `match`, and a TextMate `match` sees one line at a time \u2014 so when a head's attributes are written one per line and the `>` lands on a line of its own, that rule cannot reach it and the operator list painted it as a comparison. A `>` or `/>` alone on its line is that terminator: the formatter breaks AFTER a binary operator and never before one, so no formatted line begins with a bare `>`. The language server paints the same bracket from the parse, which is the authority whenever it is running; this is what the file looks like without it.",
+     "comment": "A multi-line element head's terminator (E115). The rule above is a `match`, and a TextMate `match` sees one line at a time \u2014 so when a head's attributes are written one per line and the `>` lands on a line of its own, that rule cannot reach it and the operator list painted it as a comparison. A `>` or `/>` alone on its line is that terminator: the formatter breaks AFTER a binary operator and never before one, so no formatted line begins with a bare `>`. A `>` that closes a GENERIC list never reaches this rule (E161): the generic rule is a begin/end and a begin/end spans lines, so the list it opened consumes its own closing bracket wherever that lands \u2014 which is what leaves this rule to the element heads it was written for. The language server paints the same bracket from the parse, which is the authority whenever it is running; this is what the file looks like without it.",
      "match": "^\\s*(/?>)",
      "captures": {
       "1": {

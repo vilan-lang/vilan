@@ -499,7 +499,15 @@ pub enum Node<'src> {
     // (`impl type T`). The optional bounds are `T: A + B`. The ANONYMOUS
     // spelling `_` (B294) is this same node with [`ANONYMOUS_TYPE_BINDER`] as
     // its name — one node, one analyzer path, no second set of semantics.
-    TypeBinder(&'src str, Vec<Spanned<Self>>),
+    //
+    // The name carries its OWN span, the way `GenericParameter` does, and not
+    // only the node's: the node's reaches from the `type` keyword to the end of
+    // the bounds, and the entity registered for the binder is spanned by what
+    // the editor must select for it — a go-to-definition target, and one
+    // semantic token (E161: the wide span painted `type _: Source<type U>` as
+    // one type-parameter run and the overlap filter then dropped every name
+    // inside it).
+    TypeBinder(Spanned<&'src str>, Vec<Spanned<Self>>),
     // `x = v` or a compound assignment like `x += v` (the operator is the
     // binary op the assignment applies, e.g. `Add` for `+=`). The target is an
     // lvalue: a local (`Accessor`) or a field place (`MemberAccessor`, e.g.

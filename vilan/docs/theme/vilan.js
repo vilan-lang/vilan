@@ -109,9 +109,18 @@
 		// Regex-level like the rest — `<` glued to a name reads as markup,
 		// which is the grammar's own atom-position rule; a spaced comparison
 		// (`a < b`) never matches.
+		//
+		// The `<` may not follow an identifier character either (E161), which
+		// is the same atom-position rule read from the other side: a tag `<`
+		// STARTS an atom, so the `<` in `Option<type _>` or `SignalCell<str>`
+		// opens a generic argument list and the lowercase word after it is a
+		// binder keyword or a primitive, never a tag. Without the guard this
+		// rule fired on `<type`, `<str`, `<sync` — any lowercase word glued to
+		// a `<` — and painted the binder keyword as an element name, the same
+		// mistake the TextMate grammar made in the same head.
 		const ELEMENT_TAG = {
 			className: "name",
-			begin: "(?<=</?)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
+			begin: "(?<=(?<![A-Za-z0-9_])</?)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
 		};
 		const ELEMENT_EVENT = {
 			className: "attr",
