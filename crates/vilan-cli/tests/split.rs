@@ -1072,7 +1072,7 @@ fn split_off_a_browser_leg_stops_the_build() {
 /// DOM MUTATION that puts `needle` on the page, so a slow box only waits longer,
 /// and a render that never comes fails loudly with the page it was left with —
 /// it can neither pass vacuously nor fail spuriously.
-const STUB: &str = r#"class StubElement {
+const STUB: &str = r##"class StubElement {
 	constructor(tagName) {
 		this.tagName = tagName;
 		this.children = [];
@@ -1102,12 +1102,47 @@ const STUB: &str = r#"class StubElement {
 		this.parent = null;
 		touched();
 	}
+	// A71: `appendChild`'s positional counterpart. `std::ui`'s `Region` plants
+	// an empty text node and inserts its content BEFORE it, so a reactive run
+	// keeps its place among static siblings.
+	insertBefore(child, anchor) {
+		if (child.parent) {
+			child.parent.children = child.parent.children.filter((c) => c !== child);
+		}
+		child.parent = this;
+		const at = this.children.lastIndexOf(anchor);
+		if (at < 0) this.children.push(child);
+		else this.children.splice(at, 0, child);
+		touched();
+		return child;
+	}
 	replaceChildren() { this.children = []; touched(); }
 	addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
 	render() {
 		const inner = this.children.map((child) => child.render()).join("");
 		return `<${this.tagName}>${this._text}${inner}</${this.tagName}>`;
 	}
+}
+
+// A text node — what a `str` child rides, and what a `Region` plants (empty)
+// as its anchor (A71). It renders as its text, so an anchor renders as nothing.
+class StubText {
+	constructor(text) {
+		this.tagName = "#text";
+		this.children = [];
+		this.parent = null;
+		this._text = text;
+	}
+	get textContent() { return this._text; }
+	set textContent(value) { this._text = value; touched(); }
+	remove() {
+		if (this.parent) {
+			this.parent.children = this.parent.children.filter((c) => c !== this);
+		}
+		this.parent = null;
+		touched();
+	}
+	render() { return this._text; }
 }
 
 // Every write to the tree bumps `mutations` and wakes whoever is waiting on the
@@ -1130,6 +1165,7 @@ global.document = {
 		return new StubElement(tag);
 	},
 	createElementNS: (namespace, tag) => new StubElement(tag),
+	createTextNode: (text) => new StubText(text),
 	getElementById: (id) => (id === "app" ? root : null),
 	querySelector: () => null,
 	querySelectorAll: () => [],
@@ -1189,4 +1225,4 @@ module.exports = {
 	},
 	first_element_saw_a_fetch: () => first_element_saw_a_fetch,
 };
-"#;
+"##;

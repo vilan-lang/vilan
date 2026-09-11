@@ -149,7 +149,7 @@ fn compare(program: &str) -> Compared {
 }
 
 /// The corpus programs the inference sweep CHANGES — 29 of them when this gate
-/// was written (const-eval.md §9.1), 32 today.
+/// was written (const-eval.md §9.1), 33 today.
 ///
 /// This is the gate's non-vacuity floor, and it is a list rather than a count
 /// because a count cannot be summed across one process per program. Every
@@ -190,6 +190,7 @@ const FOLDS: &[&str] = &[
     "tuple-access.vl",
     "tuple-spread.vl",
     "unary-minus.vl",
+    "vec2.vl",
 ];
 
 /// One corpus program, both ways. The body every generated test runs.

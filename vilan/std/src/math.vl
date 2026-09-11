@@ -7,7 +7,8 @@
 // there). The surface is bounded to what `libm` provides, so the native
 // backends (F3/F4) stay implementable — no JS-isms.
 
-import pkg::compare::Ord;
+import pkg::compare::{ Ord, PartialEq };
+import pkg::operators::{ Add, Sub };
 
 // --- Constants -----------------------------------------------------------------
 //
@@ -41,5 +42,90 @@ fun minmax<T: Ord>(a: T, b: T): (T, T) {
 		(a, b)
 	} else {
 		(b, a)
+	}
+}
+
+// --- 2-D vectors -----------------------------------------------------------
+//
+// The smallest vector value the estate actually asks for (A83). Pointer drags
+// measure offsets, distances and thresholds, and an app without this writes
+// `magnitude((x, y): (f64, f64))` by hand — the exhibit is kolt's
+// `interact.vl`, with a TODO on it asking for exactly this.
+//
+// A NAMED type rather than a `(f64, f64)` tuple, because the call site reads:
+// `origin.distance(pointer)` says what it measures, while `distance(a, b)`
+// over two pairs says only that four numbers went in — and a tuple of two
+// floats is also a size, a range and a pair of weights, so nothing catches the
+// argument that was none of those.
+//
+// The components are plain `f64` and carry NO UNIT: they are CSS pixels at a
+// UI call site and metres at a physics one, so a `Length` here would be a
+// claim this module cannot make. Only what `libm` provides is used (`sqrt`),
+// so the native backends (F3/F4) stay implementable, exactly as the constants
+// above do.
+
+/// A 2-D vector — a point, an offset, a velocity, a size: whichever the call
+/// site means, in its own units.
+struct Vec2 {
+	x: f64,
+	y: f64,
+}
+
+impl Vec2 {
+	/// `self` with both components multiplied by `factor` — the scalar half
+	/// of the arithmetic, which `Mul` cannot carry: the operator traits take
+	/// ONE other operand type per impl, and `Vec2 * Vec2` would be the more
+	/// natural claim on `Mul` if this module ever wanted a component-wise
+	/// product. A method says which of the two it is.
+	fun scale(self, factor: f64): Vec2 {
+		Vec2 { x = self.x * factor, y = self.y * factor }
+	}
+
+	/// The vector's LENGTH from the origin (its magnitude) — `sqrt(x² + y²)`.
+	/// Comparing two lengths, or a length against a threshold, does not need
+	/// the square root: square the threshold and compare `dot(self)` instead,
+	/// which is what a per-pointer-move drag check wants.
+	fun length(self): f64 {
+		self.dot(self).sqrt()
+	}
+
+	/// The distance between the two points `self` and `other` — the length of
+	/// the vector between them, and the reason this type exists at a drag
+	/// call site.
+	fun distance(self, other: Vec2): f64 {
+		self.sub(other).length()
+	}
+
+	/// The dot product `self.x * other.x + self.y * other.y`. Zero when the
+	/// two are perpendicular, and `v.dot(v)` is `v`'s length squared.
+	fun dot(self, other: Vec2): f64 {
+		self.x * other.x + self.y * other.y
+	}
+}
+
+/// Component-wise addition — `a + b` as well as `a.add(b)`.
+impl Vec2 with Add {
+	fun add(self, b: Vec2): Vec2 {
+		Vec2 { x = self.x + b.x, y = self.y + b.y }
+	}
+}
+
+/// Component-wise subtraction. `pointer - origin` is the offset of a drag, and
+/// the operand order reads the way the arithmetic does.
+impl Vec2 with Sub {
+	fun sub(self, b: Vec2): Vec2 {
+		Vec2 { x = self.x - b.x, y = self.y - b.y }
+	}
+}
+
+/// Exact component equality — `f64` equality, with everything that implies: a
+/// vector arrived at by arithmetic is rarely `==` one written down. Compare a
+/// `distance` against a tolerance where that matters. It is here because a
+/// `Vec2` in a signal wants the dedupe (`swap`, `bind_each`, `set` on a
+/// `PartialEq` mirror all ask for it) and a hand-written impl is what a std
+/// struct can have — a derive would dispatch a macro at world-load.
+impl Vec2 with PartialEq {
+	fun eq(self, b: Vec2): bool {
+		self.x == b.x && self.y == b.y
 	}
 }

@@ -57,7 +57,7 @@ impl Stored<type T> {
 /// properties, the hidden flag, text — and can serialize the tree, which is
 /// what makes "the binding fired again" an observable fact rather than an
 /// inference from the absence of a crash.
-const DOM_STUB: &str = r#"class StubElement {
+const DOM_STUB: &str = r##"class StubElement {
     constructor(tag) {
         this.tagName = tag;
         this.children = [];
@@ -86,6 +86,16 @@ const DOM_STUB: &str = r#"class StubElement {
         child.parent = this;
         this.children.push(child);
     }
+    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
+    // plants an empty text node and inserts its content BEFORE it, so a
+    // reactive run keeps its place among static siblings.
+    insertBefore(child, anchor) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        const at = this.children.lastIndexOf(anchor);
+        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+        return child;
+    }
     remove() {
         if (this.parent) {
             this.parent.children = this.parent.children.filter(c => c !== this);
@@ -96,7 +106,25 @@ const DOM_STUB: &str = r#"class StubElement {
     addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
 }
 
+/// A text node — a real sibling of the element children: what a `str` or a
+/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
+/// the anchor it inserts before (A71).
+class StubText {
+    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
+    set textContent(text) { this._text = text; }
+    get textContent() { return this._text; }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
+    }
+}
+
 function serialize(node) {
+    // A text node serializes as its text, which is nothing for a `Region`
+    // anchor (A71) — the same nothing the process twin serves.
+    if (node instanceof StubText) return node.textContent;
     let out = "<" + node.tagName;
     for (const [name, value] of Object.entries(node.attributes)) out += ` ${name}="${value}"`;
     for (const [name, value] of Object.entries(node.properties)) out += ` ${name}="${value}"`;
@@ -110,6 +138,7 @@ const documentRoot = new StubElement("body");
 global.document = {
     createElement: (tag) => new StubElement(tag),
     createElementNS: (namespace, tag) => new StubElement(tag),
+    createTextNode: (text) => new StubText(text),
     getElementById: () => documentRoot,
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -118,7 +147,7 @@ global.location = { pathname: "/" };
 global.history = { pushState(state, title, path) { global.location.pathname = path; } };
 global.window = { addEventListener: () => {} };
 global.__dump = (tag) => console.log(tag + " " + serialize(documentRoot));
-"#;
+"##;
 
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(

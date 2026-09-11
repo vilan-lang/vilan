@@ -33,6 +33,7 @@ impl Element {
 	fun style_property(self, name: str): str           // style.getPropertyValue
 	fun append(self, child: Element)
 	fun append_text(self, child: Text)                 // appendChild, text-node overload
+	fun insert_before(self, child: Element, anchor: Text)   // insertBefore — the positional append
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
@@ -78,6 +79,7 @@ impl Window {
 external struct Text;                // a text node — text only, no attributes
 impl Text {
 	fun set_text(self, text: str)                      // textContent =
+	fun remove(self)                                   // detach from the document
 }
 
 external struct Event;
@@ -283,6 +285,31 @@ too.
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
 
+**`Region` — how a reactive child keeps its place.**
+
+```vilan,fragment
+struct Region { parent: Element, anchor: Text }
+impl Region {
+	fun open(parent: View): Region   // plant the anchor at the parent's current end
+	fun insert(self, child: View)    // before the anchor — a live child MOVES
+	fun close(self)                  // drop the anchor
+}
+```
+
+Everything reactive above owns a *run* of sibling nodes: `when`'s
+instantiation, `swap`'s subtree, `bind_each`'s rows, a `Source<View>` child's
+current view. Each opens a region where it is **called** — an empty text node
+planted at that moment — and inserts its content before that anchor, so the
+run keeps its position however the chain grows afterwards. You rarely name
+this type; it is documented because the anchor is real, and because a walk
+over `element.children` will meet it.
+
+The anchor is an empty text node rather than a comment deliberately: it
+serializes to nothing, so a browser tree and the `@process` twin's HTML string
+stay byte-comparable. On the process side a `Region` plants no node at all — a
+server render is one pass in source order, so appending already *is* inserting
+before the anchor.
+
 ### A binding takes a `Source`, not a `Signal`
 
 Every binding above that only READS its argument is generic over
@@ -332,6 +359,10 @@ trait FromPath { fun from_segments(parts: List<str>): Self }   // URL → route
 fun from_path<R: FromPath>(path: str): R               // parse_path, then from_segments
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
 
+impl View {
+	fun link_to<R: Routable>(self, route: R): View  // `link`'s body on an anchor you built
+}
+
 // Route chunks (a `split = true` leg) — both are ordinary signals
 fun pending(): SignalCell<bool>                 // a route chunk is in flight
 fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with the reason
@@ -340,8 +371,11 @@ fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with t
 `current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor
 (middle-click, ctrl-click, and copy-link keep native behavior) and intercepts
-only a plain left click, calling `prevent_default` + `navigate`. Route
-modelling (`Routable`/`FromPath` over enums): the
+only a plain left click, calling `prevent_default` + `navigate`. It also sets
+`draggable="false"`, which is the one non-native thing about it — see the
+[gotchas](../appendix/gotchas.md) note. `View::link_to(route)` is that same
+body without the `<a>` and the label, for an app that builds and styles its
+own anchor. Route modelling (`Routable`/`FromPath` over enums): the
 [routing guide](../guide/routing.md).
 
 **`parse_path` is the read direction, and it cuts before it decodes.** The

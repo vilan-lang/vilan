@@ -1,0 +1,42 @@
+import std::io::print;
+import std::math::Vec2;
+
+// `std::math::Vec2` (A83): a 2-D vector VALUE — two `f64` components, the
+// arithmetic a pointer drag needs, and hand-written `Add`/`Sub` impls, so `+`
+// and `-` lower to those impls' own methods rather than to native `+`/`-` on
+// numbers. `length`/`distance` go through `dot` and one `Math.sqrt`; `==`
+// reaches the `PartialEq` impl, which is exact component equality.
+//
+// witness: const offset = sub(pointer, origin);
+// witness: return Math.sqrt(dot(self, self));
+// witness: return self[0] * other[0] + self[1] * other[1];
+fun main() {
+	let origin = Vec2 { x = 3.0, y = 4.0 };
+	let pointer = Vec2 { x = 6.0, y = 8.0 };
+	let same_as_origin = Vec2 { x = 3.0, y = 4.0 };
+
+	// 3-4-5, twice: the length from the origin and the distance between them.
+	print(origin.length());
+	print(origin.distance(pointer));
+	print(origin.dot(pointer));
+
+	let offset = pointer - origin;
+	print(i"offset {offset.x} {offset.y}");
+
+	let summed = origin + pointer;
+	print(i"sum {summed.x} {summed.y}");
+
+	let doubled = origin.scale(2.0);
+	print(i"scaled {doubled.x} {doubled.y}");
+
+	print(origin == same_as_origin);
+	print(origin != pointer);
+
+	// The drag idiom the type exists for: how far the pointer travelled, and
+	// whether that passes a threshold.
+	let start = Vec2 { x = 10.0, y = 10.0 };
+	let now = Vec2 { x = 13.0, y = 14.0 };
+	print(now.distance(start) > 3.0);
+	let travelled = now - start;
+	print(travelled.length());
+}

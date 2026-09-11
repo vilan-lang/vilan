@@ -186,6 +186,7 @@ macro_rules! corpus_manifest {
             tuple_spread => "tuple-spread.vl",
             unary_minus => "unary-minus.vl",
             value_semantics => "value-semantics.vl",
+            vec2 => "vec2.vl",
             view_basic => "view-basic.vl",
             view_conventions => "view-conventions.vl",
             view_field => "view-field.vl",
