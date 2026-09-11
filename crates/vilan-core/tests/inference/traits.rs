@@ -4832,3 +4832,95 @@ fn b299_a_trait_hung_static_is_still_reached_by_the_traits_name() {
         "2\n1\n0\n",
     );
 }
+
+// --- B297: an impl SUBJECT is walked once, so one mistake is one error -------
+//
+// `Node::Impl` walked the subject twice — once for its type, and again
+// per-argument to bank the arguments `self`'s variant patterns substitute
+// through — and each walk prepped its own deferred reference, so an unresolved
+// name in the head was reported TWICE for one mistake. The arguments are read
+// off the resolved subject now; there is nothing to walk a second time.
+
+#[test]
+fn b297_an_unresolved_name_in_an_impl_subject_is_reported_once() {
+    assert_fails_once_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<Option<Nope>> {
+            fun sample(self) { }
+        }
+
+        fun main() { }
+        "#,
+        "cannot find type 'Nope'",
+    );
+}
+
+#[test]
+fn b297_the_let_annotation_is_the_control() {
+    // The same name in the position that always reported once.
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let x: Option<Nope> = None;
+        }
+        "#,
+        "cannot find type 'Nope'",
+    );
+}
+
+#[test]
+fn b297_a_concrete_impl_subject_reports_its_unresolved_name_once_too() {
+    // Not a trait-subject rule: the second walk was the ARGUMENT bank, which a
+    // concrete generic application reaches identically.
+    assert_fails_once_with(
+        r#"
+        struct Holder<T> { value: T }
+
+        impl Holder<Nope> {
+            fun sample(self) { }
+        }
+
+        fun main() { }
+        "#,
+        "cannot find type 'Nope'",
+    );
+}
+
+#[test]
+fn b297_the_subject_arguments_still_type_selfs_variant_patterns() {
+    // The behaviour the second walk existed for, unchanged: inside
+    // `impl Option<(T, U)>`, `Some`'s payload is the TUPLE, not `Option`'s own
+    // abstract `T`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        impl Option<(type T, type U)> {
+            fun left(self, fallback: T): T {
+                match self {
+                    Some((let first, _)) => first,
+                    None => fallback,
+                }
+            }
+        }
+
+        fun main() {
+            let pair: Option<(i32, str)> = Some((7, "x"));
+            print(pair.left(0));
+            let empty: Option<(i32, str)> = None;
+            print(empty.left(1));
+        }
+
+        main();
+        "#,
+        "7\n1\n",
+    );
+}

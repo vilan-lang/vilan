@@ -3281,10 +3281,17 @@ pub struct Analyzer<'src> {
     // stored unresolved like `generic_bounds` entries.
     tuple_bounds: HashMap<TypeId, TupleBoundRequirement>,
     // For an impl whose subject is a generic application (`impl Option<(type T,
-    // type U)>`), the impl body scope -> (subject type id, the subject's walked
-    // generic arguments). Lets `self`'s variant patterns substitute the subject
-    // enum's declared parameters for these args.
-    impl_subject_args: HashMap<Id, (TypeId, Vec<TypeId>)>,
+    // type U)>`), the impl body scope -> the subject's type id. Lets `self`'s
+    // variant patterns substitute the subject enum's declared parameters for the
+    // subject's own arguments.
+    //
+    // The ARGUMENTS are read off the resolved subject rather than banked (B297).
+    // Walking them a second time to bank them prepped a second deferred
+    // reference per name, so one unresolved name in an impl subject was reported
+    // TWICE — `impl Source<Option<Nope>>` gave two `cannot find type 'Nope'`
+    // lines for one mistake, where `let x: Option<Nope>` gives one. The subject
+    // is walked ONCE and its arguments are whatever that walk resolved it to.
+    impl_subject_args: HashMap<Id, TypeId>,
     implementations: Vec<Implementation<'src>>,
     /// Member name -> the indices into `implementations` of every impl that
     /// DECLARES that name, in registration order — the reverse of each impl's
@@ -25131,18 +25138,15 @@ impl<'src> Analyzer<'src> {
     fn impl_subject_substitution(&self, scope_id: Id, enum_id: Id) -> Option<SubstitutionContext> {
         let mut current = Some(scope_id);
         while let Some(scope_id) = current {
-            if let Some((subject_type_id, arguments)) = self.impl_subject_args.get(&scope_id) {
-                if !matches!(subject_type_id.get_type(self), Type::Enum(id, _) if id == enum_id) {
+            if let Some(subject_type_id) = self.impl_subject_args.get(&scope_id) {
+                let Type::Enum(id, arguments) = subject_type_id.get_type(self) else {
+                    return None;
+                };
+                if id != enum_id {
                     return None;
                 }
                 let declared = &self.enums.get(&enum_id)?.generic_parameter_constraint_ids;
-                return Some(
-                    declared
-                        .iter()
-                        .copied()
-                        .zip(arguments.iter().copied())
-                        .collect(),
-                );
+                return Some(declared.iter().copied().zip(arguments).collect());
             }
             current = self.scopes.get(&scope_id).and_then(|scope| scope.parent_id);
         }
@@ -27297,19 +27301,16 @@ impl<'src> Analyzer<'src> {
                 for (type_id, ..) in &self.prepped_type_locals[head_prepped_from..] {
                     self.impl_head_type_ids.insert(*type_id);
                 }
-                // Record the subject's generic arguments (the `<...>` on the head)
-                // so `self`'s variant patterns substitute the enum/struct's
-                // declared parameters for these args — e.g. `Some` on a
-                // `Option<(T, U)>` subject has payload `(T, U)`, not the abstract
-                // `T` of `enum Option<T>`.
-                if let Node::AccessorWithGenerics(_, generic_arguments) = &subject.0 {
-                    let argument_type_ids: Vec<TypeId> = generic_arguments
-                        .0
-                        .iter()
-                        .map(|argument| self.walk_type_node(argument, body_scope_id))
-                        .collect();
+                // Record the SUBJECT so `self`'s variant patterns substitute
+                // the enum's declared parameters for the subject's own
+                // arguments — e.g. `Some` on an `Option<(T, U)>` subject has
+                // payload `(T, U)`, not the abstract `T` of `enum Option<T>`.
+                // The arguments come from the walk above; re-walking them here
+                // to bank them is what reported one unresolved name twice
+                // (B297).
+                if matches!(&subject.0, Node::AccessorWithGenerics(_, _)) {
                     self.impl_subject_args
-                        .insert(body_scope_id, (subject_type_id, argument_type_ids));
+                        .insert(body_scope_id, subject_type_id);
                 }
                 // Which struct an `[rpc]` method was declared on, for the
                 // notification rule (§9.3): the check runs after every module is
