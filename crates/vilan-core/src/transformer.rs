@@ -1082,6 +1082,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_run_guarded",
         "__with_finally",
         "__guarded",
+        "__with_finally_async",
         "__fs_close",
         "__fs_close_awaited",
         "__fs_stat",
@@ -1466,6 +1467,23 @@ fn helper_source(name: &str) -> &'static str {
              \t\treturn [ 1 ];\n\
              \t} catch (error) {\n\
              \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
+        // `__with_finally` for a body that SUSPENDS (`std::time::Debounce`'s
+        // driving loop, tracker B277). It is a separate helper rather than a
+        // thenable test inside `__with_finally` on purpose: the sync one is on
+        // the reactive drain's hot path and the async one is not, and "does
+        // this body suspend" is a question the compiler already answered at the
+        // call site. An abort — the nursery's cancellation reaching the loop's
+        // parked `wait` — is an ordinary rejection through `await`, so the
+        // `finally` runs on it exactly as it does on a normal return.
+        "__with_finally_async" => {
+            "async function __with_finally_async(body, after) {\n\
+             \ttry {\n\
+             \t\tawait body();\n\
+             \t} finally {\n\
+             \t\tafter();\n\
              \t}\n\
              }"
         }

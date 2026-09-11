@@ -1536,6 +1536,11 @@ impl<'a> Interpreter<'a> {
                 }
                 Err(failure) => Err(failure),
             },
+            // The async twin has no native form: the expansion environment has
+            // no suspension at all, so a body that reaches it is already
+            // outside what a macro may evaluate. Named here so the answer is
+            // this sentence rather than "unknown host call".
+            "__with_finally_async" => Err(Failure::unsupported("`with_finally_async`")),
             "__shared_new" => {
                 let mut cell = IndexMap::new();
                 cell.insert(Rc::from("v"), take(0));
