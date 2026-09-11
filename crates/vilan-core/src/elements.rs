@@ -20,7 +20,9 @@
 //! prefilter (riding `for_each_child`, like lift's mark detection) leaves
 //! untouched nodes unrebuilt.
 
-use crate::node::{Closure, ElementBody, ElementHeadItem, If, Node, NodeIfBranch, NodeList};
+use crate::node::{
+    Closure, ElementBody, ElementChild, ElementHeadItem, If, Node, NodeIfBranch, NodeList,
+};
 use crate::span::{Span, Spanned};
 
 /// Rewrite every element in a parsed tree, in place. Called at each
@@ -101,6 +103,16 @@ fn build_chain<'src>(
         // it recorded are read from the RAW tree by the editor (E115).
         punctuation: _,
     } = body;
+    // A46: the nameless head is a FRAGMENT, and its lowering is not a chain at
+    // all — `<>a b</>` IS the list `[a, b]`, a `List<View>` LITERAL, which the
+    // child contract's static `List<View>` arm already places and whose
+    // reactive twin keeps its position through A71's region. No runtime type
+    // is introduced: the fragment's TYPE is `List<View>`, legal in child
+    // position and wherever a list is.
+    let Some(tag) = tag else {
+        let items: NodeList<'src> = children.into_iter().map(ElementChild::into_node).collect();
+        return (Node::List(items), span);
+    };
     let tag_text = &source[tag.into_range()];
     // The generated `view` reference spans `<tag`, so a diagnostic about the
     // view underlines the element head itself, which is what the user wrote.

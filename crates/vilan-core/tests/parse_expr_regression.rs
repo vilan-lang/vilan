@@ -222,9 +222,16 @@ fn element_atoms_are_pinned() {
     // the four angle-bracket spans the editor paints from (E115): `<` at
     // 14..15, the head's `>` at 27..28, `</` at 32..34 and its `>` at 35..36.
     snapshot("<p class(\"x\")>\"hi\"</p>", SNAP_ELEMENT);
+    // A46: the FRAGMENT's parse shape beside it — the same body with the two
+    // names absent (`tag`/`close_tag` are `None`, which is what makes a
+    // fragment a fragment) and an empty head, since `<>` has nowhere to put
+    // one. Its four angle-bracket spans are the pair `<>` and the pair `</>`.
+    snapshot("<><i>\"a\"</i></>", SNAP_FRAGMENT);
 }
 
-const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false, close_tag: Some(34..35), punctuation: [14..15, 27..28, 32..34, 35..36] }), 14..36)";
+const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: Some(15..16), head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false, close_tag: Some(34..35), punctuation: [14..15, 27..28, 32..34, 35..36] }), 14..36)";
+
+const SNAP_FRAGMENT: &str = "(Element(ElementBody { tag: None, head: [], children: [Bare((Element(ElementBody { tag: Some(17..18), head: [], children: [Bare((String(\"a\"), 19..22))], self_closing: false, close_tag: Some(24..25), punctuation: [16..17, 18..19, 22..24, 25..26] }), 16..26))], self_closing: false, close_tag: None, punctuation: [14..15, 15..16, 26..28, 28..29] }), 14..29)";
 
 #[test]
 fn the_is_tier_and_condition_heads_are_pinned() {

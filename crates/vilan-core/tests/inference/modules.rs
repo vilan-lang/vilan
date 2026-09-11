@@ -2294,6 +2294,190 @@ fn a_macro_generated_element_desugars() {
     );
 }
 
+// --- A46: the fragment `<>…</>` lowers to a `List<View>` LITERAL -------------
+//
+// The nameless head is a different LOWERING, not an element with no tag: the
+// desugar emits the list its children make, so the fragment's TYPE is
+// `List<View>` — which the child contract's static arm already places, and
+// whose reactive twin keeps position through A71's region. No runtime type is
+// introduced, which is exactly why the pins below are typing and emission
+// claims rather than a new surface's behavior.
+
+#[test]
+fn a46_a_fragment_lowers_to_a_list_literal_byte_for_byte() {
+    // The strongest form of "no new runtime type": the fragment program and
+    // the list-literal program emit the same JS, byte for byte.
+    let fragment = r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let group: List<View> = <>
+                <i>"a"</i>
+                <b>"b"</b>
+            </>;
+            print(render(view("p").child(group)));
+        }
+        "#;
+    let list = r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let group: List<View> = [view("i").child("a"), view("b").child("b")];
+            print(render(view("p").child(group)));
+        }
+        "#;
+    assert_eq!(
+        compile(fragment).expect("the fragment program compiles"),
+        compile(list).expect("the list program compiles"),
+        "a fragment must emit the list literal's exact JS"
+    );
+}
+
+#[test]
+fn a46_an_empty_fragment_is_an_empty_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let nothing: List<View> = <></>;
+            print(render(view("p").child(nothing)));
+        }
+        "#,
+        "<p></p>\n",
+    );
+}
+
+#[test]
+fn a46_a_fragment_fills_a_child_position_bare_and_in_a_hole() {
+    // Both spellings of a child: the fragment written bare among the siblings,
+    // and the same fragment through a `{hole}`. Element syntax lowers each to
+    // `.child(…)`, and `List<View>`'s Slot arm places the run in order.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun pair(): List<View> {
+            <><i>"a"</i><b>"b"</b></>
+        }
+        fun main() {
+            print(render(<p><span>"head"</span><>{view("u").child("u")}</>{pair()}</p>));
+        }
+        "#,
+        "<p><span>head</span><u>u</u><i>a</i><b>b</b></p>\n",
+    );
+}
+
+#[test]
+fn a46_a_fragment_does_not_flatten_into_a_fragment() {
+    // The other face of "no new runtime type": a fragment IS a list literal,
+    // so a fragment written directly inside one is a `List<View>` where a
+    // `View` element belongs, and the list literal's own element-type rule
+    // refuses it. Nesting works through a CHILD position (the pin above),
+    // where the `Slot` arm places the run — not through the literal, which
+    // would have to concatenate. Documented as the limit it is.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _group: List<View> = <><i>"a"</i><>{view("b").child("b")}</></>;
+        }
+        "#,
+        "Expected View (this literal's element type), but got List<View> instead",
+    );
+}
+
+#[test]
+fn a46_a_fragment_is_a_list_and_not_a_view() {
+    // A46's documented LIMIT, pinned where a reader meets it: a fragment is
+    // legal in child position and wherever a list is, and it is not a `View`,
+    // so a `fun …: View` return refuses it by the ordinary type rule — no
+    // special-cased message, and the span is the whole fragment.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun toolbar(): View {
+            <><i>"a"</i><b>"b"</b></>
+        }
+        "#,
+        "Expected View, but got List<View> instead",
+    );
+}
+
+#[test]
+fn a46_a_fragment_close_must_be_the_nameless_one() {
+    // `<>` opens the nameless head, so only `</>` closes it — a named close
+    // inside a fragment is the mismatch, reported against `</>`.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <><i>"a"</i></div>;
+        }
+        "#,
+        "`</>`",
+    );
+}
+
+#[test]
+fn a46_a_named_close_still_names_its_own_tag_inside_a_fragment() {
+    // The converse of the pin above: the fragment arm must not swallow a
+    // NESTED element's own close-tag mismatch.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <><div>"x"</span></>;
+        }
+        "#,
+        "expected `</div>`",
+    );
+}
+
+#[test]
+fn a46_a_reactive_fragment_is_the_source_list_arm() {
+    // The half A46's recommendation left open, closed by A71: a `Source` of
+    // fragments is the `Source<List<View>>` child arm, so the run is replaced
+    // in place rather than appended behind its siblings. Typing is the claim
+    // here; `ui_rows.rs` holds the positional behavior.
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            let mark: SignalCell<i32> = Signal::new(1);
+            let _root = mount_root("app", || {
+                <main>
+                    <header>"head"</header>
+                    {mark.map(|value: i32| <><i>{i"m{value}"}</i><b>"b"</b></>)}
+                    <footer>"foot"</footer>
+                </main>
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a46_the_ssr_twin_renders_a_fragment_as_its_run() {
+    // The process twin needs nothing of its own: `List<View>`'s Slot arm is
+    // already declared there, so the fragment serializes as the run it is.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<ul>{rows()}</ul>));
+        }
+        fun rows(): List<View> {
+            <><li>"one"</li><li>"two"</li></>
+        }
+        "#,
+        "<ul><li>one</li><li>two</li></ul>\n",
+    );
+}
+
 #[test]
 fn a_mismatched_closing_tag_names_the_expected_close() {
     assert_fails_with(

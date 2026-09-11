@@ -1110,8 +1110,13 @@ fn collect_markup_spans(
 ) {
     use vilan_core::node::{ElementHeadItem, Node};
     if let Node::Element(body) = &node.0 {
-        out.scaffolding.push((node.1.start..body.tag.end).into());
-        out.tags.push(body.tag);
+        // A fragment (A46) has no tag NAME to paint, in either half of the
+        // pair: its `<>` and `</>` are punctuation and nothing else, which is
+        // why both pushes sit behind the name.
+        if let Some(tag) = body.tag {
+            out.scaffolding.push((node.1.start..tag.end).into());
+            out.tags.push(tag);
+        }
         out.punctuation.extend(body.punctuation.iter().copied());
         if let Some(close) = body.close_tag {
             out.tags.push(close);
@@ -1194,8 +1199,10 @@ fn find_linked_tags(
     use vilan_core::node::Node;
     if let Node::Element(body) = &node.0
         && let Some(close) = body.close_tag
+        // A fragment's `<>`/`</>` carry no name, so there is no pair to link
+        // and no rename to offer (A46).
+        && let Some(open) = body.tag
     {
-        let open = body.tag;
         let touches = |span: Span| span.start <= offset && offset <= span.end;
         if touches(open) || touches(close) {
             *out = Some((open, close));

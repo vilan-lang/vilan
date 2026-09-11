@@ -334,7 +334,12 @@ pub struct ElementBody<'src> {
     /// tags (`<use>`) and hyphenated custom elements (`<my-widget>`) span
     /// several tokens, and the parser has no source access — the desugar pass
     /// slices the text where the source is in scope.
-    pub tag: Span,
+    ///
+    /// `None` is a FRAGMENT — `<>…</>` (A46), the nameless head. A fragment
+    /// carries no head items and is never self-closing, and it lowers to a
+    /// `List<View>` LITERAL rather than to a `view("tag")` chain, so the
+    /// nameless case is a different lowering and not merely a missing name.
+    pub tag: Option<Span>,
     pub head: Vec<ElementHeadItem<'src>>,
     pub children: Vec<ElementChild<'src>>,
     /// Whether the element was written self-closing (`<div />`). `<div></div>`
@@ -356,6 +361,18 @@ pub struct ElementBody<'src> {
     /// rule's reach — the parser has no such limit, and the semantic-token pass
     /// paints from these spans whatever shape the head was written in.
     pub punctuation: Vec<Span>,
+}
+
+impl ElementBody<'_> {
+    /// Where the head's items begin, for span bookkeeping that needs one point
+    /// per element: the tag's span, or — for a nameless fragment — the opening
+    /// `<` the parser recorded first. Never the whole head, so a comment scan
+    /// or a split layout anchored here sees the same shape either way.
+    pub fn head_anchor(&self) -> Span {
+        self.tag
+            .or_else(|| self.punctuation.first().copied())
+            .unwrap_or_else(|| (0..0).into())
+    }
 }
 
 /// One child of an element. The distinction is TOKEN-carrying, not semantic —

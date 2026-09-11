@@ -263,7 +263,7 @@ too.
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
-| `child` | `(content: C): View`; `C: Slot` | the child contract: `str`, `View`, `List<View>`, and a `Source` of each — text re-set in place, an element or a run replaced |
+| `child` | `(content: C): View`; `C: Slot` | the child contract: `str`, `View`, `List<View>`, and a `Source` of each — text re-set in place, an element or a run replaced. `<>…</>` is the `List<View>` literal ([fragments](../guide/ui.md#fragments)) |
 | `children` | `(items: List<View>): View` | append several |
 | `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |

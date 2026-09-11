@@ -2995,12 +2995,24 @@ impl<'a, 'src> Parser<'a, 'src> {
         // is markup. The attempt keeps a garbled element's notes (the farthest
         // failure survives backtracking) while the cursor rolls back for the
         // balanced `<…>` head recovery below.
-        if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
+        if (self.peek_is_ctrl('<') && self.peek_at_is_name(1)) || self.peek_is_fragment_open() {
+            let fragment = self.peek_is_fragment_open();
             if let Some(element) = self.attempt(Self::parse_element) {
                 return Some(element);
             }
-            if let Some(span) =
-                self.recover_delimited("element", '<', '>', &[('(', ')'), ('[', ']'), ('{', '}')])
+            // A FRAGMENT's head is the two-token `<>` (A46), so the balanced
+            // `<…>` recovery below would consume exactly that and hand the
+            // body back to statement parsing — which then fails FARTHER along
+            // and buries the element's own note (`</>`, or a nested tag's
+            // close) under `expected an expression`. A garbled fragment
+            // declines instead, so its farthest failure is what surfaces.
+            if !fragment
+                && let Some(span) = self.recover_delimited(
+                    "element",
+                    '<',
+                    '>',
+                    &[('(', ')'), ('[', ']'), ('{', '}')],
+                )
             {
                 return Some((Node::Error, span));
             }
@@ -3568,6 +3580,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         matches!(self.peek_at(offset), Some(Token::Op(found)) if *found == symbol)
     }
 
+    /// `<>` — a fragment's nameless head (A46). SPAN-ADJACENT, like `/>` and
+    /// `</`: `<` and `>` are separate control tokens (neither is in the
+    /// operator charset, so the lexer never fuses them), and requiring them to
+    /// touch keeps the pair out of every expression `<` already begins.
+    fn peek_is_fragment_open(&self) -> bool {
+        self.peek_is_ctrl('<') && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1)
+    }
+
     /// A (possibly hyphenated) element NAME — `div`, `type`, `aria-label`,
     /// `my-widget`: a name token, then any number of SPAN-ADJACENT `-`-name
     /// joints (`data - id` is two names and an operator, not a name). Returns
@@ -3628,6 +3648,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         // the only place their positions are known, and the editor's
         // semantic-token pass needs them to paint a head that spans lines.
         let mut punctuation = vec![self.here_span()];
+        // A46: `<>…</>` — the nameless head, a FRAGMENT. It takes no head
+        // items and has no self-closing form, so the whole head is the
+        // adjacent `<>` pair and everything after it is children up to `</>`.
+        // The lowering diverges too (`elements.rs`): a `List<View>` literal,
+        // not a `view("tag")` chain.
+        if self.peek_is_fragment_open() {
+            self.bump();
+            punctuation.push(self.here_span());
+            self.bump();
+            let (children, _close_tag, close_punctuation) = self.parse_element_children(None)?;
+            punctuation.extend(close_punctuation);
+            let body = ElementBody {
+                tag: None,
+                head: Vec::new(),
+                children,
+                self_closing: false,
+                close_tag: None,
+                punctuation,
+            };
+            return Some((Node::Element(Box::new(body)), self.span_from(start)));
+        }
         self.expect_ctrl('<')?;
         let (tag, tag_tokens) = self.parse_element_name()?;
         let mut head = Vec::new();
@@ -3645,9 +3686,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 punctuation.push(self.here_span());
                 self.bump();
                 let (children, close_tag, close_punctuation) =
-                    self.parse_element_children(&tag_tokens)?;
+                    self.parse_element_children(Some(&tag_tokens))?;
                 punctuation.extend(close_punctuation);
-                break (children, false, Some(close_tag));
+                break (children, false, close_tag);
             }
             if self.at_end() {
                 self.note_expected("`>` or `/>`");
@@ -3659,7 +3700,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         let (children, self_closing, close_tag) = children;
         let body = ElementBody {
-            tag,
+            tag: Some(tag),
             head,
             children,
             self_closing,
@@ -3776,12 +3817,16 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (an i-string arrives as its lexed paren group), and `{expression}`
     /// holes. Bare text is a parse error that teaches the quoted form.
     ///
-    /// Returns the children, the close tag's NAME span, and the close tag's own
-    /// two angle-bracket spans — its `</` and its `>` (E115).
+    /// `open_tokens` is the opening tag's name tokens, or `None` for a
+    /// FRAGMENT (A46), which closes on `</>` and has no name to match.
+    ///
+    /// Returns the children, the close tag's NAME span (`None` for `</>`), and
+    /// the close tag's own two angle-bracket spans — its `</` and its `>`
+    /// (E115).
     fn parse_element_children(
         &mut self,
-        open_tokens: &std::ops::Range<usize>,
-    ) -> Option<(Vec<ElementChild<'src>>, Span, [Span; 2])> {
+        open_tokens: Option<&std::ops::Range<usize>>,
+    ) -> Option<(Vec<ElementChild<'src>>, Option<Span>, [Span; 2])> {
         let mut children: Vec<ElementChild<'src>> = Vec::new();
         loop {
             // `</tag>` — the close (span-adjacent `</`), name-matched against
@@ -3791,6 +3836,21 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.bump();
                 let slash = self.here_span();
                 self.bump();
+                // A fragment closes on `</>`: nothing stands where the name
+                // would, and a name there is the mismatch this reports.
+                let Some(open_tokens) = open_tokens else {
+                    let closing_angle = self.here_span();
+                    if !self.peek_is_ctrl('>') {
+                        self.note_expected("`</>`");
+                        return None;
+                    }
+                    self.bump();
+                    return Some((
+                        children,
+                        None,
+                        [(angle.start..slash.end).into(), closing_angle],
+                    ));
+                };
                 let close = self.parse_element_name();
                 let matches_open = close.as_ref().is_some_and(|(_, close_tokens)| {
                     close_tokens.len() == open_tokens.len()
@@ -3809,17 +3869,19 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let (close_span, _) = close.expect("matched above");
                 return Some((
                     children,
-                    close_span,
+                    Some(close_span),
                     [(angle.start..slash.end).into(), closing_angle],
                 ));
             }
             if self.at_end() {
-                let open_name = self.element_name_text(open_tokens);
-                self.note_expected(&format!("`</{open_name}>`"));
+                self.note_expected(&match open_tokens {
+                    Some(open_tokens) => format!("`</{}>`", self.element_name_text(open_tokens)),
+                    None => "`</>`".to_string(),
+                });
                 return None;
             }
-            // A nested element.
-            if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
+            // A nested element, or a nested fragment (A46).
+            if (self.peek_is_ctrl('<') && self.peek_at_is_name(1)) || self.peek_is_fragment_open() {
                 children.push(ElementChild::Bare(self.parse_element()?));
                 continue;
             }
@@ -7712,6 +7774,49 @@ mod tests {
             rendered_errors("fun f() { let p: Map<str, List<i32> = m; }\n"),
             vec!["found '=' expected ',' or '>' in type annotation".to_string()]
         );
+    }
+
+    /// A46: `<>` is a SPAN-ADJACENT pair, like `/>` and `</`. Spaced apart it
+    /// is not a fragment head, and the `<` falls through to everything `<`
+    /// already begins — so nothing about a comparison changes.
+    #[test]
+    fn a_spaced_angle_pair_is_not_a_fragment() {
+        assert_eq!(
+            rendered_errors("fun main() { let p = < >; }\n"),
+            vec!["found '<' expected an expression".to_string()]
+        );
+    }
+
+    /// A46: a fragment parses as a NAMELESS element body — the shape the
+    /// formatter and the editor's markup pass read, before the desugar retires
+    /// the element node and emits the list literal. All four angle-bracket
+    /// spans are recorded (E115), because `<>` and `</>` are the only
+    /// punctuation a fragment has.
+    #[test]
+    fn a_fragment_parses_as_a_nameless_element_body() {
+        let (node, _span) = expr("<><i>\"a\"</i>{row}</>");
+        let Node::Element(body) = node else {
+            panic!("a fragment must parse as an element body, got {node:?}");
+        };
+        assert!(body.tag.is_none(), "a fragment head carries no name");
+        assert!(body.close_tag.is_none(), "`</>` carries no name either");
+        assert!(body.head.is_empty(), "a fragment takes no head items");
+        assert!(!body.self_closing, "a fragment has no self-closing form");
+        assert_eq!(body.children.len(), 2, "both children are kept");
+        assert_eq!(body.punctuation.len(), 4, "`<`, `>`, `</`, `>`");
+    }
+
+    /// A46: a NAMED element is unchanged — its head still carries a tag span,
+    /// which is what keeps the nameless case a distinguishable second form and
+    /// not a default.
+    #[test]
+    fn a_named_element_still_carries_its_tag_span() {
+        let (node, _span) = expr("<i>\"a\"</i>");
+        let Node::Element(body) = node else {
+            panic!("an element must parse as an element body, got {node:?}");
+        };
+        assert!(body.tag.is_some(), "a named head carries its name");
+        assert!(body.close_tag.is_some(), "and so does its close");
     }
 
     #[test]

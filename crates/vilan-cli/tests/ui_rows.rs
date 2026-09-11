@@ -2127,3 +2127,118 @@ fn a71_a_reactive_run_and_a_swap_each_keep_their_own_place() {
          got:\n{stdout}"
     );
 }
+
+// --- A46: a fragment is a child that keeps its position ----------------------
+
+/// A static fragment between two static siblings, and a REACTIVE one — a
+/// signal whose value is a fragment — between two more. The reactive half is
+/// the piece A46's own recommendation left open and A71 closed: a
+/// `Source<List<View>>` places through a region, so the run is replaced in
+/// place instead of re-appended behind whatever the chain added after it.
+const A46_FRAGMENT: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun pair(): List<View> {
+	<>
+		<i>"a"</i>
+		<b>"b"</b>
+	</>
+}
+
+fun main() {
+	let count: SignalCell<i32> = Signal::new(1);
+	let _root = mount_root("app", || {
+		<main>
+			<header>"head"</header>
+			{pair()}
+			<hr />
+			{count.map(|n: i32| <>
+				<q>{i"g{n}"}</q>
+				<r>{i"h{n}"}</r>
+			</>)}
+			<footer>"foot"</footer>
+		</main>
+	});
+	print(i"start={tree()}");
+	count.set(3);
+	print(i"grown={tree()}");
+	count.set(2);
+	print(i"shrunk={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A46: the static fragment's two elements sit where the fragment was written,
+/// and the reactive fragment's run stays between the `<hr />` and the footer
+/// across every change — the wrapper element A46 exists to remove, removed.
+#[test]
+fn a46_a_fragment_places_its_run_in_position_statically_and_reactively() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a46_fragment", A46_FRAGMENT, &harness);
+    // Element syntax lowers every child to `.child(…)`, so a quoted string is
+    // a real TEXT NODE beside its element — which is why each tag here is
+    // followed by its own `#text'…'` rather than carrying the text itself.
+    let tree = |mark: i32| {
+        vec![
+            "root".to_string(),
+            "main".to_string(),
+            "header".to_string(),
+            "#text'head'".to_string(),
+            "i".to_string(),
+            "#text'a'".to_string(),
+            "b".to_string(),
+            "#text'b'".to_string(),
+            "hr".to_string(),
+            "q".to_string(),
+            format!("#text'g{mark}'"),
+            "r".to_string(),
+            format!("#text'h{mark}'"),
+            "footer".to_string(),
+            "#text'foot'".to_string(),
+        ]
+    };
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("start".to_string(), tree(1)),
+            ("grown".to_string(), tree(3)),
+            ("shrunk".to_string(), tree(2)),
+        ],
+        "a fragment must place its run at its own position, static or \
+         reactive; got:\n{stdout}"
+    );
+}
+
+/// A46's SSR twin: the same fragment serializes as the run it is, with no
+/// marker and no wrapper — which is what keeps the browser tree and the
+/// served markup comparable (`ssr_differential`'s rule, asserted here on the
+/// static half, which is the only half a server render has).
+const A46_FRAGMENT_SSR: &str = r#"import std::io::print;
+import std::ui::{ View, render, view };
+
+fun pair(): List<View> {
+	<><i>"a"</i><b>"b"</b></>
+}
+
+fun main() {
+	print(render(<main><header>"head"</header>{pair()}<footer>"foot"</footer></main>));
+}
+
+main();
+"#;
+
+#[test]
+fn a46_the_ssr_twin_serializes_a_fragment_as_its_run() {
+    let stdout = build_and_run_process("a46_fragment_ssr", A46_FRAGMENT_SSR);
+    assert_eq!(
+        stdout.trim(),
+        "<main><header>head</header><i>a</i><b>b</b><footer>foot</footer></main>",
+        "a fragment must serialize as its children and nothing else; \
+         got:\n{stdout}"
+    );
+}
