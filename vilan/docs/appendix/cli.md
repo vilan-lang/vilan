@@ -278,8 +278,29 @@ is the current directory. Formatting is conservative and a fixed point:
   above — an argument list sits inside an expression, where the builder
   convention decides layout, while a parameter list is a declaration's own
   contract and has no shape but one-per-line.
-- A `style()` builder chain's links are put in a canonical ORDER — the only
-  place `vilan fmt` reorders your code rather than re-laying it out. The order
+- An element HEAD's items are put in a canonical ORDER: `id`, `name`, `type`,
+  `for`, `href`, `src` lead, every other undotted attribute follows
+  alphabetically, then every `on:` handler alphabetically among themselves. A
+  DOTTED link (`.class(…)`, `.styled(…)`, `.child(…)`, one of your own) is a
+  **barrier** — it holds its position absolutely and items sort only within the
+  runs between barriers — because a link may write any slot it likes and the
+  formatter knows nothing about what yours writes. Two items naming the same
+  slot keep their written order, so a last-wins pair still wins the same way,
+  and a head with a comment anywhere inside it is left exactly as written. What
+  the reorder cannot change is what the element BUILDS: every moved item fills
+  a slot named by its own first argument, and an HTML start tag reads its
+  attributes as a set.
+- **The order the attribute VALUES run in is not preserved**, and that is the
+  one thing to know about the rule above. An attribute's value is an arbitrary
+  expression, so moving `title(a())` past `id(b())` moves when `a()` and `b()`
+  are called. In practice a value is a literal or a signal read and this cannot
+  be observed — it is the same bargain the `style()` order below ships with,
+  and the same one an argument list has always had. Where it can be observed,
+  the side effect is the smell rather than the sorter: lift it into a `let`
+  above the element, where its order is written down and a reader can see it.
+- A `style()` builder chain's links are put in a canonical ORDER — the element
+  head's sibling, reordering your code rather than re-laying it out, and taking
+  the same bargain about when its arguments run. The order
   is Tailwind CSS's category sequence (layout, flexbox/grid, spacing, sizing,
   typography, backgrounds, borders, effects, filters, tables,
   transitions/animation, transforms, interactivity, svg, accessibility), with
