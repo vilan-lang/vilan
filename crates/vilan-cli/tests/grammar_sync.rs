@@ -1284,3 +1284,228 @@ fn generated_fragments_are_current() {
          regeneration command ({REGENERATE_COMMAND})"
     );
 }
+
+// --- E161: the nested generic head, layer by layer ---------------------------
+//
+// `impl Source<Option<type _: Source<type U>>>` was painted by three different
+// rules for one bracket kind, and by a fourth for the keyword. The vocabulary
+// the rules use is asserted here, on the REGEXES, in node — which is where the
+// editor and the book run them (both grammars use lookbehind, which Rust's
+// `regex` crate does not have).
+//
+// **What this is not.** The item asked for a scope assertion driven by
+// `vscode-textmate`, which tokenises the way VS Code does and would answer
+// "which scope does THIS bracket end up with" rather than "which rule can
+// match this text". `vscode-textmate` (and the `vscode-oniguruma` it needs) is
+// not in `editors/vscode/package-lock.json` and pulling it in is a new
+// dependency, which is a ruling and not a lane's call — so the checks below
+// assert each rule's own regex plus the ORDER the rules sit in, which together
+// decide the outcome a tokeniser would report, and the gap is named rather
+// than papered over.
+
+/// The regexes one repository key contributes under `field` (`match`, `begin`
+/// or `end`), nested patterns included, in grammar order.
+fn textmate_regexes(grammar: &Grammar, key: &str, field: &str) -> Vec<String> {
+    grammar
+        .rules(key)
+        .into_iter()
+        .filter(|rule| rule.field == field)
+        .map(|rule| rule.regex.clone())
+        .collect()
+}
+
+/// The one regex under `key`/`field` that contains `needle`. Reds by name when
+/// a rule is reworded out from under a check rather than matching nothing.
+fn textmate_regex_containing(grammar: &Grammar, key: &str, field: &str, needle: &str) -> String {
+    let found: Vec<String> = textmate_regexes(grammar, key, field)
+        .into_iter()
+        .filter(|regex| regex.contains(needle))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "{TEXTMATE_GRAMMAR}: expected exactly one `{field}` under `{key}` containing {needle:?}, \
+         found {found:?}"
+    );
+    found.into_iter().next().unwrap()
+}
+
+#[test]
+fn e161_a_generic_head_opens_a_generic_list_and_never_a_tag() {
+    let grammar = textmate_grammar(&[]);
+    // The element rule is the one that read `<type`, `<str`, `<sync` as tags.
+    let tag = textmate_regex_containing(&grammar, "elements", "match", "a-zA-Z0-9_]+)*");
+    let heads = [
+        "Option<type _>",
+        "SignalCell<str>",
+        "Source<Option<type _: Source<type U>>>",
+        "|T| U",
+    ];
+    assert_eq!(
+        regex_matches(&tag, &heads),
+        vec![false; heads.len()],
+        "the element rule still reads a generic head as a tag: {tag}"
+    );
+    // The controls: real markup is still markup.
+    let markup = ["<div>", "</div>", "\tview <li>", "<my-tag>"];
+    assert_eq!(
+        regex_matches(&tag, &markup),
+        vec![true; markup.len()],
+        "the element rule stopped matching an element: {tag}"
+    );
+    // And the generic rule takes the heads the element rule gave up.
+    let open = textmate_regex_containing(&grammar, "generics", "begin", "(?<=[A-Za-z0-9_])<");
+    assert_eq!(
+        regex_matches(&open, &["Option<type _>", "SignalCell<str>", "List<i32>"]),
+        vec![true, true, true],
+        "the generic rule does not open on a head: {open}"
+    );
+    // A spaced comparison is nobody's generic — the formatter spaces every
+    // binary operator, so this is the shape a written comparison has.
+    assert_eq!(
+        regex_matches(&open, &["a < b", "if a < b {", "<div>"]),
+        vec![false, false, false],
+        "the generic rule opens on a comparison: {open}"
+    );
+}
+
+#[test]
+fn e161_the_generic_list_closes_on_a_bracket_and_at_a_statement_boundary() {
+    let grammar = textmate_grammar(&[]);
+    let close = textmate_regex_containing(&grammar, "generics", "end", ">");
+    // A `>` closes one list, so `>>>` closes the three the nesting opened.
+    assert_eq!(regex_matches(&close, &[">", ">>>"]), vec![true, true]);
+    // The bail-outs: characters no type argument contains. A glued comparison
+    // the formatter never writes gives the list back at its own statement
+    // instead of running to the next `>` in the file.
+    assert_eq!(
+        regex_matches(&close, &["{", "}", ";"]),
+        vec![true, true, true],
+        "the generic list has no statement-boundary bail-out: {close}"
+    );
+}
+
+#[test]
+fn e161_the_binder_keyword_is_scoped_as_a_keyword_inside_the_list() {
+    let grammar = textmate_grammar(&[]);
+    let binder = textmate_regex_containing(&grammar, "generics", "match", "(type)");
+    assert_eq!(
+        regex_matches(&binder, &["type T", "type _", "type U>"]),
+        vec![true, true, true],
+        "the binder rule does not match a binder: {binder}"
+    );
+    // A binder is a keyword followed by a NAME; nothing else in a type is.
+    assert_eq!(
+        regex_matches(&binder, &["type>", "type,"]),
+        vec![false, false],
+        "the binder rule matches a bare `type`: {binder}"
+    );
+    let wildcard = textmate_regex_containing(&grammar, "generics", "match", "_(?!");
+    assert_eq!(
+        regex_matches(&wildcard, &["_", "_: Source<type U>", "_>"]),
+        vec![true, true, true],
+        "the wildcard rule does not match `_`: {wildcard}"
+    );
+    // Not a name that merely contains one.
+    assert_eq!(
+        regex_matches(&wildcard, &["_name", "name_", "a_b"]),
+        vec![false, false, false],
+        "the wildcard rule matches part of a name: {wildcard}"
+    );
+}
+
+/// The two orders that decide the outcome, read from the grammar itself: the
+/// generic list is reached before the element rule (so a head is claimed by the
+/// list, not by a tag), and the binder rule is listed before the keyword
+/// include inside the list (so `type` there is the binder scope and not the
+/// declaration-keyword scope that names an item).
+#[test]
+fn e161_the_generic_list_outranks_the_element_rule_and_the_binder_outranks_the_keywords() {
+    const SCRIPT: &str = r#"
+        const grammar = require(process.env.VILAN_FILE);
+        console.log("top\t" + grammar.patterns.map((p) => p.include || "?").join(","));
+        const generics = grammar.repository.generics.patterns[0];
+        console.log("region\t" + generics.patterns.map((p) => p.include || p.name).join(","));
+        console.log("scope\t" + (generics.beginCaptures["0"].name || "?"));
+        console.log("scope\t" + (generics.endCaptures["0"].name || "?"));
+        console.log("scope\t" + (generics.name || "?"));
+    "#;
+    let lines = node(SCRIPT, &repo_root().join(TEXTMATE_GRAMMAR), &[]);
+    let field = |kind: &str| -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| line.strip_prefix(&format!("{kind}\t")))
+            .map(str::to_string)
+            .collect()
+    };
+    let top = field("top").join("");
+    let generic_at = top
+        .split(',')
+        .position(|entry| entry == "#generics")
+        .expect("the generic list is not included at the top level");
+    let element_at = top
+        .split(',')
+        .position(|entry| entry == "#elements")
+        .expect("the element rules are not included at the top level");
+    assert!(
+        generic_at < element_at,
+        "the element rule is reached before the generic list ({top}), so a head \
+         is claimed as a tag again"
+    );
+    let region = field("region").join("");
+    let binder_at = region
+        .split(',')
+        .position(|entry| entry == "keyword.other.type-binder.vilan")
+        .expect("the binder rule is not inside the generic list");
+    let keywords_at = region
+        .split(',')
+        .position(|entry| entry == "#keywords")
+        .expect("the keyword rules are not included inside the generic list");
+    assert!(
+        binder_at < keywords_at,
+        "the keyword include outranks the binder rule ({region}), so `type` in a \
+         head takes the declaration-keyword scope again"
+    );
+    // The delimiters are one vocabulary, and it is neither the tag's nor the
+    // operator's — the whole point of the item.
+    assert_eq!(
+        field("scope"),
+        vec![
+            "punctuation.definition.generic.begin.vilan".to_string(),
+            "punctuation.definition.generic.end.vilan".to_string(),
+            "meta.generic.vilan".to_string(),
+        ],
+        "the generic list's own scopes moved"
+    );
+}
+
+/// The book's twin (the third place). highlight.js has no operator rule, so its
+/// brackets were never mis-scoped — but its element-tag rule made the very same
+/// `<type` mistake, and takes the very same guard.
+#[test]
+fn e161_the_books_tag_rule_ignores_a_generic_head_too() {
+    let grammar = highlight_grammar(&[]);
+    let tag = grammar
+        .rules("name")
+        .into_iter()
+        .map(|rule| rule.regex.clone())
+        .find(|regex| regex.contains("</?"))
+        .expect("the book's element-tag rule");
+    assert_eq!(
+        regex_matches(
+            &tag,
+            &[
+                "Option<type _>",
+                "SignalCell<str>",
+                "Source<Option<type _: Source<type U>>>",
+            ],
+        ),
+        vec![false, false, false],
+        "the book still reads a generic head as a tag: {tag}"
+    );
+    assert_eq!(
+        regex_matches(&tag, &["<div>", "</div>", "<my-tag>"]),
+        vec![true, true, true],
+        "the book stopped matching an element: {tag}"
+    );
+}

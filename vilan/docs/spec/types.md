@@ -339,6 +339,23 @@ per receiver: a `Words: Source<str>` instantiates the impl at `T = str`, a
 `Counts: Source<i32>` at `T = i32`. A name in a bound that no binder
 declares is still unresolved, and is reported where it is written.
 
+A binder the head never mentions again needs no name, and is written `_` —
+the wildcard of `Some(_)` and `let _`, in the impl-subject position, with
+the same optional bound:
+
+```vilan,fragment
+impl Source<Option<_: Source<type U>>> { … }    // a signal of an optional signal
+impl Pair<_, _> { … }                           // for every Pair, whatever it holds
+```
+
+Each `_` is a parameter of its OWN: two of them in one head are two
+parameters, never one written twice, so nothing about the head says the two
+positions agree. Write a name where they must. `type _` means the same
+thing and stays accepted; `vilan fmt` prints it as `_`. Outside an impl
+subject there is no head to introduce a parameter into, so `_` in an
+annotation (`let x: List<_>`) is refused — it is a binder, not an
+inference placeholder.
+
 A trait has **one implementation per subject**: writing
 `impl Bag with Show` twice is a compile error at the second one, since
 nothing would rank them and the second would never run. Two impls are the

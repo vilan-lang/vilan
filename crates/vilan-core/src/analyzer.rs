@@ -6,8 +6,9 @@ use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet, FxIndexMap as IndexMap};
 use crate::id::Id;
 use crate::node::{
-    BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure, ExternBinding, Func,
-    GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList, Pattern,
+    ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure,
+    ExternBinding, Func, GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList,
+    Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -3950,6 +3951,17 @@ pub struct Analyzer<'src> {
     // the same question keyed structurally, and shadowing cannot arise for a
     // parameter that was never spelled.
     implicit_generic_scopes: HashMap<TypeId, Id>,
+    // B294's anonymous subject binders, by the OCCURRENCE that wrote each —
+    // `(source, the binder node's span)` to the parameter's constraint id.
+    // `_` names nothing, so there is no name for the subject walk to resolve
+    // and the occurrence's own span is the identity instead; two `_`s in one
+    // head are two parameters because they are two spans.
+    anonymous_binder_parameters: HashMap<(SourceId, Span), TypeId>,
+    // The same parameters by constraint id, to the scope whose head declared
+    // them — `implicit_generic_scopes` one position along, and read by the same
+    // two "is this parameter fixed by an enclosing binder?" tests, which
+    // otherwise resolve a generic by NAME up the scope chain.
+    anonymous_binder_scopes: HashMap<TypeId, Id>,
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `Never` (which reconciles with any expected type) and lowers to
     // a `throw`.
@@ -4776,6 +4788,8 @@ impl<'src> Analyzer<'src> {
             attributed_declarations: HashSet::default(),
             hidden_annotation_types: HashMap::default(),
             implicit_generic_scopes: HashMap::default(),
+            anonymous_binder_parameters: HashMap::default(),
+            anonymous_binder_scopes: HashMap::default(),
             panic_fn_id: None,
             call_subjects: Vec::new(),
             divergence_leaves: DivergenceLeaves::default(),
@@ -4870,8 +4884,15 @@ impl<'src> Analyzer<'src> {
     /// *other* declaration — a distinct constraint id — never matches. B186's
     /// implicit generics have no name to resolve, so they answer from the scope
     /// their declaration owns; nothing can shadow a parameter nobody wrote.
+    /// B294's anonymous binders (`_`) answer the same way, for the same reason:
+    /// the name was withdrawn so two of them could not be one.
     fn generic_is_enclosing_binder(&self, constraint_id: TypeId, id: Id) -> bool {
-        if let Some(owner_scope_id) = self.implicit_generic_scopes.get(&constraint_id).copied() {
+        if let Some(owner_scope_id) = self
+            .implicit_generic_scopes
+            .get(&constraint_id)
+            .or_else(|| self.anonymous_binder_scopes.get(&constraint_id))
+            .copied()
+        {
             return self
                 .expr_id_to_scope_id_map
                 .get(&id)
@@ -23891,10 +23912,16 @@ impl<'src> Analyzer<'src> {
     ///
     /// The lookup is by name through the scope chain and stops at the first
     /// binding of that name, so a nearer parameter shadowing this one answers
-    /// `false` — the conservative direction. B186's implicit generics answer
-    /// structurally instead: they have no name, and none can shadow them.
+    /// `false` — the conservative direction. B186's implicit generics and
+    /// B294's anonymous `_` binders answer structurally instead: they have no
+    /// name, and none can shadow them.
     fn generic_declared_by_enclosing_scope(&self, constraint_id: TypeId, scope_id: Id) -> bool {
-        if let Some(owner_scope_id) = self.implicit_generic_scopes.get(&constraint_id).copied() {
+        if let Some(owner_scope_id) = self
+            .implicit_generic_scopes
+            .get(&constraint_id)
+            .or_else(|| self.anonymous_binder_scopes.get(&constraint_id))
+            .copied()
+        {
             return self.scope_encloses(owner_scope_id, scope_id);
         }
         let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
@@ -24634,18 +24661,19 @@ impl<'src> Analyzer<'src> {
     /// they constrain registers, so the nested ones register FIRST.
     fn register_subject_binders(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) {
         match &node.0 {
-            Node::TypeBinder(name, bounds) => {
+            Node::TypeBinder((name, name_span), bounds) => {
                 for bound in bounds {
                     self.register_subject_binders(bound, scope_id);
                 }
-                self.register_binder(name, &node.1, bounds, scope_id);
+                let constraint_type_id = self.register_binder(name, name_span, bounds, scope_id);
+                self.withdraw_anonymous_binder_name(name, name_span, constraint_type_id, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
                 let inherited = self.declared_generic_constraint_ids(subject_name, scope_id);
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
-                    if let Node::TypeBinder(binder_name, bounds) = &argument.0
+                    if let Node::TypeBinder((binder_name, binder_span), bounds) = &argument.0
                         && bounds.is_empty()
                     {
                         if let Some(constraint_id) = inherited
@@ -24654,7 +24682,13 @@ impl<'src> Analyzer<'src> {
                         {
                             self.register_generic_parameter(
                                 binder_name,
-                                &argument.1,
+                                binder_span,
+                                constraint_id,
+                                scope_id,
+                            );
+                            self.withdraw_anonymous_binder_name(
+                                binder_name,
+                                binder_span,
                                 constraint_id,
                                 scope_id,
                             );
@@ -24664,7 +24698,13 @@ impl<'src> Analyzer<'src> {
                             // unbounded and retrofit the inherited bound just
                             // before solving, when every declaration exists.
                             let fresh =
-                                self.register_binder(binder_name, &argument.1, &[], scope_id);
+                                self.register_binder(binder_name, binder_span, &[], scope_id);
+                            self.withdraw_anonymous_binder_name(
+                                binder_name,
+                                binder_span,
+                                fresh,
+                                scope_id,
+                            );
                             self.prepped_binder_inheritance.push((
                                 fresh,
                                 subject_name,
@@ -24692,6 +24732,52 @@ impl<'src> Analyzer<'src> {
             }
             _ => {}
         }
+    }
+
+    /// Takes an ANONYMOUS subject binder's name back out of the scope it was
+    /// just registered into, and files the parameter under the occurrence that
+    /// wrote it instead (B294). A no-op for every named binder.
+    ///
+    /// `_` declines to name the parameter, and a name is the only thing a scope
+    /// can resolve. Left in the scope map, the second `_` in a head OVERWRITES
+    /// the first — both occurrences then resolve to the last parameter, which
+    /// is one parameter where the author wrote two. That aliasing shipped with
+    /// the keyword spelling: at 65af4be0
+    /// `impl Pair<type _: PartialEq, type _: PartialEq>` compiled
+    /// `self.first == self.second` over a `Pair<i32, str>`, the way the
+    /// deliberately-aliased `impl Pair<type T: PartialEq, T>` does and the way
+    /// `impl Pair<type A: PartialEq, type B: PartialEq>` correctly refuses. Two
+    /// wildcards are two parameters, exactly as `Some(_, _)` binds nothing
+    /// twice.
+    ///
+    /// Registering under the name and withdrawing it keeps ONE registration
+    /// path: the entity, its `Expr::Generic` (which is what B77's
+    /// declaring-file relation counts), the constraint's display name and the
+    /// go-to-definition span are all still the ones every named binder gets.
+    /// Only the lookup key changes, and `walk_type_node`'s binder arm looks the
+    /// parameter up by the same `(source, span)` it is filed under here.
+    ///
+    /// Scoped to SUBJECT binders on purpose. A `_` written in a declared
+    /// generic list (`fun identity<_>(value: _): _`) is an ordinary parameter
+    /// that happens to be called `_`, it resolves by name like any other, and
+    /// nothing here touches it.
+    fn withdraw_anonymous_binder_name(
+        &mut self,
+        name: &'src str,
+        name_span: &'src Span,
+        constraint_type_id: TypeId,
+        scope_id: Id,
+    ) {
+        if name != ANONYMOUS_TYPE_BINDER {
+            return;
+        }
+        let source_id = self.current_source_id;
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.name_to_id_map.shift_remove(name);
+        self.anonymous_binder_parameters
+            .insert((source_id, *name_span), constraint_type_id);
+        self.anonymous_binder_scopes
+            .insert(constraint_type_id, scope_id);
     }
 
     /// The substitution mapping a subject enum's declared generic parameters to
@@ -28050,16 +28136,35 @@ impl<'src> Analyzer<'src> {
             }
             // A `type X` binder resolves to the generic it was registered as (by
             // `register_subject_binders` before the subject is walked).
-            Node::TypeBinder(name, _bounds) => {
-                self.prepped_type_locals.push((
-                    type_id,
-                    name,
-                    scope_id,
-                    node.1,
-                    Vec::new(),
-                    self.current_source_id,
-                ));
-                None
+            //
+            // An ANONYMOUS binder (B294) has no name in the scope to resolve —
+            // `withdraw_anonymous_binder_name` took it back out precisely so
+            // that two `_`s in one head cannot collapse into one parameter — so
+            // the occurrence's own span is what finds it. A `_` the lookup
+            // misses was written where no binder may be introduced (a `let`
+            // annotation, a field, a parameter): it falls through to the same
+            // name resolution every other type spelling takes, which refuses it
+            // and says what `_` is for.
+            Node::TypeBinder((name, name_span), _bounds) => {
+                match self
+                    .anonymous_binder_parameters
+                    .get(&(self.current_source_id, *name_span))
+                    .copied()
+                    .filter(|_| *name == ANONYMOUS_TYPE_BINDER)
+                {
+                    Some(constraint_type_id) => Some(Type::Generic(constraint_type_id)),
+                    None => {
+                        self.prepped_type_locals.push((
+                            type_id,
+                            name,
+                            scope_id,
+                            *name_span,
+                            Vec::new(),
+                            self.current_source_id,
+                        ));
+                        None
+                    }
+                }
             }
             // `style::Style`, `std::reactive::SignalCell<i32>` — a nominal type
             // named through the modules that declare it (B172).
@@ -39932,6 +40037,21 @@ impl<'src> Analyzer<'src> {
                             "`{name}` is a namespace, not a value; import the module first \
                              (`import {name}::…;`) and qualify through its name"
                         )
+                    } else if name == ANONYMOUS_TYPE_BINDER {
+                        // B294: `_` in type position is the ANONYMOUS BINDER, so
+                        // it never reaches here from an impl head — the head
+                        // registered it, and this is every other type position,
+                        // where there is no head to introduce a parameter into.
+                        // Before the wildcard existed the reader got `cannot
+                        // find type '_'`, which invites the search for a type
+                        // called `_`; what they want to know is that `_` is not
+                        // an inference placeholder in an annotation.
+                        "`_` is the anonymous type binder: it introduces a generic parameter, \
+                         and only an `impl` subject introduces one \
+                         (`impl Source<Option<_: Source<type U>>>`). In an annotation there is \
+                         no head to bind it to — write the type here, or, where the type can be \
+                         inferred, leave the annotation off"
+                            .to_string()
                     } else {
                         let steer = self.import_steer(name).unwrap_or_default();
                         format!("cannot find type '{}'{}", name, steer)

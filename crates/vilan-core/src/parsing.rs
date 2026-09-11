@@ -56,11 +56,11 @@ use std::cell::Cell;
 
 use crate::lexing;
 use crate::node::{
-    BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration, CssItem, CssNested,
-    CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, Exposure,
-    ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If, ImportBranch,
-    ImportTail, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr,
-    StructField, TupleBound,
+    ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
+    CssItem, CssNested, CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
+    Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
+    ImportBranch, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern,
+    ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -4427,7 +4427,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_op("&") {
             return self.parse_reference_type();
         }
-        if self.peek_is(&Token::Type) {
+        if self.peek_is(&Token::Type) || self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
             return self.parse_type_binder();
         }
         if let Some(closure) = self.parse_closure_type() {
@@ -4488,18 +4488,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `type X (: A + B)?` — a generic binder in type position (impl subject
-    /// patterns).
+    /// `type X (: A + B)?` / `_ (: A + B)?` — a generic binder in type position
+    /// (impl subject patterns).
+    ///
+    /// Two spellings, one node. The keyword NAMES the parameter, and the
+    /// keyword is what says "this introduces a name" in a position that
+    /// otherwise reads a type. `_` (B294) introduces one the author declined to
+    /// name — the pattern wildcard's spelling (`Some(_)`, `let _`) in the
+    /// impl-subject position, and the only way to write a BOUND on an anonymous
+    /// parameter: `_: Source<type U>` was a parse error at the `:`, because
+    /// nothing but the keyword reached this production and a bare `_` was an
+    /// ordinary name that no scope declared.
+    ///
+    /// The reading is unconditional — `_` in ANY type position is this node,
+    /// not a name — so the parser stays context-free and a `_` written where no
+    /// binder may be introduced (`let x: List<_>`, an inference placeholder) is
+    /// refused where every other unbound name is, by resolution, with a message
+    /// that says what `_` is for.
     fn parse_type_binder(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Type)?;
+        if !self.eat(&Token::Type) && !self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
+            return None;
+        }
+        let name_start = self.position;
         let name = self.eat_ident()?;
+        // The NAME's own span, the way `GenericParameter` carries one: the
+        // node's span reaches from the `type` keyword to the end of the bounds,
+        // and what the binder's ENTITY must be spanned by is the thing an
+        // editor selects for it (E161).
+        let name_span = self.span_from(name_start);
         let bounds = if self.eat_op(":") {
             self.parse_type_bounds()?
         } else {
             Vec::new()
         };
-        Some((Node::TypeBinder(name, bounds), self.span_from(start)))
+        Some((
+            Node::TypeBinder((name, name_span), bounds),
+            self.span_from(start),
+        ))
     }
 
     /// `A + B + …` — a `+`-separated bound list (≥1).
@@ -7140,6 +7166,62 @@ mod tests {
                 assert!(matches!(body.0[0].0, Node::Func(_)));
             }
             other => panic!("expected Impl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_anonymous_type_binder_parses_as_the_keyword_form_does() {
+        // B294: `_` in type position is the binder production, with or without
+        // a bound, and it produces the very node `type _` does.
+        let binders = |source: &'static str| match only_item(source) {
+            Node::Impl(subject, _traits, _body) => match subject.0 {
+                Node::AccessorWithGenerics(_, arguments) => arguments
+                    .0
+                    .into_iter()
+                    .map(|argument| match argument.0 {
+                        Node::TypeBinder(name, bounds) => (name.0, bounds.len()),
+                        other => panic!("expected a TypeBinder argument, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                other => panic!("expected an applied subject, got {other:?}"),
+            },
+            other => panic!("expected Impl, got {other:?}"),
+        };
+        assert_eq!(
+            binders("impl Pair<_, type T> { }"),
+            vec![("_", 0), ("T", 0)]
+        );
+        // The bound `_` could not carry before: `_: Bound` stopped at the `:`.
+        assert_eq!(
+            binders("impl Pair<_: Show, _> { }"),
+            vec![("_", 1), ("_", 0)]
+        );
+        // Two occurrences are two nodes, which is what makes them two
+        // parameters downstream.
+        assert_eq!(
+            binders("impl Pair<type _, _> { }"),
+            vec![("_", 0), ("_", 0)]
+        );
+    }
+
+    #[test]
+    fn a_bare_underscore_annotation_is_a_binder_node_not_a_name() {
+        // B294: the reading is unconditional, so an inference-placeholder `_`
+        // is refused by RESOLUTION (with a message that says what `_` is for)
+        // rather than by the parser.
+        match only_item("fun f(value: _) { }") {
+            Node::Func(function) => {
+                match &function.parameters.0[0].declared_type.as_ref().unwrap().0 {
+                    Node::TypeBinder((name, name_span), bounds) => {
+                        assert_eq!(*name, "_");
+                        assert!(bounds.is_empty());
+                        // The NAME's own span (E161), not the whole binder's.
+                        assert_eq!(name_span.into_range().len(), 1);
+                    }
+                    other => panic!("expected a TypeBinder annotation, got {other:?}"),
+                }
+            }
+            other => panic!("expected Func, got {other:?}"),
         }
     }
 

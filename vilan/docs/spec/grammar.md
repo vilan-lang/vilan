@@ -247,9 +247,14 @@ trait = "trait" IDENT [ generic-params ] [ "with" type { "+" type } ]
 
 An impl's subject is a **type pattern**: `type X [: bounds]` binders
 anywhere inside it (`impl List<type T>`, `impl Option<(type T, type U)>`,
-bare `impl type T`) declare the impl's generic parameters (§5.6). `with`
-lists the implemented trait(s). An impl without `with` provides inherent
-members. A trait's `with` lists supertraits.
+bare `impl type T`) declare the impl's generic parameters (§5.6). A binder
+the head never mentions again is written `_` instead — the pattern
+wildcard's spelling, with the same optional bound (`impl
+Source<Option<_: Source<type U>>>`); each `_` is a parameter of its own, so
+two of them in one head are two parameters, exactly as `Some(_, _)` binds
+nothing twice. `type _` is accepted and `vilan fmt` prints it as `_`.
+`with` lists the implemented trait(s). An impl without `with` provides
+inherent members. A trait's `with` lists supertraits.
 
 ### Generic parameters and arguments
 
@@ -547,7 +552,7 @@ recognized between two operands.
 
 ```text
 type = "&" [ "mut" ] type                       (* view type *)
-     | "type" IDENT [ ":" bound-list ]          (* impl-subject binder *)
+     | ( "type" IDENT | "_" ) [ ":" bound-list ] (* impl-subject binder *)
      | [ "async" | "sync" ] closure-type [ context-clause ]
      | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)

@@ -472,6 +472,18 @@ pub struct ServiceAttr<'src> {
     pub client_side: bool,
 }
 
+/// The name a [`Node::TypeBinder`] carries when it was written ANONYMOUSLY —
+/// `_`, or its keyword spelling `type _` (B294).
+///
+/// It is not a keyword and nothing lexes it specially: `_` is an ordinary
+/// identifier, and the wildcard reading is a decision three places share —
+/// `parse_type_atom` routes it to the binder production, the formatter prints
+/// the binder back without the keyword, and `register_subject_binders` declines
+/// to register it under a name (`_` names nothing, so two of them in one head
+/// are two parameters). The spelling lives here, next to the node, so the three
+/// cannot drift apart.
+pub const ANONYMOUS_TYPE_BINDER: &str = "_";
+
 #[derive(Debug)]
 pub enum Node<'src> {
     Accessor(&'src str),
@@ -484,8 +496,18 @@ pub enum Node<'src> {
     Await(Box<Spanned<Self>>),
     // A `type X` generic binder appearing inside a type — the impl subject
     // pattern (`impl Option<(type T, type U)>`), including a bare blanket
-    // (`impl type T`). The optional bounds are `T: A + B`.
-    TypeBinder(&'src str, Vec<Spanned<Self>>),
+    // (`impl type T`). The optional bounds are `T: A + B`. The ANONYMOUS
+    // spelling `_` (B294) is this same node with [`ANONYMOUS_TYPE_BINDER`] as
+    // its name — one node, one analyzer path, no second set of semantics.
+    //
+    // The name carries its OWN span, the way `GenericParameter` does, and not
+    // only the node's: the node's reaches from the `type` keyword to the end of
+    // the bounds, and the entity registered for the binder is spanned by what
+    // the editor must select for it — a go-to-definition target, and one
+    // semantic token (E161: the wide span painted `type _: Source<type U>` as
+    // one type-parameter run and the overlap filter then dropped every name
+    // inside it).
+    TypeBinder(Spanned<&'src str>, Vec<Spanned<Self>>),
     // `x = v` or a compound assignment like `x += v` (the operator is the
     // binary op the assignment applies, e.g. `Add` for `+=`). The target is an
     // lvalue: a local (`Accessor`) or a field place (`MemberAccessor`, e.g.

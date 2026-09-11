@@ -10,8 +10,9 @@
 use std::cell::Cell;
 
 use crate::node::{
-    BinaryOp, Convention, Exposure, ExternBinding, Func, GenericArguments, GenericParameters,
-    ImportBranch, ImportTail, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, Exposure, ExternBinding, Func, GenericArguments,
+    GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList, Pattern,
+    StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -92,9 +93,44 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_element_heads(sort_import_runs(
         &drop_redundant_import_aliases(canonicalize_declaration_clauses(
-            collapse_field_shorthands(drop_trailing_commas(tokens)),
+            drop_anonymous_binder_keywords(collapse_field_shorthands(drop_trailing_commas(tokens))),
         )),
     ))))
+}
+
+/// Drops the `type` keyword in front of an ANONYMOUS binder — `type _` is `_`
+/// (B294) — so the safety check accepts the formatter canonicalizing the one
+/// into the other.
+///
+/// A deletion rather than a reordering, which is why it has to be folded in
+/// here at all: the net is token-for-token, so the printer's canonical `_`
+/// would otherwise fail to match the written `type _` and `format` would hand
+/// the source back unchanged.
+///
+/// The reduction is exact, not a concession. `type` reaches the lexer in
+/// exactly two productions, and the keyword carries no meaning in front of `_`
+/// in either. In a TYPE position it routes to the binder production, which `_`
+/// now reaches on its own. In a declared generic list (`fun f<type _>`) it sets
+/// `GenericParameter::is_type`, and nothing past the parser reads that flag
+/// except this printer — so the two spellings are one parameter there too.
+///
+/// Like [`drop_trailing_commas`] and [`collapse_field_shorthands`], it runs
+/// over BOTH streams, so the form reduces identically on each and the net still
+/// catches every other change.
+fn drop_anonymous_binder_keywords(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Type
+            && tokens.get(index + 1) == Some(&Token::Ident(ANONYMOUS_TYPE_BINDER))
+        {
+            index += 1;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
 }
 
 /// Drops an import alias that renames a name to ITSELF — `import a::b as b;` is
@@ -3207,8 +3243,16 @@ impl<'src> Printer<'src> {
                 }
             }
             // `type T[: A + B]` — a generic binder inside an impl subject pattern.
-            Node::TypeBinder(name, bounds) => {
-                self.out.push_str("type ");
+            // The ANONYMOUS binder canonicalises to the bare wildcard (B294):
+            // `type _` and `_` are the same node, and `_` is the spelling the
+            // parameter actually has — the one `Some(_)` and `let _` already
+            // read as. A NAMED binder keeps its keyword; there the keyword is
+            // the only thing saying "this introduces a name" in a position that
+            // otherwise reads a type.
+            Node::TypeBinder((name, _name_span), bounds) => {
+                if *name != ANONYMOUS_TYPE_BINDER {
+                    self.out.push_str("type ");
+                }
                 self.out.push_str(name);
                 self.print_bounds(bounds);
             }
@@ -6377,6 +6421,31 @@ mod reformats {
         assert_formats(
             "impl Option<type T> { fun map<U>(self, fn: |T| U): Option<U> { match self { Some(let x)=>Some(fn(x)), None=>None } } }\n",
             "impl Option<type T> {\n\tfun map<U>(self, fn: |T| U): Option<U> {\n\t\tmatch self {\n\t\t\tSome(let x) => Some(fn(x)),\n\t\t\tNone => None\n\t\t}\n\t}\n}\n",
+        );
+    }
+
+    /// B294: the ANONYMOUS binder has one canonical spelling, and it is the
+    /// wildcard. `type _` prints as `_`; a NAMED binder keeps its keyword; and
+    /// the canonical form is a fixed point (`assert_formats` re-formats its own
+    /// output). The keyword is dropped by the PRINTER, and the reprint safety
+    /// net is token-for-token — so `drop_anonymous_binder_keywords` folding the
+    /// two spellings together is what lets this land at all: without it,
+    /// `format` bails and hands the source straight back.
+    #[test]
+    fn an_anonymous_type_binder_canonicalises_to_the_wildcard() {
+        assert_formats(
+            "impl Source<Option<type _: Source<type U>>> {\n\tfun depth(self): i32 {\n\t\t2\n\t}\n}\n",
+            "impl Source<Option<_: Source<type U>>> {\n\tfun depth(self): i32 {\n\t\t2\n\t}\n}\n",
+        );
+        assert_formats(
+            "impl Pair<type _, type _> {\n\tfun blend(self): i32 {\n\t\t0\n\t}\n}\n",
+            "impl Pair<_, _> {\n\tfun blend(self): i32 {\n\t\t0\n\t}\n}\n",
+        );
+        // A named binder is untouched: there the keyword is the only thing
+        // saying the position introduces a name.
+        assert_formats(
+            "impl Option<type T> {\n\tfun held(self): i32 {\n\t\t0\n\t}\n}\n",
+            "impl Option<type T> {\n\tfun held(self): i32 {\n\t\t0\n\t}\n}\n",
         );
     }
 

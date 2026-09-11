@@ -8547,6 +8547,69 @@ pub(crate) mod tests {
         assert_eq!(kind_of("abs", 0), Some(TokenKind::Method), "{tokens:?}");
     }
 
+    // E161: which LAYER paints a nested generic head. The semantic classifier
+    // is the authority wherever it classifies — VS Code lets a semantic token
+    // override the TextMate scope underneath it — so a token that spans more
+    // than the name it classifies takes the whole run with it. The binder's
+    // entity was spanned by its NODE, which reaches from the `type` keyword to
+    // the end of the bounds: `impl Source<Option<type _: Source<type U>>>`
+    // emitted ONE `TypeParameter` token over `type _: Source<type U>`, the
+    // overlap filter (narrowest-first, then strictly non-overlapping) then
+    // dropped `Source` and `U` inside it, and the whole run painted in the
+    // type-parameter colour — which is the owner's "the binder keyword is
+    // coloured like a type name", owned here and not by the grammar. With the
+    // name's own span on the node, each name is its own token and the keyword
+    // is left to the TextMate layer, where the binder rule paints it.
+    #[test]
+    fn e161_a_binder_is_spanned_by_its_name_not_by_the_head_it_opens() {
+        let text = "import std::reactive::{ Source, Signal };\n\nimpl Source<Option<type _: Source<type U>>> {\n\tfun depth(self): i32 {\n\t\t2\n\t}\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        let painted = |snippet: &str, occurrence: usize| -> Option<(TokenKind, usize)> {
+            let mut start = 0;
+            let mut position = None;
+            for _ in 0..=occurrence {
+                position = text[start..].find(snippet).map(|at| start + at);
+                start = position? + 1;
+            }
+            let at = position?;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start <= at && at < range.end
+                })
+                .map(|(span, kind, _)| (*kind, span.into_range().len()))
+        };
+        // The binder's own name, one character wide.
+        assert_eq!(
+            painted("_", 0),
+            Some((TokenKind::TypeParameter, 1)),
+            "{tokens:?}"
+        );
+        assert_eq!(
+            painted("U", 0),
+            Some((TokenKind::TypeParameter, 1)),
+            "{tokens:?}"
+        );
+        // The bound INSIDE the binder is its own name again, not swallowed.
+        assert_eq!(
+            painted("Source<type U>", 0),
+            Some((TokenKind::Interface, "Source".len())),
+            "{tokens:?}"
+        );
+        // And the keyword is classified by nothing here, so the grammar's
+        // binder rule is what paints it.
+        let keyword = text.find("type _").expect("the binder keyword");
+        assert!(
+            !tokens.iter().any(|(span, _, _)| {
+                let range = span.into_range();
+                range.start <= keyword && keyword < range.end
+            }),
+            "the `type` keyword is classified by the semantic layer: {tokens:?}"
+        );
+    }
+
     // --- B184: a trait-typed struct field, in the editor ---------------------
     //
     // trait-typed-fields.md rev 2 §R4.2 answered the `impl Trait` grammar
