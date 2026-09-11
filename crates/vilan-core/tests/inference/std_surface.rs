@@ -5454,3 +5454,133 @@ fn b178_process_args_is_refused_on_the_browser_leg() {
         "requires the `process` layer of `std` and cannot run on `browser`",
     );
 }
+
+// --- A82: `std::wire`'s `Result` and the sized numeric family ---------------
+
+/// `Result<T, E>` crosses, and it crosses in `Option`'s vocabulary: an
+/// externally-tagged `Ok`/`Err` object over JSON, a `begin_variant` tag over
+/// the binary codec. The tags are the variant NAMES, so the encoding is
+/// hash-stable — no declaration order, no discriminant a later edit could
+/// renumber — which is what lets a client and a server built from different
+/// checkouts agree.
+///
+/// Before A82 `std::wire` had no `Result` impl at all and every app that
+/// wanted a fallible reply wrote forty lines of this itself (kolt's
+/// `store.vl:27` is the exhibit these impls were taken from).
+#[test]
+fn a_result_round_trips_through_both_codecs_in_options_vocabulary() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::json::{ decode_json, encode_json };
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let inner) => match inner {
+                    Ok(let value) => i"ok:{value}",
+                    Err(let reason) => i"err:{reason}",
+                },
+                Err(let reason) => i"failed:{reason}",
+            }
+        }
+        fun main() {
+            let good: Result<i53, str> = Ok(7i53);
+            let bad: Result<i53, str> = Err("nope");
+            print(encode_json(good));
+            print(encode_json(bad));
+            print(show(decode_json<Result<i53, str>>(encode_json(good))));
+            print(show(decode_json<Result<i53, str>>(encode_json(bad))));
+            print(show(decode_binary<Result<i53, str>>(encode_binary(good))));
+            print(show(decode_binary<Result<i53, str>>(encode_binary(bad))));
+        }
+        "#,
+        "{\"Ok\":7}\n{\"Err\":\"nope\"}\nok:7\nerr:nope\nok:7\nerr:nope\n",
+    );
+}
+
+/// An unrecognized tag is a STRUCTURAL failure and not a panic: `rebuild` fails
+/// the deserializer, which poisons every later read, so the `Err` payload it
+/// then hands back is a zero value nothing looks at and `decode` reports the
+/// reason instead. A decode is fallible by design — a malformed frame off a
+/// socket must not be able to abort the process.
+#[test]
+fn an_unknown_result_tag_is_a_sticky_decode_failure_not_a_panic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::decode_json;
+        import std::result::Result::{ self, Err, Ok };
+        fun main() {
+            match decode_json<Result<i53, str>>("{\"Nope\":1}") {
+                Ok(let _decoded) => print("decoded-garbage"),
+                Err(let reason) => print(i"sticky:{reason}"),
+            }
+        }
+        "#,
+        "sticky:unknown result variant 'Nope'\n",
+    );
+}
+
+/// The sized numeric family (numeric-types.md §5) is Wire, each width riding
+/// the visitor lane that holds it exactly — `i8`/`i16` on `i32`, `u8`/`u16` on
+/// `u32`, `u53` on `i53`, `f32` on `f64` — so the round trip is exact at both
+/// ends of every range. `std::json` has carried the same family for as long as
+/// the types existed; `std::wire`'s row stopped at `i53`/`f64`, which is why an
+/// unsigned id could not cross (kolt's `store.vl:143` is the report).
+#[test]
+fn the_sized_numeric_family_round_trips_at_both_ends_of_every_range() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::json::{ decode_json, encode_json };
+        import std::result::Result::{ self, Err, Ok };
+        fun main() {
+            print(i"i8:{decode_binary<i8>(encode_binary(-128i8)).unwrap_or(0i8)}");
+            print(i"u8:{decode_json<u8>(encode_json(255u8)).unwrap_or(0u8)}");
+            print(i"i16:{decode_binary<i16>(encode_binary(-32768i16)).unwrap_or(0i16)}");
+            print(i"u16:{decode_json<u16>(encode_json(65535u16)).unwrap_or(0u16)}");
+            print(i"i53:{decode_json<i53>(encode_json(-9007199254740992i53)).unwrap_or(0i53)}");
+            print(i"u53:{decode_binary<u53>(encode_binary(9007199254740992u53)).unwrap_or(0u53)}");
+            print(i"f32:{decode_binary<f32>(encode_binary(2.5f32)).unwrap_or(0.0f32)}");
+            print(i"f64:{decode_json<f64>(encode_json(0.5)).unwrap_or(0.0)}");
+        }
+        "#,
+        "i8:-128\nu8:255\ni16:-32768\nu16:65535\ni53:-9007199254740992\nu53:9007199254740992\nf32:2.5\nf64:0.5\n",
+    );
+}
+
+/// And the analyzer's half of the same change: the Wire boundary admits every
+/// member of the family, which is what makes the impls above reachable from an
+/// `[rpc]` signature. The two lists move together or a payload is admitted with
+/// no `describe` to call (or refused with one sitting right there).
+#[test]
+fn the_wire_boundary_admits_every_sized_scalar_in_an_rpc_signature() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Err, Ok };
+        [service(SizedClient)]
+        struct Sized { name: str }
+        impl Sized {
+            [rpc]
+            fun tiny(self, value: i8): u8 { 1u8 }
+
+            [rpc]
+            fun narrow(self, value: i16): u16 { 1u16 }
+
+            [rpc]
+            fun wide(self, value: i53): u53 { 1u53 }
+
+            [rpc]
+            fun real(self, value: f32): f64 { 1.0 }
+
+            [rpc]
+            fun fallible(self, id: u53): Result<i53, str> { Err("missing") }
+        }
+        fun main() { print("sized"); }
+        main();
+        "#,
+    );
+}

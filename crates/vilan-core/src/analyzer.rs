@@ -2750,6 +2750,26 @@ pub struct Scope<'src> {
     pub declaration_order: Vec<(&'src str, Id)>,
 }
 
+/// The scalars `resolved_type_is_wire` answers without consulting the impl
+/// table: the fast path, and the rule for the primitives (B289). One list —
+/// the check used to carry two copies of it, one per predicate, and A82 is
+/// exactly the change that would have had to edit both.
+///
+/// It must stay in step with the `impl <scalar> with Wire` rows in
+/// `vilan/std/src/wire.vl`: this list says what the analyzer ADMITS, those
+/// impls are what the codegen then calls, and a name here without an impl
+/// there is an admitted payload with no `describe`. `bool` is on it because
+/// `bool` is an enum special-case that every scalar predicate in the tree has
+/// to name explicitly.
+///
+/// A82 closed the gap it opened with: the list stopped at `i53`/`f64` while
+/// the language had had the whole sized family since numeric-types.md §5, so
+/// an unsigned id (`u53`) could not cross the wire and `std::json` — which
+/// carries the same family — was a strictly wider door than `std::wire`.
+const WIRE_SCALAR_NAMES: &[&str] = &[
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+];
+
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
 /// DECLARATION's entity id — the file every member span indexes into, which the
 /// check cannot ask for later because it runs after `build()` (B112) — plus each
@@ -2760,19 +2780,23 @@ pub struct Scope<'src> {
 /// re-walking the syntactic node.
 type WireTypeCheck<'src> = (&'src str, Id, Vec<(String, &'src Node<'src>, TypeId, Span)>);
 
-/// An `[rpc]` method awaiting its Wire-signature check: its name, its own entity
-/// id — the file every span below indexes into, which the check cannot ask for
-/// later because it runs after `build()` (B112) — plus each parameter and the
-/// return as `(label, declared type node, span)`, `None` for a parameter that
-/// declares no type (see `check_rpc_signatures`).
 /// One `[rpc]` method awaiting the Wire-signature check: the method name, the
-/// name of the impl subject it was declared on (`""` outside an impl), its id,
-/// and one entry per checked member.
+/// name of the impl subject it was declared on (`""` outside an impl), its own
+/// entity id — the file every span below indexes into, which the check cannot
+/// ask for later because it runs after `build()` (B112) — and one entry per
+/// checked member as `(label, written type node, resolved TypeId, span)`.
+///
+/// Both halves of the member are carried for the reason the `[expose]` and
+/// `[derive(Wire)]` rows carry both: the VERDICT is read off the resolved id
+/// (B289 — Wire-ness is the impl table's answer, not a spelling's), and the
+/// MESSAGE renders the node, so it quotes the type the author wrote rather
+/// than the compiler's pretty-print of it. Either half is `None` where the
+/// member declares no type at all, which is its own refusal.
 type RpcSignatureCheck<'src> = (
     &'src str,
     &'src str,
     Id,
-    Vec<(String, Option<&'src Node<'src>>, Span)>,
+    Vec<(String, Option<&'src Node<'src>>, Option<TypeId>, Span)>,
 );
 
 /// An `[expose]`d struct field awaiting its `Signal`-of-Wire check: a label
@@ -3989,6 +4013,12 @@ pub struct Analyzer<'src> {
     // its type IMPLEMENTS the nominal std trait, not when its spelling happens
     // to be the canonical cell's.
     source_trait_id: Option<Id>,
+    // The `std::wire` `Wire` TRAIT, if loaded. Wire-ness is a question for the
+    // IMPL TABLE (B289): a hand-written `impl Result<type T: Wire, type E: Wire>
+    // with Wire` makes `Result<i53, str>` as sendable as a `[derive(Wire)]`
+    // struct, and the syntactic allowlist could not see it. `resolved_type_is_wire`
+    // asks `satisfies_trait_bound` about this trait once its fast paths miss.
+    wire_trait_id: Option<Id>,
     print_fn_id: Option<Id>,
     // `std::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
@@ -4795,6 +4825,7 @@ impl<'src> Analyzer<'src> {
             divergence_leaves: DivergenceLeaves::default(),
             guard_continuations: Vec::new(),
             source_trait_id: None,
+            wire_trait_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
@@ -6340,55 +6371,6 @@ impl<'src> Analyzer<'src> {
             .push((name, declaration_id, members));
     }
 
-    /// A field type is Wire iff it is a Wire scalar
-    /// (`str`/`i32`/`u32`/`i64`/`f64`/`bool`), a `List`/`Option` of Wire
-    /// (recursing into the element), or a named `[derive(Wire)]` type —
-    /// including an *applied* one (`Handle<Node>`). Everything else is not Wire.
-    ///
-    /// A derived type's generic arguments are deliberately unconstrained (C7's
-    /// phantom-parameter condition): a `[derive(Wire)]` type can only ever have
-    /// PHANTOM parameters, because a field typed by a parameter (`value: T`, or
-    /// `List<T>`) fails this very check at the type's own declaration. So the
-    /// arguments cannot reach the payload, and `Handle<Database>` is as sendable
-    /// as `Handle<i32>` (a name is not the thing it names).
-    ///
-    /// B194 made the derive generators generic-aware, and this rule is what
-    /// decides how. A derived impl now BINDS the subject's parameters under the
-    /// trait it derives — but only the parameters the generated body REACHES,
-    /// and the paragraph above is exactly why the exception exists: for `Wire`
-    /// the reached case is unreachable (this check refuses it first), so binding
-    /// every parameter the way Rust does would buy nothing and would cost C7 —
-    /// `Handle<Session>` would need `Session: Wire`. The phantom parameter
-    /// therefore takes a bare binder, `impl Handle<type T> with Wire`, and this
-    /// check remains the whole of the Wire argument story. If the declaration
-    /// rule above is ever relaxed to admit a parameter-typed field, the argument
-    /// check lands with it AND `Wire`'s reached parameters start binding, both
-    /// on the same day.
-    fn is_wire_type(&self, node: &Node) -> bool {
-        match node {
-            Node::Accessor(name) => {
-                matches!(*name, "str" | "i32" | "u32" | "i53" | "f64" | "bool")
-                    || self.wire_names.contains(*name)
-            }
-            Node::AccessorWithGenerics(name, arguments) => {
-                if self.wire_names.contains(*name) {
-                    return true;
-                }
-                // `Map` joined `List`/`Option` with A39: `impl Map<K, V> with
-                // Wire` (backlog I1's gap, which Q8 launched without) narrates
-                // a map as a list of `{key, value}` pairs. Its key must also be
-                // `Hashable`, which is the `Map` declaration's own bound rather
-                // than this predicate's business.
-                matches!(*name, "List" | "Option" | "Map")
-                    && arguments
-                        .0
-                        .iter()
-                        .all(|argument| self.is_wire_type(&argument.0))
-            }
-            _ => false,
-        }
-    }
-
     /// Enforce the Wire boundary (`proposal/transport-rpc.md` §3): every field of a
     /// `[derive(Wire)]` type must itself be Wire, else a compile diagnostic. Runs
     /// after all modules are walked, so `wire_names` sees cross-module Wire types.
@@ -6425,7 +6407,7 @@ impl<'src> Analyzer<'src> {
                     );
                     continue;
                 }
-                if !self.is_wire_type(type_node) {
+                if !self.resolved_type_is_wire(*field_type_id) {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
@@ -6435,8 +6417,8 @@ impl<'src> Analyzer<'src> {
                             msg: format!(
                                 "{label} of `[derive(Wire)]` type `{type_name}` is `{rendered}`, \
                              which is not Wire: every field of a Wire type must itself be Wire \
-                             (a scalar, `str`, `bool`, `List`/`Option` of Wire, or another \
-                             `[derive(Wire)]` type)"
+                             (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, another \
+                             `[derive(Wire)]` type, or a type with an `impl .. with Wire`)"
                             ),
                         },
                         *declaration_id,
@@ -14787,11 +14769,23 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Record an `[rpc]` method's declared signature for the Wire-signature
-    /// check: each non-`self` parameter's type node and the return type node,
-    /// validated once `wire_names` is complete (`check_rpc_signatures`).
-    fn collect_rpc_signature(&mut self, function: &'src Func<'src>, function_id: Id) {
+    /// check: each non-`self` parameter and the return, as the node the author
+    /// wrote plus the `TypeId` that annotation walked to, validated once every
+    /// impl is in the table (`check_rpc_signatures`).
+    ///
+    /// `parameter_ids` is the function's own parameter list, one id per WRITTEN
+    /// parameter and in that order, so the two zip; the ids' types are still
+    /// unresolved slots here and are read at check time, which is the whole
+    /// point of recording rather than deciding now.
+    fn collect_rpc_signature(
+        &mut self,
+        function: &'src Func<'src>,
+        function_id: Id,
+        parameter_ids: &[Id],
+        return_type_id: Option<TypeId>,
+    ) {
         let mut members = Vec::new();
-        for parameter in &function.parameters.0 {
+        for (parameter, parameter_id) in function.parameters.0.iter().zip(parameter_ids) {
             let parameter_name = match &parameter.pattern {
                 Pattern::Binding(name, _, _) => name,
                 _ => "_",
@@ -14799,14 +14793,20 @@ impl<'src> Analyzer<'src> {
             if parameter_name == "self" {
                 continue;
             }
+            let parameter_type_id = self
+                .parameters
+                .get(parameter_id)
+                .map(|declared| declared.type_id);
             match parameter.declared_type.as_deref() {
                 Some(type_node) => members.push((
                     format!("parameter `{parameter_name}`"),
                     Some(&type_node.0),
+                    parameter_type_id,
                     type_node.1,
                 )),
                 None => members.push((
                     format!("parameter `{parameter_name}`"),
+                    None,
                     None,
                     parameter.span,
                 )),
@@ -14816,11 +14816,12 @@ impl<'src> Analyzer<'src> {
             Some(return_type) => members.push((
                 "return type".to_string(),
                 Some(&return_type.0),
+                return_type_id,
                 return_type.1,
             )),
             // A void `[rpc]` method has no reply payload to encode — require a
             // declared Wire return (fire-and-forget needs its own design).
-            None => members.push(("return type".to_string(), None, function.name.1)),
+            None => members.push(("return type".to_string(), None, None, function.name.1)),
         }
         self.rpc_signatures_to_check.push((
             function.name.0,
@@ -14843,7 +14844,7 @@ impl<'src> Analyzer<'src> {
             // Parameters are checked exactly as they are anywhere else: they
             // still cross the wire.
             let notifies = self.client_service_subjects.contains(subject_name);
-            for (label, type_node, span) in members {
+            for (label, type_node, member_type_id, span) in members {
                 if notifies && label == "return type" {
                     if let Some(type_node) = type_node {
                         let rendered = render_type(type_node);
@@ -14878,7 +14879,19 @@ impl<'src> Analyzer<'src> {
                 if label == "return type"
                     && let Some(element) = type_node.and_then(handle_return_element)
                 {
-                    if !self.is_wire_type(element) {
+                    // The SPELLING says this is a handle (the `[service]`
+                    // generator reads the same annotation to shape the stub);
+                    // the element it is tested at comes off the resolved type,
+                    // so the rule is the trait table's (B289). A handle whose
+                    // own annotation never grounded has a diagnostic of its
+                    // own — this one stands down rather than adding a second.
+                    let element_is_wire = match member_type_id
+                        .and_then(|type_id| self.resolved_handle_return_element(type_id))
+                    {
+                        Some(element_type_id) => self.resolved_type_is_wire(element_type_id),
+                        None => true,
+                    };
+                    if !element_is_wire {
                         let rendered = render_type(element);
                         self.push_anchored(
                             Error {
@@ -14891,7 +14904,8 @@ impl<'src> Analyzer<'src> {
                                          itself stays on the server and the client mirrors it \
                                          over a channel, so it is the ELEMENT that crosses the \
                                          wire and it must be Wire (a scalar, `str`, `bool`, \
-                                         `List`/`Option` of Wire, or a `[derive(Wire)]` type)"
+                                         `List`/`Option`/`Map` of Wire, a `[derive(Wire)]` \
+                                         type, or a type with an `impl .. with Wire`)"
                                 ),
                             },
                             method_id,
@@ -14899,8 +14913,10 @@ impl<'src> Analyzer<'src> {
                     }
                     continue;
                 }
+                let member_is_wire =
+                    member_type_id.is_some_and(|type_id| self.resolved_type_is_wire(type_id));
                 match type_node {
-                    Some(type_node) if self.is_wire_type(type_node) => {}
+                    Some(_) if member_is_wire => {}
                     Some(type_node) => {
                         let rendered = render_type(type_node);
                         self.push_anchored(
@@ -14911,8 +14927,8 @@ impl<'src> Analyzer<'src> {
                                 msg: format!(
                                     "{label} of `[rpc]` method `{method_name}` is `{rendered}`, \
                                  which is not Wire: every `[rpc]` parameter and return must be \
-                                 Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
-                                 `[derive(Wire)]` type)"
+                                 Wire (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, a \
+                                 `[derive(Wire)]` type, or a type with an `impl .. with Wire`)"
                                 ),
                             },
                             method_id,
@@ -15029,8 +15045,8 @@ impl<'src> Analyzer<'src> {
                             msg: format!(
                                 "{label} is `[expose]`d, but its element `{rendered}` is not Wire: \
                              an exposed source's values cross the wire, so the element must be \
-                             Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
-                             `[derive(Wire)]` type)"
+                             Wire (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, a \
+                             `[derive(Wire)]` type, or a type with an `impl .. with Wire`)"
                             ),
                         },
                         declaration_id,
@@ -15277,32 +15293,113 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// [`is_wire_type`]'s rule read off a RESOLVED type rather than a written
-    /// node — for the `[expose]` element, which now comes from the `Source`
-    /// impl and so has no node of its own.
-    fn resolved_type_is_wire(&self, type_id: TypeId) -> bool {
-        let (name, arguments) = match type_id.get_type(self) {
-            Type::Struct(id, arguments) => (self.structs.get(&id).map(|s| s.name), arguments),
-            Type::Enum(id, arguments) => (self.enums.get(&id).map(|e| e.name), arguments),
+    /// Whether a RESOLVED type is Wire — the ONE predicate behind all four
+    /// boundaries: the `[derive(Wire)]` all-fields check, the `[rpc]`
+    /// signature check, that check's handle-element arm, and the `[expose]`
+    /// element check.
+    ///
+    /// Until B289 this was a SYNTACTIC ALLOWLIST — six scalar spellings,
+    /// `List`/`Option`/`Map` of Wire, and the `[derive(Wire)]` names — so a
+    /// hand-written `impl Result<type T: Wire, type E: Wire> with Wire` was
+    /// invisible to every one of them: kolt carried forty lines of exactly
+    /// that impl and still could not return a `Result<i53, str>` from an
+    /// `[rpc]` method. What is Wire is what an `impl .. with Wire` APPLIES to,
+    /// so the impl table has the last word here; the name arms stay in front
+    /// of it as the fast path and as the rule for the primitives.
+    ///
+    /// The arms, in order:
+    ///
+    /// 1. **The scalars** ([`WIRE_SCALAR_NAMES`]). They are Wire by the
+    ///    language's own rule and `std::wire`'s impls for them are the leaves
+    ///    the derived code bottoms out in — answering them here keeps them
+    ///    decidable with `std::wire` unloaded.
+    /// 2. **A `[derive(Wire)]` NAME, whatever its arguments** — C7's
+    ///    phantom-parameter condition. A `[derive(Wire)]` type can only ever
+    ///    have PHANTOM parameters, because a field typed by a parameter
+    ///    (`value: T`, or `List<T>`) fails this very check at the type's own
+    ///    declaration. So the arguments cannot reach the payload, and
+    ///    `Handle<Database>` is as sendable as `Handle<i32>` (a name is not the
+    ///    thing it names). B194 made the derive generators generic-aware and
+    ///    this rule is what decides how: a derived impl binds only the
+    ///    parameters the generated body REACHES, and for `Wire` the reached
+    ///    case is unreachable (the declaration check refuses it first), so the
+    ///    phantom parameter takes a bare binder, `impl Handle<type T> with
+    ///    Wire`. Were the declaration rule ever relaxed to admit a
+    ///    parameter-typed field, the argument check would land with it AND
+    ///    `Wire`'s reached parameters would start binding, both on the same day.
+    /// 3. **`List`/`Option`/`Map` of Wire**, recursing into the arguments —
+    ///    the fast path for std's own conditional impls (`Map` joined the pair
+    ///    with A39, narrating as a list of `{key, value}` pairs; its key must
+    ///    also be `Hashable`, which is `Map`'s own declaration bound rather
+    ///    than this predicate's business).
+    /// 4. **The impl table**, via [`Self::satisfies_trait_bound`] — which is
+    ///    what makes arm 3 redundant rather than load-bearing, and what reads
+    ///    a user's own impl. Recursion into the arguments happens exactly
+    ///    where the IMPL's own binder bounds demand it: `impl Result<type T:
+    ///    Wire, type E: Wire>` checks both arguments, `impl Handle<type T>`
+    ///    checks neither — C7's phantom rule expressed by the impl instead of
+    ///    by a special case here.
+    ///
+    /// A type that is not a resolved nominal — a closure, a tuple, a generic
+    /// parameter, an unresolved annotation — is NOT Wire and never reaches the
+    /// impl table: a bare parameter would otherwise answer from its declared
+    /// bound, which is the one answer arm 2 exists to refuse.
+    fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
+        let type_ = type_id.get_type(self);
+        let (name, arguments) = match &type_ {
+            Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
+            Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
             _ => return false,
         };
         let Some(name) = name else {
             return false;
         };
-        if matches!(name, "str" | "i32" | "u32" | "i53" | "f64" | "bool") {
+        if WIRE_SCALAR_NAMES.contains(&name) {
             return true;
         }
-        // A `[derive(Wire)]` name is Wire whatever its arguments, exactly as the
-        // node-shaped check reads it: the derive emits no generic impls, so a
-        // generic Wire type fails at its own declaration and its arguments can
-        // never reach the payload.
         if self.wire_names.contains(name) {
             return true;
         }
-        matches!(name, "List" | "Option" | "Map")
+        if matches!(name, "List" | "Option" | "Map")
             && arguments
                 .iter()
                 .all(|argument| self.resolved_type_is_wire(*argument))
+        {
+            return true;
+        }
+        let Some(wire_trait_id) = self.wire_trait_id else {
+            return false;
+        };
+        self.satisfies_trait_bound(&type_, wire_trait_id, &[], 0)
+    }
+
+    /// [`handle_return_element`]'s descent, read off a RESOLVED type: the
+    /// `SignalCell<T>` element behind an `[rpc]` handle return, through an
+    /// optional `Option`.
+    ///
+    /// The written-node twin decides WHETHER a return is a handle — the
+    /// `[service]` generator reads the same spelling and its stub's shape
+    /// follows the annotation, so that half cannot move — while the element
+    /// whose Wire-ness is actually tested comes from here, so an element the
+    /// allowlist could not read (`Result<i53, str>`) is judged by what it IS.
+    fn resolved_handle_return_element(&self, type_id: TypeId) -> Option<TypeId> {
+        match type_id.get_type(self) {
+            Type::Struct(id, arguments) => match (
+                self.structs.get(&id).map(|struct_| struct_.name)?,
+                arguments.as_slice(),
+            ) {
+                ("SignalCell", [element]) => Some(*element),
+                _ => None,
+            },
+            Type::Enum(id, arguments) => match (
+                self.enums.get(&id).map(|enum_| enum_.name)?,
+                arguments.as_slice(),
+            ) {
+                ("Option", [inner]) => self.resolved_handle_return_element(*inner),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Resolves a method `member_name` callable on a concrete `subject_type`
@@ -26101,6 +26198,13 @@ impl<'src> Analyzer<'src> {
                         self.constraints
                             .push(Constraint::FunctionReturns { function_id: id });
                     }
+                    // An `[rpc]` method's declared signature must be Wire —
+                    // recorded now, with the type ids its annotations walked
+                    // to, and checked once every impl is in the table. Ahead of
+                    // the insert below because that is what moves `parameters`.
+                    if function.rpc {
+                        self.collect_rpc_signature(function, id, &parameters, return_type_id);
+                    }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
                         id,
@@ -26140,11 +26244,6 @@ impl<'src> Analyzer<'src> {
                             doc_hidden: function.doc_hidden,
                         },
                     );
-                    // An `[rpc]` method's declared signature must be Wire —
-                    // recorded now, checked once `wire_names` is complete.
-                    if function.rpc {
-                        self.collect_rpc_signature(function, id);
-                    }
                     Some(Expr::Function(id))
                 }
             }
@@ -52484,6 +52583,14 @@ fn analyze_inner<'src>(
         .get("reactive")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
         .and_then(|scope| scope.name_to_id_map.get("Source").copied());
+
+    // The `std::wire` `Wire` TRAIT, if `wire.vl` loaded — captured exactly as
+    // `Source` is, and read for exactly the same reason (B289): what is Wire is
+    // what an `impl .. with Wire` applies to, not what a name list spells.
+    analyzer.wire_trait_id = module_scopes
+        .get("wire")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("Wire").copied());
 
     // The `std::json` `JsonValue` struct, if `json.vl` loaded — same treatment.
     // Its `field` method id is captured after `build()` to lower to `self[name]`.

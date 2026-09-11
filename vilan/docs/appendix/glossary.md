@@ -208,6 +208,8 @@ held across a [suspension](#suspension).
 <a id="wave"></a>**wave**: one settling of a [turn](#turn): every affected watcher runs
 once with the final values. [Reactive state](../guide/reactive.md).
 
-<a id="wire"></a>**Wire**: the "can travel over the network" capability: scalars, lists
-and options of Wire types, and anything with `[derive(Wire)]`.
+<a id="wire"></a>**Wire**: the "can travel over the network" capability, and an
+ordinary trait: scalars, lists, options, results and maps of Wire types,
+anything with `[derive(Wire)]`, and any type you write an `impl … with Wire`
+for.
 [Services & RPC](../guide/services.md).

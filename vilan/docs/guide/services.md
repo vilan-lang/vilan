@@ -127,9 +127,10 @@ the full shape.
 Everything that travels — an rpc's parameters, the values a call answers
 with, mirrored payloads — must be serializable, which Vilan calls
 **Wire**. The scalars
-are Wire (`bool`, the integers including `i53`, floats, `str`). `List`
-and `Option` of Wire types are Wire. And your own types opt in with a
-derive:
+are Wire (`bool`, every integer width from `i8` to `u53`, both floats,
+`str`). `List`, `Option`, `Result` and `Map` of Wire types are Wire — so a
+fallible reply, `Result<Row, str>`, is an ordinary return type. And your own
+types opt in with a derive:
 
 ```vilan,fragment
 [derive(Wire, PartialEq, Debug)]
@@ -143,6 +144,17 @@ That triple is the standard shape for payload types: `Wire` to travel,
 `derive(Wire)` checks every field recursively. A closure or a `Signal`
 hiding inside a payload type is a compile error at the derive, which is
 exactly where you want to find out.
+
+`Wire` is an ordinary trait, so the derive is a convenience and not the
+only door: a type with a hand-written `impl … with Wire` is Wire
+everywhere the compiler asks — in an `[rpc]` signature, in a payload
+type's fields, and as an `[expose]`d source's element. A *conditional*
+impl carries its own recursion: `impl Pair<type A: Wire, type B: Wire>
+with Wire` makes `Pair<i53, str>` sendable and `Pair<Conn, str>`
+refused, naming the argument, while an impl whose binder declares no
+bound — `impl Handle<type T> with Wire`, which is what the derive emits
+— leaves its argument unconstrained, because a phantom parameter never
+reaches the payload.
 
 A `resource` never travels, in either position: not as a field, and not as
 the derived type itself — `derive(Wire)` and `derive(Json)` are both refused
