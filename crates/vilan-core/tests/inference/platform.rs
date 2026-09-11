@@ -10154,3 +10154,246 @@ fn b290_an_annotated_closure_parameter_stays_the_control() {
         "#,
     );
 }
+
+// --- B304: an unannotated closure parameter is not frozen at the callee's own
+// --- unbound generic --------------------------------------------------------
+//
+// `fun apply<E>(self, handler: |E| void)` binds `E` from no ordinary argument,
+// so the bidirectional fill wrote the abstract `E` into the closure
+// parameter's ONE-SHOT slot and every use of it in the body was refused. It
+// showed up as an asymmetry that looked like "free function versus impl
+// method" and is really "was the receiver's type known on the first attempt":
+// a receiver whose type had not landed made the call DEFER, the body typed the
+// parameter itself, and the retry bound `E` from the finished closure.
+// `std::router::link_to`'s `|event: Event|` was the workaround.
+
+#[test]
+fn b304_a_closure_parameter_is_not_frozen_at_the_callees_unbound_generic() {
+    // The exhibit, both receivers in one program: `from_chain`'s receiver is a
+    // CALL (its type lands late — this half always compiled) and
+    // `from_parameter`'s is a parameter (known immediately — this half did
+    // not). The body pins the parameter through a free function taking the
+    // concrete type, exactly as `plain_left_click(event)` does in std.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        impl Ev {
+            fun stop(self) { print("stopped"); }
+        }
+        struct Holder { tag: str }
+
+        fun make(): Holder { Holder { tag = "h" } }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_plain(event: Ev): bool { event.code == 0 }
+
+        fun from_chain(): Holder {
+            make().apply(|event| {
+                if is_plain(event) { event.stop(); }
+            })
+        }
+
+        fun from_parameter(holder: Holder): Holder {
+            holder.apply(|event| {
+                if is_plain(event) { event.stop(); }
+            })
+        }
+
+        fun main() {
+            from_chain();
+            from_parameter(make());
+            print("done");
+        }
+
+        main();
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b304_the_same_call_from_inside_an_inherent_impl_method_types_its_closure() {
+    // B304's own spelling: the call is made from inside an INHERENT IMPL
+    // METHOD, where `self` is known immediately — `View::link_to`'s shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        impl Ev {
+            fun stop(self) { print("stopped"); }
+        }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_plain(event: Ev): bool { event.code == 0 }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event| {
+                    if is_plain(event) { event.stop(); }
+                })
+            }
+        }
+
+        fun main() {
+            Holder { tag = "h" }.wire();
+            print("done");
+        }
+
+        main();
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b304_an_annotated_closure_parameter_still_binds_the_generic() {
+    // The control the workaround was: an annotation is still the binding
+    // channel it always was, and it still binds `E` for the rest of the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event: Ev| { print(event.code); })
+            }
+        }
+
+        fun main() {
+            Holder { tag = "h" }.wire();
+            print("done");
+        }
+
+        main();
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b304_a_generic_bound_by_an_ordinary_argument_still_fills_the_closure() {
+    // The shape that must NOT change: `E` is bound by a non-closure argument
+    // before the closure is typed, so the fill has a concrete type to give and
+    // the parameter needs no annotation. Declining here would starve every
+    // `bind_each`-shaped call in the tree.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun each<E>(self, seed: E, handler: |E| void): Holder {
+                handler(seed);
+                self
+            }
+        }
+
+        fun main() {
+            Holder { tag = "h" }.each(7, |value| print(value + 1));
+        }
+
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b304_a_generic_in_the_closures_return_still_fills_the_parameter() {
+    // The other shape that must not change: the callee's own generic is in the
+    // closure's RETURN (`map<U>(transform: |T| U)`), which the closure BINDS.
+    // The parameter position carries only `T`, already bound from the
+    // receiver, so the fill still runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun map<U>(self, transform: |T| U): Cell<U> {
+                Cell { value = transform(self.value) }
+            }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            let mapped = cell.map(|value| i"n={value}");
+            print(mapped.value);
+        }
+
+        main();
+        "#,
+        "n=7\n",
+    );
+}
+
+#[test]
+fn b304_a_closure_body_that_pins_nothing_is_still_refused() {
+    // The negative control: leaving the slot open is not silent acceptance.
+    // A body that USES the parameter and pins nothing about it still gets the
+    // abstract-parameter refusal it always got — the fix removes the freeze,
+    // not the check.
+    assert_fails_with(
+        r#"
+        struct Ev { code: i32 }
+        impl Ev {
+            fun stop(self) { }
+        }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event| { event.stop(); })
+            }
+        }
+
+        fun main() { }
+        "#,
+        "cannot call method 'stop' on E",
+    );
+}
+
+#[test]
+fn b304_a_closure_that_never_touches_its_parameter_compiles() {
+    // And the parameter nothing reads at all stays admitted: `E` is never
+    // instantiated, which is no one's problem.
+    assert_compiles(
+        r#"
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event| { })
+            }
+        }
+
+        fun main() { }
+        "#,
+    );
+}

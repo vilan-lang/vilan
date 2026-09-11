@@ -5532,7 +5532,11 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
                 .bind_each(remote, |todo: Todo| todo.id, |todo| view("li").text(todo.label)));
         }
         "#,
-        "'RemoteSource<List<Todo>>' does not implement trait 'Source<List<T>>'",
+        // B304: the bound is named AT ITS INSTANTIATION now (`List<Todo>`, not
+        // the abstract `List<T>`) — `bind_each`'s `T` binds from the key
+        // closure before the bound is checked, where the render closure's
+        // unannotated parameter used to freeze it abstract.
+        "'RemoteSource<List<Todo>>' does not implement trait 'Source<List<Todo>>'",
     );
     assert_compiles_browser(
         r#"

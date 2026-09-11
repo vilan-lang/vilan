@@ -29295,7 +29295,22 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            let argument_type = self.infer_type(*argument_id, &parameter_type, substitution);
+            // B304: a closure argument whose parameter positions still carry
+            // an unbound own generic is typed against NO expectation — the
+            // expectation would write that generic into the closure
+            // parameter's one-shot slot and freeze it there. It is inferred
+            // from its own body instead, and the reconcile below binds the
+            // generic FROM the finished closure.
+            let expectation = match is_closure
+                && self.closure_parameters_await_an_own_generic_at(
+                    member_id,
+                    &parameter_type,
+                    substitution,
+                ) {
+                true => Type::Unknown,
+                false => parameter_type.clone(),
+            };
+            let argument_type = self.infer_type(*argument_id, &expectation, substitution);
             if matches!(argument_type, Type::Unresolved) {
                 unresolved_closure_argument |= is_closure;
                 continue;
@@ -29688,9 +29703,91 @@ impl<'src> Analyzer<'src> {
                 // generic `|T| U` is matched as `|i32| U`, typing the closure's
                 // parameter concretely rather than as the abstract `T`.
                 let parameter_type = self.substitute_type(&parameter_type, substitution);
+                // B304: filling the slot with the callee's OWN generic, still
+                // unbound on this attempt, is worse than not filling it — see
+                // [`Self::closure_parameters_await_an_own_generic`].
+                if self.closure_parameters_await_an_own_generic(
+                    member_id,
+                    &parameter_type,
+                    substitution,
+                ) {
+                    continue;
+                }
                 self.infer_type(*argument_id, &parameter_type, substitution);
             }
         }
+    }
+
+    /// Whether a callee parameter's CLOSURE-PARAMETER positions still mention
+    /// an own generic of the callee that this attempt has not bound — the one
+    /// case where filling an unannotated closure parameter is worse than
+    /// leaving it open (B304).
+    ///
+    /// An unannotated closure parameter's type slot is a ONE-SHOT channel: it
+    /// is filled only while it is still `Unknown`. `fun on_event<E>(self,
+    /// event: str, handler: |E| void)` binds `E` from NO ordinary argument, so
+    /// the fill wrote the abstract `E` into the slot and froze it there — and
+    /// every use of the parameter in the body was then refused against a
+    /// parameter nothing would ever instantiate ("cannot call method
+    /// 'prevent_default' on E"). Whether that happened at all depended on
+    /// something unrelated: with a receiver whose own type had not landed yet
+    /// (`view("a").attr(..).on_event(..)`) the call DEFERRED, the body's own
+    /// uses typed the parameter first, and the retry bound `E` from the
+    /// finished closure — so the identical body compiled as a free function's
+    /// chain and failed from `impl View { fun link_to(self, ..) }`, where
+    /// `self` is known immediately. std carries the annotation that was the
+    /// workaround (`|event: Event|`), and kolt carries its twin.
+    ///
+    /// Skipping leaves the slot open for exactly the channel that works: the
+    /// body types the parameter, `bind_callee_own_generics`' second pass binds
+    /// the generic from the finished closure, and a body that pins nothing
+    /// reaches B131's starved-parameter refusal, which names the parameter and
+    /// asks for an annotation.
+    ///
+    /// Restricted to the PARAMETER positions on purpose. A generic in the
+    /// closure's RETURN (`map<U>(self, transform: |T| U)`) is the ordinary
+    /// shape — it is bound BY the closure, and the fill still has `T` to give —
+    /// so declining there would starve every `map` call in the tree.
+    /// [`Self::closure_parameters_await_an_own_generic`] over a parameter type
+    /// as WRITTEN — substituting the call's bindings in first, which is what
+    /// the sibling caller has already done to its copy.
+    fn closure_parameters_await_an_own_generic_at(
+        &mut self,
+        member_id: Id,
+        parameter_type: &Type,
+        substitution: &SubstitutionContext,
+    ) -> bool {
+        let substituted = self.substitute_type(parameter_type, substitution);
+        self.closure_parameters_await_an_own_generic(member_id, &substituted, substitution)
+    }
+
+    fn closure_parameters_await_an_own_generic(
+        &self,
+        member_id: Id,
+        parameter_type: &Type,
+        substitution: &SubstitutionContext,
+    ) -> bool {
+        let Type::Closure(closure_parameter_ids, _) = parameter_type else {
+            return false;
+        };
+        let Some((_, own_generics)) = self.method_signature_ref(member_id) else {
+            return false;
+        };
+        let unbound: Vec<TypeId> = own_generics
+            .iter()
+            .copied()
+            .filter(|generic| !substitution.contains_key(generic))
+            .collect();
+        if unbound.is_empty() {
+            return false;
+        }
+        closure_parameter_ids.iter().any(|type_id| {
+            let mut residual = Vec::new();
+            self.collect_residual_generics(&type_id.get_type(self), &mut residual);
+            residual
+                .iter()
+                .any(|constraint_id| unbound.contains(constraint_id))
+        })
     }
 
     /// Whether `expr_id` is a closure parameter whose type is still `Unknown`
