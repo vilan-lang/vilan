@@ -1,6 +1,7 @@
 import pkg::compare::PartialEq;
 import pkg::context::Context;
 import pkg::hash::Hashable;
+import pkg::io::panic;
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
@@ -57,6 +58,25 @@ enum FlushPolicy {
 /// The host's microtask queue — the continuation-settling primitive.
 [extern("queueMicrotask", retains)]
 external fun queue_microtask(callback: || void);
+
+/// The runtime's `try`/`finally` (tracker B292). vilan has no exception
+/// syntax, so the catch seam is glue — `__with_finally` in `transformer.rs`,
+/// the shape `std::db`'s `exec_guarded` already uses at this boundary. Run
+/// `body`, and run `after` before the stack leaves: on a normal return AND on
+/// a host throw, which then keeps unwinding UNTOUCHED — its type, its message
+/// and its stack are the ones it was thrown with, from where it was thrown.
+/// Nothing is allocated per call, which is what lets the drain hot path carry
+/// it.
+[extern("__with_finally")]
+external fun with_finally(body: || void, after: || void);
+
+/// The runtime's `try`/`catch` (tracker B292) — for a loop that must FINISH
+/// past a throw rather than merely restore itself on the way out. `None` when
+/// `body` returned; `Some(text)` carrying the host's own diagnosis when it
+/// threw. It costs one `Option` per call, so it belongs where the loop is a
+/// disposal group and not where it is a notification wave.
+[extern("__guarded")]
+external fun guarded(body: || void): Option<str>;
 
 struct Turn {
 	pending: Shared<List<Subscriber>>,
@@ -139,21 +159,43 @@ fun drain(turn: Turn) {
 	if !turn.draining.read() {
 		turn.draining.write() = true;
 		draining_turns.write().push(turn);
-		mut budget = 100000;
-		for !turn.pending.read().is_empty() && budget > 0 {
-			let wave = turn.pending.read();
-			turn.pending.write() = [];
-			// The wave is out of the queue, so its ids are free to re-enter it
-			// — a cascade re-enqueuing an observer this wave already ran is
-			// the propagation `drain`'s loop exists for.
-			turn.queued.write() = NativeMap::new();
-			for subscriber in wave {
-				(subscriber.notify)();
-				budget -= 1;
+		// The restore is a FINALLY (tracker B292). A notify is an arbitrary
+		// closure — an application observer that panics, a host API that
+		// refuses its argument (Chrome's `insertRule` on a selector it does
+		// not know) — and a throw out of one unwound straight past the two
+		// writes below. The turn then stayed DRAINING forever and stayed on
+		// `draining_turns`, so every later write that resolved to it — a
+		// settled capture's late path, and EVERY no-ambient-turn `set` or
+		// `at_settle`, which join `draining_turns.last()` — enqueued and never
+		// flushed: one error turned the reactive graph off for the rest of the
+		// session, with no second error to show for it.
+		//
+		// Restore-and-rethrow, not catch-and-continue: the wave's remaining
+		// notifies are abandoned, because a throwing observer means the graph
+		// is mid-update and the honest thing is for the write that started the
+		// drain to see the failure. What the finally guarantees is that the
+		// SCHEDULER survives it — the next `set` drains normally, this turn
+		// included. Nested drains unwind in LIFO order, so each one's finally
+		// pops its own entry.
+		with_finally(|| {
+			mut budget = 100000;
+			for !turn.pending.read().is_empty() && budget > 0 {
+				let wave = turn.pending.read();
+				turn.pending.write() = [];
+				// The wave is out of the queue, so its ids are free to
+				// re-enter it — a cascade re-enqueuing an observer this
+				// wave already ran is the propagation `drain`'s loop
+				// exists for.
+				turn.queued.write() = NativeMap::new();
+				for subscriber in wave {
+					(subscriber.notify)();
+					budget -= 1;
+				}
 			}
-		}
-		draining_turns.write().pop();
-		turn.draining.write() = false;
+		}, || {
+			draining_turns.write().pop();
+			turn.draining.write() = false;
+		});
 	}
 }
 
@@ -410,10 +452,30 @@ impl Owner with Disposable {
 	fun dispose(self) {
 		if !self.disposed.read() {
 			self.disposed.write() = true;
+			// Every cleanup runs, even past a throwing one (tracker B292).
+			// `drain`'s finally would be the wrong guard here: a disposal
+			// group is a LIST OF PROMISES, not one update, and abandoning the
+			// rest of it leaks every subscription after the failure — now
+			// permanently, because the flag above makes a second `dispose` a
+			// no-op. So the loop finishes and the first failure is raised
+			// after the group is released. Only the first: the later ones are
+			// the same event, and a `panic` takes one message.
+			mut failure: Option<str> = None;
 			for cleanup in self.cleanups.read() {
-				cleanup();
+				match guarded(cleanup) {
+					Some(let message) => {
+						if failure.is_none() {
+							failure = Some(message);
+						}
+					},
+					None => {},
+				}
 			}
 			self.cleanups.write() = [];
+			match failure {
+				Some(let message) => panic(message),
+				None => {},
+			}
 		}
 	}
 }

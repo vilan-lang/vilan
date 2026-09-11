@@ -4,6 +4,14 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __guarded(body) {
+	try {
+		body();
+		return [ 1 ];
+	} catch (error) {
+		return [ 0, error && error.message ? error.message : String(error) ];
+	}
+}
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
@@ -18,6 +26,13 @@ function __map_get(map, key) {
 }
 function __shared_new(value) {
 	return { v: value };
+}
+function __with_finally(body, after) {
+	try {
+		body();
+	} finally {
+		after();
+	}
 }
 function hash(self) {
 	return __hash(self);
@@ -51,18 +66,23 @@ function drain(turn) {
 	if (!(turn[2].v)) {
 		turn[2].v = true;
 		draining_turns.v.push(__clone(turn));
-		let budget = 100000;
-		while (!($o(turn[0].v)) && budget > 0) {
-			const wave = turn[0].v;
-			turn[0].v = [  ];
-			turn[1].v = new Map();
-			for (const subscriber of wave) {
-				subscriber[1]();
-				budget = budget - 1;
+		__with_finally(() => {
+			let budget = 100000;
+			while (!($o(turn[0].v)) && budget > 0) {
+				const wave = turn[0].v;
+				turn[0].v = [  ];
+				turn[1].v = new Map();
+				for (const subscriber of wave) {
+					subscriber[1]();
+					budget = budget - 1;
+				}
 			}
-		}
-		__list_pop(draining_turns.v);
-		turn[2].v = false;
+			return;
+		}, () => {
+			__list_pop(draining_turns.v);
+			turn[2].v = false;
+			return;
+		});
 	}
 }
 function dispose(self, $C) {
@@ -113,13 +133,38 @@ function defer(self, cleanup) {
 	}
 }
 function dispose2(self) {
+	let $ah = null;
 	if (!(self[1].v)) {
 		self[1].v = true;
+		let failure = [ 1 ];
 		for (const cleanup of self[0].v) {
-			cleanup();
+			const $ab = __guarded(cleanup);
+			let $ac = null;
+			if ($ab[0] === 0) {
+				const message = $ab[1];
+				if ($ad(failure)) {
+					failure = [ 0, message ];
+				}
+				$ac = undefined;
+			} else {
+				$ac = undefined;
+			}
+			$ac;
 		}
 		self[0].v = [  ];
+		const $af = failure;
+		let $ag = null;
+		if ($af[0] === 0) {
+			const message2 = $af[1];
+			$ag = (() => {
+				throw message2;
+			})();
+		} else {
+			$ag = undefined;
+		}
+		$ah = $ag;
 	}
+	return $ah;
 }
 function register_with_owner(subscription, $w, $x) {
 	const $y = $x;
@@ -282,20 +327,24 @@ function $U(self, value, $j) {
 	self[0].v = __clone(value);
 	$V(self, $j);
 }
-function $ac(body, $ad) {
-	const $ae = $ad;
-	let $af = null;
-	if ($ae[0] === 0) {
-		const current2 = $ae[1];
-		$af = body(current2);
+function $ad(self) {
+	const $ae = self;
+	return $ae[0] === 1;
+}
+function $aj(body, $ak) {
+	const $al = $ak;
+	let $am = null;
+	if ($al[0] === 0) {
+		const current2 = $al[1];
+		$am = body(current2);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[3].v = true;
-		$af = result;
+		$am = result;
 	}
-	return $af;
+	return $am;
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -329,9 +378,9 @@ const watch = $u(counted, (_) => {
 	hits = hits + 1;
 	return;
 });
-$ac(($ab) => {
-	$U(counted, 1, [ 0, $ab ]);
-	$U(counted, 2, [ 0, $ab ]);
+$aj(($ai) => {
+	$U(counted, 1, [ 0, $ai ]);
+	$U(counted, 2, [ 0, $ai ]);
 	return;
 }, [ 1 ]);
 console.log("hits=" + hits);

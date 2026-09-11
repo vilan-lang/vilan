@@ -1080,6 +1080,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_close",
         "__db_exec_guarded",
         "__db_run_guarded",
+        "__with_finally",
+        "__guarded",
         "__fs_close",
         "__fs_close_awaited",
         "__fs_stat",
@@ -1427,6 +1429,40 @@ fn helper_source(name: &str) -> &'static str {
             "function __db_run_guarded(statement, parameters) {\n\
              \ttry {\n\
              \t\tstatement.run(...parameters);\n\
+             \t\treturn [ 1 ];\n\
+             \t} catch (error) {\n\
+             \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
+        // The reactive core's two exception seams (`std::reactive`, tracker
+        // B292). vilan has no `try`/`catch` syntax, so the runtime's is glue
+        // here, in the `__db_*_guarded` shape above.
+        //
+        // `__with_finally` is the one the drain loop wants: an observer that
+        // throws unwound past `draining = false` and left the turn draining
+        // forever, and a FINALLY restores the flag without touching the throw
+        // — the original error keeps its type, its message and its stack, and
+        // leaves from where it was thrown. Nothing is allocated per call, which
+        // is what lets the drain hot path carry it.
+        "__with_finally" => {
+            "function __with_finally(body, after) {\n\
+             \ttry {\n\
+             \t\tbody();\n\
+             \t} finally {\n\
+             \t\tafter();\n\
+             \t}\n\
+             }"
+        }
+        // `__guarded` is the one a loop that must FINISH wants — `Owner`'s
+        // cleanup group, where a throwing cleanup would otherwise leave every
+        // later one in the group undisposed. `None` when `body` returned;
+        // `Some(text)` with the host's own diagnosis when it threw, the same
+        // `error.message`-else-`String(error)` reading as the db pair.
+        "__guarded" => {
+            "function __guarded(body) {\n\
+             \ttry {\n\
+             \t\tbody();\n\
              \t\treturn [ 1 ];\n\
              \t} catch (error) {\n\
              \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\

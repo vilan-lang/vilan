@@ -4,6 +4,14 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __guarded(body) {
+	try {
+		body();
+		return [ 1 ];
+	} catch (error) {
+		return [ 0, error && error.message ? error.message : String(error) ];
+	}
+}
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
@@ -15,6 +23,13 @@ function __list_pop(list) {
 }
 function __shared_new(value) {
 	return { v: value };
+}
+function __with_finally(body, after) {
+	try {
+		body();
+	} finally {
+		after();
+	}
 }
 function hash(self) {
 	return __hash(self);
@@ -45,18 +60,23 @@ function drain(turn) {
 	if (!(turn[2].v)) {
 		turn[2].v = true;
 		draining_turns.v.push(__clone(turn));
-		let budget = 100000;
-		while (!($A(turn[0].v)) && budget > 0) {
-			const wave = turn[0].v;
-			turn[0].v = [  ];
-			turn[1].v = new Map();
-			for (const subscriber of wave) {
-				subscriber[1]();
-				budget = budget - 1;
+		__with_finally(() => {
+			let budget = 100000;
+			while (!($A(turn[0].v)) && budget > 0) {
+				const wave = turn[0].v;
+				turn[0].v = [  ];
+				turn[1].v = new Map();
+				for (const subscriber of wave) {
+					subscriber[1]();
+					budget = budget - 1;
+				}
 			}
-		}
-		__list_pop(draining_turns.v);
-		turn[2].v = false;
+			return;
+		}, () => {
+			__list_pop(draining_turns.v);
+			turn[2].v = false;
+			return;
+		});
 	}
 }
 function dispose(self, $o) {
@@ -100,13 +120,38 @@ function new2() {
 	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function dispose2(self) {
+	let $K = null;
 	if (!(self[1].v)) {
 		self[1].v = true;
+		let failure = [ 1 ];
 		for (const cleanup of self[0].v) {
-			cleanup();
+			const $E = __guarded(cleanup);
+			let $F = null;
+			if ($E[0] === 0) {
+				const message = $E[1];
+				if ($G(failure)) {
+					failure = [ 0, message ];
+				}
+				$F = undefined;
+			} else {
+				$F = undefined;
+			}
+			$F;
 		}
 		self[0].v = [  ];
+		const $I = failure;
+		let $J = null;
+		if ($I[0] === 0) {
+			const message2 = $I[1];
+			$J = (() => {
+				throw message2;
+			})();
+		} else {
+			$J = undefined;
+		}
+		$K = $J;
 	}
+	return $K;
 }
 function get_owner($j) {
 	return $j;
@@ -183,10 +228,14 @@ function $u(self, value, $v) {
 	self[0].v = __clone(value);
 	$w(self, $v);
 }
-function $H(owner2, body) {
+function $G(self) {
+	const $H = self;
+	return $H[0] === 1;
+}
+function $O(owner2, body) {
 	return body(owner2);
 }
-function $J(body) {
+function $Q(body) {
 	const scope2 = new2();
 	const result = body(scope2);
 	return [ result, scope2 ];
@@ -207,16 +256,16 @@ $u(count, 3, [ 1 ]);
 console.log("done");
 const outer = new2();
 const inner = new2();
-(($E) => {
-	(($F) => {
+(($L) => {
+	(($M) => {
 		$d(count, (value) => {
 			return console.log("inner " + value);
-		}, [ 1 ], $F);
+		}, [ 1 ], $M);
 		return;
 	})(inner);
 	$d(count, (value) => {
 		return console.log("outer " + value);
-	}, [ 1 ], $E);
+	}, [ 1 ], $L);
 	return;
 })(outer);
 $u(count, 4, [ 1 ]);
@@ -226,24 +275,24 @@ dispose2(outer);
 $u(count, 6, [ 1 ]);
 console.log("end");
 const wrapped = new2();
-$H(wrapped, ($G) => {
+$O(wrapped, ($N) => {
 	$d(count, (value) => {
 		return console.log("wrapped " + value);
-	}, [ 1 ], $G);
+	}, [ 1 ], $N);
 	return;
 });
 $u(count, 7, [ 1 ]);
 dispose2(wrapped);
 $u(count, 8, [ 1 ]);
 console.log("fin");
-const $K = $J(($I) => {
+const $R = $Q(($P) => {
 	$d(count, (value) => {
 		return console.log("comp " + value);
-	}, [ 1 ], $I);
+	}, [ 1 ], $P);
 	return "built";
 });
-const label = $K[0];
-const scope = $K[1];
+const label = $R[0];
+const scope = $R[1];
 console.log(label);
 $u(count, 9, [ 1 ]);
 dispose2(scope);

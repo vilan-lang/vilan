@@ -511,3 +511,123 @@ fn b291_a_disposed_owner_is_idempotent_and_releases_what_it_is_given_at_once() {
         "the disposed owner's state went differently:\n{stdout}"
     );
 }
+
+// --- B292: the drain is exception-safe, and so is a disposal group ----------
+
+/// A throwing observer, and a throwing cleanup, with a harness that can see the
+/// throw — vilan has no exception syntax, so `__step` is the only way a program
+/// can report that the error really left the reactive core rather than being
+/// swallowed there.
+const THROWING_OBSERVER: &str = r#"import std::io::{ panic, print };
+import std::reactive::{ Disposable, FlushPolicy, Owner, Signal, SignalCell, turn };
+
+/// The harness runs each step inside a JS `try`/`catch` and prints what it
+/// caught.
+[extern("__step")]
+external fun step(body: || void): void;
+
+fun main() {
+	let a: SignalCell<i32> = Signal::new(0);
+	let b: SignalCell<i32> = Signal::new(0);
+	let seen_a: SignalCell<i32> = Signal::new(0);
+	let seen_b: SignalCell<i32> = Signal::new(0);
+	let armed: SignalCell<bool> = Signal::new(true);
+
+	let _watch_a = a.on_change(|value: i32| {
+		seen_a.set(value);
+		if armed.get() {
+			armed.set(false);
+			panic("observer exploded");
+		}
+	});
+	let _watch_b = b.on_change(|value: i32| {
+		seen_b.set(value);
+	});
+
+	// Both writes land in ONE turn, so both observers are in one wave.
+	step(|| {
+		turn(FlushPolicy::AtEnd, || {
+			a.set(1);
+			b.set(1);
+		});
+	});
+	print(i"after-throw:a={seen_a.get()} b={seen_b.get()}");
+
+	// The scheduler survived. These two have NO ambient turn, so they resolve
+	// through `draining_turns.last()` — which is exactly where the stuck turn
+	// used to be, swallowing every write in the program from here on.
+	a.set(2);
+	b.set(2);
+	print(i"after-recovery:a={seen_a.get()} b={seen_b.get()}");
+
+	// A disposal group is a list of promises, so it FINISHES past a throwing
+	// cleanup and raises the failure afterwards.
+	let owner = Owner::new();
+	let released: SignalCell<i32> = Signal::new(0);
+	owner.defer(|| {
+		released.set_with(|n| n + 1);
+	});
+	owner.defer(|| {
+		panic("cleanup exploded");
+	});
+	owner.defer(|| {
+		released.set_with(|n| n + 1);
+	});
+	step(|| {
+		owner.dispose();
+	});
+	print(i"released={released.get()}");
+}
+"#;
+
+#[test]
+fn b292_a_throwing_observer_leaves_the_turn_drainable_and_the_error_visible() {
+    // B292. `drain` set `draining = true`, pushed the turn onto
+    // `draining_turns`, and restored neither on the way out of a throw, so one
+    // observer that panicked — or one host API that refused its argument, the
+    // Chrome `insertRule` shape the item names — left the turn DRAINING
+    // forever and on the stack. Every later write then resolved to it
+    // (`Signal::notify`'s no-ambient-turn arm joins `draining_turns.last()`)
+    // and enqueued into a queue nothing would ever flush: the reactive graph
+    // was off for the rest of the session, with no second error to show for
+    // it. `after-recovery` is that line.
+    //
+    // The drain restores under a FINALLY and lets the throw keep unwinding
+    // untouched, rather than catching and continuing the wave: a throwing
+    // observer means the graph is mid-update, and the write that started the
+    // drain is the honest place for the failure to surface. `b=0` on the
+    // `after-throw` line is the price, and it is deliberate. A disposal group
+    // is the opposite case and gets the opposite guard — see `released`.
+    let harness = format!(
+        r#"{DOM_STUB}
+global.__step = (body) => {{
+    try {{
+        body();
+    }} catch (error) {{
+        console.log(`caught:${{error && error.message ? error.message : String(error)}}`);
+    }}
+}};
+require("./app.js");
+"#
+    );
+    let stdout = build_and_run("throwing_observer", THROWING_OBSERVER, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The throw left the core with its own message.
+            "caught:observer exploded",
+            // The wave was abandoned at the thrower, deliberately.
+            "after-throw:a=1 b=0",
+            // And the scheduler is usable again — this is the line that was
+            // `a=1 b=0` for the rest of the session.
+            "after-recovery:a=2 b=2",
+            "caught:cleanup exploded",
+            // Both surviving cleanups ran: a disposal group finishes. Before
+            // B292 this was 1, and B291's idempotence made it permanent — a
+            // second `dispose` no longer picks up what the throw skipped.
+            "released=2",
+        ],
+        "the reactive core's exception safety went differently:\n{stdout}"
+    );
+}
