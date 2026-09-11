@@ -64,6 +64,9 @@ function without_covered(rules, media, condition, property) {
 	}
 	return out;
 }
+function key_is_marked(key) {
+	return key.startsWith(":!:") || key.startsWith(":! ");
+}
 function when(self, condition, delta) {
 	let $k = null;
 	if (condition) {
@@ -74,6 +77,13 @@ function when(self, condition, delta) {
 	return $k;
 }
 function class_list(self) {
+	for (const key of $a(self[0])) {
+		if (key_is_marked(key)) {
+			(() => {
+				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
+			})();
+		}
+	}
 	let out = "";
 	for (const entry of $l(self[0])) {
 		const $m = entry;

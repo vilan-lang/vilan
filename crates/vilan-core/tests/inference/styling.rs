@@ -166,7 +166,7 @@ fn within_prefixes_the_ancestor_guard() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data-theme", "dark", style().background(Color::gray(900)))
+            style().within("data-theme", Some("dark"), style().background(Color::gray(900)))
         }
         let _s = const s();
         fun main() {}
@@ -190,7 +190,7 @@ fn within_stacks_over_a_pseudo_class() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data-theme", "dark", style().hover(style().background(Color::gray(700))))
+            style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -214,7 +214,7 @@ fn a_breakpoint_wraps_within_over_a_pseudo_class() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().md(style().within("data-theme", "dark", style().hover(style().padding(space(6)))))
+            style().md(style().within("data-theme", Some("dark"), style().hover(style().padding(space(6)))))
         }
         let _s = const s();
         fun main() {}
@@ -239,7 +239,7 @@ fn a_pseudo_class_cannot_wrap_within() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().hover(style().within("data-theme", "dark", style().background(Color::gray(700))))
+            style().hover(style().within("data-theme", Some("dark"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -260,7 +260,7 @@ fn within_cannot_wrap_within() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data-theme", "dark", style().within("data-theme", "dim", style().background(Color::gray(700))))
+            style().within("data-theme", Some("dark"), style().within("data-theme", Some("dim"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -281,7 +281,7 @@ fn within_cannot_wrap_a_breakpoint() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().within("data-theme", "dark", style().md(style().padding(space(6))))
+            style().within("data-theme", Some("dark"), style().md(style().padding(space(6))))
         }
         let _s = const s();
         fun main() {}
@@ -304,7 +304,7 @@ fn within_validates_its_name_and_value() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data theme", "dark", style().background(Color::gray(700)))
+            style().within("data theme", Some("dark"), style().background(Color::gray(700)))
         }
         let _s = const s();
         fun main() {}
@@ -920,7 +920,7 @@ fn the_display_enum_covers_every_variant() {
                 .disabled(style().display(Display::InlineBlock))
                 .first(style().display(Display::InlineFlex))
                 .last(style().display(Display::InlineGrid))
-                .within("data-theme", "dark", style().display(Display::Hidden))
+                .within("data-theme", Some("dark"), style().display(Display::Hidden))
         }
         let _s = const s();
         fun main() {}
@@ -1240,7 +1240,7 @@ fn a_condition_never_clears_the_base_family() {
         r#"
         import std::style::{ style, space, Style };
         fun shorthand_under_within(): Style {
-            style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)))
+            style().padding_top(space(0)).within("data-theme", Some("dark"), style().padding(space(4)))
         }
         fun longhand_under_hover(): Style {
             style().padding(space(6)).hover(style().padding_top(space(2)))
@@ -1285,7 +1285,7 @@ fn a_condition_never_clears_the_base_family() {
         import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
-            let themed = const style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)));
+            let themed = const style().padding_top(space(0)).within("data-theme", Some("dark"), style().padding(space(4)));
             print(themed.class_list().split(" ").len());
         }
         main();
@@ -2077,7 +2077,7 @@ fn an_attribute_condition_selects_on_the_element_itself() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data-open", "true", style().opacity(0.5))
+            style().attribute("data-open", Some("true"), style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
@@ -2101,7 +2101,7 @@ fn an_attribute_condition_wraps_a_pseudo_class() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data-open", "true", style().hover(style().opacity(0.8)))
+            style().attribute("data-open", Some("true"), style().hover(style().opacity(0.8)))
         }
         let _s = const s();
         fun main() {}
@@ -2124,7 +2124,7 @@ fn within_wraps_an_attribute_condition() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().within("data-theme", "dark", style().attribute("data-open", "true", style().opacity(0.8)))
+            style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().opacity(0.8)))
         }
         let _s = const s();
         fun main() {}
@@ -2148,9 +2148,9 @@ fn all_four_condition_axes_compose_outside_in() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().md(style().within("data-theme", "dark", style().attribute(
+            style().md(style().within("data-theme", Some("dark"), style().attribute(
                 "data-open",
-                "true",
+                Some("true"),
                 style().hover(style().opacity(0.8)),
             )))
         }
@@ -2176,7 +2176,7 @@ fn an_attribute_cannot_wrap_a_media_conditioned_style() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().attribute("data-open", "true", style().md(style().padding(space(6))))
+            style().attribute("data-open", Some("true"), style().md(style().padding(space(6))))
         }
         let _s = const s();
         fun main() {}
@@ -2197,7 +2197,7 @@ fn an_attribute_cannot_wrap_within() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().attribute("data-open", "true", style().within("data-theme", "dark", style().background(Color::gray(700))))
+            style().attribute("data-open", Some("true"), style().within("data-theme", Some("dark"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -2219,7 +2219,7 @@ fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().hover(style().attribute("data-open", "true", style().background(Color::gray(700))))
+            style().hover(style().attribute("data-open", Some("true"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -2243,8 +2243,8 @@ fn an_attribute_cannot_wrap_an_attribute_condition() {
         fun s(): Style {
             style().attribute(
                 "data-open",
-                "true",
-                style().attribute("data-side", "left", style().background(Color::gray(700))),
+                Some("true"),
+                style().attribute("data-side", Some("left"), style().background(Color::gray(700))),
             )
         }
         let _s = const s();
@@ -2269,7 +2269,7 @@ fn an_attribute_name_with_a_delimiter_fails_the_build() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data open", "true", style().opacity(0.5))
+            style().attribute("data open", Some("true"), style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
@@ -2290,7 +2290,7 @@ fn an_attribute_value_with_a_quote_fails_the_build() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data-open", "tr\"ue", style().opacity(0.5))
+            style().attribute("data-open", Some("tr\"ue"), style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
@@ -2316,12 +2316,12 @@ fn attribute_slots_merge_per_condition_and_property() {
         import std::style::{ style, Style };
         fun main() {
             let togged = const style()
-                .attribute("data-open", "true", style().opacity(0.5))
-                .attribute("data-open", "true", style().opacity(1.0));
+                .attribute("data-open", Some("true"), style().opacity(0.5))
+                .attribute("data-open", Some("true"), style().opacity(1.0));
             print(togged.class_list().split(" ").len());
             let sided = const style()
-                .attribute("data-side", "left", style().opacity(0.5))
-                .attribute("data-side", "right", style().opacity(1.0));
+                .attribute("data-side", Some("left"), style().opacity(0.5))
+                .attribute("data-side", Some("right"), style().opacity(1.0));
             print(sided.class_list().split(" ").len());
         }
         main();
@@ -2343,12 +2343,378 @@ fn ssr_renders_attribute_conditioned_classes() {
         fun main() {
             let disclosure = const style()
                 .color(Color::gray(700))
-                .attribute("data-open", "true", style().color(Color::gray(900)));
+                .attribute("data-open", Some("true"), style().color(Color::gray(900)));
             print(render(view("div").styled(disclosure)));
         }
         main();
         "#,
         "<div class=\"s1hbtfg8 sjt5x3g\"></div>\n",
+    );
+}
+
+// --- A89: the PRESENCE form and the `not` marker (ui-styling.md, A89) ---------
+// `attribute`/`within` take `value: Option<str>`: `Some(v)` is the exact match
+// CSS spells `[name="v"]`, `None` the PRESENCE condition `[name]` — the shape a
+// boolean attribute actually has in markup, which had no spelling before and
+// pushed authors onto `child_relation` as a raw-selector escape hatch.
+//
+// Negation is a MARKER, not a pseudo head: `not(inner)` emits nothing and marks
+// the inner's slots, and the condition IMMEDIATELY enclosing it emits its own
+// selector negated. Reading inside-out, `not` negates exactly the next
+// condition out. Three refusals fence it: an unwrapped `not`, `not(not(..))`,
+// and a negated media condition.
+
+#[test]
+fn an_attribute_condition_with_no_value_selects_on_presence() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-selected", None, style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            // No `=`: presence, not an exact match — and still the base band.
+            line.starts_with('.') && line.contains("[data-selected]{opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+    // The control: `Some` renders exactly what it always did, so the presence
+    // form is a second condition rather than a reinterpretation of the first.
+    let exact = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-selected", Some("true"), style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        exact
+            .iter()
+            .any(|(_, line)| line.contains("[data-selected=\"true\"]{opacity:0.5}")),
+        "{exact:?}"
+    );
+}
+
+/// `within`'s value is the same `Option` for the same reason: an ancestor that
+/// merely CARRIES the attribute (`[data-print] .sX`) rather than one whose value
+/// matches.
+#[test]
+fn an_ancestor_guard_with_no_value_selects_on_presence() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().within("data-print", None, style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.starts_with("[data-print] .") && line.ends_with("{opacity:0.5}")),
+        "{assets:?}"
+    );
+}
+
+/// The owner's form, verbatim: `attribute("disabled", None, not(hover(s)))` is
+/// `.sX:not([disabled]):hover` — the hover is KEPT and the attribute negated,
+/// because `not` negates the next condition OUT.
+#[test]
+fn not_under_an_attribute_negates_the_attribute_and_keeps_the_pseudo() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("disabled", None, style().not(style().hover(style().opacity(0.8))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with('.') && line.contains(":not([disabled]):hover{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The other spelling: the mark sits directly under the pseudo-class, so it is
+/// the PSEUDO that is negated — `hover(not(s))` is `.sX:not(:hover)`.
+#[test]
+fn not_under_a_pseudo_class_negates_the_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().hover(style().not(style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.starts_with('.') && line.contains(":not(:hover){opacity:0.8}")),
+        "{assets:?}"
+    );
+}
+
+/// The relation axis negates too: a guard on an ancestor that does NOT carry
+/// the theme. This is the one rule the negation moves into another cascade
+/// BAND — the line starts with ':' rather than '[' — which is recorded at
+/// `render_rule` and pinned here so the move is deliberate.
+#[test]
+fn not_under_an_ancestor_guard_negates_the_guard() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().within("data-theme", Some("dark"), style().not(style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":not([data-theme=\"dark\"]) .") && line.ends_with("{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// Specificity, stated and pinned: `:not(x)` counts as its ARGUMENT, so the
+/// composed `.sX:not([disabled]):hover` is (0,3,0) — class + attribute +
+/// pseudo-class — over the plain `.sY:hover`'s (0,2,0), and the
+/// more-conditioned rule wins the cascade exactly as it does un-negated. The
+/// two rules are compared as TEXT because there is no browser in the tree: the
+/// composed line carries both an attribute selector and a pseudo-class where
+/// the plain one carries only the pseudo-class.
+#[test]
+fn a_negated_attribute_rule_outranks_the_plain_pseudo_rule() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style()
+                .hover(style().opacity(0.9))
+                .attribute("disabled", None, style().not(style().hover(style().opacity(0.8))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let composed = assets
+        .iter()
+        .find(|(_, line)| line.contains(":not([disabled]):hover"))
+        .map(|(_, line)| line.clone())
+        .unwrap_or_else(|| panic!("{assets:?}"));
+    let plain = assets
+        .iter()
+        .find(|(_, line)| line.ends_with(":hover{opacity:0.9}"))
+        .map(|(_, line)| line.clone())
+        .unwrap_or_else(|| panic!("{assets:?}"));
+    assert!(
+        composed.matches(':').count() > plain.matches(':').count(),
+        "the composed rule must carry one more condition than the plain one: \
+         {composed} vs {plain}"
+    );
+    assert!(!plain.contains(":not("), "{plain}");
+}
+
+/// The `css` block reaches the same rule by the name-blind nested-rule rule
+/// (css-block.md §5.3): `.not { … }` is `.not(style() … )` with no knowledge of
+/// the combinator's name anywhere in the desugar, and `.attribute(a, None) { … }`
+/// carries its arguments before the chain. Both spellings must resolve to ONE
+/// class, which is the strongest available statement that they are one rule.
+#[test]
+fn a_css_block_spells_the_negated_presence_condition() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::{ style, Style };
+        fun main() {
+            let chain = const style()
+                .attribute("disabled", None, style().not(style().hover(style().raw("color", "red"))));
+            let block = const css {
+                .attribute("disabled", None) {
+                    .not {
+                        .hover {
+                            color: red;
+                        }
+                    }
+                }
+            };
+            print(chain.class_list() == block.class_list());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+/// Refusal 1: a marked style that reaches APPLICATION. `not` emitted no rule
+/// for it — it never knew which selector to negate — so its class would name
+/// nothing on the sheet and the element would silently get the UN-negated
+/// declaration instead. Application is runtime-legal code (`styled`,
+/// `bind_styled` and the element syntax all render through `class_list`), so
+/// this one refusal is a runtime failure where the other two are build errors.
+#[test]
+fn an_unwrapped_not_is_refused_at_application() {
+    assert_run_panics(
+        r#"
+        import std::style::{ style, Style };
+        fun main() {
+            let bad = const style().not(style().opacity(0.5));
+            let _classes = bad.class_list();
+        }
+        main();
+        "#,
+        "unwrapped not(..)",
+    );
+}
+
+/// Refusal 2: a double negation is said, not cancelled.
+#[test]
+fn a_double_not_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().hover(style().not(style().not(style().opacity(0.5))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("not(not(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// Refusal 3, both spellings of it: `@media not (..)` is its own grammar and no
+/// ruling has reached it, so a breakpoint may neither wrap a marked style nor
+/// be wrapped by one.
+#[test]
+fn a_negated_media_condition_fails_the_build() {
+    for program in [
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().md(style().not(style().opacity(0.5)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().not(style().md(style().opacity(0.5)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    ] {
+        let diagnostics = failure_diagnostics(program);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains("a media condition cannot be negated")),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+/// The marker's grammar fence: a leading `!` on a condition token IS the
+/// negation, so `pseudo`'s free-form name may not forge one.
+#[test]
+fn a_pseudo_class_name_cannot_forge_the_negation_marker() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().pseudo("!hover", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("a pseudo-class name cannot start with '!'")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// A negated slot is its OWN slot: `[disabled]` and `:not([disabled])` are two
+/// conditions on one property, so they coexist rather than overwrite — the same
+/// rule two values of one attribute already follow.
+#[test]
+fn a_negated_condition_is_its_own_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::{ style, Style };
+        fun main() {
+            let both = const style()
+                .attribute("disabled", None, style().opacity(0.5))
+                .attribute("disabled", None, style().not(style().opacity(1.0)));
+            print(both.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// `child_relation`'s refusal gains A89's steer: the reason kolt reached for
+/// `child_relation` as a raw-selector hatch was that a state on the element
+/// ITSELF had no spelling, and now it does.
+#[test]
+fn a_child_relation_steers_a_conditioned_inner_to_attribute() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().children(style().hover(style().opacity(0.5)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("for a state on the element ITSELF")),
+        "{diagnostics:#?}"
     );
 }
 
@@ -2517,7 +2883,7 @@ fn a_within_rule_sorts_after_the_pseudo_band() {
         fun s(): Style {
             style()
                 .hover(style().background(Color::gray(100)))
-                .within("data-theme", "dark", style().background(Color::gray(900)))
+                .within("data-theme", Some("dark"), style().background(Color::gray(900)))
         }
         let _s = const s();
         fun main() {}
@@ -2579,7 +2945,7 @@ fn divide_takes_an_unconditioned_style() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().divide(style().attribute("data-open", "true", style().opacity(0.5)))
+            style().divide(style().attribute("data-open", Some("true"), style().opacity(0.5)))
         }
         let _s = const s();
         fun main() {}
@@ -2621,7 +2987,7 @@ fn within_cannot_wrap_a_child_relation() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().within("data-theme", "dark", style().children(style().margin_top(space(2))))
+            style().within("data-theme", Some("dark"), style().children(style().margin_top(space(2))))
         }
         let _s = const s();
         fun main() {}
@@ -5088,7 +5454,7 @@ const TWIN_BLOCK: &str = r#"css {
             .hover {
                 background-color: {Color::gray(100)};
             }
-            .within("data-theme", "dark") {
+            .within("data-theme", Some("dark")) {
                 color: {Color::gray(50)};
             }
             .children {
@@ -5105,7 +5471,7 @@ const TWIN_CHAIN: &str = r#"style()
             .raw("grid-template-columns", "repeat(3, 1fr)")
             .md(style().raw("padding", space(6)))
             .hover(style().raw("background-color", Color::gray(100)))
-            .within("data-theme", "dark", style().raw("color", Color::gray(50)))
+            .within("data-theme", Some("dark"), style().raw("color", Color::gray(50)))
             .children(style().raw("margin-top", space(2)))"#;
 
 fn twin(spelling: &str) -> String {
@@ -5364,7 +5730,7 @@ fn nested_rules_lower_to_the_shipped_relation_combinators() {
         r#"
         import std::style::{ style, space, Color };
         let _s = const css {
-            .within("data-theme", "dark") {
+            .within("data-theme", Some("dark")) {
                 color: {Color::gray(50)};
             }
             .children {
@@ -5396,8 +5762,8 @@ fn nesting_order_is_combinator_order() {
         import std::style::{ style, Color };
         let _s = const css {
             .md {
-                .within("data-theme", "dark") {
-                    .attribute("data-open", "true") {
+                .within("data-theme", Some("dark")) {
+                    .attribute("data-open", Some("true")) {
                         .hover {
                             color: {Color::gray(50)};
                         }
@@ -5602,7 +5968,7 @@ fn a_chain_link_calls_an_apps_own_style_helper() {
                 self.display(Display::Flex).flex_direction(FlexDirection::Row)
             }
             fun select_off(self): Style {
-                self.within("data-user-select", "false", style().user_select(UserSelect::Off))
+                self.within("data-user-select", Some("false"), style().user_select(UserSelect::Off))
             }
             fun ghost(self): Style {
                 self.raw("pointer-events", "none").select_off()

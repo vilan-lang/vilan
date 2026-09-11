@@ -56,7 +56,7 @@ function without_covered(rules, media, condition, property) {
 		return __clone(rules);
 	}
 	let out = __clone(rules);
-	for (const key of $c(rules)) {
+	for (const key of $a(rules)) {
 		const parts = key.split(":");
 		if (__at(parts, 0) === media && __at(parts, 1) === condition && longhands.includes(";" + __at(parts, 2) + ";")) {
 			$k(out, key);
@@ -64,12 +64,22 @@ function without_covered(rules, media, condition, property) {
 	}
 	return out;
 }
+function key_is_marked(key) {
+	return key.startsWith(":!:") || key.startsWith(":! ");
+}
 function class_list(self) {
+	for (const key of $a(self[0])) {
+		if (key_is_marked(key)) {
+			(() => {
+				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
+			})();
+		}
+	}
 	let out = "";
-	for (const entry of $a(self[0])) {
-		const $b = entry;
-		const class2 = $b[0];
-		const _declaration = $b[1];
+	for (const entry of $b(self[0])) {
+		const $c = entry;
+		const class2 = $c[0];
+		const _declaration = $c[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -80,7 +90,7 @@ function class_list(self) {
 }
 function add(self, b) {
 	let rules = __clone(self[0]);
-	for (const key of $c(b[0])) {
+	for (const key of $a(b[0])) {
 		const $g = $d(b[0], key);
 		let $h = null;
 		if ($g[0] === 0) {
@@ -99,14 +109,14 @@ function add(self, b) {
 function $a(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+		result.push(__clone(entry[0]));
 	}
 	return result;
 }
-function $c(self) {
+function $b(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
+		result.push(__clone(entry[1]));
 	}
 	return result;
 }
@@ -155,6 +165,8 @@ console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");
 const disclosed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "s1dwvy7w", "color:var(--gray-50)" ] ] ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ "s1jqpl5k", "background-color:var(--gray-800)" ] ] ], [ ":[data-open=\"true\"]:display", [ ":[data-open=\"true\"]:display", [ "s11vlq4c", "display:flex" ] ] ], [ ":[data-open=\"true\"] hover:background-color", [ ":[data-open=\"true\"] hover:background-color", [ "s1j5l6ea", "background-color:var(--gray-100)" ] ] ] ]) ] ];
 console.log(class_list(disclosed));
+const gated = [ [ new Map([ [ ":!^[data-theme=\"dark\"]:background-color", [ ":!^[data-theme=\"dark\"]:background-color", [ "s1jayb7s", "background-color:var(--gray-900)" ] ] ], [ ":^[data-collapsed]:display", [ ":^[data-collapsed]:display", [ "s4ss8fz", "display:none" ] ] ], [ ":[data-selected]:color", [ ":[data-selected]:color", [ "st2ig1a", "color:var(--gray-50)" ] ] ], [ ":![disabled] hover:background-color", [ ":![disabled] hover:background-color", [ "s1pk9f1d", "background-color:var(--gray-100)" ] ] ], [ ":!hover:color", [ ":!hover:color", [ "s6t6iu5", "color:var(--gray-700)" ] ] ] ]) ] ];
+console.log(class_list(gated));
 const stacked = [ [ new Map([ [ "768px:>*:gap", [ "768px:>*:gap", [ "svmscer", "gap:var(--space-2)" ] ] ], [ ":>*:margin-top", [ ":>*:margin-top", [ "sxzag36", "margin-top:var(--space-2)" ] ] ], [ ":>*+*:margin-top", [ ":>*+*:margin-top", [ "skr9oll", "margin-top:var(--space-4)" ] ] ] ]) ] ];
 console.log(class_list(stacked));
 const tiled = [ [ new Map([ [ "::line-height", [ "::line-height", [ "snq90yh", "line-height:24px" ] ] ], [ "::background-image", [ "::background-image", [ "s5hidsk", "background-image:url(tile.png)" ] ] ], [ "::background-size", [ "::background-size", [ "skugn91", "background-size:120px 120px" ] ] ] ]) ] ];

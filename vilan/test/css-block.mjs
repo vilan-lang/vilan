@@ -56,7 +56,7 @@ function without_covered(rules, media, condition, property) {
 		return __clone(rules);
 	}
 	let out = __clone(rules);
-	for (const key of $c(rules)) {
+	for (const key of $a(rules)) {
 		const parts = key.split(":");
 		if (__at(parts, 0) === media && __at(parts, 1) === condition && longhands.includes(";" + __at(parts, 2) + ";")) {
 			$k(out, key);
@@ -64,12 +64,22 @@ function without_covered(rules, media, condition, property) {
 	}
 	return out;
 }
+function key_is_marked(key) {
+	return key.startsWith(":!:") || key.startsWith(":! ");
+}
 function class_list(self) {
+	for (const key of $a(self[0])) {
+		if (key_is_marked(key)) {
+			(() => {
+				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
+			})();
+		}
+	}
 	let out = "";
-	for (const entry of $a(self[0])) {
-		const $b = entry;
-		const class2 = $b[0];
-		const _declaration = $b[1];
+	for (const entry of $b(self[0])) {
+		const $c = entry;
+		const class2 = $c[0];
+		const _declaration = $c[1];
 		if (out === "") {
 			out = class2;
 		} else {
@@ -80,7 +90,7 @@ function class_list(self) {
 }
 function add(self, b) {
 	let rules = __clone(self[0]);
-	for (const key of $c(b[0])) {
+	for (const key of $a(b[0])) {
 		const $g = $d(b[0], key);
 		let $h = null;
 		if ($g[0] === 0) {
@@ -99,14 +109,14 @@ function add(self, b) {
 function $a(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+		result.push(__clone(entry[0]));
 	}
 	return result;
 }
-function $c(self) {
+function $b(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
+		result.push(__clone(entry[1]));
 	}
 	return result;
 }

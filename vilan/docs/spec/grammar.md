@@ -466,7 +466,7 @@ token, and a required terminator makes value scanning decidable in one
 pass. A value is a run of tokens and `{expression}` holes — there is no
 typed value grammar, and typed values arrive through the holes. A
 condition rule's parenthesized arguments are ordinary expressions
-(`.within("data-theme", "dark") { … }`).
+(`.within("data-theme", Some("dark")) { … }`).
 
 Like an element, a block is an ordinary expression that desugars before
 analysis — to the `std::style` chain: `style()`, then `.raw(property,
