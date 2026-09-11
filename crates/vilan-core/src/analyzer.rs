@@ -16308,6 +16308,80 @@ impl<'src> Analyzer<'src> {
         Some(self.substitute_type(&declared, &bindings))
     }
 
+    /// Grounds the binders an impl subject's BOUNDS introduce, from the
+    /// receiver's own implementation of each bound trait (B300(a)) — the
+    /// analyzer-side reading of `impl_select::bind_bound_binders`, which has
+    /// answered the same question on the emission side since B165.
+    ///
+    /// `reconcile_declaration` binds what the SUBJECT writes and nothing else:
+    /// against `impl type S: Read<type T>` a `Cell<i32>` receiver binds
+    /// `S = Cell<i32>` and leaves `T` a hole, because `T` appears nowhere in
+    /// the subject — it is written inside the bound. Every signature the impl
+    /// states in `T` (`fun sample(self): T`) then stayed abstract at the call
+    /// site: the result "is never fully determined", and an annotation at the
+    /// call had to do the solver's work. `T` is not free, though — the bound
+    /// says the receiver implements `Read` AT it, so the receiver's own impl
+    /// decides it: `Cell<i32>: Read<i32>` gives `T = i32`.
+    ///
+    /// A bound's argument may itself be a bounded binder
+    /// (`type S: Read<type I: Read<type U>>`, A86's `flatten` shape), so the
+    /// walk is a worklist: binding `I` makes `I`'s own bounds answerable, which
+    /// is what binds `U`. Every step is LENIENT — a receiver with no impl of
+    /// the trait in view, an arity mismatch, or a position that does not
+    /// reconcile leaves the binder as it was, so a program that resolved
+    /// before resolves the same way.
+    fn bind_subject_bound_binders(
+        &mut self,
+        impl_subject_id: TypeId,
+        bindings: &mut SubstitutionContext,
+    ) {
+        let mut pending = Vec::new();
+        self.collect_subject_binders(impl_subject_id, &mut pending);
+        let mut seen: Vec<TypeId> = Vec::new();
+        while let Some(binder) = pending.pop() {
+            if seen.contains(&binder) {
+                continue;
+            }
+            seen.push(binder);
+            let Some(concrete_id) = bindings.get(&binder).copied() else {
+                continue;
+            };
+            let concrete = concrete_id.get_type(self);
+            if !crate::impl_select::is_resolvable(&concrete) {
+                continue;
+            }
+            for (trait_id, bound_arguments) in self.generic_bound_traits(binder) {
+                if bound_arguments.is_empty() {
+                    continue;
+                }
+                let Some(provided) = self.trait_args_for(&concrete, trait_id) else {
+                    continue;
+                };
+                if provided.len() != bound_arguments.len() {
+                    continue;
+                }
+                for (pattern_id, actual_id) in bound_arguments.into_iter().zip(provided) {
+                    self.collect_subject_binders(pattern_id, &mut pending);
+                    let pattern = pattern_id.get_type(self);
+                    let actual = actual_id.get_type(self);
+                    if !crate::impl_select::is_resolvable(&actual) {
+                        continue;
+                    }
+                    let Some((_, pairs)) = self.reconcile_declaration(&actual, &pattern, &pattern)
+                    else {
+                        continue;
+                    };
+                    let mut pattern_binders = Vec::new();
+                    self.collect_subject_binders(pattern_id, &mut pattern_binders);
+                    let grounded = self.bindings_for_binders(&pattern_binders, pairs);
+                    for (constraint_id, bound_id) in grounded {
+                        bindings.entry(constraint_id).or_insert(bound_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// The trait that is `member_name`'s home when `implementation` provides it
     /// — one of the impl's `with`-clause traits, or a supertrait of one,
     /// declaring that name. `None` makes the member INHERENT: a name an impl
@@ -35445,10 +35519,17 @@ impl<'src> Analyzer<'src> {
                         let impl_subject = impl_subject_id.get_type(self);
                         if let Some((_, bindings)) =
                             self.reconcile_declaration(&impl_subject, &subject_type, &impl_subject)
-                            && !bindings.is_empty()
                         {
-                            self.method_call_substitution
-                                .insert(id, bindings.into_iter().collect());
+                            // B300(a): the subject's binders alone leave a
+                            // binder written inside a BOUND (`impl type S:
+                            // Read<type T>`) a hole. The receiver's own impl of
+                            // the bound trait decides it, so ground those too
+                            // before the body monomorphizes.
+                            let mut bindings: SubstitutionContext = bindings.into_iter().collect();
+                            self.bind_subject_bound_binders(impl_subject_id, &mut bindings);
+                            if !bindings.is_empty() {
+                                self.method_call_substitution.insert(id, bindings);
+                            }
                         }
                         // A method that fills a container's inference slot —
                         // `list.push(value)` or `context.run(value, ..)` — unifies
