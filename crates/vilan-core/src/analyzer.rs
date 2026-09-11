@@ -25929,8 +25929,9 @@ impl<'src> Analyzer<'src> {
                 None
             }
             // `[service(..)]` is transparent to analysis: walk the wrapped
-            // struct; the generated dispatcher/client are appended separately
-            // (`service_impl_source`).
+            // struct; the generated dispatcher and client are appended
+            // separately, by `std/src/rpc.vl`'s `service` macro (N70 retired
+            // the Rust twin that used to do it for a std without `rpc.vl`).
             Node::Service(attribute, inner) => {
                 if let Node::Struct(name, ..) = &inner.0
                     && attribute.client_side
@@ -47078,9 +47079,12 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
     }
 }
 
-/// The djb2 string hash (the `service_contract_hash` precedent), as a raw `u32` —
-/// the HMR fingerprint of a binding's canonical structural type rendering
-/// (`hmr.md` §4).
+/// The djb2 string hash, as a raw `u32` — the HMR fingerprint of a binding's
+/// canonical structural type rendering (`hmr.md` §4).
+///
+/// It is the same hash `std/src/rpc.vl`'s `service_hash` computes over a
+/// service contract surface; the Rust `service_contract_hash` that used to
+/// share this function went with the fallback generator (N70).
 fn djb2_hash(text: &str) -> u32 {
     let mut hash: u32 = 5381;
     for byte in text.bytes() {
