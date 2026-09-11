@@ -9135,3 +9135,144 @@ fn a85_a_plain_closure_field_answers_to_the_owner_it_was_built_under() {
         "body sees one\nbody sees two\n",
     );
 }
+
+/// B307's ruling: an argument the `with` clause did not write for a
+/// NON-defaulted trait parameter is an arity error, not an elision.
+///
+/// `effective_trait_arguments_of` pads a missing argument with the trait's own
+/// declared parameter, and the item read that padding as an acceptance. It is
+/// not one — B273's recording site runs B188's arity check over the clause, so
+/// `impl DogBox with Holder` is refused where it is written. This pin is the
+/// ruling stated: nothing else holds the under-supply direction at a `with`
+/// clause (B273's own pins cover over-supply and the argument's bounds; B188's
+/// cover a field and a closure annotation), so without it the rule lives in one
+/// unpinned branch of a shared helper.
+#[test]
+fn b307_an_elided_with_clause_argument_for_a_bounded_parameter_is_an_arity_error() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        trait Holder<type T: Display> { fun held(self): T; }
+        struct Dog { name: str }
+        impl Dog with Display { fun to_string(self): str { self.name } }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(DogBox { dog = Dog { name = "rex" } }.held().to_string()); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+/// The same refusal for an UNBOUNDED parameter: a bound is not what makes the
+/// argument necessary — the position is. A parameter with no bound still has
+/// nothing to be inferred from at a clause, which is why the steer here offers a
+/// concrete example (`Holder<i32>`) where the bounded one cannot.
+#[test]
+fn b307_an_elided_with_clause_argument_for_an_unbounded_parameter_is_an_arity_error_too() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Holder<type T> { fun held(self): T; }
+        struct Dog { name: str }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(DogBox { dog = Dog { name = "rex" } }.held().name); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given — write `Holder<T>` with `T` supplied here: \
+         a concrete type (`Holder<i32>`)",
+    );
+}
+
+/// A std trait, because the rule is not about locally declared ones: `Keyed<K>`
+/// is what `[expose(keyed)]` reads, and eliding its key is the mistake the
+/// service family keeps meeting from the other side.
+#[test]
+fn b307_an_elided_argument_on_a_std_parameterised_trait_is_refused_the_same_way() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::wire::Keyed;
+        struct Message { id: str }
+        impl Message with Keyed {
+            fun key(self): str { self.id }
+        }
+        fun main() { print(Message { id = "m" }.key()); }
+        "#,
+        "`Keyed` takes 1 type argument, 0 given",
+    );
+}
+
+/// The ruling's other half, and the reason the refusal is not "write every
+/// argument": a DEFAULTED parameter supplies itself, so eliding it is not
+/// eliding anything. `Add<B = Self>` is the spelling std itself writes 40 times
+/// over and the whole operator family rides on; `Combine<T = Self>` is the
+/// corpus's own exhibit.
+#[test]
+fn b307_a_defaulted_trait_parameter_stays_elidable_at_a_with_clause() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+        fun main() { print((Money { cents = 1 } + Money { cents = 2 }).cents); }
+        main();
+        "#,
+        "3\n",
+    );
+}
+
+/// One written clause is ONE report (B188's rule). The arity refusal used to be
+/// joined by a conformance mismatch read off the PADDING — "`DogBox`'s `held`
+/// returns `Dog`, but `Holder` declares `T`" — a requirement against the trait's
+/// own parameter that no impl could satisfy, restating the missing argument in a
+/// vocabulary that hides it. Conformance is a question about an instantiation,
+/// and a clause whose arity is wrong has not named one.
+#[test]
+fn b307_a_clause_refused_on_its_arity_reports_nothing_about_conformance() {
+    let source = r#"
+        import std::io::print;
+        trait Holder<type T> { fun held(self): T; }
+        struct Dog { name: str }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(DogBox { dog = Dog { name = "rex" } }.held().name); }
+        "#;
+    assert_fails_without(source, "but `Holder` declares `T`");
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one under-supplied clause is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+/// The non-vacuity control for the stand-down above: a clause whose arity is
+/// RIGHT still has its conformance checked, so what was removed is the
+/// follow-on and not the check.
+#[test]
+fn b307_a_well_formed_clause_still_has_its_conformance_checked() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Holder<type T> { fun held(self): T; }
+        struct Dog { name: str }
+        struct Cat { name: str }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder<Cat> {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(1); }
+        "#,
+        "returns `Dog`",
+    );
+}

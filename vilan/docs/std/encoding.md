@@ -193,6 +193,14 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
 
+It gives you the wire codec and nothing else: a type that also needs
+`to_json`/`from_json` asks for both, `[derive(Json, Wire)]`. The two are
+separate trait families with separate field rules — `Map`, `Result` and
+any hand-written `impl … with Wire` type are Wire and are not Json — so a
+`Wire` derive that quietly emitted a JSON codec as well would refuse
+fields the wire boundary admits, in `to_json`'s vocabulary rather than
+Wire's.
+
 `Wire` is a trait like any other, and what counts as Wire is what an
 `impl … with Wire` applies to — the derive is one way to get one, not the
 definition. A conditional impl's own binder bounds are what recurse into

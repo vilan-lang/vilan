@@ -223,7 +223,7 @@ are the ops never compares anything.
 ## Errors
 
 ```vilan,fragment
-[derive(Wire, Debug)]
+[derive(Wire, Json, Debug, PartialEq)]
 enum RpcError {
 	Transport(str),   // couldn't reach / lost the server ("not connected", "connection lost")
 	Decode(str),      // reply didn't parse

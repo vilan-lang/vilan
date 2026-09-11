@@ -3919,6 +3919,21 @@ pub struct Analyzer<'src> {
     // silencing every generated bound failure about `Task` would silence
     // sentences this refusal never said, and `Keyed<i32>` is the one it did.
     expose_refused_key_bounds: HashSet<String>,
+    // B303's twin of the set above, for the OTHER half of a service the
+    // `[rpc]` Wire-signature refusal already named: every type label that
+    // refusal reported as not Wire, plus every non-Wire component nested
+    // inside one. The generated client's `call<T: Wire>` fails at exactly
+    // those types, in code the author never wrote and spanned on the STRUCT,
+    // which is the same restatement `[expose]` has stood down since B189.
+    //
+    // Keyed on the TYPE rather than on the trait label, because the trait
+    // label here is the bare `Wire` and standing down every generated `Wire`
+    // failure would silence sentences this refusal never said. The nesting is
+    // what makes it precise for the argument positions too: a refused
+    // `List<Password>` parameter fails the bound at `Password`, so the label
+    // the bound check computes is the ELEMENT's and the label the refusal
+    // reported is the collection's.
+    rpc_refused_wire_types: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -4822,6 +4837,7 @@ impl<'src> Analyzer<'src> {
             entry_cycle_refused_imports: Vec::new(),
             expose_refused_elements: HashSet::default(),
             expose_refused_key_bounds: HashSet::default(),
+            rpc_refused_wire_types: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             field_annotation_type_ids: HashMap::default(),
@@ -5473,6 +5489,25 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                     let type_label = self.pretty_print_type(&value_type, &HashMap::default());
+                    // B303's stand-down, A56's above read for the `[rpc]` half:
+                    // the generated client's `call<T: Wire>` failing at a type
+                    // the `[rpc]` signature refusal has ALREADY named, in the
+                    // method's own vocabulary and on the annotation the author
+                    // wrote. `[expose]` has had B189's stand-down for exactly
+                    // this since the check existed; `[rpc]` had none, so one
+                    // non-Wire payload reported two and three times over, and
+                    // the honest sentence was not the one that read first.
+                    // Generated only, the `Wire` bound only, and only at the
+                    // types the refusal reported.
+                    if !self.rpc_refused_wire_types.is_empty()
+                        && trait_label == "Wire"
+                        && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                        && self
+                            .rpc_refused_wire_types
+                            .contains(&without_spaces(&type_label))
+                    {
+                        continue;
+                    }
                     // A generic argument fails by MISSING the bound on its own
                     // declaration — name that fix; a concrete one by missing
                     // the impl.
@@ -7199,6 +7234,15 @@ impl<'src> Analyzer<'src> {
     /// means the SUBJECT at an impl. Without that substitution
     /// `impl Bag with Combine` and `impl Bag with Combine<Bag>` would compare as
     /// different instantiations of the one they both are.
+    ///
+    /// B307's boundary, stated because the padding reads as wider than it is:
+    /// a NON-defaulted position left unwritten is refused at the clause
+    /// (B273's recording site, B188's message) and the whole clause is then
+    /// checked no further, so what this pads for such a position — the trait's
+    /// own declared parameter — is only ever read by the duplicate-impl
+    /// comparison, where two clauses refused the same way must still compare as
+    /// the same instantiation rather than reporting a second time. It is not a
+    /// reading the type checker acts on, and nothing is admitted by it.
     fn effective_trait_arguments(&self, site: &TraitImplSite) -> Vec<TypeId> {
         self.effective_trait_arguments_of(site.trait_id, &site.arguments, site.subject)
     }
@@ -7231,7 +7275,9 @@ impl<'src> Analyzer<'src> {
             )
             .chain(
                 // A clause that wrote MORE arguments than the trait declares is
-                // already an arity error elsewhere; keep them so two such
+                // an arity error at the clause itself (B188's message through
+                // B273's recording site — the claim this comment made was
+                // false until then, and true since); keep them so two such
                 // clauses still compare by what they wrote.
                 written_arguments
                     .iter()
@@ -14942,6 +14988,11 @@ impl<'src> Analyzer<'src> {
                         None => true,
                     };
                     if !element_is_wire {
+                        if let Some(element_type_id) = member_type_id
+                            .and_then(|type_id| self.resolved_handle_return_element(type_id))
+                        {
+                            self.record_refused_rpc_wire_type(element_type_id);
+                        }
                         let rendered = render_type(element);
                         self.push_anchored(
                             Error {
@@ -14968,6 +15019,9 @@ impl<'src> Analyzer<'src> {
                 match type_node {
                     Some(_) if member_is_wire => {}
                     Some(type_node) => {
+                        if let Some(member_type_id) = member_type_id {
+                            self.record_refused_rpc_wire_type(member_type_id);
+                        }
                         let rendered = render_type(type_node);
                         self.push_anchored(
                             Error {
@@ -15394,6 +15448,37 @@ impl<'src> Analyzer<'src> {
     /// parameter, an unresolved annotation — is NOT Wire and never reaches the
     /// impl table: a bare parameter would otherwise answer from its declared
     /// bound, which is the one answer arm 2 exists to refuse.
+    /// Record a type the `[rpc]` Wire-signature refusal has just reported as
+    /// not Wire — and every non-Wire component nested inside it — so the
+    /// generated client's `call<T: Wire>` failure at the same type stands down
+    /// (B303, [`Self::rpc_refused_wire_types`]).
+    ///
+    /// The descent is what makes the set match what the BOUND check computes:
+    /// a refused `List<Password>` parameter is reported at the collection, and
+    /// `List<T: Wire>`'s own `describe` fails at the element — two labels for
+    /// one mistake. A Wire component is not recorded, so a `Map<str, Password>`
+    /// contributes `Map<str, Password>` and `Password` and never `str`.
+    fn record_refused_rpc_wire_type(&mut self, type_id: TypeId) {
+        if self.resolved_type_is_wire(type_id) {
+            return;
+        }
+        let type_ = type_id.get_type(self);
+        let label = self.pretty_print_type(&type_, &HashMap::default());
+        if !self.rpc_refused_wire_types.insert(without_spaces(&label)) {
+            // Already recorded: a type that contains itself through a field is
+            // not expressible here, but a shape like `Map<Password, Password>`
+            // reaches the same argument twice and the walk must end.
+            return;
+        }
+        let arguments = match &type_ {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
+            _ => Vec::new(),
+        };
+        for argument in arguments {
+            self.record_refused_rpc_wire_type(argument);
+        }
+    }
+
     fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
         let type_ = type_id.get_type(self);
         let (name, arguments) = match &type_ {
@@ -25823,8 +25908,9 @@ impl<'src> Analyzer<'src> {
                 None
             }
             // `[service(..)]` is transparent to analysis: walk the wrapped
-            // struct; the generated dispatcher/client are appended separately
-            // (`service_impl_source`).
+            // struct; the generated dispatcher and client are appended
+            // separately, by `std/src/rpc.vl`'s `service` macro (N70 retired
+            // the Rust twin that used to do it for a std without `rpc.vl`).
             Node::Service(attribute, inner) => {
                 if let Node::Struct(name, ..) = &inner.0
                     && attribute.client_side
@@ -41098,6 +41184,27 @@ impl<'src> Analyzer<'src> {
                         check.source_id,
                         anchor_type_id,
                     );
+                    // B307: and NOTHING else is checked against this clause.
+                    // Conformance is a question about an INSTANTIATION —
+                    // `Holder<Dog>` requires `fun held(self): Dog`,
+                    // `Holder<Cat>` requires `Cat` — and a clause whose arity
+                    // is wrong has not named one, so every answer below would
+                    // be read off `effective_trait_arguments_of`'s padding
+                    // rather than off anything the author wrote. It showed:
+                    // `impl DogBox with Holder` over `trait Holder<type T>`
+                    // reported the arity error AND "`DogBox`'s `held` returns
+                    // `Dog`, but `Holder` declares `T`" — a mismatch against
+                    // the trait's own parameter, which no impl could ever
+                    // satisfy and which restates the missing argument in a
+                    // vocabulary that hides it. One written clause is one
+                    // report, which is B188's rule and the reason the bound
+                    // check beside this already stands down.
+                    //
+                    // `impl .. with Drop` is the one recording skipped here
+                    // that is not a diagnostic, and it cannot be reached: the
+                    // trait declares no parameters, so its clause has no arity
+                    // to get wrong.
+                    continue;
                 }
                 (None, Some(anchor_type_id)) => {
                     self.written_nominal_bound_sites.push((
@@ -46681,6 +46788,13 @@ fn derive_enum_impls(
                     subject.binders("Debug"),
                 ));
             }
+            // B301: `Json` emits the JSON pair, `Wire` the §6.1 visitor, and
+            // `[derive(Json, Wire)]` — two derives, two passes of this loop —
+            // emits both. The arm is shared because the two codecs read the
+            // same declaration, never because either implies the other; `Wire`
+            // used to emit the JSON pair beside its visitor ("additive until
+            // the codec re-plumb consumes it") and the residue made a Wire
+            // type's fields have to be Json as well.
             "Json" | "Wire" => {
                 // §3.9's backed form: the value on the wire IS the backing
                 // value, and it round-trips through the synthesized `parse`.
@@ -46688,20 +46802,21 @@ fn derive_enum_impls(
                 // and `<backing>::to_json` already escapes correctly — so
                 // neither direction re-implements JSON quoting here.
                 if let Some(backing_type) = backing_type {
-                    out.push_str(&format!(
-                        "impl {enum_name}{} with Json {{\n\
+                    if *derive == "Json" {
+                        out.push_str(&format!(
+                            "impl {enum_name}{} with Json {{\n\
                          \tfun to_json(self): str {{\n\
                          \t\tself.value().to_json()\n\
                          \t}}\n\
                          }}\n",
-                        subject.binders("Json"),
-                    ));
-                    let coerce = match backing_type {
-                        "str" => "coerce_str",
-                        "i53" => "coerce_i53",
-                        _ => "coerce_i32",
-                    };
-                    out.push_str(&format!(
+                            subject.binders("Json"),
+                        ));
+                        let coerce = match backing_type {
+                            "str" => "coerce_str",
+                            "i53" => "coerce_i53",
+                            _ => "coerce_i32",
+                        };
+                        out.push_str(&format!(
                         "impl {enum_name}{} with FromJson {{\n\
                          \tfun from_json(text: str): Result<{applied}, str> {{\n\
                          \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
@@ -46712,6 +46827,7 @@ fn derive_enum_impls(
                          }}\n",
                         subject.binders("FromJson"),
                     ));
+                    }
                     if *derive == "Wire" {
                         let first_variant =
                             variants.first().map(|(name, _)| *name).unwrap_or(enum_name);
@@ -46725,60 +46841,61 @@ fn derive_enum_impls(
                 }
                 // Externally tagged: no payload -> `"V"`; one -> `{"V":<p>}`;
                 // many -> `{"V":[<p0>,<p1>]}`.
-                let mut arms = String::new();
-                for (name, payload_types) in &variants {
-                    let arity = payload_types.len();
-                    if arity == 0 {
-                        arms.push_str(&format!(
-                            "\t\t\t{enum_name}::{name} => \"\\\"{name}\\\"\",\n"
-                        ));
-                    } else if arity == 1 {
-                        arms.push_str(&format!(
+                if *derive == "Json" {
+                    let mut arms = String::new();
+                    for (name, payload_types) in &variants {
+                        let arity = payload_types.len();
+                        if arity == 0 {
+                            arms.push_str(&format!(
+                                "\t\t\t{enum_name}::{name} => \"\\\"{name}\\\"\",\n"
+                            ));
+                        } else if arity == 1 {
+                            arms.push_str(&format!(
                             "\t\t\t{enum_name}::{name}(let p0) => \"{{\\\"{name}\\\":\" + p0.to_json() + \"}}\",\n"
                         ));
-                    } else {
-                        let binds = (0..arity)
-                            .map(|i| format!("let p{i}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let parts = (0..arity)
-                            .map(|i| format!("p{i}.to_json()"))
-                            .collect::<Vec<_>>()
-                            .join(" + \",\" + ");
-                        arms.push_str(&format!(
+                        } else {
+                            let binds = (0..arity)
+                                .map(|i| format!("let p{i}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let parts = (0..arity)
+                                .map(|i| format!("p{i}.to_json()"))
+                                .collect::<Vec<_>>()
+                                .join(" + \",\" + ");
+                            arms.push_str(&format!(
                             "\t\t\t{enum_name}::{name}({binds}) => \"{{\\\"{name}\\\":[\" + {parts} + \"]}}\",\n"
                         ));
+                        }
                     }
-                }
-                out.push_str(&format!(
-                    "impl {enum_name}{} with Json {{\n\
+                    out.push_str(&format!(
+                        "impl {enum_name}{} with Json {{\n\
                      \tfun to_json(self): str {{\n\
                      \t\tmatch self {{\n{arms}\t\t}}\n\
                      \t}}\n\
                      }}\n",
-                    subject.binders("Json"),
-                ));
-                // The reverse direction: read the externally-tagged discriminator,
-                // then rebuild that variant from the host value. A no-payload tag is
-                // the bare string; a single payload is `value.field(tag)`; several
-                // are positional elements of the tagged array. Each payload is
-                // coerced via its own type's `from_json_value`.
-                // Decoding is fallible (I3): validate the tag (unknown = a decode
-                // error, not a panic) and thread each payload leaf with `!`.
-                let mut arms = String::new();
-                for (name, payload_types) in &variants {
-                    let arity = payload_types.len();
-                    if arity == 0 {
-                        arms.push_str(&format!(
-                            "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}),\n"
-                        ));
-                    } else if arity == 1 {
-                        let payload_type = &payload_types[0];
-                        arms.push_str(&format!(
+                        subject.binders("Json"),
+                    ));
+                    // The reverse direction: read the externally-tagged discriminator,
+                    // then rebuild that variant from the host value. A no-payload tag is
+                    // the bare string; a single payload is `value.field(tag)`; several
+                    // are positional elements of the tagged array. Each payload is
+                    // coerced via its own type's `from_json_value`.
+                    // Decoding is fallible (I3): validate the tag (unknown = a decode
+                    // error, not a panic) and thread each payload leaf with `!`.
+                    let mut arms = String::new();
+                    for (name, payload_types) in &variants {
+                        let arity = payload_types.len();
+                        if arity == 0 {
+                            arms.push_str(&format!(
+                                "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}),\n"
+                            ));
+                        } else if arity == 1 {
+                            let payload_type = &payload_types[0];
+                            arms.push_str(&format!(
                             "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({payload_type}::from_json_value(value.field(\"{name}\"))!)),\n"
                         ));
-                    } else {
-                        let elements = payload_types
+                        } else {
+                            let elements = payload_types
                             .iter()
                             .enumerate()
                             .map(|(index, payload_type)| {
@@ -46788,15 +46905,15 @@ fn derive_enum_impls(
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
-                        arms.push_str(&format!(
-                            "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({elements})),\n"
-                        ));
+                            arms.push_str(&format!(
+                                "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({elements})),\n"
+                            ));
+                        }
                     }
-                }
-                arms.push_str(&format!(
+                    arms.push_str(&format!(
                     "\t\t\t_ => Result::Err(\"unknown variant in JSON for enum {enum_name}\"),\n"
                 ));
-                out.push_str(&format!(
+                    out.push_str(&format!(
                     "impl {enum_name}{} with FromJson {{\n\
                      \tfun from_json(text: str): Result<{applied}, str> {{\n\
                      \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
@@ -46807,8 +46924,7 @@ fn derive_enum_impls(
                      }}\n",
                     subject.binders("FromJson"),
                 ));
-                // `[derive(Wire)]` also targets the §6.1 visitor (see the
-                // struct arm's note).
+                }
                 if *derive == "Wire" {
                     out.push_str(&enum_wire_visitor_impls(subject, &variants));
                 }
@@ -46950,16 +47066,12 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
     }
 }
 
-/// A stable fingerprint of a service's surface (Q6 v2): method names, parameter
-/// types, return types, and exposed fields — djb2 over the canonical string, so
-/// the same contract always hashes the same and any drift changes it.
-fn service_contract_hash(surface: &str) -> String {
-    format!("{:08x}", djb2_hash(surface))
-}
-
-/// The djb2 string hash (the `service_contract_hash` precedent), as a raw `u32` —
-/// the HMR fingerprint of a binding's canonical structural type rendering
-/// (`hmr.md` §4).
+/// The djb2 string hash, as a raw `u32` — the HMR fingerprint of a binding's
+/// canonical structural type rendering (`hmr.md` §4).
+///
+/// It is the same hash `std/src/rpc.vl`'s `service_hash` computes over a
+/// service contract surface; the Rust `service_contract_hash` that used to
+/// share this function went with the fallback generator (N70).
 fn djb2_hash(text: &str) -> u32 {
     let mut hash: u32 = 5381;
     for byte in text.bytes() {
@@ -46968,276 +47080,23 @@ fn djb2_hash(text: &str) -> u32 {
     hash
 }
 
-/// The synthesized source for a `[service(Client)]` struct (transport-rpc.md
-/// §4.2): a `dispatcher(self)` method routing each `[rpc]` method through the
-/// §4.1 `Dispatcher` (the handlers capture `self`, the per-connection session),
-/// a sibling client struct over a generic `Transport` whose methods are the
-/// `Result`-wrapped `call(..)`s and whose `[expose]`d fields surface as
-/// `RemoteSource` mirrors, and a shared `contract_hash()` on both sides. The
-/// service's `[rpc]` methods are gathered from the *same module's* inherent
-/// `impl` blocks (`nodes`).
-pub(crate) fn service_impl_source(
-    client_name: Option<&str>,
-    item: &Spanned<Node<'_>>,
-    nodes: &NodeList<'_>,
-) -> String {
-    let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
-        return String::new();
-    };
-    let service_name = name.0;
-    let client_name = client_name
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{service_name}Client"));
-    // The `[expose]`d fields — each becomes a typed `RemoteSource<Element>`
-    // mirror on the client. This runs at macro-expansion time, before any type
-    // resolves, so the element is read off the field's SOLE type argument —
-    // `SignalCell<Note>`, `StorageSignal<str>`, any single-parameter source.
-    // Whether the field is exposable at all is the analyzer's
-    // `check_expose_fields`, which reconciles it against `std::Source`; a field
-    // whose element cannot be read HERE generates nothing at all — no surface
-    // entry, no mirror, no `expose` call (B202, and the `service` macro in
-    // `std/src/rpc.vl` reads the same rule). It used to render the literal `_`,
-    // which is not a type, so a field exposing something that is no source at
-    // all drew `cannot find type '_'` twice over on top of the compiler's own
-    // curated refusal.
-    let exposed: Vec<(&str, String)> = fields
-        .0
-        .iter()
-        .filter(|field| field.0.2.is_exposed())
-        .filter_map(|field| {
-            let element = match field.0.1.as_ref().map(|type_node| &type_node.0) {
-                Some(Node::AccessorWithGenerics(_, arguments)) if arguments.0.len() == 1 => {
-                    render_type(&arguments.0[0].0)
-                }
-                _ => return None,
-            };
-            Some((field.0.0.0, element))
-        })
-        .collect();
-    // The `[rpc]` methods: (name, [(parameter, type)], return type), from this
-    // module's inherent impls of the service struct.
-    let mut methods: Vec<(&str, Vec<(String, String)>, String)> = Vec::new();
-    for (node, _span) in nodes {
-        let Node::Impl(subject, impl_traits, body) = node else {
-            continue;
-        };
-        if !impl_traits.is_empty() {
-            continue;
-        }
-        let Node::Accessor(subject_name) = &subject.0 else {
-            continue;
-        };
-        if *subject_name != service_name {
-            continue;
-        }
-        for (member, _member_span) in &body.0 {
-            let Node::Func(function) = member else {
-                continue;
-            };
-            if !function.rpc {
-                continue;
-            }
-            let mut parameters = Vec::new();
-            for parameter in &function.parameters.0 {
-                let parameter_name = match &parameter.pattern {
-                    Pattern::Binding(name, _, _) => *name,
-                    _ => "_",
-                };
-                if parameter_name == "self" {
-                    continue;
-                }
-                let type_string = parameter
-                    .declared_type
-                    .as_deref()
-                    .map(|type_| render_type(&type_.0))
-                    .unwrap_or_else(|| "_".to_string());
-                parameters.push((parameter_name.to_string(), type_string));
-            }
-            let return_string = function
-                .return_type
-                .as_deref()
-                .map(|type_| render_type(&type_.0))
-                .unwrap_or_else(|| "void".to_string());
-            methods.push((function.name.0, parameters, return_string));
-        }
-    }
-    // The contract surface + its hash — shared verbatim by both sides.
-    let mut surface = String::new();
-    for (method_name, parameters, return_string) in &methods {
-        surface.push_str(method_name);
-        surface.push('(');
-        for (index, (_, type_string)) in parameters.iter().enumerate() {
-            if index > 0 {
-                surface.push(',');
-            }
-            surface.push_str(type_string);
-        }
-        surface.push_str(")->");
-        surface.push_str(return_string);
-        surface.push(';');
-    }
-    for (field_name, element) in &exposed {
-        surface.push_str("expose:");
-        surface.push_str(field_name);
-        surface.push(':');
-        surface.push_str(element);
-        surface.push(';');
-    }
-    let hash = service_contract_hash(&surface);
-
-    let mut out = String::new();
-    // --- The dispatcher: one route per [rpc] method, handlers capturing `self`.
-    out.push_str(&format!("impl {service_name} {{\n"));
-    out.push_str("\tfun dispatcher(self): Dispatcher {\n\t\tDispatcher::new()");
-    for (method_name, parameters, _) in &methods {
-        if parameters.is_empty() {
-            out.push_str(&format!(
-                "\n\t\t\t.on(\"{method_name}\", |_| reply(self.{method_name}()))"
-            ));
-        } else {
-            // Args are pulled from the request's deserializer in declaration
-            // order (§4.1 single-pass), then `decode_failed` gates the impl —
-            // a garbled request becomes RpcError::Decode, not an impl run on
-            // zero values.
-            out.push_str(&format!("\n\t\t\t.on(\"{method_name}\", |request| {{\n"));
-            for (index, (parameter_name, type_string)) in parameters.iter().enumerate() {
-                out.push_str(&format!(
-                    "\t\t\t\tlet {parameter_name}: {type_string} = arg(request, {index});\n"
-                ));
-            }
-            let argument_list = parameters
-                .iter()
-                .map(|(parameter_name, _)| parameter_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!(
-                "\t\t\t\tmatch decode_failed(request) {{\n\
-                 \t\t\t\t\tOption::Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),\n\
-                 \t\t\t\t\tOption::None => reply(self.{method_name}({argument_list})),\n\
-                 \t\t\t\t}}\n\t\t\t}})"
-            ));
-        }
-    }
-    // The built-in contract route (Q6 v2): the client's `verify()` calls it and
-    // compares the two sides' hashes — a clean mismatch instead of decode garbage.
-    out.push_str("\n\t\t\t.on(\"__contract\", |_| reply(self.contract_hash()))");
-    // The built-in attach route (§4.2): expose every `[expose]`d field on the
-    // calling connection's registry session (declaration order) and return the
-    // channel ids — what the generated `Client::connect` wires mirrors from.
-    let exposures = exposed
-        .iter()
-        .map(|(field_name, _)| format!("session.expose(self.{field_name})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    out.push_str(&format!(
-        "\n\t\t\t.on(\"__attach\", |request| {{\n\
-         \t\t\t\tlet connection: i32 = arg(request, 0);\n\
-         \t\t\t\tmatch decode_failed(request) {{\n\
-         \t\t\t\t\tOption::Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),\n\
-         \t\t\t\t\tOption::None => match session_of(connection) {{\n\
-         \t\t\t\t\t\tOption::Some(let session) => {{\n\
-         \t\t\t\t\t\t\tlet channels: List<i32> = [{exposures}];\n\
-         \t\t\t\t\t\t\treply(channels)\n\
-         \t\t\t\t\t\t}},\n\
-         \t\t\t\t\t\tOption::None => RpcOutcome::Failure(RpcError::Remote(\"unknown connection\")),\n\
-         \t\t\t\t\t}},\n\
-         \t\t\t\t}}\n\t\t\t}})"
-    ));
-    out.push_str("\n\t}\n");
-    out.push_str(&format!(
-        "\tfun contract_hash(self): str {{\n\t\t\"{hash}\"\n\t}}\n}}\n"
-    ));
-    // --- The client sibling: a transport + a mirror per exposed field.
-    out.push_str(&format!(
-        "struct {client_name}<T: Transport> {{\n\ttransport: T,\n\tcodec: Codec,\n"
-    ));
-    for (field_name, element) in &exposed {
-        out.push_str(&format!("\t{field_name}: RemoteSource<{element}>,\n"));
-    }
-    out.push_str("}\n");
-    out.push_str(&format!("impl {client_name}<type T> {{\n"));
-    for (method_name, parameters, return_string) in &methods {
-        let parameter_list = parameters
-            .iter()
-            .map(|(parameter_name, type_string)| format!(", {parameter_name}: {type_string}"))
-            .collect::<Vec<_>>()
-            .join("");
-        let argument_list = parameters
-            .iter()
-            .map(|(parameter_name, _)| {
-                format!("|serializer: Serializer| {parameter_name}.describe(serializer)")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!(
-            "\tfun {method_name}(self{parameter_list}): Result<{return_string}, RpcError> {{\n\
-             \t\tcall(self.transport, self.codec, \"{method_name}\", [{argument_list}])\n\
-             \t}}\n"
-        ));
-    }
-    // Contract verification (Q6 v2): fetch the server's hash over the wire and
-    // compare — `Ok(true)` is a matching contract, `Ok(false)` a drifted one.
-    out.push_str(
-        // The typed intermediate directs `call`'s T; `!` propagates the error
-        // (a return-position generic does not bind THROUGH `!` — the recorded
-        // try-and-lift deferral).
-        "\tfun verify(self): Result<bool, RpcError> {\n\
-         \t\tlet remote: Result<str, RpcError> = call(self.transport, self.codec, \"__contract\", []);\n\
-         \t\tResult::Ok(remote! == self.contract_hash())\n\
-         \t}\n",
-    );
-    out.push_str(&format!(
-        "\tfun contract_hash(self): str {{\n\t\t\"{hash}\"\n\t}}\n}}\n"
-    ));
-    // Client::connect (§4.2): the whole handshake, generated — open the socket,
-    // ENFORCE the contract hash (a drifted server is Err(Contract), before
-    // anything else), __attach with the connection id, and wire one mirror per
-    // [expose]d field from the returned channels (declaration order).
-    // Each mirror binds `source<T>` through an annotated let (a struct-literal
-    // field does not direct a generic call's type parameter; a let does).
-    let mirror_lets = exposed
-        .iter()
-        .enumerate()
-        .map(|(index, (field_name, element))| {
-            format!(
-                "\t\t\t\tlet mirror_{field_name}: RemoteSource<{element}> = \
-                 reactive.source(channels[{index}]);\n"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let mirror_fields = exposed
-        .iter()
-        .map(|(field_name, _)| format!(",\n\t\t\t\t\t{field_name} = mirror_{field_name}"))
-        .collect::<Vec<_>>()
-        .join("");
-    // The mirror lets sit one level shallower now (no match arm around them).
-    let mirror_lets = mirror_lets.replace("\t\t\t\tlet mirror_", "\t\tlet mirror_");
-    let mirror_fields = mirror_fields.replace("\n\t\t\t\t\t", "\n\t\t\t");
-    out.push_str(&format!(
-        "impl {client_name}<SocketTransport> {{\n\
-         \tfun connect(url: str, codec: Codec): Result<{client_name}<SocketTransport>, RpcError> {{\n\
-         \t\tlet socket = connect_socket(url);\n\
-         \t\tlet transport = socket.transport();\n\
-         \t\tlet remote: Result<str, RpcError> = call(transport, codec, \"__contract\", []);\n\
-         \t\tif remote! != \"{hash}\" {{\n\
-         \t\t\tret Result::Err(RpcError::Contract(\"the server reports a different service surface\"));\n\
-         \t\t}}\n\
-         \t\tlet connection = socket.connection;\n\
-         \t\tlet attached: Result<List<i32>, RpcError> = call(transport, codec, \"__attach\", [|serializer: Serializer| connection.describe(serializer)]);\n\
-         \t\tlet channels = attached!;\n\
-         \t\tlet reactive = ReactiveClient::new(bridge(socket), codec);\n\
-{mirror_lets}\
-         \t\tResult::Ok({client_name} {{\n\
-         \t\t\ttransport = transport,\n\
-         \t\t\tcodec = codec{mirror_fields},\n\
-         \t\t}})\n\
-         \t}}\n\
-         }}\n"
-    ));
-    out
-}
-
+/// N70: the Rust FALLBACK `[service]` generator is gone.
+///
+/// It was a twin of `std/src/rpc.vl`'s `service` macro and it had drifted into
+/// a stale one: no `turn` wrapper around a route, no keyed exposures, still
+/// `fun dispatcher(self)` where the macro emits `mut self`, no `connect_with`,
+/// no reconnect hook, no handle mapping — and its own `service_contract_hash`
+/// disagreed with the macro's for any keyed service, so the two halves of one
+/// wire contract could not have talked to each other. The file's comments
+/// insisted the two must not disagree; nothing checked that they did not, and
+/// they did.
+///
+/// Its only reach was a fixture std with no `rpc.vl` in it, and a silently
+/// STALE expansion is a far worse answer for that reader than a sentence
+/// saying the std they built cannot expand the attribute (B21's class). The
+/// `None` arm of `macros.rs`'s `Node::Service` dispatch says exactly that now,
+/// and syncing 270 lines of twin against a macro that keeps growing was the
+/// alternative nobody was going to keep paying for.
 /// The enum a member may be synthesized onto: BARE-LOWERED, and eligible for
 /// synthesis at all (`proposal/backed-enums.md` §10). `None` for every other
 /// item — a plain enum, a payload enum, a generic or `resource` enum.
@@ -47349,8 +47208,14 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
     ))
 }
 
-/// The refusals a `[service]` subject's `mut self` `[rpc]` methods take — one
-/// per offending method, spanned on the METHOD's name (B272 / R-A38b).
+/// The refusals a `[service]` subject's `[rpc]` methods take at the attribute —
+/// one per offending method, spanned on the METHOD's name or on the parameter
+/// that earned it (B272 / R-A38b, B295).
+///
+/// Two rules share this walk because they share the reason: both are mistakes
+/// the EXPANSION cannot state, so they are answered above it.
+///
+/// 1. `mut self` on an `[rpc]` method.
 ///
 /// `mut self` is a parameter-local copy (`proposal/mut-parameters.md`): the
 /// handler mutates it, the reply carries the new value, and the copy is
@@ -47373,7 +47238,37 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
 /// `mut self` method that mutates nothing is refused too, because the receiver
 /// is the claim being made and a body that grows one write later would
 /// otherwise turn silent.
-pub(crate) fn service_mut_self_refusals(
+///
+/// 2. `async` beside `&mut self` (B287, RULED 2026-09-11).
+///
+/// `&mut self` on an `[rpc]` method mutates THIS connection's instance, and
+/// since B281 one connection's handlers INTERLEAVE: another route can run, and
+/// write, between this method's suspension and its resume, so the instance it
+/// returns to is not the instance it saw. `transport-rpc.md`'s Q9 answered that
+/// with "a `&mut self` method is itself a promise that it does not await" and
+/// nothing enforced the promise.
+///
+/// E3's signature rule (`async_view_parameter_message`) already refuses an
+/// async function that takes a `&mut` parameter — but only once the body
+/// actually SUSPENDS, because that rule is about a view held across a
+/// suspension point. `async fun bump(&mut self, by: i32): i32` with no await in
+/// it compiled, which is the hole: the keyword is the promise, and a body that
+/// grows its first await a week later would otherwise turn silent. So this is
+/// keyed on the written `async` KEYWORD and on the receiver, never on the body
+/// — the same standard the `mut self` arm takes — and it says the hazard in the
+/// service's vocabulary rather than in the view checker's.
+///
+/// 3. A parameter whose name starts with `__` (B295).
+///
+/// `__` is the generator's own prefix: a route is `.on("f", |__request| { .. })`
+/// and the `__attach`/`__contract` routes are spelled with it too. A parameter
+/// named `__request` rebinds the handle the route decodes from, and the build
+/// stopped inside generated code with "Expected RpcRequest, but got str",
+/// spanned on the STRUCT — B282's symptom, for the one name B282's fix moved
+/// the collision onto. The prefix is reserved WHOLE rather than the one name,
+/// because the generator is free to mint a second `__` binding and a reservation
+/// that has to be re-read on every such change is not one.
+pub(crate) fn service_method_refusals(
     item: &Spanned<Node<'_>>,
     nodes: &NodeList<'_>,
 ) -> Vec<(Span, String)> {
@@ -47399,20 +47294,59 @@ pub(crate) fn service_mut_self_refusals(
             let Node::Func(function) = member else {
                 continue;
             };
-            if !function.rpc || function.receiver_spelling() != Some("mut self") {
+            if !function.rpc {
                 continue;
             }
             let method_name = function.name.0;
-            refusals.push((
-                function.name.1,
-                format!(
-                    "`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` method's \
-                     `mut self` copy is discarded after the call: the handler mutates it, the \
-                     reply carries the new value, and the next call on this connection reads the \
-                     old one. Write `&mut self` to mutate this connection's instance, or hold \
-                     the state in a `Shared<T>` field"
-                ),
-            ));
+            if function.is_async && function.receiver_spelling() == Some("&mut self") {
+                refusals.push((
+                    function.name.1,
+                    format!(
+                        "`[rpc]` method `{method_name}` is declared `async` and takes `&mut \
+                         self`, and the two cannot both hold: `&mut self` is a view into this \
+                         connection's instance, and one connection's `[rpc]` handlers \
+                         interleave — another route can run, and write, between this method's \
+                         suspension and its resume, so what the view points at is no longer \
+                         what it saw. Drop the `async` keyword, or take `self` and hold the \
+                         state in a `Shared<T>` field, which every handler shares deliberately. \
+                         Refused on the keyword and the receiver rather than on the body: an \
+                         `async` method that never awaits today is a promise about tomorrow"
+                    ),
+                ));
+            }
+            if function.receiver_spelling() == Some("mut self") {
+                refusals.push((
+                    function.name.1,
+                    format!(
+                        "`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` \
+                         method's `mut self` copy is discarded after the call: the handler \
+                         mutates it, the reply carries the new value, and the next call on this \
+                         connection reads the old one. Write `&mut self` to mutate this \
+                         connection's instance, or hold the state in a `Shared<T>` field"
+                    ),
+                ));
+            }
+            for parameter in &function.parameters.0 {
+                let Pattern::Binding(parameter_name, _, _) = &parameter.pattern else {
+                    continue;
+                };
+                if !parameter_name.starts_with("__") {
+                    continue;
+                }
+                refusals.push((
+                    parameter.span,
+                    format!(
+                        "parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts \
+                         with `__`, which the `[service]` expansion reserves for its own \
+                         bindings: every route is written `.on(\"{method_name}\", |__request| \
+                         {{ .. }})` and the generated `__attach` and `__contract` routes take \
+                         the same prefix, so a parameter spelled this way rebinds the handle the \
+                         route decodes its arguments from and the build stops inside code you \
+                         never wrote. Rename it — an `[rpc]` parameter may be spelled anything \
+                         that does not begin with `__`"
+                    ),
+                ));
+            }
         }
     }
     refusals
@@ -47870,49 +47804,52 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                      }}\n"
                 ));
             }
+            // B301: `Json` emits the JSON pair, `Wire` the §6.1 visitor,
+            // `[derive(Json, Wire)]` both (see the enum arm's note).
             "Json" | "Wire" => {
-                // `"{" + "\"a\":" + self.a.to_json() + "," + "\"b\":" +
-                // self.b.to_json() + "}"` — a JSON object with the real field
-                // names; each value serializes via its own `to_json`.
-                let mut body = String::from("\"{\"");
-                for (index, (field, _)) in fields.iter().enumerate() {
-                    if index > 0 {
-                        body.push_str(" + \",\"");
+                if *derive == "Json" {
+                    // `"{" + "\"a\":" + self.a.to_json() + "," + "\"b\":" +
+                    // self.b.to_json() + "}"` — a JSON object with the real field
+                    // names; each value serializes via its own `to_json`.
+                    let mut body = String::from("\"{\"");
+                    for (index, (field, _)) in fields.iter().enumerate() {
+                        if index > 0 {
+                            body.push_str(" + \",\"");
+                        }
+                        body.push_str(" + \"\\\"");
+                        body.push_str(field);
+                        body.push_str("\\\":\" + self.");
+                        body.push_str(field);
+                        body.push_str(".to_json()");
                     }
-                    body.push_str(" + \"\\\"");
-                    body.push_str(field);
-                    body.push_str("\\\":\" + self.");
-                    body.push_str(field);
-                    body.push_str(".to_json()");
-                }
-                body.push_str(" + \"}\"");
-                out.push_str(&format!(
-                    "impl {struct_name}{} with Json {{\n\
+                    body.push_str(" + \"}\"");
+                    out.push_str(&format!(
+                        "impl {struct_name}{} with Json {{\n\
                      \tfun to_json(self): str {{\n\
                      \t\t{body}\n\
                      \t}}\n\
                      }}\n",
-                    subject.binders("Json"),
-                ));
-                // The reverse direction (I3): decoding is fallible, so `from_json`
-                // yields a `Result`. Each field is checked present (naming a
-                // missing one), then coerced via the field type's own
-                // `from_json_value` (nested structs recurse), threading a leaf
-                // failure with `!`.
-                let mut presence = String::new();
-                for (field, _) in &fields {
-                    presence.push_str(&format!(
+                        subject.binders("Json"),
+                    ));
+                    // The reverse direction (I3): decoding is fallible, so `from_json`
+                    // yields a `Result`. Each field is checked present (naming a
+                    // missing one), then coerced via the field type's own
+                    // `from_json_value` (nested structs recurse), threading a leaf
+                    // failure with `!`.
+                    let mut presence = String::new();
+                    for (field, _) in &fields {
+                        presence.push_str(&format!(
                         "\t\tif !value.has_field(\"{field}\") {{ ret Result::Err(\"missing field {field}\") }}\n"
                     ));
-                }
-                let initializers = fields
-                    .iter()
-                    .map(|(field, type_)| {
-                        format!("{field} = {type_}::from_json_value(value.field(\"{field}\"))!")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                out.push_str(&format!(
+                    }
+                    let initializers = fields
+                        .iter()
+                        .map(|(field, type_)| {
+                            format!("{field} = {type_}::from_json_value(value.field(\"{field}\"))!")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
                     "impl {struct_name}{} with FromJson {{\n\
                      \tfun from_json(text: str): Result<{applied}, str> {{\n\
                      \t\t{struct_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
@@ -47923,8 +47860,7 @@ pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> 
                      }}\n",
                     subject.binders("FromJson"),
                 ));
-                // `[derive(Wire)]` also targets the §6.1 visitor — additive
-                // beside the JSON impls until the codec re-plumb consumes it.
+                }
                 if *derive == "Wire" {
                     out.push_str(&struct_wire_visitor_impls(&subject, &fields));
                 }

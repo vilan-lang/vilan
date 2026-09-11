@@ -3590,8 +3590,9 @@ fun run(port: i32) {
 }
 "#;
 
-/// djb2 over a contract surface, as `service_hash` computes it (`std/src/rpc.vl`,
-/// and `service_contract_hash` in the analyzer's fallback). Written out here so
+/// djb2 over a contract surface, as `service_hash` computes it (`std/src/rpc.vl`
+/// — the only place that computes it since N70 retired the analyzer's stale
+/// fallback twin and its disagreeing `service_contract_hash`). Written out so
 /// a hash pin can state the SURFACE it expects rather than a magic number: what
 /// is being pinned is the rendering, and a number alone cannot say which
 /// rendering it came from.
@@ -4363,4 +4364,529 @@ fun main() {{}}
     assert!(ok, "the unannotated bridge must compile:\n{report}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B295: an `[rpc]` method may be spelled with any of the names the `[service]`
+/// generator's own bodies call, in BOTH directions.
+///
+/// The generated stub used to call the imported FREE `call(self.transport,
+/// self.codec, ..)` from inside `impl <Name>Client` — which now declares
+/// `fun call` — and the build stopped inside generated code with "`call`
+/// expects 2 arguments, but got 4", spanned on the STRUCT. `notify` did the
+/// same through `<Name>Proxy`, and `arg`, `reply`, `turn` and `notified` were
+/// the same hazard waiting for the author who spells one. The generator writes
+/// `rpc::call(..)` / `reactive::turn(..)` now and imports the two modules
+/// beside the TYPES it names, so no method can shadow one.
+///
+/// Both directions in one program on purpose: the forward stub (`<Name>Client`)
+/// and the reverse proxy (`<Name>Proxy`) are separate emission paths that
+/// shadowed separately, and `kick` drives the reverse one through the service's
+/// own `HandlersProxy` field. The round trip — not a `check` — is what proves
+/// the qualified name resolved to std's function and not to something that
+/// merely compiled.
+#[test]
+fn an_rpc_method_named_for_a_generator_free_function_round_trips_in_both_directions() {
+    let dir = temp_project("generator_name_collisions");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun notify(self, what: str) {
+		self.seen.set(what);
+	}
+}
+
+[service(BusClient, client = Handlers)]
+struct Bus {
+	client: HandlersProxy,
+}
+
+impl Bus {
+	[rpc]
+	fun call(self, what: str): str {
+		"called " + what
+	}
+
+	[rpc]
+	fun arg(self, index: i32): i32 {
+		index + 1
+	}
+
+	[rpc]
+	fun reply(self, what: str): str {
+		"replied " + what
+	}
+
+	[rpc]
+	fun turn(self, degrees: i32): i32 {
+		degrees * 2
+	}
+
+	[rpc]
+	fun notified(self, what: str): str {
+		"notified " + what
+	}
+
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		self.client.notify(reason);
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Bus {
+			client = connection.client(),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match BusClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let handlers = Handlers { seen = Signal::new("") };
+			let client = raw.with_handlers(handlers);
+			print(i"call:{client.call("hi").unwrap_or("<err>")}");
+			print(i"arg:{client.arg(41).unwrap_or(0)}");
+			print(i"reply:{client.reply("ok").unwrap_or("<err>")}");
+			print(i"turn:{client.turn(21).unwrap_or(0)}");
+			print(i"notified:{client.notified("x").unwrap_or("<err>")}");
+			match client.kick("revoked") {
+				Ok(let count) => print(i"kick:{count}"),
+				Err(let _e) => print("kick-error"),
+			}
+			mut attempts = 0;
+			for attempts < 200 {
+				if handlers.seen.get() == "revoked" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"seen:{handlers.seen.get()}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The forward stub, through `<Name>Client`: the name the item reported.
+        "call:called hi",
+        // `arg`, `reply` and `notified` are the dispatcher's free calls; `turn`
+        // is `std::reactive`'s, written into every route block.
+        "arg:42",
+        "reply:replied ok",
+        "turn:42",
+        "notified:notified x",
+        // The reverse proxy, through `<Name>Proxy`: `notify` is the free
+        // function its body calls AND the method the author declared.
+        "kick:1",
+        "seen:revoked",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a generator free-function name used as an `[rpc]` method must \
+             round-trip; expected `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B295's other half: `__` is the generator's prefix, so an `[rpc]` parameter
+/// spelled with it is refused AT THE ATTRIBUTE.
+///
+/// B282 moved the route closure's binding from `request` to `__request`, which
+/// closed the collision an author could stumble into and opened one they cannot
+/// be asked to know about: `fun send(self, __request: str)` rebinds the handle
+/// the route decodes from, and the build stopped inside generated code with
+/// "Expected RpcRequest, but got str", spanned on the STRUCT. Qualifying cannot
+/// help here — the collision is between two BINDINGS in one block, not between
+/// a method and an import — so the prefix is reserved and said so once, on the
+/// parameter. The whole prefix, not the one name: `__attach` and `__contract`
+/// already take it, and a reservation that has to be re-read every time the
+/// generator mints a binding is not a reservation.
+#[test]
+fn an_rpc_parameter_whose_name_starts_with_a_double_underscore_is_refused() {
+    let dir = temp_project("dunder_parameter");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[service(EchoClient)]
+struct Echo {
+	seen: i32,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, __request: str): str {
+		__request
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    for expected in [
+        "parameter `__request` of `[rpc]` method `send` starts with `__`",
+        "the `[service]` expansion reserves for its own bindings",
+        "does not begin with `__`",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    // One mistake, one message: the expansion is skipped, so the generated
+    // client the author never wrote contributes nothing.
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the build reported:\n{text}"
+    );
+    assert!(
+        !text.contains("Expected RpcRequest"),
+        "the generated-code diagnostic B295 recorded must be gone:\n{text}"
+    );
+    // A SINGLE leading underscore is the ordinary unused-binding spelling and
+    // is untouched — the reservation is the generator's prefix, not underscores.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[service(EchoClient)]
+struct Echo {
+	seen: i32,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, _request: str): str {
+		_request
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a single leading underscore must still compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B303: a non-Wire `[rpc]` payload reports ONCE — the signature refusal, in
+/// the method's own vocabulary and on the annotation the author wrote.
+///
+/// The generated client's `call<T: Wire>` fails at exactly the type the refusal
+/// has already named, and that failure is anchored over the whole `[service]`
+/// struct as "in code generated by this attribute: 'Password' does not
+/// implement trait 'Wire'" — a second (and, with an argument beside the return,
+/// a third) report of one mistake, at a span the author never wrote and reading
+/// FIRST. `[expose]` has stood its generated bound failures down since B189 and
+/// `[rpc]` had nothing; it does now, keyed on the TYPES the refusal reported
+/// rather than on the bare `Wire` label, which would have silenced sentences
+/// this refusal never said.
+///
+/// Two shapes, because the labels differ: a bare non-Wire return, where the
+/// refusal and the bound failure name the same type, and a `List<Password>`
+/// parameter beside a `Map<str, Password>` return, where the refusal names the
+/// COLLECTION and the bound fails at the element — which is why the recorded
+/// set descends.
+#[test]
+fn a_non_wire_rpc_payload_reports_once_in_the_methods_own_vocabulary() {
+    let dir = temp_project("non_wire_payload_once");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+struct Password {
+	hash: str,
+}
+
+[service(VaultClient)]
+struct Vault {
+	seen: i32,
+}
+
+impl Vault {
+	[rpc]
+	fun secret(self, who: str): Password {
+		Password { hash = who }
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("return type of `[rpc]` method `secret` is `Password`, which is not Wire"),
+        "the honest refusal must still fire:\n{text}"
+    );
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "one non-Wire payload is one report; the build said:\n{text}"
+    );
+    assert!(
+        !text.contains("does not implement trait 'Wire'"),
+        "the generated client's bound failure must stand down behind the \
+         signature refusal:\n{text}"
+    );
+    assert!(
+        !text.contains("in code generated by this attribute"),
+        "nothing about generated code may be left for the author to read:\n{text}"
+    );
+
+    // The nesting case: the refusal names the COLLECTION, the generated
+    // `describe`/`call` bound fails at the ELEMENT. Two mistakes here, so two
+    // reports — and neither of them a generated one.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::map::Map;
+
+struct Password {
+	hash: str,
+}
+
+[service(VaultClient)]
+struct Vault {
+	seen: i32,
+}
+
+impl Vault {
+	[rpc]
+	fun store(self, keys: List<Password>): i32 {
+		keys.len()
+	}
+
+	[rpc]
+	fun lookup(self, who: str): Map<str, Password> {
+		Map::new()
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("parameter `keys` of `[rpc]` method `store` is `List<Password>`"),
+        "the parameter's refusal must still fire:\n{text}"
+    );
+    assert!(
+        text.contains("return type of `[rpc]` method `lookup` is `Map<str, Password>`"),
+        "the return's refusal must still fire:\n{text}"
+    );
+    assert_eq!(
+        text.matches("Error:").count(),
+        2,
+        "two non-Wire payloads are two reports and no more; the build said:\n{text}"
+    );
+    assert!(
+        !text.contains("does not implement trait 'Wire'"),
+        "the stand-down must reach the element the collection nests:\n{text}"
+    );
+
+    // The CONTROL: a Wire payload compiles, so the stand-down is not a check
+    // that stopped running.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::wire::Wire;
+
+[derive(Wire)]
+struct Badge {
+	hash: str,
+}
+
+[service(VaultClient)]
+struct Vault {
+	seen: i32,
+}
+
+impl Vault {
+	[rpc]
+	fun secret(self, who: str): Badge {
+		Badge { hash = who }
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a Wire payload must still compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Copy a directory tree — the fixture-std machinery below, and nothing else
+/// in this file needs it.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create fixture dir");
+    for entry in std::fs::read_dir(from).expect("read fixture source") {
+        let entry = entry.expect("read fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("fixture entry kind").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy fixture file");
+        }
+    }
+}
+
+/// N70: there is no Rust fallback `[service]` generator any more, and the one
+/// path that reached it is answered with a sentence.
+///
+/// `analyzer::service_impl_source` was a twin of `std/src/rpc.vl`'s `service`
+/// macro and had drifted into a stale one — no `turn` wrapper, no keyed
+/// exposures, still `fun dispatcher(self)`, no `connect_with`, no reconnect
+/// hook, no handle mapping, and a `service_contract_hash` that disagreed with
+/// the macro's for any keyed service, which is to say the two halves it
+/// generated could not have talked to each other. Its only reach was a std with
+/// no `rpc.vl` in it; a silently STALE expansion is the worst answer available
+/// to that reader, so the attribute refuses instead.
+///
+/// The fixture is a real std with exactly one file removed, driven through
+/// `VILAN_STD`, because that is precisely the state the fallback existed for.
+/// The control is the same program against the shipped std: it compiles, which
+/// is what makes the refusal a statement about `rpc.vl` and not about the
+/// attribute.
+#[test]
+fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stale_twin() {
+    let toolchain = temp_project("std_without_rpc");
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    copy_tree(&shipped.join("std"), &toolchain.join("std"));
+    // Macros resolve `macro_std` BESIDE `std`, so the fixture needs the sibling.
+    copy_tree(&shipped.join("macro_std"), &toolchain.join("macro_std"));
+    std::fs::remove_file(toolchain.join("std/src/rpc.vl")).expect("remove rpc.vl");
+
+    let dir = temp_project("service_without_rpc");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nfun main() {}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .env("VILAN_STD", toolchain.join("std"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[service]` over a std with no `rpc.vl` must not compile:\n{text}"
+    );
+    for expected in [
+        "`[service]` needs std's `rpc.vl`",
+        "there is no second generator behind it",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{text}"
+    );
+
+    // The control: the same program against the SHIPPED std compiles, so what
+    // is being refused is the missing module and not the attribute.
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    assert!(
+        output.status.success(),
+        "the same service must compile against the shipped std:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&toolchain);
 }
