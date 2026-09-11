@@ -261,6 +261,13 @@ is the current directory. Formatting is conservative and a fixed point:
   and the body's `{` (or a bodyless `;`) riding the closing `)`. An empty
   parameter list never breaks, so a signature pushed over by its *name*
   stays long. A closure's parameters are never broken.
+- A block-bearing HEAD over the budget breaks at its own layout site: an
+  `if` or `for` condition, a `for … in` iterable, a `match` subject. Each of
+  those lines — `if <cond> {`, `for <name> in <iterable> {` — carries one
+  thing with a layout of its own, so that is where the break goes, at the
+  lowest-precedence operator and operator-leading. The permission stops at the
+  head: a loop body is a fresh statement list and a `match`'s legs earn their
+  own breaks from their own lines.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
 - A call's *argument* list is never wrapped, but the split reaches the
