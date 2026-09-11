@@ -1437,7 +1437,6 @@ pub(crate) struct ExpansionOutput {
 struct RustFallback {
     source: String,
     traits: std::collections::HashSet<&'static str>,
-    any_service: bool,
     /// Whether this scope declared a backed enum whose `value()`/`parse()` were
     /// generated, so the generated block gets `Option` in scope for its `parse`
     /// (backed-enums.md §3.8).
@@ -1732,34 +1731,42 @@ impl Expander<'_, '_> {
                         self.run_service(def, *attribute, item, siblings, text, depth);
                     }
                     None => {
-                        // The Rust generator exists for FIXTURE stds that have
-                        // no rpc module at all. A real std reaching here means
-                        // `std::rpc` wasn't loaded before this expansion — the
-                        // B21 ordering class, whose symptom (a silently STALE
-                        // twin of the macro's template) is far worse than a
-                        // loud error. Every `[service]` site now seeds the rpc
-                        // load (entry, load loop, dependency surfaces), so
-                        // this firing again is a compiler bug to report.
-                        if self.std.base_root.join("rpc.vl").is_file() {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: item.1,
-                                msg: "`[service]` expanded before std::rpc's `service` macro was \
-                                      loaded: a compiler load-ordering bug (B21's class); please \
-                                      report how this module is reached"
-                                    .to_string(),
-                            });
+                        // There is no second generator to fall back to (N70).
+                        // There used to be — a Rust twin of `std/src/rpc.vl`'s
+                        // `service` macro — and it had drifted far enough that
+                        // the two disagreed about the contract hash of any
+                        // keyed service, which is to say the halves it
+                        // generated could not have talked to each other. A
+                        // silently STALE expansion is the worst of the three
+                        // outcomes available here; both remaining ones are a
+                        // sentence.
+                        //
+                        // Which sentence depends on WHY the macro is missing. A
+                        // real std reaching here means `std::rpc` was not
+                        // loaded before this expansion — the B21 ordering
+                        // class, and a compiler bug, because every `[service]`
+                        // site seeds the rpc load (entry, load loop, dependency
+                        // surfaces). A std with no `rpc.vl` in it at all is not
+                        // a bug: it is a std that does not carry the attribute,
+                        // and the author of that std is the reader.
+                        let msg = if self.std.base_root.join("rpc.vl").is_file() {
+                            "`[service]` expanded before std::rpc's `service` macro was loaded: \
+                             a compiler load-ordering bug (B21's class); please report how this \
+                             module is reached"
+                                .to_string()
                         } else {
-                            let source = crate::analyzer::service_impl_source(
-                                attribute.client_name,
-                                item,
-                                siblings,
-                            );
-                            let fallback = self.fallback();
-                            fallback.any_service = true;
-                            fallback.source.push_str(&source);
-                        }
+                            "`[service]` needs std's `rpc.vl`, and the std this package resolves \
+                             to does not carry one: the attribute is expanded by the `service` \
+                             macro that module declares, and there is no second generator behind \
+                             it. Build against a std that has `rpc.vl`, or drop the attribute"
+                                .to_string()
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: item.1,
+                            msg,
+                        });
                     }
                 }
                 self.sweep_expressions(item, text, depth);
@@ -1938,14 +1945,6 @@ impl Expander<'_, '_> {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
         }
         if fallback.backed_enums {
-            prelude.push_str("import std::option::Option;\n");
-        }
-        if fallback.any_service {
-            prelude.push_str(
-                "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, call, arg, reply, decode_failed, session_of, connect_socket, SocketTransport, bridge, ReactiveClient };\n",
-            );
-            prelude.push_str("import std::wire::{ Codec, Serializer };\n");
-            prelude.push_str("import std::result::Result;\n");
             prelude.push_str("import std::option::Option;\n");
         }
         let combined = format!("{prelude}{}", fallback.source);

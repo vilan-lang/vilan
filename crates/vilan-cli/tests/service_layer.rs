@@ -3547,8 +3547,9 @@ fun run(port: i32) {
 }
 "#;
 
-/// djb2 over a contract surface, as `service_hash` computes it (`std/src/rpc.vl`,
-/// and `service_contract_hash` in the analyzer's fallback). Written out here so
+/// djb2 over a contract surface, as `service_hash` computes it (`std/src/rpc.vl`
+/// — the only place that computes it since N70 retired the analyzer's stale
+/// fallback twin and its disagreeing `service_contract_hash`). Written out so
 /// a hash pin can state the SURFACE it expects rather than a magic number: what
 /// is being pinned is the rendering, and a number alone cannot say which
 /// rendering it came from.
@@ -4745,4 +4746,104 @@ fun main() {
         String::from_utf8_lossy(&output.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Copy a directory tree — the fixture-std machinery below, and nothing else
+/// in this file needs it.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create fixture dir");
+    for entry in std::fs::read_dir(from).expect("read fixture source") {
+        let entry = entry.expect("read fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("fixture entry kind").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy fixture file");
+        }
+    }
+}
+
+/// N70: there is no Rust fallback `[service]` generator any more, and the one
+/// path that reached it is answered with a sentence.
+///
+/// `analyzer::service_impl_source` was a twin of `std/src/rpc.vl`'s `service`
+/// macro and had drifted into a stale one — no `turn` wrapper, no keyed
+/// exposures, still `fun dispatcher(self)`, no `connect_with`, no reconnect
+/// hook, no handle mapping, and a `service_contract_hash` that disagreed with
+/// the macro's for any keyed service, which is to say the two halves it
+/// generated could not have talked to each other. Its only reach was a std with
+/// no `rpc.vl` in it; a silently STALE expansion is the worst answer available
+/// to that reader, so the attribute refuses instead.
+///
+/// The fixture is a real std with exactly one file removed, driven through
+/// `VILAN_STD`, because that is precisely the state the fallback existed for.
+/// The control is the same program against the shipped std: it compiles, which
+/// is what makes the refusal a statement about `rpc.vl` and not about the
+/// attribute.
+#[test]
+fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stale_twin() {
+    let toolchain = temp_project("std_without_rpc");
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    copy_tree(&shipped.join("std"), &toolchain.join("std"));
+    // Macros resolve `macro_std` BESIDE `std`, so the fixture needs the sibling.
+    copy_tree(&shipped.join("macro_std"), &toolchain.join("macro_std"));
+    std::fs::remove_file(toolchain.join("std/src/rpc.vl")).expect("remove rpc.vl");
+
+    let dir = temp_project("service_without_rpc");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nfun main() {}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .env("VILAN_STD", toolchain.join("std"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[service]` over a std with no `rpc.vl` must not compile:\n{text}"
+    );
+    for expected in [
+        "`[service]` needs std's `rpc.vl`",
+        "there is no second generator behind it",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{text}"
+    );
+
+    // The control: the same program against the SHIPPED std compiles, so what
+    // is being refused is the missing module and not the attribute.
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    assert!(
+        output.status.success(),
+        "the same service must compile against the shipped std:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&toolchain);
 }

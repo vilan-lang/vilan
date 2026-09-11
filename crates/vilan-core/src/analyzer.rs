@@ -47037,13 +47037,6 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
     }
 }
 
-/// A stable fingerprint of a service's surface (Q6 v2): method names, parameter
-/// types, return types, and exposed fields — djb2 over the canonical string, so
-/// the same contract always hashes the same and any drift changes it.
-fn service_contract_hash(surface: &str) -> String {
-    format!("{:08x}", djb2_hash(surface))
-}
-
 /// The djb2 string hash (the `service_contract_hash` precedent), as a raw `u32` —
 /// the HMR fingerprint of a binding's canonical structural type rendering
 /// (`hmr.md` §4).
@@ -47055,276 +47048,23 @@ fn djb2_hash(text: &str) -> u32 {
     hash
 }
 
-/// The synthesized source for a `[service(Client)]` struct (transport-rpc.md
-/// §4.2): a `dispatcher(self)` method routing each `[rpc]` method through the
-/// §4.1 `Dispatcher` (the handlers capture `self`, the per-connection session),
-/// a sibling client struct over a generic `Transport` whose methods are the
-/// `Result`-wrapped `call(..)`s and whose `[expose]`d fields surface as
-/// `RemoteSource` mirrors, and a shared `contract_hash()` on both sides. The
-/// service's `[rpc]` methods are gathered from the *same module's* inherent
-/// `impl` blocks (`nodes`).
-pub(crate) fn service_impl_source(
-    client_name: Option<&str>,
-    item: &Spanned<Node<'_>>,
-    nodes: &NodeList<'_>,
-) -> String {
-    let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
-        return String::new();
-    };
-    let service_name = name.0;
-    let client_name = client_name
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{service_name}Client"));
-    // The `[expose]`d fields — each becomes a typed `RemoteSource<Element>`
-    // mirror on the client. This runs at macro-expansion time, before any type
-    // resolves, so the element is read off the field's SOLE type argument —
-    // `SignalCell<Note>`, `StorageSignal<str>`, any single-parameter source.
-    // Whether the field is exposable at all is the analyzer's
-    // `check_expose_fields`, which reconciles it against `std::Source`; a field
-    // whose element cannot be read HERE generates nothing at all — no surface
-    // entry, no mirror, no `expose` call (B202, and the `service` macro in
-    // `std/src/rpc.vl` reads the same rule). It used to render the literal `_`,
-    // which is not a type, so a field exposing something that is no source at
-    // all drew `cannot find type '_'` twice over on top of the compiler's own
-    // curated refusal.
-    let exposed: Vec<(&str, String)> = fields
-        .0
-        .iter()
-        .filter(|field| field.0.2.is_exposed())
-        .filter_map(|field| {
-            let element = match field.0.1.as_ref().map(|type_node| &type_node.0) {
-                Some(Node::AccessorWithGenerics(_, arguments)) if arguments.0.len() == 1 => {
-                    render_type(&arguments.0[0].0)
-                }
-                _ => return None,
-            };
-            Some((field.0.0.0, element))
-        })
-        .collect();
-    // The `[rpc]` methods: (name, [(parameter, type)], return type), from this
-    // module's inherent impls of the service struct.
-    let mut methods: Vec<(&str, Vec<(String, String)>, String)> = Vec::new();
-    for (node, _span) in nodes {
-        let Node::Impl(subject, impl_traits, body) = node else {
-            continue;
-        };
-        if !impl_traits.is_empty() {
-            continue;
-        }
-        let Node::Accessor(subject_name) = &subject.0 else {
-            continue;
-        };
-        if *subject_name != service_name {
-            continue;
-        }
-        for (member, _member_span) in &body.0 {
-            let Node::Func(function) = member else {
-                continue;
-            };
-            if !function.rpc {
-                continue;
-            }
-            let mut parameters = Vec::new();
-            for parameter in &function.parameters.0 {
-                let parameter_name = match &parameter.pattern {
-                    Pattern::Binding(name, _, _) => *name,
-                    _ => "_",
-                };
-                if parameter_name == "self" {
-                    continue;
-                }
-                let type_string = parameter
-                    .declared_type
-                    .as_deref()
-                    .map(|type_| render_type(&type_.0))
-                    .unwrap_or_else(|| "_".to_string());
-                parameters.push((parameter_name.to_string(), type_string));
-            }
-            let return_string = function
-                .return_type
-                .as_deref()
-                .map(|type_| render_type(&type_.0))
-                .unwrap_or_else(|| "void".to_string());
-            methods.push((function.name.0, parameters, return_string));
-        }
-    }
-    // The contract surface + its hash — shared verbatim by both sides.
-    let mut surface = String::new();
-    for (method_name, parameters, return_string) in &methods {
-        surface.push_str(method_name);
-        surface.push('(');
-        for (index, (_, type_string)) in parameters.iter().enumerate() {
-            if index > 0 {
-                surface.push(',');
-            }
-            surface.push_str(type_string);
-        }
-        surface.push_str(")->");
-        surface.push_str(return_string);
-        surface.push(';');
-    }
-    for (field_name, element) in &exposed {
-        surface.push_str("expose:");
-        surface.push_str(field_name);
-        surface.push(':');
-        surface.push_str(element);
-        surface.push(';');
-    }
-    let hash = service_contract_hash(&surface);
-
-    let mut out = String::new();
-    // --- The dispatcher: one route per [rpc] method, handlers capturing `self`.
-    out.push_str(&format!("impl {service_name} {{\n"));
-    out.push_str("\tfun dispatcher(self): Dispatcher {\n\t\tDispatcher::new()");
-    for (method_name, parameters, _) in &methods {
-        if parameters.is_empty() {
-            out.push_str(&format!(
-                "\n\t\t\t.on(\"{method_name}\", |_| reply(self.{method_name}()))"
-            ));
-        } else {
-            // Args are pulled from the request's deserializer in declaration
-            // order (§4.1 single-pass), then `decode_failed` gates the impl —
-            // a garbled request becomes RpcError::Decode, not an impl run on
-            // zero values.
-            out.push_str(&format!("\n\t\t\t.on(\"{method_name}\", |request| {{\n"));
-            for (index, (parameter_name, type_string)) in parameters.iter().enumerate() {
-                out.push_str(&format!(
-                    "\t\t\t\tlet {parameter_name}: {type_string} = arg(request, {index});\n"
-                ));
-            }
-            let argument_list = parameters
-                .iter()
-                .map(|(parameter_name, _)| parameter_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!(
-                "\t\t\t\tmatch decode_failed(request) {{\n\
-                 \t\t\t\t\tOption::Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),\n\
-                 \t\t\t\t\tOption::None => reply(self.{method_name}({argument_list})),\n\
-                 \t\t\t\t}}\n\t\t\t}})"
-            ));
-        }
-    }
-    // The built-in contract route (Q6 v2): the client's `verify()` calls it and
-    // compares the two sides' hashes — a clean mismatch instead of decode garbage.
-    out.push_str("\n\t\t\t.on(\"__contract\", |_| reply(self.contract_hash()))");
-    // The built-in attach route (§4.2): expose every `[expose]`d field on the
-    // calling connection's registry session (declaration order) and return the
-    // channel ids — what the generated `Client::connect` wires mirrors from.
-    let exposures = exposed
-        .iter()
-        .map(|(field_name, _)| format!("session.expose(self.{field_name})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    out.push_str(&format!(
-        "\n\t\t\t.on(\"__attach\", |request| {{\n\
-         \t\t\t\tlet connection: i32 = arg(request, 0);\n\
-         \t\t\t\tmatch decode_failed(request) {{\n\
-         \t\t\t\t\tOption::Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),\n\
-         \t\t\t\t\tOption::None => match session_of(connection) {{\n\
-         \t\t\t\t\t\tOption::Some(let session) => {{\n\
-         \t\t\t\t\t\t\tlet channels: List<i32> = [{exposures}];\n\
-         \t\t\t\t\t\t\treply(channels)\n\
-         \t\t\t\t\t\t}},\n\
-         \t\t\t\t\t\tOption::None => RpcOutcome::Failure(RpcError::Remote(\"unknown connection\")),\n\
-         \t\t\t\t\t}},\n\
-         \t\t\t\t}}\n\t\t\t}})"
-    ));
-    out.push_str("\n\t}\n");
-    out.push_str(&format!(
-        "\tfun contract_hash(self): str {{\n\t\t\"{hash}\"\n\t}}\n}}\n"
-    ));
-    // --- The client sibling: a transport + a mirror per exposed field.
-    out.push_str(&format!(
-        "struct {client_name}<T: Transport> {{\n\ttransport: T,\n\tcodec: Codec,\n"
-    ));
-    for (field_name, element) in &exposed {
-        out.push_str(&format!("\t{field_name}: RemoteSource<{element}>,\n"));
-    }
-    out.push_str("}\n");
-    out.push_str(&format!("impl {client_name}<type T> {{\n"));
-    for (method_name, parameters, return_string) in &methods {
-        let parameter_list = parameters
-            .iter()
-            .map(|(parameter_name, type_string)| format!(", {parameter_name}: {type_string}"))
-            .collect::<Vec<_>>()
-            .join("");
-        let argument_list = parameters
-            .iter()
-            .map(|(parameter_name, _)| {
-                format!("|serializer: Serializer| {parameter_name}.describe(serializer)")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!(
-            "\tfun {method_name}(self{parameter_list}): Result<{return_string}, RpcError> {{\n\
-             \t\tcall(self.transport, self.codec, \"{method_name}\", [{argument_list}])\n\
-             \t}}\n"
-        ));
-    }
-    // Contract verification (Q6 v2): fetch the server's hash over the wire and
-    // compare — `Ok(true)` is a matching contract, `Ok(false)` a drifted one.
-    out.push_str(
-        // The typed intermediate directs `call`'s T; `!` propagates the error
-        // (a return-position generic does not bind THROUGH `!` — the recorded
-        // try-and-lift deferral).
-        "\tfun verify(self): Result<bool, RpcError> {\n\
-         \t\tlet remote: Result<str, RpcError> = call(self.transport, self.codec, \"__contract\", []);\n\
-         \t\tResult::Ok(remote! == self.contract_hash())\n\
-         \t}\n",
-    );
-    out.push_str(&format!(
-        "\tfun contract_hash(self): str {{\n\t\t\"{hash}\"\n\t}}\n}}\n"
-    ));
-    // Client::connect (§4.2): the whole handshake, generated — open the socket,
-    // ENFORCE the contract hash (a drifted server is Err(Contract), before
-    // anything else), __attach with the connection id, and wire one mirror per
-    // [expose]d field from the returned channels (declaration order).
-    // Each mirror binds `source<T>` through an annotated let (a struct-literal
-    // field does not direct a generic call's type parameter; a let does).
-    let mirror_lets = exposed
-        .iter()
-        .enumerate()
-        .map(|(index, (field_name, element))| {
-            format!(
-                "\t\t\t\tlet mirror_{field_name}: RemoteSource<{element}> = \
-                 reactive.source(channels[{index}]);\n"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let mirror_fields = exposed
-        .iter()
-        .map(|(field_name, _)| format!(",\n\t\t\t\t\t{field_name} = mirror_{field_name}"))
-        .collect::<Vec<_>>()
-        .join("");
-    // The mirror lets sit one level shallower now (no match arm around them).
-    let mirror_lets = mirror_lets.replace("\t\t\t\tlet mirror_", "\t\tlet mirror_");
-    let mirror_fields = mirror_fields.replace("\n\t\t\t\t\t", "\n\t\t\t");
-    out.push_str(&format!(
-        "impl {client_name}<SocketTransport> {{\n\
-         \tfun connect(url: str, codec: Codec): Result<{client_name}<SocketTransport>, RpcError> {{\n\
-         \t\tlet socket = connect_socket(url);\n\
-         \t\tlet transport = socket.transport();\n\
-         \t\tlet remote: Result<str, RpcError> = call(transport, codec, \"__contract\", []);\n\
-         \t\tif remote! != \"{hash}\" {{\n\
-         \t\t\tret Result::Err(RpcError::Contract(\"the server reports a different service surface\"));\n\
-         \t\t}}\n\
-         \t\tlet connection = socket.connection;\n\
-         \t\tlet attached: Result<List<i32>, RpcError> = call(transport, codec, \"__attach\", [|serializer: Serializer| connection.describe(serializer)]);\n\
-         \t\tlet channels = attached!;\n\
-         \t\tlet reactive = ReactiveClient::new(bridge(socket), codec);\n\
-{mirror_lets}\
-         \t\tResult::Ok({client_name} {{\n\
-         \t\t\ttransport = transport,\n\
-         \t\t\tcodec = codec{mirror_fields},\n\
-         \t\t}})\n\
-         \t}}\n\
-         }}\n"
-    ));
-    out
-}
-
+/// N70: the Rust FALLBACK `[service]` generator is gone.
+///
+/// It was a twin of `std/src/rpc.vl`'s `service` macro and it had drifted into
+/// a stale one: no `turn` wrapper around a route, no keyed exposures, still
+/// `fun dispatcher(self)` where the macro emits `mut self`, no `connect_with`,
+/// no reconnect hook, no handle mapping — and its own `service_contract_hash`
+/// disagreed with the macro's for any keyed service, so the two halves of one
+/// wire contract could not have talked to each other. The file's comments
+/// insisted the two must not disagree; nothing checked that they did not, and
+/// they did.
+///
+/// Its only reach was a fixture std with no `rpc.vl` in it, and a silently
+/// STALE expansion is a far worse answer for that reader than a sentence
+/// saying the std they built cannot expand the attribute (B21's class). The
+/// `None` arm of `macros.rs`'s `Node::Service` dispatch says exactly that now,
+/// and syncing 270 lines of twin against a macro that keeps growing was the
+/// alternative nobody was going to keep paying for.
 /// The enum a member may be synthesized onto: BARE-LOWERED, and eligible for
 /// synthesis at all (`proposal/backed-enums.md` §10). `None` for every other
 /// item — a plain enum, a payload enum, a generic or `resource` enum.

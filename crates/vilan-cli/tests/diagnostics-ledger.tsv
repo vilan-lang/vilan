@@ -444,3 +444,4 @@ row	flagship	key
 414	-	`_` is the anonymous type binder: it introduces a generic parameter, and only an `impl` subject introduces one
 415	-	parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts with `__`, which the `[service]` expansion reserves for its own bindings
 416	-	`[rpc]` method `{method_name}` is declared `async` and takes `&mut self`, and the two cannot both hold
+417	-	`[service]` needs std's `rpc.vl`, and the std this package resolves to does not carry one
