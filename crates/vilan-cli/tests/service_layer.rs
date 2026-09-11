@@ -4006,3 +4006,98 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B282: an `[rpc]` parameter named `request` must not shadow the route
+/// closure's own handle.
+///
+/// The generated route was `.on("send", |request| { … let request: str =
+/// arg(request, 0); … })`: the author's first parameter rebound the closure's
+/// binding to a decoded `str`, and every later `arg`/`decode_failed` in the
+/// block was handed that `str` instead of the `RpcRequest`. The build stopped
+/// inside generated code — "Expected RpcRequest, but got str", spanned on the
+/// STRUCT — for a parameter name nothing told the author not to use. The
+/// closure is `|__request|` now, the same reservation the `__attach` and
+/// `__contract` routes take.
+///
+/// Three shapes, because the collision was positional: one parameter named
+/// `request` (the single-argument route, whose `decode_failed` guard reads the
+/// handle AFTER the rebind), a multi-parameter route that names `request`
+/// FIRST and then two more arguments off the already-shadowed handle, and a
+/// no-argument route as the control. `reason` and `connection` ride along:
+/// they are the other two identifiers the expansion writes into a block, and
+/// neither was ever a collision (`reason` is bound inside the decode arm,
+/// `connection` only in `__attach`'s own route) — so they are pinned as
+/// admitted, not as fixes.
+#[test]
+fn an_rpc_parameter_named_request_does_not_shadow_the_route_closures_handle() {
+    let dir = temp_project("request_named_parameter");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::shared::Shared;
+import std::result::Result::{ self, Ok, Err };
+import std::json::{ Json, FromJson };
+import std::json::json_codec;
+import std::rpc::local_rpc;
+
+[service(EchoClient)]
+struct Echo {
+	seen: Shared<i32>,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, request: str): str {
+		self.seen.write() = self.seen.read() + 1;
+		"got " + request
+	}
+
+	[rpc]
+	fun tally(self, request: i32, reason: str, connection: i32): str {
+		i"{request}/{reason}/{connection}"
+	}
+
+	[rpc]
+	fun ping(self): str {
+		"pong"
+	}
+}
+
+fun main() {
+	let echo = Echo { seen = Shared::new(0) };
+	let transport = local_rpc(echo.dispatcher().into_protocol(json_codec()));
+	let client = EchoClient { transport, codec = json_codec() };
+	print(i"send = {client.send("hi").unwrap_or("<err>")}");
+	print(i"tally = {client.tally(7, "why", 3).unwrap_or("<err>")}");
+	print(i"ping = {client.ping().unwrap_or("<err>")}");
+	print(i"seen = {echo.seen.read()}");
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("send = got hi"),
+        "a `request`-named parameter must decode like any other:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("tally = 7/why/3"),
+        "every argument after a `request`-named one must decode off the \
+         closure's handle, not off the shadow:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ping = pong"),
+        "the no-argument control route must still answer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("seen = 1"),
+        "the handler must have run exactly once — a decode that failed \
+         silently would answer without touching the service:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
