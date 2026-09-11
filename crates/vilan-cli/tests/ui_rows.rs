@@ -1100,6 +1100,7 @@ fun main() {
 	run.set([view("li").text("c")]);
 	print(i"changed={tree()}");
 	root.dispose();
+	print(i"emptied={tree()}");
 	label.set("three");
 	panel.set(view("p").text("third"));
 	run.set([view("li").text("d")]);
@@ -1261,6 +1262,7 @@ fn b268_every_child_arm_places_and_the_reactive_ones_replace_and_die_with_the_bo
     };
     let built = line("built=");
     let changed = line("changed=");
+    let emptied = line("emptied=");
     let disposed = line("disposed=");
 
     // The static arms: a text node, an element, and a run of elements.
@@ -1304,10 +1306,35 @@ fn b268_every_child_arm_places_and_the_reactive_ones_replace_and_die_with_the_bo
         "a Signal<List<View>> child must replace the whole run; got:\n{stdout}"
     );
 
+    // The boundary removed what it placed (A88): each reactive arm's content
+    // is out of the document, and so is the marker its region kept its place
+    // with. The STATIC arms are untouched — their lifetime is their parent
+    // element's, not a boundary's.
+    for gone in ["'second'", "'c'", "'two'"] {
+        assert!(
+            !emptied.contains(gone),
+            "a disposed boundary must take the reactive arm's {gone} out of \
+             the document; got:\n{stdout}"
+        );
+    }
+    for kept in ["'plain'", "'element'", "'x'", "'y'"] {
+        assert!(
+            emptied.contains(kept),
+            "a static child arm belongs to its parent, not to the boundary, \
+             so {kept} must stay; got:\n{stdout}"
+        );
+    }
+    assert!(
+        !emptied
+            .split(' ')
+            .any(|token| token.starts_with("#text#") && !token.contains('\'')),
+        "a closed region leaves no anchor behind; got:\n{stdout}"
+    );
+
     // And the subscriptions died with the root owner: three more writes, no
     // change to the tree at all.
     assert_eq!(
-        disposed, changed,
+        disposed, emptied,
         "every reactive child arm registers with the nearest boundary, so \
          disposing it must stop the replacement; got:\n{stdout}"
     );
@@ -1918,5 +1945,258 @@ fn a71_a_reactive_run_and_a_swap_each_keep_their_own_place() {
         ],
         "a reactive run and a `swap` must each stay where they were written; \
          got:\n{stdout}"
+    );
+}
+
+// --- A46: a fragment is a child that keeps its position ----------------------
+
+/// A static fragment between two static siblings, and a REACTIVE one — a
+/// signal whose value is a fragment — between two more. The reactive half is
+/// the piece A46's own recommendation left open and A71 closed: a
+/// `Source<List<View>>` places through a region, so the run is replaced in
+/// place instead of re-appended behind whatever the chain added after it.
+const A46_FRAGMENT: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun pair(): List<View> {
+	<>
+		<i>"a"</i>
+		<b>"b"</b>
+	</>
+}
+
+fun main() {
+	let count: SignalCell<i32> = Signal::new(1);
+	let _root = mount_root("app", || {
+		<main>
+			<header>"head"</header>
+			{pair()}
+			<hr />
+			{count.map(|n: i32| <>
+				<q>{i"g{n}"}</q>
+				<r>{i"h{n}"}</r>
+			</>)}
+			<footer>"foot"</footer>
+		</main>
+	});
+	print(i"start={tree()}");
+	count.set(3);
+	print(i"grown={tree()}");
+	count.set(2);
+	print(i"shrunk={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A46: the static fragment's two elements sit where the fragment was written,
+/// and the reactive fragment's run stays between the `<hr />` and the footer
+/// across every change — the wrapper element A46 exists to remove, removed.
+#[test]
+fn a46_a_fragment_places_its_run_in_position_statically_and_reactively() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a46_fragment", A46_FRAGMENT, &harness);
+    // Element syntax lowers every child to `.child(…)`, so a quoted string is
+    // a real TEXT NODE beside its element — which is why each tag here is
+    // followed by its own `#text'…'` rather than carrying the text itself.
+    let tree = |mark: i32| {
+        vec![
+            "root".to_string(),
+            "main".to_string(),
+            "header".to_string(),
+            "#text'head'".to_string(),
+            "i".to_string(),
+            "#text'a'".to_string(),
+            "b".to_string(),
+            "#text'b'".to_string(),
+            "hr".to_string(),
+            "q".to_string(),
+            format!("#text'g{mark}'"),
+            "r".to_string(),
+            format!("#text'h{mark}'"),
+            "footer".to_string(),
+            "#text'foot'".to_string(),
+        ]
+    };
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("start".to_string(), tree(1)),
+            ("grown".to_string(), tree(3)),
+            ("shrunk".to_string(), tree(2)),
+        ],
+        "a fragment must place its run at its own position, static or \
+         reactive; got:\n{stdout}"
+    );
+}
+
+/// A46's SSR twin: the same fragment serializes as the run it is, with no
+/// marker and no wrapper — which is what keeps the browser tree and the
+/// served markup comparable (`ssr_differential`'s rule, asserted here on the
+/// static half, which is the only half a server render has).
+const A46_FRAGMENT_SSR: &str = r#"import std::io::print;
+import std::ui::{ View, render, view };
+
+fun pair(): List<View> {
+	<><i>"a"</i><b>"b"</b></>
+}
+
+fun main() {
+	print(render(<main><header>"head"</header>{pair()}<footer>"foot"</footer></main>));
+}
+
+main();
+"#;
+
+#[test]
+fn a46_the_ssr_twin_serializes_a_fragment_as_its_run() {
+    let stdout = build_and_run_process("a46_fragment_ssr", A46_FRAGMENT_SSR);
+    assert_eq!(
+        stdout.trim(),
+        "<main><header>head</header><i>a</i><b>b</b><footer>foot</footer></main>",
+        "a fragment must serialize as its children and nothing else; \
+         got:\n{stdout}"
+    );
+}
+
+// --- A88: a boundary REMOVES what it placed ---------------------------------
+//
+// Disposal used to end the subscriptions and leave the DOM alone, on the
+// assumption that a disposed subtree leaves with its parent. That is true for
+// a component under its own root and FALSE for a PORTAL, whose container
+// outlives the boundary that filled it — kolt's overlay hand-wrote a
+// `defer(|| live_panel.remove())` saying exactly this. `Region::close` now
+// takes the live nodes out of the document before dropping the anchor, so the
+// portal container is empty after the owner goes, for every form at once.
+
+/// One portal container, filled by a separate boundary. Each form is given its
+/// own container so the readout says WHICH one leaked, and the containers are
+/// mounted into the document up front, so they are the survivors and the
+/// boundary is the thing that goes.
+const A88_PORTAL: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell, comp };
+import std::ui::{ View, mount, view };
+
+[derive(PartialEq)]
+struct Row {
+	id: i32,
+	label: str,
+}
+
+fun main() {
+	let shell = view("div");
+	let when_host = view("section");
+	let swap_host = view("section");
+	let rows_host = view("section");
+	let signal_host = view("section");
+	let run_host = view("section");
+	mount("app", shell
+		.child(when_host)
+		.child(swap_host)
+		.child(rows_host)
+		.child(signal_host)
+		.child(run_host));
+	let flag: SignalCell<bool> = Signal::new(true);
+	let page: SignalCell<i32> = Signal::new(1);
+	let rows: SignalCell<List<Row>> = Signal::new([
+		Row { id = 1, label = "a" },
+		Row { id = 2, label = "b" },
+	]);
+	let one: SignalCell<View> = Signal::new(view("u").text("u"));
+	let many: SignalCell<List<View>> = Signal::new([view("s").text("s")]);
+	let (_built, scope) = comp(|| {
+		when_host.when(flag, || view("aside").text("cond"));
+		swap_host.swap(page, |n: i32| view("article").text(i"p{n}"));
+		rows_host.bind_each(rows, |row: Row| row.id, |row: Row| view("li").text(row.label));
+		signal_host.child(one);
+		run_host.child(many)
+	});
+	print(i"live={tree()}");
+	scope.dispose();
+	print(i"disposed={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// A88: after the boundary is disposed every portal container is EMPTY —
+/// content and anchor both — on all five forms. Before this, each container
+/// kept its live element (or its rows) and its marker text node for as long as
+/// the container itself lived.
+#[test]
+fn a88_a_disposed_boundary_empties_the_portal_containers_it_filled() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a88_portal", A88_PORTAL, &harness);
+    let seen = readouts(&stdout);
+    assert_eq!(
+        seen[0],
+        (
+            "live".to_string(),
+            vec![
+                "root".to_string(),
+                "div".to_string(),
+                "section".to_string(),
+                "aside'cond'".to_string(),
+                "section".to_string(),
+                "article'p1'".to_string(),
+                "section".to_string(),
+                "li'a'".to_string(),
+                "li'b'".to_string(),
+                "section".to_string(),
+                "u'u'".to_string(),
+                "section".to_string(),
+                "s's'".to_string(),
+            ]
+        ),
+        "every form must be live before the disposal; got:\n{stdout}"
+    );
+    assert_eq!(
+        seen[1],
+        (
+            "disposed".to_string(),
+            vec![
+                "root".to_string(),
+                "div".to_string(),
+                "section".to_string(),
+                "section".to_string(),
+                "section".to_string(),
+                "section".to_string(),
+                "section".to_string(),
+            ]
+        ),
+        "a disposed boundary must leave nothing behind in a container that \
+         survives it; got:\n{stdout}"
+    );
+}
+
+/// A88's MECHANISM, asserted where the readout above cannot see it: the
+/// ANCHORS go too. `nodes` drops empty text nodes deliberately (they are the
+/// mechanism, not the claim), so the raw line is read here — five regions
+/// planted five markers, and after the disposal there are none.
+#[test]
+fn a88_the_anchors_go_with_the_content() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a88_anchors", A88_PORTAL, &harness);
+    let anchors = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line in:\n{stdout}"))
+            .split(' ')
+            .filter(|token| token.starts_with("#text#") && !token.contains('\''))
+            .count()
+    };
+    assert_eq!(anchors("live="), 5, "five regions, five anchors:\n{stdout}");
+    assert_eq!(
+        anchors("disposed="),
+        0,
+        "a closed region leaves no marker behind:\n{stdout}"
     );
 }

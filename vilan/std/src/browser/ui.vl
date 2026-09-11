@@ -403,6 +403,9 @@ impl View {
 			for row in next_views {
 				region.insert(row);
 			}
+			// A88: the region holds the run it now shows, so a disposal in a
+			// parent that survives takes these rows out of the document.
+			region.hold(next_views);
 			mut next_keys: List<K> = [];
 			for item in list {
 				next_keys.push(key(item));
@@ -528,6 +531,9 @@ impl View {
 			for row in next_views {
 				region.insert(row);
 			}
+			// A88: the region holds the run it now shows, so a disposal in a
+			// parent that survives takes these rows out of the document.
+			region.hold(next_views);
 			mut next_keys: List<K> = [];
 			for item in list {
 				next_keys.push(key(item));
@@ -567,6 +573,7 @@ impl View {
 						let owner = Owner::new();
 						let built = run_with_owner(owner, body);
 						region.insert(built);
+						region.hold([built]);
 						live_view.write() = Some(built);
 						live_owner.write() = Some(owner);
 					},
@@ -576,6 +583,7 @@ impl View {
 					Some(let built) => {
 						live_owner.read()?.dispose();
 						built.element.remove();
+						region.hold([]);
 						live_view.write() = None;
 						live_owner.write() = None;
 					},
@@ -635,6 +643,7 @@ impl View {
 				let owner = Owner::new();
 				let built = run_with_owner(owner, || render(value));
 				region.insert(built);
+				region.hold([built]);
 				last_value.write() = Some(value);
 				live_view.write() = Some(built);
 				live_owner.write() = Some(owner);
@@ -949,13 +958,21 @@ fun clear_chunk_error() {
 /// insertion goes BEFORE that anchor, so the run stays put however the
 /// parent grows afterwards.
 ///
-/// A region does NOT own the views in it. Each form already tracks what it
-/// has live and disposes it (rows with their owners, a `when` body with
-/// its own), and duplicating that here would be a second copy of the same
-/// bookkeeping; `insert` is the one thing they share. What the region owns is
-/// the ANCHOR, and `close` removes it — called from the `defer` each form
-/// already registers with the enclosing boundary, so the marker dies with the
-/// content rather than outliving it as a stray node.
+/// THE BOUNDARY REMOVES WHAT IT PLACED (A88). A region holds the run that is
+/// live in it, and `close` takes the nodes OUT of the document before dropping
+/// the anchor. Disposal used to end the subscriptions and leave the DOM alone,
+/// on the assumption that a disposed subtree is leaving with its parent — true
+/// for a component under its own root, and FALSE for a PORTAL, whose parent
+/// outlives the boundary that filled it. kolt's overlay hand-wrote
+/// `get_owner().defer(|| live_panel.read()?.remove())` with a comment saying
+/// exactly this; that line is what this closes, for every form at once.
+///
+/// The region does not RECONCILE the run — each form still tracks what it has
+/// live and disposes its owners, which is the half the region has no business
+/// repeating — it is TOLD the current run (`hold`) after each update, so
+/// `close` has the node list without a second copy of the bookkeeping. The
+/// cost is one `remove` per live node at disposal, and it is paid only at
+/// disposal; a `remove` of a node whose parent already went is a no-op.
 ///
 /// A85 (positional slots) is the design this serves: there, `when(..)` /
 /// `swap(..)` / `each(..)` become VALUES that create their region in
@@ -965,6 +982,7 @@ fun clear_chunk_error() {
 struct Region {
 	parent: Element,
 	anchor: Text,
+	live: Shared<List<View>>,
 }
 
 impl Region {
@@ -973,7 +991,7 @@ impl Region {
 	fun open(parent: View): Region {
 		let anchor = create_text_node("");
 		parent.element.append_text(anchor);
-		Region { parent = parent.element, anchor }
+		Region { parent = parent.element, anchor, live = Shared::new([]) }
 	}
 
 	/// Puts `child` at the end of the region, before the anchor. A child that
@@ -983,9 +1001,24 @@ impl Region {
 		self.parent.insert_before(child.element, self.anchor);
 	}
 
-	/// Drops the anchor. The content is the caller's to dispose — see the
-	/// ownership note above.
+	/// Records the run that is live in this region, for `close` to remove
+	/// (A88). Every form calls it wherever it already writes its own live
+	/// bookkeeping — after the order pass, after an instantiation, after a
+	/// swap — so the two can never disagree; an empty run is the right answer
+	/// for a `when` that is off.
+	fun hold(self, live: List<View>) {
+		self.live.write() = live;
+	}
+
+	/// Takes the region out of the document: every live node, then the
+	/// anchor (A88). Called from the `defer` each form registers with the
+	/// enclosing boundary, so the content and the marker die with it rather
+	/// than outliving it in a parent that survives.
 	fun close(self) {
+		for view in self.live.read() {
+			view.element.remove();
+		}
+		self.live.write() = [];
 		self.anchor.remove();
 	}
 }
@@ -1037,6 +1070,12 @@ impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		let node = create_text_node("");
 		parent.element.append_text(node);
+		// A88: the boundary removes what it PLACED. This arm has no region —
+		// one text node is its whole run — so it takes that node out itself.
+		// The three STATIC arms take no such defer, deliberately: a static
+		// child's lifetime is its parent element's, and it was placed while
+		// the caller was building that parent, not by a boundary.
+		get_owner().defer(|| node.remove());
 		self.effect(|value| {
 			node.set_text(value);
 		});
@@ -1084,12 +1123,17 @@ impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
 		let region = Region::open(parent);
 		let live: Shared<Option<View>> = Shared::new(None);
+		// A88: the arm's view and its anchor leave with the boundary. The
+		// subscription already dies with it (an ambient `effect`); this is the
+		// DOM half, which matters exactly when the parent survives.
+		get_owner().defer(|| region.close());
 		self.effect(|next: View| {
 			match live.read() {
 				Some(let previous) => previous.element.remove(),
 				None => {},
 			}
 			region.insert(next);
+			region.hold([next]);
 			live.write() = Some(next);
 		});
 	}
@@ -1110,6 +1154,9 @@ impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
 		let region = Region::open(parent);
 		let live: Shared<List<View>> = Shared::new([]);
+		// A88, as for the single-view arm above: the run and its anchor leave
+		// with the boundary.
+		get_owner().defer(|| region.close());
 		self.effect(|next: List<View>| {
 			for previous in live.read() {
 				previous.element.remove();
@@ -1117,6 +1164,7 @@ impl type S: Source<List<View>> with Slot {
 			for item in next {
 				region.insert(item);
 			}
+			region.hold(next);
 			live.write() = next;
 		});
 	}

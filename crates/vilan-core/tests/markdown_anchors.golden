@@ -146,6 +146,7 @@ guide/ui.md h1 building-ui
 guide/ui.md h2 views
 guide/ui.md h2 text-children-and-mixed-content
 guide/ui.md h2 element-syntax
+guide/ui.md h3 fragments
 guide/ui.md h2 components-are-just-functions
 guide/ui.md h2 events-run-in-turns
 guide/ui.md h2 inputs

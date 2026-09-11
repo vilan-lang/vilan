@@ -8990,3 +8990,148 @@ fn b275_a_str_signal_is_still_an_attribute_value() {
         "#,
     );
 }
+
+// --- A85: a `context` clause lives on a PARAMETER, and only there ------------
+//
+// A85 (positional slots) asks for `when`/`swap`/`each` as VALUES — structs
+// implementing `Slot` whose body/render closure is a FIELD — with the five
+// parent methods rewritten as one-line sugar over them. Its §5 named the one
+// implementation risk and told the build to probe it first: a struct field
+// typed as a context-carrying closure, `body: (sync || View) context
+// owner_scope`, which is the only shape in the design std does not already
+// write. The probe answers NO, three ways, and the three pins below are the
+// answer written down where it cannot be lost.
+//
+// The blocker is `ambient-owner.md` §5's v1 restriction, not a solver gap: a
+// clause is recorded SIDE-BAND, keyed by parameter id (`parameter_contexts`),
+// and `Type::Closure(parameters, return)` carries no clause at all — so a
+// clause cannot flow through a struct field, a generic argument or a return
+// type, and `context.rs`'s threading follows LOCALS. Lifting it is a language
+// change to the context model (a clause in the type, or a parallel field map
+// plus its own flow rules), which is A85's own ruling to reopen and not a
+// lane's to make. See the report for the measured consequence: a PLAIN closure
+// field is not a fallback — it captures its context at CREATION, so `place`'s
+// fresh per-instantiation owner never reaches the body, and the value forms
+// would leak every body's subscriptions into the enclosing boundary.
+
+/// What the language does TODAY. This is the CONTROL for the two `#[ignore]`d
+/// pins below: the day the context model admits a field clause, this pin goes
+/// red and points at them.
+#[test]
+fn a85_a_context_clause_is_refused_off_a_parameter() {
+    let source = r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (sync || View) context owner_scope,
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "a `context` clause is only supported on a parameter's closure type",
+    );
+    assert_fails_with(
+        source,
+        "a `sync` closure contract is only supported on parameters",
+    );
+}
+
+/// A85 §3a: the value forms' bodies are FIELDS, not type parameters, because a
+/// helper returning one has to be able to NAME the type (§6) and a type
+/// parameterized by a closure's own type is unnameable. So the field must
+/// carry the clause, and today it cannot.
+#[test]
+#[ignore = "A85: a struct field cannot carry a `context` clause — the clause is recorded per PARAMETER and is not part of `Type::Closure`, so it flows through no field; lifting it is a context-model change (ambient-owner.md §5 v1)"]
+fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ Region, Slot, View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (sync || View) context owner_scope,
+        }
+        fun when<S: Source<bool>>(
+            condition: S,
+            body: (sync || View) context owner_scope,
+        ): Conditional<S> {
+            Conditional { condition, body }
+        }
+        impl Conditional<type S: Source<bool>> with Slot {
+            fun place(self, parent: View) {
+                let region = Region::open(parent);
+                region.insert((self.body)());
+            }
+        }
+        "#,
+    );
+}
+
+/// A85 §3b: `View::when` becomes `self.child(when(condition, body))`. That
+/// rewrite needs the method's own INJECTED parameter to reach a struct, and
+/// the value-flow restriction refuses every escape an injected closure makes
+/// other than being called, forwarded to a parameter with the same clause, or
+/// passed to `run`. So the methods cannot become sugar over the values either,
+/// which is the half that made the surface a no-migration change.
+#[test]
+#[ignore = "A85: an injected (`context`-typed) parameter cannot be stored — the value-flow restriction admits only a call, a forward to the same clause, or `run`, so the parent methods cannot become sugar over the value forms"]
+fn a85_an_injected_body_reaches_the_value_form_that_stores_it() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (sync || View) context owner_scope,
+        }
+        fun when<S: Source<bool>>(
+            condition: S,
+            body: (sync || View) context owner_scope,
+        ): Conditional<S> {
+            Conditional { condition, body }
+        }
+        "#,
+    );
+}
+
+/// The MEASURED consequence, which is why the plain-closure fallback the work
+/// order named is not one: a closure captures its context AT CREATION
+/// (`reactive.vl`'s own note on `owner_scope`), so a body stored as a plain
+/// `|| T` field answers to the owner that was ambient where the VALUE was
+/// built, and re-entering a fresh owner around the CALL does not reach it.
+/// Here the effect registered inside the stored body survives the disposal of
+/// the owner it was called under and dies only with the outer one — which for
+/// `when`/`swap`/`each` would mean every instantiation's subscriptions
+/// outliving the instantiation, against A85 §3e's "ownership unchanged".
+#[test]
+fn a85_a_plain_closure_field_answers_to_the_owner_it_was_built_under() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        struct Body {
+            build: || i32,
+        }
+        fun main() {
+            let label: SignalCell<str> = Signal::new("one");
+            let outer = Owner::new();
+            let held = run_with_owner(outer, || Body {
+                build = || {
+                    label.effect(|value: str| print(i"body sees {value}"));
+                    0
+                },
+            });
+            let inner = Owner::new();
+            let build = held.build;
+            let _first = run_with_owner(inner, || build());
+            inner.dispose();
+            label.set("two");
+            outer.dispose();
+            label.set("three");
+        }
+        main();
+        "#,
+        "body sees one\nbody sees two\n",
+    );
+}

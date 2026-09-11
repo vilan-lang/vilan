@@ -4206,7 +4206,7 @@ impl<'src> Printer<'src> {
     /// head item, each child. The gaps between them are where a markup comment
     /// sits (`proposal/split-comment-attachment.md`, extended to elements).
     fn element_item_spans(body: &crate::node::ElementBody<'src>) -> Vec<Span> {
-        let mut spans = vec![body.tag];
+        let mut spans = vec![body.head_anchor()];
         for item in &body.head {
             spans.push(match item {
                 crate::node::ElementHeadItem::Chain(link) => link.1,
@@ -4479,7 +4479,7 @@ impl<'src> Printer<'src> {
         }
         let spans = Self::element_item_spans(body);
         let head_end = spans[body.head.len()].into_range().end;
-        if self.has_comment_in(body.tag.into_range().end, head_end) {
+        if self.has_comment_in(body.head_anchor().into_range().end, head_end) {
             return written();
         }
         let kinds: Vec<ElementHeadKind<'src>> = body
@@ -4488,6 +4488,16 @@ impl<'src> Printer<'src> {
             .map(|item| element_head_kind(item, self.source))
             .collect();
         element_head_permutation(&kinds).unwrap_or_else(written)
+    }
+
+    /// The tag's source text — the empty string for a FRAGMENT (A46), whose
+    /// head is nameless, so `<` + this + `>` prints `<>` and `</` + this + `>`
+    /// prints `</>` with no arm of its own in either rendering.
+    fn element_tag_text(&self, body: &crate::node::ElementBody<'src>) -> &'src str {
+        match body.tag {
+            Some(tag) => &self.source[tag.into_range()],
+            None => "",
+        }
     }
 
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
@@ -4516,7 +4526,7 @@ impl<'src> Printer<'src> {
 
     fn print_element_inline(&mut self, body: &crate::node::ElementBody<'src>, order: &[usize]) {
         self.out.push('<');
-        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push_str(self.element_tag_text(body));
         for &at in order {
             self.out.push(' ');
             self.print_element_head_item(&body.head[at]);
@@ -4533,7 +4543,7 @@ impl<'src> Printer<'src> {
             self.print_element_child(child);
         }
         self.out.push_str("</");
-        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push_str(self.element_tag_text(body));
         self.out.push('>');
     }
 
@@ -4551,7 +4561,7 @@ impl<'src> Printer<'src> {
         let head_start = self.out.len();
         let comment_cursor = self.cursor;
         self.out.push('<');
-        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push_str(self.element_tag_text(body));
         for &at in order {
             self.out.push(' ');
             self.print_element_head_item(&body.head[at]);
@@ -4562,14 +4572,14 @@ impl<'src> Printer<'src> {
             self.out.truncate(head_start);
             self.cursor = comment_cursor;
             self.out.push('<');
-            self.out.push_str(&self.source[body.tag.into_range()]);
+            self.out.push_str(self.element_tag_text(body));
             self.indent += 1;
             // The comment flushes below run over the head items in the order
             // they PRINT. That is safe precisely because a head that reorders
             // carries no comment inside it (`element_head_order` refuses one),
             // so every flush here is a no-op unless the order is the written
             // one — in which case the spans ascend as they always did.
-            let mut prev_end = body.tag.end;
+            let mut prev_end = body.head_anchor().end;
             for (item, item_span) in order.iter().map(|&at| (&body.head[at], head_spans[1 + at])) {
                 let item_start = self.out.len();
                 let item_cursor = self.cursor;
@@ -4622,7 +4632,7 @@ impl<'src> Printer<'src> {
         self.indent -= 1;
         self.line();
         self.out.push_str("</");
-        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push_str(self.element_tag_text(body));
         self.out.push('>');
     }
 
@@ -9521,6 +9531,42 @@ mod element_layout {
         assert_construct(
             "fun demo(): View {\n\t<div/>\n}\n",
             "fun demo(): View {\n\t<div />\n}\n",
+        );
+    }
+
+    /// A46: the fragment's nameless head needs no rule of its own — the tag
+    /// text is empty, so `<` + it + `>` is `<>` and `</` + it + `>` is `</>`,
+    /// and every layout decision above (inline while one child fits, one child
+    /// per line otherwise) is the element's unchanged.
+    #[test]
+    fn a_fragment_with_one_hole_child_stays_inline() {
+        assert_construct(
+            "fun demo(): List<View> {\n\t<>{ row }</>\n}\n",
+            "fun demo(): List<View> {\n\t<>{row}</>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_fragment_with_several_children_splits_one_per_line() {
+        assert_construct(
+            "fun demo(): List<View> {\n\t<><i>\"a\"</i><b>\"b\"</b></>\n}\n",
+            "fun demo(): List<View> {\n\t<>\n\t\t<i>\"a\"</i>\n\t\t<b>\"b\"</b>\n\t</>\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_empty_fragment_prints_as_the_bare_pair() {
+        assert_construct(
+            "fun demo(): List<View> {\n\t<></>\n}\n",
+            "fun demo(): List<View> {\n\t<></>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_fragment_nested_in_an_element_splits_with_it() {
+        assert_construct(
+            "fun demo(): View {\n\t<ul>{head}<>{rows}</></ul>\n}\n",
+            "fun demo(): View {\n\t<ul>\n\t\t{head}\n\t\t<>{rows}</>\n\t</ul>\n}\n",
         );
     }
 

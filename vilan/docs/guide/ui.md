@@ -63,7 +63,8 @@ static arms, and a reactive twin for each:
 - a `str` appends as a **text node**; a `Source<str>` appends a text
   node kept in sync;
 - a `List<View>` appends every view, in order; a `Source<List<View>>`
-  appends the run and replaces the whole run on every change.
+  appends the run and replaces the whole run on every change. `<>…</>`
+  is the literal for one (see [Fragments](#fragments)).
 
 That pairing is the whole contract: whatever may be a child statically
 may be a child reactively, and `{expr}` in element syntax means the same
@@ -193,6 +194,46 @@ fun main() {
 	let _root = mount_root("app", || panel(Signal::new(["alpha"]), Signal::new(false)));
 }
 ```
+
+### Fragments
+
+A **fragment** groups several children under one hole, with no wrapper
+element. `<>…</>` is the nameless head, and it lowers to a **list
+literal** of its children — so its type is `List<View>`, the arm `child`
+already places:
+
+```vilan,browser
+import std::ui::{ View, mount_root, view };
+
+fun labelled(name: str, value: str): List<View> {
+	<>
+		<dt>{name}</dt>
+		<dd>{value}</dd>
+	</>
+}
+
+fun main() {
+	let _root = mount_root("app", || {
+		<dl>
+			{labelled("host", "localhost")}
+			{labelled("port", "8080")}
+		</dl>
+	});
+}
+```
+
+`<>` and `</>` are written tight, like `/>` and `</`. A fragment takes
+no attributes and no chain links — there is no element to put them on —
+and it has no self-closing form; the empty fragment is `<></>`.
+
+Its type is where its uses are, and where its limits are. A fragment is
+a `List<View>`, so it fills a child position and every position a list
+fills, and a `Source<List<View>>` of fragments keeps its place like any
+other reactive child. It is **not** a `View`: a `fun …: View` return, a
+`when` body, a `swap` render and a `bind_each` row all want one view,
+and a fragment there is a type error that says so. It also does not
+flatten — a fragment written directly inside another is a list inside a
+list, which the literal refuses; nest through a child position instead.
 
 Components stay what they are — functions returning `View` — and are
 called in holes: `{todo_row(items, todo)}`. Reactivity stays explicit:
@@ -515,6 +556,20 @@ created dies with it. Delete row 2, and only row 2's bindings die. This
 is why there is no unsubscribe code anywhere in a Vilan app: the tree of
 boundaries *is* the cleanup logic, and the framework already placed
 them where subtrees end.
+
+**A boundary also removes what it placed.** Disposing it takes the
+nodes out of the document: `when`'s body, `swap`'s subtree,
+`bind_each`'s rows, a `{signal}` child's view or run or text node, and
+the invisible marker each of them keeps its position with. That is
+usually invisible — the subtree was leaving with its parent anyway —
+and it is the whole story for a **portal**, a container that outlives
+the boundary filling it: an overlay, a tooltip layer, a modal host
+mounted once at the top of the page. Fill one from a component's
+boundary, dispose the component, and the container is empty; there is
+nothing to remember to clean up by hand. The three **static** child
+arms are untouched, deliberately: a `str`, a `View` or a `List<View>`
+child belongs to the parent element it was appended to, not to a
+boundary.
 
 ## Server-side rendering
 

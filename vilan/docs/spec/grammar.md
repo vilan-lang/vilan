@@ -382,7 +382,9 @@ list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
 tuple-comprehension = "(" IDENT "in" secondary-expr "=>" expression ")" ;
 
 element      = "<" element-name { head-item }
-               ( "/>" | ">" { child } "</" element-name ">" ) ;
+               ( "/>" | ">" { child } "</" element-name ">" )
+             | fragment ;
+fragment     = "<>" { child } "</>" ;              (* a List<View> literal *)
 head-item    = "." member                          (* a chain link, verbatim *)
              | "on" ":" IDENT "(" expression ")"   (* event form *)
              | element-name [ "(" expression ")" ] ;
@@ -440,6 +442,17 @@ an ordinary expression: it desugars before analysis to the `std::ui`
 view chain (`view("tag")` with one method call per head item and a
 `.child(…)` per child), and postfix suffixes apply to it
 (`<div />.show(flag)`).
+
+A **fragment** `<>…</>` is the nameless head, and it is a different
+lowering rather than an element with no tag: it desugars to a LIST
+LITERAL of its children, so its type is `List<View>`. `<>` and `</>`
+are span-adjacent pairs like `/>` and `</`, and neither is a lexical
+token — `<` and `>` are the same control characters the element and
+generic-argument rules use, so nothing about a comparison changes. A
+fragment takes no head items and has no self-closing form. Its type is
+where its uses are: a child position and every position a list fills
+(A46); it is not a `View`, so it is not a `fun …: View` return, a
+`when` body, a `swap` render or a `bind_each` row.
 
 A **`css` block** is the same shape on the style side, and it appears in
 atom position too — but where an element occupies grammar space nothing

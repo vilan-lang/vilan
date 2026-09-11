@@ -585,7 +585,9 @@ fn innermost_open_tag_end(
     let span = node.1.into_range();
     if span.start <= offset && offset <= span.end {
         let tag_end = match &node.0 {
-            Node::Element(body) => Some(body.tag.end),
+            // A fragment (A46) has no head at all, so nothing completes
+            // inside `<>` — `None`, not a zero-width head.
+            Node::Element(body) => body.tag.map(|tag| tag.end),
             Node::Error => error_tag_name_end(source, span.start, span.end),
             _ => None,
         };
