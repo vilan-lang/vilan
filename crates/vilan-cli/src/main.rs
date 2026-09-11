@@ -1266,23 +1266,10 @@ fn hmr_round(
     let manifest_changed = state.manifest.is_some_and(|previous| previous != manifest);
     state.manifest = Some(manifest);
     let force_full = hmr::round_forces_full(state.legs.is_empty(), state.failed, manifest_changed);
-    let current_hash = |path: &Path| -> Option<u64> {
-        // A recorded input that is a DIRECTORY re-hashes as its listing
-        // (`asset::read_dir` / `read_dir_all`, const-eval.md §3.1). Without
-        // this arm the read below fails on it and the leg could never skip;
-        // with it, an unchanged directory compares equal and a file appearing
-        // or vanishing anywhere in a listed tree fails the compare, which is
-        // exactly the invalidation the tracked-directory doctrine promises.
-        if path.is_dir() {
-            return vilan_core::const_eval::directory_input_hash(path);
-        }
-        // Read the same way the compiler reads (BOM dropped,
-        // windows-support.md §2), or the hash recorded from the text it
-        // consumed could never match.
-        vilan_core::util::read_source(path)
-            .ok()
-            .map(|text| vilan_core::content_hash(&text))
-    };
+    // The ONE hash rule, asked of the path (B276): [`current_source_hash`] is
+    // the function the recording side used too, so a re-hash equal to the
+    // recorded hash means the file is unchanged and nothing else. Directories,
+    // text and bytes are all its arms.
     // B203 — the legs in artifact-dependency order, and the edges the skip
     // decision consults at each leg's own turn. The HMR round writes `dist/`
     // AFTER the whole compile loop (the shim carries a version the classifier
@@ -1323,7 +1310,9 @@ fn hmr_round(
                 .legs
                 .iter()
                 .find(|leg| leg.name == unit.name)
-                .is_some_and(|previous| hmr::leg_is_current(&previous.sources, current_hash));
+                .is_some_and(|previous| {
+                    hmr::leg_is_current(&previous.sources, current_source_hash)
+                });
         if reusable {
             skip.insert(unit.name.clone());
         } else {
@@ -4807,21 +4796,20 @@ fn sequential_build() -> bool {
     *ENABLED.get_or_init(|| std::env::var("VILAN_SEQUENTIAL_BUILD").is_ok_and(|value| value != "0"))
 }
 
-/// A watched source's content hash RIGHT NOW, read the way the compiler reads
-/// it (BOM dropped, `windows-support.md` §2) so the compare is against the
-/// text the compiler consumed. A recorded input that is a DIRECTORY re-hashes
-/// as its listing (`asset::read_dir`, const-eval.md §3.1), so a file appearing
-/// or vanishing in a listed tree fails the compare. `None` — deleted,
-/// unreadable — disqualifies the skip by construction.
+/// A watched source's content hash RIGHT NOW — [`vilan_core::const_eval::
+/// tracked_input_hash`], which is the SAME function the compile recorded the
+/// hash with (tracker B276). One rule, both sides: a directory re-hashes as its
+/// listing, a file as its text where it decodes (BOM dropped,
+/// `windows-support.md` §2) and as its bytes where it does not, and `None` —
+/// deleted, unreadable — disqualifies the skip by construction.
 ///
-/// The same reader the HMR round uses, for the same reason it uses it.
+/// It used to re-hash every path as text, while `asset::bundle` recorded its
+/// files' bytes: the two never agreed, so a leg that bundled anything
+/// recompiled on every round however little had changed. Kept as a named
+/// function so both watch loops — this one and the HMR round's — are visibly
+/// asking the one question.
 fn current_source_hash(path: &Path) -> Option<u64> {
-    if path.is_dir() {
-        return vilan_core::const_eval::directory_input_hash(path);
-    }
-    vilan_core::util::read_source(path)
-        .ok()
-        .map(|text| vilan_core::content_hash(&text))
+    vilan_core::const_eval::tracked_input_hash(path)
 }
 
 /// Type-checks every member of a workspace (each for its own platform; a `none`

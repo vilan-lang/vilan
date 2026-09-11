@@ -396,3 +396,238 @@ fn a_watch_round_recompiles_the_legs_the_edit_reached() {
     support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B276's fixture: a client leg that BUNDLES — one file that is not valid
+/// UTF-8 (a `.woff2`, written here as raw bytes) and one that is (a `.txt`) —
+/// beside a module only the SERVER leg loads.
+///
+/// Both kinds are present deliberately. The binary one is what made the bug
+/// total on kolt (`read_source` cannot decode a font at all, so the re-hash was
+/// `None` and the leg was disqualified outright); the text one is what makes
+/// the bug a HASHING bug rather than a decoding one, because `content_hash` of
+/// a `str` and `content_hash_bytes` of its bytes disagree on plain ASCII too.
+/// A fix that only taught the watch loop to read bytes would pass the first row
+/// and fail the second.
+fn build_bundling_fixture(dir: &Path) {
+    write(
+        dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    // A `.woff2` header followed by bytes no UTF-8 decoder accepts — the shape
+    // of the thing, without carrying a font into the tree.
+    let font = dir.join("src/static/font/body.woff2");
+    std::fs::create_dir_all(font.parent().unwrap()).unwrap();
+    std::fs::write(&font, [b'w', b'O', b'F', b'2', 0x00, 0xff, 0xfe, 0x80]).unwrap();
+    write(dir, "src/static/robots.txt", "User-agent: *\n");
+    write(
+        dir,
+        "src/only_server.vl",
+        "fun server_value(): i32 {\n\t1\n}\n",
+    );
+    write(
+        dir,
+        "src/client.vl",
+        "import std::asset::bundle;\nimport std::io::print;\n\n\
+         const {\n\tbundle(\"static/font/body.woff2\");\n\tbundle(\"static/robots.txt\");\n};\n\n\
+         fun main() {\n\tprint(\"client\");\n}\n",
+    );
+    write(
+        dir,
+        "src/server.vl",
+        "import std::io::print;\nimport pkg::only_server::server_value;\n\n\
+         fun main() {\n\tprint(server_value());\n}\n",
+    );
+}
+
+/// B276 — a leg that bundles anything was never `Fresh`, however little
+/// changed.
+///
+/// `asset::bundle` recorded its files under `content_hash_bytes`; the watch
+/// loop re-hashed every recorded input with `read_source` + `content_hash`. The
+/// two never agreed, so `leg_is_current` failed on the bundled row of every
+/// round and kolt — which bundles a favicon, three fonts, an svg and a
+/// manifest — reused nothing for the life of a session.
+///
+/// Both directions are pinned here, because a change detector that never fires
+/// and one that always fires are the same bug wearing different clothes:
+/// 1. an edit to a module only the SERVER loads leaves the client `Fresh`, and
+/// 2. an edit to the BUNDLED BINARY recompiles the client, which is reuse still
+///    being decided by content (E12's rule) and the bundled copy in `dist/`
+///    still being the bytes on disk.
+#[test]
+fn a_bundling_leg_is_fresh_on_a_round_that_did_not_touch_it() {
+    let dir = temp_project("bundling");
+    build_bundling_fixture(&dir);
+
+    let trace_path = dir.join("watch-trace.log");
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", "--watch", dir.to_str().unwrap()])
+        .env("VILAN_WATCH_LOG", &trace_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the watcher");
+    let receiver = spawn_reader(watcher.stdout.take().expect("piped stdout"));
+
+    let started = Instant::now();
+    let first = next_round(
+        &receiver,
+        2,
+        "the initial build",
+        None,
+        support::WATCH_LIVENESS,
+        &trace_path,
+    );
+    let budget = support::round_budget(started.elapsed());
+    assert!(
+        first.iter().all(|leg| leg.rebuilt),
+        "the first round must compile both legs: {first:?}"
+    );
+
+    // --- Row 1: the edit reaches the server leg alone. ---
+    const ONLY_SERVER: &str = "fun server_value(): i32 {\n\t2\n}\n";
+    let only_server = dir.join("src/only_server.vl");
+    let mut retouches = 0;
+    std::fs::write(&only_server, ONLY_SERVER).expect("edit the server-only module");
+    let round = next_round(
+        &receiver,
+        2,
+        "the server-only round",
+        Some((&only_server, ONLY_SERVER, &mut retouches)),
+        budget,
+        &trace_path,
+    );
+    let client = round
+        .iter()
+        .find(|leg| leg.entry.ends_with("client.vl"))
+        .unwrap_or_else(|| panic!("the round must name the client leg: {round:?}"));
+    assert!(
+        !client.rebuilt,
+        "the client leg BUNDLES and nothing it loads changed, so it must be \
+         `Fresh` — a rebuilt client here is B276: its bundled files re-hash \
+         under a rule the compile did not record them with: {round:?}"
+    );
+    let server = round
+        .iter()
+        .find(|leg| leg.entry.ends_with("server.vl"))
+        .unwrap_or_else(|| panic!("the round must name the server leg: {round:?}"));
+    assert!(
+        server.rebuilt,
+        "the edited module is the server's, so the server recompiles: {round:?}"
+    );
+
+    // --- Row 2: the edit is the bundled BINARY itself. ---
+    let font = dir.join("src/static/font/body.woff2");
+    std::fs::write(&font, [b'w', b'O', b'F', b'2', 0x01, 0xfd, 0xfc, 0x81])
+        .expect("edit the bundled font");
+    let deadline = Instant::now() + budget;
+    let mut rounds = 0;
+    let client_recompiled = loop {
+        if Instant::now() >= deadline {
+            break false;
+        }
+        let round = next_round(
+            &receiver,
+            2,
+            "the bundled-asset round",
+            None,
+            budget,
+            &trace_path,
+        );
+        rounds += 1;
+        if round
+            .iter()
+            .any(|leg| leg.entry.ends_with("client.vl") && leg.rebuilt)
+        {
+            break true;
+        }
+    };
+    assert!(
+        client_recompiled,
+        "a changed BUNDLED file must recompile the leg that bundles it — reuse \
+         is decided by content, and a `Fresh` client here would serve a font \
+         its build no longer matches ({rounds} rounds seen)"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("dist/static/font/body.woff2")).expect("the bundled copy"),
+        [b'w', b'O', b'F', b'2', 0x01, 0xfd, 0xfc, 0x81],
+        "the recompiled leg re-copies the edited file into `dist/`"
+    );
+
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The invariant under B276's fix, asked of the two functions directly: the
+/// hash a tracked build input is RECORDED with and the hash it is RE-VERIFIED
+/// with are the same hash, for every kind of file the const channel can touch.
+///
+/// This is the pin that would have caught the bug at the seam rather than three
+/// layers up in a watch round. It goes red if either side grows an arm the
+/// other does not have — which is exactly how the two came apart: `bundle`
+/// gained a bytes hash and the watch loop was never told.
+#[test]
+fn hashing_agrees_between_the_recording_side_and_the_watch_side() {
+    use vilan_core::const_eval::{tracked_input_hash, tracked_input_hash_of_bytes};
+
+    let dir = temp_project("hash_agreement");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Plain text (what `asset::read` and every `.vl` module are), text with a
+    // BOM (`windows-support.md` §2 — the compiler never sees the marker, so
+    // neither may the hash), and bytes no decoder accepts (a font, an image).
+    let rows: [(&str, Vec<u8>); 3] = [
+        ("plain.txt", b"User-agent: *\n".to_vec()),
+        ("bom.txt", "\u{feff}fun main() {}\n".as_bytes().to_vec()),
+        (
+            "body.woff2",
+            vec![b'w', b'O', b'F', b'2', 0x00, 0xff, 0xfe, 0x80],
+        ),
+    ];
+    for (name, bytes) in &rows {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            tracked_input_hash(&path),
+            Some(tracked_input_hash_of_bytes(bytes)),
+            "`{name}`: the watch side must re-hash to what the compile recorded"
+        );
+    }
+
+    // A `.vl` module's row in the same map is recorded as `content_hash` of the
+    // text the compiler consumed — the text arm's answer for the same file, or
+    // a module edit and a bundled-file edit could not share one map.
+    let module = dir.join("module.vl");
+    let source = "fun main() {\n\tprint(\"hi\")\n}\n";
+    std::fs::write(&module, source).unwrap();
+    assert_eq!(
+        tracked_input_hash(&module),
+        Some(vilan_core::content_hash(source)),
+        "a module row and a const-input row must agree on what one file hashes to"
+    );
+
+    // A BOM'd module hashes as the text the lexer sees, not as the file.
+    let bom_module = dir.join("bom.vl");
+    std::fs::write(&bom_module, format!("\u{feff}{source}")).unwrap();
+    assert_eq!(
+        tracked_input_hash(&bom_module),
+        Some(vilan_core::content_hash(source)),
+        "the BOM is an encoding marker, so it cannot move the hash"
+    );
+
+    // Gone is `None`, which is what disqualifies a reuse by construction.
+    assert_eq!(tracked_input_hash(&dir.join("absent.txt")), None);
+
+    // A DIRECTORY re-hashes as its listing (`asset::read_dir`), and a file
+    // appearing in it moves that hash.
+    let listed = tracked_input_hash(&dir).expect("a directory hashes as its listing");
+    std::fs::write(dir.join("new.txt"), "x").unwrap();
+    assert_ne!(
+        tracked_input_hash(&dir),
+        Some(listed),
+        "a file appearing in a listed directory must fail the compare"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

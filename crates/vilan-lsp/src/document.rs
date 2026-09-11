@@ -3038,9 +3038,12 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
+        // The same hoist as `semantic_tokens`, for the same reason and over the
+        // same whole-program table (M27/M58).
+        let source_of = program.source_lookup();
         let mut hints: Vec<(usize, String)> = Vec::new();
         for (id, variable) in &program.variables {
-            if variable.annotated || program.source_of(*id) != Some(SourceId(0)) {
+            if variable.annotated || source_of.of(*id) != Some(SourceId(0)) {
                 continue;
             }
             let Some(label) = program.expr_types.get(id) else {
@@ -3077,7 +3080,18 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let entry = |id: Id| program.source_of(id) == Some(SourceId(0));
+        // M27's hoist, which this table never took (M58). `source_of` is a
+        // LINEAR scan of `source_ranges`, and the predicate below is asked once
+        // per row of every whole-program table this walk touches: measured
+        // under callgrind on a WARM re-analysis of kolt's client, 426,198 calls
+        // and 253.5 M Ir — 7.0% of the entire analysis, and 98% of this
+        // function's own cost — for a question about ~60 ranges. `source_lookup`
+        // answers it by binary search, is answer-identical by construction (it
+        // falls back to `source_of`'s own scan when the ranges are not ascending
+        // and disjoint rather than assuming they are), and is taken ONCE here
+        // because the ranges do not move while a walk reads them.
+        let source_of = program.source_lookup();
+        let entry = |id: Id| source_of.of(id) == Some(SourceId(0));
         let mut tokens: Vec<(Span, TokenKind, u32)> = Vec::new();
         let classify_target = |target: Id| -> TokenKind {
             use vilan_core::analyzer::Expr;
@@ -5764,6 +5778,104 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&entry).unwrap();
         let document = Document::analyze(&text, &std_root(), &entry);
         (dir, document)
+    }
+
+    /// M27's `source_lookup` is a BINARY SEARCH standing in for
+    /// `Program::source_of`'s linear scan, and until M58 nothing held the two to
+    /// the same answer — five callers deep, including the two editor tables this
+    /// lane hoisted (`semantic_tokens`, `inlay_hints`), on a promise its own
+    /// doc-comment makes and no test checked.
+    ///
+    /// The premise is that entity ids are minted from a monotonically increasing
+    /// counter, so `source_ranges` comes out ascending and disjoint. The lookup
+    /// refuses to ASSUME that — it verifies once and falls back to the scan when
+    /// it does not hold — which is exactly the branch a pin has to exercise the
+    /// other side of: over a real multi-module program, with `std`, a package
+    /// module and a generated derive in it, every id the program knows must get
+    /// the SAME answer from both.
+    #[test]
+    fn the_hoisted_source_lookup_answers_exactly_what_source_of_answers() {
+        let _guard = base_cache_guard();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::rows::Row;\n\n\
+                 fun main() {\n\tlet row = Row { label: \"a\" };\n\tprint(row.label);\n}\n",
+            ),
+            (
+                "rows.vl",
+                "[derive(Debug)]\nstruct Row {\n\tlabel: str,\n}\n",
+            ),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("the fixture analyzes cleanly");
+
+        // Every id the program holds a row for, whichever table it lives in —
+        // the entity map is the biggest, and the declaration tables carry ids
+        // the entity map does not.
+        let mut checked = 0usize;
+        let lookup = program.source_lookup();
+        let check = |id: Id| {
+            assert_eq!(
+                lookup.of(id),
+                program.source_of(id),
+                "the hoisted lookup and the scan disagree about id {}",
+                id.0,
+            );
+        };
+        for id in program.entity_map.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.variables.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.structs.keys() {
+            check(*id);
+            checked += 1;
+        }
+        assert!(
+            checked > 100,
+            "a std-using two-module program should hold more than {checked} ids — a pin that \
+             checks a handful is not checking the seam",
+        );
+
+        // And the ids that are in NO range: below the first, past the last, and
+        // the sentinel. `source_of` answers `None` for each, and a binary
+        // search's `partition_point` is exactly where an off-by-one would hide.
+        check(Id(u32::MAX));
+        check(Id(0));
+        let past_the_end = program
+            .entity_map
+            .keys()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or_default()
+            + 1;
+        check(Id(past_the_end));
+
+        // The entry's own rows are what the editor tables filter for, so the
+        // agreement has to be non-trivial: some ids ARE the entry's and some
+        // are not.
+        let entry_ids = program
+            .entity_map
+            .keys()
+            .filter(|id| lookup.of(**id) == Some(SourceId(0)))
+            .count();
+        assert!(
+            entry_ids > 0 && entry_ids < program.entity_map.len(),
+            "the fixture must hold both entry and non-entry entities ({entry_ids} of {})",
+            program.entity_map.len(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // An error INSIDE an imported module publishes to that module's path, with
@@ -15825,7 +15937,7 @@ mod leak_measurement {
     /// with allocator retention. `None` off glibc — like `/proc` above, the
     /// gate is about the instrument, not the claim.
     #[cfg(target_env = "gnu")]
-    fn heap_split_bytes() -> Option<(isize, isize)> {
+    pub(super) fn heap_split_bytes() -> Option<(isize, isize)> {
         /// glibc's `struct mallinfo2` (malloc.h): ten `size_t` counters.
         #[repr(C)]
         struct MallInfo2 {
@@ -15850,7 +15962,7 @@ mod leak_measurement {
     }
 
     #[cfg(not(target_env = "gnu"))]
-    fn heap_split_bytes() -> Option<(isize, isize)> {
+    pub(super) fn heap_split_bytes() -> Option<(isize, isize)> {
         None
     }
 
@@ -17147,6 +17259,747 @@ mod perf_baseline {
         assert_eq!(percentile(&sorted, 0.99), 99.0);
         // A single sample answers every question with itself.
         assert_eq!(percentile(&sorted[..1], 0.99), 1.0);
+    }
+}
+
+/// E106 — "the language server slows down over a session", measured.
+///
+/// The item's suspects were a per-analysis leak and S5's per-request re-parses;
+/// the instruments this tree grew after them (`leak_measurement` above, the
+/// session trace, `keystroke.rs`'s gate) all answer a question about ONE
+/// analysis or one request. None of them answers the item's question, which is
+/// about the two-thousandth: does the SAME keystroke, on the same file, in one
+/// process, cost more at the end of a session than at the start?
+///
+/// So the shape here is a session rather than a sample. 2,000 keystrokes land
+/// in ONE process on ONE document, and the window — 100 keystrokes — is the
+/// reporting unit: a median per window, twenty windows, with RSS and the
+/// deliberate leak's outstanding balance read at each window's end. A median
+/// and not a mean, because one scheduler hiccup in two thousand analyses will
+/// move a mean and cannot move a median; twenty windows and not a before/after
+/// pair, because growth has a SHAPE (linear, a step, a plateau) and two numbers
+/// cannot show one.
+///
+/// **CPU, never wall** (M27's rule, E121's re-statement): this box recorded
+/// loadavg 6 to 150 across one order, wall readings moved 5× with it, and CPU
+/// readings did not. The analyses run inline on the measuring thread, so the
+/// thread clock sees all of their work and none of anyone else's.
+///
+/// **RSS is read but never asserted alone.** Resident size confounds a genuine
+/// leak with allocator retention (`leak-soak.md` §7.7 — the reason
+/// `leak_measurement` reads `mallinfo2` beside it), so the row carries both the
+/// resident figure and the tally's own outstanding balance at the two entry
+/// sites, and the assertion is on what the tally says.
+///
+/// Run the full session deliberately:
+///
+/// ```text
+/// cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+///     -E 'test(session_growth)' --no-capture > session.log 2>&1
+/// ```
+///
+/// `VILAN_PERF_KOLT` points the same driver at a sibling checkout's
+/// `src/views.vl` (`perf-baseline.md` §1's convention, and the owner's standing
+/// rule: kolt is evidence, never a fixture — nothing is copied in).
+///
+/// ## What it found, 2026-09-11 (release, a box at loadavg 25–140 — every row
+/// carries its own)
+///
+/// **Not the deliberate leak, and not the analysis.** 2,000 keystrokes on one
+/// document, kolt's `views.vl`: the entry text/tree balance is the SAME
+/// constant at every window (one live document, one analysis — 4,528 → 4,529
+/// bytes on the exhibit, the single byte being the keystroke counter widening),
+/// RSS moves 62,656 → 63,088 KiB, and the analyze cost does not trend (1.30×
+/// first-to-last window on a box whose loadavg moved 68 → 73 under it; 1.02×
+/// on the analyze-only driver at loadavg 28–34). The reclaim across
+/// `adopt_analysis` works, every window, for two thousand of them. The item's
+/// PRIME SUSPECT is refuted, and its second — S5's per-request re-parses — is
+/// a per-request constant and not growth: the five-provider burst reads 5.95 ms
+/// at keystroke 100 and 6.21 ms at keystroke 2,000.
+///
+/// **What does grow is what a session OPENS.** [`open_documents`] opens
+/// kolt's eighteen `src/*.vl` files in one process: RSS 5.4 MB → 864 MB, about
+/// 48 MB per file and 126 MB for `views.vl` alone, because a `Document` holds
+/// its whole analysis for as long as the editor holds the file. Closing all
+/// eighteen returns 418 MB to the ALLOCATOR (in-use 738 → 320 MB, free-retained
+/// 3 → 421 MB) and 62 MB to the OS: glibc does not trim, so resident size
+/// ratchets up across a session of opening and closing files and never comes
+/// back down. Beside it, the owner's own live server — read from `/proc` on the
+/// same box, eight hours into a working day — stood at 4.13 GB resident, 4.40
+/// GB high-water, 6.64 GB peak virtual. The instrument and the field agree
+/// about the shape; neither of them is the per-analysis leak.
+#[cfg(all(test, target_os = "linux"))]
+mod session_growth {
+    use super::*;
+    use crate::document::leak_measurement::heap_split_bytes;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use crate::keystroke::gate::{
+        EXHIBIT_ENTRY, GATE_FUNCTIONS, exhibit_module, loadavg_1m, profile, thread_cpu_now,
+    };
+    use std::time::Duration;
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    /// Keystrokes per reported window.
+    const WINDOW: usize = 100;
+    /// Windows in a full session — 2,000 keystrokes, the item's figure.
+    const SESSION_WINDOWS: usize = 20;
+    /// The smoke session: the same driver, small enough for every suite run.
+    const SMOKE_WINDOWS: usize = 2;
+    const SMOKE_WINDOW: usize = 5;
+
+    /// The growth bound. A session's last window may cost more than its first —
+    /// an allocator settles, a cache fills — but not MUCH more, and 1.5× is the
+    /// line: below it no editor session is perceptibly slower at hour two, and
+    /// above it the thing the owner reported is happening.
+    ///
+    /// Stated on each window's CHEAPEST analysis, not its median, and the
+    /// reason is a measurement this lane took rather than a preference: CPU
+    /// time on this box is LOAD-DEPENDENT (E121's standing note, re-confirmed
+    /// here — one window of the same 100 keystrokes on the same file read a
+    /// 371 ms median at loadavg 11.7 and 772 ms at loadavg 35.2). A median
+    /// carries that contention and a growth ratio built from two of them
+    /// measures the box; the minimum is the sample that ran with the fewest
+    /// neighbours and is the closest thing to the quiet-box number the mandate
+    /// is written in. The median is REPORTED beside it, per window and in the
+    /// verdict, because it is what the brief asks to see — it is simply not
+    /// what the gate may be built on.
+    const GROWTH_BOUND: f64 = 1.5;
+
+    /// The bound on what a session RETAINS, stated against the first window and
+    /// applied to both the deliberate leak's outstanding balance and to RSS.
+    ///
+    /// Tighter than [`GROWTH_BOUND`] because it is a claim about a CONSTANT:
+    /// one live document holds one analysis, so the balance moves only by the
+    /// edited text's own growth (a keystroke counter widening by a digit), and
+    /// the measured drift over 2,000 keystrokes is 4,528 → 4,529 bytes and
+    /// 62,656 → 63,088 KiB resident. The 10% here is slack for the allocator,
+    /// not room for a trend. Proven non-vacuous by planting the defect it
+    /// names — an `adopt_analysis` that does not drop the outgoing analysis —
+    /// which takes the balance to 1.83× and RSS to 1.38× within TEN
+    /// keystrokes.
+    const RETENTION_BOUND: f64 = 1.1;
+
+    /// Resident set size in KiB, from `/proc/self/statm` (pages × 4) — the same
+    /// reader `leak_measurement` uses, for the same reason it is Linux-gated.
+    fn rss_kib() -> usize {
+        let statm = std::fs::read_to_string("/proc/self/statm").expect("statm");
+        let pages: usize = statm
+            .split_whitespace()
+            .nth(1)
+            .expect("resident field")
+            .parse()
+            .expect("resident pages");
+        pages * 4
+    }
+
+    /// One window's report: the median CPU of its analyses, and the memory
+    /// picture as the window closed.
+    #[derive(Clone, Copy, Debug)]
+    struct Window {
+        index: usize,
+        median: Duration,
+        minimum: Duration,
+        maximum: Duration,
+        /// The median cost of the five-provider request burst the same
+        /// keystroke answered off the LIVE buffer before the analysis landed —
+        /// the keystroke path (E121 §2.1), measured beside the analysis rather
+        /// than instead of it, because the item's second suspect (S5's
+        /// per-request re-parses) lives here and nowhere else.
+        burst: Duration,
+        rss_kib: usize,
+        /// Recorded-minus-reclaimed at the two entry sites: the deliberate
+        /// per-analysis leak's NET balance, which is the number that has to
+        /// stay flat for a session to stay honest.
+        entry_outstanding: isize,
+        /// The macro-expansion sites' gross bytes — the leak that PLATEAUs once
+        /// an unchanged program's expansions are cached (analysis-reuse.md §2),
+        /// carried here because a session is exactly where a plateau that is
+        /// not one would show.
+        macro_bytes: usize,
+    }
+
+    fn median(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// Drives `windows × per_window` keystrokes on one document in this
+    /// process, reporting per window. `text_at` is the edited buffer at
+    /// keystroke `i` — a distinct text each time, which is what makes every
+    /// analysis a real one rather than a cache hit.
+    fn drive(
+        label: &str,
+        text_at: impl Fn(usize) -> String,
+        entry: &Path,
+        windows: usize,
+        per_window: usize,
+    ) -> Vec<Window> {
+        let std_dir = std_root();
+        // The first analysis in a process resolves std and fills the base
+        // cache, so it is the COLD one and no window may carry it
+        // (`suite-speed.md` §2.1). It is also the document the session then
+        // edits, which is exactly how a file opens in the editor.
+
+        // ONE long-lived document for the whole session, as the server keeps
+        // one per open file. Everything a session RETAINS hangs off it — the
+        // live and analyzed line indices, the keystroke path's captured token
+        // stream, hint list, declaration stamp and symbol index, the reference
+        // index, the retained tail — so a driver that minted a fresh
+        // `Document` per keystroke would be measuring the analyzer and
+        // reporting on the server.
+        let mut document = Document::analyze_on_this_thread(&text_at(0), &std_dir, entry);
+        // A stable, real offset for the completion request: the end of the
+        // first line, which is a char boundary in every file and a position a
+        // person actually types at.
+        let completion_offset = text_at(0).find('\n').unwrap_or(0);
+
+        let mut reported = Vec::with_capacity(windows);
+        let mut keystroke = 1;
+        for index in 0..windows {
+            let mut analyses = Vec::with_capacity(per_window);
+            let mut bursts = Vec::with_capacity(per_window);
+            for _ in 0..per_window {
+                let text = text_at(keystroke);
+                keystroke += 1;
+
+                // 1. The edit reaches the LIVE snapshot at once, which is what
+                //    every request answers over until the analysis lands.
+                document.set_text(&text);
+
+                // 2. The five-provider burst, off the landed capture through
+                //    the anchor — the path the editor actually drives per
+                //    keystroke (E121 §2.1, `keystroke.rs`).
+                let burst_started = thread_cpu_now();
+                let tokens = document.keystroke_tokens(false);
+                let hints = document.keystroke_hints(false);
+                let completions = document.keystroke_completion(completion_offset, false);
+                let symbols = document.document_symbols();
+                let landed_tokens = document.semantic_tokens();
+                let burst_ended = thread_cpu_now();
+                // Read so the compiler cannot delete the work being measured.
+                std::hint::black_box((
+                    tokens.len(),
+                    hints.len(),
+                    completions.len(),
+                    symbols.len(),
+                    landed_tokens.len(),
+                ));
+
+                // 3. The debounced re-analysis, landing on the SAME document.
+                //    `adopt_analysis` is the line the session-leak claim stops
+                //    at (`leak-soak.md` §4.1): it drops the outgoing program
+                //    and gives its entry text and tree back, which is why the
+                //    outstanding balance below is a fact about a session.
+                let analyze_started = thread_cpu_now();
+                let landed = Document::analyze_on_this_thread(&text, &std_dir, entry);
+                document.adopt_analysis(landed);
+                let analyze_ended = thread_cpu_now();
+
+                let elapsed = |before: Option<Duration>, after: Option<Duration>| {
+                    before
+                        .zip(after)
+                        .map(|(before, after)| after.saturating_sub(before))
+                        .expect("this host exposes no thread CPU clock")
+                };
+                analyses.push(elapsed(analyze_started, analyze_ended));
+                bursts.push(elapsed(burst_started, burst_ended));
+            }
+            let minimum = *analyses.iter().min().expect("a non-empty window");
+            let maximum = *analyses.iter().max().expect("a non-empty window");
+            let window = Window {
+                index,
+                median: median(&mut analyses),
+                minimum,
+                maximum,
+                burst: median(&mut bursts),
+                rss_kib: rss_kib(),
+                entry_outstanding: leak_tally::outstanding(LeakSite::LspEntryText)
+                    + leak_tally::outstanding(LeakSite::EntryAst),
+                macro_bytes: leak_tally::bytes(LeakSite::MacroParseText)
+                    + leak_tally::bytes(LeakSite::MacroParseAst)
+                    + leak_tally::bytes(LeakSite::MacroExpansion),
+            };
+            let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
+            println!(
+                "E106 {{\"section\":\"session_growth\",\"corpus\":\"{label}\",\
+                 \"profile\":\"{}\",\"load\":\"{}\",\"window\":{},\"keystrokes\":{},\
+                 \"median_cpu_ms\":{:.2},\"min_cpu_ms\":{:.2},\"max_cpu_ms\":{:.2},\
+                 \"median_burst_ms\":{:.3},\"rss_kib\":{},\"entry_outstanding_bytes\":{},\
+                 \"macro_bytes\":{}}}",
+                profile(),
+                loadavg_1m(),
+                window.index,
+                keystroke - 1,
+                milliseconds(window.median),
+                milliseconds(window.minimum),
+                milliseconds(window.maximum),
+                milliseconds(window.burst),
+                window.rss_kib,
+                window.entry_outstanding,
+                window.macro_bytes,
+            );
+            reported.push(window);
+        }
+        drop(document);
+        reported
+    }
+
+    /// Writes the generated exhibit — kolt-with-lucide's SIZE, none of its
+    /// content (E121 Q6, and the owner's standing rule) — and answers the
+    /// directory plus the entry path.
+    fn exhibit(tag: &str, functions: usize) -> (PathBuf, PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e106_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(functions))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, EXHIBIT_ENTRY).expect("write the exhibit entry");
+        (directory, entry)
+    }
+
+    /// One keystroke's buffer: a trailing comment that changes every time. It
+    /// is a whole re-analysis either way (the entry is never served from a
+    /// content cache once its bytes move) and it is the one edit valid in every
+    /// file, so the same mutation drives the exhibit and a sibling checkout
+    /// alike.
+    fn keystroke_text(base: &str, keystroke: usize) -> String {
+        format!("{base}\n// keystroke {keystroke}\n")
+    }
+
+    /// The verdict a driven session produces, printed and asserted on.
+    fn verdict(label: &str, windows: &[Window]) -> f64 {
+        let first = windows.first().expect("a driven session has windows");
+        let last = windows.last().expect("a driven session has windows");
+        let ratio = last.minimum.as_secs_f64() / first.minimum.as_secs_f64();
+        println!(
+            "E106 {{\"section\":\"session_verdict\",\"corpus\":\"{label}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"windows\":{},\"first_median_ms\":{:.2},\
+             \"last_median_ms\":{:.2},\"first_min_ms\":{:.2},\"last_min_ms\":{:.2},\
+             \"growth\":{:.3},\"median_growth\":{:.3},\"bound\":{GROWTH_BOUND},\
+             \"first_burst_ms\":{:.3},\"last_burst_ms\":{:.3},\
+             \"rss_kib_first\":{},\"rss_kib_last\":{},\"entry_outstanding_last\":{}}}",
+            profile(),
+            loadavg_1m(),
+            windows.len(),
+            first.median.as_secs_f64() * 1000.0,
+            last.median.as_secs_f64() * 1000.0,
+            first.minimum.as_secs_f64() * 1000.0,
+            last.minimum.as_secs_f64() * 1000.0,
+            ratio,
+            last.median.as_secs_f64() / first.median.as_secs_f64(),
+            first.burst.as_secs_f64() * 1000.0,
+            last.burst.as_secs_f64() * 1000.0,
+            first.rss_kib,
+            last.rss_kib,
+            last.entry_outstanding,
+        );
+        ratio
+    }
+
+    /// THE PIN (E106): a session does not get slower, and its deliberate leak
+    /// does not accumulate.
+    ///
+    /// Three assertions, and the third is the one that would have caught the
+    /// reported defect at its cause rather than at its symptom:
+    /// 1. the LAST window's median analyze CPU is within [`GROWTH_BOUND`] of
+    ///    the first's;
+    /// 2. no window's median is above the bound either — a session that slows
+    ///    in the middle and recovers is still a session that slowed;
+    /// 3. the entry text/tree leak's NET outstanding balance stays within 2× of
+    ///    the first window's at every window's end. Not zero — ONE live
+    ///    document holds ONE analysis, and that is the balance — but flat:
+    ///    `adopt_analysis` drops the outgoing program and gives its text and
+    ///    tree back (`leak-soak.md` §4.1), so a session retains one analysis
+    ///    and not one per keystroke. This is E106's PRIME SUSPECT stated as a
+    ///    gate: if the reclaim ever stops reaching this seam, 2,000 keystrokes
+    ///    are 2,000 analyses of deliberate garbage and the window that catches
+    ///    it is the second one.
+    ///
+    /// Smoke-sized here so the suite runs it on every change (the shape is what
+    /// regresses, and the shape is visible in two windows); the 2,000-keystroke
+    /// session is its `#[ignore]`d sibling below.
+    #[test]
+    fn a_session_does_not_get_slower_or_leak_across_windows() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("smoke", 24);
+        let windows = on_big_stack(move || {
+            let base = EXHIBIT_ENTRY.to_string();
+            drive(
+                "exhibit_24",
+                move |keystroke| keystroke_text(&base, keystroke),
+                &entry,
+                SMOKE_WINDOWS,
+                SMOKE_WINDOW,
+            )
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let first_outstanding = windows[0].entry_outstanding;
+        assert!(
+            first_outstanding > 0,
+            "the live document holds its own analysis, so the outstanding balance cannot be \
+             zero — a zero here means the tally was read on the wrong thread and this pin is \
+             measuring nothing",
+        );
+        let first_rss = windows[0].rss_kib as f64;
+        for window in &windows {
+            assert!(
+                (window.entry_outstanding as f64) <= first_outstanding as f64 * RETENTION_BOUND,
+                "window {} closed with {} bytes of entry text/tree outstanding against the \
+                 first window's {first_outstanding} — ONE live document holds ONE analysis, so \
+                 that balance is a CONSTANT plus the edited text's own growth, and one that \
+                 tracks the keystroke count is the per-analysis leak going unreclaimed across \
+                 `adopt_analysis` (leak-soak.md §4.1): E106's prime suspect, and what a session \
+                 would accumulate without bound",
+                window.index,
+                window.entry_outstanding,
+            );
+            assert!(
+                window.rss_kib as f64 <= first_rss * RETENTION_BOUND,
+                "window {} held {} KiB resident against the first window's {} — a session that \
+                 grows in memory while holding one document is E106's report in the instrument",
+                window.index,
+                window.rss_kib,
+                windows[0].rss_kib,
+            );
+        }
+        let ratio = verdict("exhibit_24", &windows);
+        let first = windows[0].minimum.as_secs_f64();
+        for window in &windows {
+            let window_ratio = window.minimum.as_secs_f64() / first;
+            assert!(
+                window_ratio < GROWTH_BOUND,
+                "window {} of {} cost {window_ratio:.2}× the first window's cheapest analyze \
+                 CPU (bound {GROWTH_BOUND}) — the session is slowing down (E106)",
+                window.index,
+                windows.len(),
+            );
+        }
+        assert!(
+            ratio < GROWTH_BOUND,
+            "the session's last window cost {ratio:.2}× its first (bound {GROWTH_BOUND})",
+        );
+    }
+
+    /// The OTHER axis a session grows along, and the one a single-document
+    /// driver cannot see: how much a server retains PER OPEN FILE.
+    ///
+    /// A `Document` holds its whole analysis — the `Program` and the entry text
+    /// and tree it borrows, both line indices, the reference index, the
+    /// keystroke path's captured token stream, hint list and symbol index — and
+    /// the server keeps one per open document for as long as the editor has it
+    /// open. Nothing here is a leak; it is the design. The question this
+    /// answers is how big the design's constant is on a real application, which
+    /// is what turns "twelve files open" into a number.
+    ///
+    /// Reports RSS and the leak tally's outstanding balance after each open, so
+    /// the row is a curve rather than a total.
+    fn open_documents(label: &str, entries: &[PathBuf]) {
+        let std_dir = std_root();
+        let baseline = rss_kib();
+        let mut open: Vec<Document> = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let Ok(text) = std::fs::read_to_string(entry) else {
+                println!("E106-SKIP {label}: {} is not readable", entry.display());
+                continue;
+            };
+            let before = thread_cpu_now();
+            open.push(Document::analyze_on_this_thread(&text, &std_dir, entry));
+            let after = thread_cpu_now();
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            let resident = rss_kib();
+            let (in_use, retained) = heap_split_bytes().unwrap_or((-1, -1));
+            println!(
+                "E106 {{\"section\":\"open_documents\",\"corpus\":\"{label}\",\
+                 \"profile\":\"{}\",\"load\":\"{}\",\"open\":{},\"file\":\"{}\",\
+                 \"analyze_cpu_ms\":{:.2},\"rss_kib\":{},\"rss_kib_since_baseline\":{},\
+                 \"heap_in_use_kib\":{},\"heap_free_retained_kib\":{},\
+                 \"entry_outstanding_bytes\":{}}}",
+                profile(),
+                loadavg_1m(),
+                index + 1,
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                cpu.as_secs_f64() * 1000.0,
+                resident,
+                resident.saturating_sub(baseline),
+                in_use / 1024,
+                retained / 1024,
+                leak_tally::outstanding(LeakSite::LspEntryText)
+                    + leak_tally::outstanding(LeakSite::EntryAst),
+            );
+        }
+        let held = rss_kib();
+        let (held_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        drop(open);
+        // The split is the whole point of reading it here (`leak-soak.md`
+        // §7.7): if RSS stays up while IN-USE bytes fall, the memory is the
+        // allocator's to hand back and not the server's to free, and the fix
+        // is a different one entirely.
+        let (closed_in_use, closed_retained) = heap_split_bytes().unwrap_or((-1, -1));
+        println!(
+            "E106 {{\"section\":\"open_documents_released\",\"corpus\":\"{label}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"rss_kib_held\":{},\"rss_kib_after_close\":{},\
+             \"heap_in_use_kib_held\":{},\"heap_in_use_kib_after_close\":{},\
+             \"heap_free_retained_kib_after_close\":{},\"entry_outstanding_bytes\":{}}}",
+            profile(),
+            loadavg_1m(),
+            held,
+            rss_kib(),
+            held_in_use / 1024,
+            closed_in_use / 1024,
+            closed_retained / 1024,
+            leak_tally::outstanding(LeakSite::LspEntryText)
+                + leak_tally::outstanding(LeakSite::EntryAst),
+        );
+    }
+
+    /// E106's second measurement: what a session costs per OPEN FILE.
+    ///
+    /// `#[ignore]`d for its cost and because its subject is a sibling checkout:
+    /// with `VILAN_PERF_KOLT` set it opens every `.vl` file directly under that
+    /// checkout's `src/`, which is the shape of the owner's own session.
+    #[test]
+    #[ignore = "E106's per-open-document measurement: needs VILAN_PERF_KOLT, run deliberately"]
+    fn session_growth_across_open_documents() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("E106-SKIP open_documents: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        on_big_stack(move || open_documents("kolt_src", &entries));
+    }
+
+    /// The item's own session: 2,000 keystrokes, twenty windows, on the
+    /// kolt-sized generated exhibit — and on a sibling checkout's `views.vl`
+    /// when `VILAN_PERF_KOLT` points at one.
+    ///
+    /// `#[ignore]`d for its cost, like every other row of the baseline: at a
+    /// real file's per-keystroke price this is a quarter of an hour.
+    #[test]
+    #[ignore = "E106's session measurement: 2,000 analyses, run deliberately (proposal/perf-baseline.md §3)"]
+    fn session_growth_over_two_thousand_keystrokes() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("session", GATE_FUNCTIONS);
+        let windows = on_big_stack(move || {
+            let base = EXHIBIT_ENTRY.to_string();
+            drive(
+                "exhibit_1791",
+                move |keystroke| keystroke_text(&base, keystroke),
+                &entry,
+                SESSION_WINDOWS,
+                WINDOW,
+            )
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+        let ratio = verdict("exhibit_1791", &windows);
+
+        if let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) {
+            let entry = root.join("src/views.vl");
+            match std::fs::read_to_string(&entry) {
+                Ok(base) => {
+                    let sibling = on_big_stack(move || {
+                        drive(
+                            "kolt_views",
+                            move |keystroke| keystroke_text(&base, keystroke),
+                            &entry,
+                            SESSION_WINDOWS,
+                            WINDOW,
+                        )
+                    });
+                    verdict("kolt_views", &sibling);
+                }
+                Err(error) => println!("E106-SKIP kolt_views: {} ({error})", entry.display()),
+            }
+        } else {
+            println!("E106-SKIP kolt_views: VILAN_PERF_KOLT is not set");
+        }
+
+        assert!(
+            ratio < GROWTH_BOUND,
+            "the 2,000-keystroke session's last window cost {ratio:.2}× its first \
+             (bound {GROWTH_BOUND})",
+        );
+    }
+}
+
+/// M58 — the WARM re-analysis profile, and the driver that takes it.
+///
+/// Every lane profile in this tree so far has used the COLD shape: one process,
+/// one analysis, `vilan check` from the outside. That is the right subject for
+/// a build and the wrong one for an editor, where the base world is already
+/// resolved, the parse caches are full, and the only new thing in the process
+/// is the entry's own bytes — which is the keystroke path, and where the owner
+/// spends the day. The two shapes profile differently enough that M58 exists to
+/// say so: `post_analysis_passes` is 62.7% of a warm analysis (57.1% after M53)
+/// and nothing like that share of a cold one.
+///
+/// The driver is a COLD analysis followed by a WARM one in the same process,
+/// with the warm half behind [`warm_reanalysis`] — an `#[inline(never)]` frame
+/// that exists for exactly one reason: it is the symbol callgrind toggles
+/// collection on, so the profile contains the warm analysis and not the cold
+/// one that filled the caches for it.
+///
+/// Take a profile (the `profiling` profile is release + symbols, root
+/// `Cargo.toml`):
+///
+/// ```text
+/// cargo build --profile profiling -p vilan-lsp --tests
+/// valgrind --tool=callgrind --collect-atstart=no \
+///     --toggle-collect='*warm_reanalysis*' --callgrind-out-file=warm.out \
+///     <the test binary> --exact --ignored --nocapture \
+///     document::warm_profile::m58_warm_reanalysis_profile
+/// callgrind_annotate --auto=no --inclusive=yes warm.out | head -40
+/// ```
+///
+/// `VILAN_M58_ENTRY` names the entry to profile — a sibling checkout's
+/// `src/client.vl`, say. Absent, the driver profiles the generated exhibit, so
+/// the instrument is runnable with nothing else on the machine (the owner's
+/// standing rule: a sibling checkout is evidence, never a fixture).
+///
+/// `VILAN_PHASE_TIMING=1` on the same run prints the analyzer's own phase line
+/// for both halves, which is the cross-check a callgrind reading wants: Ir
+/// attributes to symbols, the phase line attributes to PASSES, and a profile
+/// whose two readings disagree about which pass dominates is a profile of the
+/// wrong process.
+///
+/// ## The warm profile, 2026-09-11 (kolt's `client.vl`, `profiling`, callgrind)
+///
+/// 3,635,194,953 Ir for one warm re-analysis. The top five, by INCLUSIVE Ir —
+/// and the entries callgrind marks `'2` are left out of the ranking, because
+/// inclusive cost double-counts a recursive function (`Interpreter::eval'2`
+/// reads 143.6% of the program total):
+///
+/// | | | Ir | share |
+/// |-|-|-|-|
+/// | 1 | `post_analysis_passes` (lib.rs) | 1,856,489,029 | 51.07% |
+/// | 2 | `analyzer::analyze_cancellable` | 1,099,268,791 | 30.24% |
+/// | 3 | `const_eval::evaluate` (inside 1) | 827,668,479 | 22.77% |
+/// | 4 | `context::thread_contexts` (inside 1) | 468,847,124 | 12.90% |
+/// | 5 | `async_infer::infer` (inside 1) | 376,042,827 | 10.34% |
+///
+/// then `call_graph::Collector::walk` 357,110,799 (9.82%),
+/// `dispatch_refine::refined_edges` 344,848,848 (9.49%),
+/// `Program::source_of` 262,380,207 (7.22%) and `Document::semantic_tokens`
+/// 258,348,201 (7.11%). M58's own headline reproduces: the post-passes are the
+/// warm analysis's majority, where a COLD profile is dominated by the analyzer.
+///
+/// **What this lane took off the table.** The eighth and ninth rows were the
+/// same row: `semantic_tokens` was 98% `Program::source_of`, which is a LINEAR
+/// scan of `source_ranges` asked once per entity of every whole-program table —
+/// 426,198 calls in one analysis, against about sixty ranges. M27 had already
+/// built the answer (`Program::source_lookup`, a verified binary search that
+/// falls back to the scan rather than assume ranges are disjoint) and this
+/// table never took it. Hoisted: `semantic_tokens` 258,348,201 → 25,518,527 Ir,
+/// `source_of` across the whole analysis 262,380,207 → 7,548,684, and the WARM
+/// RE-ANALYSIS 3,635,194,953 → 3,401,139,236 Ir, **−6.44%**. The residue is
+/// `vilan_ide::completion::CompletionIndex::build`, which asks the same
+/// question 14,580 times for 7.5 M Ir — another lane's file, filed rather than
+/// taken.
+#[cfg(all(test, target_os = "linux"))]
+mod warm_profile {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use crate::keystroke::gate::{
+        EXHIBIT_ENTRY, GATE_FUNCTIONS, exhibit_module, loadavg_1m, process_cpu_now, profile,
+    };
+    use std::time::Duration;
+
+    /// THE PROFILED FRAME. `#[inline(never)]` so the symbol survives release
+    /// codegen and callgrind can toggle on it; it does one warm analysis and
+    /// nothing else, so everything inside the toggle is the thing being
+    /// measured.
+    #[inline(never)]
+    fn warm_reanalysis(text: &str, std_dir: &Path, entry: &Path) -> Duration {
+        let before = process_cpu_now();
+        let document = Document::analyze_on_this_thread(text, std_dir, entry);
+        let after = process_cpu_now();
+        // Dropped inside the frame: a superseded analysis is released in the
+        // server, and the release is part of what a keystroke costs.
+        drop(document);
+        before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default()
+    }
+
+    /// The cold half — named too, so a profile taken with the toggle OFF can
+    /// tell the two apart in one run.
+    #[inline(never)]
+    fn cold_analysis(text: &str, std_dir: &Path, entry: &Path) -> Duration {
+        let before = process_cpu_now();
+        drop(Document::analyze_on_this_thread(text, std_dir, entry));
+        let after = process_cpu_now();
+        before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default()
+    }
+
+    fn report(corpus: &str, phase: &str, cpu: Duration) {
+        println!(
+            "M58 {{\"section\":\"warm_profile\",\"corpus\":\"{corpus}\",\"phase\":\"{phase}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"cpu_ms\":{:.2}}}",
+            profile(),
+            loadavg_1m(),
+            cpu.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// The subject: a sibling checkout's entry when `VILAN_M58_ENTRY` names
+    /// one, else the generated kolt-sized exhibit written to a temp directory.
+    fn subject() -> (Option<PathBuf>, PathBuf, String) {
+        if let Some(entry) = std::env::var_os("VILAN_M58_ENTRY").map(PathBuf::from) {
+            let text = std::fs::read_to_string(&entry)
+                .unwrap_or_else(|error| panic!("VILAN_M58_ENTRY {}: {error}", entry.display()));
+            return (None, entry, text);
+        }
+        let directory = std::env::temp_dir().join(format!("vilan_m58_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(GATE_FUNCTIONS))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, EXHIBIT_ENTRY).expect("write the exhibit entry");
+        (Some(directory), entry, EXHIBIT_ENTRY.to_string())
+    }
+
+    #[test]
+    #[ignore = "M58's warm re-analysis profile: run under callgrind (the module docs give the command)"]
+    fn m58_warm_reanalysis_profile() {
+        let _guard = base_cache_guard();
+        let (directory, entry, text) = subject();
+        let corpus = entry.display().to_string();
+        let (cold, warm) = on_big_stack(move || {
+            let std_dir = std_root();
+            let cold = cold_analysis(&text, &std_dir, &entry);
+            // The edit: a trailing comment, so the entry's bytes move and the
+            // analysis is a real one rather than a cache hit — the same
+            // mutation E106's session driver uses, for the same reason.
+            let edited = format!("{text}\n// warm keystroke\n");
+            let warm = warm_reanalysis(&edited, &std_dir, &entry);
+            (cold, warm)
+        });
+        if let Some(directory) = directory {
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+        report(&corpus, "cold", cold);
+        report(&corpus, "warm", warm);
+        assert!(
+            warm > Duration::ZERO,
+            "the warm analysis measured zero CPU — the clock is not measuring the work",
+        );
     }
 }
 

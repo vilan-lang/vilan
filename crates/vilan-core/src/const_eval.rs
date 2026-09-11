@@ -400,6 +400,55 @@ pub fn directory_input_hash(directory: &Path) -> Option<u64> {
     Some(crate::content_hash(&names.join("\n")))
 }
 
+/// The content key ONE tracked build input is recorded and re-verified by, over
+/// the bytes the recording side already holds — the RECORDING half of the pair
+/// [`tracked_input_hash`] completes (tracker B276).
+///
+/// Text if the file decodes as UTF-8 (BOM dropped, `windows-support.md` §2),
+/// bytes otherwise. The rule is a function of the FILE and of nothing else,
+/// which is the whole point: the watch loop is handed a path and no memory of
+/// which const verb touched it, so a hash that depended on the verb could never
+/// be recomputed there. That is exactly what B276 was — `asset::bundle`
+/// recorded `content_hash_bytes(&bytes)` while the watch loop re-hashed with
+/// `read_source` + `content_hash`, the two disagreed on every file (they
+/// disagree even on plain ASCII: `str`'s hash terminates with `0xff` where a
+/// byte slice's is length-prefixed), and a leg that bundled anything could
+/// never be `Fresh`.
+///
+/// The text arm and not bytes throughout, because a `.vl` module's recorded
+/// hash is `content_hash` of the text the compiler consumed
+/// (`Program.source_hashes`) and the same map holds both: one rule that already
+/// agrees with the module rows beats two rules that agree with neither.
+pub fn tracked_input_hash_of_bytes(bytes: &[u8]) -> u64 {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => crate::content_hash(crate::util::strip_bom(text)),
+        Err(_) => crate::content_hash_bytes(bytes),
+    }
+}
+
+/// The content key a tracked build input re-hashes to RIGHT NOW — the
+/// VERIFYING half, and the one function the watch loop's per-leg skip decision
+/// asks its question with (`hmr::leg_is_current`).
+///
+/// A recorded input that is a DIRECTORY re-hashes as its listing
+/// (`asset::read_dir`, const-eval.md §3.1), so a file appearing or vanishing in
+/// a listed tree fails the compare. Everything else goes through
+/// [`tracked_input_hash_of_bytes`], which is what makes the answer here and the
+/// answer recorded at compile time the same answer by construction — the
+/// invariant `hashing_agrees_between_the_recording_side_and_the_watch_side`
+/// pins, including for a `.vl` module row, whose `content_hash` of the
+/// compiler's text is the text arm's answer for the same file.
+///
+/// `None` — deleted, unreadable — disqualifies the skip by construction.
+pub fn tracked_input_hash(path: &Path) -> Option<u64> {
+    if path.is_dir() {
+        return directory_input_hash(path);
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| tracked_input_hash_of_bytes(&bytes))
+}
+
 impl ProjectReader {
     /// Points every fact recorded from here on at `site` — the `const`
     /// expression whose evaluation is about to run.
@@ -436,7 +485,15 @@ impl interpreter::AssetReader for ProjectReader {
         let resolved = self.root.join(requested);
         match crate::util::read_source(&resolved) {
             Ok(text) => {
-                self.track(resolved, Some(crate::content_hash(&text)), "asset::read");
+                // Through the one rule, over the text's own bytes — which is
+                // `content_hash(&text)` for anything `read_source` can return,
+                // and says so at the site rather than leaving a reader to
+                // re-derive that the two agree (B276).
+                self.track(
+                    resolved,
+                    Some(tracked_input_hash_of_bytes(text.as_bytes())),
+                    "asset::read",
+                );
                 Ok(text)
             }
             Err(error) => {
@@ -486,7 +543,7 @@ impl interpreter::AssetReader for ProjectReader {
             Ok(bytes) => {
                 self.track(
                     resolved.clone(),
-                    Some(crate::content_hash_bytes(&bytes)),
+                    Some(tracked_input_hash_of_bytes(&bytes)),
                     function,
                 );
             }
@@ -577,7 +634,7 @@ impl interpreter::AssetReader for ProjectReader {
             Ok(bytes) => {
                 self.track(
                     resolved,
-                    Some(crate::content_hash_bytes(&bytes)),
+                    Some(tracked_input_hash_of_bytes(&bytes)),
                     "asset::digest",
                 );
                 let mut hasher = Sha256::new();
@@ -639,6 +696,8 @@ impl ProjectReader {
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
+        // [`directory_input_hash`]'s rule, over the listing already in hand —
+        // spelled out here rather than re-listing the directory to ask it.
         self.track(
             directory.to_path_buf(),
             Some(crate::content_hash(&names.join("\n"))),
