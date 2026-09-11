@@ -125,7 +125,11 @@ impl Length {
 
 	/// The typed end of the dynamic-value channel: pairs with
 	/// `view.style_var(name, signal)` writing the custom property at runtime.
+	/// The name is the custom property's own, dashes included — checked at const
+	/// time, because `var(w)` is a dropped declaration rather than an error
+	/// anywhere a browser can tell you about it.
 	fun var(name: str): Length {
+		check_custom_property_name(name);
 		Length { text = i"var({name})", root = "" }
 	}
 }
@@ -196,8 +200,10 @@ impl Color {
 	/// block, or `view.style_var(name, signal)` writing it at runtime.
 	/// `.alpha()` composes over it through the relative-colour form,
 	/// `rgb(from var(..) r g b / a)`, so a variable-backed colour
-	/// translucifies exactly like a ramp token.
+	/// translucifies exactly like a ramp token. The name carries its dashes, and
+	/// `Length::var`'s const-time check is the same one.
 	fun var(name: str): Color {
+		check_custom_property_name(name);
 		Color { text = i"var({name})", root = "" }
 	}
 
@@ -337,6 +343,23 @@ fun check_attribute_value(value: str) {
 	for banned in ["\"", "'", " ", ":"] {
 		if value.contains(banned) {
 			panic(i"an attribute value cannot contain '{banned}' (got \"{value}\") — a styling hook's value is one token, like \"true\"");
+		}
+	}
+}
+
+/// A CSS custom property is spelled with its two leading dashes — that is what
+/// makes it one (A90). `var(button-color)` is not a broken reference, it is not
+/// a reference at all: `button-color` parses as a keyword, the declaration is
+/// dropped, and nothing says so until the page renders wrong. The fence is the
+/// attribute name's, plus the dashes: no space, quote or `:`, since those
+/// delimit the `var()` call and the declaration around it.
+fun check_custom_property_name(name: str) {
+	if !name.starts_with("--") || name.len() < 3 {
+		panic(i"a custom property is written with its dashes — var(\"--button-color\"), not var(\"{name}\")");
+	}
+	for banned in ["\"", "'", " ", ":"] {
+		if name.contains(banned) {
+			panic(i"a custom property name cannot contain '{banned}' (got \"{name}\") — the name is one token, like --button-color");
 		}
 	}
 }

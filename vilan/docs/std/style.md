@@ -74,7 +74,11 @@ colour.
 `Color::var` is `Length::var`'s counterpart — the typed end of the
 dynamic-value channel. It renders `var(--name)` and **declares nothing**:
 the app owns the custom property's declaration (its emitted theme block,
-or `view.style_var` writing it at runtime). `.alpha()` composes over it
+or `view.style_var` writing it at runtime). Both spell the name with its
+**two leading dashes**, and both refuse one without them at const time:
+`var(button-color)` is not a broken reference, it is not a reference —
+`button-color` parses as a keyword, the browser drops the declaration, and
+nothing says so until the page is wrong. `.alpha()` composes over it
 through the same relative-colour form, so a variable-backed colour
 translucifies exactly like a ramp token.
 

@@ -1966,6 +1966,113 @@ fn color_var_references_without_declaring() {
     );
 }
 
+/// A90: a custom property is spelled with its two leading dashes, and a name
+/// without them is refused at const time on both `var`s. `var(button-color)` is
+/// the failure that has no other detector — `button-color` parses as a keyword,
+/// the browser drops the declaration, and the page is simply wrong.
+#[test]
+fn a_custom_property_reference_without_its_dashes_fails_the_build() {
+    for program in [
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::var("button-color"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style().width(Length::var("w"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    ] {
+        let diagnostics = failure_diagnostics(program);
+        assert!(
+            diagnostics.iter().any(
+                |(message, _)| message.contains("a custom property is written with its dashes")
+            ),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+/// A bare `--` names nothing, and the same message says so.
+#[test]
+fn a_custom_property_named_only_dashes_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::var("--"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("a custom property is written with its dashes")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The name's fence is the attribute name's: a space, a quote or a `:` would
+/// run past the `var()` call it is written into.
+#[test]
+fn a_custom_property_name_with_a_delimiter_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::var("--button color"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("a custom property name cannot contain ' '")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The control: a name WITH its dashes renders exactly as it always did, on
+/// both types, so the check costs the shipped spelling nothing.
+#[test]
+fn a_dashed_custom_property_reference_still_renders() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style()
+                .background(Color::var("--button-color"))
+                .width(Length::var("--w"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in ["{background-color:var(--button-color)}", "{width:var(--w)}"] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
 /// `Color::oklch` (item 013): the perceptual literal, emitted in the CSS
 /// number form — space-joined components, the hue a bare degree count — with
 /// `.alpha()` composing through the relative form like over any colour.

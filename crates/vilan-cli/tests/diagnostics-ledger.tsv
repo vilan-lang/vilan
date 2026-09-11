@@ -446,3 +446,5 @@ NEW	-	this style carries an unwrapped not(..): `not` marks the condition immedia
 NEW	-	not(not(..)) — a double negation is a spelling mistake rather than a cancellation: drop both, or negate the condition you meant
 NEW	-	a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead
 NEW	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's negation marker; write not(..) inside the condition you want negated
+NEW	-	a custom property is written with its dashes — var("--button-color"), not var("{name}")
+NEW	-	a custom property name cannot contain {...} — the name is one token, like --button-color
