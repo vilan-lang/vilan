@@ -7234,6 +7234,15 @@ impl<'src> Analyzer<'src> {
     /// means the SUBJECT at an impl. Without that substitution
     /// `impl Bag with Combine` and `impl Bag with Combine<Bag>` would compare as
     /// different instantiations of the one they both are.
+    ///
+    /// B307's boundary, stated because the padding reads as wider than it is:
+    /// a NON-defaulted position left unwritten is refused at the clause
+    /// (B273's recording site, B188's message) and the whole clause is then
+    /// checked no further, so what this pads for such a position — the trait's
+    /// own declared parameter — is only ever read by the duplicate-impl
+    /// comparison, where two clauses refused the same way must still compare as
+    /// the same instantiation rather than reporting a second time. It is not a
+    /// reading the type checker acts on, and nothing is admitted by it.
     fn effective_trait_arguments(&self, site: &TraitImplSite) -> Vec<TypeId> {
         self.effective_trait_arguments_of(site.trait_id, &site.arguments, site.subject)
     }
@@ -7266,7 +7275,9 @@ impl<'src> Analyzer<'src> {
             )
             .chain(
                 // A clause that wrote MORE arguments than the trait declares is
-                // already an arity error elsewhere; keep them so two such
+                // an arity error at the clause itself (B188's message through
+                // B273's recording site — the claim this comment made was
+                // false until then, and true since); keep them so two such
                 // clauses still compare by what they wrote.
                 written_arguments
                     .iter()
@@ -41185,6 +41196,27 @@ impl<'src> Analyzer<'src> {
                         check.source_id,
                         anchor_type_id,
                     );
+                    // B307: and NOTHING else is checked against this clause.
+                    // Conformance is a question about an INSTANTIATION —
+                    // `Holder<Dog>` requires `fun held(self): Dog`,
+                    // `Holder<Cat>` requires `Cat` — and a clause whose arity
+                    // is wrong has not named one, so every answer below would
+                    // be read off `effective_trait_arguments_of`'s padding
+                    // rather than off anything the author wrote. It showed:
+                    // `impl DogBox with Holder` over `trait Holder<type T>`
+                    // reported the arity error AND "`DogBox`'s `held` returns
+                    // `Dog`, but `Holder` declares `T`" — a mismatch against
+                    // the trait's own parameter, which no impl could ever
+                    // satisfy and which restates the missing argument in a
+                    // vocabulary that hides it. One written clause is one
+                    // report, which is B188's rule and the reason the bound
+                    // check beside this already stands down.
+                    //
+                    // `impl .. with Drop` is the one recording skipped here
+                    // that is not a diagnostic, and it cannot be reached: the
+                    // trait declares no parameters, so its clause has no arity
+                    // to get wrong.
+                    continue;
                 }
                 (None, Some(anchor_type_id)) => {
                     self.written_nominal_bound_sites.push((
