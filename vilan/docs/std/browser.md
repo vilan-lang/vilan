@@ -288,11 +288,12 @@ Semantics, choosing between `show`/`when`/`swap`, and examples: the
 **`Region` — how a reactive child keeps its place.**
 
 ```vilan,fragment
-struct Region { parent: Element, anchor: Text }
+struct Region { parent: Element, anchor: Text, live: Shared<List<View>> }
 impl Region {
-	fun open(parent: View): Region   // plant the anchor at the parent's current end
-	fun insert(self, child: View)    // before the anchor — a live child MOVES
-	fun close(self)                  // drop the anchor
+	fun open(parent: View): Region       // plant the anchor at the parent's current end
+	fun insert(self, child: View)        // before the anchor — a live child MOVES
+	fun hold(self, live: List<View>)     // the run that is live now, for close
+	fun close(self)                      // remove the live run, then the anchor
 }
 ```
 
@@ -303,6 +304,11 @@ planted at that moment — and inserts its content before that anchor, so the
 run keeps its position however the chain grows afterwards. You rarely name
 this type; it is documented because the anchor is real, and because a walk
 over `element.children` will meet it.
+
+Disposal takes the region OUT of the document — every live node, then the
+anchor. That is invisible when the subtree was leaving with its parent, and
+it is the whole point for a **portal**, whose container outlives the boundary
+that filled it: nothing is left to remove by hand.
 
 The anchor is an empty text node rather than a comment deliberately: it
 serializes to nothing, so a browser tree and the `@process` twin's HTML string

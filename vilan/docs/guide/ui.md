@@ -555,6 +555,20 @@ is why there is no unsubscribe code anywhere in a Vilan app: the tree of
 boundaries *is* the cleanup logic, and the framework already placed
 them where subtrees end.
 
+**A boundary also removes what it placed.** Disposing it takes the
+nodes out of the document: `when`'s body, `swap`'s subtree,
+`bind_each`'s rows, a `{signal}` child's view or run or text node, and
+the invisible marker each of them keeps its position with. That is
+usually invisible — the subtree was leaving with its parent anyway —
+and it is the whole story for a **portal**, a container that outlives
+the boundary filling it: an overlay, a tooltip layer, a modal host
+mounted once at the top of the page. Fill one from a component's
+boundary, dispose the component, and the container is empty; there is
+nothing to remember to clean up by hand. The three **static** child
+arms are untouched, deliberately: a `str`, a `View` or a `List<View>`
+child belongs to the parent element it was appended to, not to a
+boundary.
+
 ## Server-side rendering
 
 The same component code runs on the server. On a Node build `std::ui`

@@ -423,12 +423,19 @@ function clear_chunk_error($bL) {
 function open(parent) {
 	const anchor = document.createTextNode("");
 	parent[0].appendChild(anchor);
-	return [ __clone(parent[0]), anchor ];
+	return [ __clone(parent[0]), anchor, __shared_new([  ]) ];
 }
 function insert(self, child) {
 	self[0].insertBefore(child[0], self[1]);
 }
+function hold(self, live) {
+	self[2].v = __clone(live);
+}
 function close(self) {
+	for (const view2 of self[2].v) {
+		view2[0].remove();
+	}
+	self[2].v = [  ];
 	self[1].remove();
 }
 function place(self, parent) {
@@ -823,6 +830,7 @@ function $bk(self, source, render, $bl, $bm) {
 				return render(value, $bE);
 			});
 			insert(region, built2);
+			hold(region, [ __clone(built2) ]);
 			last_value.v = [ 0, __clone(value) ];
 			live_view.v = [ 0, built2 ];
 			live_owner.v = [ 0, owner ];

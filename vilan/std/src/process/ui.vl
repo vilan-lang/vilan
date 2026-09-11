@@ -403,7 +403,15 @@ impl Region {
 		self.parent.children.write().push(Child::Element(child));
 	}
 
-	/// Drops the anchor — there is none to drop.
+	/// Records the live run — accepted and dropped, like the event binders'
+	/// handlers. A88 exists because a browser boundary can be disposed while
+	/// its parent survives; a server render has no disposal and no later
+	/// change to survive, so there is nothing to remember. KEEP IN STEP with
+	/// the browser twin (browser/ui.vl).
+	fun hold(self, live: List<View>) {}
+
+	/// Drops the anchor — there is none to drop, and no live content to take
+	/// out of a document that does not exist yet (A88). KEEP IN STEP.
 	fun close(self) {}
 }
 
