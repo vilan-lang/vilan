@@ -193,6 +193,12 @@ impl CompletionItem {
             is_snippet = true;
             boost = -9;
         }
+        // A plain insertion (E160's `name = `): the text, no ranking change —
+        // a struct-initializer field is the only thing offered at its position.
+        if let Some(plain) = completion.insert {
+            insert = plain.text;
+            is_snippet = plain.is_snippet;
+        }
         let import_edit = completion.needs_import.map(|auto_import| {
             detail = Some(auto_import.module_path.join("::"));
             boost = -(1 + i32::from(auto_import.origin_tier));

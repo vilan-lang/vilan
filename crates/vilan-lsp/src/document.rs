@@ -10192,6 +10192,295 @@ pub(crate) mod tests {
         assert!(labels.contains(&"sum".to_string()), "methods: {labels:?}");
     }
 
+    // --- E160: completion inside a STRUCT INITIALIZER -----------------------
+    //
+    // The position `KoltStore { us▮` used to fall to `Expression` and list
+    // every binding in scope, which is the one list that cannot be right
+    // there: the author is writing a FIELD name. Each pin below is one clause
+    // of the recognizer (`completion.rs::struct_initializer_head`) or one of
+    // the two lists that used to be confused.
+
+    /// The E160 exhibit, kolt's `store.vl:265` in miniature: a struct whose
+    /// fields have same-named module bindings, so the shorthand applies to
+    /// four of five.
+    const INITIALIZER_PRELUDE: &str = "struct Point {\n\
+         \t/// The abscissa.\n\
+         \tx: i32,\n\
+         \ty: i32,\n\
+         }\n\
+         impl Point { fun sum(self): i32 { self.x + self.y } }\n";
+
+    fn initializer_items(body: &str) -> Vec<Completion> {
+        completion_items_at_cursor(&format!("{INITIALIZER_PRELUDE}fun main() {{\n{body}}}\n"))
+    }
+
+    fn initializer_labels(body: &str) -> Vec<String> {
+        initializer_items(body)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    #[test]
+    fn struct_initializer_completion_lists_the_struct_fields() {
+        let labels = initializer_labels("\tlet start = 1;\n\tlet p = Point { |\n");
+        assert_eq!(labels, vec!["x".to_string(), "y".to_string()], "{labels:?}");
+    }
+
+    // The defect itself: not one binding, keyword or snippet from the
+    // enclosing scope may appear at a field position.
+    #[test]
+    fn struct_initializer_completion_offers_no_scope_name() {
+        let labels = initializer_labels("\tlet start = 1;\n\tlet p = Point { |\n");
+        for absent in ["start", "main", "sum", "let", "Point"] {
+            assert!(
+                !labels.contains(&absent.to_string()),
+                "`{absent}` is not a field: {labels:?}"
+            );
+        }
+    }
+
+    // The fields already written are gone from the list — the whole point of
+    // reading the initializer's own token run.
+    #[test]
+    fn struct_initializer_completion_drops_the_written_fields() {
+        let labels = initializer_labels("\tlet p = Point { x = 1, |\n");
+        assert_eq!(labels, vec!["y".to_string()], "{labels:?}");
+    }
+
+    // …including one written AFTER the cursor: the walk runs to the closing
+    // brace, not to the cursor.
+    #[test]
+    fn struct_initializer_completion_drops_a_field_written_after_the_cursor() {
+        let labels = initializer_labels("\tlet p = Point { |, y = 2 };\n");
+        assert_eq!(labels, vec!["x".to_string()], "{labels:?}");
+    }
+
+    // The field being RETYPED is still a candidate — its own partial name is
+    // the prefix the editor filters by, not a "written" field.
+    #[test]
+    fn struct_initializer_completion_keeps_the_field_being_retyped() {
+        let labels = initializer_labels("\tlet p = Point { |x };\n");
+        assert!(labels.contains(&"x".to_string()), "{labels:?}");
+    }
+
+    // Accepting a candidate writes the `=` the author would type next.
+    #[test]
+    fn struct_initializer_completion_inserts_the_assignment() {
+        let x = initializer_items("\tlet p = Point { |\n")
+            .into_iter()
+            .find(|completion| completion.label == "x")
+            .expect("`x` offered");
+        assert_eq!(x.insert.map(|insert| insert.text), Some("x = ".to_string()));
+    }
+
+    // The shorthand: with a binding of the same name in scope, `Point { x }`
+    // IS `Point { x = x }`, so the bare label is the insertion. This is the
+    // one place the two lists E160 confused genuinely overlap.
+    #[test]
+    fn struct_initializer_completion_inserts_the_shorthand_over_a_binding_in_scope() {
+        let items = initializer_items("\tlet x = 1;\n\tlet p = Point { |\n");
+        let x = items
+            .iter()
+            .find(|completion| completion.label == "x")
+            .expect("`x` offered");
+        let y = items
+            .iter()
+            .find(|completion| completion.label == "y")
+            .expect("`y` offered");
+        assert!(x.insert.is_none(), "shorthand: {:?}", x.insert);
+        assert_eq!(
+            y.insert.as_ref().map(|insert| insert.text.clone()),
+            Some("y = ".to_string()),
+            "no binding named `y`"
+        );
+    }
+
+    // The popup's detail line is the field's declared type, and its
+    // documentation the field's own `///` first paragraph.
+    #[test]
+    fn struct_initializer_completion_details_the_field_type_and_doc() {
+        let items = initializer_items("\tlet p = Point { |\n");
+        let x = items
+            .iter()
+            .find(|completion| completion.label == "x")
+            .expect("`x` offered");
+        assert_eq!(x.kind, CompletionKind::Field);
+        assert_eq!(x.detail.as_deref(), Some("i32"));
+        assert_eq!(x.documentation.as_deref(), Some("The abscissa."));
+    }
+
+    // A VALUE position is not a field position: past the `=`, the ordinary
+    // scope gatherer answers again.
+    #[test]
+    fn struct_initializer_value_position_completes_the_scope() {
+        let labels = initializer_labels("\tlet start = 1;\n\tlet p = Point { x = |\n");
+        assert!(labels.contains(&"start".to_string()), "{labels:?}");
+    }
+
+    // …and a `.` inside a value still completes members (the member trigger
+    // outranks this context deliberately).
+    #[test]
+    fn struct_initializer_value_position_completes_members() {
+        let labels =
+            initializer_labels("\tlet q = Point { x = 1, y = 2 };\n\tlet p = Point { x = q.|\n");
+        assert!(labels.contains(&"sum".to_string()), "{labels:?}");
+    }
+
+    // An `=` in an EARLIER field says nothing about the run the cursor is in.
+    #[test]
+    fn struct_initializer_completion_reads_only_the_cursors_own_run() {
+        let labels = initializer_labels("\tlet p = Point { x = 1 + 2, |\n");
+        assert_eq!(labels, vec!["y".to_string()], "{labels:?}");
+    }
+
+    // A nested initializer resolves to the INNER struct — the walk stops at
+    // the innermost unclosed brace.
+    #[test]
+    fn struct_initializer_completion_resolves_the_inner_struct() {
+        let labels = completions_at_cursor(
+            "struct Inner { depth: i32 }\n\
+             struct Outer { inner: Inner, tag: str }\n\
+             fun main() {\n\tlet o = Outer { inner = Inner { | } };\n}\n",
+        );
+        assert_eq!(labels, vec!["depth".to_string()], "{labels:?}");
+    }
+
+    // A generic struct answers through its DECLARATION: the written arguments
+    // play no part in which field names exist.
+    #[test]
+    fn struct_initializer_completion_reads_a_generic_head_through_the_declaration() {
+        let labels = completions_at_cursor(
+            "struct Holder<T> { value: T, tag: str }\n\
+             fun main() {\n\tlet h = Holder<i32> { |\n}\n",
+        );
+        assert_eq!(
+            labels,
+            vec!["value".to_string(), "tag".to_string()],
+            "{labels:?}"
+        );
+    }
+
+    // An ordinary block whose head is a name is not an initializer — the head
+    // has to NAME a struct.
+    #[test]
+    fn struct_initializer_completion_declines_a_plain_block() {
+        let labels = initializer_labels("\tlet start = 1;\n\tst|\n");
+        assert!(labels.contains(&"start".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"y".to_string()), "{labels:?}");
+    }
+
+    // The two shapes whose head DOES name a struct and still are not
+    // initializers: the declaration and the impl block.
+    #[test]
+    fn struct_initializer_completion_declines_a_struct_declaration() {
+        let labels = completions_at_cursor("fun other() {}\nstruct Point {\n\tx: i32,\n\t|\n}\n");
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn struct_initializer_completion_declines_an_impl_block() {
+        let labels = completions_at_cursor(
+            "struct Point { x: i32 }\nfun other() {}\nimpl Point {\n\t|\n}\n",
+        );
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // A `;` at the field list's own depth means the brace is a block, whatever
+    // its head is called — the mid-edit shape where a stray statement lands
+    // inside what looked like a field list.
+    #[test]
+    fn struct_initializer_completion_declines_a_block_holding_a_statement() {
+        let labels = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\
+             fun other() {}\n\
+             fun main() {\n\tlet p = Point {\n\t\tlet a = 1;\n\t\t|\n}\n",
+        );
+        assert!(!labels.contains(&"y".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // A RETURN TYPE that names the struct: `fun store_for(…): KoltStore {`
+    // (kolt `store.vl:263`) is a function body, and its first line is the
+    // initializer this whole context exists for — offering the fields one line
+    // too early is the same defect facing the other way.
+    #[test]
+    fn struct_initializer_completion_declines_a_return_type_head() {
+        let labels = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\
+             fun other() {}\n\
+             fun make(): Point {\n\toth|\n}\n",
+        );
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // …and the qualified spelling of the same trap, which one token of
+    // lookahead cannot tell from a qualified initializer.
+    #[test]
+    fn struct_initializer_completion_declines_a_qualified_return_type_head() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::shapes;\n\
+                 fun other() {}\n\
+                 fun make(): shapes::Dot {\n\toth|\n}\n",
+            ),
+            ("src/shapes.vl", "export struct Dot { x: i32, y: i32 }\n"),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // The qualified INITIALIZER still answers (B190's spelling).
+    #[test]
+    fn struct_initializer_completion_reads_a_qualified_head() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::shapes;\n\
+                 fun main() {\n\tlet d = shapes::Dot { |\n}\n",
+            ),
+            ("src/shapes.vl", "export struct Dot { x: i32, y: i32 }\n"),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert_eq!(labels, vec!["x".to_string(), "y".to_string()], "{labels:?}");
+    }
+
+    // The exhibit's own shape (kolt `store.vl:265`): a multi-line list, one
+    // assigned field and three shorthands, the cursor on a fresh line.
+    #[test]
+    fn struct_initializer_completion_over_the_kolt_shape() {
+        let items = completion_items_at_cursor(
+            "struct Store {\n\tuser: str,\n\tchannels: i32,\n\tmessages: i32,\n\ttag: str,\n}\n\
+             let channels = 1;\nlet messages = 2;\n\
+             fun store_for(name: str): Store {\n\
+             \tStore {\n\t\tuser = name,\n\t\tchannels,\n\t\t|\n\t}\n}\n",
+        );
+        let labels: Vec<String> = items
+            .iter()
+            .map(|completion| completion.label.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["messages".to_string(), "tag".to_string()],
+            "{labels:?}"
+        );
+        let messages = &items[0];
+        assert!(
+            messages.insert.is_none(),
+            "a module binding named `messages` is in scope: {:?}",
+            messages.insert
+        );
+        assert_eq!(
+            items[1].insert.as_ref().map(|insert| insert.text.clone()),
+            Some("tag = ".to_string())
+        );
+    }
+
     #[test]
     fn member_completion_on_incomplete_receiver() {
         // The realistic moment: `p.` typed with nothing after it yet.

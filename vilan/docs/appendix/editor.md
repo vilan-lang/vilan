@@ -119,6 +119,14 @@ Where the cursor is decides what is offered.
   method `ListIterator`'s own `impl` block writes out, and a type that
   implements `Ord` offers `min`/`max`/`clamp` with the comparisons its
   supertraits provide.
+- **Inside a struct initializer** — `Point { ` — offers that struct's
+  **fields**, and nothing that is merely in scope: the one thing you are
+  writing there is a field name. The fields you have already written drop out
+  of the list, each candidate shows its declared type and its own doc, and
+  accepting one writes `name = ` — or just `name`, the shorthand, when a
+  binding of that name is in scope and `Point { x }` already means
+  `Point { x = x }`. Past the `=` you are writing an expression again, so the
+  ordinary answers come back.
 - **Inside a string or a comment** nothing is offered. A caption is text, not
   code, and a `.` in one is not a member access.
 - **Inside a `css` block** the vocabulary is CSS, and nothing in scope is
