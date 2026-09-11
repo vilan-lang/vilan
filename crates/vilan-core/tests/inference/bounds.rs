@@ -8480,3 +8480,224 @@ fn b263_an_open_list_element_is_still_filled_from_later_pushes() {
         "2\n",
     );
 }
+
+// --- B294: `_`, the ANONYMOUS type binder -----------------------------------
+//
+// `type _` already existed — the binder is the impl's parameter whether or not
+// it is named — and only its spelling was heavy: `_` in type position was an
+// ordinary name nothing declared (`cannot find type '_'`), and `_: Bound` did
+// not parse at all, so an anonymous binder could not carry the bound that makes
+// it useful. Both spellings are one `Node::TypeBinder` now.
+
+/// The owner's exhibit: a bound on an anonymous binder, written without the
+/// keyword. `impl Source<Option<type _: Source<type U>>>` compiled at 65af4be0;
+/// `impl Source<Option<_: Source<type U>>>` was a parse error at the `:`.
+#[test]
+fn b294_an_anonymous_binder_carries_a_bound_without_the_keyword() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, Signal };
+        impl Source<Option<_: Source<type U>>> {
+            fun depth(self): i32 { 2 }
+        }
+        fun main() {
+            let nested = Signal::new(Some(Signal::new(0)));
+            print(nested.depth());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// The keyword spelling of the same head still compiles — one node, two
+/// spellings, and the old one is not retired.
+#[test]
+fn b294_the_keyword_spelling_of_an_anonymous_binder_still_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, Signal };
+        impl Source<Option<type _: Source<type U>>> {
+            fun depth(self): i32 { 2 }
+        }
+        fun main() {
+            let nested = Signal::new(Some(Signal::new(0)));
+            print(nested.depth());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// A bare `_` with no bound, in one argument of a head whose other arguments
+/// are concrete — the `Some(_)` reading, in the impl-subject position.
+#[test]
+fn b294_a_bare_anonymous_binder_matches_any_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, Signal };
+        impl Source<Option<_>> {
+            fun held(self): i32 { 7 }
+        }
+        fun main() { print(Signal::new(Some(1)).held()); }
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+// The freshness question, asked four ways. `pairwise<T>(a, b)` takes TWO
+// arguments of ONE type, so it compiles exactly when the head's two positions
+// are the same parameter — which makes it the discriminator the impl head
+// itself is not (an inherent impl applies to `Pair<i32, str>` whatever its
+// binders say). Two anonymous binders ALIASED at 65af4be0: `_` was registered
+// under the name `_`, the second registration overwrote the first, and both
+// occurrences then resolved to the last one.
+
+const B294_PAIR_PRELUDE: &str = r#"
+    struct Pair<A, B> { first: A, second: B }
+    fun pairwise<T>(a: T, b: T): i32 { 0 }
+"#;
+
+/// The control the other three are read against: two NAMED binders are two
+/// parameters, and passing one where the other is expected is refused.
+#[test]
+fn b294_two_named_binders_are_two_parameters() {
+    assert_fails_with(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<type A, type B> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = "x" }}.blend()); }}
+            main();
+            "#
+        ),
+        "but got B instead.",
+    );
+}
+
+/// Two WILDCARDS are two parameters, exactly as two named binders are — and
+/// exactly as `Some(_, _)` binds nothing twice.
+#[test]
+fn b294_two_anonymous_binders_are_two_parameters() {
+    assert_fails_with(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<_, _> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = "x" }}.blend()); }}
+            main();
+            "#
+        ),
+        "but got _ instead.",
+    );
+}
+
+/// The keyword spelling is the same node, so it is fresh now too — this is the
+/// case that compiled at 65af4be0 and should not have.
+#[test]
+fn b294_two_keyword_anonymous_binders_are_two_parameters() {
+    assert_fails_with(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<type _, type _> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = "x" }}.blend()); }}
+            main();
+            "#
+        ),
+        "but got _ instead.",
+    );
+}
+
+/// The counterweight: a binder MENTIONED twice is still one parameter. The fix
+/// withdraws the anonymous binder's name, and a written name still binds.
+#[test]
+fn b294_a_named_binder_reused_in_the_head_is_still_one_parameter() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<type T, T> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = 2 }}.blend()); }}
+            main();
+            "#
+        ),
+        "0\n",
+    );
+}
+
+/// A binder bound by an anonymous parameter's BOUND is still declared and still
+/// reusable — B165's shape written with the wildcard subject.
+#[test]
+fn b294_a_binder_inside_an_anonymous_binders_bound_is_still_declared() {
+    assert_compiles_and_runs(
+        r#"
+        trait Src<T> { fun read(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+        struct Cell { value: str }
+        impl Cell with Src<str> { fun read(self): str { self.value } }
+        impl _: Src<type T> with Maybe<T> {
+            fun show(self, react: |T| void) { react(self.read()); }
+        }
+        fun tell<V: Maybe<str>>(v: V) { v.show(|text| print(text)); }
+        fun main() { tell(Cell { value = "anonymous subject" }); }
+        main();
+        "#,
+        "anonymous subject\n",
+    );
+}
+
+/// Out of scope and said so: `_` is not an inference placeholder. The refusal
+/// names what `_` is for instead of inviting a search for a type called `_`.
+#[test]
+fn b294_a_placeholder_underscore_in_an_annotation_says_what_it_is_for() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let values: List<_> = [1, 2];
+            print(values.len());
+        }
+        main();
+        "#,
+        "`_` is the anonymous type binder",
+    );
+}
+
+/// The same refusal in a PARAMETER annotation, where there is no initializer to
+/// infer from either.
+#[test]
+fn b294_a_placeholder_underscore_in_a_parameter_is_refused_too() {
+    assert_fails_with(
+        r#"
+        fun takes(value: _): i32 { 0 }
+        fun main() { print(takes(1)); }
+        main();
+        "#,
+        "only an `impl` subject introduces one",
+    );
+}
+
+/// A generic parameter a declaration NAMES `_` is an ordinary parameter that
+/// resolves by name, and the wildcard reading does not take it away: the fix is
+/// scoped to impl-subject binders, which are the only place two `_`s can meet.
+#[test]
+fn b294_a_declared_generic_named_underscore_still_resolves_by_name() {
+    assert_compiles_and_runs(
+        r#"
+        fun identity<_>(value: _): _ { value }
+        fun main() { print(identity(3)); }
+        main();
+        "#,
+        "3\n",
+    );
+}
