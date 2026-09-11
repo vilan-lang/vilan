@@ -16,6 +16,166 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A79: the KEYED handle return, over a real WebSocket and read off the
+/// server's own tables.
+const KEYED_HANDLE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Subscription };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ KeyedCell, KeyedSource, RemoteSource, session_of };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Task {
+	id: i32,
+	title: str,
+}
+
+impl Task with Keyed<i32> {
+	fun key(self): i32 {
+		self.id
+	}
+}
+
+// One board per workspace — the shape the return mapping exists for: a
+// collection the client watches a FRACTION of, and one no `[expose]` field
+// could name (there is one field per exposure, and a workspace is not a set
+// the compiler knows).
+let boards: Shared<List<(str, KeyedCell<i32, Task>)>> = Shared::new([]);
+let asks: Shared<i32> = Shared::new(0);
+
+fun board_for(workspace: str): KeyedCell<i32, Task> {
+	for entry in boards.read() {
+		let (key, cell) = entry;
+		if key == workspace {
+			ret cell;
+		}
+	}
+	let fresh: KeyedCell<i32, Task> = KeyedCell::new([Task { id = 1, title = "first" }]);
+	boards.write().push((workspace, fresh));
+	fresh
+}
+
+[service(BoardClient)]
+struct Board {
+	[expose] name: SignalCell<str>,
+	connection: i32,
+}
+
+impl Board {
+	[rpc]
+	fun tasks_in(self, workspace: str): KeyedCell<i32, Task> {
+		asks.write() = asks.read() + 1;
+		board_for(workspace)
+	}
+
+	// The SAME source, answered as a plain handle: a `KeyedCell`'s `elements`
+	// IS a `SignalCell`, so this method and `tasks_in` offer one cell identity
+	// for two channels that carry different FRAMES.
+	[rpc]
+	fun rows_in(self, workspace: str): SignalCell<List<Task>> {
+		board_for(workspace).elements
+	}
+
+	[rpc]
+	fun add(self, workspace: str, id: i32, title: str): bool {
+		board_for(workspace).insert(Task { id, title });
+		true
+	}
+
+	[rpc]
+	fun stats(self): List<i32> {
+		match session_of(self.connection) {
+			Option::Some(let session) => [
+				session.sources.read().len(),
+				session.live.read().len(),
+				asks.read(),
+			],
+			Option::None => [0 - 1, 0 - 1, 0 - 1],
+		}
+	}
+}
+
+let name: SignalCell<str> = Signal::new("acme");
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(
+			|connection| Board { name, connection = connection.id },
+			json_codec(),
+		))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let empty: List<i32> = [0 - 1, 0 - 1, 0 - 1];
+			print(i"hash:{client.contract_hash()}");
+			// SYNC and unleased, exactly like the plain form.
+			let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let before = client.stats().unwrap_or(empty);
+			print(i"minted:sources={before[0]} live={before[1]} asks={before[2]} status={tasks.status().get().debug()}");
+			let seen: Shared<i32> = Shared::new(0);
+			let watching = tasks.sub(|rows| {
+				seen.write() = seen.read() + 1;
+				print(i"rows:{rows.len()}");
+			});
+			let _settle = client.stats();
+			let leased = client.stats().unwrap_or(empty);
+			print(i"leased:sources={leased[0]} live={leased[1]} asks={leased[2]} status={tasks.status().get().debug()}");
+			print(i"add:{client.add("alpha", 2, "second").unwrap_or(false)}");
+			let _flush = client.stats();
+			print(i"frames:{seen.read()}");
+			watching.dispose();
+			let _drain = client.stats();
+			let released = client.stats().unwrap_or(empty);
+			print(i"released:sources={released[0]} live={released[1]} asks={released[2]}");
+
+			// A per-KEY lease is a first demand too, and mints the same way.
+			let keyed: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let one = keyed.sub_key(2, |row| match row {
+				Option::Some(let task) => print(i"key:{task.title}"),
+				Option::None => {},
+			});
+			let _asked = client.stats();
+			let keyleased = client.stats().unwrap_or(empty);
+			print(i"keyleased:sources={keyleased[0]} live={keyleased[1]} asks={keyleased[2]}");
+			one.dispose();
+			let _quiet = client.stats();
+			let keyreleased = client.stats().unwrap_or(empty);
+			print(i"keyreleased:sources={keyreleased[0]} live={keyreleased[1]} asks={keyreleased[2]}");
+
+			// Dedup is by source AND frame shape. These two handles name one
+			// cell and must NOT share a channel: one carries `Patch` frames,
+			// the other `Update`s, and a mirror handed the wrong one would
+			// simply never seed.
+			let patched: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let whole: RemoteSource<List<Task>> = client.rows_in("alpha");
+			let holding_patched = patched.sub(|_rows| {});
+			let holding_whole = whole.sub(|_rows| {});
+			let _both = client.stats();
+			let shapes = client.stats().unwrap_or(empty);
+			print(i"shapes:sources={shapes[0]} live={shapes[1]}");
+			print(i"patched:{patched.get().unwrap_or([]).len()} whole:{whole.get().unwrap_or([]).len()}");
+			holding_patched.dispose();
+			holding_whole.dispose();
+			print("done");
+			exit(0);
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+}
+"#;
+
 /// A `[expose(keyed)]` service, end to end over a real WebSocket: the keyed
 /// channel the macro mints, the `KeyedSource` mirror the generated client
 /// carries, and a per-key subscription taken through it (A39).
@@ -3613,14 +3773,15 @@ fn contract_hash_of(surface: &str) -> String {
 ///
 /// 1. **The round trip.** `get_message(id)` puts a `ChannelId` on the wire —
 ///    the reply is an `i32` and the codec sees nothing else — and the stub
-///    mints the mirror from it. The mirror is LAZY (`before:Waiting`: a handle
-///    nothing watches has opened no channel), seeds from the server's first
-///    `Update` the moment something leases it (`m3:`, the empty body the cell
-///    was minted with), and follows every later write (`m3:hello`). The
-///    `Ready` is read AFTER the edit's round trip and not before it: over a
-///    real socket the seeding `Update` is a frame, not a return value, so a
-///    status read in the same synchronous extent as the `sub` would be pinning
-///    the transport rather than the mirror.
+///    mints the mirror from it. The stub is SYNC and makes NO call (A92): the
+///    mirror is minted unleased (`before:Waiting` — a handle nothing watches
+///    has not even asked), and the first lease is what issues the call, opens
+///    the channel and seeds the mirror (`m3:hello`), which then follows every
+///    later write. The `Ready` is read after a SECOND round trip and not
+///    before: the mint the lease issued and the edit were in flight together,
+///    and over a real socket the seeding `Update` is a frame, not a return
+///    value — a status read in the same synchronous extent as the `sub` would
+///    be pinning the transport rather than the mirror.
 /// 2. **A handle-free service's hash did not move.** `PlainChat` is written
 ///    exactly as it was measured at `c3ed9239`, before any of this existed, and
 ///    `78bdada7` is that measurement frozen. This is the promise the whole
@@ -3631,6 +3792,16 @@ fn contract_hash_of(surface: &str) -> String {
 ///    — and its twin with that one return written as a plain `MessageBody`
 ///    hashes differently. A server that turns a handle into a value is refused
 ///    at connect instead of feeding a `ChannelId` to a `MessageBody` decoder.
+/// 4. **The two handle FORMS are still told apart (A92).** Since A92 both
+///    `SignalCell<T>` and `Option<SignalCell<T>>` answer the same client type,
+///    `RemoteSource<T>` — a `None` reply is `Status::Absent`, not an `Option`
+///    the caller unwraps — but they do NOT decode alike: the plain form's
+///    reply is an `i32` and the `Option` form's an `Option<i32>`. So the
+///    surface entry carries a `?` on the optional one
+///    (`get_message(str)->RemoteSource<MessageBody>?;`), which moves that
+///    form's hash off what it was and keeps a client generated against one
+///    from reading the other's `null` as a channel id. The plain form's bytes
+///    are untouched, which is claim 2's whole point.
 #[test]
 fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_type() {
     let dir = temp_project("handle_service");
@@ -3665,17 +3836,12 @@ fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_
         "Ready",
         "the lease did not seed the mirror from the server's updates:\n{stdout}"
     );
-    for expected in ["m3:", "m3:hello", "edit:true", "held:hello"] {
+    for expected in ["m3:hello", "edit:true", "held:hello"] {
         assert!(
             stdout.contains(expected),
             "`{expected}` is missing from the handle service's run:\n{stdout}"
         );
     }
-    assert!(
-        !stdout.contains("mirror-err:"),
-        "the handle call failed:\n{stdout}"
-    );
-
     // The hash halves.
     let handle_surface = "get_messages(str,i32)->List<str>;\
                           get_message(str)->RemoteSource<MessageBody>;\
@@ -3685,6 +3851,10 @@ fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_
                          get_message(str)->MessageBody;\
                          edit(str,str)->bool;\
                          expose:topic:str;";
+    let option_surface = "get_messages(str,i32)->List<str>;\
+                          get_message(str)->RemoteSource<MessageBody>?;\
+                          edit(str,str)->bool;\
+                          expose:topic:str;";
     let plain_surface = "get_messages(str,i32)->List<str>;\
                          get_message(str)->MessageBody;\
                          expose:topic:str;";
@@ -3715,6 +3885,21 @@ fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_
         line_of("value-hash:"),
         "turning a handle return into a plain value must move the hash, or a \
          stale client decodes a ChannelId as a MessageBody:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("option-hash:"),
+        contract_hash_of(option_surface),
+        "the `Option` form's surface entry is the mirror type with a `?`: the \
+         client's TYPE is the same as the plain form's, and its REPLY is \
+         not:\n{stdout}"
+    );
+    assert_ne!(
+        line_of("option-hash:"),
+        line_of("handle-hash:"),
+        "the two written handle forms answer the same client type and decode \
+         differently (`i32` vs `Option<i32>`), so they must not hash alike — a \
+         client generated against one would read the other's `null` as a \
+         channel id:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3919,29 +4104,42 @@ fun run(port: i32) {
 }
 "#;
 
-/// R3 as ruled, over a real socket and read off the server's own tables.
+/// R3 as ruled and A92 on top of it, over a real socket and read off the
+/// server's own tables.
 ///
-/// - **A hundred handles cost nothing until they are watched.** `minted`
-///   reports 101 capabilities (a hundred handles plus the `[expose]`d field)
-///   and ZERO live forwards; `leased` reports the same 101 with TEN forwards.
-///   That is the shipped lease rule doing the whole of the owner's "a server
-///   subscription is only triggered once the client maps the handle to a local
-///   Signal" — no new mechanism, and it is what makes the exhibit's shape
-///   (a hundred ids, ten on screen) affordable.
+/// - **A hundred handles cost NOTHING until they are watched.** Not one call,
+///   not one capability, not one forward: `minted` reports the same
+///   `sources=1 live=0 calls=0` as `attached`, because the stub is sync and
+///   the mirror is minted unleased (A92). `leased` is where the cost appears
+///   — ten leases, ten calls, ten capabilities, ten forwards — which is the
+///   owner's "a server subscription is only triggered once the client maps the
+///   handle to a local Signal", now true of the CALL as well as the
+///   subscription. Before A92 the same program made a hundred calls and left
+///   ninety-one capabilities standing.
 /// - **Demand decides the channel's life.** The ten leases reach zero, the
 ///   `Unsubscribe`s go out past the turn's settle and the microtask hop, and
-///   the server REVOKES: `released` reports 91 capabilities. §9.2 proposed a
-///   `Release(channel)` frame for this; R3 spends the `Unsubscribe` instead,
-///   because the server already knows which channels it minted dynamically.
+///   the server REVOKES: `released` is back to the field's channel alone.
+///   §9.2 proposed a `Release(channel)` frame for this; R3 spends the
+///   `Unsubscribe` instead, because the server already knows which channels it
+///   minted dynamically.
 /// - **Re-acquiring re-mints.** A lease returns on a mirror whose channel is
-///   gone, the mirror re-issues its own `origin` call — the getter runs a
-///   SECOND time, `calls` goes from 100 to 101 — the capability table grows
-///   back to 92, and the mirror rebinds. The `seed` line is the cached value
-///   painted before the round trip; `fresh` is what the fresh channel's first
-///   `Update` carried, which is the edit made while nothing was watching.
-/// - **The `Option` form mints on presence only.** `find("nobody")` answers
-///   `None` and leaves the capability table exactly where it was; `find("m0")`
-///   answers a mirror like any other.
+///   gone, the mirror re-issues its own `origin` call — the getter runs again,
+///   `calls` 10 → 11 — the capability comes back, and the mirror rebinds. The
+///   `seed` line is the cached value painted before the round trip; `fresh` is
+///   what the fresh channel's first `Update` carried, which is the edit made
+///   while nothing was watching.
+/// - **Dedup by source identity, and the counting it obliges (A92).** Two
+///   handles for the same row are two mirrors and two CALLS — `calls` 11 → 13
+///   — and ONE channel: the second reply carries a cell this connection has
+///   already exported, so `deduped` reports one capability and one forward for
+///   the pair. `half-released` is the obligation: the first mirror's
+///   `Unsubscribe` must NOT revoke the channel under the second, so the table
+///   does not move and the surviving mirror still reads its value (`twin`).
+///   `both-released` is the last hold going, and only then does the channel go.
+/// - **The `Option` form mints on presence only, and says so in `Status`.**
+///   One mirror type for both answers now: `find("nobody")` leases, asks, is
+///   told `None`, mints no channel — the table does not move — and reads
+///   `Absent` with `get()` still `None`. `find("m0")` is an ordinary mirror.
 /// - **The `[expose]` field channel is the control.** Its `Unsubscribe` is
 ///   demand-only, its capability survives the release (`sources` does not
 ///   move) and the remount finds it on the same id and re-seeds
@@ -3973,17 +4171,19 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("minted:"),
-        "sources=101 live=0 calls=100",
-        "a hundred minted handles must start no forward at all:\n{stdout}"
+        "sources=1 live=0 calls=0",
+        "a hundred unleased handles must cost nothing at all — no call, no \
+         capability, no forward (A92):\n{stdout}"
     );
     assert_eq!(
         line_of("leased:"),
-        "sources=101 live=10 calls=100",
-        "ten leases must be ten forwards, and no more:\n{stdout}"
+        "sources=11 live=10 calls=10",
+        "ten leases must be ten calls, ten capabilities and ten forwards, and \
+         no more:\n{stdout}"
     );
     assert_eq!(
         line_of("released:"),
-        "sources=91 live=0 calls=100",
+        "sources=1 live=0 calls=10",
         "a dynamic channel's Unsubscribe must revoke it — the capability, the \
          starter and the source it captured all go:\n{stdout}"
     );
@@ -4000,7 +4200,7 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("re-acquired:"),
-        "sources=92 live=1 calls=101",
+        "sources=2 live=1 calls=11",
         "demand returning must re-issue the origin call — one fresh capability, \
          one fresh forward, and the getter run a second time:\n{stdout}"
     );
@@ -4012,13 +4212,35 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("re-released:"),
-        "sources=91 live=0 calls=101",
+        "sources=1 live=0 calls=11",
         "the re-minted channel is revoked at its own lease-zero exactly like \
          the first one:\n{stdout}"
     );
     assert_eq!(
+        line_of("deduped:"),
+        "sources=2 live=1 calls=13",
+        "two handles on one source are two calls and ONE channel: the second \
+         reply must answer the channel the first already minted (A92):\n{stdout}"
+    );
+    assert_eq!(
+        line_of("half-released:"),
+        "sources=2 live=1 calls=13",
+        "one mirror letting go of a SHARED channel must revoke nothing — the \
+         other mirror is still watching it:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("twin:"),
+        "second",
+        "the surviving mirror of a deduped channel must still be fed:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("both-released:"),
+        "sources=1 live=0 calls=13",
+        "the LAST hold going is what revokes a deduped channel:\n{stdout}"
+    );
+    assert_eq!(
         line_of("field-released:"),
-        "sources=91 live=0 calls=101",
+        "sources=1 live=0 calls=13",
         "an `[expose]`d field channel's Unsubscribe is demand-only: its \
          capability must survive, or every remount is silently dead (A41):\n{stdout}"
     );
@@ -4030,12 +4252,18 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("find-missing:"),
+        "Absent",
+        "a `None` reply to an Option-written handle method must read as \
+         `Absent`, not as a `Waiting` that never resolves:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-missing-held:"),
         "false",
-        "the Option form's `None` must arrive as a `None`:\n{stdout}"
+        "an absent mirror must hold nothing — `get()` stays `None`:\n{stdout}"
     );
     assert_eq!(
         line_of("after-missing:"),
-        "sources=91 live=0 calls=101",
+        "sources=1 live=0 calls=13",
         "a `None` from an Option-returning handle method must mint no channel \
          at all — the absence is the whole reply:\n{stdout}"
     );
@@ -4043,6 +4271,11 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
         line_of("find-found:"),
         "second",
         "the Option form's `Some` must be an ordinary mirror:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-found-status:"),
+        "Ready",
+        "a present Option-form mirror reads `Ready` like any other:\n{stdout}"
     );
     assert!(
         !stdout.contains("mint-err:") && !stdout.contains("find-err:"),
@@ -4268,6 +4501,12 @@ fun run(port: i32) {
 /// annotation used to be accepted in silence — kolt's `model.vl` carried three
 /// of them behind FIXMEs, one over a `List<i53>` handle annotated as something
 /// else entirely — and dropping the annotation was not possible at all.
+///
+/// A92 made the handle stub SYNC, which retires the bridge as an idiom (the
+/// mirror is in hand; `or([])` is the whole of it). The `Task` is therefore
+/// written here rather than produced by the stub — what is pinned is the
+/// SOLVER's behaviour, that a closure's RETURN binds `U`, and that shape is
+/// exactly as reachable over a handle a caller wrapped itself.
 #[test]
 fn a_handle_bridges_element_type_is_checked_against_the_annotation_at_the_call() {
     let dir = temp_project("b288_handle_bridge");
@@ -4290,6 +4529,12 @@ impl Chat {
 	fun get_messages(self, id: i53): Option<SignalCell<List<i53>>> {
 		None
 	}
+}
+
+// The handle stub is sync (A92), so the `Task` the bridge takes is the
+// caller's own — which is what a `remote_signal`-shaped helper is left with.
+fun handle_of<X: Transport>(client: ChatClient<X>): Task<RemoteSource<List<i53>>> {
+	async { client.get_messages(1i53) }
 }
 
 impl Task<type T> {
@@ -4320,8 +4565,8 @@ impl Task<type T> {
     let (ok, report) = check(&format!(
         "{BRIDGE}
 fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<str>> {{
-	let handle = async client.get_messages(1i53);
-	let messages: SignalCell<List<str>> = handle.remote_signal([], |x| x.ok().flatten());
+	let handle = handle_of(client);
+	let messages: SignalCell<List<str>> = handle.remote_signal([], |x| Option::Some(x));
 	messages
 }}
 
@@ -4339,8 +4584,8 @@ fun main() {{}}
     let (ok, report) = check(&format!(
         "{BRIDGE}
 fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<i53>> {{
-	let handle = async client.get_messages(1i53);
-	let messages: SignalCell<List<i53>> = handle.remote_signal([], |x| x.ok().flatten());
+	let handle = handle_of(client);
+	let messages: SignalCell<List<i53>> = handle.remote_signal([], |x| Option::Some(x));
 	messages
 }}
 
@@ -4354,8 +4599,8 @@ fun main() {{}}
     let (ok, report) = check(&format!(
         "{BRIDGE}
 fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<i53>> {{
-	let handle = async client.get_messages(1i53);
-	handle.remote_signal([], |x| x.ok().flatten())
+	let handle = handle_of(client);
+	handle.remote_signal([], |x| Option::Some(x))
 }}
 
 fun main() {{}}
@@ -4889,4 +5134,123 @@ fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stal
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&toolchain);
+}
+
+/// A79: an `[rpc]` method returning a `KeyedCell<K, T>` hands the client a
+/// `KeyedSource<K, T>` — §9.2's third row, in A92's sync unleased shape.
+///
+/// - **The same shape as the plain form, at the keyed type.** The stub is sync
+///   and answers the mirror; `minted` reports the `[expose]`d field's channel
+///   and nothing else, no ask, `Waiting`. The first lease issues the call, and
+///   `leased` is one ask, one capability, one forward.
+/// - **Element-grained, which is the whole reason the row exists.** The seed
+///   is a `Reset` (`rows:1`) and the `add` is ONE `Patch` carrying one op
+///   (`rows:2`, `frames:2`) — the `KeyedCell`'s op log forwarded rather than
+///   two snapshots diffed, per change per connection. A `RemoteSource<List<T>>`
+///   would resend the collection.
+/// - **Demand decides, per DEMAND rather than per channel.** The whole-
+///   collection lease going away withdraws the channel (`released` back to the
+///   field's alone), and a per-KEY lease on a fresh handle mints again
+///   (`asks` 1 → 2) and withdraws on its own release. That is the keyed half
+///   of the count: a keyed channel carries one forward per demand, so the
+///   capability goes when the last of them does — and no per-key hop, which
+///   stays Order 31's standing default.
+/// - **Dedup is by source AND frame shape.** A `KeyedCell`'s `elements` is a
+///   `SignalCell`, so a service can offer one cell identity for two channels
+///   that carry different frames — `Patch`es on the keyed one, `Update`s on
+///   the plain one. They must not collapse: `shapes` reports three
+///   capabilities and two forwards, and both mirrors are fed.
+/// - **The surface names the mapped type.** `tasks_in(str)->KeyedSource<i32,
+///   Task>;` — the client's type, like every other handle row.
+#[test]
+fn a_keyed_handle_return_hands_the_client_a_patched_mirror_minted_at_its_first_lease() {
+    let dir = temp_project("keyed_handle");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_HANDLE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let line_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        line_of("minted:"),
+        "sources=1 live=0 asks=0 status=Waiting",
+        "a keyed handle nothing watches must cost nothing — no call, no \
+         capability, no forward:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("leased:"),
+        "sources=2 live=1 asks=1 status=Ready",
+        "the first lease must issue the call, mint the channel and seed the \
+         mirror:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("add:"),
+        "true",
+        "the write did not reach the board:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("frames:"),
+        "2",
+        "a keyed handle must be ELEMENT-GRAINED: a seed and one patch per \
+         change, not a whole collection per change:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("released:"),
+        "sources=1 live=0 asks=1",
+        "the whole-collection lease reaching zero must withdraw the dynamic \
+         keyed channel:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("key:"),
+        "second",
+        "a per-key lease must deliver its own element:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("keyleased:"),
+        "sources=2 live=1 asks=2",
+        "a per-KEY lease is a first demand too: it must mint the channel the \
+         same way a whole-collection one does:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("keyreleased:"),
+        "sources=1 live=0 asks=2",
+        "the last per-key hold going is the channel going — a keyed channel \
+         carries one forward per demand:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("shapes:"),
+        "sources=3 live=2",
+        "a keyed and a plain handle over ONE cell must not share a channel: \
+         they carry different frames, and a mirror handed the wrong shape \
+         would silently never seed:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("patched:"),
+        "2 whole:2",
+        "both mirrors of the one source must be fed, each in its own frame \
+         shape:\n{stdout}"
+    );
+    let keyed_surface = "tasks_in(str)->KeyedSource<i32, Task>;\
+                         rows_in(str)->RemoteSource<List<Task>>;\
+                         add(str,i32,str)->bool;\
+                         stats()->List<i32>;\
+                         expose:name:str;";
+    assert_eq!(
+        line_of("hash:"),
+        contract_hash_of(keyed_surface),
+        "the contract surface must name the MAPPED keyed type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("err:"),
+        "the keyed handle service failed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

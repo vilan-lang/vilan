@@ -5584,3 +5584,50 @@ fn the_wire_boundary_admits_every_sized_scalar_in_an_rpc_signature() {
         "#,
     );
 }
+
+/// A92: std's `Memo<K: Hashable, V>` — a per-key cache of values made on first
+/// ask, and the app's composition tool for "one handle per id".
+///
+/// Three claims in one run, because they are one behaviour seen from three
+/// sides. The MAKER runs once per key and never again while the entry is held
+/// (`makes` moves on the first ask and not the second), which is the whole
+/// point — memoizing a remote handle is what keeps two views of one row from
+/// leasing two mirrors. `forget` puts a key back to unmade, so a value that
+/// turned out wrong can be retried without a second mechanism. And the maker
+/// is a CLOSURE evaluated at the call site rather than a value passed in, so a
+/// maker that reads its caller's ambient scope — the rpc client, an owner —
+/// reads the right one; `held_after_forget:false` is the passive `get`
+/// agreeing with `len`.
+#[test]
+fn a_memo_makes_a_value_once_per_key_and_forgets_one_on_request() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::memo::Memo;
+        import std::shared::Shared;
+
+        let makes: Shared<i32> = Shared::new(0);
+        let widths: Memo<str, i32> = Memo::new();
+
+        fun width_of(word: str): i32 {
+            makes.write() = makes.read() + 1;
+            word.len()
+        }
+
+        fun main() {
+            print(i"first:{widths.get_or("alpha", || width_of("alpha"))}");
+            print(i"again:{widths.get_or("alpha", || width_of("alpha"))}");
+            print(i"other:{widths.get_or("be", || width_of("be"))}");
+            print(i"makes:{makes.read()} len:{widths.len()}");
+            print(i"held:{widths.get("alpha").is_some()}");
+            widths.forget("alpha");
+            print(i"held_after_forget:{widths.get("alpha").is_some()} len:{widths.len()}");
+            print(i"remade:{widths.get_or("alpha", || width_of("alpha"))} makes:{makes.read()}");
+            widths.clear();
+            print(i"cleared:{widths.len()}");
+        }
+        main();
+        "#,
+        "first:5\nagain:5\nother:2\nmakes:2 len:2\nheld:true\nheld_after_forget:false len:1\nremade:5 makes:3\ncleared:0\n",
+    );
+}

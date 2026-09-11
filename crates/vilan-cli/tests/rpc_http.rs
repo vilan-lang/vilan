@@ -986,6 +986,11 @@ fun run_clients(port: i32) {
 /// POST leg fails naming the method, and the service's plain methods keep
 /// answering beside it.
 ///
+/// Since A92 the stub is SYNC and makes no call, so the failure arrives one
+/// step later and in the mirror's own vocabulary: the first LEASE is what asks,
+/// and what it was told is `status()` — `Failed(Remote("`note` returns a signal
+/// handle, …"))`. The message is unchanged; where a caller reads it is not.
+///
 /// A handle's reply is a channel id minted in the connection's capability
 /// table, and the POST leg holds no connection — so the call cannot be served
 /// there. The message used to say only that "a source-returning method" needed
@@ -1062,10 +1067,17 @@ fun run_client(url: str) {
 		Ok(let n) => print(i"touch -> {n}"),
 		Err(let error) => print(i"touch err {error.to_json()}"),
 	}
-	match client.note("welcome") {
-		Ok(let _mirror) => print("note -> minted"),
-		Err(let error) => print(i"note err {error.to_json()}"),
+	// The stub is sync and makes no call (A92), so the failure arrives where a
+	// mirror's facts live: the first LEASE issues the call, it fails, and
+	// `status()` reads `Failed(error)`.
+	let note: RemoteSource<str> = client.note("welcome");
+	let watching = note.sub(|_text| print("note -> seeded"));
+	match client.touch() {
+		Ok(let _settle) => {},
+		Err(let _error) => {},
 	}
+	print(i"note err {note.status().get().debug()}");
+	watching.dispose();
 	exit(0);
 }
 "#,
@@ -1077,9 +1089,13 @@ fun run_client(url: str) {
          the handle's, not the mount's:\n{stdout}"
     );
     assert!(
-        stdout.contains("note err"),
-        "a handle method over the POST leg must fail, not answer a channel id \
-         that names nothing:\n{stdout}"
+        stdout.contains("note err Failed("),
+        "a handle method over the POST leg must fail at its first lease, not \
+         answer a channel id that names nothing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("note -> seeded"),
+        "a mirror whose mint failed must deliver nothing:\n{stdout}"
     );
     assert!(
         stdout.contains("`note` returns a signal handle"),

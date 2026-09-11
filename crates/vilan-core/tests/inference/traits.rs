@@ -3944,6 +3944,10 @@ fn a78_a_handle_service_on_a_stamped_local_rpc_protocol_still_round_trips() {
         impl Notes {
             [rpc]
             fun note(self, id: str): SignalCell<str> { self.body }
+
+            // A round trip to settle the mint the lease below issues.
+            [rpc]
+            fun ping(self): i32 { 1 }
         }
         fun main() {
             let notes = Notes { body = Signal::new("hello") };
@@ -3956,13 +3960,15 @@ fn a78_a_handle_service_on_a_stamped_local_rpc_protocol_still_round_trips() {
                 .for_connection(connection));
             let reactive = ReactiveClient::new(client_end, json_codec());
             let client = NotesClient { transport, codec = json_codec(), reactive };
-            match client.note("welcome") {
-                Ok(let mirror) => {
-                    let reading = mirror.sub(|text| print(i"note = {text}"));
-                    reading.dispose();
-                },
-                Err(let error) => print(i"note err {error.debug()}"),
+            // Sync since A92: the mirror is in hand, and the `sub` is what
+            // issues the call — which is what this pin is about.
+            let mirror: RemoteSource<str> = client.note("welcome");
+            let reading = mirror.sub(|text| print(i"note = {text}"));
+            match client.ping() {
+                Ok(let _settled) => {},
+                Err(let _unreached) => {},
             }
+            reading.dispose();
         }
         main();
         "#,

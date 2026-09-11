@@ -150,13 +150,18 @@ fn post_build(directory: &str) -> PostBuild {
                 "status = online\n",
                 "login -> true\n",
                 "whoami -> ada (@ada)\n",
-                // The handle half (transport-rpc.md §9.2): `note` returns a
-                // `SignalCell<str>`, so the reply is a channel id and the
-                // client reads a `RemoteSource<str>` — seeded by the server's
-                // first update, then following `edit_note`'s write.
-                "note = (empty)\n",
+                // The handle half (transport-rpc.md §9.2, as A92 reshaped it):
+                // `note` returns a `SignalCell<str>`, and the client's stub is
+                // SYNC — a bare `RemoteSource<str>`, minted unleased. Nothing
+                // is on the wire until the `sub`, which is why the mirror reads
+                // `Waiting` first; the lease then issues the call, opens the
+                // channel and seeds the mirror with what the server holds THEN
+                // — `edit_note` was in flight with the mint, so the seed is
+                // already the edited text and one `note =` line prints, not two.
+                "note status = Waiting\n",
                 "note = hello, ada\n",
                 "edit -> true\n",
+                "note status = Ready\n",
             ),
         },
         "browser" => PostBuild::Artifacts(&["client.js"]),

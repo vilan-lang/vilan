@@ -1282,10 +1282,22 @@ fn a25_a_second_watcher_opens_no_second_server_forward() {
 
 /// §3 — the server's half of §1.2, independent of the client: `start` is
 /// idempotent. A raw client that says `Subscribe` twice on one channel gets
-/// ONE forward (one `Update` per change, no re-seed for the duplicate), and
-/// one `Unsubscribe` stops it. Before A25 the second `Subscribe` opened a
-/// second forward: `down {"Update":[0,0]}` twice, then `down
-/// {"Update":[0,1]}` twice.
+/// ONE forward (one `Update` per change, no re-seed for the duplicate). Before
+/// A25 the second `Subscribe` opened a second forward: `down {"Update":[0,0]}`
+/// twice, then `down {"Update":[0,1]}` twice.
+///
+/// **A92 amended what STOPS it, and §3's sentence with it.** The second
+/// `Subscribe` now takes a HOLD on the one forward, so it takes two
+/// `Unsubscribe`s to close — the first leaves the forward running (`down
+/// {"Update":[0,1]}` still arrives), the second stops it (`[0,2]` does not).
+/// One demand is still one forward; what a duplicate ask no longer is, is
+/// free. That is the price of dedup: two client MIRRORS of one source share a
+/// channel now, and the server cannot tell those two `Subscribe`s from one
+/// client's two, so it must honour both or revoke the channel out from under
+/// a watcher. §3's "the server does not rely on [a counted client] for its own
+/// correctness" holds for what it SENDS and no longer for when it stops: a
+/// client that asks twice and releases once holds its own channel open until
+/// the connection closes, and disturbs nothing else.
 #[test]
 fn a25_a_second_subscribe_frame_opens_no_second_forward() {
     assert_compiles_and_runs(
@@ -1311,13 +1323,18 @@ fn a25_a_second_subscribe_frame_opens_no_second_forward() {
             client_end.send(encode_control(json_codec(), "Subscribe", channel));
             client_end.send(encode_control(json_codec(), "Subscribe", channel));
             counter.set(1);
+            // One release of two holds: the forward is still owed.
             client_end.send(encode_control(json_codec(), "Unsubscribe", channel));
             counter.set(2);
+            // The second: now it stops.
+            client_end.send(encode_control(json_codec(), "Unsubscribe", channel));
+            counter.set(3);
             print("done");
         }
         "#,
         "down {\"Update\":[0,0]}\n\
          down {\"Update\":[0,1]}\n\
+         down {\"Update\":[0,2]}\n\
          done\n",
     );
 }
@@ -1552,6 +1569,11 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
             match remote.status().get() {
                 Status::Waiting => print("status = Waiting"),
                 Status::Ready => print("status = Ready"),
+                // A92's arms. A FIELD mirror reads neither — they say what a
+                // handle's minting call was told, and this one made none —
+                // but the match is exhaustive, so they are written.
+                Status::Absent => print("status = Absent"),
+                Status::Failed(let _error) => print("status = Failed"),
             }
 
             let scope = Owner::new();
@@ -1849,6 +1871,8 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
             match status {
                 Status::Waiting => "Waiting",
                 Status::Ready => "Ready",
+                Status::Absent => "Absent",
+                Status::Failed(let _error) => "Failed",
             }
         }
 

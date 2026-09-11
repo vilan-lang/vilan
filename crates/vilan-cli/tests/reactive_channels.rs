@@ -1733,7 +1733,9 @@ fun main() {
 		describers = [],
 		reissue = |name: str, args: List<|Serializer| void>| {
 			mints.write() = mints.read() + 1;
-			let fresh: Result<i32, RpcError> = Ok(session.expose_dynamic(cell));
+			// Three-valued since A92: `Ok(None)` is the server saying there
+			// is no such source, which this seam never says.
+			let fresh: Result<Option<i32>, RpcError> = Ok(Some(session.expose_dynamic(cell)));
 			fresh
 		},
 	};
@@ -1872,6 +1874,11 @@ import std::wire::{ Serializer, Wire };
 fun main() {
 	let (app_end, wire_end) = duplex_pair();
 	let cell: SignalCell<str> = Signal::new("first");
+	// Distinct SOURCES, because a channel is per source now: `expose_dynamic`
+	// dedups by the cell's identity (A92), so three exposures of one cell
+	// would be one channel and this pin counts three.
+	let spare: SignalCell<str> = Signal::new("spare");
+	let unbound: SignalCell<str> = Signal::new("unbound");
 	let session: Shared<ReactiveServer> = Shared::new(ReactiveServer::new(wire_end, json_codec()));
 	let client = ReactiveClient::new(app_end, json_codec());
 	let mints: Shared<i32> = Shared::new(0);
@@ -1883,7 +1890,7 @@ fun main() {
 		describers = [],
 		reissue = |name: str, args: List<|Serializer| void>| {
 			mints.write() = mints.read() + 1;
-			let fresh: Result<i32, RpcError> = Ok(session.read().expose_dynamic(cell));
+			let fresh: Result<Option<i32>, RpcError> = Ok(Some(session.read().expose_dynamic(cell)));
 			fresh
 		},
 	};
@@ -1901,14 +1908,14 @@ fun main() {
 
 	// A mirror minted with NO ambient owner lives with the connection — the
 	// documented case, and the reason the read is owner-optional.
-	let ownerless: RemoteSource<str> = client.minted_source(session.read().expose_dynamic(cell), origin);
+	let ownerless: RemoteSource<str> = client.minted_source(session.read().expose_dynamic(spare), origin);
 	print(i"ownerless:sources={session.read().sources.read().len()}");
 
 	// (g) THE RECONNECT REPLAY. One WATCHED minted mirror, one unwatched, and
 	// one hand-wired mirror with no origin at all.
 	let watched: RemoteSource<str> = client.minted_source(session.read().expose_dynamic(cell), origin);
 	let lease = watched.sub(|value| print(i"watched:{value}"));
-	let hand: RemoteSource<str> = client.source(session.read().expose_dynamic(cell));
+	let hand: RemoteSource<str> = client.source(session.read().expose_dynamic(unbound));
 	print(i"before-drop:sources={session.read().sources.read().len()} mints={mints.read()}");
 
 	// The connection is replaced: the old session dies with every channel it
@@ -1957,6 +1964,11 @@ fun main() {
 /// re-mints anyway — and a mirror with NO origin (the hand-wired
 /// `ReactiveClient::source`) is left to `invalidate_dynamic`, which is what
 /// "retired for generated mirrors, kept for origin-less ones" means.
+///
+/// The three mirrors are over three distinct SOURCES on purpose (A92): a
+/// dynamic channel is per source now, so exposing one cell three times would
+/// answer one channel three times and this pin would be counting dedup rather
+/// than lifetimes. Dedup has its own pin (`service_layer`'s demand test).
 #[test]
 fn an_owner_and_a_reconnect_each_end_a_minted_mirror_the_lease_cannot() {
     let stdout = run_program("mintedowner", MINTED_OWNER_AND_REPLAY);
@@ -2558,5 +2570,145 @@ fn b283_a_lease_born_outside_a_turn_still_rebuilds_inside_one_for_free() {
             "done",
         ],
         "the outside-in lease's same-turn rebuild went differently:\n{stdout}"
+    );
+}
+
+/// A92's mint, in process: the unleased mirror, the three things its first
+/// lease can be told, and the join.
+const UNLEASED_MINT: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ Origin, ReactiveClient, ReactiveServer, RemoteSource, RpcError, Status, duplex_pair };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Serializer, Wire };
+
+fun main() {
+	let (app_end, wire_end) = duplex_pair();
+	let cell: SignalCell<str> = Signal::new("first");
+	let session = ReactiveServer::new(wire_end, json_codec());
+	let client = ReactiveClient::new(app_end, json_codec());
+	let asks: Shared<i32> = Shared::new(0);
+	// What the next ask is answered with — the three things a minting call can
+	// say, driven from the test rather than from a server's mood.
+	let answer: Shared<str> = Shared::new("fail");
+
+	let origin = Origin {
+		method = "get_note",
+		describers = [],
+		reissue = |name: str, args: List<|Serializer| void>| {
+			asks.write() = asks.read() + 1;
+			let told = answer.read();
+			if told == "fail" {
+				let failed: Result<Option<i32>, RpcError> = Err(RpcError::Remote("no route"));
+				failed
+			} else if told == "absent" {
+				let absent: Result<Option<i32>, RpcError> = Ok(None);
+				absent
+			} else {
+				let fresh: Result<Option<i32>, RpcError> = Ok(Some(session.expose_dynamic(cell)));
+				fresh
+			}
+		},
+	};
+
+	// UNLEASED: no call, no capability, no frame, and `Waiting` because
+	// nothing has been asked.
+	let mirror: RemoteSource<str> = client.unleased_source(origin);
+	print(i"minted:asks={asks.read()} sources={session.sources.read().len()} status={mirror.status().get().debug()}");
+
+	// The first lease IS the mint. This one fails, and the mirror says so.
+	let first = mirror.sub(|value| print(i"value:{value}"));
+	sleep_for(Duration::millis(0));
+	print(i"failed:asks={asks.read()} sources={session.sources.read().len()} status={mirror.status().get().debug()}");
+	first.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+
+	// The next 0→1 asks again — and is told there is no such source.
+	answer.write() = "absent";
+	let second = mirror.sub(|value| print(i"value:{value}"));
+	sleep_for(Duration::millis(0));
+	print(i"absent:asks={asks.read()} sources={session.sources.read().len()} status={mirror.status().get().debug()} held={mirror.get().is_some()}");
+	second.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+
+	// And the retry that lands: a channel, a seed, `Ready`.
+	answer.write() = "ok";
+	let third = mirror.sub(|value| print(i"value:{value}"));
+	sleep_for(Duration::millis(0));
+	print(i"ready:asks={asks.read()} sources={session.sources.read().len()} status={mirror.status().get().debug()} held={mirror.get().unwrap_or("?")}");
+	third.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print(i"closed:sources={session.sources.read().len()}");
+
+	// THE JOIN. Two leases taken on an unleased mirror before the mint has
+	// landed are one call, not two: `remint` clears `released` before it
+	// awaits, and the rebind subscribes for whatever demand exists by then.
+	let twin: RemoteSource<str> = client.unleased_source(origin);
+	let left = twin.sub(|value| print(i"left:{value}"));
+	let right = twin.sub(|value| print(i"right:{value}"));
+	print(i"in-flight:asks={asks.read()}");
+	sleep_for(Duration::millis(0));
+	print(i"joined:asks={asks.read()} sources={session.sources.read().len()} live={session.live.read().len()}");
+	left.dispose();
+	right.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print(i"parted:sources={session.sources.read().len()} live={session.live.read().len()}");
+	print("done");
+}
+"#;
+
+/// A92: the SYNC unleased handle mirror — what its first lease costs, what
+/// each of the three answers does to it, and that two leases are one call.
+///
+/// - **Unleased is free.** `unleased_source` is what a handle stub hands back:
+///   a mirror carrying its call and having made none. `minted:` reports no
+///   ask, no capability and `Waiting` — a handle nothing watches has not
+///   merely opened no channel, it has not asked, and costs nothing on either
+///   side. Before A92 the stub made the call at the call site and left a
+///   capability standing for the life of the connection.
+/// - **The first lease is the mint, through the SHIPPED re-mint path.**
+///   `acquire` → `remint` → `rebind` is R3's, unchanged; all A92 did was mint
+///   the mirror already `released` so that path runs the first time too. That
+///   is why the shape costs nothing to add.
+/// - **`Failed` and `Absent`, and the retry.** A sync stub has no `Result` to
+///   hand a failure back in, so what the call was told is `status()`:
+///   `Failed(Remote("no route"))` for a call that failed, `Absent` for a
+///   `None` reply, with `get()` still empty and no capability minted. Both are
+///   answers about NOW — the next 0→1 asks again (`asks` 1 → 2 → 3), and the
+///   third one lands: a channel, a seed, `Ready`.
+/// - **The join.** Two leases taken while the mint is in flight are ONE call
+///   (`in-flight:asks=4` and `joined:asks=4`): `remint` clears `released`
+///   before it awaits, so the second `acquire` finds nothing to re-issue, and
+///   the rebind subscribes for the demand that exists when it lands.
+#[test]
+fn an_unleased_mirrors_first_lease_is_its_mint_and_a_failed_one_retries() {
+    let stdout = run_program("unleasedmint", UNLEASED_MINT);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "minted:asks=0 sources=0 status=Waiting",
+            "failed:asks=1 sources=0 status=Failed(Remote(\"no route\"))",
+            "absent:asks=2 sources=0 status=Absent held=false",
+            "value:first",
+            "ready:asks=3 sources=1 status=Ready held=first",
+            "closed:sources=0",
+            // The ask is synchronous in this seam, so `asks` has already moved
+            // when the second lease is taken; the two observers are seeded by
+            // the rebind that lands after it.
+            "in-flight:asks=4",
+            "left:first",
+            "right:first",
+            "joined:asks=4 sources=1 live=1",
+            "parted:sources=0 live=0",
+            "done",
+        ],
+        "the unleased mint went differently:\n{stdout}"
     );
 }

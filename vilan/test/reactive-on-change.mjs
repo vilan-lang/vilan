@@ -174,7 +174,7 @@ function register_with_owner(subscription, $Y, $Z) {
 }
 function $b(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	return [ __shared_new(value), __shared_new(subscribers), fresh_id() ];
 }
 function $a(value) {
 	return $b(value);

@@ -7,6 +7,11 @@ function __clone(value) {
 function __shared_new(value) {
 	return { v: value };
 }
+function fresh_id() {
+	const id = next_subscriber_id.v;
+	next_subscriber_id.v = id + 1;
+	return id;
+}
 function view(tag) {
 	const attributes = __shared_new([  ]);
 	if (tag === "svg") {
@@ -110,7 +115,7 @@ function row(label) {
 }
 function $b(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	return [ __shared_new(value), __shared_new(subscribers), fresh_id() ];
 }
 function $a(value) {
 	return $b(value);
@@ -144,6 +149,7 @@ function $i(self, content) {
 	$j(content, self);
 	return __clone(self);
 }
+const next_subscriber_id = __shared_new(0);
 const name = $a("world & <you>");
 console.log(render($i($g($h($g($f($c(view("p"), "data-live", name), "title", "hi"), "Take "), $g(view("code"), "vilan upgrade")), " & enjoy. "), name)));
 console.log(render($f($f($f(view("input"), "type", "checkbox"), "aria-label", "Done"), "disabled", "")));

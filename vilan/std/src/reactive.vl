@@ -758,6 +758,19 @@ trait Signal<T> with Source<T> {
 struct SignalCell<T> {
 	value: Shared<T>,
 	subscribers: Shared<List<Subscriber>>,
+	/// This cell's IDENTITY — stamped once at construction, never compared by
+	/// value. vilan has no reference equality, and a cell is exactly the kind
+	/// of thing two holders need to recognise as the SAME one: `Shared` is
+	/// not deep-copied, so two bindings of one cell are one cell, and nothing
+	/// else in the value says so.
+	///
+	/// The consumer is the rpc runtime's dynamic exposure (A92): a reply
+	/// carrying a source the connection has already exported answers the
+	/// channel it already minted, rather than a second capability and a
+	/// second forward of the same updates. It is a stamp rather than a
+	/// derivation because a derivation would have to be from the value, and
+	/// two cells holding equal values are not one cell.
+	id: i32,
 }
 
 impl SignalCell<type T> with Source<T> {
@@ -821,7 +834,11 @@ impl SignalCell<type T> with Signal<T> {
 	/// reachable at `SignalCell::new`. They are the same cell either way.
 	fun new(value: T): SignalCell<T> {
 		mut subscribers: List<Subscriber> = [];
-		SignalCell { value = Shared::new(value), subscribers = Shared::new(subscribers) }
+		SignalCell {
+			value = Shared::new(value),
+			subscribers = Shared::new(subscribers),
+			id = fresh_id(),
+		}
 	}
 
 	fun set(self, value: T) {
