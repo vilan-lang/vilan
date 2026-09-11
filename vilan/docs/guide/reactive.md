@@ -123,8 +123,11 @@ Build state as a graph and let it recompute itself:
   ```
 - `combine((a, b, …))` gives a signal of the tuple of several
   signals' values. It fires when any of them changes. Takes two or more.
-- `nested.flatten()` on a `SignalCell<SignalCell<U>>` follows whichever inner
-  signal is current, and detaches from a replaced one.
+- `nested.flatten()` on **any source whose element is a source** follows
+  whichever inner signal is current, and detaches from a replaced one — a
+  `SignalCell<SignalCell<U>>`, a `map` result that picks between signals, a
+  mirror. An outer of `Option<inner>` joins too: `None` gives `None` and
+  detaches, `Some(inner)` follows that inner.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, combine };

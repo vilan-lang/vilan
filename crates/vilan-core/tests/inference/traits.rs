@@ -4260,6 +4260,105 @@ fn b300_an_unbounded_blanket_binder_is_left_alone() {
     );
 }
 
+#[test]
+fn a86_two_blankets_bounded_at_different_arguments_may_share_a_member_name() {
+    // The duplicate-member rule compared inherent subjects with `compare_type`,
+    // which consults a bound's TRAIT and not its ARGUMENTS, so any two blankets
+    // over one parameterized trait read as one name declared twice. They are
+    // two impls: no `Option` is a `Read`, so nothing satisfies both bounds —
+    // and this is the pair A86's `flatten` needs (the join, and the join over
+    // an optional inner). The rule now reads the binders' bounds, which is what
+    // the coherence rule one tier down (`same_impl_type_shape`) already says.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun join(self): U { self.get().get() }
+        }
+        impl type S: Read<Option<type I: Read<type U>>> {
+            fun join(self): Option<U> {
+                match self.get() {
+                    Some(let inner) => Some(inner.get()),
+                    None => None,
+                }
+            }
+        }
+
+        fun main() {
+            let nested = Cell { value = Cell { value = 7 } };
+            print(nested.join() + 1);
+            let optional: Cell<Option<Cell<i32>>> = Cell { value = Some(Cell { value = 3 }) };
+            print(optional.join().unwrap_or(0));
+            let empty: Cell<Option<Cell<i32>>> = Cell { value = None };
+            print(empty.join().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "8\n3\n0\n",
+    );
+}
+
+#[test]
+fn a86_two_blankets_bounded_the_same_way_still_collide() {
+    // The control: identical bounds are the repeat the rule exists to refuse,
+    // because tier 1 of method resolution takes the first inherent candidate
+    // without ranking — a silent pick between two bodies.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun peek(self): T { self.get() }
+        }
+        impl type O: Read<type V> {
+            fun peek(self): V { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is already defined for",
+    );
+}
+
+#[test]
+fn a86_a_blanket_and_a_constructor_headed_impl_still_collide() {
+    // The other control: the bounds clause reaches BARE binders only. A
+    // blanket against a concrete subject is the overlap B73 named, and it is
+    // still refused.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun peek(self): T { self.get() }
+        }
+        impl Cell<type T> {
+            fun peek(self): T { self.value }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is already defined for",
+    );
+}
+
 /// The `[rpc]` face of the exhibit: one service whose only interesting feature
 /// is the return type, so a pin swaps exactly one spelling to move between the
 /// faces. `Opaque` is the not-Wire type and `Phantom<T>` the unbounded-binder

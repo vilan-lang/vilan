@@ -119,6 +119,140 @@ fn flatten_registers_its_outer_and_live_inner_subscriptions() {
     );
 }
 
+// --- A86: `flatten` is a BLANKET over `Source`, not a member of the cell -----
+//
+// The read contract is the trait, so an outer that is a `map` result or a
+// derived cell holds an inner signal exactly as a `SignalCell` does. The pin
+// above (`flatten_registers_its_outer_and_live_inner_subscriptions`) is the
+// control for the cell receiver and for the ownership story; these are the
+// receivers the inherent impl could not reach.
+
+#[test]
+fn flatten_joins_a_derived_outer_not_only_a_cell() {
+    // The outer is a `map` RESULT — a `SignalCell` the user never spelled, and
+    // the shape `outer.map(..).flatten()` has wanted since A4. Switching the
+    // outer detaches the replaced inner, exactly as it does for a cell.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let first = Signal::new(1);
+            let second = Signal::new(10);
+            let which = Signal::new(true);
+            let picked = which.map(|flag| if flag { first } else { second });
+            let joined = picked.flatten();
+            print(joined.get());
+            which.set(false);
+            print(joined.get());
+            second.set(11);
+            print(joined.get());
+            // The replaced inner no longer drives the result.
+            first.set(99);
+            print(joined.get());
+        }
+
+        main();
+        "#,
+        "1\n10\n11\n11\n",
+    );
+}
+
+#[test]
+fn flatten_over_an_optional_inner_follows_some_and_detaches_on_none() {
+    // The `Option` form: an outer of `Option<inner source>` — a lazily-created
+    // signal. `None` is `None` and DETACHES (the last line proves it: a set on
+    // the dropped inner does not reach the result), `Some(inner)` follows that
+    // inner from its current value.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let inner = Signal::new(1);
+            let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(None);
+            let joined = outer.flatten();
+            print(joined.get().unwrap_or(0));
+            outer.set(Some(inner));
+            print(joined.get().unwrap_or(0));
+            inner.set(5);
+            print(joined.get().unwrap_or(0));
+            outer.set(None);
+            print(joined.get().unwrap_or(0));
+            inner.set(9);
+            print(joined.get().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "0\n1\n5\n0\n0\n",
+    );
+}
+
+#[test]
+fn the_optional_flatten_registers_its_subscriptions_with_the_ambient_owner() {
+    // A28's story, unchanged by the second blanket: the outer subscription is
+    // registered and whichever inner is live at disposal is deferred, so a
+    // disposed boundary leaves no subscriber behind on either signal.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
+
+        fun main() {
+            let inner = Signal::new(1);
+            let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(inner));
+            let owner = Owner::new();
+            owner_scope.run(owner, || {
+                let joined = outer.flatten();
+                joined.effect(|value| print(value.unwrap_or(0)));
+            });
+            inner.set(5);
+            owner.dispose();
+            print(outer.subscribers.read().len());
+            print(inner.subscribers.read().len());
+        }
+
+        main();
+        "#,
+        "1\n5\n0\n0\n",
+    );
+}
+
+#[test]
+fn flatten_still_joins_a_plain_cell_of_cells() {
+    // The control the blanket has to subsume: the receiver the retired
+    // inherent `impl SignalCell<SignalCell<type U>>` served, un-annotated, with
+    // derived work stacked on the result — `vilan/test/reactive-flatten.vl`'s
+    // shape in one pin.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let first = Signal::new(1);
+            let second = Signal::new(10);
+            let outer = Signal::new(first);
+            let joined = outer.flatten();
+            let doubled = joined.map(|value| value * 2);
+            print(joined.get());
+            outer.set(second);
+            print(joined.get());
+            second.set(21);
+            print(doubled.get());
+        }
+
+        main();
+        "#,
+        "1\n10\n42\n",
+    );
+}
+
 // The ownerless case is leak-as-today, NOT a refusal: a derivation made where no
 // `owner_scope.run` encloses still compiles and still tracks its source, which
 // is what a module-level `current_path().map(parse)` needs. Making this an

@@ -6891,11 +6891,7 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .filter(|(earlier_index, _, _)| earlier_index != index)
                     .find(|(_, _, earlier_subject)| {
-                        self.compare_type(
-                            &subject_type,
-                            &earlier_subject.get_type(self),
-                            &HashMap::default(),
-                        )
+                        self.subjects_collide(&subject_type, *earlier_subject)
                     });
                 if let Some((_, earlier_id, _)) = earlier {
                     duplicates.push((member_name, *earlier_id, *member_id, *subject));
@@ -7273,6 +7269,36 @@ impl<'src> Analyzer<'src> {
             self.same_impl_type_shape(&left.get_type(self), &right.get_type(self), comparing);
         comparing.pop();
         same
+    }
+
+    /// Whether two INHERENT impl subjects claim the same receivers for the
+    /// purposes of the duplicate-member rule: compatible by the ordinary
+    /// comparison, and — when both are BARE BINDERS — bound the same way.
+    ///
+    /// The bounds clause is the coherence rule's own reading, one tier down
+    /// (`same_impl_type_shape`: "two impl parameters are the same position when
+    /// they are bound the same way … different bounds are two overlapping
+    /// impls"). `compare_type` consults a bound's TRAIT and not its ARGUMENTS,
+    /// so every blanket over one parameterized trait collided with every other
+    /// — `impl type S: Source<type I: Source<type U>>` and
+    /// `impl type S: Source<Option<type I: Source<type U>>>` (A86's two joins)
+    /// are disjoint, since no `Option` is a `Source`, and the rule called them
+    /// one name declared twice. A CONSTRUCTOR-headed subject keeps the
+    /// compatibility rule exactly: `impl Box<i32>` and `impl Box<type T>`
+    /// declaring one name is still the overlap the rule exists to refuse,
+    /// because tier 1 of method resolution takes the first inherent candidate
+    /// without ranking.
+    fn subjects_collide(&self, subject_type: &Type, earlier_subject: TypeId) -> bool {
+        let earlier_type = earlier_subject.get_type(self);
+        if !self.compare_type(subject_type, &earlier_type, &HashMap::default()) {
+            return false;
+        }
+        match (subject_type, &earlier_type) {
+            (Type::Generic(left_id), Type::Generic(right_id)) => {
+                self.same_generic_bounds(*left_id, *right_id, &mut Vec::new())
+            }
+            _ => true,
+        }
     }
 
     fn same_impl_type_shape(
