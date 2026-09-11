@@ -4321,3 +4321,259 @@ fun main() {{}}
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B295: an `[rpc]` method may be spelled with any of the names the `[service]`
+/// generator's own bodies call, in BOTH directions.
+///
+/// The generated stub used to call the imported FREE `call(self.transport,
+/// self.codec, ..)` from inside `impl <Name>Client` — which now declares
+/// `fun call` — and the build stopped inside generated code with "`call`
+/// expects 2 arguments, but got 4", spanned on the STRUCT. `notify` did the
+/// same through `<Name>Proxy`, and `arg`, `reply`, `turn` and `notified` were
+/// the same hazard waiting for the author who spells one. The generator writes
+/// `rpc::call(..)` / `reactive::turn(..)` now and imports the two modules
+/// beside the TYPES it names, so no method can shadow one.
+///
+/// Both directions in one program on purpose: the forward stub (`<Name>Client`)
+/// and the reverse proxy (`<Name>Proxy`) are separate emission paths that
+/// shadowed separately, and `kick` drives the reverse one through the service's
+/// own `HandlersProxy` field. The round trip — not a `check` — is what proves
+/// the qualified name resolved to std's function and not to something that
+/// merely compiled.
+#[test]
+fn an_rpc_method_named_for_a_generator_free_function_round_trips_in_both_directions() {
+    let dir = temp_project("generator_name_collisions");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun notify(self, what: str) {
+		self.seen.set(what);
+	}
+}
+
+[service(BusClient, client = Handlers)]
+struct Bus {
+	client: HandlersProxy,
+}
+
+impl Bus {
+	[rpc]
+	fun call(self, what: str): str {
+		"called " + what
+	}
+
+	[rpc]
+	fun arg(self, index: i32): i32 {
+		index + 1
+	}
+
+	[rpc]
+	fun reply(self, what: str): str {
+		"replied " + what
+	}
+
+	[rpc]
+	fun turn(self, degrees: i32): i32 {
+		degrees * 2
+	}
+
+	[rpc]
+	fun notified(self, what: str): str {
+		"notified " + what
+	}
+
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		self.client.notify(reason);
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Bus {
+			client = connection.client(),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match BusClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let handlers = Handlers { seen = Signal::new("") };
+			let client = raw.with_handlers(handlers);
+			print(i"call:{client.call("hi").unwrap_or("<err>")}");
+			print(i"arg:{client.arg(41).unwrap_or(0)}");
+			print(i"reply:{client.reply("ok").unwrap_or("<err>")}");
+			print(i"turn:{client.turn(21).unwrap_or(0)}");
+			print(i"notified:{client.notified("x").unwrap_or("<err>")}");
+			match client.kick("revoked") {
+				Ok(let count) => print(i"kick:{count}"),
+				Err(let _e) => print("kick-error"),
+			}
+			mut attempts = 0;
+			for attempts < 200 {
+				if handlers.seen.get() == "revoked" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"seen:{handlers.seen.get()}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The forward stub, through `<Name>Client`: the name the item reported.
+        "call:called hi",
+        // `arg`, `reply` and `notified` are the dispatcher's free calls; `turn`
+        // is `std::reactive`'s, written into every route block.
+        "arg:42",
+        "reply:replied ok",
+        "turn:42",
+        "notified:notified x",
+        // The reverse proxy, through `<Name>Proxy`: `notify` is the free
+        // function its body calls AND the method the author declared.
+        "kick:1",
+        "seen:revoked",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a generator free-function name used as an `[rpc]` method must \
+             round-trip; expected `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B295's other half: `__` is the generator's prefix, so an `[rpc]` parameter
+/// spelled with it is refused AT THE ATTRIBUTE.
+///
+/// B282 moved the route closure's binding from `request` to `__request`, which
+/// closed the collision an author could stumble into and opened one they cannot
+/// be asked to know about: `fun send(self, __request: str)` rebinds the handle
+/// the route decodes from, and the build stopped inside generated code with
+/// "Expected RpcRequest, but got str", spanned on the STRUCT. Qualifying cannot
+/// help here — the collision is between two BINDINGS in one block, not between
+/// a method and an import — so the prefix is reserved and said so once, on the
+/// parameter. The whole prefix, not the one name: `__attach` and `__contract`
+/// already take it, and a reservation that has to be re-read every time the
+/// generator mints a binding is not a reservation.
+#[test]
+fn an_rpc_parameter_whose_name_starts_with_a_double_underscore_is_refused() {
+    let dir = temp_project("dunder_parameter");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[service(EchoClient)]
+struct Echo {
+	seen: i32,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, __request: str): str {
+		__request
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    for expected in [
+        "parameter `__request` of `[rpc]` method `send` starts with `__`",
+        "the `[service]` expansion reserves for its own bindings",
+        "does not begin with `__`",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    // One mistake, one message: the expansion is skipped, so the generated
+    // client the author never wrote contributes nothing.
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the build reported:\n{text}"
+    );
+    assert!(
+        !text.contains("Expected RpcRequest"),
+        "the generated-code diagnostic B295 recorded must be gone:\n{text}"
+    );
+    // A SINGLE leading underscore is the ordinary unused-binding spelling and
+    // is untouched — the reservation is the generator's prefix, not underscores.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[service(EchoClient)]
+struct Echo {
+	seen: i32,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, _request: str): str {
+		_request
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a single leading underscore must still compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

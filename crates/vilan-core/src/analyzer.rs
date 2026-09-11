@@ -47362,8 +47362,14 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
     ))
 }
 
-/// The refusals a `[service]` subject's `mut self` `[rpc]` methods take — one
-/// per offending method, spanned on the METHOD's name (B272 / R-A38b).
+/// The refusals a `[service]` subject's `[rpc]` methods take at the attribute —
+/// one per offending method, spanned on the METHOD's name or on the parameter
+/// that earned it (B272 / R-A38b, B295).
+///
+/// Two rules share this walk because they share the reason: both are mistakes
+/// the EXPANSION cannot state, so they are answered above it.
+///
+/// 1. `mut self` on an `[rpc]` method.
 ///
 /// `mut self` is a parameter-local copy (`proposal/mut-parameters.md`): the
 /// handler mutates it, the reply carries the new value, and the copy is
@@ -47386,7 +47392,18 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
 /// `mut self` method that mutates nothing is refused too, because the receiver
 /// is the claim being made and a body that grows one write later would
 /// otherwise turn silent.
-pub(crate) fn service_mut_self_refusals(
+///
+/// 2. A parameter whose name starts with `__` (B295).
+///
+/// `__` is the generator's own prefix: a route is `.on("f", |__request| { .. })`
+/// and the `__attach`/`__contract` routes are spelled with it too. A parameter
+/// named `__request` rebinds the handle the route decodes from, and the build
+/// stopped inside generated code with "Expected RpcRequest, but got str",
+/// spanned on the STRUCT — B282's symptom, for the one name B282's fix moved
+/// the collision onto. The prefix is reserved WHOLE rather than the one name,
+/// because the generator is free to mint a second `__` binding and a reservation
+/// that has to be re-read on every such change is not one.
+pub(crate) fn service_method_refusals(
     item: &Spanned<Node<'_>>,
     nodes: &NodeList<'_>,
 ) -> Vec<(Span, String)> {
@@ -47412,20 +47429,43 @@ pub(crate) fn service_mut_self_refusals(
             let Node::Func(function) = member else {
                 continue;
             };
-            if !function.rpc || function.receiver_spelling() != Some("mut self") {
+            if !function.rpc {
                 continue;
             }
             let method_name = function.name.0;
-            refusals.push((
-                function.name.1,
-                format!(
-                    "`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` method's \
-                     `mut self` copy is discarded after the call: the handler mutates it, the \
-                     reply carries the new value, and the next call on this connection reads the \
-                     old one. Write `&mut self` to mutate this connection's instance, or hold \
-                     the state in a `Shared<T>` field"
-                ),
-            ));
+            if function.receiver_spelling() == Some("mut self") {
+                refusals.push((
+                    function.name.1,
+                    format!(
+                        "`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` \
+                         method's `mut self` copy is discarded after the call: the handler \
+                         mutates it, the reply carries the new value, and the next call on this \
+                         connection reads the old one. Write `&mut self` to mutate this \
+                         connection's instance, or hold the state in a `Shared<T>` field"
+                    ),
+                ));
+            }
+            for parameter in &function.parameters.0 {
+                let Pattern::Binding(parameter_name, _, _) = &parameter.pattern else {
+                    continue;
+                };
+                if !parameter_name.starts_with("__") {
+                    continue;
+                }
+                refusals.push((
+                    parameter.span,
+                    format!(
+                        "parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts \
+                         with `__`, which the `[service]` expansion reserves for its own \
+                         bindings: every route is written `.on(\"{method_name}\", |__request| \
+                         {{ .. }})` and the generated `__attach` and `__contract` routes take \
+                         the same prefix, so a parameter spelled this way rebinds the handle the \
+                         route decodes its arguments from and the build stops inside code you \
+                         never wrote. Rename it — an `[rpc]` parameter may be spelled anything \
+                         that does not begin with `__`"
+                    ),
+                ));
+            }
         }
     }
     refusals

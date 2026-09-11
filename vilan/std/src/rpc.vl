@@ -4307,7 +4307,7 @@ macro fun nibble_char(digit: u32): str {
 /// and a `void` call is not an argument).
 macro fun route_outcome(returns_void: bool, replier: str, called: str): str {
 	if returns_void {
-		i"notified(|| {called})"
+		i"rpc::notified(|| {called})"
 	} else {
 		i"{replier}{called})"
 	}
@@ -4337,7 +4337,7 @@ macro fun route_block(name: str, statements: List<str>): str {
 	// real handler code, and one request's signal writes settle as one wave.
 	let label = quote(name);
 	mut closure = i".on({label}, |__request| \{\n";
-	closure = closure + indent("turn(FlushPolicy::AtEnd, || {", 1) + "\n";
+	closure = closure + indent("reactive::turn(FlushPolicy::AtEnd, || {", 1) + "\n";
 	for statement in statements {
 		closure = closure + indent(statement, 2) + "\n";
 	}
@@ -4663,11 +4663,11 @@ macro fun service(item: Item): Source {
 			None => "",
 		};
 		let replier = if kind == "plain" {
-			"reply_source(__request, "
+			"rpc::reply_source(__request, "
 		} else if kind == "option" {
-			"reply_source_option(__request, "
+			"rpc::reply_source_option(__request, "
 		} else {
-			"reply("
+			"rpc::reply("
 		};
 		route_index = route_index + 1;
 		mut statements: List<str> = [];
@@ -4677,7 +4677,7 @@ macro fun service(item: Item): Source {
 			if parameter.name == "self" {
 				jump continue;
 			}
-			statements.push(i"let {parameter.name}: {parameter.type_.render()} = arg(__request, {arity});");
+			statements.push(i"let {parameter.name}: {parameter.type_.render()} = rpc::arg(__request, {arity});");
 			arguments.push(parameter.name);
 			arity = arity + 1;
 		}
@@ -4695,14 +4695,14 @@ macro fun service(item: Item): Source {
 			statements.push(route_outcome(returns_void, replier, i"self.{method.name}()"));
 		} else {
 			let argument_list = join(arguments, ", ");
-			statements.push(match_of("decode_failed(__request)")
+			statements.push(match_of("rpc::decode_failed(__request)")
 				.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
 				.arm("Option::None", route_outcome(returns_void, replier, i"self.{method.name}({argument_list})"))
 				.render());
 		}
 		routes.push(route_block(method.name, statements));
 	}
-	routes.push(".on(" + quote("__contract") + ", |_| reply(self.contract_hash()))");
+	routes.push(".on(" + quote("__contract") + ", |_| rpc::reply(self.contract_hash()))");
 	mut exposures: List<str> = [];
 	mut exposure_index = 0;
 	for field_name in exposed_names {
@@ -4746,18 +4746,18 @@ macro fun service(item: Item): Source {
 		exposure_index = exposure_index + 1;
 	}
 	let exposure_list = join(exposures, ", ");
-	let attach_reply = match_of("session_of(connection)")
+	let attach_reply = match_of("rpc::session_of(connection)")
 		.arm_block("Option::Some(let session)", [
 			i"let channels: List<i32> = [{exposure_list}];",
-			"reply(channels)",
+			"rpc::reply(channels)",
 		])
 		.arm("Option::None", "RpcOutcome::Failure(RpcError::Remote("
 			+ quote("unknown connection")
 			+ "))")
 		.render();
 	mut attach_statements: List<str> = [];
-	attach_statements.push("let connection: i32 = arg(__request, 0);");
-	attach_statements.push(match_of("decode_failed(__request)")
+	attach_statements.push("let connection: i32 = rpc::arg(__request, 0);");
+	attach_statements.push(match_of("rpc::decode_failed(__request)")
 		.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
 		.arm("Option::None", attach_reply)
 		.render());
@@ -4883,11 +4883,11 @@ macro fun service(item: Item): Source {
 		// This is what lets a peer-to-peer struct — both attributes, one method
 		// set — be called from either end without a second spelling.
 		if method.return_type.render() == "void" {
-			stub = stub.expr(i"send_notification(self.transport, self.codec, {label}, [{describer_list}])");
+			stub = stub.expr(i"rpc::send_notification(self.transport, self.codec, {label}, [{describer_list}])");
 		} else {
 			stub = stub.returns(i"Result<{mapped}, RpcError>");
 			if kind == "" {
-				stub = stub.expr(i"call(self.transport, self.codec, {label}, [{describer_list}])");
+				stub = stub.expr(i"rpc::call(self.transport, self.codec, {label}, [{describer_list}])");
 			} else {
 				// The MINT (§9.2). The reply is a channel id and nothing else; the
 				// mirror is built here, on the client, with the call that produced
@@ -4905,7 +4905,7 @@ macro fun service(item: Item): Source {
 					+ "\n"
 					+ indent(if kind == "option" {
 						"let handle_reply: Result<Option<i32>, RpcError> =\n"
-							+ indent("call(self.transport, self.codec, handle_method, handle_args);", 1)
+							+ indent("rpc::call(self.transport, self.codec, handle_method, handle_args);", 1)
 							+ "\n"
 							+ match_of("handle_reply")
 								.arm("Result::Err(let failure)", "Result::Err(failure)")
@@ -4920,7 +4920,7 @@ macro fun service(item: Item): Source {
 								.render()
 					} else {
 						"let handle_reply: Result<i32, RpcError> =\n"
-							+ indent("call(self.transport, self.codec, handle_method, handle_args);", 1)
+							+ indent("rpc::call(self.transport, self.codec, handle_method, handle_args);", 1)
 							+ "\nhandle_reply"
 					}, 2)
 					+ "\n"
@@ -4928,7 +4928,7 @@ macro fun service(item: Item): Source {
 					+ "\n}";
 				if kind == "option" {
 					stub = stub
-						.line(i"let handle_channel: Result<Option<i32>, RpcError> = call(self.transport, self.codec, {label}, [{describer_list}]);")
+						.line(i"let handle_channel: Result<Option<i32>, RpcError> = rpc::call(self.transport, self.codec, {label}, [{describer_list}]);")
 						.expr(match_of("handle_channel!")
 							.arm_block("Option::None", [
 								i"let handle_absent: Option<RemoteSource<{element}>> = Option::None;",
@@ -4941,7 +4941,7 @@ macro fun service(item: Item): Source {
 							.render());
 				} else {
 					stub = stub
-						.line(i"let handle_channel: Result<i32, RpcError> = call(self.transport, self.codec, {label}, [{describer_list}]);")
+						.line(i"let handle_channel: Result<i32, RpcError> = rpc::call(self.transport, self.codec, {label}, [{describer_list}]);")
 						.line(i"let handle_mirror: RemoteSource<{element}> = self.reactive.minted_source(handle_channel!, {origin});")
 						.expr("Result::Ok(handle_mirror)");
 				}
@@ -4952,7 +4952,7 @@ macro fun service(item: Item): Source {
 	let verify = fun_of("verify")
 		.parameter("self")
 		.returns("Result<bool, RpcError>")
-		.line("let remote: Result<str, RpcError> = call(self.transport, self.codec, "
+		.line("let remote: Result<str, RpcError> = rpc::call(self.transport, self.codec, "
 			+ quote("__contract")
 			+ ", []);")
 		.expr("Result::Ok(remote! == self.contract_hash())");
@@ -4966,7 +4966,7 @@ macro fun service(item: Item): Source {
 	// only difference is the handshake offer it dials with).
 	mut body: List<str> = [];
 	body.push("let transport = socket.transport();");
-	body.push("let remote: Result<str, RpcError> = call(transport, codec, "
+	body.push("let remote: Result<str, RpcError> = rpc::call(transport, codec, "
 		+ quote("__contract")
 		+ ", []);");
 	body.push("if remote! != "
@@ -4975,15 +4975,15 @@ macro fun service(item: Item): Source {
 		+ indent(i"ret Result::Err(RpcError::Contract({complaint}));", 1)
 		+ "\n}");
 	body.push("let connection = socket.connection.read();");
-	body.push("let attached: Result<List<i32>, RpcError> = call(transport, codec, "
+	body.push("let attached: Result<List<i32>, RpcError> = rpc::call(transport, codec, "
 		+ quote("__attach")
 		+ ", [|serializer: Serializer| connection.describe(serializer)]);");
 	body.push("let channels = attached!;");
-	body.push("let reactive = ReactiveClient::new(bridge(socket), codec);");
+	body.push("let reactive = ReactiveClient::new(rpc::bridge(socket), codec);");
 	// Registered where the client is born, so no terminal arm has to carry
 	// it and no window exists in which the connection could close unbound
 	// (backlog A31).
-	body.push("dispose_on_close(socket, reactive);");
+	body.push("rpc::dispose_on_close(socket, reactive);");
 	mut ok_fields: List<str> = [];
 	ok_fields.push("transport = transport");
 	ok_fields.push("codec = codec");
@@ -5023,7 +5023,7 @@ macro fun service(item: Item): Source {
 	};
 	body.push(i"let rebinds: List<|i32, Frame| void> = {rebind_list};");
 	body.push("socket.on_reconnect.write().push(|| {\n"
-		+ indent("reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds, || reactive.replay_dynamic());", 1)
+		+ indent("rpc::reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds, || reactive.replay_dynamic());", 1)
 		+ "\n});");
 	let field_lines = join(ok_fields, ",\n");
 	let client_value = i"Result::Ok({target.client_name} \{\n" + indent(field_lines, 1) + "\n})";
@@ -5032,7 +5032,7 @@ macro fun service(item: Item): Source {
 		.parameter("url: str")
 		.parameter("codec: Codec")
 		.returns(connect_type)
-		.line("let socket = dial_for_service(url)!;");
+		.line("let socket = rpc::dial_for_service(url)!;");
 	for line in body {
 		connect = connect.line(line);
 	}
@@ -5044,7 +5044,7 @@ macro fun service(item: Item): Source {
 		.parameter("codec: Codec")
 		.parameter("protocols: List<str>")
 		.returns(connect_type)
-		.line("let socket = dial_for_service_with(url, protocols)!;");
+		.line("let socket = rpc::dial_for_service_with(url, protocols)!;");
 	for line in body {
 		connect_with = connect_with.line(line);
 	}
@@ -5061,7 +5061,7 @@ macro fun service(item: Item): Source {
 		.parameter("self")
 		.parameter("handlers: H")
 		.returns(i"{target.client_name}<SocketTransport>")
-		.line("install_client_handlers(self.transport.duplex," + " handlers.dispatcher_for().into_protocol(self.codec));")
+		.line("rpc::install_client_handlers(self.transport.duplex," + " handlers.dispatcher_for().into_protocol(self.codec));")
 		.expr("self");
 	let connect_impl = impl_of(target.client_name)
 		.generics("<SocketTransport>")
@@ -5103,7 +5103,7 @@ macro fun service(item: Item): Source {
 			// SYNC and void, by R4: a notification has no reply to await, so
 			// calling one is not a suspension point and cannot hold the
 			// caller's wire turn open for a round trip.
-			proxy_impl = proxy_impl.method(stub.expr(i"notify(self.connection, {label}, [{describer_list}])"));
+			proxy_impl = proxy_impl.method(stub.expr(i"rpc::notify(self.connection, {label}, [{describer_list}])"));
 		}
 		proxy_source = proxy_struct + proxy_ctor + proxy_impl.render();
 	}
@@ -5116,10 +5116,23 @@ macro fun service(item: Item): Source {
 		""
 	};
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, call, send_notification, arg, reply, reply_source, reply_source_option, notified, decode_failed, notify, install_client_handlers, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n"
+	// The generated bodies call std's free functions MODULE-QUALIFIED —
+	// `rpc::call(..)`, `reactive::turn(..)` — and the named imports below bring
+	// in TYPES only (B295). A bare `call(..)` inside `impl <Name>Client` was
+	// resolved against that impl's own methods first, so an `[rpc]` method
+	// named `call` shadowed the `std::rpc` import and the build stopped inside
+	// generated code with "`call` expects 2 arguments, but got 4", spanned on
+	// the STRUCT; `notify` did the same through `<Name>Proxy`, and every other
+	// free name the generator writes — `arg`, `reply`, `turn`, `bridge` — was
+	// the same hazard waiting for the method that spells it. Qualifying removes
+	// the hazard rather than naming it: a method cannot shadow a module path,
+	// so the service's vocabulary is the author's again.
+	let imports = "import std::rpc;\n"
+		+ "import std::reactive;\n"
+		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, ReactiveClient };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"
-		+ "import std::reactive::{ turn, FlushPolicy };\n";
+		+ "import std::reactive::FlushPolicy;\n";
 	source(imports + service_impl + service_trait_impl + client_source + proxy_source)
 }

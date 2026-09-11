@@ -1710,10 +1710,13 @@ impl Expander<'_, '_> {
                 // the same reason, spanned on the METHOD — the receiver is what
                 // has to change, and the expansion is not where that is legible.
                 // `&mut self` is honoured by the generator instead (R-A38b(a)),
-                // so this is the only receiver a service refuses.
-                let mut_self_refusals = crate::analyzer::service_mut_self_refusals(item, siblings);
-                if !mut_self_refusals.is_empty() {
-                    for (span, msg) in mut_self_refusals {
+                // so this is the only receiver a service refuses. B295 joins it
+                // with the `__` parameter-name reservation, spanned on the
+                // parameter, for the identical reason: the expansion would fail
+                // over a binding of its own that the author's name rebound.
+                let method_refusals = crate::analyzer::service_method_refusals(item, siblings);
+                if !method_refusals.is_empty() {
+                    for (span, msg) in method_refusals {
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
