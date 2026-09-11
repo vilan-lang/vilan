@@ -3822,3 +3822,130 @@ fn b285_a_keyed_cell_exposed_without_an_argument_still_compiles() {
         "#,
     );
 }
+
+// --- A78: a handle-returning service on a CONNECTIONLESS mount -------------
+
+/// A78: a `local_rpc` transport over a protocol no connection stamped cannot
+/// answer a handle-returning method, and says so AT WIRING TIME.
+///
+/// A handle's reply is a channel id minted in the CONNECTION's capability
+/// table; `into_protocol` leaves the connection unstamped (`for_connection` is
+/// what stamps it), so the call could only ever fail. It used to fail at the
+/// first such call, as an `RpcError::Remote` raised inside generated code that
+/// named neither the method nor the wiring that had to change — and a service
+/// whose handle method is called on some later code path shipped with the
+/// defect latent. The `[service]` expansion records its handle methods on the
+/// dispatcher (`Dispatcher::handles`), so `local_rpc` can see them before a
+/// call is made.
+#[test]
+fn a78_a_handle_service_on_an_unstamped_local_rpc_protocol_is_refused_at_wiring() {
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::json::json_codec;
+        import std::rpc::local_rpc;
+        [service(NotesClient)]
+        struct Notes {
+            body: SignalCell<str>,
+        }
+        impl Notes {
+            [rpc]
+            fun note(self, id: str): SignalCell<str> { self.body }
+        }
+        fun main() {
+            let notes = Notes { body = Signal::new("hello") };
+            let transport = local_rpc(notes.dispatcher().into_protocol(json_codec()));
+            print("wired");
+        }
+        main();
+        "#,
+        "a signal handle is returned by `note`",
+    );
+}
+
+/// A78's control, and the whole of the test the refusal makes: a STAMPED
+/// protocol is admitted, and the handle round-trips in process.
+///
+/// `vilan/examples/rpc` is written this way — register a session, stamp the
+/// protocol with its connection, serve handles locally — and the refusal must
+/// not reach it. The test is structural (was a connection stamped?) rather
+/// than a `session_of` lookup for this pin's sake and the example's alike: a
+/// session may legitimately be registered after the transport is built, and an
+/// ordering the app is free to choose must not decide whether its build
+/// survives.
+#[test]
+fn a78_a_handle_service_on_a_stamped_local_rpc_protocol_still_round_trips() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::result::Result::{ self, Ok, Err };
+        import std::json::{ Json, FromJson };
+        import std::json::json_codec;
+        import std::rpc::{ local_rpc, duplex_pair, register_session, ReactiveClient, RemoteSource };
+        [service(NotesClient)]
+        struct Notes {
+            body: SignalCell<str>,
+        }
+        impl Notes {
+            [rpc]
+            fun note(self, id: str): SignalCell<str> { self.body }
+        }
+        fun main() {
+            let notes = Notes { body = Signal::new("hello") };
+            let (client_end, server_end) = duplex_pair();
+            let connection = 0;
+            register_session(connection, server_end, json_codec());
+            let transport = local_rpc(notes
+                .dispatcher()
+                .into_protocol(json_codec())
+                .for_connection(connection));
+            let reactive = ReactiveClient::new(client_end, json_codec());
+            let client = NotesClient { transport, codec = json_codec(), reactive };
+            match client.note("welcome") {
+                Ok(let mirror) => {
+                    let reading = mirror.sub(|text| print(i"note = {text}"));
+                    reading.dispose();
+                },
+                Err(let error) => print(i"note err {error.debug()}"),
+            }
+        }
+        main();
+        "#,
+        "note = hello\n",
+    );
+}
+
+/// A78's other control: a service with NO handle method records nothing, so a
+/// plain `local_rpc` mount is untouched. The refusal is about the one return
+/// shape that needs a connection, and a dispatcher written by hand records
+/// nothing either — which is why `handles` is a record and not a rule.
+#[test]
+fn a78_a_plain_service_on_an_unstamped_local_rpc_protocol_still_round_trips() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+        import std::json::{ Json, FromJson };
+        import std::json::json_codec;
+        import std::rpc::local_rpc;
+        [service(NotesClient)]
+        struct Notes {
+            label: str,
+        }
+        impl Notes {
+            [rpc]
+            fun touch(self): i32 { 7 }
+        }
+        fun main() {
+            let notes = Notes { label = "n" };
+            let transport = local_rpc(notes.dispatcher().into_protocol(json_codec()));
+            let client = NotesClient { transport, codec = json_codec() };
+            print(i"touch = {client.touch().unwrap_or(0)}");
+        }
+        main();
+        "#,
+        "touch = 7\n",
+    );
+}

@@ -1193,6 +1193,11 @@ struct RpcProtocol {
 	/// connection at the upgrade, which is how a source-returning route
 	/// reaches THIS client's capability table and no other's (§9.2).
 	connection: i32,
+	/// The `[rpc]` methods whose reply is a signal HANDLE, read off the
+	/// dispatcher at `into_protocol` (tracker A78). What lets `local_rpc`
+	/// refuse a handle service it has no connection for at WIRING time,
+	/// rather than at the first such call.
+	handle_methods: List<str>,
 }
 
 impl RpcProtocol {
@@ -1224,7 +1229,52 @@ impl RpcProtocol {
 /// coalesced `Update` per source alongside its reply, not one per write — even
 /// when the method suspends partway.
 fun local_rpc(protocol: RpcProtocol): LocalTransport {
+	// A78: a handle-returning method's reply is a channel id minted in the
+	// CONNECTION's capability table, and `into_protocol` stamps no connection
+	// (`for_connection` is what does). A `local_rpc` transport over an
+	// unstamped protocol therefore cannot answer one — and used to say so at
+	// the FIRST such call, as an `RpcError::Remote` raised inside generated
+	// code that named neither the method nor the wiring that had to change.
+	// The wiring is knowable here, before a call is made, so it is refused
+	// here.
+	//
+	// A STAMPED protocol is admitted, and that is the whole of the test:
+	// `vilan/examples/rpc` registers a session, stamps the protocol with its
+	// connection and serves handles in-process, which is the shape this must
+	// not touch. The test is structural rather than a `session_of` lookup on
+	// purpose — a session may be registered after this call, and an ordering
+	// the app is free to choose must not decide whether its build survives.
+	//
+	// The `{mount}rpc` POST leg has no equivalent refusal and cannot: that
+	// mount's WebSocket leg is always installed beside it (`ServerBuilder::
+	// build` folds one for every service), so the service is not wrongly
+	// mounted — only wrongly REACHED, by a client that dialled the
+	// connectionless route. That one is said at the call, by
+	// `reply_source`/`reply_source_option`, naming the method.
+	if protocol.connection < 0 && protocol.handle_methods.len() > 0 {
+		panic("std::rpc local_rpc: a signal handle is returned by "
+			+ listed_methods(protocol.handle_methods)
+			+ ", and this protocol carries no connection to mint one on: a handle's reply is a channel id in the CONNECTION's capability table, and `into_protocol` leaves the connection unstamped. Register a session and stamp the protocol with it — `register_session(id, end, codec)`, then `.for_connection(id)` — or reach this service over the socket transport, which is what every generated `Client::connect` uses");
+	}
 	LocalTransport { handler = |frame| turn(FlushPolicy::AtEnd, || protocol.respond(frame)) }
+}
+
+/// Method names as a quoted, comma-separated list — `` `note` `` for one,
+/// `` `note`, `find` `` for two. Written out rather than reaching for
+/// `List::join`, which needs `Display` in scope for the element type; this
+/// module's one use does not earn the import.
+fun listed_methods(methods: List<str>): str {
+	mut listed = "";
+	mut first = true;
+	for method in methods {
+		if first {
+			first = false;
+		} else {
+			listed = listed + ", ";
+		}
+		listed = listed + "`" + method + "`";
+	}
+	listed
 }
 
 // === Foundation: the ergonomic client + server API (proposal §4.1) ==========
@@ -1359,8 +1409,30 @@ fun send_notification<Tx: Transport>(
 fun reply_source<T: Wire>(request: RpcRequest, source: SignalCell<T>): RpcOutcome {
 	match session_of(request.connection) {
 		Some(let session) => reply(session.expose_dynamic(source)),
-		None => RpcOutcome::Failure(RpcError::Remote("a source-returning method needs this connection's reactive session, and this " + "request arrived on none (the connectionless POST leg has no channels)")),
+		None => no_connection_for_handle(request),
 	}
+}
+
+/// The refusal a handle-returning route answers with when the request arrived
+/// on NO connection (tracker A78) — the connectionless `{mount}rpc` POST leg.
+///
+/// It names the METHOD, because that is the half the reader can act on: the
+/// message used to say only that "a source-returning method" needed a session
+/// this request had none of, which read as a server fault at a call the author
+/// could not see. A handle's reply is a channel id minted in the CONNECTION's
+/// capability table, so the method is WebSocket-only and the fix is the
+/// transport, not the service.
+///
+/// This is the leg that cannot be refused earlier. A `Service` mount always
+/// carries its WebSocket leg beside the POST one (`ServerBuilder::build` folds
+/// an upgrade handler for every service), so nothing about the mount is wrong
+/// and refusing it would refuse every working handle service; `local_rpc`,
+/// which really can be wired with no connection at all, refuses at wiring time
+/// instead.
+fun no_connection_for_handle(request: RpcRequest): RpcOutcome {
+	RpcOutcome::Failure(RpcError::Remote("`"
+		+ request.method
+		+ "` returns a signal handle, and this request arrived on no connection: a handle's reply is a channel id minted in the CONNECTION's capability table, and the connectionless legs — the `{mount}rpc` POST route, and a `local_rpc` transport no `for_connection` stamped — have none. Reach this method over the socket transport, which is what every generated `Client::connect` uses"))
 }
 
 /// `reply_source` for the `Option` form: `Option<SignalCell<T>>` in, an
@@ -1378,7 +1450,7 @@ fun reply_source_option<T: Wire>(request: RpcRequest, source: Option<SignalCell<
 				let channel: Option<i32> = Some(session.expose_dynamic(present));
 				reply(channel)
 			},
-			None => RpcOutcome::Failure(RpcError::Remote("a source-returning method needs this connection's reactive session, and this " + "request arrived on none (the connectionless POST leg has no channels)")),
+			None => no_connection_for_handle(request),
 		},
 	}
 }
@@ -1395,11 +1467,28 @@ struct Route {
 /// (or an `unknown method` failure). `into_protocol` wraps it as an `RpcProtocol` for a transport.
 struct Dispatcher {
 	routes: Shared<List<Route>>,
+	/// The `[rpc]` methods whose reply is a signal HANDLE (§9.2), by name.
+	/// Recorded by `handles` at the head of the generated chain, and carried
+	/// into the `RpcProtocol` so a CONNECTIONLESS mount can refuse them at
+	/// wiring time instead of at the first call (tracker A78). Empty for a
+	/// hand-written dispatcher and for every service that returns no handle,
+	/// which is what keeps this a record rather than a rule.
+	handle_methods: Shared<List<str>>,
 }
 
 impl Dispatcher {
 	fun new(): Dispatcher {
-		Dispatcher { routes = Shared::new([]) }
+		Dispatcher { routes = Shared::new([]), handle_methods = Shared::new([]) }
+	}
+
+	/// Record the methods whose reply is a signal handle — the generated
+	/// chain's first link for a service that returns one, and nothing a
+	/// hand-written dispatcher owes. It is a RECORD and not a registration:
+	/// the routes are what answer, and this is what lets a mount see, before
+	/// any call, that answering needs a connection.
+	fun handles(self, methods: List<str>): Dispatcher {
+		self.handle_methods.write() = methods;
+		self
 	}
 
 	/// Register a handler for a method name, returning `self` so registrations chain.
@@ -1421,7 +1510,12 @@ impl Dispatcher {
 	fun into_protocol(self, codec: Codec): RpcProtocol {
 		// No connection until a service stamps one (`for_connection`): a
 		// dispatcher on its own answers whoever calls it.
-		RpcProtocol { codec, dispatch = |request| self.handle(request), connection = 0 - 1 }
+		RpcProtocol {
+			codec,
+			dispatch = |request| self.handle(request),
+			connection = 0 - 1,
+			handle_methods = self.handle_methods.read(),
+		}
 	}
 }
 
@@ -4673,6 +4767,26 @@ macro fun service(item: Item): Source {
 		routes.push(route_block("__attach", attach_statements));
 	}
 	mut chain = "Dispatcher::new()";
+	// A78: the handle-returning methods are RECORDED on the dispatcher, so a
+	// connectionless mount can refuse them at wiring time rather than at the
+	// first such call (`local_rpc`). Emitted only for a service that has one,
+	// so a plain service's generated chain is byte-identical to what it was.
+	if any_handle {
+		mut handle_names: List<str> = [];
+		mut handle_name_index = 0;
+		for method in target.methods {
+			let kind = match handle_kinds.get(handle_name_index) {
+				Some(let found) => found,
+				None => "",
+			};
+			if kind != "" {
+				handle_names.push(quote(method.name));
+			}
+			handle_name_index = handle_name_index + 1;
+		}
+		let handle_list = join(handle_names, ", ");
+		chain = chain + "\n" + indent(i".handles([{handle_list}])", 1);
+	}
 	for route in routes {
 		chain = chain + "\n" + indent(route, 1);
 	}
