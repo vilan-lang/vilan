@@ -188,6 +188,12 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
 
+`Wire` is a trait like any other, and what counts as Wire is what an
+`impl … with Wire` applies to — the derive is one way to get one, not the
+definition. A conditional impl's own binder bounds are what recurse into
+the arguments, so `impl Pair<type A: Wire, type B: Wire> with Wire`
+demands both and `impl Handle<type T> with Wire` demands neither.
+
 `Map<K, V>` is Wire when both its key and its value are (the key is
 already `Hashable` by the type's own bound). It narrates as a list of
 `{key, value}` pairs — codec-neutral, readable in JSON, and

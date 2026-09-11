@@ -3580,3 +3580,335 @@ fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
         "which is not Wire",
     );
 }
+
+// --- B289: Wire is a TRAIT, and the predicate asks the impl table ----------
+
+/// kolt's `store.vl:27`, retyped: the hand-written two-parameter conditional
+/// `Wire` impl the marker sweep found, variant-tagged exactly as `Option`'s
+/// is. Shared by the pins below so each exercises the SAME impl the field
+/// report named.
+///
+/// It is written over a USER enum rather than over `Result` on purpose. kolt's
+/// was a `Result` impl, and A82 is std adopting it — so a pin that hand-wrote
+/// one would be a duplicate impl the day A82 landed, and would have been
+/// testing "std has no impl for this" rather than "a hand-written impl is
+/// read". `Outcome` is `Result` in all but name and belongs to nobody, which
+/// is what makes these pins about the PREDICATE.
+const OUTCOME_WIRE_IMPL: &str = r#"
+        enum Outcome<T, E> {
+            Good(T),
+            Bad(E),
+        }
+
+        impl Outcome<type T: Wire, type E: Wire> with Wire {
+            fun describe<S: Serialize>(self, serializer: S) {
+                match self {
+                    Outcome::Good(let value) => {
+                        serializer.begin_variant("Good", 1);
+                        value.describe(serializer);
+                        serializer.end_variant();
+                    },
+                    Outcome::Bad(let error) => {
+                        serializer.begin_variant("Bad", 1);
+                        error.describe(serializer);
+                        serializer.end_variant();
+                    },
+                }
+            }
+
+            fun rebuild<D: Deserialize>(deserializer: D): Outcome<T, E> {
+                let tag = deserializer.variant_tag();
+                match tag {
+                    "Good" => {
+                        deserializer.begin_variant("Good", 1);
+                        let value = T::rebuild(deserializer);
+                        deserializer.end_variant();
+                        Outcome::Good(value)
+                    },
+                    _ => {
+                        deserializer.begin_variant("Bad", 1);
+                        let error = E::rebuild(deserializer);
+                        deserializer.end_variant();
+                        Outcome::Bad(error)
+                    },
+                }
+            }
+        }
+"#;
+
+/// The `[rpc]` face of the exhibit: one service whose only interesting feature
+/// is the return type, so a pin swaps exactly one spelling to move between the
+/// faces. `Opaque` is the not-Wire type and `Phantom<T>` the unbounded-binder
+/// one (`Handle<T>`'s shape, written by hand).
+fn wire_impl_service() -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::wire::{{ Deserialize, Serialize, Wire }};
+        struct Opaque {{ body: || void }}
+        struct Phantom<T> {{ count: i53 }}
+        impl Phantom<type T> with Wire {{
+            fun describe<S: Serialize>(self, serializer: S) {{
+                self.count.describe(serializer);
+            }}
+
+            fun rebuild<D: Deserialize>(deserializer: D): Phantom<T> {{
+                Phantom {{ count = i53::rebuild(deserializer) }}
+            }}
+        }}
+        {OUTCOME_WIRE_IMPL}
+        [service(StoreClient)]
+        struct Store {{ name: str }}
+        impl Store {{
+            [rpc]
+            fun look(self, id: i53): Outcome<i53, str> {{ Outcome::Bad("missing") }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+    )
+}
+
+/// The exhibit, and the whole of B289 in one program. `std::wire` shipped no
+/// `Result` impl (A82 lands it); kolt wrote one by hand and still could not
+/// return a `Result<i53, str>` from an `[rpc]` method, because the Wire
+/// predicate was a syntactic allowlist of six scalar spellings,
+/// `List`/`Option`/`Map`, and the `[derive(Wire)]` NAMES — an `impl .. with
+/// Wire` was invisible to it.
+///
+/// The impl is now the answer: the predicate consults the trait table, so a
+/// type that implements `Wire` is Wire wherever the boundary is asked.
+#[test]
+fn a_hand_written_wire_impl_admits_its_type_in_an_rpc_signature() {
+    assert_compiles(&wire_impl_service());
+}
+
+/// The refuse face, and the thing a NAME-keyed scan could never do: `Outcome`
+/// has an impl, so a scan over names would admit every `Outcome` in the
+/// program. Recursion into the arguments happens exactly where the IMPL's own
+/// binder bounds demand it — `impl Outcome<type T: Wire, type E: Wire>` binds
+/// both — so the argument that is not Wire refuses the signature, and the
+/// refusal quotes the type that carries it.
+#[test]
+fn a_hand_written_wire_impls_bounds_still_refuse_an_argument_that_is_not_wire() {
+    assert_fails_with(
+        &wire_impl_service().replace("Outcome<i53, str>", "Outcome<Opaque, str>"),
+        "is `Outcome<Opaque, str>`, which is not Wire",
+    );
+}
+
+/// C7's phantom rule, expressed by the impl rather than by a special case in
+/// the predicate: a binder with NO bound reaches its argument with no
+/// requirement, so `Phantom<Opaque>` is as sendable as `Phantom<i53>` — the
+/// argument never reaches the payload. The same shape the derive gives
+/// `Handle<T>` (`impl Handle<type T> with Wire`), written by hand so the rule
+/// is pinned at the impl and not at the derive.
+#[test]
+fn a_wire_impl_whose_binder_carries_no_bound_admits_any_argument() {
+    assert_compiles(
+        &wire_impl_service()
+            .replace("Outcome<i53, str>", "Phantom<Opaque>")
+            .replace(r#"Outcome::Bad("missing")"#, "Phantom { count = 1i53 }"),
+    );
+}
+
+/// The second boundary: the `[derive(Wire)]` all-fields check reads the same
+/// predicate, so a field typed by a hand-implemented Wire type passes it. It
+/// was refused before B289 for the same reason the signature was — the field's
+/// SPELLING was the test.
+///
+/// What it does NOT yet do is compile, and the reason is a PRE-EXISTING
+/// coupling the allowlist was hiding: `[derive(Wire)]` still emits
+/// `Json`/`FromJson` beside the §6.1 visitor ("additive beside the JSON impls
+/// until the codec re-plumb consumes it", `derive_impl_source`), so a field
+/// type needs a `Json` impl as well as a `Wire` one — and the generated body
+/// says so in `to_json`'s vocabulary, not the boundary's. `Map` has been
+/// admitted by the Wire boundary since A39 and walks into the same wall
+/// (`[derive(Wire)] struct Row {{ tags: Map<str, i32> }}` — the sibling pin), so
+/// the defect is the derive's, not this change's, and it is filed as its own
+/// item. This pin holds the half B289 owns and names the half it does not.
+#[test]
+fn a_derive_wire_field_may_be_a_hand_implemented_wire_type() {
+    let source = format!(
+        r#"
+        import std::io::print;
+        import std::wire::{{ Deserialize, Serialize, Wire }};
+        {OUTCOME_WIRE_IMPL}
+        [derive(Wire)]
+        struct Row {{ id: i53, outcome: Outcome<i53, str> }}
+        fun main() {{ print("row"); }}
+        main();
+        "#
+    );
+    assert_fails_without(&source, "which is not Wire");
+    assert_fails_with(&source, "has no method 'to_json'");
+}
+
+/// The sibling that proves the residue above is the DERIVE's and not the
+/// hand-written impl's: `Map` is Wire by std's own `impl Map<type K: Hashable +
+/// Wire, type V: Wire> with Wire` (A39), the Wire boundary has admitted it by
+/// name since, and `[derive(Wire)]`'s JSON half has never been able to
+/// generate for it — on `next` at 65af4be0, with nothing in this change
+/// reaching it.
+#[test]
+fn a_derive_wire_field_typed_map_meets_the_same_pre_existing_json_residue() {
+    let source = r#"
+        import std::io::print;
+        import std::map::Map;
+        [derive(Wire)]
+        struct Row { id: i53, tags: Map<str, i32> }
+        fun main() { print("row"); }
+        main();
+        "#;
+    assert_fails_without(source, "which is not Wire");
+    assert_fails_with(source, "has no method 'to_json'");
+}
+
+/// And its refuse face at the same boundary, for the same reason as the
+/// signature's: the impl's binder bounds are what recurse.
+#[test]
+fn a_derive_wire_field_of_a_hand_implemented_type_still_checks_its_arguments() {
+    assert_fails_with(
+        &format!(
+            r#"
+        import std::io::print;
+        import std::wire::{{ Deserialize, Serialize, Wire }};
+        struct Opaque {{ body: || void }}
+        {OUTCOME_WIRE_IMPL}
+        [derive(Wire)]
+        struct Row {{ id: i53, outcome: Outcome<Opaque, str> }}
+        fun main() {{ print("row"); }}
+        main();
+        "#
+        ),
+        "is `Outcome<Opaque, str>`, which is not Wire",
+    );
+}
+
+/// The third boundary: an `[expose]`d source's ELEMENT. The element comes off
+/// the `Source` impl and has no written node of its own, which is why this
+/// site always read a resolved type — B289 is what makes the rule it reads the
+/// same rule as the other three.
+#[test]
+fn an_exposed_element_may_be_a_hand_implemented_wire_type() {
+    assert_compiles(&format!(
+        r#"
+        import std::io::print;
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::wire::{{ Deserialize, Serialize, Wire }};
+        {OUTCOME_WIRE_IMPL}
+        [service(StoreClient)]
+        struct Store {{
+            [expose] outcome: SignalCell<Outcome<i53, str>>,
+        }}
+        impl Store {{
+            [rpc]
+            fun ping(self): i53 {{ 1i53 }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+    ));
+}
+
+/// The fourth boundary: a handle RETURN's element (§9.2, row 411). The
+/// spelling still decides that the return IS a handle — the `[service]`
+/// expansion reads the same annotation to shape the stub, and it runs before
+/// any type resolves — but the element it is JUDGED at is the resolved one, so
+/// a hand-implemented Wire element crosses.
+#[test]
+fn a_handle_returns_element_may_be_a_hand_implemented_wire_type() {
+    assert_compiles(&format!(
+        r#"
+        import std::io::print;
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::wire::{{ Deserialize, Serialize, Wire }};
+        {OUTCOME_WIRE_IMPL}
+        [service(StoreClient)]
+        struct Store {{
+            outcome: SignalCell<Outcome<i53, str>>,
+        }}
+        impl Store {{
+            [rpc]
+            fun watch(self): SignalCell<Outcome<i53, str>> {{ self.outcome }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+    ));
+}
+
+/// A39 admitted `Map` two orders ago and no refusal ever said so: all four
+/// texts listed `List`/`Option` and stopped. They now name `Map` and the impl
+/// escape hatch — the sentence that would have saved kolt the forty lines it
+/// wrote instead — and this holds all four at once, which is also the pin that
+/// they ARE four texts saying one thing.
+#[test]
+fn the_wire_refusal_names_map_and_the_impl_among_the_shapes_it_admits() {
+    let admitted = "`List`/`Option`/`Map` of Wire";
+    let escape = "or a type with an `impl .. with Wire`";
+    for (source, head) in [
+        (
+            r#"
+        import std::io::print;
+        struct Opaque { body: || void }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun look(self): Opaque { Opaque { body = || {} } }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+            "of `[rpc]` method `look` is `Opaque`, which is not Wire",
+        ),
+        (
+            r#"
+        import std::io::print;
+        struct Opaque { body: || void }
+        [derive(Wire)]
+        struct Row { hidden: Opaque }
+        fun main() { print("row"); }
+        main();
+        "#,
+            "of `[derive(Wire)]` type `Row` is `Opaque`, which is not Wire",
+        ),
+        (
+            r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Opaque { body: || void }
+        [service(StoreClient)]
+        struct Store { [expose] hidden: SignalCell<Opaque> }
+        impl Store {
+            [rpc]
+            fun ping(self): i53 { 1i53 }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+            "its element `Opaque` is not Wire",
+        ),
+        (
+            r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Opaque { body: || void }
+        [service(StoreClient)]
+        struct Store { hidden: SignalCell<Opaque> }
+        impl Store {
+            [rpc]
+            fun watch(self): SignalCell<Opaque> { self.hidden }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+            "returns a signal handle whose element `Opaque` is not Wire",
+        ),
+    ] {
+        assert_fails_with(source, head);
+        assert_fails_with(source, admitted);
+        assert_fails_with(source, escape);
+    }
+}
