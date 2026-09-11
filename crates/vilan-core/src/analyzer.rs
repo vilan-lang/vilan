@@ -2942,6 +2942,13 @@ pub struct Analyzer<'src> {
     /// one is legal, which it is nowhere else. Collected across every module,
     /// read by `check_rpc_signatures` once all are walked.
     client_service_subjects: HashSet<&'src str>,
+    /// The declarations of structs carrying `[client_service]` and NOT
+    /// `[service(..)]` — the client-only half of the pair above, by id rather
+    /// than by name because the one question asked of it is about a specific
+    /// declaration's fields (`check_expose_fields`, B284). A peer struct
+    /// carrying both attributes is deliberately absent: it serves as well as
+    /// handles, so its exposures are real.
+    client_only_service_declarations: HashSet<Id>,
     /// The name of the `impl` subject currently being walked, so an `[rpc]`
     /// method records which struct declared it.
     current_impl_subject_name: Option<&'src str>,
@@ -4574,6 +4581,7 @@ impl<'src> Analyzer<'src> {
             drop_call_edges: HashMap::default(),
             rpc_signatures_to_check: Vec::new(),
             client_service_subjects: HashSet::default(),
+            client_only_service_declarations: HashSet::default(),
             current_impl_subject_name: None,
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
@@ -14932,6 +14940,40 @@ impl<'src> Analyzer<'src> {
         // going unchecked.
         let source_trait_id = self.source_trait_id;
         for (label, type_node, field_type_id, span, declaration_id, exposure) in checks {
+            // B284, and it is asked BEFORE the type is: a struct carrying only
+            // `[client_service]` has no reactive session to export out of and
+            // no `__attach` route to mint through, so `[expose]` there is a
+            // no-op whatever the field's type turns out to be. It compiled, it
+            // moved the contract hash — `expose:` is a surface entry — and it
+            // exported nothing, which is the shape of defect the whole
+            // `check_expose_fields` family exists to say out loud (B202): the
+            // expansion generates nothing for such a field, so without this
+            // nothing would.
+            if self
+                .client_only_service_declarations
+                .contains(&declaration_id)
+            {
+                self.expose_refused_field_slots.insert(field_type_id);
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "{label} is `[expose]`d, but that struct carries only \
+                             `[client_service]`: an exposed field is mirrored out of the \
+                             SERVER's reactive session through the generated `__attach` \
+                             route, and a client-side struct has neither — so the \
+                             attribute moves the contract hash and mints no channel at \
+                             all. Drop `[expose]`, or write `[service(..)]` beside \
+                             `[client_service]` if this struct is a peer that serves as \
+                             well as handles"
+                        ),
+                    },
+                    declaration_id,
+                );
+                continue;
+            }
             let field_type = field_type_id.get_type(self);
             // A field that never grounded is another diagnostic's business.
             if matches!(field_type, Type::Unknown | Type::Unresolved) {
@@ -25529,6 +25571,13 @@ impl<'src> Analyzer<'src> {
                 }
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
+                // B284: a struct that handles and does not serve has no
+                // reactive session for an `[expose]`d field to be mirrored out
+                // of. Recorded AFTER the walk, because the walk is what mints
+                // the id the exposed fields were filed under.
+                if attribute.client_side && !attribute.server_side {
+                    self.client_only_service_declarations.insert(declaration_id);
+                }
                 None
             }
             // `!` yields `bool`; `-` yields its operand's type. Both hold their

@@ -439,3 +439,4 @@ row	flagship	key
 409	-	return type of `[rpc]` method `{method_name}` is `{rendered}`, but a `[client_service]` method is a
 410	-	`[service(.., client = {handler_name})]` names `{handler_name}` as the struct this
 411	-	`[rpc]` method `{method_name}` returns a signal handle whose element `{rendered}` is not Wire: the source itself stays on the server and the client mirrors it over a channel, so it is the ELEMENT that crosses the wire and it must be Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a `[derive(Wire)]` type)
+NEW	-	{label} is `[expose]`d, but that struct carries only `[client_service]`: an exposed field is mirrored out of the SERVER's reactive session through the generated `__attach` route, and a client-side struct has neither — so the attribute moves the contract hash and mints no channel at all. Drop `[expose]`, or write `[service(..)]` beside `[client_service]` if this struct is a peer that serves as well as handles

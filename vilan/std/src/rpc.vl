@@ -4656,6 +4656,14 @@ macro fun service(item: Item): Source {
 	// SERVER half only: a struct carrying `[client_service]` alone has no
 	// reactive session to mint them from, and nothing on the server end ever
 	// calls it.
+	//
+	// Which is why an `[expose]`d field on such a struct is refused at the
+	// attribute (B284, `check_expose_fields`): the loop above still builds its
+	// exposure — the builders are strings — and no route is emitted to run it,
+	// so the field contributed an `expose:` entry to the contract hash and
+	// minted nothing. The refusal is the analyzer's rather than a skip here,
+	// for the reason every arm of that check exists: code this expansion
+	// silently declines to generate has to be told about somewhere.
 	if target.client_name != "" {
 		routes.push(route_block("__attach", attach_statements));
 	}

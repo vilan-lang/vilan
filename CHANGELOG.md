@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**`[expose]` on a struct carrying only `[client_service]` is refused at the attribute instead of compiling into a channel nothing ever mints.** `[client_service] struct Handlers { [expose] tally: SignalCell<i32> }` built, printed a contract hash — the `expose:` surface entry is in it, so both peers had to agree about the field — and exported nothing: a client-side struct has no reactive session to export out of, and the expansion emits no `__attach` route for it at all. The refusal is said in the field's own vocabulary, for the reason every arm of that check exists (B202): the expansion silently declines to generate for such a field, so without this nothing said why. A peer struct — `[service(..)]` and `[client_service]` together — serves as well as handles and keeps its exposures, which is why the refusal is keyed on the declaration rather than on `[client_service]` being present.
+
 <!-- family: fix -->
 **An `[rpc]` method with a parameter named `request` did not build: the generated route's closure took `request` too, so the author's parameter shadowed it and every `arg`/`decode_failed` after the first was handed a decoded value where the request handle belonged.** `[rpc] fun send(self, request: str): str` stopped the build with "Expected RpcRequest, but got str", spanned on the STRUCT — a message about generated code the author never wrote, for a parameter name nothing told them not to use. The route is emitted as `.on("send", |__request| { … })` now, and the statements the expansion writes into that block read `arg(__request, 0)` / `decode_failed(__request)`: the same `__` reservation the generated `__attach` and `__contract` routes already take. Only `request` ever collided — `reason` is bound inside the decode arm and `connection` only in `__attach`'s own route, and both are pinned as admitted alongside the fix.
 

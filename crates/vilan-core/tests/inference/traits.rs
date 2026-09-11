@@ -3580,3 +3580,117 @@ fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
         "which is not Wire",
     );
 }
+
+// --- B284: `[expose]` on a struct that HANDLES and does not SERVE -----------
+
+/// B284: `[expose]` on a `[client_service]`-ONLY struct was a silent no-op.
+///
+/// It compiled, it contributed an `expose:` entry to the struct's contract
+/// hash — so the two peers had to agree about a channel neither could
+/// mint — and nothing ever minted one: a client-side struct has no reactive
+/// session to export out of, and the expansion generates no `__attach` route
+/// for it at all. Refused at the attribute now, in the field's own vocabulary,
+/// for the same reason every other arm of `check_expose_fields` is said there
+/// (B202): the expansion skips such a field, so without this nothing says why.
+#[test]
+fn b284_an_expose_on_a_client_service_only_struct_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [client_service]
+        struct Handlers {
+            [expose] tally: SignalCell<i32>,
+        }
+        impl Handlers {
+            [rpc]
+            fun session_revoked(self, reason: str) { print(reason); }
+        }
+        fun main() { print(Handlers { tally = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+        "carries only `[client_service]`",
+    );
+}
+
+/// B284's keyed spelling: the refusal is about the STRUCT, not about the shape
+/// of the exposure, so `[expose(keyed)]` over a `Map` element on a client-only
+/// struct is refused by the same arm — and by it ALONE, rather than also
+/// collecting the keyed arms' own complaints, because the early arm answers
+/// first and the field is done.
+#[test]
+fn b284_an_expose_keyed_on_a_client_service_only_struct_is_refused_once() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [client_service]
+        struct Handlers {
+            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
+        }
+        impl Handlers {
+            [rpc]
+            fun session_revoked(self, reason: str) { print(reason); }
+        }
+        fun main() { print(Handlers { tasks = Signal::new(Map::new()) }.contract_hash()); }
+        main();
+        "#,
+        "carries only `[client_service]`",
+    );
+}
+
+/// B284's control, and the reason the refusal is keyed on the DECLARATION
+/// rather than on `[client_service]` being present: a PEER struct carries both
+/// attributes, so it serves as well as handles — it has a dispatcher, an
+/// `__attach` route and a reactive session per connection, and its exposures
+/// are real. A program that wrote one before this landed keeps compiling and
+/// keeps its hash.
+#[test]
+fn b284_an_expose_on_a_peer_struct_that_also_serves_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [service(PeerClient)]
+        [client_service]
+        struct Peer {
+            [expose] tally: SignalCell<i32>,
+        }
+        impl Peer {
+            [rpc]
+            fun bump(self, by: i32) { self.tally.set(self.tally.get() + by); }
+        }
+        fun main() { print(Peer { tally = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+    );
+}
+
+/// B284's other control: a client-only struct with no `[expose]` at all is
+/// untouched. The refusal is the attribute's, not the attribute pair's.
+#[test]
+fn b284_a_client_service_only_struct_without_an_expose_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [client_service]
+        struct Handlers {
+            tally: SignalCell<i32>,
+        }
+        impl Handlers {
+            [rpc]
+            fun session_revoked(self, reason: str) { print(reason); }
+        }
+        fun main() { print(Handlers { tally = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+    );
+}
