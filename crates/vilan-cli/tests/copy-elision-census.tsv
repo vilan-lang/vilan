@@ -126,6 +126,7 @@ tuple-access	1
 tuple-spread	10
 unary-minus	0
 value-semantics	3
+vec2	0
 view-basic	1
 view-conventions	0
 view-field	0

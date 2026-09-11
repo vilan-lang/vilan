@@ -156,7 +156,38 @@ Conversions on literals fold at compile time.
 fun min<T: Ord>(a: T, b: T): T
 fun max<T: Ord>(a: T, b: T): T
 fun minmax<T: Ord>(a: T, b: T): (T, T)   // (smaller, larger)
+
+struct Vec2 { x: f64, y: f64 }           // a 2-D vector: point, offset, velocity, size
+impl Vec2 {
+	fun scale(self, factor: f64): Vec2   // both components times a scalar
+	fun length(self): f64                // sqrt(x² + y²)
+	fun distance(self, other: Vec2): f64 // the length of the vector between two points
+	fun dot(self, other: Vec2): f64      // x*x + y*y; v.dot(v) is v's length squared
+}
+// `Add`, `Sub` (component-wise, so `a + b` and `a - b`) and `PartialEq`.
 ```
+
+`Vec2` is a value, not a handle: it copies, compares and parks in a signal.
+The components carry **no unit** — CSS pixels at a UI call site, metres at a
+physics one — which is why there is no `Length` type in the signature.
+
+```vilan
+import std::math::Vec2;
+
+fun main() {
+	let start = Vec2 { x = 10.0, y = 10.0 };
+	let now = Vec2 { x = 13.0, y = 14.0 };
+	let travelled = now - start;
+	print(travelled.length());              // 5
+	print(now.distance(start) > 3.0);       // a drag threshold
+}
+```
+
+A threshold does not need the square root: `travelled.dot(travelled)` is the
+length squared, so compare it against the squared threshold on a hot path.
+`==` is exact `f64` equality, with everything that implies — a vector arrived
+at by arithmetic is rarely `==` one written down, so compare a `distance`
+against a tolerance where that matters.
 
 ## std::random
 
