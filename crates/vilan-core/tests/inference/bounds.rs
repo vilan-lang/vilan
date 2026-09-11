@@ -1559,6 +1559,39 @@ fn math_constants_and_moved_free_functions_import() {
     );
 }
 
+/// `Vec2::length_squared` — `x² + y²` under the name a comparison wants, with
+/// `length` now stated in terms of it. `sqrt` is monotonic, so the squared
+/// comparison decides exactly what the rooted one decides; the pin holds both
+/// halves, since a `length_squared` that returned something else would still
+/// pass a threshold test written against itself.
+#[test]
+fn vec2_length_squared_compares_without_the_root() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::math::Vec2;
+
+        fun main() {
+            let travelled = Vec2 { x = 3.0, y = 4.0 };
+            print(travelled.length_squared());
+            print(travelled.length_squared() == travelled.length() * travelled.length());
+            let threshold = 3.0;
+            print(travelled.length_squared() > threshold * threshold);
+            print((travelled.length() > threshold) == (travelled.length_squared() > threshold * threshold));
+            let shorter = Vec2 { x = 1.0, y = 1.0 };
+            print(shorter.length_squared() < travelled.length_squared());
+        }
+        main();
+        "#,
+        "25
+true
+true
+true
+true
+",
+    );
+}
+
 #[test]
 fn f64_float_classification_predicates() {
     assert_compiles_and_runs(

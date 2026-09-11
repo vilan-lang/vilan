@@ -628,7 +628,7 @@ const CSS_ORDER_SENSITIVE: &str = concat!(
     "\tlet i = const css {\n",
     "\t\t.hover { color: {Color::gray(50)}; }\n",
     "\t\tpadding: {space(2)};\n",
-    "\t\t.within(\"data-theme\", \"dark\") { color: {Color::gray(100)}; }\n",
+    "\t\t.within(\"data-theme\", Some(\"dark\")) { color: {Color::gray(100)}; }\n",
     "\t\tdisplay: flex;\n",
     "\t\t.md { padding: {space(6)}; }\n",
     "\t};\n",

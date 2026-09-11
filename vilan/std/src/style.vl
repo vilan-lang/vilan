@@ -125,7 +125,11 @@ impl Length {
 
 	/// The typed end of the dynamic-value channel: pairs with
 	/// `view.style_var(name, signal)` writing the custom property at runtime.
+	/// The name is the custom property's own, dashes included — checked at const
+	/// time, because `var(w)` is a dropped declaration rather than an error
+	/// anywhere a browser can tell you about it.
 	fun var(name: str): Length {
+		check_custom_property_name(name);
 		Length { text = i"var({name})", root = "" }
 	}
 }
@@ -196,8 +200,10 @@ impl Color {
 	/// block, or `view.style_var(name, signal)` writing it at runtime.
 	/// `.alpha()` composes over it through the relative-colour form,
 	/// `rgb(from var(..) r g b / a)`, so a variable-backed colour
-	/// translucifies exactly like a ramp token.
+	/// translucifies exactly like a ramp token. The name carries its dashes, and
+	/// `Length::var`'s const-time check is the same one.
 	fun var(name: str): Color {
+		check_custom_property_name(name);
 		Color { text = i"var({name})", root = "" }
 	}
 
@@ -337,6 +343,23 @@ fun check_attribute_value(value: str) {
 	for banned in ["\"", "'", " ", ":"] {
 		if value.contains(banned) {
 			panic(i"an attribute value cannot contain '{banned}' (got \"{value}\") — a styling hook's value is one token, like \"true\"");
+		}
+	}
+}
+
+/// A CSS custom property is spelled with its two leading dashes — that is what
+/// makes it one (A90). `var(button-color)` is not a broken reference, it is not
+/// a reference at all: `button-color` parses as a keyword, the declaration is
+/// dropped, and nothing says so until the page renders wrong. The fence is the
+/// attribute name's, plus the dashes: no space, quote or `:`, since those
+/// delimit the `var()` call and the declaration around it.
+fun check_custom_property_name(name: str) {
+	if !name.starts_with("--") || name.len() < 3 {
+		panic(i"a custom property is written with its dashes — var(\"--button-color\"), not var(\"{name}\")");
+	}
+	for banned in ["\"", "'", " ", ":"] {
+		if name.contains(banned) {
+			panic(i"a custom property name cannot contain '{banned}' (got \"{name}\") — the name is one token, like --button-color");
 		}
 	}
 }
@@ -818,13 +841,67 @@ fun without_covered(
 	out
 }
 
+/// The condition grammar carries the NEGATION marker (A89) in two shapes, and
+/// keeping them apart is what lets a negation nest inside a condition that is
+/// itself negated:
+///
+/// - **Pending**, a `!` as the condition's own FIRST TOKEN (`"!"`, `"! hover"`).
+///   `not(inner)` leaves it: `not` names no selector of its own, so it cannot
+///   emit, and the condition combinator immediately OUTSIDE it is the one that
+///   knows which selector to negate. A pending mark never reaches
+///   [`render_rule`] — the enclosing combinator consumes it, or one of the three
+///   refusals fires.
+/// - **Applied**, a `!` PREFIXING one token (`![data-open="true"]`, `!hover`,
+///   `!^[data-theme="dark"]`). That is the negation already placed on its axis,
+///   and it is what `render_rule` turns into `:not(..)`.
+fun condition_is_marked(condition: str): bool {
+	condition == "!" || condition.starts_with("! ")
+}
+
+/// The condition a pending mark was left on — `"! hover"` is a marked `"hover"`.
+fun condition_unmarked(condition: str): str {
+	if condition == "!" {
+		""
+	} else if condition.starts_with("! ") {
+		condition.substring(2, condition.len())
+	} else {
+		condition
+	}
+}
+
+/// `condition_unmarked`'s inverse: the condition with a pending mark on it.
+fun condition_marked(condition: str): str {
+	if condition == "" {
+		"!"
+	} else {
+		"! " + condition
+	}
+}
+
+/// Whether a condition TOKEN carries an applied negation, and the token without
+/// it. Every token test below reads the BARE token, so an axis is recognized
+/// the same negated or not, and returns the token WITH its marker, so
+/// `render_rule` still sees the negation it has to render.
+fun token_is_negated(token: str): bool {
+	token.starts_with("!")
+}
+
+fun token_bare(token: str): str {
+	if token.starts_with("!") {
+		token.substring(1, token.len())
+	} else {
+		token
+	}
+}
+
 /// The condition's RELATION token, if any — always the FIRST token when it is
 /// one: the ancestor guard (`^[data-theme="dark"]`), the children combinator
 /// (`>*`), or the divide combinator (`>*+*`). `""` when the condition opens
 /// with an attribute or pseudo-class token instead.
 fun condition_relation(condition: str): str {
 	let first = condition.split(" ")[0];
-	if first.starts_with("^") || first.starts_with(">") {
+	let bare = token_bare(first);
+	if bare.starts_with("^") || bare.starts_with(">") {
 		first
 	} else {
 		""
@@ -836,7 +913,7 @@ fun condition_relation(condition: str): str {
 /// bracketed form, so the scan is a prefix check per token.
 fun condition_attribute(condition: str): str {
 	for part in condition.split(" ") {
-		if part.starts_with("[") {
+		if token_bare(part).starts_with("[") {
 			ret part;
 		}
 	}
@@ -851,7 +928,8 @@ fun condition_attribute(condition: str): str {
 fun condition_pseudo(condition: str): str {
 	let parts = condition.split(" ");
 	let last = parts[parts.len() - 1];
-	if last.starts_with("^") || last.starts_with(">") || last.starts_with("[") {
+	let bare = token_bare(last);
+	if bare == "" || bare.starts_with("^") || bare.starts_with(">") || bare.starts_with("[") {
 		""
 	} else {
 		last
@@ -896,30 +974,53 @@ fun condition_pseudo(condition: str): str {
 fun render_rule(media: str, condition: str, property: str, class: str, declaration: str): str {
 	mut selector = if family_longhands(property) == "" { "." + class } else { "*." + class };
 	let relation = condition_relation(condition);
-	if relation.starts_with("^") {
+	let bare_relation = token_bare(relation);
+	if bare_relation.starts_with("^") {
 		// The ancestor guard: the token minus its `^` marker is the ancestor's
-		// attribute selector, prepended with the descendant combinator.
-		selector = relation.substring(1, relation.len()) + " " + selector;
+		// attribute selector, prepended with the descendant combinator. A NEGATED
+		// guard wraps that selector in `:not(..)`, which is the one place the
+		// negation moves a rule's cascade BAND: the line then starts with ':'
+		// rather than '[', so it sorts among the pseudo rules instead of after
+		// them. Specificity is unchanged — `:not(x)` counts as `x` — so every
+		// composed rule still wins its cascade on specificity, and the only
+		// outcome the band decides is a (0,2,0) tie between a NEGATED guard and a
+		// plain pseudo rule, which now falls to the pseudo (ui-styling.md
+		// §0bis.6's ledger reads the un-negated case).
+		let guard = bare_relation.substring(1, bare_relation.len());
+		let rendered_guard = if token_is_negated(relation) { i":not({guard})" } else { guard };
+		selector = rendered_guard + " " + selector;
 	}
 	// The attribute token is already selector syntax, appended to the
 	// element's own compound selector — an attribute-conditioned base rule
 	// still starts with '.', so it stays in the base cascade band (B35).
 	let attribute = condition_attribute(condition);
 	if attribute != "" {
-		selector = selector + attribute;
+		let bare_attribute = token_bare(attribute);
+		let rendered_attribute = if token_is_negated(attribute) {
+			i":not({bare_attribute})"
+		} else {
+			bare_attribute
+		};
+		selector = selector + rendered_attribute;
 	}
 	let pseudo = condition_pseudo(condition);
 	if pseudo != "" {
-		selector = selector + ":" + pseudo;
+		let bare_pseudo = token_bare(pseudo);
+		let rendered_pseudo = if token_is_negated(pseudo) {
+			i":not(:{bare_pseudo})"
+		} else {
+			":" + bare_pseudo
+		};
+		selector = selector + rendered_pseudo;
 	}
-	if relation == ">*" {
+	if bare_relation == ">*" {
 		selector = selector + " > *";
 	}
-	if relation == ">*+*" {
+	if bare_relation == ">*+*" {
 		selector = selector + " > :not(:first-child)";
 	}
 	mut rule = selector + "{" + declaration + "}";
-	if relation.starts_with(">") {
+	if bare_relation.starts_with(">") {
 		rule = "@layer vilan{" + rule + "}";
 	}
 	if media != "" {
@@ -1335,6 +1436,11 @@ impl Style {
 	// the child-side relations (`children`, `divide`) take an unconditioned
 	// inner in v1: a pseudo or attribute under them would bind to the CHILD's
 	// compound, which is semantics nobody has ruled yet.
+	//
+	// `not` (A89) is the one combinator that is NOT an axis: it marks its inner
+	// and the enclosing condition negates ITS OWN selector. It therefore adds
+	// no nesting order of its own — it sits directly inside the condition it
+	// negates, on whichever axis that is.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -1360,6 +1466,66 @@ impl Style {
 		self.pseudo("last-child", inner)
 	}
 
+	/// NEGATION, as a MARKER on the inner style (A89). `not` names no selector
+	/// of its own — which selector is being negated is a fact about the
+	/// condition OUTSIDE it — so it emits nothing: it marks each of `inner`'s
+	/// slots, and the condition combinator immediately enclosing it emits its
+	/// own selector NEGATED and clears the mark.
+	///
+	///     style().attribute("disabled", None, style().not(style().hover(s)))
+	///     // .sX:not([disabled]):hover{…}
+	///     style().hover(style().not(s))
+	///     // .sX:not(:hover){…}
+	///     style().within("data-theme", Some("dark"), style().not(s))
+	///     // :not([data-theme="dark"]) .sX{…}
+	///
+	/// Reading inside-out, `not` negates exactly the next condition OUT, so the
+	/// first form keeps the hover and negates the attribute. In a `css` block it
+	/// is the nested rule `.not { … }` by the name-blind lowering, like every
+	/// other combinator.
+	///
+	/// Specificity is unchanged by negating a part: `:not(x)` counts as `x`, so
+	/// `.sX:not([disabled]):hover` is (0,3,0) over both of its (0,2,0)
+	/// components, exactly as `.sX[disabled]:hover` is.
+	///
+	/// Three refusals, all at const time. A `not` that reaches APPLICATION
+	/// unwrapped is caught by `class_list` — nothing emitted a rule for it, so
+	/// applying it would be silence. `not(not(..))` is refused rather than
+	/// cancelled: a double negation is a spelling mistake, never an intent. And
+	/// a media condition cannot be negated in v1 — `@media not (..)` is its own
+	/// grammar and no ruling has reached it.
+	fun not(self, inner: Style): Style {
+		mut rules = self.rules;
+		for key in inner.rules.keys() {
+			match inner.rules.get(key) {
+				Some(let entry) => {
+					let parts = key.split(":");
+					if condition_is_marked(parts[1]) {
+						panic("not(not(..)) — a double negation is a spelling mistake rather than a cancellation: drop both, or negate the condition you meant");
+					}
+					if parts[0] != "" {
+						panic("a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead");
+					}
+					let (class, declaration) = entry;
+					let condition = condition_marked(parts[1]);
+					rules = without_covered(rules, parts[0], condition, parts[2]);
+					// The mark is written TWICE, deliberately, and `not` is the only
+					// writer of either. On the CONDITION it is the slot's identity, so
+					// a negated slot and its plain twin coexist and the enclosing
+					// combinator can read which it is. On the CLASS it is the same fact
+					// placed where `class_list` already walks: application runs once per
+					// element per render, and a second walk to read the keys cost 3.1 us
+					// per call on a 25-slot style (78% of `class_list`) when it was
+					// measured. The class of a marked slot is never used for anything
+					// else — the enclosing combinator re-mints it through `rule`.
+					rules.insert(parts[0] + ":" + condition + ":" + parts[2], ("!" + class, declaration));
+				}
+				None => {}
+			}
+		}
+		Style { rules }
+	}
+
 	/// The ancestor guard — `[name="value"] .sX`: the element's own slots,
 	/// conditioned on an ANCESTOR carrying the attribute. The theme condition
 	/// is its motivating instance — `within("data-theme", "dark", ..)` under a
@@ -1377,23 +1543,36 @@ impl Style {
 	/// its parts on specificity), media nests outside, and no relation wraps
 	/// a relation. Name and value are fenced at const time like `attribute`'s
 	/// — one token, no quotes, spaces or `:`.
-	fun within(self, name: str, value: str, inner: Style): Style {
+	///
+	/// The value is `attribute`'s `Option` for the same reason and with the
+	/// same reading (A89): `Some(v)` guards on the exact value
+	/// (`[name="v"] .sX`), `None` on the ancestor merely CARRYING the attribute
+	/// (`[name] .sX`) — a `[data-collapsed]` sidebar, a `[data-print]` root.
+	fun within(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
-		check_attribute_value(value);
+		let guard = match value {
+			Some(let exact) => {
+				check_attribute_value(exact);
+				i"^[{name}=\"{exact}\"]"
+			},
+			None => i"^[{name}]",
+		};
 		mut out = self;
 		for key in inner.rules.keys() {
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
 					let parts = key.split(":");
+					let negated = condition_is_marked(parts[1]);
+					let rest = condition_unmarked(parts[1]);
 					if parts[0] != "" {
 						panic("nest conditions as md(within(..)) — within cannot wrap a media-conditioned style");
 					}
-					if condition_relation(parts[1]) != "" {
+					if condition_relation(rest) != "" {
 						panic("within cannot wrap an already relation-conditioned style — one within, children or divide per slot");
 					}
-					let token = i"^[{name}=\"{value}\"]";
-					let condition = if parts[1] == "" { token } else { token + " " + parts[1] };
+					let token = if negated { "!" + guard } else { guard };
+					let condition = if rest == "" { token } else { token + " " + rest };
 					out = out.rule("", condition, parts[2], declaration);
 				}
 				None => {}
@@ -1440,7 +1619,7 @@ impl Style {
 						panic(i"nest conditions as md({name}(..)) — {name} cannot wrap a media-conditioned style");
 					}
 					if parts[1] != "" {
-						panic(i"{name} takes an unconditioned style — a hover, attribute or within condition belongs on the child's own style");
+						panic(i"{name} takes an unconditioned style — a hover, attribute or within condition belongs on the child's own style; for a state on the element ITSELF, condition it with attribute(..) rather than reaching for a child relation");
 					}
 					out = out.rule("", token, parts[2], declaration);
 				}
@@ -1453,8 +1632,16 @@ impl Style {
 	/// An attribute condition on the element ITSELF — `.sX[data-open="true"]`
 	/// — where `within` is the ancestor form. The general spelling of state
 	/// carried in markup: `data-state`, `data-open`, `aria-expanded` — any
-	/// attribute rides, `aria-*` included, and the value matches exactly
-	/// (CSS `[name="value"]`). Its own slot in the condition axis, between
+	/// attribute rides, `aria-*` included.
+	///
+	/// The value says WHICH of the two attribute conditions CSS has (A89):
+	/// `Some(v)` is the exact match `[name="v"]`, and `None` is PRESENCE,
+	/// `[name]` — the form a boolean attribute actually has in markup
+	/// (`[disabled]`, `[data-selected]`), which before A89 had no spelling at
+	/// all and pushed authors onto `child_relation` as a raw-selector escape
+	/// hatch. Under `not(..)` the presence form is the other half of the pair:
+	/// `attribute("disabled", None, not(hover(s)))` is `.sX:not([disabled]):hover`.
+	/// Its own slot in the condition axis, between
 	/// the relation and the pseudo-class —
 	/// `md(within(.., attribute(.., hover(..))))` — so a theme guard composes
 	/// with an element's state; every other order is refused naming the fix,
@@ -1463,30 +1650,39 @@ impl Style {
 	/// `.sX[..]:hover` is (0,3,0) over both (0,2,0) components.
 	///
 	/// The app owns SETTING the attribute on the element; the style only
-	/// selects on it. Name and value are validated at const time: no quotes,
+	/// selects on it. The name, and the value when there is one, are validated
+	/// at const time: no quotes,
 	/// no spaces, no `:` — those delimit the machinery underneath (the slot
 	/// key, the condition grammar, the selector's own quoting), and a styling
 	/// hook is a single token in practice.
-	fun attribute(self, name: str, value: str, inner: Style): Style {
+	fun attribute(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
-		check_attribute_value(value);
+		let selector = match value {
+			Some(let exact) => {
+				check_attribute_value(exact);
+				i"[{name}=\"{exact}\"]"
+			},
+			None => i"[{name}]",
+		};
 		mut out = self;
 		for key in inner.rules.keys() {
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
 					let parts = key.split(":");
+					let negated = condition_is_marked(parts[1]);
+					let rest = condition_unmarked(parts[1]);
 					if parts[0] != "" {
 						panic("nest conditions as md(attribute(..)) — attribute cannot wrap a media-conditioned style");
 					}
-					if condition_relation(parts[1]) != "" {
+					if condition_relation(rest) != "" {
 						panic("nest the relation OUTSIDE the attribute — within(.., attribute(..)), not attribute(within(..))");
 					}
-					if condition_attribute(parts[1]) != "" {
+					if condition_attribute(rest) != "" {
 						panic("attribute cannot wrap an already attribute-conditioned style");
 					}
-					let token = i"[{name}=\"{value}\"]";
-					let condition = if parts[1] == "" { token } else { token + " " + parts[1] };
+					let token = if negated { "!" + selector } else { selector };
+					let condition = if rest == "" { token } else { token + " " + rest };
 					out = out.rule("", condition, parts[2], declaration);
 				}
 				None => {}
@@ -1500,25 +1696,31 @@ impl Style {
 	/// position: a relation, an attribute and a breakpoint may wrap it, and it
 	/// may wrap none of them (nor another pseudo-class).
 	fun pseudo(self, name: str, inner: Style): Style {
+		if name.starts_with("!") {
+			panic(i"a pseudo-class name cannot start with '!' (got \"{name}\") — a leading '!' is the condition grammar's negation marker; write not(..) inside the condition you want negated");
+		}
 		mut out = self;
 		for key in inner.rules.keys() {
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
 					let parts = key.split(":");
+					let negated = condition_is_marked(parts[1]);
+					let rest = condition_unmarked(parts[1]);
 					if parts[0] != "" {
 						panic(i"nest conditions as md(hover(..)) — {name} cannot wrap a media-conditioned style");
 					}
-					if condition_relation(parts[1]) != "" {
+					if condition_relation(rest) != "" {
 						panic(i"nest the relation OUTSIDE the pseudo — within(.., {name}(..)), not {name}(within(..))");
 					}
-					if condition_attribute(parts[1]) != "" {
+					if condition_attribute(rest) != "" {
 						panic(i"nest the attribute OUTSIDE the pseudo — attribute(.., {name}(..)), not {name}(attribute(..))");
 					}
-					if parts[1] != "" {
+					if rest != "" {
 						panic(i"{name} cannot wrap an already pseudo-conditioned style");
 					}
-					out = out.rule("", name, parts[2], declaration);
+					let token = if negated { "!" + name } else { name };
+					out = out.rule("", token, parts[2], declaration);
 				}
 				None => {}
 			}
@@ -1556,6 +1758,9 @@ impl Style {
 					let parts = key.split(":");
 					if parts[0] != "" {
 						panic("a breakpoint cannot wrap another media-conditioned style");
+					}
+					if condition_is_marked(parts[1]) {
+						panic("a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead");
 					}
 					out = out.rule(min_width, parts[1], parts[2], declaration);
 				}
@@ -1598,10 +1803,23 @@ impl Style {
 
 	/// The rendered class attribute: every slot's class, space-joined.
 	/// Runtime-legal (no emission) — selection and merging stay ordinary code.
+	///
+	/// It is also where an UNWRAPPED `not(..)` is caught (A89). A marked slot
+	/// emitted no rule — `not` cannot know which selector to negate until the
+	/// enclosing condition tells it — so its class would name nothing on the
+	/// sheet, and applying the style would be silence rather than a wrong
+	/// colour. Application is the last place that can still say so: every path
+	/// that dresses an element (`styled`, `bind_styled`, the element syntax's
+	/// class attribute) renders its classes through here. It costs one prefix
+	/// test per slot inside the walk that was already happening, which is why
+	/// `not` marks the class as well as the condition.
 	fun class_list(self): str {
 		mut out = "";
 		for entry in self.rules.values() {
 			let (class, _declaration) = entry;
+			if token_is_negated(class) {
+				panic("this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style — attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))");
+			}
 			if out == "" {
 				out = class;
 			} else {

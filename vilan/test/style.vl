@@ -72,9 +72,9 @@ fun main() {
 	// (B35 / ui-styling.md §0bis.6), so its (0,2,0) tie against a pseudo rule
 	// resolves to the theme by source order.
 	let themed = const style()
-		.md(style().within("data-theme", "dark", style().hover(style().background(Color::gray(50)))))
-		.within("data-theme", "dark", style().background(Color::gray(900)))
-		.within("data-theme", "dark", style().hover(style().background(Color::gray(700))));
+		.md(style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(50)))))
+		.within("data-theme", Some("dark"), style().background(Color::gray(900)))
+		.within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))));
 	print(themed.class_list());
 
 	// The value types (ui-styling.md §0bis.3). A translucent token renders as
@@ -151,11 +151,26 @@ fun main() {
 	// attribute rules start with '.', so they stay in the base cascade band
 	// (B35).
 	let disclosed = const style()
-		.md(style().within("data-theme", "dark", style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))))
-		.within("data-theme", "dark", style().attribute("data-open", "true", style().background(Color::gray(800))))
-		.attribute("data-open", "true", style().display(Display::Flex))
-		.attribute("data-open", "true", style().hover(style().background(Color::gray(100))));
+		.md(style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().hover(style().color(Color::gray(50))))))
+		.within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().background(Color::gray(800))))
+		.attribute("data-open", Some("true"), style().display(Display::Flex))
+		.attribute("data-open", Some("true"), style().hover(style().background(Color::gray(100))));
 	print(disclosed.class_list());
+
+	// A89: the PRESENCE form and the negation MARKER. `None` renders `[name]`
+	// — the shape a boolean attribute actually has in markup — and `not(..)`
+	// emits nothing itself: the condition immediately OUTSIDE it emits its own
+	// selector negated, so `attribute(.., None, not(hover(..)))` keeps the
+	// hover and negates the attribute. The golden pins the four selectors in
+	// bytes, the negated ancestor guard among them — the one negation that
+	// moves a rule out of the `[` cascade band into the `:` one.
+	let gated = const style()
+		.within("data-theme", Some("dark"), style().not(style().background(Color::gray(900))))
+		.within("data-collapsed", None, style().display(Display::Hidden))
+		.attribute("data-selected", None, style().color(Color::gray(50)))
+		.attribute("disabled", None, style().not(style().hover(style().background(Color::gray(100)))))
+		.hover(style().not(style().color(Color::gray(700))));
+	print(gated.class_list());
 
 	// The child-side relations (ui-styling.md §0bis.6): children and divide
 	// reach the element's CHILDREN, so their rules emit inside `@layer vilan`

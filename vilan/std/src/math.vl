@@ -83,10 +83,24 @@ impl Vec2 {
 
 	/// The vector's LENGTH from the origin (its magnitude) — `sqrt(x² + y²)`.
 	/// Comparing two lengths, or a length against a threshold, does not need
-	/// the square root: square the threshold and compare `dot(self)` instead,
-	/// which is what a per-pointer-move drag check wants.
+	/// the square root: reach for `length_squared` and square the threshold.
 	fun length(self): f64 {
-		self.dot(self).sqrt()
+		self.length_squared().sqrt()
+	}
+
+	/// The length WITHOUT the square root — `x² + y²`, which is `self.dot(self)`
+	/// under the name the comparison actually wants. `sqrt` is monotonic, so
+	/// `a.length() < b.length()` and `a.length_squared() < b.length_squared()`
+	/// agree on every pair, and a THRESHOLD comparison squares the threshold
+	/// once instead of taking a root per sample:
+	///
+	///     if moved.length_squared() > drag_threshold * drag_threshold { … }
+	///
+	/// Which is a pointer-move handler's whole arithmetic, run on every event.
+	/// It is a name for a comparison, not a faster `length`: take the root when
+	/// the NUMBER is the answer.
+	fun length_squared(self): f64 {
+		self.dot(self)
 	}
 
 	/// The distance between the two points `self` and `other` — the length of

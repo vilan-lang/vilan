@@ -64,12 +64,20 @@ function without_covered(rules, media, condition, property) {
 	}
 	return out;
 }
+function token_is_negated(token) {
+	return token.startsWith("!");
+}
 function class_list(self) {
 	let out = "";
 	for (const entry of $a(self[0])) {
 		const $b = entry;
 		const class2 = $b[0];
 		const _declaration = $b[1];
+		if (token_is_negated(class2)) {
+			(() => {
+				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
+			})();
+		}
 		if (out === "") {
 			out = class2;
 		} else {

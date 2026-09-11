@@ -85,15 +85,15 @@ fun conditions(): Style {
 	css {
 		color: {Color::gray(900)};
 		.md {
-			.within("data-theme", "dark") {
-				.attribute("data-open", "true") {
+			.within("data-theme", Some("dark")) {
+				.attribute("data-open", Some("true")) {
 					.hover {
 						color: {Color::gray(50)};
 					}
 				}
 			}
 		}
-		.within("data-theme", "dark") {
+		.within("data-theme", Some("dark")) {
 			color: {Color::gray(50)};
 			.hover {
 				color: {Color::gray(100)};

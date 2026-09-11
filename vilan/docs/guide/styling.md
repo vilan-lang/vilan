@@ -91,7 +91,7 @@ a dotted `.name { … }` is a condition combinator and becomes
 `.name(style() … )`, with the block's own chain as its last argument.
 The dot is the only thing the grammar looks at, so every condition
 method works inside a block — `.hover`, `.md`, `.within("data-theme",
-"dark")`, `.children`, `.attribute("data-open", "true")` — including
+"dark")`, `.children`, `.attribute("data-open", Some("true"))` — including
 ones added later, and nesting order is combinator order: media outside,
 then the relation, then the attribute, then the pseudo-class.
 
@@ -99,7 +99,7 @@ then the relation, then the attribute, then the pseudo-class.
 let panel = css {
 	color: {Color::gray(900)};
 
-	.within("data-theme", "dark") {
+	.within("data-theme", Some("dark")) {
 		color: {Color::gray(50)};
 	}
 
@@ -444,6 +444,28 @@ let button = const style()
 
 Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
 `.last`, and `.pseudo(name, inner)` for anything else.
+
+Two more conditions round the set out. `.attribute(name, value, inner)`
+conditions on an attribute of the element **itself**, and its value is an
+`Option`: `Some("true")` is the exact match `[data-open="true"]`, `None` is
+**presence** — `[data-selected]`, `[disabled]`, the shape a boolean attribute
+actually has in markup. And `.not(inner)` **negates the condition immediately
+outside it**: it emits nothing on its own, it marks its inner, and the
+enclosing condition renders its own selector negated.
+
+```vilan,fragment
+let row = const style()
+	.attribute("data-selected", None, style().background(Color::blue(100)))
+	.attribute("disabled", None, style().not(style().hover(style().background(Color::gray(50)))))
+	.hover(style().not(style().opacity(0.6)));
+```
+
+That is `.sX[data-selected]`, `.sX:not([disabled]):hover` — hovered *and* not
+disabled, the pair that had no spelling before — and `.sX:not(:hover)`. Read
+inside-out: `not` negates exactly the next condition out, never its own inner.
+A `not` left unwrapped is refused when the style is applied, a double `not` is
+refused rather than cancelled, and a breakpoint cannot be negated in this
+version.
 Breakpoints work the same way: `.sm(inner)` (640px), `.md(inner)`
 (768px), `.lg(inner)` (1024px), `.xl(inner)` (1280px), or
 `.media(min_width, inner)`. All are `min-width` conditions, so chains are
@@ -453,7 +475,7 @@ order, which is what makes that true).
 
 ## Theming, and stacking conditions
 
-`.within(name, value, inner)` applies under an **ancestor** carrying the
+`.within(name, Some(value), inner)` applies under an **ancestor** carrying the
 attribute — `within("data-theme", "dark", ..)` is the theme condition,
 under a `[data-theme="dark"]` switch you set on the document, not
 `prefers-color-scheme`. That is deliberate: a server can decide the theme
@@ -476,9 +498,9 @@ a breakpoint outside the guard, the guard outside the pseudo-class.
 let button = const style()
 	.background(Color::gray(100))
 	.hover(style().background(Color::gray(200)))
-	.within("data-theme", "dark", style().background(Color::gray(800)))
-	.within("data-theme", "dark", style().hover(style().background(Color::gray(700))))
-	.md(style().within("data-theme", "dark", style().hover(style().background(Color::gray(600)))));
+	.within("data-theme", Some("dark"), style().background(Color::gray(800)))
+	.within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))))
+	.md(style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(600)))));
 ```
 
 Write them in any other order and the build stops and tells you which

@@ -416,6 +416,7 @@ std/style.md h2 constructors-and-values
 std/style.md h2 style-methods
 std/style.md h2 conditions
 std/style.md h3 stacking
+std/style.md h3 negation-not
 std/style.md h3 relations
 std/style.md h2 declaration-blocks
 std/style.md h3 ordering

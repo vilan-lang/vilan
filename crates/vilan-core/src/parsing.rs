@@ -3410,7 +3410,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         // The head's arguments are ORDINARY vilan expressions, so
-        // `.within("data-theme", "dark") { … }` and `.pseudo("first-child") { … }`
+        // `.within("data-theme", Some("dark")) { … }` and `.pseudo("first-child") { … }`
         // work with no special casing (§4.3) — and so do a link's.
         let parenthesized = self.peek_is_ctrl('(');
         let arguments = if parenthesized {

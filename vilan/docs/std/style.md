@@ -74,7 +74,11 @@ colour.
 `Color::var` is `Length::var`'s counterpart — the typed end of the
 dynamic-value channel. It renders `var(--name)` and **declares nothing**:
 the app owns the custom property's declaration (its emitted theme block,
-or `view.style_var` writing it at runtime). `.alpha()` composes over it
+or `view.style_var` writing it at runtime). Both spell the name with its
+**two leading dashes**, and both refuse one without them at const time:
+`var(button-color)` is not a broken reference, it is not a reference —
+`button-color` parses as a keyword, the browser drops the declaration, and
+nothing says so until the page is wrong. `.alpha()` composes over it
 through the same relative-colour form, so a variable-backed colour
 translucifies exactly like a ramp token.
 
@@ -213,11 +217,12 @@ fun active(self, inner: Style): Style
 fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
-fun within(self, name: str, value: str, inner: Style): Style     // [name="value"] .sX — an ancestor guard
+fun within(self, name: str, value: Option<str>, inner: Style): Style     // [name="value"] .sX — an ancestor guard
 fun children(self, inner: Style): Style   // @layer vilan{.sX > *} — every direct child
 fun divide(self, inner: Style): Style     // @layer vilan{.sX > :not(:first-child)} — every child but the first
-fun attribute(self, name: str, value: str, inner: Style): Style  // .sX[name="value"] — the element itself
+fun attribute(self, name: str, value: Option<str>, inner: Style): Style  // .sX[name="value"] — the element itself
 fun pseudo(self, name: str, inner: Style): Style
+fun not(self, inner: Style): Style        // negates the condition IMMEDIATELY OUTSIDE it
 
 fun sm(self, inner: Style): Style          // breakpoints (min-width):
 fun md(self, inner: Style): Style          // 640px, 768px, 1024px, 1280px
@@ -233,10 +238,10 @@ nests them** — media, then the relation (`within`, `children`, `divide`),
 then the attribute, then the pseudo-class:
 
 ```vilan,fragment
-style().md(style().within("data-theme", "dark", style().hover(style().opacity(0.8))))
+style().md(style().within("data-theme", Some("dark"), style().hover(style().opacity(0.8))))
 // @media (min-width: 768px){[data-theme="dark"] .sX:hover{opacity:0.8}}
 
-style().md(style().within("data-theme", "dark", style().attribute("data-open", "true", style().hover(style().opacity(0.8)))))
+style().md(style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().hover(style().opacity(0.8)))))
 // @media (min-width: 768px){[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
 ```
 
@@ -250,11 +255,54 @@ breakpoint wins.
 `attribute` conditions on the element **itself** — `.sX[data-open="true"]`
 — where `within` is the ancestor form. It is the general spelling of state
 carried in markup: `data-state`, `data-open`, `aria-expanded` — any
-attribute rides, `aria-*` included, and the value matches exactly. The
+attribute rides, `aria-*` included. The
 app owns *setting* the attribute on the element; the style only selects
 on it. Name and value refuse quotes, spaces and `:` at const time (they
 delimit the machinery underneath), and a styling hook is a single token
 in practice — the same fences guard `within`'s name and value.
+
+The value is an `Option`, and it says **which** of CSS's two attribute
+conditions you mean: `Some(v)` is the exact match `[name="v"]`, `None` is
+**presence**, `[name]` — the shape a boolean attribute actually has in
+markup. `within`'s value reads the same way, on the ancestor.
+
+```vilan,fragment
+style().attribute("data-selected", None, style().opacity(1.0))
+// .sX[data-selected]{opacity:1}
+
+style().within("data-collapsed", None, style().display(Display::Hidden))
+// [data-collapsed] .sX{display:none}
+```
+
+### Negation: `not`
+
+`not(inner)` **marks** its inner style and emits nothing of its own — which
+selector is being negated is a fact about the condition *outside* it. The
+condition immediately enclosing the mark emits **its own** selector negated
+and clears it, so reading inside-out, `not` negates exactly the next
+condition out:
+
+```vilan,fragment
+style().attribute("disabled", None, style().not(style().hover(style().opacity(0.8))))
+// .sX:not([disabled]):hover{opacity:0.8}   — the hover is KEPT, the attribute negated
+
+style().hover(style().not(style().opacity(0.8)))
+// .sX:not(:hover){opacity:0.8}
+
+style().within("data-theme", Some("dark"), style().not(style().opacity(0.8)))
+// :not([data-theme="dark"]) .sX{opacity:0.8}
+```
+
+`:not(x)` carries `x`'s own specificity, so nothing about the cascade story
+changes: `.sX:not([disabled]):hover` is (0,3,0) over both of its (0,2,0)
+parts, exactly as `.sX[disabled]:hover` is.
+
+Three refusals fence it. A `not` that reaches **application** unwrapped fails
+there, naming the wrap it needed — it emitted no rule, so applying it would be
+silence. `not(not(..))` is refused rather than cancelled. And a **media**
+condition cannot be negated in this version: `@media not (..)` is a grammar of
+its own, so negate the relation, attribute or pseudo-class inside the
+breakpoint instead.
 
 `within` prepends an ancestor selector, so a composed
 `within(.., hover(..))` rule is more specific than either `within(..)` or

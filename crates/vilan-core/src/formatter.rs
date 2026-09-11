@@ -928,6 +928,13 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("first",     ConditionAxis::Pseudo),
     ("last",      ConditionAxis::Pseudo),
     ("pseudo",    ConditionAxis::Pseudo),
+    // `not` (A89) is a MARKER rather than an axis: it emits nothing and the
+    // condition enclosing it negates its own selector. It is recorded on the
+    // innermost axis because that is where it sits in a chain — directly
+    // inside the condition it negates — and because two conditions on one axis
+    // keep their written order, which is the only property the sort needs from
+    // a link whose axis is whatever its enclosing combinator turns out to be.
+    ("not",       ConditionAxis::Pseudo),
 ];
 
 /// The breakpoint combinators' own min-widths, as `style.vl` spells them: `md`

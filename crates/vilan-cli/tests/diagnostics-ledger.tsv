@@ -450,3 +450,9 @@ row	flagship	key
 416	-	parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts with `__`, which the `[service]` expansion reserves for its own bindings
 417	-	`[rpc]` method `{method_name}` is declared `async` and takes `&mut self`, and the two cannot both hold
 418	-	`[service]` needs std's `rpc.vl`, and the std this package resolves to does not carry one
+419	-	this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style — attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))
+420	-	not(not(..)) — a double negation is a spelling mistake rather than a cancellation: drop both, or negate the condition you meant
+421	-	a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead
+422	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's negation marker; write not(..) inside the condition you want negated
+423	-	a custom property is written with its dashes — var("--button-color"), not var("{name}")
+424	-	a custom property name cannot contain {...} — the name is one token, like --button-color

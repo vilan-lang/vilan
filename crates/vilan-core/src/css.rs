@@ -721,8 +721,8 @@ mod tests {
     #[test]
     fn a_nested_head_with_arguments_keeps_them_before_the_chain() {
         let (block, chain) = shapes_match(
-            r#"css { .within("data-theme", "dark") { color: red; } }"#,
-            r#"style().within("data-theme", "dark", style().raw("color", "red"))"#,
+            r#"css { .within("data-theme", Some("dark")) { color: red; } }"#,
+            r#"style().within("data-theme", Some("dark"), style().raw("color", "red"))"#,
         );
         assert_eq!(block, chain);
     }

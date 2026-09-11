@@ -2,7 +2,10 @@ function scale(self, factor) {
 	return [ self[0] * factor, self[1] * factor ];
 }
 function length(self) {
-	return Math.sqrt(dot(self, self));
+	return Math.sqrt(length_squared(self));
+}
+function length_squared(self) {
+	return dot(self, self);
 }
 function distance(self, other) {
 	return length(sub(self, other));
@@ -38,3 +41,7 @@ const now = [ 13.0, 14.0 ];
 console.log(distance(now, start) > 3.0);
 const travelled = sub(now, start);
 console.log(length(travelled));
+const threshold = 3.0;
+console.log(length_squared(travelled));
+console.log(length_squared(travelled) > threshold * threshold);
+console.log(length_squared(travelled) === length(travelled) * length(travelled));
