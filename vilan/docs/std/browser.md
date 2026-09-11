@@ -332,6 +332,10 @@ trait FromPath { fun from_segments(parts: List<str>): Self }   // URL → route
 fun from_path<R: FromPath>(path: str): R               // parse_path, then from_segments
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
 
+impl View {
+	fun link_to<R: Routable>(self, route: R): View  // `link`'s body on an anchor you built
+}
+
 // Route chunks (a `split = true` leg) — both are ordinary signals
 fun pending(): SignalCell<bool>                 // a route chunk is in flight
 fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with the reason
@@ -340,8 +344,11 @@ fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with t
 `current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor
 (middle-click, ctrl-click, and copy-link keep native behavior) and intercepts
-only a plain left click, calling `prevent_default` + `navigate`. Route
-modelling (`Routable`/`FromPath` over enums): the
+only a plain left click, calling `prevent_default` + `navigate`. It also sets
+`draggable="false"`, which is the one non-native thing about it — see the
+[gotchas](../appendix/gotchas.md) note. `View::link_to(route)` is that same
+body without the `<a>` and the label, for an app that builds and styles its
+own anchor. Route modelling (`Routable`/`FromPath` over enums): the
 [routing guide](../guide/routing.md).
 
 **`parse_path` is the read direction, and it cuts before it decodes.** The

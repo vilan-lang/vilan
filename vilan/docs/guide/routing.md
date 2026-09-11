@@ -213,6 +213,16 @@ link("← All workspaces", Route::Home)
 link(task.name, Route::Workspace(workspace_id, WorkspaceRoute::Task(task.id)))
 ```
 
+The anchor is built `draggable="false"`, because a link drag started while a
+quick click's navigation is still settling wedges the whole tab in Chrome (the
+[gotchas](../appendix/gotchas.md) page has the mechanism) — the `href` stays,
+so nothing native is lost. If you build and style your own anchor, put
+`link_to` on it and you get the same three things:
+
+```vilan,fragment
+view("a").class("nav-item").link_to(Route::Home).text("Home")
+```
+
 For programmatic navigation (after a sign-out, after creating a thing):
 
 ```vilan,fragment

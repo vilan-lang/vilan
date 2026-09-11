@@ -573,3 +573,173 @@ fn a62_parse_path_reads_a_url_and_from_path_round_trips_through_to_path() {
         "parse_path/from_path output drifted; got:\n{stdout}"
     );
 }
+
+// --- B293: the anchor `link` builds is not drag-armed -----------------------
+
+/// B293's exhibit, in both spellings: `link`, and a hand-built anchor turned
+/// into a link by `View::link_to`. Both must carry `href` AND
+/// `draggable="false"`, and both must still intercept exactly the plain
+/// left-click.
+const DRAGGABLE_APP: &str = r#"import std::ui::{ View, view, mount_root };
+import std::router::{ link, Routable };
+
+[derive(PartialEq)]
+enum Route {
+	Home,
+	Tasks,
+}
+
+impl Route with Routable {
+	fun to_path(self): str {
+		match self {
+			Route::Home => "/",
+			Route::Tasks => "/tasks",
+		}
+	}
+}
+
+fun main() {
+	let _root = mount_root("app", || {
+		view("nav")
+			.child(link("Tasks", Route::Tasks))
+			.child(view("a").attr("class", "own").link_to(Route::Home).text("Home"))
+	});
+}
+"#;
+
+/// The stub is the minimum this claim needs: attributes, children, and a click
+/// that records `preventDefault`.
+const DRAGGABLE_HARNESS: &str = r##"class StubElement {
+    constructor(tag) {
+        this.tagName = tag;
+        this.children = [];
+        this.parent = null;
+        this.listeners = {};
+        this._text = "";
+        this.attributes = {};
+        this.style = { setProperty() {}, getPropertyValue() { return ""; } };
+    }
+    set textContent(text) { this._text = text; this.children = []; }
+    get textContent() { return this._text; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    appendChild(child) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        this.children.push(child);
+    }
+    insertBefore(child, anchor) {
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        const at = this.children.indexOf(anchor);
+        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+        return child;
+    }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
+    }
+    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
+    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
+    click(overrides = {}) {
+        const event = {
+            button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false,
+            prevented: false, preventDefault() { this.prevented = true; }, ...overrides,
+        };
+        for (const h of (this.listeners.click || [])) h(event);
+        return event;
+    }
+}
+class StubText {
+    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
+    set textContent(text) { this._text = text; }
+    get textContent() { return this._text; }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter(c => c !== this);
+            this.parent = null;
+        }
+    }
+}
+const root = new StubElement("div");
+global.document = {
+    createElement: (tag) => new StubElement(tag),
+    createTextNode: (text) => new StubText(text),
+    getElementById: (id) => (id === "app" ? root : null),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+};
+global.location = { pathname: "/" };
+global.history = { pushState(state, title, path) { global.location.pathname = path; } };
+global.window = { addEventListener: () => {} };
+
+require("./app.js");
+
+let failures = 0;
+const assert = (cond, msg) => {
+    if (!cond) { failures += 1; console.error("FAIL - " + msg); }
+    else console.log("ok   - " + msg);
+};
+const nav = root.children[0];
+const built = nav.children[0];
+const own = nav.children[1];
+
+assert(built.tagName === "a" && built.attributes.href === "/tasks",
+    "link still builds a real <a href>");
+assert(built.attributes.draggable === "false",
+    "the anchor link builds is not drag-armed (B293)");
+assert(own.attributes.href === "/" && own.attributes.draggable === "false",
+    "link_to arms an app's own anchor the same way");
+assert(own.attributes.class === "own", "link_to leaves the app's own attributes alone");
+
+let event = built.click();
+assert(event.prevented && global.location.pathname === "/tasks",
+    "a plain left-click is still intercepted");
+event = own.click({ metaKey: true });
+assert(!event.prevented && global.location.pathname === "/tasks",
+    "a modified click still keeps native anchor behavior");
+
+process.exit(failures === 0 ? 0 : 1);
+"##;
+
+/// B293: an `<a href>` is drag-armed by default, and a link drag started while
+/// a quick click's in-app navigation is settling wedges the TAB in Chrome
+/// (per tab, surviving a hard refresh). std stops arming the gesture; the href
+/// — and everything native that rides on it — stays.
+#[test]
+fn b293_the_anchor_link_builds_is_not_drag_armed() {
+    let dir = temp_project("draggable");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"router_draggable\"\nroot = \".\"\nentry = \"app.vl\"\ntarget = \"browser\"\n",
+    );
+    write(&dir, "app.vl", DRAGGABLE_APP);
+    write(&dir, "harness.js", DRAGGABLE_HARNESS);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new("node")
+        .arg("harness.js")
+        .current_dir(&dir)
+        .output()
+        .expect("run node harness");
+    assert!(
+        run.status.success(),
+        "draggable harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

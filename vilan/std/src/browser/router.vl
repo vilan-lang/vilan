@@ -258,14 +258,53 @@ fun from_path<R: FromPath>(path: str): R {
 /// copy-link keep native anchor behavior), intercepting only a PLAIN
 /// left-click with `prevent_default` + `navigate`. Returns a `View` — chain
 /// as usual (`link("Tasks", route).styled(nav_item)`).
+///
+/// The anchor is NOT DRAGGABLE (B293), and that is the one thing here that is
+/// not plain anchor behavior. An `<a href>` is drag-armed by default, and in
+/// Chrome a link drag that starts while a quick click's in-app navigation is
+/// still settling WEDGES THE TAB: from then on every drag in that tab gets
+/// `dragstart` then `pointercancel` and never `dragend`, and pointer input
+/// stays dead — hover, `:active`, clicks, native scrollbars — while
+/// compositor wheel scrolling keeps working. It is per TAB, survives a hard
+/// refresh, and only a new tab escapes it. Chrome's bug to fix; std's not to
+/// arm it. The cost is nothing an app wants: the `href` stays, so
+/// middle-click, ctrl-click and copy-link-address are untouched, and only the
+/// native "drag this link somewhere" gesture goes. An app that hand-writes
+/// its own `<a href on:click>` should set the attribute too.
 fun link<R: Routable>(label: str, route: R): View {
-	let path = route.to_path();
-	view("a").attr("href", path).text(label).on_event("click", |event| {
-		if plain_left_click(event) {
-			event.prevent_default();
-			navigate(path);
-		}
-	})
+	view("a").link_to(route).text(label)
+}
+
+impl View {
+	/// Make THIS view a navigation link to `route` — `link`'s body, without
+	/// `link`'s `<a>` and label, for an app that builds and styles its own
+	/// anchor: `<a class("nav-item")>{icon}"Tasks"</a>` then `.link_to(route)`.
+	/// Sets the `href`, clears the drag arming (B293 — see `link`), and
+	/// intercepts exactly the plain left-click.
+	///
+	/// It lives here rather than in `std::ui` because it is routing, not view
+	/// building: it needs `Routable` and `navigate`, and `std::ui` knows
+	/// nothing about either. `link` IS this method plus an anchor, which is
+	/// the honest relation between the two.
+	///
+	/// `|event: Event|` IS ANNOTATED, and must stay annotated. A process build
+	/// analyzes this browser module to color the program, and the process
+	/// `View::on_event` takes a generic `|E| void` (a server layer cannot name
+	/// `std::dom::Event`). In a free function — `link`'s old body — the
+	/// `plain_left_click(event)` call below pins `E` to `Event` by itself; from
+	/// inside an INHERENT IMPL METHOD it does not, and the process analysis
+	/// fails with "cannot call method 'prevent_default' on E". The annotation
+	/// says what the body already meant. (The asymmetry is a solver gap, not a
+	/// rule — filed from this lane.)
+	fun link_to<R: Routable>(self, route: R): View {
+		let path = route.to_path();
+		self.attr("href", path).attr("draggable", "false").on_event("click", |event: Event| {
+			if plain_left_click(event) {
+				event.prevent_default();
+				navigate(path);
+			}
+		})
+	}
 }
 
 /// A main-button click with no modifier keys — the only click `link`

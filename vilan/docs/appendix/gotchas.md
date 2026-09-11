@@ -54,6 +54,15 @@ organized by message instead of by topic.
 - **Disposal doesn't cancel the in-flight wave**: a subscriber already
   queued in the draining turn may fire once more; only *later* deliveries
   are guaranteed gone.
+- **Don't leave your own `<a href>` drag-armed.** In Chrome, a link drag
+  that starts while a quick click's in-app navigation is still settling
+  wedges the *tab*: every later drag there gets `dragstart` then
+  `pointercancel` and never `dragend`, and pointer input stays dead — hover,
+  `:active`, clicks, native scrollbars — while wheel scrolling (the
+  compositor's) keeps working. It is per tab and survives a hard refresh;
+  only a new tab escapes it. `link` and `link_to` set `draggable="false"`
+  for you; a hand-written anchor wants it too. The `href` is untouched, so
+  middle-click, ctrl-click and copy-link-address still behave natively.
 
 ## Services & the wire
 
