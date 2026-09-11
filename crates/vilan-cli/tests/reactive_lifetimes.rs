@@ -375,3 +375,259 @@ for (const phase of ["mounted", "unmounted"]) {{
         "a disposed app must hold no reactive cycle; got:\n{stdout}"
     );
 }
+
+// --- B291: an owner has a DISPOSED state ------------------------------------
+
+/// The async shape the item names: a scope torn down while a continuation that
+/// registers into it is still in flight — a route switched away before a
+/// handle's reply, a `bind_each` row rebuilt while its first fetch is out.
+const LATE_REGISTRATION: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, owner_scope };
+
+async fun main() {
+	let count: SignalCell<i32> = Signal::new(0);
+	let fired: SignalCell<i32> = Signal::new(0);
+	let owner = Owner::new();
+
+	// The continuation's owner is captured at CREATION and disposed before the
+	// continuation ever runs.
+	owner_scope.run(owner, || {
+		async {
+			let _tick: i32 = await async 1;
+			count.effect(|_value: i32| {
+				fired.set_with(|n| n + 1);
+			});
+		};
+	});
+	owner.dispose();
+	let _first: i32 = await async 1;
+	let _second: i32 = await async 1;
+
+	// `effect` is `effect_on_change` plus one immediate call, and the immediate
+	// call is the observer's contract, not a subscription — it still happens.
+	print(i"at-registration={fired.get()}");
+	count.set(1);
+	count.set(2);
+	print(i"after-disposal={fired.get() - 1}");
+	print(i"subscribers={count.subscribers.read().len()}");
+	owner.dispose();
+	count.set(3);
+	print(i"after-second-dispose={fired.get() - 1}");
+}
+"#;
+
+#[test]
+fn b291_an_effect_registered_after_its_owner_was_disposed_never_fires_again() {
+    // Before the flag, `Owner::dispose` emptied the cleanup list and kept no
+    // record, so this `take` parked a cleanup on a list nothing runs again:
+    // `after-disposal=2` (the observer fired on every later `set` for the rest
+    // of the session) and only a SECOND `dispose` released it. The immediate
+    // call at registration is deliberately NOT what changed — `effect`'s
+    // contract is one call with the current value, and it is made before the
+    // subscription is handed anywhere.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("late_registration", LATE_REGISTRATION, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "at-registration=1",
+            "after-disposal=0",
+            "subscribers=0",
+            "after-second-dispose=0",
+        ],
+        "a late registration must be disposed on the spot; got:\n{stdout}"
+    );
+}
+
+/// The three faces of the flag, synchronously: `dispose` is idempotent, a late
+/// `defer` runs now, a late `take` disposes on the spot — and a LIVE owner
+/// still parks everything it is given, which is the control.
+const DISPOSED_OWNER_STATE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell };
+
+fun main() {
+	let ran: SignalCell<i32> = Signal::new(0);
+	let owner = Owner::new();
+	owner.defer(|| {
+		ran.set_with(|n| n + 1);
+	});
+	owner.dispose();
+	print(i"first-dispose={ran.get()}");
+	owner.dispose();
+	print(i"second-dispose={ran.get()}");
+
+	// A cleanup deferred to an owner that is already gone runs NOW — the
+	// promise to release is kept the only way it still can be.
+	owner.defer(|| {
+		ran.set_with(|n| n + 1);
+	});
+	print(i"late-defer={ran.get()}");
+
+	// And a disposable TAKEN by a dead owner is disposed on the spot: the
+	// observer is off the signal before the next write.
+	let count: SignalCell<i32> = Signal::new(0);
+	let seen: SignalCell<i32> = Signal::new(0);
+	let late = owner.take(count.on_change(|_value: i32| {
+		seen.set_with(|n| n + 1);
+	}));
+	count.set(1);
+	print(i"late-take={seen.get()} subscribers={count.subscribers.read().len()}");
+	late.dispose();
+	print(i"disposing-it-again={count.subscribers.read().len()}");
+
+	// The control: a live owner parks its cleanups and releases them as a
+	// group, exactly as before.
+	let live = Owner::new();
+	let parked: SignalCell<i32> = Signal::new(0);
+	live.defer(|| {
+		parked.set_with(|n| n + 1);
+	});
+	print(i"parked={parked.get()}");
+	live.dispose();
+	print(i"released={parked.get()}");
+}
+"#;
+
+#[test]
+fn b291_a_disposed_owner_is_idempotent_and_releases_what_it_is_given_at_once() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("disposed_owner", DISPOSED_OWNER_STATE, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "first-dispose=1",
+            // Idempotent: the second `dispose` runs nothing. Before the flag
+            // this was true only because the list had been emptied, which is
+            // exactly what made a LATE registration immortal.
+            "second-dispose=1",
+            "late-defer=2",
+            "late-take=0 subscribers=0",
+            "disposing-it-again=0",
+            "parked=0",
+            "released=1",
+        ],
+        "the disposed owner's state went differently:\n{stdout}"
+    );
+}
+
+// --- B292: the drain is exception-safe, and so is a disposal group ----------
+
+/// A throwing observer, and a throwing cleanup, with a harness that can see the
+/// throw — vilan has no exception syntax, so `__step` is the only way a program
+/// can report that the error really left the reactive core rather than being
+/// swallowed there.
+const THROWING_OBSERVER: &str = r#"import std::io::{ panic, print };
+import std::reactive::{ Disposable, FlushPolicy, Owner, Signal, SignalCell, turn };
+
+/// The harness runs each step inside a JS `try`/`catch` and prints what it
+/// caught.
+[extern("__step")]
+external fun step(body: || void): void;
+
+fun main() {
+	let a: SignalCell<i32> = Signal::new(0);
+	let b: SignalCell<i32> = Signal::new(0);
+	let seen_a: SignalCell<i32> = Signal::new(0);
+	let seen_b: SignalCell<i32> = Signal::new(0);
+	let armed: SignalCell<bool> = Signal::new(true);
+
+	let _watch_a = a.on_change(|value: i32| {
+		seen_a.set(value);
+		if armed.get() {
+			armed.set(false);
+			panic("observer exploded");
+		}
+	});
+	let _watch_b = b.on_change(|value: i32| {
+		seen_b.set(value);
+	});
+
+	// Both writes land in ONE turn, so both observers are in one wave.
+	step(|| {
+		turn(FlushPolicy::AtEnd, || {
+			a.set(1);
+			b.set(1);
+		});
+	});
+	print(i"after-throw:a={seen_a.get()} b={seen_b.get()}");
+
+	// The scheduler survived. These two have NO ambient turn, so they resolve
+	// through `draining_turns.last()` — which is exactly where the stuck turn
+	// used to be, swallowing every write in the program from here on.
+	a.set(2);
+	b.set(2);
+	print(i"after-recovery:a={seen_a.get()} b={seen_b.get()}");
+
+	// A disposal group is a list of promises, so it FINISHES past a throwing
+	// cleanup and raises the failure afterwards.
+	let owner = Owner::new();
+	let released: SignalCell<i32> = Signal::new(0);
+	owner.defer(|| {
+		released.set_with(|n| n + 1);
+	});
+	owner.defer(|| {
+		panic("cleanup exploded");
+	});
+	owner.defer(|| {
+		released.set_with(|n| n + 1);
+	});
+	step(|| {
+		owner.dispose();
+	});
+	print(i"released={released.get()}");
+}
+"#;
+
+#[test]
+fn b292_a_throwing_observer_leaves_the_turn_drainable_and_the_error_visible() {
+    // B292. `drain` set `draining = true`, pushed the turn onto
+    // `draining_turns`, and restored neither on the way out of a throw, so one
+    // observer that panicked — or one host API that refused its argument, the
+    // Chrome `insertRule` shape the item names — left the turn DRAINING
+    // forever and on the stack. Every later write then resolved to it
+    // (`Signal::notify`'s no-ambient-turn arm joins `draining_turns.last()`)
+    // and enqueued into a queue nothing would ever flush: the reactive graph
+    // was off for the rest of the session, with no second error to show for
+    // it. `after-recovery` is that line.
+    //
+    // The drain restores under a FINALLY and lets the throw keep unwinding
+    // untouched, rather than catching and continuing the wave: a throwing
+    // observer means the graph is mid-update, and the write that started the
+    // drain is the honest place for the failure to surface. `b=0` on the
+    // `after-throw` line is the price, and it is deliberate. A disposal group
+    // is the opposite case and gets the opposite guard — see `released`.
+    let harness = format!(
+        r#"{DOM_STUB}
+global.__step = (body) => {{
+    try {{
+        body();
+    }} catch (error) {{
+        console.log(`caught:${{error && error.message ? error.message : String(error)}}`);
+    }}
+}};
+require("./app.js");
+"#
+    );
+    let stdout = build_and_run("throwing_observer", THROWING_OBSERVER, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The throw left the core with its own message.
+            "caught:observer exploded",
+            // The wave was abandoned at the thrower, deliberately.
+            "after-throw:a=1 b=0",
+            // And the scheduler is usable again — this is the line that was
+            // `a=1 b=0` for the rest of the session.
+            "after-recovery:a=2 b=2",
+            "caught:cleanup exploded",
+            // Both surviving cleanups ran: a disposal group finishes. Before
+            // B292 this was 1, and B291's idempotence made it permanent — a
+            // second `dispose` no longer picks up what the throw skipped.
+            "released=2",
+        ],
+        "the reactive core's exception safety went differently:\n{stdout}"
+    );
+}

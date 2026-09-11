@@ -32,6 +32,7 @@ import pkg::reactive::{
 	SignalCell,
 	Source,
 	Subscription,
+	at_release_settle,
 	at_settle,
 	batch,
 	defer_to_owner,
@@ -3169,15 +3170,23 @@ impl RemoteSource<type T> {
 	}
 
 	/// Release a lease. 1→0 marks the mirror closing and defers the
-	/// `Unsubscribe` to the ambient turn's settle (`at_settle`); a 0→1 before
-	/// then cancels it. The `Unsubscribe` is pure economy, so it can afford to
-	/// wait — and waiting is what makes the common re-render free.
+	/// `Unsubscribe` to the ambient turn's settle (`at_release_settle`); a 0→1
+	/// before then cancels it. The `Unsubscribe` is pure economy, so it can
+	/// afford to wait — and waiting is what makes the common re-render free.
+	///
+	/// The settle is the one ambient AT THE RELEASE, not the one this body's
+	/// closure captured (tracker B283). `release` is reached through the
+	/// subscription's stored release hook, so a lease taken outside every turn
+	/// used to defer against no turn at all and send inline — and a
+	/// dispose-and-rebuild inside one turn paid a whole round trip for a
+	/// rebuild that churns nothing when the lease happened to be born inside a
+	/// turn instead. A release belongs to whoever disposed it.
 	fun release(self) {
 		let after = self.count.read() - 1;
 		self.count.write() = after;
 		if after == 0 {
 			self.closing.write() = true;
-			at_settle(self.settle_id, || self.flush_close());
+			at_release_settle(self.settle_id, || self.flush_close());
 		}
 	}
 
@@ -3806,13 +3815,14 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		}
 	}
 
-	/// Release the whole-collection lease; the `Unsubscribe` rides the settle.
+	/// Release the whole-collection lease; the `Unsubscribe` rides the settle
+	/// ambient AT THE RELEASE, for `RemoteSource::release`'s reason (B283).
 	fun release(self) {
 		let after = self.count.read() - 1;
 		self.count.write() = after;
 		if after == 0 {
 			self.closing.write() = true;
-			at_settle(self.settle_id, || self.flush_close());
+			at_release_settle(self.settle_id, || self.flush_close());
 		}
 	}
 
@@ -3868,7 +3878,7 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		lease.count.write() = after;
 		if after == 0 {
 			lease.closing.write() = true;
-			at_settle(lease.settle_id, || self.flush_key_close(lease));
+			at_release_settle(lease.settle_id, || self.flush_key_close(lease));
 		}
 	}
 

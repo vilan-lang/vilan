@@ -57,7 +57,7 @@ fun main() {
 	// current value — the eager contract, built by addition. The emitted body
 	// is the whole of it: no wrapper cell, no swallowed call, no branch riding
 	// every later notification.
-	// witness: const subscription = $F(self, observer); observer($G(self)); return subscription;
+	// witness: const subscription = $M(self, observer); observer($N(self)); return subscription;
 	// witness-absent: seeded
 	let stored = Stored { inner = Signal::new(10) };
 	let eagerly = stored.sub(|value| print(i"eager {value}"));

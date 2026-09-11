@@ -1516,6 +1516,31 @@ impl<'a> Interpreter<'a> {
             // false — keeping the guarded `dev::*` / std hooks inert here, so the
             // equivalence gate holds.
             "__hmr_active" => Ok(Value::Bool(false)),
+            // The reactive core's two exception seams (tracker B292), mirroring
+            // `helper_source`'s JS. Only a vilan `panic` is a THROW here
+            // (`FailureKind::Thrown`); fuel, depth, an unsupported capability
+            // and an internal bug are the expansion environment failing rather
+            // than the program throwing, so they keep unwinding past both.
+            "__with_finally" => {
+                let outcome = self.call_value(&take(0), Vec::new());
+                let after = self.call_value(&take(1), Vec::new());
+                match outcome {
+                    Err(failure) => Err(failure),
+                    Ok(_value) => after.map(|_after| Value::Undefined),
+                }
+            }
+            "__guarded" => match self.call_value(&take(0), Vec::new()) {
+                Ok(_value) => Ok(option_none()),
+                Err(failure) if failure.kind == FailureKind::Thrown => {
+                    Ok(option_some(Value::Str(Rc::from(failure.message.as_str()))))
+                }
+                Err(failure) => Err(failure),
+            },
+            // The async twin has no native form: the expansion environment has
+            // no suspension at all, so a body that reaches it is already
+            // outside what a macro may evaluate. Named here so the answer is
+            // this sentence rather than "unknown host call".
+            "__with_finally_async" => Err(Failure::unsupported("`with_finally_async`")),
             "__shared_new" => {
                 let mut cell = IndexMap::new();
                 cell.insert(Rc::from("v"), take(0));

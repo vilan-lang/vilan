@@ -1,6 +1,7 @@
 import pkg::compare::PartialEq;
 import pkg::context::Context;
 import pkg::hash::Hashable;
+import pkg::io::panic;
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
@@ -58,6 +59,25 @@ enum FlushPolicy {
 [extern("queueMicrotask", retains)]
 external fun queue_microtask(callback: || void);
 
+/// The runtime's `try`/`finally` (tracker B292). vilan has no exception
+/// syntax, so the catch seam is glue — `__with_finally` in `transformer.rs`,
+/// the shape `std::db`'s `exec_guarded` already uses at this boundary. Run
+/// `body`, and run `after` before the stack leaves: on a normal return AND on
+/// a host throw, which then keeps unwinding UNTOUCHED — its type, its message
+/// and its stack are the ones it was thrown with, from where it was thrown.
+/// Nothing is allocated per call, which is what lets the drain hot path carry
+/// it.
+[extern("__with_finally")]
+external fun with_finally(body: || void, after: || void);
+
+/// The runtime's `try`/`catch` (tracker B292) — for a loop that must FINISH
+/// past a throw rather than merely restore itself on the way out. `None` when
+/// `body` returned; `Some(text)` carrying the host's own diagnosis when it
+/// threw. It costs one `Option` per call, so it belongs where the loop is a
+/// disposal group and not where it is a notification wave.
+[extern("__guarded")]
+external fun guarded(body: || void): Option<str>;
+
 struct Turn {
 	pending: Shared<List<Subscriber>>,
 	// The ids in `pending`, as a keyed set — `enqueue`'s dedup (A44). Kept in
@@ -99,6 +119,28 @@ let turn_scope: Context<Turn> = Context::new();
 /// crosses an `await`.
 let draining_turns: Shared<List<Turn>> = Shared::new([]);
 
+/// Release affinity (tracker B283) — the narrow twin of `draining_turns`, and
+/// the second and last runtime device in the model.
+///
+/// A subscription's RELEASE HOOK is a stored closure, so the turn its body
+/// reads is the one it captured AT CREATION (spec §8.4's context rule). A
+/// lease taken outside every turn — the top of `main`, a module-level binding,
+/// a handle fetched before the first event — and then disposed INSIDE one
+/// therefore deferred its `Unsubscribe` against no turn at all and sent it
+/// inline, so a dispose-and-rebuild in one turn paid a whole
+/// `Unsubscribe` + `Subscribe` round for a rebuild the guide promises churns
+/// nothing (the plant measured `same-turn:up=2 down=1`). The capture rule is
+/// right for a `set` from a stored callback and wrong for this, because a
+/// release is not the hook's own event: it is the DISPOSER's.
+///
+/// `Subscription::dispose` is the one place that knows the answer — it reads
+/// the ambient turn a few lines earlier to scrub the pending queue — so it
+/// publishes it here for the duration of the hook, and `at_release_settle`
+/// reads it. A stack, because disposing one subscription may dispose another;
+/// `None` ON the stack is an honest "no turn was ambient at that release",
+/// which is a different answer from an empty stack's "no release is running".
+let releasing_turns: Shared<List<Option<Turn>>> = Shared::new([]);
+
 /// Enqueue subscribers into `turn`'s queue, deduped by id so a subscriber fed
 /// by several inputs in one turn fires once — the dedup *is* the
 /// glitch-freeness.
@@ -139,21 +181,43 @@ fun drain(turn: Turn) {
 	if !turn.draining.read() {
 		turn.draining.write() = true;
 		draining_turns.write().push(turn);
-		mut budget = 100000;
-		for !turn.pending.read().is_empty() && budget > 0 {
-			let wave = turn.pending.read();
-			turn.pending.write() = [];
-			// The wave is out of the queue, so its ids are free to re-enter it
-			// — a cascade re-enqueuing an observer this wave already ran is
-			// the propagation `drain`'s loop exists for.
-			turn.queued.write() = NativeMap::new();
-			for subscriber in wave {
-				(subscriber.notify)();
-				budget -= 1;
+		// The restore is a FINALLY (tracker B292). A notify is an arbitrary
+		// closure — an application observer that panics, a host API that
+		// refuses its argument (Chrome's `insertRule` on a selector it does
+		// not know) — and a throw out of one unwound straight past the two
+		// writes below. The turn then stayed DRAINING forever and stayed on
+		// `draining_turns`, so every later write that resolved to it — a
+		// settled capture's late path, and EVERY no-ambient-turn `set` or
+		// `at_settle`, which join `draining_turns.last()` — enqueued and never
+		// flushed: one error turned the reactive graph off for the rest of the
+		// session, with no second error to show for it.
+		//
+		// Restore-and-rethrow, not catch-and-continue: the wave's remaining
+		// notifies are abandoned, because a throwing observer means the graph
+		// is mid-update and the honest thing is for the write that started the
+		// drain to see the failure. What the finally guarantees is that the
+		// SCHEDULER survives it — the next `set` drains normally, this turn
+		// included. Nested drains unwind in LIFO order, so each one's finally
+		// pops its own entry.
+		with_finally(|| {
+			mut budget = 100000;
+			for !turn.pending.read().is_empty() && budget > 0 {
+				let wave = turn.pending.read();
+				turn.pending.write() = [];
+				// The wave is out of the queue, so its ids are free to
+				// re-enter it — a cascade re-enqueuing an observer this
+				// wave already ran is the propagation `drain`'s loop
+				// exists for.
+				turn.queued.write() = NativeMap::new();
+				for subscriber in wave {
+					(subscriber.notify)();
+					budget -= 1;
+				}
 			}
-		}
-		draining_turns.write().pop();
-		turn.draining.write() = false;
+		}, || {
+			draining_turns.write().pop();
+			turn.draining.write() = false;
+		});
 	}
 }
 
@@ -178,13 +242,38 @@ fun flush() {
 /// subscription's release hook — the turn is the one that closure captured
 /// at creation, exactly as a `set` from a stored callback; a settled capture
 /// drains on a microtask (`enqueue`'s late path), which still lands after
-/// the current synchronous segment. `proposal/remote-sources.md` §2a: the
-/// `Unsubscribe` a remote mirror owes at its last release is deferred here,
-/// which is what lets a same-segment re-subscribe cancel it.
+/// the current synchronous segment. A release hook that wants the turn
+/// ambient at the RELEASE instead says `at_release_settle` (B283).
+/// `proposal/remote-sources.md` §2a: the `Unsubscribe` a remote mirror owes at
+/// its last release is deferred there, which is what lets a same-segment
+/// re-subscribe cancel it.
 fun at_settle(id: i32, action: || void) {
+	defer_to_turn(turn_scope.get_safe(), id, action)
+}
+
+/// `at_settle` for a subscription's RELEASE HOOK: resolved against the turn
+/// ambient at the RELEASE rather than the one the hook captured at creation
+/// (tracker B283).
+///
+/// Outside a release hook this IS `at_settle` — a direct `mirror.release()`
+/// reads its caller's turn correctly, because nothing stored stands between
+/// them — so the two are one rule with one extra question asked first.
+fun at_release_settle(id: i32, action: || void) {
+	match releasing_turns.read().last() {
+		Some(let at_release) => defer_to_turn(at_release, id, action),
+		None => at_settle(id, action),
+	}
+}
+
+/// The shared tail of both: park `action` on `turn` if there is one, else on
+/// the currently DRAINING turn (an action deferred from inside a settle joins
+/// that settle), else run it now. Takes the turn as a VALUE — the whole
+/// difference between the two callers above is which turn they resolve, and
+/// that question belongs at the seam, not in here.
+fun defer_to_turn(turn: Option<Turn>, id: i32, action: || void) {
 	let deferred = [Subscriber { id, notify = action }];
-	match turn_scope.get_safe() {
-		Some(let turn) => enqueue(turn, deferred),
+	match turn {
+		Some(let ambient) => enqueue(ambient, deferred),
 		None => {
 			match draining_turns.read().last() {
 				Some(let draining) => enqueue(draining, deferred),
@@ -314,7 +403,8 @@ impl Subscription with Disposable {
 		// of this one's reach — the isolation cuts both ways; that stale
 		// notify fires once against current state. Recorded in
 		// `reactive-turns.md`.)
-		match turn_scope.get_safe() {
+		let ambient = turn_scope.get_safe();
+		match ambient {
 			Some(let turn) => {
 				mut kept_pending: List<Subscriber> = [];
 				for subscriber in turn.pending.read() {
@@ -331,10 +421,18 @@ impl Subscription with Disposable {
 		// The release hook runs ONCE: taken out before it runs, so a second
 		// `dispose` (an owner releasing a handle the app already disposed by
 		// hand) cannot double-decrement a count.
+		//
+		// `ambient` is published for the hook's duration (tracker B283): the
+		// hook is a stored closure, so its own turn read answers the turn it
+		// was CREATED under, and a release belongs to whoever disposed it.
+		// Under a finally, so a throwing hook cannot leave the stack standing.
 		match self.release.read() {
 			Some(let release) => {
 				self.release.write() = None;
-				release();
+				releasing_turns.write().push(ambient);
+				with_finally(release, || {
+					releasing_turns.write().pop();
+				});
 			},
 			None => {},
 		}
@@ -344,37 +442,97 @@ impl Subscription with Disposable {
 /// An owner scope: collects subscriptions (and child owners / views) and disposes
 /// them as a group. Ownership is explicit for now — build a value, `take` it into
 /// an owner, and `dispose` the owner to release the whole group.
+///
+/// An owner has a DISPOSED state (tracker B291), and it is the half that makes
+/// ownership hold across `await`. A registration is a PROMISE to release, and an
+/// async continuation registers whenever it happens to run — a route switched
+/// away before a handle's reply, a `bind_each` row rebuilt while its first fetch
+/// is in flight. Without the flag such a late `take` parked a cleanup on a list
+/// nothing ever runs again: the subscription fired for the rest of the session
+/// and only a SECOND `dispose` released it. With it, the promise is kept the
+/// only way it still can be — the item is disposed ON THE SPOT, because the
+/// extent it would have belonged to is already over.
 struct Owner {
 	cleanups: Shared<List<|| void>>,
+	// Set BEFORE the cleanups run, so a cleanup that registers back into this
+	// owner (a `defer` reached from another `dispose`) is disposed on the spot
+	// rather than appended to a list the loop has already snapshotted.
+	disposed: Shared<bool>,
 }
 
 impl Owner {
 	fun new(): Owner {
-		Owner { cleanups = Shared::new([]) }
+		Owner { cleanups = Shared::new([]), disposed = Shared::new(false) }
+	}
+
+	/// Whether this owner has been disposed. A late registration is not an
+	/// error — it is the async shape — but a caller that can do something
+	/// CHEAPER than register-and-immediately-release (a remote mirror, whose
+	/// lease is a network frame) reads this first.
+	fun is_disposed(self): bool {
+		self.disposed.read()
 	}
 
 	/// Take ownership of a disposable (a `Subscription`, a `View`, or a child
-	/// `Owner`), returning it for chaining. It is released when this owner is.
+	/// `Owner`), returning it for chaining. It is released when this owner is —
+	/// or NOW, if this owner is already disposed (B291): the item is still
+	/// returned, so a caller that chains on it reads a disposed handle rather
+	/// than a live one nothing will ever release.
 	fun take<T: Disposable>(self, item: T): T {
-		self.cleanups.write().push(|| {
+		if self.disposed.read() {
 			item.dispose();
-		});
+		} else {
+			self.cleanups.write().push(|| {
+				item.dispose();
+			});
+		}
 		item
 	}
 
 	/// Register a plain cleanup to run at disposal — for teardown that isn't a
 	/// single `Disposable` (e.g. `bind_each` disposing whichever rows are live).
+	/// On a disposed owner the cleanup runs immediately, for `take`'s reason.
 	fun defer(self, cleanup: || void) {
-		self.cleanups.write().push(cleanup);
+		if self.disposed.read() {
+			cleanup();
+		} else {
+			self.cleanups.write().push(cleanup);
+		}
 	}
 }
 
 impl Owner with Disposable {
+	/// Idempotent: a second `dispose` runs nothing. The flag goes up FIRST, so
+	/// anything a cleanup registers back into this owner is disposed on the
+	/// spot instead of landing on the emptied list.
 	fun dispose(self) {
-		for cleanup in self.cleanups.read() {
-			cleanup();
+		if !self.disposed.read() {
+			self.disposed.write() = true;
+			// Every cleanup runs, even past a throwing one (tracker B292).
+			// `drain`'s finally would be the wrong guard here: a disposal
+			// group is a LIST OF PROMISES, not one update, and abandoning the
+			// rest of it leaks every subscription after the failure — now
+			// permanently, because the flag above makes a second `dispose` a
+			// no-op. So the loop finishes and the first failure is raised
+			// after the group is released. Only the first: the later ones are
+			// the same event, and a `panic` takes one message.
+			mut failure: Option<str> = None;
+			for cleanup in self.cleanups.read() {
+				match guarded(cleanup) {
+					Some(let message) => {
+						if failure.is_none() {
+							failure = Some(message);
+						}
+					},
+					None => {},
+				}
+			}
+			self.cleanups.write() = [];
+			match failure {
+				Some(let message) => panic(message),
+				None => {},
+			}
 		}
-		self.cleanups.write() = [];
 	}
 }
 

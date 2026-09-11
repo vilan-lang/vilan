@@ -432,9 +432,10 @@ impl Owner {
 	fun new(): Owner
 	fun take<T: Disposable>(self, item: T): T   // adopt a disposable; returns it
 	fun defer(self, cleanup: || void)           // run cleanup at dispose
+	fun is_disposed(self): bool                 // has this owner already been disposed?
 }
 impl Owner with Disposable {
-	fun dispose(self)   // dispose everything collected + run defers
+	fun dispose(self)   // dispose everything collected + run defers; idempotent
 }
 
 let owner_scope: Context<Owner>
@@ -449,6 +450,25 @@ Establish owners at **disposal boundaries** (places where a subtree can die),
 not per object; in UI code the framework's boundaries (`mount_root`,
 `bind_each` rows, `when`/`swap` bodies) already do this.
 
+An owner has a **disposed state**, and it is what makes ownership hold across
+`await`. A registration is a promise to release, and an async continuation
+registers whenever it happens to run — a route switched away before a handle's
+reply, a `bind_each` row rebuilt while its first fetch is in flight. `take` and
+`defer` on an owner that is already disposed therefore run the cleanup **now**
+rather than parking it: the extent it would have belonged to is over, so the
+only way left to keep the promise is to keep it immediately. `dispose` itself is
+idempotent, and `is_disposed` reports the flag for a caller that can do
+something cheaper than register-and-immediately-release.
+
+An `effect` registered this late still makes its one immediate call — that call
+is the observer's contract, not a subscription — and then never fires again.
+
+A disposal group **finishes**: if one cleanup throws, the rest still run and the
+first failure is raised once the group is released. That is the opposite of the
+drain's rule, on purpose — an owner holds a list of independent promises to
+release, so abandoning the list at the first failure would leak everything after
+it, permanently.
+
 ## Turns
 
 ```vilan,fragment
@@ -459,6 +479,7 @@ fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T
 fun batch<T>(body: (sync || T) context turn_scope): T   // join or create
 fun flush()                                             // drain the ambient turn now
 fun at_settle(id: i32, action: || void)                 // run `action` at the ambient settle; now if none
+fun at_release_settle(id: i32, action: || void)          // the same, from a subscription's release hook
 ```
 
 Inside a turn, signal writes are recorded and each subscriber runs once with
@@ -476,6 +497,22 @@ called from inside a settle, and runs inline when no turn is ambient. It is
 the primitive under a remote mirror's deferred `Unsubscribe`
 (`std::rpc`); library code that wants "after this turn, once" uses it with
 an id that cannot collide with a subscriber's (`fresh_id()` mints one).
+
+"Ambient" is the context rule's: reached through a **stored closure** — an
+owner's cleanup, a subscription's release hook — the turn `at_settle` sees is
+the one that closure captured when it was created. That is right for a write
+from a stored callback and wrong for a RELEASE, which belongs to whoever
+disposed the subscription and not to whoever took it; `at_release_settle` is
+the release hook's spelling, and it resolves against the turn ambient at the
+`dispose`. Outside a release hook the two are the same function.
+
+**If an observer throws**, the settle is abandoned at that observer — the rest
+of the wave does not run — and the error keeps unwinding out of the write that
+started the settle, with its own type, message and stack. What it cannot do is
+leave the scheduler broken: the draining flags are restored on the way out, so
+the next write settles normally, this turn included. (Before this, one throwing
+observer left its turn draining forever, and every later write in the program
+queued into it and was never flushed.)
 
 ## optimistic
 

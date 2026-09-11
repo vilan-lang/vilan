@@ -16,6 +16,13 @@ function __list_pop(list) {
 function __shared_new(value) {
 	return { v: value };
 }
+function __with_finally(body, after) {
+	try {
+		body();
+	} finally {
+		after();
+	}
+}
 function hash(self) {
 	return __hash(self);
 }
@@ -55,18 +62,23 @@ function drain(turn) {
 	if (!(turn[2].v)) {
 		turn[2].v = true;
 		draining_turns.v.push(__clone(turn));
-		let budget = 100000;
-		while (!($i(turn[0].v)) && budget > 0) {
-			const wave = turn[0].v;
-			turn[0].v = [  ];
-			turn[1].v = new Map();
-			for (const subscriber of wave) {
-				subscriber[1]();
-				budget = budget - 1;
+		__with_finally(() => {
+			let budget = 100000;
+			while (!($i(turn[0].v)) && budget > 0) {
+				const wave = turn[0].v;
+				turn[0].v = [  ];
+				turn[1].v = new Map();
+				for (const subscriber of wave) {
+					subscriber[1]();
+					budget = budget - 1;
+				}
 			}
-		}
-		__list_pop(draining_turns.v);
-		turn[2].v = false;
+			return;
+		}, () => {
+			__list_pop(draining_turns.v);
+			turn[2].v = false;
+			return;
+		});
 	}
 }
 function dispose(self, $L) {
@@ -77,7 +89,8 @@ function dispose(self, $L) {
 		}
 	}
 	self[0].v = kept;
-	const $M = $L;
+	const ambient = $L;
+	const $M = ambient;
 	let $N = null;
 	if ($M[0] === 0) {
 		const turn = $M[1];
@@ -99,7 +112,11 @@ function dispose(self, $L) {
 	if ($O[0] === 0) {
 		const release = $O[1];
 		self[2].v = [ 1 ];
-		release();
+		releasing_turns.v.push(ambient);
+		__with_finally(release, () => {
+			__list_pop(releasing_turns.v);
+			return;
+		});
 		$P = undefined;
 	} else {
 		$P = undefined;
@@ -107,7 +124,7 @@ function dispose(self, $L) {
 	return $P;
 }
 function new4() {
-	return [ __shared_new([  ]) ];
+	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -227,10 +244,14 @@ function $H(self, observer) {
 	return subscription;
 }
 function $J(self, item, $K) {
-	self[0].v.push(() => {
+	if (self[1].v) {
 		dispose(item, $K);
-		return;
-	});
+	} else {
+		self[0].v.push(() => {
+			dispose(item, $K);
+			return;
+		});
+	}
 	return __clone(item);
 }
 function $R(body, $S) {
@@ -257,6 +278,7 @@ function $V(self, transform, $W) {
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
+const releasing_turns = __shared_new([  ]);
 const owner = new4();
 const todos = $a([ 1, 2 ]);
 $c(todos, (list) => {

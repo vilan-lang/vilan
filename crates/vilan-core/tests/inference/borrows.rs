@@ -48,24 +48,35 @@ fn reactive_map_sub_and_set_with() {
 #[test]
 fn owner_disposes_subscriptions_across_re_renders() {
     // A2: the leak fix. Mimics `bind_each` — `source` drives re-renders; each
-    // render disposes the previous rows' subscriptions (`rows.dispose()`) and
-    // creates fresh ones. After several renders only the *current* rows fire, so
-    // the count stays bounded (a leak would give 6, not 2).
+    // render disposes the previous rows' subscriptions and creates fresh ones
+    // under a FRESH owner. After several renders only the *current* rows fire,
+    // so the count stays bounded (a leak would give 6, not 2).
+    //
+    // The fresh owner per render is `std::ui`'s own discipline — every
+    // boundary in `browser/ui.vl` (`bind_each`'s rows, `when`, `swap`) disposes
+    // the old owner and mints a new one, never refilling the disposed one — and
+    // since B291 it is the only shape that works: an `Owner` has a disposed
+    // state, and a `take` on a disposed owner releases the item on the spot
+    // rather than parking a cleanup nothing would ever run. This pin drove the
+    // dead owner before B291 and read 2 by accident, because the cleanups it
+    // parked were never run by anything either.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::shared::Shared;
-        import std::reactive::{ Signal, SignalCell, Owner };
+        import std::reactive::{ Disposable, Signal, SignalCell, Owner };
         fun main() {
             let source = Signal::new(0);
             let data = Signal::new(0);
-            let rows = Owner::new();
+            let rows: Shared<Owner> = Shared::new(Owner::new());
             let fires = Shared::new(0);
             let outer = Owner::new();
             outer.take(source.sub(|_| {
-                rows.dispose();
-                rows.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
-                rows.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
+                rows.read().dispose();
+                let fresh = Owner::new();
+                fresh.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
+                fresh.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
+                rows.write() = fresh;
             }));
             source.set(1);
             source.set(2);

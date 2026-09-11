@@ -189,3 +189,65 @@ fn a_burst_fires_once_with_the_last_callback_and_cancel_fires_nothing() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B277: the driving loop runs under the AMBIENT NURSERY, so a nursery
+/// cancellation unwinds it at its parked `wait`.
+const DEBOUNCE_AFTER_A_NURSERY_CANCEL: &str = r#"import std::io::print;
+import std::task::{ Nursery, nursery };
+import std::time::{ Debounce, Duration, sleep };
+
+async fun main() {
+	let debounce = Debounce::new(Duration::millis(50));
+	// The driving loop is spawned inside the nursery's extent, so the
+	// cancellation below unwinds it where it is parked — mid-window, with a
+	// deadline still pushed and nothing fired.
+	nursery(|n: Nursery| {
+		debounce.run(|| print("cancelled-never"));
+		sleep(10);
+		n.cancel();
+	});
+	print("mark-cancelled");
+
+	// And the debounce is still a debounce.
+	debounce.run(|| print("after-nursery-cancel"));
+	sleep(1000);
+	print("mark-done");
+}
+"#;
+
+/// A cancelled nursery leaves the `Debounce` usable, not inert.
+#[test]
+fn b277_a_debounce_survives_the_cancellation_of_the_nursery_that_drove_it() {
+    // B277. `run` sets `running` before spawning the loop and the loop cleared
+    // it at its own end — an end a cancellation never reaches. The task
+    // unwound with `running` still true, and every later `run` pushed a
+    // deadline that nothing was reading: the value was INERT for the rest of
+    // its life, silently. `after-nursery-cancel` is the line that disappeared.
+    //
+    // The fix is a `finally` around the loop rather than a nursery-cancellation
+    // special case, because the flag must be cleared on EVERY unwind — a
+    // callback of the app's own that throws killed the loop the same way.
+    // `pending` and `timer` are left where they are: the next `run` opens a
+    // fresh window over them, exactly as it does after `cancel()`.
+    let dir = temp_project("nursery_cancel");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", DEBOUNCE_AFTER_A_NURSERY_CANCEL);
+    let stdout = run_project(&dir);
+
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        // The cancelled window fires nothing — it was cancelled mid-wait.
+        ["mark-cancelled", "after-nursery-cancel", "mark-done"],
+        "a debounce must survive its nursery; got:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

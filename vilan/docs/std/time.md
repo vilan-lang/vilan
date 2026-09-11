@@ -177,6 +177,12 @@ window in the ordinary way.
 Like `Timer`, a `Debounce` is a value wrapping shared cells: copying it shares
 the one debounce, and `run` through any copy pushes the same deadline.
 
+**The driving loop runs under the ambient nursery**, so cancelling that nursery
+stops the window — nothing fires, exactly as `cancel()` would. It does not
+retire the `Debounce`: the loop's bookkeeping is cleared however it unwinds
+(cancellation, or a callback of yours that throws), so the next `run` opens a
+fresh window in the ordinary way.
+
 **It takes no owner and registers no cleanup.** `std::time` is the base clock
 module and sits below `std::reactive`, so a `Debounce` is a plain value in the
 shape `Timer` established — `cancel()` is the teardown, and an app that wants

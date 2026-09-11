@@ -199,6 +199,19 @@ fun sleep_for(duration: Duration) {
 	sleep(duration.millis.as_i32());
 }
 
+/// The runtime's `try`/`finally` for a body that SUSPENDS (tracker B277).
+/// vilan has no exception syntax, so the seam is glue —
+/// `__with_finally_async` in `transformer.rs`, the shape `std::db`'s
+/// `exec_guarded` established and `std::reactive` uses for its synchronous
+/// twin. `after` runs when `body` returns AND when it unwinds, a nursery's
+/// cancellation reaching a parked `await` included: an abort is an ordinary
+/// rejection through `await`, and the error keeps unwinding untouched
+/// afterwards. Declared here rather than imported because `std::time` is the
+/// base clock module and sits BELOW `std::reactive` — the extern is the
+/// symbol, so both declarations name one emitted helper.
+[extern("__with_finally_async")]
+async external fun with_finally_async(body: async || void, after: || void);
+
 // --- Cancelable timers ---------------------------------------------------------
 
 /// The host timer handle behind `Timer` — a `setTimeout` id plus the verdict
@@ -369,29 +382,42 @@ impl Debounce {
 		if !self.running.read() {
 			self.running.write() = true;
 			async {
-				for self.pending.read() is Some(let (deadline, _)) {
-					let timer = Timer::after_for(deadline.since(now()));
-					self.timer.write() = Some(timer);
-					if timer.wait() {
-						self.timer.write() = None;
-						// Re-read: a `run` that arrived DURING the wait pushed the
-						// deadline out, so the timer that just fired is early and
-						// the loop takes another turn. This is what makes a burst
-						// one run rather than one run per call.
-						if self.pending.read() is Some(let (moment, latest)) {
-							if now() >= moment {
-								self.pending.write() = None;
-								latest();
+				with_finally_async(|| {
+					for self.pending.read() is Some(let (deadline, _)) {
+						let timer = Timer::after_for(deadline.since(now()));
+						self.timer.write() = Some(timer);
+						if timer.wait() {
+							self.timer.write() = None;
+							// Re-read: a `run` that arrived DURING the wait pushed
+							// the deadline out, so the timer that just fired is
+							// early and the loop takes another turn. This is what
+							// makes a burst one run rather than one run per call.
+							if self.pending.read() is Some(let (moment, latest)) {
+								if now() >= moment {
+									self.pending.write() = None;
+									latest();
+								}
 							}
+						} else {
+							// `cancel` called the timer off. `pending` decides
+							// what happens next: `None` ends the loop at the
+							// head, `Some` (a `run` that came after the cancel)
+							// starts a new wait.
+							self.timer.write() = None;
 						}
-					} else {
-						// `cancel` called the timer off. `pending` decides what
-						// happens next: `None` ends the loop at the head, `Some`
-						// (a `run` that came after the cancel) starts a new wait.
-						self.timer.write() = None;
 					}
-				}
-				self.running.write() = false;
+				}, || {
+					// The flag is cleared on EVERY exit, not just the loop's own
+					// (tracker B277). The loop runs under the ambient nursery, so
+					// a nursery cancellation rejects its parked `wait` and unwinds
+					// it — and with `running` left true the `Debounce` was INERT
+					// for good: every later `run` pushed a deadline that nothing
+					// was reading. A callback of the app's own that throws did the
+					// same thing. `pending` and `timer` are left exactly as they
+					// were: the next `run` starts a fresh window over them, which
+					// is the ordinary post-`cancel` path.
+					self.running.write() = false;
+				});
 			};
 		}
 	}
