@@ -274,6 +274,23 @@ const BLOCK_LIKE_STATEMENT_IS_COMPLETE: &str = "a `match`, `if`, `for` or `{` fo
      `(match x { .. }).to_str()` — to use its value as an operand. (The rule is what lets a line \
      beginning `-x` or `*p` mean subtraction or a dereference by where it sits.)";
 
+/// The rule a block-like form followed by `::` breaks (E157). Its own rule
+/// rather than [`BLOCK_LIKE_STATEMENT_IS_COMPLETE`], because that message's
+/// STEER is a fix for every other continuation and is not one here: `::` is the
+/// only one with no valid spelling at all. `(match x { .. }) + 1` and
+/// `(match x { .. }).to_str()` both parse — B231 admits the form inside
+/// parentheses — and `(match x { .. })::foo` does not, because `::` reaches
+/// into a NAMESPACE and what stands to its left is a name rather than a value.
+/// Offering the parentheses there sent the author to a second parse error.
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
+/// the two ways out are the two things the author can actually have meant.
+const A_PATH_CANNOT_START_AT_A_BLOCK: &str = "`::` reaches into a NAMESPACE — a module, a type or an enum — so what \
+     stands to its left has to be a NAME, and a `match`, `if`, `for` or `{` form is a value: \
+     parentheses do not help here, the way they do for an operator or a `.` chain after one \
+     (`(match x { .. }) + 1`). Write the path on its own if the block-like form ended the \
+     statement before it, or bind the form first — `let value = match x { .. };` — and reach \
+     for the member through the value.";
+
 /// The rule `let mut x = …` breaks. Curated (diagnostics-standard.md B6): `let`
 /// and `mut` are the two BINDING FORMS, not a keyword and a modifier on it, so
 /// the pair is a Rust spelling with no reading here — and the failure it
@@ -1109,6 +1126,14 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// are the `(` and `[` postfixes, which lead a parenthesized expression and a
     /// list literal.
     ///
+    /// `::` is INSIDE the set and takes a rule of its own (E157,
+    /// [`A_PATH_CANNOT_START_AT_A_BLOCK`]). The shared message's value is its
+    /// STEER, and the steer has to be a fix: `(match x { .. }) + 1` and
+    /// `(match x { .. }).to_str()` both parse, and `(match x { .. })::foo` does
+    /// not — a path reaches into a namespace, so its left side is a name and no
+    /// expression can stand there. Sending the author to parentheses bought
+    /// them a second parse error and nothing else.
+    ///
     /// `=>` is outside it for a different reason, and it is the one B248 could not
     /// see from the statement fork: it is a SEPARATOR of the enclosing production,
     /// not a continuation of this expression. A match GUARD is an expression that
@@ -1127,6 +1152,24 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut refused = false;
         loop {
             let operator = match self.peek() {
+                // `::` is an operator token, and the ONE continuation whose
+                // refusal is not this rule's (E157): every other one is steered
+                // to parentheses, and that steer is a FIX for every other one.
+                // A path is not an expression, so there is nothing to
+                // parenthesize and the steer sent the author to a second parse
+                // error. Its own statement, at its own site.
+                Some(Token::Op("::")) => {
+                    if !refused {
+                        self.errors.push(ParseError {
+                            span: self.here_span(),
+                            reason: ParseErrorReason::Rule(A_PATH_CANNOT_START_AT_A_BLOCK),
+                            context: self.context_stack.clone(),
+                            hint: None,
+                        });
+                        refused = true;
+                    }
+                    true
+                }
                 Some(Token::Op(symbol)) if !matches!(*symbol, "!" | "-" | "&" | "*" | "=>") => true,
                 Some(Token::Ctrl('.')) => false,
                 _ => return,

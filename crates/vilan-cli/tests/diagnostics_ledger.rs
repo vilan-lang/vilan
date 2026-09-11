@@ -194,11 +194,11 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 ///
 /// Construction sites only. `parsing.rs` mentions the variant three more times —
 /// the `match &error.reason` arm that RENDERS one, and two doc comments — and a
-/// mention is not a statement. Three of the twenty carry a caller-supplied
+/// mention is not a statement. Three of them carry a caller-supplied
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 21;
+const RULE_STATEMENT_SITES: usize = 22;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what

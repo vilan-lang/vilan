@@ -1479,6 +1479,68 @@ fn e161_the_generic_list_outranks_the_element_rule_and_the_binder_outranks_the_k
     );
 }
 
+// --- E162: a fixed-array argument inside a generic head ----------------------
+
+/// `SignalCell<[i32; 4]>` used to end the list at the ARRAY's `;`, because the
+/// enclosing region's statement-boundary bail-out (E161) cannot tell an array's
+/// length separator from the `;` that ends a statement. The array is its own
+/// region now, so the bail-out is never offered that `;` at all — a begin/end
+/// region matches its contained rules and its end pattern at their earliest
+/// position, and the `[` comes first.
+///
+/// A REGEX pin, like E161's five and for E161's reason: a true scope assertion
+/// tokenises with `vscode-textmate`, which is still not in the extension's
+/// `package-lock.json` (E163). The behaviour was verified against the real
+/// tokeniser off-tree while this was written — `[`, `i32`, `;`, `4` and `]` all
+/// carry `meta.generic.vilan` and the closing `>` carries
+/// `punctuation.definition.generic.end.vilan` — and that verification is not
+/// what this file can run.
+#[test]
+fn e162_a_fixed_array_argument_is_its_own_region_inside_the_list() {
+    let grammar = textmate_grammar(&[]);
+    let open = textmate_regex_containing(&grammar, "generics", "begin", "\\[");
+    assert_eq!(
+        regex_matches(&open, &["[i32; 4]", "[str; 2]"]),
+        vec![true, true],
+        "the array rule does not open on a fixed array: {open}"
+    );
+    assert_eq!(
+        regex_matches(&open, &["i32", "<str>", "type U"]),
+        vec![false, false, false],
+        "the array rule opens on something that is not an array: {open}"
+    );
+    let close = textmate_regex_containing(&grammar, "generics", "end", "\\]");
+    assert_eq!(
+        regex_matches(&close, &["]"]),
+        vec![true],
+        "the array region does not close on its own bracket: {close}"
+    );
+    // THE POINT: the array's own end must not treat `;` as a boundary, or the
+    // region would give the `;` straight back to the bail-out it exists to
+    // hide. It keeps the brace bail-outs, so an unclosed `[` still gives itself
+    // back at a statement rather than running to the end of the file.
+    assert_eq!(
+        regex_matches(&close, &[";"]),
+        vec![false],
+        "the array region bails out at the length separator: {close}"
+    );
+    assert_eq!(
+        regex_matches(&close, &["{", "}"]),
+        vec![true, true],
+        "the array region has no statement-boundary bail-out: {close}"
+    );
+    // And the enclosing list's own bail-out is untouched — the fix is the new
+    // region, not a weakened boundary (E161's control, restated here because
+    // deleting the `;` from the list's end would ALSO make this item's exhibit
+    // paint correctly, at the cost of the runaway E161 closed).
+    let list_close = textmate_regex_containing(&grammar, "generics", "end", ">");
+    assert_eq!(
+        regex_matches(&list_close, &[";", "{", "}"]),
+        vec![true, true, true],
+        "the generic list lost its statement-boundary bail-out: {list_close}"
+    );
+}
+
 /// The book's twin (the third place). highlight.js has no operator rule, so its
 /// brackets were never mis-scoped — but its element-tag rule made the very same
 /// `<type` mistake, and takes the very same guard.

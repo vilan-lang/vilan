@@ -61,6 +61,17 @@ pub struct Completion {
     /// (`CompletionKind::Snippet`, from [`CONSTRUCT_SNIPPETS`]); `None` for every
     /// other candidate (E14).
     pub snippet: Option<SnippetInsertion>,
+    /// A plain insertion that is neither call-shaped nor a construct snippet
+    /// (E160): a struct-initializer field inserts `name = `, or the bare
+    /// `name` where the shorthand applies. `None` inserts the label, which is
+    /// what every other candidate does.
+    ///
+    /// Its own field rather than a reuse of [`Self::snippet`], because
+    /// `snippet` also carries a construct snippet's RANKING — the front-ends
+    /// sort one below every entity (`~`-prefixed `sort_text`), and a field is
+    /// the only thing offered at its position, so burying it would be
+    /// nonsense.
+    pub insert: Option<InsertText>,
     /// The import this candidate needs before it resolves (E54c) — `None` for
     /// a candidate already reachable without one (every candidate except the
     /// ones [`Analysis::auto_import_completions`] adds). The server
@@ -96,6 +107,7 @@ impl Completion {
             documentation: None,
             call_parameters: None,
             snippet: None,
+            insert: None,
             needs_import: None,
         }
     }
@@ -115,6 +127,7 @@ impl Completion {
                 body: body.to_string(),
                 fallback: keyword.to_string(),
             }),
+            insert: None,
             needs_import: None,
         }
     }
@@ -994,6 +1007,13 @@ enum CursorContext {
     Member { receiver_end: usize, lifted: bool },
     /// A `::` path position; `path_start` is the first `:`.
     Path { path_start: usize },
+    /// A FIELD position inside a struct initializer (E160): `KoltStore { us▎`.
+    /// `struct_id` is the struct being constructed and `open` is the token
+    /// index of its `{`, from which the already-written field names are read
+    /// ([`Analysis::struct_initializer_completions`]) — an index rather than
+    /// the names themselves so this classifier stays `Copy`, like every arm
+    /// beside it.
+    StructInitializer { struct_id: Id, open: usize },
     /// An ordinary expression position: the names in scope.
     Expression,
 }
@@ -1027,6 +1047,175 @@ fn member_context(tokens: &[(Token, Span)], start: usize) -> Option<CursorContex
         receiver_end: tokens[receiver].1.into_range().end,
         lifted,
     })
+}
+
+/// The struct-initializer FIELD position at `start` (E160): the token index of
+/// the initializer's `{` and the token index of its head NAME, or `None` when
+/// the cursor is not at one.
+///
+/// Read in TOKEN space for [`member_context`]'s reason — the lexer already
+/// decides what is trivia, so a `{` inside a string or a `//` comment is not a
+/// bracket here at all. Three clauses, each one clause of the grammar
+/// `parsing.rs::parse_struct_initializer` accepts:
+///
+/// 1. The cursor is inside an UNCLOSED `{ … }`, found by walking back with a
+///    depth counter — so a nested initializer, call or list resolves to the
+///    INNERMOST brace, which is the one being typed in.
+/// 2. That brace's head is a name: `Name {`, `a::b::Name {` or `Name<Args> {`
+///    (the argument list is walked back over `<`/`>`, which the lexer always
+///    emits as single control tokens — there is no fused `>>`). The CALLER
+///    resolves that name against the program, and that is what keeps an
+///    ordinary block out: `fun f() {` and `match x {` have no struct name
+///    before the brace, and the two shapes that do — `struct Point {`,
+///    `impl Point {` — are declined by [`head_is_not_an_initializer`].
+/// 3. The cursor is at a FIELD position and not a VALUE one: the
+///    comma-separated run it sits in carries no `=` yet. `Point { x = p|` is a
+///    value position, and falls through to the ordinary gatherers so the
+///    expression being written there completes normally.
+fn struct_initializer_head(tokens: &[(Token<'_>, Span)], start: usize) -> Option<(usize, usize)> {
+    let mut index = tokens
+        .iter()
+        .rposition(|(_, span)| span.into_range().end <= start)?;
+    let mut depth = 0usize;
+    // Whether the walk is still inside the run the cursor sits in. Only there
+    // does an `=` mean "the cursor is past the field name"; a `=` in an
+    // earlier field's value says nothing about this one.
+    let mut in_cursor_run = true;
+    let open = loop {
+        match tokens[index].0 {
+            Token::Ctrl(')' | ']' | '}') => depth += 1,
+            Token::Ctrl('(' | '[') => depth = depth.checked_sub(1)?,
+            Token::Ctrl('{') => {
+                if depth == 0 {
+                    break index;
+                }
+                depth -= 1;
+            }
+            // A field list has no statements in it; a `;` at this depth means
+            // the enclosing brace is a block.
+            Token::Ctrl(';') if depth == 0 => return None,
+            Token::Ctrl(',') if depth == 0 => in_cursor_run = false,
+            // Exactly `=`: `==`, `+=` and `=>` are their own tokens.
+            Token::Op("=") if depth == 0 && in_cursor_run => return None,
+            _ => {}
+        }
+        index = index.checked_sub(1)?;
+    };
+    let mut head = open.checked_sub(1)?;
+    if matches!(tokens[head].0, Token::Ctrl('>')) {
+        let mut angle = 0usize;
+        loop {
+            match tokens[head].0 {
+                Token::Ctrl('>') => angle += 1,
+                Token::Ctrl('<') => {
+                    angle = angle.checked_sub(1)?;
+                    if angle == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            head = head.checked_sub(1)?;
+        }
+        head = head.checked_sub(1)?;
+    }
+    if !matches!(tokens[head].0, Token::Ident(_)) {
+        return None;
+    }
+    // Back over the rest of a qualified head (`a::b::Name {`) to its FIRST
+    // segment, which is the token the guard below must look behind: `::`
+    // precedes a qualified initializer and a qualified return type alike, so
+    // one token of lookahead cannot tell `shapes::Dot { x = 1 }` from `fun
+    // make(): shapes::Dot {`.
+    let mut path_start = head;
+    while path_start >= 2
+        && matches!(tokens[path_start - 1].0, Token::Op("::"))
+        && matches!(tokens[path_start - 2].0, Token::Ident(_))
+    {
+        path_start -= 2;
+    }
+    if path_start
+        .checked_sub(1)
+        .is_some_and(|previous| head_is_not_an_initializer(&tokens[previous].0))
+    {
+        return None;
+    }
+    Some((open, head))
+}
+
+/// The field names already written in the initializer opened at token `open`
+/// (E160) — every comma-separated run's leading identifier, from the `{` to its
+/// matching `}` or to the end of the buffer when it is still unclosed.
+///
+/// The run the cursor is IN is excluded: its name is the prefix being typed
+/// (`KoltStore { us▎`), and while retyping a written one (`KoltStore { use▎r }`)
+/// that field is still the candidate the author wants.
+fn struct_initializer_written<'src>(
+    tokens: &[(Token<'src>, Span)],
+    open: usize,
+    start: usize,
+) -> HashSet<&'src str> {
+    let mut written = HashSet::new();
+    let mut depth = 0usize;
+    let mut at_run_start = true;
+    for (token, span) in &tokens[open + 1..] {
+        match token {
+            Token::Ctrl('(' | '[' | '{') => depth += 1,
+            Token::Ctrl(')' | ']') => depth = depth.saturating_sub(1),
+            Token::Ctrl('}') => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            Token::Ctrl(',') if depth == 0 => {
+                at_run_start = true;
+                continue;
+            }
+            Token::Ident(name) if depth == 0 && at_run_start => {
+                let range = span.into_range();
+                if !(range.start <= start && start <= range.end) {
+                    written.insert(*name);
+                }
+            }
+            _ => {}
+        }
+        at_run_start = false;
+    }
+    written
+}
+
+/// Whether the token BEFORE a struct-named head puts that head in a
+/// declaration or a type position, so the `{` after it opens a body and not a
+/// field list (E160).
+///
+/// Three families, and each one really collides — the head names a struct in
+/// all of them:
+///
+/// - `struct Point {`, `impl Point {`: the declaration and its impl block.
+/// - `:` — every TYPE position, and the common one is a function whose return
+///   type is the struct it builds (`fun store_for(…): KoltStore {`, kolt
+///   `store.vl:263`, whose body's first line is the initializer this context
+///   exists for).
+/// - the control-flow words, because a condition parses in the parser's
+///   `no_struct` mode (`parsing.rs::parse_chain_head`), where a `{` after a
+///   bare name is a block BY RULE and not by what the name happens to denote.
+fn head_is_not_an_initializer(token: &Token<'_>) -> bool {
+    matches!(
+        token,
+        Token::Op(":")
+            | Token::Struct
+            | Token::Enum
+            | Token::Trait
+            | Token::Impl
+            | Token::With
+            | Token::If
+            | Token::Else
+            | Token::Match
+            | Token::For
+            | Token::In
+            | Token::Is
+    )
 }
 
 /// Whether `offset` (LIVE space) is TEXT rather than code — inside a string
@@ -1118,6 +1307,14 @@ impl<'a, 'src> Analysis<'a, 'src> {
             CursorContext::MacroName => return self.macro_name_completions(),
             CursorContext::ElementHead { chain } => return self.element_head_completions(chain),
             CursorContext::CssBlock(position) => return css_block_completions(position),
+            // A field position offers the struct's fields and NOTHING else
+            // (E160) — the element head's rule, for the element head's reason:
+            // a name in scope is not a field name, and the one thing the author
+            // is typing is the latter.
+            CursorContext::StructInitializer { struct_id, open } => {
+                return self
+                    .struct_initializer_completions(&tokens, struct_id, open, offset, start);
+            }
             _ => {}
         }
         // An import path takes names from the package tree, and it also shapes
@@ -1274,6 +1471,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 path_start: start - 2,
             };
         }
+        // A struct initializer's FIELD position (E160), last of the syntactic
+        // triggers because it is the widest: it is a claim about the enclosing
+        // brace rather than about the character just before the cursor, and a
+        // `.` or a `::` written inside one is still the member or path position
+        // it looks like (`Point { x = origin.|` completes `origin`'s members).
+        // What it does outrank is the bare scope position, which is the whole
+        // defect — `KoltStore { us|` used to list every binding in scope.
+        if let Some(context) = self.struct_initializer_context(tokens, start) {
+            return context;
+        }
         CursorContext::Expression
     }
 
@@ -1313,6 +1520,107 @@ impl<'a, 'src> Analysis<'a, 'src> {
             ));
         }
         items
+    }
+
+    /// The struct-initializer field position at `start`, with the head name
+    /// resolved against the program (E160). `None` when the token walk finds no
+    /// initializer, or when its head names no struct — which is how a block
+    /// whose head happens to be an identifier (`match value {`, `for x in xs
+    /// {`) declines without the classifier needing a parse.
+    ///
+    /// The head is looked up by NAME, which is what a generic struct needs: the
+    /// fields are the DECLARATION's, `Holder<i32> { … }` and `Holder<str> { … }`
+    /// name the same ones, and the argument list the author wrote plays no part
+    /// in which names are offered.
+    fn struct_initializer_context(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        start: usize,
+    ) -> Option<CursorContext> {
+        let (open, head) = struct_initializer_head(tokens, start)?;
+        let Token::Ident(name) = tokens[head].0 else {
+            return None;
+        };
+        let struct_id = *self
+            .program
+            .structs
+            .iter()
+            .find(|(_, structure)| structure.name == name)?
+            .0;
+        Some(CursorContext::StructInitializer { struct_id, open })
+    }
+
+    /// The candidates at a struct-initializer field position (E160): the
+    /// struct's fields minus the ones already written, each carrying its
+    /// declared type as the popup's detail and its own `///` first paragraph as
+    /// the documentation.
+    ///
+    /// Accepting one writes `name = ` — the author's next keystrokes — except
+    /// where a binding of the same name is in scope, which is the SHORTHAND
+    /// (`Point { x }` is `Point { x = x }`) and is what kolt's `store.vl:265`
+    /// writes for four of its five fields. That is the one place the two lists
+    /// this context used to confuse actually overlap, so it is decided here
+    /// rather than left to the author to delete the ` = ` again.
+    fn struct_initializer_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        struct_id: Id,
+        open: usize,
+        offset: usize,
+        start: usize,
+    ) -> Vec<Completion> {
+        let program = self.program;
+        let Some(structure) = program.structs.get(&struct_id) else {
+            return Vec::new();
+        };
+        let written = struct_initializer_written(tokens, open, start);
+        // The shorthand test is a scope question, so it is asked in ANALYZED
+        // space like every other one (E52).
+        let analyzed_offset = self.to_analyzed_offset(offset);
+        let source = program.source_of(struct_id);
+        structure
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !written.contains(field.name))
+            .map(|(index, field)| {
+                let mut completion =
+                    Completion::bare(field.name.to_string(), CompletionKind::Field);
+                completion.detail = self.field_type_label(struct_id, index, field.name);
+                completion.documentation = source.and_then(|source| {
+                    self.doc_first_paragraph_at(source, field.name_span.into_range().start)
+                });
+                if self.binding_in_scope(field.name, analyzed_offset).is_none() {
+                    completion.insert = Some(InsertText {
+                        text: format!("{} = ", field.name),
+                        is_snippet: false,
+                    });
+                }
+                completion
+            })
+            .collect()
+    }
+
+    /// The rendered type of the struct field at `index`, read out of the
+    /// struct's pre-rendered declaration label (E160) — the block hover fences,
+    /// whose field lines are `\t{name}: {type},` in declaration order
+    /// (`analyzer.rs::struct_declaration_label`).
+    ///
+    /// Read from the label rather than rendered here because the analyzer's
+    /// type printer is not on `Program` — a `TypeId` cannot be rendered outside
+    /// the analyzer, which is the sentence [`Completion::detail`] recorded as
+    /// "a field's type is not cheaply renderable from the analyzed `Program`".
+    /// The label already IS that printer's answer for exactly these fields, so
+    /// this is one source of truth and no per-request cost: the table is built
+    /// with the analysis. The field's own name is checked off the line rather
+    /// than assumed, so a label whose shape ever changes yields `None` — no
+    /// detail — instead of a wrong type.
+    fn field_type_label(&self, struct_id: Id, index: usize, name: &str) -> Option<String> {
+        let label = self.program.declaration_labels.get(&struct_id)?;
+        // Line 0 is `struct Name… {`; the fields follow in declaration order.
+        let line = label.lines().nth(index + 1)?.trim();
+        let rendered = line.strip_prefix(name)?.strip_prefix(": ")?;
+        Some(rendered.trim_end_matches(',').to_string())
     }
 
     /// The `View` the element desugar builds on: the nominal `view("tag")`
@@ -2183,6 +2491,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     documentation: None,
                     call_parameters: None,
                     snippet: None,
+                    insert: None,
                     needs_import: Some(AutoImport {
                         module_path: module.path.clone(),
                         edit_span: span,

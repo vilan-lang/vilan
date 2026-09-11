@@ -198,6 +198,18 @@ fn to_completion_item(
         item.insert_text_format = Some(format);
         item.sort_text = Some(format!("~{}", snippet.fallback));
     }
+    // A plain insertion (E160): a struct-initializer field writes `name = `,
+    // or the bare `name` where the shorthand applies. No `sort_text` — the
+    // fields are the only candidates at that position, so the label order is
+    // the right one.
+    if let Some(plain) = completion.insert {
+        item.insert_text = Some(plain.text);
+        item.insert_text_format = Some(if plain.is_snippet {
+            InsertTextFormat::SNIPPET
+        } else {
+            InsertTextFormat::PLAIN_TEXT
+        });
+    }
     // An auto-import candidate (E54c): LABEL it with the module it comes
     // from (overriding any signature/type `detail` — the point here is
     // making the import visible, not the candidate's shape) and carry the
@@ -820,6 +832,7 @@ mod completion_item_tests {
             call_parameters: call_parameters
                 .map(|names| names.into_iter().map(str::to_string).collect()),
             snippet: None,
+            insert: None,
             needs_import: None,
         }
     }
@@ -957,6 +970,7 @@ mod completion_item_tests {
                 body: "for ${1:item} in ${2:items} {\n\t$0\n}".to_string(),
                 fallback: "for".to_string(),
             }),
+            insert: None,
             needs_import: None,
         }
     }
@@ -973,6 +987,7 @@ mod completion_item_tests {
             documentation: None,
             call_parameters: None,
             snippet: None,
+            insert: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },

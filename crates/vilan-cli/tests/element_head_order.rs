@@ -34,6 +34,14 @@
 //! is the same bargain that order shipped with — but a value with a side effect
 //! whose ORDER matters is outside what either sorter promises.
 //!
+//! E156 asked whether to accept that or to refuse to sort a head whose values
+//! are not literals or pure paths, and it is RULED (2026-09-11) accept and
+//! document. [`sorting_an_element_head_moves_when_its_values_are_evaluated`] is
+//! the bargain as a FACT rather than as this paragraph: it prints from two
+//! attribute values and asserts that the sorted twin ran them in the SORTED
+//! order while rendering the same document. A purity check added later without
+//! a ruling reds there, which is the point of pinning a bargain.
+//!
 //! The order itself is pinned in `vilan-core`'s `formatter::element_head_layout`.
 
 use std::path::{Path, PathBuf};
@@ -101,6 +109,24 @@ const ORDER_SENSITIVE: &str = concat!(
     "href(\"h\") type(\"t\") id(\"i\")>\"l\"</label>));\n",
     // The last-wins pair: `second` renders, and only a stable sort keeps it so.
     "\tprint(render(<div class(\"first\") class(\"second\")>\"dup\"</div>));\n",
+    "}\n",
+    "main();\n",
+);
+
+/// E156's fixture: two attribute values that PRINT, written out of canonical
+/// order. `title` is written first and `id` leads the canonical order, so the
+/// sort moves them past each other and the two `print`s swap.
+const EVALUATION_ORDER: &str = concat!(
+    "import std::io::print;\n",
+    "import std::ui::{ View, render, view };\n",
+    "\n",
+    "fun note(name: str): str {\n",
+    "\tprint(name);\n",
+    "\tname\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(render(<div title(note(\"title\")) id(note(\"id\"))>\"x\"</div>));\n",
     "}\n",
     "main();\n",
 );
@@ -352,6 +378,47 @@ fn sorting_an_element_head_adds_and_drops_nothing() {
 /// The tracked corpus, both ways. Canonical today, so the twins are identical
 /// and this is a regression guard; it goes red the moment a head in one of
 /// these files is written out of order.
+/// E156, ruled 2026-09-11: the sorter reorders WHEN attribute values run, and
+/// that is accepted and documented rather than checked for.
+///
+/// Pinned here because a documented bargain nobody checks is a sentence, not a
+/// promise. Both halves are asserted, and they are different claims: the
+/// DOCUMENT is identical (what the sorter promises, and what every other pin in
+/// this file is about), and the two side effects ran in the SORTED order (what
+/// it explicitly does not promise). A later purity check — refusing to sort a
+/// head whose values are not literals or pure paths — would turn the second
+/// assertion red, which is what makes this the place the ruling lives.
+///
+/// A value with a side effect whose ORDER matters is the smell. The fix is to
+/// lift it out of the head, which is what the book now says.
+#[test]
+fn sorting_an_element_head_moves_when_its_values_are_evaluated() {
+    let twins = twins("evaluation-order", EVALUATION_ORDER, true);
+    let written: Vec<&str> = twins.written.rendered.lines().collect();
+    let sorted: Vec<&str> = twins.sorted.rendered.lines().collect();
+    assert_eq!(
+        written.len(),
+        3,
+        "the fixture prints two values and one document: {written:?}"
+    );
+    assert_eq!(
+        (written[0], written[1]),
+        ("title", "id"),
+        "as WRITTEN, the values run left to right: {written:?}"
+    );
+    assert_eq!(
+        (sorted[0], sorted[1]),
+        ("id", "title"),
+        "sorted, they run in the canonical order — E156's bargain, and the \
+         assertion a purity check would have to come back and change: {sorted:?}"
+    );
+    assert_eq!(
+        sort_tag_attributes(written[2]),
+        sort_tag_attributes(sorted[2]),
+        "the DOCUMENT moved, which the sorter does promise it never does"
+    );
+}
+
 #[test]
 fn the_tracked_corpus_renders_the_same_document_both_ways() {
     for relative in ELEMENT_SOURCES {

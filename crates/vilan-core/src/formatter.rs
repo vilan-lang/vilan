@@ -5613,6 +5613,14 @@ impl<'src> Printer<'src> {
                 self.out.push_str("for ");
                 self.out.push_str(variable);
                 self.out.push_str(" in ");
+                // `for <name> in <iterable> {` is one measured line, and the
+                // ITERABLE is the only thing on it with a layout of its own —
+                // the binder is a name — so it takes the split permission the
+                // `for` condition and the `match` subject take (E147, E150
+                // rule B, E154). E150 rule B reached the two block-bearing
+                // heads it was written for and left the third sibling alone,
+                // so an over-budget iterable had nowhere to break at all.
+                self.split = split;
                 self.print_expr(iterable);
                 self.out.push(' ');
                 self.print_block(body);
@@ -11751,15 +11759,19 @@ mod element_head_layout {
 
 #[cfg(test)]
 mod loop_and_match_head_layout {
-    //! E150 rule B — a `for` (vilan's `while`) CONDITION and a `match` SUBJECT
-    //! take the split permission an `if` condition took at E147.
+    //! E150 rule B — a `for` (vilan's `while`) CONDITION, a `for … in`
+    //! ITERABLE (E154) and a `match` SUBJECT take the split permission an `if`
+    //! condition took at E147.
     //!
     //! E147 gave the `if` condition the permission on one argument: `if <cond> {`
     //! is one measured line and the condition is the only thing on it with a
     //! layout of its own, so without the permission an over-budget `if` had
-    //! nowhere to break at all. `for <cond> {` and `match <subject> {` are the
-    //! same sentence with a different keyword — one measured line, one layout
-    //! site — and they were left out only because E147 was written for `if`.
+    //! nowhere to break at all. `for <cond> {`, `for <name> in <iterable> {` and
+    //! `match <subject> {` are the same sentence with a different keyword — one
+    //! measured line, one layout site, the binder being a name and no layout
+    //! site at all — and they were left out only because E147 was written for
+    //! `if`. E150 rule B then reached two of the three and left the iterable,
+    //! which is what E154 finishes.
     //!
     //! There is no over-budget instance of either in the tree, so these pins
     //! WRITE one: the rule is a rule about the shape, not a rescue of a line
@@ -11873,6 +11885,62 @@ mod loop_and_match_head_layout {
         );
     }
 
+    /// E154 — the third sibling: `for <name> in <iterable> {`. The iterable is
+    /// the only layout site on the line (the binder is a name), and before this
+    /// the line stayed over budget however many operators the iterable held.
+    #[test]
+    fn a_for_in_iterable_over_the_budget_breaks() {
+        let joined = "\tfor word in first.words() + second.words() + third.words() \
+                      + fourth.words() + fifth.words() + sixth.words() {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun count(first: str, second: str, third: str, fourth: str, fifth: str, \
+             sixth: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor word in first.words() + second.words() + third.words() + fourth.words() \
+             + fifth.words() + sixth.words() {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+            "fun count(first: str, second: str, third: str, fourth: str, fifth: str, \
+             sixth: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor word in first.words()\n\
+             \t\t+ second.words()\n\
+             \t\t+ third.words()\n\
+             \t\t+ fourth.words()\n\
+             \t\t+ fifth.words()\n\
+             \t\t+ sixth.words() {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+        );
+    }
+
+    /// The entry is width, in both directions, for the iterable too: one that
+    /// fits stays on its line, and a hand-broken one that fits joins back.
+    #[test]
+    fn a_for_in_head_that_fits_stays_on_its_line() {
+        let source = "fun demo(a: List<i32>, b: List<i32>) {\n\
+                      \tfor x in a + b {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      }\n";
+        assert!(columns("\tfor x in a + b {") <= LINE_BUDGET);
+        assert_construct(source, source);
+        assert_construct(
+            "fun demo(a: List<i32>, b: List<i32>) {\n\
+             \tfor x in a\n\
+             \t\t+ b {\n\
+             \t\tlog(\"x\");\n\
+             \t}\n\
+             }\n",
+            source,
+        );
+    }
+
     /// A bare `for {` — the unconditional loop — has no condition to hand the
     /// permission to, and the arm that would hand it over is not reached.
     #[test]
@@ -11908,6 +11976,14 @@ mod loop_and_match_head_layout {
                 false,
             ),
             ("fun d() {\n\tfor {\n\t\tlog(\"x\");\n\t}\n}\n", false),
+            (
+                "fun e(first: str, second: str, third: str, fourth: str, fifth: str, sixth: str) {\n\tmut n = 0;\n\tfor w in first.words() + second.words() + third.words() + fourth.words() + fifth.words() + sixth.words() {\n\t\tn += 1;\n\t}\n}\n",
+                true,
+            ),
+            (
+                "fun f(a: List<i32>, b: List<i32>) {\n\tfor x in a + b {\n\t\tlog(\"x\");\n\t}\n}\n",
+                false,
+            ),
         ] {
             let once = format(source);
             assert_eq!(

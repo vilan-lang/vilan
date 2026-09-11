@@ -447,9 +447,22 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// ([`Self::source_text`] — once per module per query, not once per
     /// candidate, E83).
     pub fn doc_comment_of(&self, declaration_id: Id) -> Option<String> {
-        let program = self.program;
-        let source = program.source_of(declaration_id)?;
         let name_span = self.definition_name_span(declaration_id)?;
+        self.doc_comment_at(
+            self.program.source_of(declaration_id)?,
+            name_span.into_range().start,
+        )
+    }
+
+    /// The `///` block above the name starting at `name_start` in `source` —
+    /// [`Self::doc_comment_of`]'s body over coordinates rather than a
+    /// declaration id, for the members that HAVE no id of their own.
+    ///
+    /// A struct field is the case (E160): `analyzer::Field` is a name, a name
+    /// span and a type id, so there is no entity to look up and no
+    /// `definition_name_span` to ask. The span it does carry is enough, and
+    /// this is the same read `doc_comment_of` performs.
+    pub(crate) fn doc_comment_at(&self, source: SourceId, name_start: usize) -> Option<String> {
         let owned;
         let text: &str = if source == SourceId(0) {
             self.analyzed.text()
@@ -457,7 +470,25 @@ impl<'a, 'src> Analysis<'a, 'src> {
             owned = self.source_text(source)?;
             &owned
         };
-        doc_comment_above(text, name_span.into_range().start)
+        doc_comment_above(text, name_start)
+    }
+
+    /// The first paragraph of the `///` doc above the name at `name_start` in
+    /// `source` (E160) — [`Self::doc_first_paragraph`] for a member with no
+    /// declaration id.
+    ///
+    /// It renders rather than reading M39's captured table, which holds
+    /// FUNCTIONS and externals only. The cost M39 was about does not arise
+    /// here: a struct-initializer completion's candidates all come from ONE
+    /// declaration in ONE module, so this is a single module read per request
+    /// — and for the entry file, where a program's own structs live, the text
+    /// is already in hand.
+    pub(crate) fn doc_first_paragraph_at(
+        &self,
+        source: SourceId,
+        name_start: usize,
+    ) -> Option<String> {
+        first_paragraph(&self.doc_comment_at(source, name_start)?)
     }
 
     /// The first paragraph of a declaration's `///` doc — up to the first blank

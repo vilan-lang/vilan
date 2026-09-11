@@ -949,9 +949,11 @@ fn is_identifier_char(character: char) -> bool {
 
 /// Turn index entries into completion candidates, filtered by `prefix`.
 ///
-/// A `Completion` the keystroke path produces carries no `needs_import` and no
-/// snippet: auto-import is a resolution question and belongs to the analysis's
-/// own completion, which the client gets on the next landing.
+/// A `Completion` the keystroke path produces carries no `needs_import`, no
+/// snippet and no plain insertion: auto-import is a resolution question and
+/// belongs to the analysis's own completion, which the client gets on the next
+/// landing, and the index holds declared NAMES — never a struct-initializer
+/// field position, which is a claim about the enclosing brace.
 pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
     entries
         .iter()
@@ -963,6 +965,7 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
             documentation: None,
             call_parameters: entry.call_parameters.clone(),
             snippet: None,
+            insert: None,
             needs_import: None,
         })
         .collect()
