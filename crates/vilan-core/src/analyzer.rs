@@ -2019,6 +2019,12 @@ struct TraitImplSite {
 /// `std::reactive::SignalCell<i32>` — B172), deferred to the `build()` drain
 /// because the namespace it reaches through is itself a deferred reference.
 ///
+/// The recorded sites [`Analyzer::check_written_nominal_bounds`] drains:
+/// `(declaration id, written arguments, span, source, anchor type id, generic
+/// arguments exempt)`. Named because it is a six-tuple in two producers and one
+/// consumer, and the last flag is easy to read as "one more `TypeId`" otherwise.
+type WrittenNominalBoundSites = Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId, bool)>;
+
 /// The unqualified twin is `prepped_type_locals`, whose head is a NAME resolved
 /// in a lexical scope; here the head is a walked type that must turn out to be a
 /// module, and the member is looked up in what that module declares.
@@ -3837,12 +3843,19 @@ pub struct Analyzer<'src> {
     // binding is forced to.
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
     // B251: every WRITTEN application of a struct that declared bounded
-    // parameters — `(struct id, written arguments, span, source, type id)` —
-    // asked after `build()` by `check_written_nominal_bounds`. A type
-    // application binds a declaration's parameters exactly as a call does, but
-    // records nothing into `method_call_substitution`, so the bound check every
-    // call gets never reached it.
-    written_nominal_bound_sites: Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId)>,
+    // parameters — `(struct id, written arguments, span, source, type id,
+    // generic arguments exempt)` — asked after `build()` by
+    // `check_written_nominal_bounds`. A type application binds a declaration's
+    // parameters exactly as a call does, but records nothing into
+    // `method_call_substitution`, so the bound check every call gets never
+    // reached it.
+    //
+    // The last flag is B273's: at an impl's `with` clause an argument that is
+    // the impl's OWN binder is discharged where the parameter is GROUNDED, not
+    // where it is written (`a_bounded_trait_parameter_left_operand_still_\
+    // dispatches` pins that reading), so those positions are skipped there and
+    // nowhere else.
+    written_nominal_bound_sites: WrittenNominalBoundSites,
     // B182: the annotation slots a REFUSED bare trait resolved to `Unknown`,
     // each with the site its one report was filed at. B161 resolves a refused
     // annotation to `Unknown` "so the one report stands alone instead of
@@ -4991,10 +5004,27 @@ impl<'src> Analyzer<'src> {
                 });
         }
         // Each candidate keeps the arguments it provides for the required
-        // trait when it names it DIRECTLY (`with Feed<i32>`); a match via a
-        // subtrait stays trait-level (v1 — supertrait argument threading is
-        // recorded, not taken).
-        let candidates: Vec<(TypeId, Option<Vec<TypeId>>)> = self
+        // trait — written on the clause when it names the trait DIRECTLY
+        // (`with Feed<i32>`), and THREADED THROUGH THE SUPERTRAIT CHAIN when it
+        // names it through a subtrait (B275).
+        //
+        // The threading was recorded and not taken in v1, and the hole it left
+        // is not small: `trait Signal<T> with Source<T>` means `impl SignalCell
+        // <type T> with Signal<T>` reaches `Source` without writing it, so the
+        // argument check below saw no provided arguments at all and passed
+        // VACUOUSLY. A program whose only `Slot` impl is the blanket `impl type
+        // S: Source<str> with Slot` then admitted a `SignalCell<Panel>` at a
+        // `: Slot` call site, and the emission filter's never-empty fallback —
+        // an internal guard, not a checker — was the only thing between that
+        // and an internal-error report.
+        //
+        // `trait_with_supertraits_at` is the threading, already written for
+        // method lookup: it walks the chain substituting each trait's own
+        // parameters at the arguments the clause below it passes, so
+        // `Signal<T_impl>`'s `Source<T>` comes back as `Source<T_impl>` and the
+        // impl's own binding (`T_impl := Panel`) grounds it at the comparison.
+        // Collected in two steps because the walk takes `&mut self`.
+        let matching: Vec<(TypeId, Vec<(Id, Vec<TypeId>)>)> = self
             .implementations
             .iter()
             .filter(|implementation| {
@@ -5003,13 +5033,22 @@ impl<'src> Analyzer<'src> {
                         .contains(&required_trait_id)
                 })
             })
-            .map(|implementation| {
-                let provided = implementation
-                    .trait_args
-                    .iter()
-                    .find(|(provided_trait, _)| *provided_trait == required_trait_id)
-                    .map(|(_, arguments)| arguments.clone());
-                (implementation.subject, provided)
+            .map(|implementation| (implementation.subject, implementation.trait_args.clone()))
+            .collect();
+        let candidates: Vec<(TypeId, Option<Vec<TypeId>>)> = matching
+            .into_iter()
+            .map(|(subject, trait_args)| {
+                let provided = trait_args.iter().find_map(|(provided_trait, arguments)| {
+                    match *provided_trait == required_trait_id {
+                        true => Some(arguments.clone()),
+                        false => self
+                            .trait_with_supertraits_at(*provided_trait, arguments)
+                            .into_iter()
+                            .find(|(reached, _)| *reached == required_trait_id)
+                            .map(|(_, reached_arguments)| reached_arguments),
+                    }
+                });
+                (subject, provided)
             })
             .collect();
         'candidates: for (subject_id, provided_arguments) in candidates {
@@ -5995,7 +6034,7 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
-        for (owner_id, written_arguments, span, source_id, type_id) in
+        for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
             let Some((owner_name, declared, _)) = self.nominal_bound_owner(owner_id) else {
@@ -6029,6 +6068,17 @@ impl<'src> Analyzer<'src> {
                     argument_type,
                     Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
                 ) {
+                    continue;
+                }
+                // B273: at an impl's `with` clause the impl's OWN binder is not
+                // held to the trait's bound HERE — `impl Holder<type T> with
+                // Doubler<T>` over `trait Doubler<T: Add>` is the shipped
+                // spelling, and the requirement is discharged where `T` is
+                // grounded (`Holder { value = Point { .. } }.twice()` is
+                // refused there). A CONCRETE argument at the same clause has no
+                // grounding site left to discharge it, which is the half B273
+                // closes.
+                if generics_exempt && matches!(argument_type, Type::Generic(_)) {
                     continue;
                 }
                 for (required_trait_id, required_arguments) in &bound_traits {
@@ -29000,6 +29050,39 @@ impl<'src> Analyzer<'src> {
                     if self.generic_is_enclosing_binder(constraint_id, call_id)))
     }
 
+    /// B280: whether an EXTERNAL callee's own signature fixes the element of a
+    /// `List` it returns — some PARAMETER's declared type mentions the same
+    /// generic, so the element is decided by an input rather than being a hole
+    /// to fill from later `push` calls.
+    ///
+    /// Asked of the DECLARED types, in the callee's own terms: the return the
+    /// call site holds has already had the receiver's bindings substituted in,
+    /// so its element is no longer the id the parameters name.
+    fn external_parameters_fix_the_list_element(&self, function_id: Id) -> bool {
+        let Some(function) = self.external_functions.get(&function_id) else {
+            return false;
+        };
+        let Type::Struct(struct_id, arguments) = function.return_type_id.get_type(self) else {
+            return false;
+        };
+        if !self.is_slot_container(struct_id) || arguments.len() != 1 {
+            return false;
+        }
+        let Type::Generic(element_constraint_id) = arguments[0].get_type(self) else {
+            return false;
+        };
+        let parameter_ids = function.parameters.clone();
+        parameter_ids.iter().any(|parameter_id| {
+            let Some(parameter) = self.parameters.get(parameter_id) else {
+                return false;
+            };
+            let parameter_type = parameter.type_id.get_type(self);
+            let mut mentioned = Vec::new();
+            self.collect_generics(&parameter_type, 0, &mut mentioned);
+            mentioned.contains(&element_constraint_id)
+        })
+    }
+
     /// If `type_` is a `List` whose element is an unbound generic (i.e. the
     /// result of `List::new()`), replaces the element with a fresh inference
     /// slot stable for this call id, so the element can be unified from later
@@ -29273,6 +29356,63 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// [`Self::own_generics_unbound`] for the CLOSURE-return retry gate
+    /// (B288): a generic bound to a type that still carries an `Unknown` HOLE
+    /// is not an answer either. An empty `[]` argument binds `U := List<?>` —
+    /// a real binding with an open element slot — so the "is anything still
+    /// unbound?" test said no, the call committed, and the closure's return,
+    /// which had not typed on that attempt, never got to refine it. An
+    /// `Unknown` inside the binding is exactly the hole
+    /// `bind_callee_own_generics_from_expectation` already declines to commit
+    /// on; this is the same standard applied to the retry decision.
+    ///
+    /// A binding that is merely ABSTRACT (`U := T`, the enclosing
+    /// declaration's own binder) is an ANSWER and not a hole — the caller
+    /// chose it — which is why this asks about `Unknown` and not about
+    /// [`Self::type_is_fully_determined`].
+    fn own_generics_undetermined(&self, member_id: Id, substitution: &SubstitutionContext) -> bool {
+        self.method_signature_ref(member_id)
+            .is_some_and(|(_, own_generics)| {
+                own_generics
+                    .iter()
+                    .any(|generic| match substitution.get(generic) {
+                        None => true,
+                        Some(bound) => self.type_has_an_unknown_hole(&bound.get_type(self)),
+                    })
+            })
+    }
+
+    /// Whether a type carries an `Unknown` anywhere inside it — the open
+    /// element slot of an empty `[]`, or a parameter nothing has filled.
+    /// `Unresolved` counts too: a type still mid-inference is no answer.
+    fn type_has_an_unknown_hole(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Unknown | Type::Unresolved => true,
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                arguments
+                    .iter()
+                    .any(|argument| self.type_has_an_unknown_hole(&argument.get_type(self)))
+            }
+            Type::Tuple(items) => items
+                .iter()
+                .any(|item| self.type_has_an_unknown_hole(&item.get_type(self))),
+            Type::Array(element_id, _) => self.type_has_an_unknown_hole(&element_id.get_type(self)),
+            Type::Closure(parameter_ids, return_id) => {
+                parameter_ids
+                    .iter()
+                    .any(|parameter| self.type_has_an_unknown_hole(&parameter.get_type(self)))
+                    || self.type_has_an_unknown_hole(&return_id.get_type(self))
+            }
+            Type::Any
+            | Type::Never
+            | Type::Generic(_)
+            | Type::Mapped(..)
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void => false,
+        }
+    }
+
     /// Binds the callee's own generics the call's EXPECTATION fixes — the
     /// `U` of `let widths: List<i32> = points.map(|point| ..)` — for exactly
     /// the generics the receiver and the non-closure arguments left open
@@ -29458,6 +29598,40 @@ impl<'src> Analyzer<'src> {
     /// `Local` indirections to the `Parameter` entity.
     fn is_unknown_closure_parameter(&self, expr_id: Id) -> bool {
         self.unfilled_closure_parameter(expr_id).is_some()
+    }
+
+    /// Whether a VALUE expression is still waiting on an unannotated closure
+    /// parameter's bidirectional fill — [`Self::is_unknown_closure_parameter`]
+    /// asked of the whole subtree rather than of one name, because a value is
+    /// as unready as the readiest thing inside it (`[x]`, `Wrap { inner = x }`,
+    /// `f(x)`).
+    ///
+    /// B288: the struct-literal door needs the subtree form. `is_unknown_..`
+    /// answers for the parameter ITSELF, which is the shape the call-subject,
+    /// subscript and `match` doors all meet; a field VALUE reaches the same
+    /// not-yet one constructor deep, and the literal built around it publishes
+    /// a type that is then permanent.
+    ///
+    /// A nested closure is a TERMINAL here, exactly as it is in
+    /// [`Self::drop_scan_children`] (which is what makes that walk the right
+    /// one to borrow): its own parameters fill from ITS call, and waiting on
+    /// them would be waiting on a different call's answer.
+    fn value_awaits_a_closure_parameter(&self, expr_id: Id) -> bool {
+        let mut pending = vec![expr_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        let mut children = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.is_unknown_closure_parameter(id) {
+                return true;
+            }
+            children.clear();
+            self.drop_scan_children(id, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        false
     }
 
     /// [`Self::is_unknown_closure_parameter`], answering WHICH parameter: the
@@ -30336,7 +30510,42 @@ impl<'src> Analyzer<'src> {
                             } else {
                                 return_type
                             };
-                            return self.freshen_list_element_slots(return_type, id);
+                            // B280: the same guard the DECLARED return takes
+                            // below (B263), plus the one thing the external
+                            // path needs that the declared one does not.
+                            // `freshen_list_element_slots` exists for
+                            // `List::new()`, whose element is a genuine hole;
+                            // a `List<T>` whose `T` is a binder of the
+                            // declaration this call SITS IN is not a hole, and
+                            // replacing it with a fresh slot erases the
+                            // caller's rigid element — an `external fun
+                            // items(self): List<T>` reached through a receiver
+                            // typed by the impl's own `T` reported "cannot
+                            // index this List: its element type is never
+                            // determined" over complete code.
+                            //
+                            // `List::new()` is why the enclosing-binder test
+                            // alone will not do here, and it is the only
+                            // difference between the two sites: it is declared
+                            // INSIDE `impl List<type T>`, so its return element
+                            // IS that binder by the name rule, and a call to it
+                            // from a sibling member (`map`'s `mut result =
+                            // List::new()`) would stop being freshened and type
+                            // as `List<T>` where the body fills a `List<U>`.
+                            // So the element counts as fixed only when the
+                            // callee's own signature fixes it: some PARAMETER
+                            // mentions the same generic (`values(self):
+                            // List<V>` through `self`, `settle_all(tasks:
+                            // List<Task<T>>): List<T>` through its argument).
+                            // `List::new()` takes none, which is exactly why
+                            // its element is a hole.
+                            let element_is_fixed = self
+                                .return_element_is_a_caller_binder(&return_type, id)
+                                && self.external_parameters_fix_the_list_element(function_id);
+                            return match element_is_fixed {
+                                true => return_type,
+                                false => self.freshen_list_element_slots(return_type, id),
+                            };
                         };
                         let mut substitution_context = substitution_context.clone();
                         // A method on a concrete generic instance (`box.unwrap()`
@@ -35571,7 +35780,7 @@ impl<'src> Analyzer<'src> {
                 // RETURN (`map<U>`'s `U`) would otherwise freeze abstract in the
                 // call's substitution and return type.
                 if unresolved_closure_argument
-                    && self.own_generics_unbound(member_id, &substitution)
+                    && self.own_generics_undetermined(member_id, &substitution)
                 {
                     return Resolution::Deferred;
                 }
@@ -38416,6 +38625,24 @@ impl<'src> Analyzer<'src> {
         if let Type::Unresolved = value_type {
             return FieldValueVerdict::Deferred;
         }
+        // B288: an unfilled closure parameter inside the value is a NOT-YET,
+        // not an answer — the same rule `resolve_variable` states for a
+        // binding (B185) and `resolve_is`/`resolve_match`/`resolve_subscript`
+        // for a scrutinee. It matters here because the literal's type is
+        // PUBLISHED (`resolved_types`) and read from the cache ever after: a
+        // field value that reads `Unknown` binds the struct's parameter to
+        // nothing and the literal types as `Remote<any>`, and one that reads
+        // through a container (`[x]`) binds it to an ERASED `List` — and both
+        // of those reconcile with ANYTHING, so the closure's return-position
+        // check against a ground target matched vacuously and
+        // `take(|x| Remote { seed = [x] })` satisfied a `|i32| Remote<List<str>>`
+        // parameter. Deferring lets the value type properly on the retry after
+        // the owning call fills the parameter; nothing else about the door
+        // moves, and a value that never fills is reported by the starved
+        // -parameter sweep (B131) rather than silently.
+        if self.value_awaits_a_closure_parameter(value_id) {
+            return FieldValueVerdict::Deferred;
+        }
         match self.reconcile_type(&value_type, field_type, substitution_context) {
             Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
             None => {
@@ -38986,6 +39213,22 @@ impl<'src> Analyzer<'src> {
     fn resolve_is(&mut self, prepped: &PreppedIs<'src>) -> Resolution {
         let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
+            return Resolution::Deferred;
+        }
+        // B290: an `is` over an unannotated closure parameter waits for
+        // bidirectional inference to FILL that parameter — the same rule
+        // `resolve_match` states for `|current| match current` (C′'s family,
+        // B23) and `resolve_subscript` for `|list| list[0]`. This door was the
+        // one that drifted. Resolving on the `Unknown` reads the pattern
+        // against the ENUM's own declaration, so `|inner| inner is Some(let
+        // payload)` typed `payload` as `Option`'s declared `T` — a free,
+        // unbounded generic that never revisits and then reconciles with
+        // ANYTHING: `inner.len()` over an `Option<List<i32>>` payload was
+        // refused "cannot call method 'len' on T", and the same binding passed
+        // to a `str` parameter compiled.
+        if matches!(subject_type, Type::Unknown)
+            && self.is_unknown_closure_parameter(prepped.subject_id)
+        {
             return Resolution::Deferred;
         }
         let subject_type_id = subject_type.get_type_id(self);
@@ -39787,6 +40030,7 @@ impl<'src> Analyzer<'src> {
                             span,
                             source_id,
                             type_id,
+                            false,
                         ));
                     }
                     // Attach the written generic arguments to the nominal type
@@ -40825,6 +41069,60 @@ impl<'src> Analyzer<'src> {
                     msg: format!("'{}' is not a trait", check.trait_name),
                 });
                 continue;
+            }
+            // B273: the impl's `with` clause writes a trait APPLICATION, and
+            // nothing checked it — not its ARITY (B188's check runs off the
+            // `prepped_type_locals` drain, which a `with` clause does not go
+            // through, so `impl CatBox with Holder<Cat, i32>` compiled) and not
+            // its arguments against the trait's declared BOUNDS (B251's check,
+            // whose two recording sites are that same drain, so `impl CatBox
+            // with Holder<Cat>` compiled with `Cat` implementing no `Label`).
+            // The tour page has asserted the opposite in prose since it was
+            // written. This is the THIRD recording site for the one check, not
+            // a third check: the arity message is B188's, the bound message is
+            // B251's, and a clause already refused on its arity records nothing
+            // (one report per written spelling).
+            //
+            // Anchored on the FIRST written argument's type id, which is what
+            // the walk that wrote the clause minted — so a derived impl's
+            // refusal redirects to the attribute that generated it (B217),
+            // exactly as the annotation drain's does.
+            let trait_type = Type::Trait(trait_id, Vec::new());
+            let arity_error = self.written_application_arity_error(
+                trait_id,
+                &trait_type,
+                check.trait_name,
+                check.trait_arguments.len(),
+            );
+            match (arity_error, check.trait_arguments.first().copied()) {
+                (Some(message), _) => {
+                    let anchor_type_id = check
+                        .trait_arguments
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| trait_type.clone().get_type_id(self));
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: check.span,
+                            msg: message,
+                        },
+                        check.source_id,
+                        anchor_type_id,
+                    );
+                }
+                (None, Some(anchor_type_id)) => {
+                    self.written_nominal_bound_sites.push((
+                        trait_id,
+                        check.trait_arguments.clone(),
+                        check.span,
+                        check.source_id,
+                        anchor_type_id,
+                        true,
+                    ));
+                }
+                (None, None) => {}
             }
             // (The trait was already recorded on its impl — and the `with`
             // reference indexed — in the pre-static pass above.)

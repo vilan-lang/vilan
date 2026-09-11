@@ -4217,3 +4217,107 @@ fun run(port: i32) {
         "the result service refused the connection:\n{stdout}"
     );
 }
+
+/// B288, on a GENERATED client: the kolt shape, where the handle's element
+/// type is reachable only through the closure's return (`|T|
+/// Option<RemoteSource<U>>`) and the fallback is an empty `[]`. The wrong
+/// annotation used to be accepted in silence — kolt's `model.vl` carried three
+/// of them behind FIXMEs, one over a `List<i53>` handle annotated as something
+/// else entirely — and dropping the annotation was not possible at all.
+#[test]
+fn a_handle_bridges_element_type_is_checked_against_the_annotation_at_the_call() {
+    let dir = temp_project("b288_handle_bridge");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    const BRIDGE: &str = r#"import std::reactive::{ Signal, SignalCell };
+import std::rpc::{ RemoteSource, Transport };
+import std::task::Task;
+
+[service(ChatClient)]
+struct Chat {
+	label: str,
+}
+
+impl Chat {
+	[rpc]
+	fun get_messages(self, id: i53): Option<SignalCell<List<i53>>> {
+		None
+	}
+}
+
+impl Task<type T> {
+	fun remote_signal<U>(self, fallback: U, transform: |T| Option<RemoteSource<U>>): SignalCell<U> {
+		Signal::new(fallback)
+	}
+}
+"#;
+    let check = |source: &str| {
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+
+    // The wrong annotation is refused, and the refusal names the element type
+    // the handle actually carries.
+    let (ok, report) = check(&format!(
+        "{BRIDGE}
+fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<str>> {{
+	let handle = async client.get_messages(1i53);
+	let messages: SignalCell<List<str>> = handle.remote_signal([], |x| x.ok().flatten());
+	messages
+}}
+
+fun main() {{}}
+"
+    ));
+    assert!(!ok, "the wrong annotation must not compile:\n{report}");
+    assert!(
+        report.contains("Expected SignalCell<List<str>>, but got SignalCell<List<i53>> instead."),
+        "the refusal must name the handle's element type; it said:\n{report}"
+    );
+
+    // The RIGHT annotation compiles — the control that the refusal above is a
+    // disagreement and not a new blanket refusal of the shape.
+    let (ok, report) = check(&format!(
+        "{BRIDGE}
+fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<i53>> {{
+	let handle = async client.get_messages(1i53);
+	let messages: SignalCell<List<i53>> = handle.remote_signal([], |x| x.ok().flatten());
+	messages
+}}
+
+fun main() {{}}
+"
+    ));
+    assert!(ok, "the right annotation must compile:\n{report}");
+
+    // And NO annotation compiles: the closure's return binds `U` now, which is
+    // the half that made the annotation mandatory in the first place.
+    let (ok, report) = check(&format!(
+        "{BRIDGE}
+fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<i53>> {{
+	let handle = async client.get_messages(1i53);
+	handle.remote_signal([], |x| x.ok().flatten())
+}}
+
+fun main() {{}}
+"
+    ));
+    assert!(ok, "the unannotated bridge must compile:\n{report}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

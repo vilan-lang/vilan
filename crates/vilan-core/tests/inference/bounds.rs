@@ -8277,18 +8277,16 @@ fn b262_the_estates_own_bounded_trait_still_compiles() {
 }
 
 #[test]
-#[ignore = "B262's boundary: an impl's `with` clause reaches neither the arity \
-            check nor the bound check - a site apart from the \
-            `prepped_type_locals` drain this item widens"]
 fn b262_an_impl_with_clauses_trait_argument_is_still_unchecked() {
-    // The boundary, pinned rather than claimed. An impl's `with` clause writes a
-    // trait APPLICATION, but it does not drain through `prepped_type_locals`:
-    // `impl CatBox with Holder<Cat>` is accepted with `Cat` implementing
-    // nothing, and so is `impl CatBox with Holder<Cat, i32>` — so B188's arity
-    // check misses the position too, which dates the hole well before this item.
-    // `vilan/docs/tour/data-and-traits.md` states the opposite in prose ("Each
-    // impl picks the argument … and is checked against the bound there"), so the
-    // page is ahead of the compiler here.
+    // B262's boundary, CLOSED by B273. An impl's `with` clause writes a trait
+    // APPLICATION and did not drain through `prepped_type_locals`, so it reached
+    // neither B188's arity check nor B251's bound check: `impl CatBox with
+    // Holder<Cat>` was accepted with `Cat` implementing nothing, and so was
+    // `impl CatBox with Holder<Cat, i32>`. The clause is a THIRD recording site
+    // for the one check now, so both messages are the ones the other two sites
+    // already produce. `vilan/docs/tour/data-and-traits.md` asserted this in
+    // prose all along ("Each impl picks the argument … and is checked against
+    // the bound there"); the page was ahead of the compiler and stays.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -8699,5 +8697,296 @@ fn b294_a_declared_generic_named_underscore_still_resolves_by_name() {
         main();
         "#,
         "3\n",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clauses_over_supplied_arity_is_refused() {
+    // B188's check at the third site. `Holder` declares one parameter; the
+    // clause wrote two, and the clause was the one position the arity check
+    // never saw.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> { fun item(self): T; }
+        struct Cat {}
+        struct CatBox {}
+        impl Cat with Label { fun label(self): str { "a cat" } }
+        impl CatBox with Holder<Cat, i32> {
+            fun item(self): Cat { Cat {} }
+        }
+        fun main() { print(1); }
+        "#,
+        "`Holder` takes 1 type argument, 2 given",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clause_on_an_unparameterised_trait_takes_no_arguments() {
+    // The zero-arity arm of the same message: the fix is the bare name.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        struct Cat {}
+        impl Cat with Label<i32> { fun label(self): str { "a cat" } }
+        fun main() { print(1); }
+        "#,
+        "`Label` takes 0 type arguments, 1 given",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clauses_satisfied_argument_still_compiles() {
+    // The counterweight: a concrete argument that MEETS the bound is what the
+    // estate is made of, and the new site must not invent a requirement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> {
+            fun item(self): T;
+            fun describe(self): str { "holding " + self.item().label() }
+        }
+        struct Dog {}
+        impl Dog with Label { fun label(self): str { "a dog" } }
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        fun main() { print(DogBox {}.describe()); }
+        main();
+        "#,
+        "holding a dog\n",
+    );
+}
+
+#[test]
+fn b273_an_impls_own_binder_is_not_held_to_the_traits_bound_at_the_clause() {
+    // The BOUNDARY the census found, pinned as the rule rather than left
+    // implicit: `impl Holder<type T> with Doubler<T>` over `trait Doubler<T:
+    // Add>` does not restate the bound, and is not refused here — the
+    // requirement is discharged where `T` is GROUNDED
+    // (`a_bounded_trait_parameter_left_operand_still_dispatches` pins both
+    // halves of that). A CONCRETE argument has no grounding site left, which is
+    // the half B273 closes; this is the line between them.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+            fun twice(self): T { self.once() + self.once() }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T { self.value }
+        }
+
+        fun main() { print(Holder { value = 21 }.twice()); }
+        main();
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clause_grounds_a_sibling_bound_from_its_own_arguments() {
+    // The `declared_bindings` half the shared check already does, reached from
+    // the new site: `Pairing<K, V: Tagged<K>>` reads its second argument's
+    // bound in terms of the first, so the refusal names `Tagged<str>` — the
+    // instantiation — and not the declaration's `Tagged<K>`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Tagged<K> { fun tag(self): K; }
+        trait Pairing<K, V: Tagged<K>> { fun pair(self): V; }
+        struct Note {}
+        impl Note with Tagged<i32> { fun tag(self): i32 { 1 } }
+        struct Book {}
+        impl Book with Pairing<str, Note> { fun pair(self): Note { Note {} } }
+        fun main() { print(1); }
+        "#,
+        "'Note' does not implement trait 'Tagged<str>'",
+    );
+}
+
+#[test]
+fn b275_a_supertrait_match_threads_the_bounds_arguments() {
+    // The exhibit: the only `Place` impl is the blanket over `Source<str>`, and
+    // a `SignalCell<Panel>` reaches `Source` only through `Signal` — so it used
+    // to satisfy `: Place` and the emission filter's never-empty fallback was
+    // the only thing left between that and an internal-error report.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel {}
+
+        trait Place {
+            fun place(self): str;
+        }
+
+        impl type S: Source<str> with Place {
+            fun place(self): str { "placed" }
+        }
+
+        fun slot<P: Place>(part: P): str {
+            part.place()
+        }
+
+        fun main() {
+            let signal_of_panel: SignalCell<Panel> = Signal::new(Panel {});
+            print(slot(signal_of_panel));
+        }
+        "#,
+        "'SignalCell<Panel>' does not implement trait 'Place'",
+    );
+}
+
+#[test]
+fn b275_a_supertrait_match_at_the_right_argument_still_satisfies() {
+    // The counterweight, and the one that proves the threading SUBSTITUTES
+    // rather than merely refusing: `SignalCell<str>` reaches `Source<str>`
+    // through `Signal<str>`, and the blanket applies to it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Place {
+            fun place(self): str;
+        }
+
+        impl type S: Source<str> with Place {
+            fun place(self): str { "placed" }
+        }
+
+        fun slot<P: Place>(part: P): str {
+            part.place()
+        }
+
+        fun main() {
+            let signal_of_text: SignalCell<str> = Signal::new("hi");
+            print(slot(signal_of_text));
+        }
+        main();
+        "#,
+        "placed\n",
+    );
+}
+
+#[test]
+fn b275_a_user_supertrait_chain_threads_its_arguments() {
+    // Two levels of user traits, with the argument RENAMED on the way up
+    // (`Middle<M>` passes `M` to `Base<M>`): the substitution is the walk's,
+    // not a same-name coincidence.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<B> {
+            fun base(self): B;
+        }
+
+        trait Middle<M> with Base<M> {
+            fun middle(self): M;
+        }
+
+        struct Holder {}
+
+        impl Holder with Middle<i32> {
+            fun base(self): i32 { 1 }
+            fun middle(self): i32 { 1 }
+        }
+
+        fun needs<T: Base<str>>(value: T): str {
+            value.base()
+        }
+
+        fun main() {
+            print(needs(Holder {}));
+        }
+        "#,
+        "'Holder' does not implement trait 'Base<str>'",
+    );
+}
+
+#[test]
+fn b275_a_user_supertrait_chain_at_the_right_argument_satisfies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<B> {
+            fun base(self): B;
+        }
+
+        trait Middle<M> with Base<M> {
+            fun middle(self): M;
+        }
+
+        struct Holder {}
+
+        impl Holder with Middle<str> {
+            fun base(self): str { "base" }
+            fun middle(self): str { "middle" }
+        }
+
+        fun needs<T: Base<str>>(value: T): str {
+            value.base()
+        }
+
+        fun main() {
+            print(needs(Holder {}));
+        }
+        main();
+        "#,
+        "base\n",
+    );
+}
+
+#[test]
+fn b275_a_bool_signal_is_not_an_attribute_value() {
+    // The std face, and the one real program the census found: an element
+    // attribute's blanket is `impl type S: Source<str> with AttrValue`, and a
+    // `SignalCell<bool>` reaches `Source` through `Signal` — so it satisfied
+    // the bound and `set_attribute(name, true)` shipped, correct only by JS
+    // coercion. kolt's `views.vl` carried exactly one such site.
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::view;
+
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _bad = <div data-b(flag) />;
+        }
+        "#,
+        "'SignalCell<bool>' does not implement trait 'AttrValue'",
+    );
+}
+
+#[test]
+fn b275_a_str_signal_is_still_an_attribute_value() {
+    // Its control: the blanket's own instantiation is untouched.
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
+        import std::ui::view;
+
+        fun main() {
+            let text: SignalCell<str> = Signal::new("on");
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                let _good = <div data-a(text) />;
+            });
+        }
+        "#,
     );
 }
