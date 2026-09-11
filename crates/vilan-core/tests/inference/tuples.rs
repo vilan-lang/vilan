@@ -4793,9 +4793,24 @@ fn the_earliest_settled_child_failure_wins_with_origin() {
     }
 }
 
+/// A nursery joins INSIDE OUT: the inner one waits for its own child before
+/// its value is a value, and the outer one waits for both the inner nursery and
+/// its own child before its.
+///
+/// N72: that nesting is what is promised, and it is all this asserts. The two
+/// children are independent TIMERS started one statement apart — 25 ms out
+/// there, 10 ms in here — so "inner-child prints before outer-child" is a claim
+/// about the machine and not about the language: a 15 ms stall between two
+/// adjacent spawns (one loaded box, one scheduler quantum) starts the 10 ms
+/// sleep after the 25 ms one is already due, and the interleaving inverts. It
+/// inverted exactly that way once under full-suite load
+/// (`inner-body/outer-child/inner-child/inner-done`) and passed in isolation,
+/// which is the signature of a pin asserting the machine. Pinning the
+/// interleaving would mean promising it, and nothing does: two sibling children
+/// of two different nurseries have no ordering between them at all. N35's class.
 #[test]
 fn nested_nurseries_join_inside_out() {
-    assert_compiles_and_runs(
+    let stdout = compile_and_run(
         r#"
         import std::io::print;
         import std::time::sleep;
@@ -4820,7 +4835,45 @@ fn nested_nurseries_join_inside_out() {
             print(total);
         }
         "#,
-        "inner-body\ninner-child\ninner-done\nouter-child\n3\n",
+    )
+    .unwrap_or_else(|errors| panic!("expected a clean run, got: {errors:#?}"));
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut printed = lines.clone();
+    printed.sort_unstable();
+    // Every line exactly once: no child dropped, none run twice, and the
+    // nursery's value is the inner one's plus one.
+    assert_eq!(
+        printed,
+        [
+            "3",
+            "inner-body",
+            "inner-child",
+            "inner-done",
+            "outer-child"
+        ],
+        "the nested nurseries printed the wrong set; got:\n{stdout}"
+    );
+
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| *line == needle)
+            .unwrap_or_else(|| panic!("no {needle:?} line in:\n{stdout}"))
+    };
+    assert!(
+        at("inner-body") < at("inner-child"),
+        "the body runs to its own end before a child it spawned resumes; got:\n{stdout}"
+    );
+    assert!(
+        at("inner-child") < at("inner-done"),
+        "the INNER join waits for the inner child: `inner-done` is printed after \
+         the inner nursery returned; got:\n{stdout}"
+    );
+    assert!(
+        at("inner-done") < at("3") && at("outer-child") < at("3"),
+        "the OUTER join waits for the inner nursery AND its own child before its \
+         value is a value; got:\n{stdout}"
     );
 }
 
