@@ -8990,3 +8990,91 @@ fn b275_a_str_signal_is_still_an_attribute_value() {
         "#,
     );
 }
+
+// --- B305: a non-empty list literal whose element did not type is a SLOT -----
+//
+// The `Expr::List` arm manufactured an ERASED `List` — a `Type::Struct(List,
+// [])`, no arguments at all — whenever the unified element type came out
+// `Unknown`. The EMPTY path stopped doing that in B16 (a zero-argument `List`
+// reconciles with anything and makes every method call on it vacuous) and mints
+// a slot a later `push` can ground; the non-empty path still erased, which is
+// what `[x]` over a closure parameter nothing had filled yet produced. Both
+// paths mint the same slot now, keyed by the literal so the constraint
+// fixpoint's re-runs reach it again.
+
+#[test]
+fn b305_a_literal_over_an_unfilled_closure_parameter_is_indexable() {
+    // The observable face: `[event][0]` was "cannot index this List: its
+    // element type is never determined" — a refusal over a program that is
+    // perfectly determinate, because the erasure had thrown the element
+    // position away before the parameter was filled. With a slot the index
+    // yields the slot, `is_ev` grounds it, and the same body compiles.
+    // A compile claim, not a run one: `E` is the callee's own generic, so
+    // nothing inside `apply` may call `handler` with a concrete value, and the
+    // closure has no caller to run it.
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_ev(event: Ev): bool { event.code == 0 }
+
+        fun main() {
+            Holder { tag = "h" }.apply(|event| {
+                let first = [event][0];
+                if is_ev(first) { print("ev"); }
+            });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b305_a_literal_over_a_determined_element_is_unchanged() {
+    // The control: an element that DID type still names itself in the
+    // literal's type, and the index reads it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let items = [1, 2, 3];
+            print(items[0] + 1);
+        }
+
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b305_a_slot_nothing_fills_is_still_not_an_answer() {
+    // The negative control: minting a slot is not the same as answering. A
+    // literal whose element nothing ever grounds still has an open element,
+    // and reading it at a concrete type is still refused.
+    assert_fails(
+        r#"
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun wants_number(value: i32): i32 { value + 1 }
+
+        fun main() {
+            Holder { tag = "h" }.apply(|event| {
+                let first = [event][0];
+                let doubled: str = wants_number(first);
+            });
+        }
+        "#,
+    );
+}

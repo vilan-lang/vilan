@@ -29718,6 +29718,24 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The inference slot a LIST LITERAL's element type lives in, minted once
+    /// and keyed by the literal — so the constraint fixpoint's re-runs of the
+    /// same literal reach the same slot and a fill survives them.
+    ///
+    /// Shared by the empty path (B16: a zero-argument `List` made every method
+    /// call on it vacuous, so `[]` mints a slot a later `push` can ground) and
+    /// by the non-empty path whose elements did not type (B305: the same
+    /// erasure, manufactured for `[x]` over a closure parameter nothing had
+    /// filled yet).
+    fn list_literal_element_slot(&mut self, literal_id: Id) -> TypeId {
+        if let Some(slot) = self.list_element_slots.get(&literal_id).copied() {
+            return slot;
+        }
+        let slot = Type::Unknown.get_type_id(self);
+        self.list_element_slots.insert(literal_id, slot);
+        slot
+    }
+
     /// Whether a callee parameter's CLOSURE-PARAMETER positions still mention
     /// an own generic of the callee that this attempt has not bound — the one
     /// case where filling an unannotated closure parameter is worse than
@@ -30364,14 +30382,7 @@ impl<'src> Analyzer<'src> {
                 if item_ids.is_empty() {
                     return match self.primitive_struct_ids.get("List").copied() {
                         Some(list_id) => {
-                            let slot = match self.list_element_slots.get(&expr_id).copied() {
-                                Some(slot) => slot,
-                                None => {
-                                    let slot = Type::Unknown.get_type_id(self);
-                                    self.list_element_slots.insert(expr_id, slot);
-                                    slot
-                                }
-                            };
+                            let slot = self.list_literal_element_slot(expr_id);
                             // B129: an empty `[]` takes its element type from
                             // where it lands. When the expectation is `List<E>`
                             // — a call argument checked against a substituted
@@ -30476,10 +30487,19 @@ impl<'src> Analyzer<'src> {
                 }
                 match self.primitive_struct_ids.get("List").copied() {
                     Some(list_id) => {
-                        let arguments = if matches!(element_type, Type::Unknown) {
-                            Vec::new()
-                        } else {
-                            vec![element_type.get_type_id(self)]
+                        // B305: an element type that did not land is a SLOT,
+                        // the way the empty path's is (B16) — not an erased
+                        // `List` with no arguments. A zero-argument `List`
+                        // reconciles with anything and makes every method call
+                        // on it vacuous, which is exactly what B16 removed from
+                        // the empty path and what this path still manufactured
+                        // for `[x]` over an unfilled closure parameter. The
+                        // slot is keyed by the literal, so the constraint
+                        // fixpoint's re-runs reach the same one and a fill
+                        // survives them.
+                        let arguments = match matches!(element_type, Type::Unknown) {
+                            true => vec![self.list_literal_element_slot(expr_id)],
+                            false => vec![element_type.get_type_id(self)],
                         };
                         Type::Struct(list_id, arguments)
                     }
