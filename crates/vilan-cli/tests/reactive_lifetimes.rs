@@ -57,79 +57,10 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 
 /// The DOM/history stub every harness here builds on: enough of a document to
 /// mount into, with `parent`/`children` links so the walk sees a real tree.
-const DOM_STUB: &str = r##"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.value = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
-    // plants an empty text node and inserts its content BEFORE it, so a
-    // reactive run keeps its place among static siblings.
-    insertBefore(child, anchor) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        const at = this.children.lastIndexOf(anchor);
-        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
-        return child;
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    fire(event, payload = {}) { for (const h of (this.listeners[event] || [])) h(payload); }
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-}
-
-/// A text node — a real sibling of the element children: what a `str` or a
-/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
-/// the anchor it inserts before (A71).
-class StubText {
-    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
-    set textContent(text) { this._text = text; }
-    get textContent() { return this._text; }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-}
-
-const documentRoot = new StubElement("div");
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createElementNS: (namespace, tag) => new StubElement(tag),
-    createTextNode: (text) => new StubText(text),
-    getElementById: () => documentRoot,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-global.window = { addEventListener: () => {} };
-"##;
+const DOM_STUB: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/reactive_lifetimes.js"),
+);
 
 /// Builds `app.vl` for the browser with the real CLI and runs `harness.js`
 /// under node, returning its stdout. Fails loudly with both streams.

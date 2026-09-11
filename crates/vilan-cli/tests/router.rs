@@ -151,101 +151,10 @@ fun main() {
 /// The DOM/history stub plus the behavioral assertions, run under node against
 /// the compiled bundle. Prints one `ok - ..` line per assertion; exits 1 on
 /// any failure.
-const HARNESS: &str = r##"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.className = "";
-        this.hidden = false;
-        this.value = "";
-        this.attributes = {};
-        // Recorded, not dropped: `style_var`'s only observable effect is this
-        // write, so a no-op stub cannot see a subscription that outlived its
-        // boundary (A21).
-        this.styleProperties = {};
-        this.style = { setProperty: (name, value) => { this.styleProperties[name] = value; } };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
-    // plants an empty text node and inserts its content BEFORE it, so a
-    // reactive run keeps its place among static siblings.
-    insertBefore(child, anchor) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        const at = this.children.lastIndexOf(anchor);
-        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
-        return child;
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    click(overrides = {}) {
-        const event = {
-            button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false,
-            prevented: false, preventDefault() { this.prevented = true; }, ...overrides,
-        };
-        for (const h of (this.listeners.click || [])) h(event);
-        return event;
-    }
-    // The walk skips TEXT nodes: a `Region`'s anchor (A71) is one, and this
-    // asks an element question.
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find && c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-    render() {
-        const kids = this.children.map(c => (c.render ? c.render() : c.textContent)).join("");
-        return `<${this.tagName}>${this._text}${kids}</${this.tagName}>`;
-    }
-}
-
-/// A text node — a real sibling of the element children: what a `str` or a
-/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
-/// the anchor it inserts before (A71).
-class StubText {
-    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
-    set textContent(text) { this._text = text; }
-    get textContent() { return this._text; }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-}
-
-const root = new StubElement("div");
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createTextNode: (text) => new StubText(text),
-    getElementById: (id) => (id === "app" ? root : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = {
-    pushState(state, title, path) { global.location.pathname = path; },
-};
-const popstateHandlers = [];
-global.window = { addEventListener: (ev, h) => { if (ev === "popstate") popstateHandlers.push(h); } };
-
-require("./app.js");
+const HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/router.js"),
+    r##"require("./app.js");
 
 let failures = 0;
 const assert = (cond, msg) => {
@@ -307,11 +216,12 @@ assert(loginPage.styleProperties["--w"] === "10px",
     "style_var's subscription was disposed with the swapped-out subtree");
 
 global.location.pathname = "/login";
-for (const h of popstateHandlers) h({});
+global.window.fire("popstate", {});
 assert(page().textContent === "/login", "popstate (back/forward) drives the same route signal");
 
 process.exit(failures === 0 ? 0 : 1);
-"##;
+"##,
+);
 
 #[test]
 fn router_swap_link_and_history_semantics() {
@@ -640,72 +550,10 @@ fun main() {
 
 /// The stub is the minimum this claim needs: attributes, children, and a click
 /// that records `preventDefault`.
-const DRAGGABLE_HARNESS: &str = r##"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.attributes = {};
-        this.style = { setProperty() {}, getPropertyValue() { return ""; } };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    insertBefore(child, anchor) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        const at = this.children.indexOf(anchor);
-        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
-        return child;
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    click(overrides = {}) {
-        const event = {
-            button: 0, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false,
-            prevented: false, preventDefault() { this.prevented = true; }, ...overrides,
-        };
-        for (const h of (this.listeners.click || [])) h(event);
-        return event;
-    }
-}
-class StubText {
-    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
-    set textContent(text) { this._text = text; }
-    get textContent() { return this._text; }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-}
-const root = new StubElement("div");
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createTextNode: (text) => new StubText(text),
-    getElementById: (id) => (id === "app" ? root : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-global.window = { addEventListener: () => {} };
-
-require("./app.js");
+const DRAGGABLE_HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/router.js"),
+    r##"require("./app.js");
 
 let failures = 0;
 const assert = (cond, msg) => {
@@ -732,7 +580,8 @@ assert(!event.prevented && global.location.pathname === "/tasks",
     "a modified click still keeps native anchor behavior");
 
 process.exit(failures === 0 ? 0 : 1);
-"##;
+"##,
+);
 
 /// B293: an `<a href>` is drag-armed by default, and a link drag started while
 /// a quick click's in-app navigation is settling wedges the TAB in Chrome
