@@ -2018,6 +2018,12 @@ struct TraitImplSite {
 /// `std::reactive::SignalCell<i32>` — B172), deferred to the `build()` drain
 /// because the namespace it reaches through is itself a deferred reference.
 ///
+/// The recorded sites [`Analyzer::check_written_nominal_bounds`] drains:
+/// `(declaration id, written arguments, span, source, anchor type id, generic
+/// arguments exempt)`. Named because it is a six-tuple in two producers and one
+/// consumer, and the last flag is easy to read as "one more `TypeId`" otherwise.
+type WrittenNominalBoundSites = Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId, bool)>;
+
 /// The unqualified twin is `prepped_type_locals`, whose head is a NAME resolved
 /// in a lexical scope; here the head is a walked type that must turn out to be a
 /// module, and the member is looked up in what that module declares.
@@ -3805,12 +3811,19 @@ pub struct Analyzer<'src> {
     // binding is forced to.
     binding_hidden_nominal_constraints: Vec<(Id, Id, Vec<TypeId>, Span)>,
     // B251: every WRITTEN application of a struct that declared bounded
-    // parameters — `(struct id, written arguments, span, source, type id)` —
-    // asked after `build()` by `check_written_nominal_bounds`. A type
-    // application binds a declaration's parameters exactly as a call does, but
-    // records nothing into `method_call_substitution`, so the bound check every
-    // call gets never reached it.
-    written_nominal_bound_sites: Vec<(Id, Vec<TypeId>, Span, SourceId, TypeId)>,
+    // parameters — `(struct id, written arguments, span, source, type id,
+    // generic arguments exempt)` — asked after `build()` by
+    // `check_written_nominal_bounds`. A type application binds a declaration's
+    // parameters exactly as a call does, but records nothing into
+    // `method_call_substitution`, so the bound check every call gets never
+    // reached it.
+    //
+    // The last flag is B273's: at an impl's `with` clause an argument that is
+    // the impl's OWN binder is discharged where the parameter is GROUNDED, not
+    // where it is written (`a_bounded_trait_parameter_left_operand_still_\
+    // dispatches` pins that reading), so those positions are skipped there and
+    // nowhere else.
+    written_nominal_bound_sites: WrittenNominalBoundSites,
     // B182: the annotation slots a REFUSED bare trait resolved to `Unknown`,
     // each with the site its one report was filed at. B161 resolves a refused
     // annotation to `Unknown` "so the one report stands alone instead of
@@ -5935,7 +5948,7 @@ impl<'src> Analyzer<'src> {
     /// one report per written spelling (B188) — and neither does a path head,
     /// which applies nothing.
     fn check_written_nominal_bounds(&mut self) {
-        for (owner_id, written_arguments, span, source_id, type_id) in
+        for (owner_id, written_arguments, span, source_id, type_id, generics_exempt) in
             std::mem::take(&mut self.written_nominal_bound_sites)
         {
             let Some((owner_name, declared, _)) = self.nominal_bound_owner(owner_id) else {
@@ -5969,6 +5982,17 @@ impl<'src> Analyzer<'src> {
                     argument_type,
                     Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
                 ) {
+                    continue;
+                }
+                // B273: at an impl's `with` clause the impl's OWN binder is not
+                // held to the trait's bound HERE — `impl Holder<type T> with
+                // Doubler<T>` over `trait Doubler<T: Add>` is the shipped
+                // spelling, and the requirement is discharged where `T` is
+                // grounded (`Holder { value = Point { .. } }.twice()` is
+                // refused there). A CONCRETE argument at the same clause has no
+                // grounding site left to discharge it, which is the half B273
+                // closes.
+                if generics_exempt && matches!(argument_type, Type::Generic(_)) {
                     continue;
                 }
                 for (required_trait_id, required_arguments) in &bound_traits {
@@ -39609,6 +39633,7 @@ impl<'src> Analyzer<'src> {
                             span,
                             source_id,
                             type_id,
+                            false,
                         ));
                     }
                     // Attach the written generic arguments to the nominal type
@@ -40632,6 +40657,60 @@ impl<'src> Analyzer<'src> {
                     msg: format!("'{}' is not a trait", check.trait_name),
                 });
                 continue;
+            }
+            // B273: the impl's `with` clause writes a trait APPLICATION, and
+            // nothing checked it — not its ARITY (B188's check runs off the
+            // `prepped_type_locals` drain, which a `with` clause does not go
+            // through, so `impl CatBox with Holder<Cat, i32>` compiled) and not
+            // its arguments against the trait's declared BOUNDS (B251's check,
+            // whose two recording sites are that same drain, so `impl CatBox
+            // with Holder<Cat>` compiled with `Cat` implementing no `Label`).
+            // The tour page has asserted the opposite in prose since it was
+            // written. This is the THIRD recording site for the one check, not
+            // a third check: the arity message is B188's, the bound message is
+            // B251's, and a clause already refused on its arity records nothing
+            // (one report per written spelling).
+            //
+            // Anchored on the FIRST written argument's type id, which is what
+            // the walk that wrote the clause minted — so a derived impl's
+            // refusal redirects to the attribute that generated it (B217),
+            // exactly as the annotation drain's does.
+            let trait_type = Type::Trait(trait_id, Vec::new());
+            let arity_error = self.written_application_arity_error(
+                trait_id,
+                &trait_type,
+                check.trait_name,
+                check.trait_arguments.len(),
+            );
+            match (arity_error, check.trait_arguments.first().copied()) {
+                (Some(message), _) => {
+                    let anchor_type_id = check
+                        .trait_arguments
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| trait_type.clone().get_type_id(self));
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: check.span,
+                            msg: message,
+                        },
+                        check.source_id,
+                        anchor_type_id,
+                    );
+                }
+                (None, Some(anchor_type_id)) => {
+                    self.written_nominal_bound_sites.push((
+                        trait_id,
+                        check.trait_arguments.clone(),
+                        check.span,
+                        check.source_id,
+                        anchor_type_id,
+                        true,
+                    ));
+                }
+                (None, None) => {}
             }
             // (The trait was already recorded on its impl — and the `with`
             // reference indexed — in the pre-static pass above.)

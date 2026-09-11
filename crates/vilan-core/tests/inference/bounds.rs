@@ -8277,18 +8277,16 @@ fn b262_the_estates_own_bounded_trait_still_compiles() {
 }
 
 #[test]
-#[ignore = "B262's boundary: an impl's `with` clause reaches neither the arity \
-            check nor the bound check - a site apart from the \
-            `prepped_type_locals` drain this item widens"]
 fn b262_an_impl_with_clauses_trait_argument_is_still_unchecked() {
-    // The boundary, pinned rather than claimed. An impl's `with` clause writes a
-    // trait APPLICATION, but it does not drain through `prepped_type_locals`:
-    // `impl CatBox with Holder<Cat>` is accepted with `Cat` implementing
-    // nothing, and so is `impl CatBox with Holder<Cat, i32>` — so B188's arity
-    // check misses the position too, which dates the hole well before this item.
-    // `vilan/docs/tour/data-and-traits.md` states the opposite in prose ("Each
-    // impl picks the argument … and is checked against the bound there"), so the
-    // page is ahead of the compiler here.
+    // B262's boundary, CLOSED by B273. An impl's `with` clause writes a trait
+    // APPLICATION and did not drain through `prepped_type_locals`, so it reached
+    // neither B188's arity check nor B251's bound check: `impl CatBox with
+    // Holder<Cat>` was accepted with `Cat` implementing nothing, and so was
+    // `impl CatBox with Holder<Cat, i32>`. The clause is a THIRD recording site
+    // for the one check now, so both messages are the ones the other two sites
+    // already produce. `vilan/docs/tour/data-and-traits.md` asserted this in
+    // prose all along ("Each impl picks the argument … and is checked against
+    // the bound there"); the page was ahead of the compiler and stays.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -8478,5 +8476,122 @@ fn b263_an_open_list_element_is_still_filled_from_later_pushes() {
         main();
         "#,
         "2\n",
+    );
+}
+
+// --- B273: an impl's `with` clause, arity and bounds -------------------------
+
+#[test]
+fn b273_an_impl_with_clauses_over_supplied_arity_is_refused() {
+    // B188's check at the third site. `Holder` declares one parameter; the
+    // clause wrote two, and the clause was the one position the arity check
+    // never saw.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> { fun item(self): T; }
+        struct Cat {}
+        struct CatBox {}
+        impl Cat with Label { fun label(self): str { "a cat" } }
+        impl CatBox with Holder<Cat, i32> {
+            fun item(self): Cat { Cat {} }
+        }
+        fun main() { print(1); }
+        "#,
+        "`Holder` takes 1 type argument, 2 given",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clause_on_an_unparameterised_trait_takes_no_arguments() {
+    // The zero-arity arm of the same message: the fix is the bare name.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        struct Cat {}
+        impl Cat with Label<i32> { fun label(self): str { "a cat" } }
+        fun main() { print(1); }
+        "#,
+        "`Label` takes 0 type arguments, 1 given",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clauses_satisfied_argument_still_compiles() {
+    // The counterweight: a concrete argument that MEETS the bound is what the
+    // estate is made of, and the new site must not invent a requirement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> {
+            fun item(self): T;
+            fun describe(self): str { "holding " + self.item().label() }
+        }
+        struct Dog {}
+        impl Dog with Label { fun label(self): str { "a dog" } }
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        fun main() { print(DogBox {}.describe()); }
+        main();
+        "#,
+        "holding a dog\n",
+    );
+}
+
+#[test]
+fn b273_an_impls_own_binder_is_not_held_to_the_traits_bound_at_the_clause() {
+    // The BOUNDARY the census found, pinned as the rule rather than left
+    // implicit: `impl Holder<type T> with Doubler<T>` over `trait Doubler<T:
+    // Add>` does not restate the bound, and is not refused here — the
+    // requirement is discharged where `T` is GROUNDED
+    // (`a_bounded_trait_parameter_left_operand_still_dispatches` pins both
+    // halves of that). A CONCRETE argument has no grounding site left, which is
+    // the half B273 closes; this is the line between them.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+            fun twice(self): T { self.once() + self.once() }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T { self.value }
+        }
+
+        fun main() { print(Holder { value = 21 }.twice()); }
+        main();
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clause_grounds_a_sibling_bound_from_its_own_arguments() {
+    // The `declared_bindings` half the shared check already does, reached from
+    // the new site: `Pairing<K, V: Tagged<K>>` reads its second argument's
+    // bound in terms of the first, so the refusal names `Tagged<str>` — the
+    // instantiation — and not the declaration's `Tagged<K>`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Tagged<K> { fun tag(self): K; }
+        trait Pairing<K, V: Tagged<K>> { fun pair(self): V; }
+        struct Note {}
+        impl Note with Tagged<i32> { fun tag(self): i32 { 1 } }
+        struct Book {}
+        impl Book with Pairing<str, Note> { fun pair(self): Note { Note {} } }
+        fun main() { print(1); }
+        "#,
+        "'Note' does not implement trait 'Tagged<str>'",
     );
 }
