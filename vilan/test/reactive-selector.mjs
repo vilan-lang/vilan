@@ -103,16 +103,23 @@ function dispose(self, $C) {
 	return $G;
 }
 function new3() {
-	return [ __shared_new([  ]) ];
+	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function defer(self, cleanup) {
-	self[0].v.push(cleanup);
+	if (self[1].v) {
+		cleanup();
+	} else {
+		self[0].v.push(cleanup);
+	}
 }
 function dispose2(self) {
-	for (const cleanup of self[0].v) {
-		cleanup();
+	if (!(self[1].v)) {
+		self[1].v = true;
+		for (const cleanup of self[0].v) {
+			cleanup();
+		}
+		self[0].v = [  ];
 	}
-	self[0].v = [  ];
 }
 function register_with_owner(subscription, $w, $x) {
 	const $y = $x;
@@ -191,10 +198,14 @@ function $u(self, observer) {
 	return $v(self, observer);
 }
 function $A(self, item, $B) {
-	self[0].v.push(() => {
+	if (self[1].v) {
 		dispose(item, $B);
-		return;
-	});
+	} else {
+		self[0].v.push(() => {
+			dispose(item, $B);
+			return;
+		});
+	}
 	return __clone(item);
 }
 function $c(source, $d, $e) {

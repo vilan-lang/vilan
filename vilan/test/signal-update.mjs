@@ -107,7 +107,7 @@ function dispose(self, $L) {
 	return $P;
 }
 function new4() {
-	return [ __shared_new([  ]) ];
+	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -227,10 +227,14 @@ function $H(self, observer) {
 	return subscription;
 }
 function $J(self, item, $K) {
-	self[0].v.push(() => {
+	if (self[1].v) {
 		dispose(item, $K);
-		return;
-	});
+	} else {
+		self[0].v.push(() => {
+			dispose(item, $K);
+			return;
+		});
+	}
 	return __clone(item);
 }
 function $R(body, $S) {

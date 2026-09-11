@@ -97,7 +97,7 @@ function dispose(self, $z) {
 	return $D;
 }
 function new2() {
-	return [ __shared_new([  ]) ];
+	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function register_with_owner(subscription, $t, $u) {
 	const $v = $u;
@@ -165,10 +165,14 @@ function $r(self, observer) {
 	return $s(self, observer);
 }
 function $x(self, item, $y) {
-	self[0].v.push(() => {
+	if (self[1].v) {
 		dispose(item, $y);
-		return;
-	});
+	} else {
+		self[0].v.push(() => {
+			dispose(item, $y);
+			return;
+		});
+	}
 	return __clone(item);
 }
 function $c(self, transform, $d, $e) {

@@ -432,9 +432,10 @@ impl Owner {
 	fun new(): Owner
 	fun take<T: Disposable>(self, item: T): T   // adopt a disposable; returns it
 	fun defer(self, cleanup: || void)           // run cleanup at dispose
+	fun is_disposed(self): bool                 // has this owner already been disposed?
 }
 impl Owner with Disposable {
-	fun dispose(self)   // dispose everything collected + run defers
+	fun dispose(self)   // dispose everything collected + run defers; idempotent
 }
 
 let owner_scope: Context<Owner>
@@ -448,6 +449,19 @@ implicitly: your component functions thread ownership without mentioning it.
 Establish owners at **disposal boundaries** (places where a subtree can die),
 not per object; in UI code the framework's boundaries (`mount_root`,
 `bind_each` rows, `when`/`swap` bodies) already do this.
+
+An owner has a **disposed state**, and it is what makes ownership hold across
+`await`. A registration is a promise to release, and an async continuation
+registers whenever it happens to run — a route switched away before a handle's
+reply, a `bind_each` row rebuilt while its first fetch is in flight. `take` and
+`defer` on an owner that is already disposed therefore run the cleanup **now**
+rather than parking it: the extent it would have belonged to is over, so the
+only way left to keep the promise is to keep it immediately. `dispose` itself is
+idempotent, and `is_disposed` reports the flag for a caller that can do
+something cheaper than register-and-immediately-release.
+
+An `effect` registered this late still makes its one immediate call — that call
+is the observer's contract, not a subscription — and then never fires again.
 
 ## Turns
 

@@ -344,37 +344,77 @@ impl Subscription with Disposable {
 /// An owner scope: collects subscriptions (and child owners / views) and disposes
 /// them as a group. Ownership is explicit for now — build a value, `take` it into
 /// an owner, and `dispose` the owner to release the whole group.
+///
+/// An owner has a DISPOSED state (tracker B291), and it is the half that makes
+/// ownership hold across `await`. A registration is a PROMISE to release, and an
+/// async continuation registers whenever it happens to run — a route switched
+/// away before a handle's reply, a `bind_each` row rebuilt while its first fetch
+/// is in flight. Without the flag such a late `take` parked a cleanup on a list
+/// nothing ever runs again: the subscription fired for the rest of the session
+/// and only a SECOND `dispose` released it. With it, the promise is kept the
+/// only way it still can be — the item is disposed ON THE SPOT, because the
+/// extent it would have belonged to is already over.
 struct Owner {
 	cleanups: Shared<List<|| void>>,
+	// Set BEFORE the cleanups run, so a cleanup that registers back into this
+	// owner (a `defer` reached from another `dispose`) is disposed on the spot
+	// rather than appended to a list the loop has already snapshotted.
+	disposed: Shared<bool>,
 }
 
 impl Owner {
 	fun new(): Owner {
-		Owner { cleanups = Shared::new([]) }
+		Owner { cleanups = Shared::new([]), disposed = Shared::new(false) }
+	}
+
+	/// Whether this owner has been disposed. A late registration is not an
+	/// error — it is the async shape — but a caller that can do something
+	/// CHEAPER than register-and-immediately-release (a remote mirror, whose
+	/// lease is a network frame) reads this first.
+	fun is_disposed(self): bool {
+		self.disposed.read()
 	}
 
 	/// Take ownership of a disposable (a `Subscription`, a `View`, or a child
-	/// `Owner`), returning it for chaining. It is released when this owner is.
+	/// `Owner`), returning it for chaining. It is released when this owner is —
+	/// or NOW, if this owner is already disposed (B291): the item is still
+	/// returned, so a caller that chains on it reads a disposed handle rather
+	/// than a live one nothing will ever release.
 	fun take<T: Disposable>(self, item: T): T {
-		self.cleanups.write().push(|| {
+		if self.disposed.read() {
 			item.dispose();
-		});
+		} else {
+			self.cleanups.write().push(|| {
+				item.dispose();
+			});
+		}
 		item
 	}
 
 	/// Register a plain cleanup to run at disposal — for teardown that isn't a
 	/// single `Disposable` (e.g. `bind_each` disposing whichever rows are live).
+	/// On a disposed owner the cleanup runs immediately, for `take`'s reason.
 	fun defer(self, cleanup: || void) {
-		self.cleanups.write().push(cleanup);
+		if self.disposed.read() {
+			cleanup();
+		} else {
+			self.cleanups.write().push(cleanup);
+		}
 	}
 }
 
 impl Owner with Disposable {
+	/// Idempotent: a second `dispose` runs nothing. The flag goes up FIRST, so
+	/// anything a cleanup registers back into this owner is disposed on the
+	/// spot instead of landing on the emptied list.
 	fun dispose(self) {
-		for cleanup in self.cleanups.read() {
-			cleanup();
+		if !self.disposed.read() {
+			self.disposed.write() = true;
+			for cleanup in self.cleanups.read() {
+				cleanup();
+			}
+			self.cleanups.write() = [];
 		}
-		self.cleanups.write() = [];
 	}
 }
 

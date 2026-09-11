@@ -97,7 +97,11 @@ function dispose(self, $l) {
 	return $p;
 }
 function defer(self, cleanup) {
-	self[0].v.push(cleanup);
+	if (self[1].v) {
+		cleanup();
+	} else {
+		self[0].v.push(cleanup);
+	}
 }
 function register_with_owner(subscription, $F, $G) {
 	const $H = $G;
@@ -186,10 +190,14 @@ function $C(self, observer) {
 	return subscription;
 }
 function $J(self, item, $K) {
-	self[0].v.push(() => {
+	if (self[1].v) {
 		dispose(item, $K);
-		return;
-	});
+	} else {
+		self[0].v.push(() => {
+			dispose(item, $K);
+			return;
+		});
+	}
 	return __clone(item);
 }
 function $e(self, $f, $g) {

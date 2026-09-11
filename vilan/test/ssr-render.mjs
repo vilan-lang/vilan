@@ -8,7 +8,7 @@ function __shared_new(value) {
 	return { v: value };
 }
 function new2() {
-	return [ __shared_new([  ]) ];
+	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function view(tag) {
 	const attributes = __shared_new([  ]);

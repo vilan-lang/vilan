@@ -97,13 +97,16 @@ function dispose(self, $o) {
 	return $s;
 }
 function new2() {
-	return [ __shared_new([  ]) ];
+	return [ __shared_new([  ]), __shared_new(false) ];
 }
 function dispose2(self) {
-	for (const cleanup of self[0].v) {
-		cleanup();
+	if (!(self[1].v)) {
+		self[1].v = true;
+		for (const cleanup of self[0].v) {
+			cleanup();
+		}
+		self[0].v = [  ];
 	}
-	self[0].v = [  ];
 }
 function get_owner($j) {
 	return $j;
@@ -128,10 +131,14 @@ function $k(self, observer) {
 	return $l(self, observer);
 }
 function $m(self, item, $n) {
-	self[0].v.push(() => {
+	if (self[1].v) {
 		dispose(item, $n);
-		return;
-	});
+	} else {
+		self[0].v.push(() => {
+			dispose(item, $n);
+			return;
+		});
+	}
 	return __clone(item);
 }
 function $g(self, observer, $h, $i) {

@@ -375,3 +375,139 @@ for (const phase of ["mounted", "unmounted"]) {{
         "a disposed app must hold no reactive cycle; got:\n{stdout}"
     );
 }
+
+// --- B291: an owner has a DISPOSED state ------------------------------------
+
+/// The async shape the item names: a scope torn down while a continuation that
+/// registers into it is still in flight — a route switched away before a
+/// handle's reply, a `bind_each` row rebuilt while its first fetch is out.
+const LATE_REGISTRATION: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, owner_scope };
+
+async fun main() {
+	let count: SignalCell<i32> = Signal::new(0);
+	let fired: SignalCell<i32> = Signal::new(0);
+	let owner = Owner::new();
+
+	// The continuation's owner is captured at CREATION and disposed before the
+	// continuation ever runs.
+	owner_scope.run(owner, || {
+		async {
+			let _tick: i32 = await async 1;
+			count.effect(|_value: i32| {
+				fired.set_with(|n| n + 1);
+			});
+		};
+	});
+	owner.dispose();
+	let _first: i32 = await async 1;
+	let _second: i32 = await async 1;
+
+	// `effect` is `effect_on_change` plus one immediate call, and the immediate
+	// call is the observer's contract, not a subscription — it still happens.
+	print(i"at-registration={fired.get()}");
+	count.set(1);
+	count.set(2);
+	print(i"after-disposal={fired.get() - 1}");
+	print(i"subscribers={count.subscribers.read().len()}");
+	owner.dispose();
+	count.set(3);
+	print(i"after-second-dispose={fired.get() - 1}");
+}
+"#;
+
+#[test]
+fn b291_an_effect_registered_after_its_owner_was_disposed_never_fires_again() {
+    // Before the flag, `Owner::dispose` emptied the cleanup list and kept no
+    // record, so this `take` parked a cleanup on a list nothing runs again:
+    // `after-disposal=2` (the observer fired on every later `set` for the rest
+    // of the session) and only a SECOND `dispose` released it. The immediate
+    // call at registration is deliberately NOT what changed — `effect`'s
+    // contract is one call with the current value, and it is made before the
+    // subscription is handed anywhere.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("late_registration", LATE_REGISTRATION, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "at-registration=1",
+            "after-disposal=0",
+            "subscribers=0",
+            "after-second-dispose=0",
+        ],
+        "a late registration must be disposed on the spot; got:\n{stdout}"
+    );
+}
+
+/// The three faces of the flag, synchronously: `dispose` is idempotent, a late
+/// `defer` runs now, a late `take` disposes on the spot — and a LIVE owner
+/// still parks everything it is given, which is the control.
+const DISPOSED_OWNER_STATE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell };
+
+fun main() {
+	let ran: SignalCell<i32> = Signal::new(0);
+	let owner = Owner::new();
+	owner.defer(|| {
+		ran.set_with(|n| n + 1);
+	});
+	owner.dispose();
+	print(i"first-dispose={ran.get()}");
+	owner.dispose();
+	print(i"second-dispose={ran.get()}");
+
+	// A cleanup deferred to an owner that is already gone runs NOW — the
+	// promise to release is kept the only way it still can be.
+	owner.defer(|| {
+		ran.set_with(|n| n + 1);
+	});
+	print(i"late-defer={ran.get()}");
+
+	// And a disposable TAKEN by a dead owner is disposed on the spot: the
+	// observer is off the signal before the next write.
+	let count: SignalCell<i32> = Signal::new(0);
+	let seen: SignalCell<i32> = Signal::new(0);
+	let late = owner.take(count.on_change(|_value: i32| {
+		seen.set_with(|n| n + 1);
+	}));
+	count.set(1);
+	print(i"late-take={seen.get()} subscribers={count.subscribers.read().len()}");
+	late.dispose();
+	print(i"disposing-it-again={count.subscribers.read().len()}");
+
+	// The control: a live owner parks its cleanups and releases them as a
+	// group, exactly as before.
+	let live = Owner::new();
+	let parked: SignalCell<i32> = Signal::new(0);
+	live.defer(|| {
+		parked.set_with(|n| n + 1);
+	});
+	print(i"parked={parked.get()}");
+	live.dispose();
+	print(i"released={parked.get()}");
+}
+"#;
+
+#[test]
+fn b291_a_disposed_owner_is_idempotent_and_releases_what_it_is_given_at_once() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("disposed_owner", DISPOSED_OWNER_STATE, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "first-dispose=1",
+            // Idempotent: the second `dispose` runs nothing. Before the flag
+            // this was true only because the list had been emptied, which is
+            // exactly what made a LATE registration immortal.
+            "second-dispose=1",
+            "late-defer=2",
+            "late-take=0 subscribers=0",
+            "disposing-it-again=0",
+            "parked=0",
+            "released=1",
+        ],
+        "the disposed owner's state went differently:\n{stdout}"
+    );
+}
