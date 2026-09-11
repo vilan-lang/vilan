@@ -127,9 +127,10 @@ the full shape.
 Everything that travels — an rpc's parameters, the values a call answers
 with, mirrored payloads — must be serializable, which Vilan calls
 **Wire**. The scalars
-are Wire (`bool`, the integers including `i53`, floats, `str`). `List`,
-`Option` and `Map` of Wire types are Wire. And your own types opt in with a
-derive:
+are Wire (`bool`, every integer width from `i8` to `u53`, both floats,
+`str`). `List`, `Option`, `Result` and `Map` of Wire types are Wire — so a
+fallible reply, `Result<Row, str>`, is an ordinary return type. And your own
+types opt in with a derive:
 
 ```vilan,fragment
 [derive(Wire, PartialEq, Debug)]

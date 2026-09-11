@@ -854,8 +854,8 @@ migration notes.
 **"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire: …"**
 Something unserializable (a closure, a `Signal`) is inside a payload
 type. Wire types carry data only: scalars, `str`, `bool`,
-`List`/`Option`/`Map` of Wire, other Wire types, and anything you write
-an `impl … with Wire` for.
+`List`/`Option`/`Result`/`Map` of Wire, other Wire types, and anything
+you write an `impl … with Wire` for.
 → [Services & RPC](../guide/services.md)
 
 **`RpcError::Contract` at connect time**

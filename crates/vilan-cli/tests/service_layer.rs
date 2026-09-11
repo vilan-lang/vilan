@@ -4006,3 +4006,119 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A82's wire face, end to end over a real socket: an `[rpc]` method taking a
+/// `u53` and answering a `Result<i53, str>` — the two things `std::wire` did
+/// not carry, and the exact signature kolt's `store.vl:184` wanted and wrote
+/// `Option<i53>` for instead, with forty lines of hand-written `Result` impl
+/// sitting above it.
+///
+/// What the round trip proves that the codec pins cannot: the generated client
+/// and the generated dispatcher agree about this payload, which means the
+/// `call<T: Wire>` bound resolved to std's impl on both sides, `Ok` and `Err`
+/// survive the frame in both directions, and the unsigned id decodes at its
+/// declared width rather than at `i53`'s. The stub's own `Result<_, RpcError>`
+/// wraps the method's `Result<i53, str>` — two `Result`s nested, which is the
+/// shape every fallible rpc has from here on, so it is what the assertions
+/// read.
+#[test]
+fn an_rpc_answering_a_result_over_a_u53_id_round_trips_both_arms() {
+    let dir = temp_project("wire_result");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(StoreClient)]
+struct Store {
+	name: str,
+}
+
+impl Store {
+	// The signature A82 exists for: an unsigned id in, a fallible reply out.
+	[rpc]
+	fun lookup(self, id: u53): Result<i53, str> {
+		if id == 0u53 {
+			Err(i"no row {id} in {self.name}")
+		} else {
+			Ok(id.as_i53() * 2i53)
+		}
+	}
+
+	// The widest id the contract admits, answered at the widest value — the
+	// [0, 2^53] window's top, which is exactly where a narrowing bug shows.
+	[rpc]
+	fun widest(self): u53 {
+		9007199254740992u53
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Store {
+			name = "store",
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun show(outcome: Result<Result<i53, str>, str>): str {
+	match outcome {
+		Ok(let inner) => match inner {
+			Ok(let value) => i"ok:{value}",
+			Err(let reason) => i"err:{reason}",
+		},
+		Err(let reason) => i"call-failed:{reason}",
+	}
+}
+
+fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			print(show(client.lookup(21u53).map_err(|error| error.debug())));
+			print(show(client.lookup(0u53).map_err(|error| error.debug())));
+			print(i"widest:{client.widest().unwrap_or(0u53)}");
+		},
+		Err(let error) => print(i"connect-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The `Ok` arm crossed and carried its payload.
+        "ok:42",
+        // The `Err` arm crossed as an `Err`, not as a transport failure, and
+        // its `str` payload came with it.
+        "err:no row 0 in store",
+        // The unsigned id decoded at its own width at both ends.
+        "widest:9007199254740992",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the result service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("call-failed:"),
+        "a `Result` reply was reported as a transport failure:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("connect-err:"),
+        "the result service refused the connection:\n{stdout}"
+    );
+}

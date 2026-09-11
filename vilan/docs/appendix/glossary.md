@@ -209,6 +209,7 @@ held across a [suspension](#suspension).
 once with the final values. [Reactive state](../guide/reactive.md).
 
 <a id="wire"></a>**Wire**: the "can travel over the network" capability, and an
-ordinary trait: scalars, lists, options and maps of Wire types, anything with
-`[derive(Wire)]`, and any type you write an `impl … with Wire` for.
+ordinary trait: scalars, lists, options, results and maps of Wire types,
+anything with `[derive(Wire)]`, and any type you write an `impl … with Wire`
+for.
 [Services & RPC](../guide/services.md).

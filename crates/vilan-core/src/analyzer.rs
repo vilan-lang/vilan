@@ -2754,13 +2754,20 @@ pub struct Scope<'src> {
 /// the check used to carry two copies of it, one per predicate, and A82 is
 /// exactly the change that would have had to edit both.
 ///
-/// It must stay in step with the `impl <scalar> with Wire` row in
+/// It must stay in step with the `impl <scalar> with Wire` rows in
 /// `vilan/std/src/wire.vl`: this list says what the analyzer ADMITS, those
 /// impls are what the codegen then calls, and a name here without an impl
 /// there is an admitted payload with no `describe`. `bool` is on it because
 /// `bool` is an enum special-case that every scalar predicate in the tree has
 /// to name explicitly.
-const WIRE_SCALAR_NAMES: &[&str] = &["str", "i32", "u32", "i53", "f64", "bool"];
+///
+/// A82 closed the gap it opened with: the list stopped at `i53`/`f64` while
+/// the language had had the whole sized family since numeric-types.md §5, so
+/// an unsigned id (`u53`) could not cross the wire and `std::json` — which
+/// carries the same family — was a strictly wider door than `std::wire`.
+const WIRE_SCALAR_NAMES: &[&str] = &[
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+];
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
 /// DECLARATION's entity id — the file every member span indexes into, which the
@@ -15242,7 +15249,6 @@ impl<'src> Analyzer<'src> {
         }
         if matches!(name, "List" | "Option" | "Map")
             && arguments
-                .clone()
                 .iter()
                 .all(|argument| self.resolved_type_is_wire(*argument))
         {

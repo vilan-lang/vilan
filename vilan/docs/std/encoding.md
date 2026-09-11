@@ -177,8 +177,13 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 
 - `trait Serialize` / `trait Deserialize`: visitor-style value
   description (`begin_struct`/`field`/`str_value`/`i53_value`/…). The
-  wire scalars: `str`, `bool`, `i32`, `u32`, `i53`, `f64` (+ lists,
-  options, structs, enum variants).
+  wire scalars are `str`, `bool` and the whole sized numeric family —
+  `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i53`, `u53`, `f32`, `f64` —
+  plus lists, options, results, maps, structs and enum variants. The
+  visitor itself has six scalar lanes and the sized widths ride the one
+  that holds them exactly (`i8`/`i16` on `i32`, `u8`/`u16` on `u32`,
+  `u53` on `i53`, `f32` on `f64`), so every round trip is lossless and
+  no codec grows a method per width.
 - `Frame`: one encoded message.
 - `Codec`: a matched writer/reader pair, `json_codec()` (`std::json`,
   readable) or `binary_codec()` (`std::binary`, compact). Client and
@@ -193,6 +198,14 @@ types with a custom encoding.
 definition. A conditional impl's own binder bounds are what recurse into
 the arguments, so `impl Pair<type A: Wire, type B: Wire> with Wire`
 demands both and `impl Handle<type T> with Wire` demands neither.
+
+`Result<T, E>` is Wire when both arms are, and narrates in `Option`'s
+vocabulary: an externally-tagged `{"Ok": …}` / `{"Err": …}` over JSON, a
+tagged variant over the binary codec. That makes a fallible reply an
+ordinary payload — `[rpc] fun lookup(self, id: u53): Result<Row, str>`
+needs nothing hand-written. An unrecognized tag is a sticky decode
+failure, so `decode` answers `Err(reason)` rather than panicking on a
+malformed frame.
 
 `Map<K, V>` is Wire when both its key and its value are (the key is
 already `Hashable` by the type's own bound). It narrates as a list of

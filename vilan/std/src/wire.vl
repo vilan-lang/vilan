@@ -334,6 +334,88 @@ impl bool with Wire {
 	}
 }
 
+// --- The sized numeric family (proposal/numeric-types.md §5) -----------------
+
+// The visitor's scalar vocabulary is six lanes wide, and the sized numbers ride
+// the lane that holds them EXACTLY: `i8`/`i16` on `i32`, `u8`/`u16` on `u32`,
+// `u53` on `i53` (its whole [0, 2^53] range sits inside i53's symmetric
+// window), `f32` on `f64` (every f32 is an f64). Widening then narrowing is
+// lossless in both directions for every representable value, so the round trip
+// is exact — and it is codec-neutral, which is the same reason `i53_value`
+// itself rides the binary codec's f64 lane.
+//
+// The alternative is one visitor method per width: six more methods on
+// `Serialize`, six on `Deserialize`, on both records and in every codec, to buy
+// a binary frame three bytes per small integer. Nobody has asked for the bytes;
+// the day a codec does, the lanes are added and these impls are the one place
+// that changes.
+//
+// `std::json` carries the same family (`impl i8 with Json`, …) and the two
+// lists have to stay in step, because a `[derive(Wire)]` type's fields go
+// through both — as does the analyzer's Wire scalar list (`WIRE_SCALAR_NAMES`
+// in `analyzer.rs`), which says what the boundary ADMITS where these say what
+// it then calls.
+
+impl i8 with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		serializer.i32_value(self.as_i32());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): i8 {
+		deserializer.i32_value().as_i8()
+	}
+}
+
+impl u8 with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		serializer.u32_value(self.as_u32());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): u8 {
+		deserializer.u32_value().as_u8()
+	}
+}
+
+impl i16 with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		serializer.i32_value(self.as_i32());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): i16 {
+		deserializer.i32_value().as_i16()
+	}
+}
+
+impl u16 with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		serializer.u32_value(self.as_u32());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): u16 {
+		deserializer.u32_value().as_u16()
+	}
+}
+
+impl u53 with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		serializer.i53_value(self.as_i53());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): u53 {
+		deserializer.i53_value().as_u53()
+	}
+}
+
+impl f32 with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		serializer.f64_value(self.as_f64());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): f32 {
+		deserializer.f64_value().as_f32()
+	}
+}
+
 // A list narrates element by element; rebuild trusts `begin_list`'s count.
 impl List<type T: Wire> with Wire {
 	fun describe<S: Serialize>(self, serializer: S) {
@@ -376,6 +458,61 @@ impl Option<type T: Wire> with Wire {
 			None
 		} else {
 			Some(T::rebuild(deserializer))
+		}
+	}
+}
+
+// A `Result` narrates as a tagged variant, exactly as an enum payload does:
+// `Ok`/`Err` plus the value bare. Backlog A82's gap — a fallible reply is the
+// most ordinary payload an `[rpc]` method has, and every app that wanted one
+// wrote this impl itself (kolt's `store.vl:27`, forty lines, verbatim this).
+//
+// The tags are the VARIANT NAMES, which is what makes the encoding hash-stable:
+// the JSON object is keyed by them and the binary codec's `begin_variant`
+// matches on them, so neither side depends on declaration order or on a
+// discriminant that a later edit could renumber.
+//
+// An unrecognized tag is a structural failure, not a panic. The deserializer is
+// failed FIRST, which poisons every later read — the `Err` payload below then
+// rebuilds to its own zero value without touching the frame — and `decode`
+// reports the reason instead of the value, which is the sticky-error contract
+// `Deserializer` promises. (`Delta`'s `_` arm answers with `Reset([])`;
+// `Result` has no empty value to hand back, so it hands back a poisoned one.)
+impl Result<type T: Wire, type E: Wire> with Wire {
+	fun describe<S: Serialize>(self, serializer: S) {
+		match self {
+			Ok(let value) => {
+				serializer.begin_variant("Ok", 1);
+				value.describe(serializer);
+				serializer.end_variant();
+			},
+			Err(let error) => {
+				serializer.begin_variant("Err", 1);
+				error.describe(serializer);
+				serializer.end_variant();
+			},
+		}
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: D): Result<T, E> {
+		let tag = deserializer.variant_tag();
+		match tag {
+			"Ok" => {
+				deserializer.begin_variant("Ok", 1);
+				let value = T::rebuild(deserializer);
+				deserializer.end_variant();
+				Ok(value)
+			},
+			"Err" => {
+				deserializer.begin_variant("Err", 1);
+				let error = E::rebuild(deserializer);
+				deserializer.end_variant();
+				Err(error)
+			},
+			_ => {
+				deserializer.fail(i"unknown result variant '{tag}'");
+				Err(E::rebuild(deserializer))
+			},
 		}
 	}
 }
