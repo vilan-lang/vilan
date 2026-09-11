@@ -3919,6 +3919,21 @@ pub struct Analyzer<'src> {
     // silencing every generated bound failure about `Task` would silence
     // sentences this refusal never said, and `Keyed<i32>` is the one it did.
     expose_refused_key_bounds: HashSet<String>,
+    // B303's twin of the set above, for the OTHER half of a service the
+    // `[rpc]` Wire-signature refusal already named: every type label that
+    // refusal reported as not Wire, plus every non-Wire component nested
+    // inside one. The generated client's `call<T: Wire>` fails at exactly
+    // those types, in code the author never wrote and spanned on the STRUCT,
+    // which is the same restatement `[expose]` has stood down since B189.
+    //
+    // Keyed on the TYPE rather than on the trait label, because the trait
+    // label here is the bare `Wire` and standing down every generated `Wire`
+    // failure would silence sentences this refusal never said. The nesting is
+    // what makes it precise for the argument positions too: a refused
+    // `List<Password>` parameter fails the bound at `Password`, so the label
+    // the bound check computes is the ELEMENT's and the label the refusal
+    // reported is the collection's.
+    rpc_refused_wire_types: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -4822,6 +4837,7 @@ impl<'src> Analyzer<'src> {
             entry_cycle_refused_imports: Vec::new(),
             expose_refused_elements: HashSet::default(),
             expose_refused_key_bounds: HashSet::default(),
+            rpc_refused_wire_types: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             field_annotation_type_ids: HashMap::default(),
@@ -5473,6 +5489,25 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                     let type_label = self.pretty_print_type(&value_type, &HashMap::default());
+                    // B303's stand-down, A56's above read for the `[rpc]` half:
+                    // the generated client's `call<T: Wire>` failing at a type
+                    // the `[rpc]` signature refusal has ALREADY named, in the
+                    // method's own vocabulary and on the annotation the author
+                    // wrote. `[expose]` has had B189's stand-down for exactly
+                    // this since the check existed; `[rpc]` had none, so one
+                    // non-Wire payload reported two and three times over, and
+                    // the honest sentence was not the one that read first.
+                    // Generated only, the `Wire` bound only, and only at the
+                    // types the refusal reported.
+                    if !self.rpc_refused_wire_types.is_empty()
+                        && trait_label == "Wire"
+                        && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                        && self
+                            .rpc_refused_wire_types
+                            .contains(&without_spaces(&type_label))
+                    {
+                        continue;
+                    }
                     // A generic argument fails by MISSING the bound on its own
                     // declaration — name that fix; a concrete one by missing
                     // the impl.
@@ -14942,6 +14977,11 @@ impl<'src> Analyzer<'src> {
                         None => true,
                     };
                     if !element_is_wire {
+                        if let Some(element_type_id) = member_type_id
+                            .and_then(|type_id| self.resolved_handle_return_element(type_id))
+                        {
+                            self.record_refused_rpc_wire_type(element_type_id);
+                        }
                         let rendered = render_type(element);
                         self.push_anchored(
                             Error {
@@ -14968,6 +15008,9 @@ impl<'src> Analyzer<'src> {
                 match type_node {
                     Some(_) if member_is_wire => {}
                     Some(type_node) => {
+                        if let Some(member_type_id) = member_type_id {
+                            self.record_refused_rpc_wire_type(member_type_id);
+                        }
                         let rendered = render_type(type_node);
                         self.push_anchored(
                             Error {
@@ -15394,6 +15437,37 @@ impl<'src> Analyzer<'src> {
     /// parameter, an unresolved annotation — is NOT Wire and never reaches the
     /// impl table: a bare parameter would otherwise answer from its declared
     /// bound, which is the one answer arm 2 exists to refuse.
+    /// Record a type the `[rpc]` Wire-signature refusal has just reported as
+    /// not Wire — and every non-Wire component nested inside it — so the
+    /// generated client's `call<T: Wire>` failure at the same type stands down
+    /// (B303, [`Self::rpc_refused_wire_types`]).
+    ///
+    /// The descent is what makes the set match what the BOUND check computes:
+    /// a refused `List<Password>` parameter is reported at the collection, and
+    /// `List<T: Wire>`'s own `describe` fails at the element — two labels for
+    /// one mistake. A Wire component is not recorded, so a `Map<str, Password>`
+    /// contributes `Map<str, Password>` and `Password` and never `str`.
+    fn record_refused_rpc_wire_type(&mut self, type_id: TypeId) {
+        if self.resolved_type_is_wire(type_id) {
+            return;
+        }
+        let type_ = type_id.get_type(self);
+        let label = self.pretty_print_type(&type_, &HashMap::default());
+        if !self.rpc_refused_wire_types.insert(without_spaces(&label)) {
+            // Already recorded: a type that contains itself through a field is
+            // not expressible here, but a shape like `Map<Password, Password>`
+            // reaches the same argument twice and the walk must end.
+            return;
+        }
+        let arguments = match &type_ {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => arguments.clone(),
+            _ => Vec::new(),
+        };
+        for argument in arguments {
+            self.record_refused_rpc_wire_type(argument);
+        }
+    }
+
     fn resolved_type_is_wire(&mut self, type_id: TypeId) -> bool {
         let type_ = type_id.get_type(self);
         let (name, arguments) = match &type_ {
