@@ -28747,6 +28747,39 @@ impl<'src> Analyzer<'src> {
                     if self.generic_is_enclosing_binder(constraint_id, call_id)))
     }
 
+    /// B280: whether an EXTERNAL callee's own signature fixes the element of a
+    /// `List` it returns — some PARAMETER's declared type mentions the same
+    /// generic, so the element is decided by an input rather than being a hole
+    /// to fill from later `push` calls.
+    ///
+    /// Asked of the DECLARED types, in the callee's own terms: the return the
+    /// call site holds has already had the receiver's bindings substituted in,
+    /// so its element is no longer the id the parameters name.
+    fn external_parameters_fix_the_list_element(&self, function_id: Id) -> bool {
+        let Some(function) = self.external_functions.get(&function_id) else {
+            return false;
+        };
+        let Type::Struct(struct_id, arguments) = function.return_type_id.get_type(self) else {
+            return false;
+        };
+        if !self.is_slot_container(struct_id) || arguments.len() != 1 {
+            return false;
+        }
+        let Type::Generic(element_constraint_id) = arguments[0].get_type(self) else {
+            return false;
+        };
+        let parameter_ids = function.parameters.clone();
+        parameter_ids.iter().any(|parameter_id| {
+            let Some(parameter) = self.parameters.get(parameter_id) else {
+                return false;
+            };
+            let parameter_type = parameter.type_id.get_type(self);
+            let mut mentioned = Vec::new();
+            self.collect_generics(&parameter_type, 0, &mut mentioned);
+            mentioned.contains(&element_constraint_id)
+        })
+    }
+
     /// If `type_` is a `List` whose element is an unbound generic (i.e. the
     /// result of `List::new()`), replaces the element with a fresh inference
     /// slot stable for this call id, so the element can be unified from later
@@ -30174,7 +30207,42 @@ impl<'src> Analyzer<'src> {
                             } else {
                                 return_type
                             };
-                            return self.freshen_list_element_slots(return_type, id);
+                            // B280: the same guard the DECLARED return takes
+                            // below (B263), plus the one thing the external
+                            // path needs that the declared one does not.
+                            // `freshen_list_element_slots` exists for
+                            // `List::new()`, whose element is a genuine hole;
+                            // a `List<T>` whose `T` is a binder of the
+                            // declaration this call SITS IN is not a hole, and
+                            // replacing it with a fresh slot erases the
+                            // caller's rigid element — an `external fun
+                            // items(self): List<T>` reached through a receiver
+                            // typed by the impl's own `T` reported "cannot
+                            // index this List: its element type is never
+                            // determined" over complete code.
+                            //
+                            // `List::new()` is why the enclosing-binder test
+                            // alone will not do here, and it is the only
+                            // difference between the two sites: it is declared
+                            // INSIDE `impl List<type T>`, so its return element
+                            // IS that binder by the name rule, and a call to it
+                            // from a sibling member (`map`'s `mut result =
+                            // List::new()`) would stop being freshened and type
+                            // as `List<T>` where the body fills a `List<U>`.
+                            // So the element counts as fixed only when the
+                            // callee's own signature fixes it: some PARAMETER
+                            // mentions the same generic (`values(self):
+                            // List<V>` through `self`, `settle_all(tasks:
+                            // List<Task<T>>): List<T>` through its argument).
+                            // `List::new()` takes none, which is exactly why
+                            // its element is a hole.
+                            let element_is_fixed = self
+                                .return_element_is_a_caller_binder(&return_type, id)
+                                && self.external_parameters_fix_the_list_element(function_id);
+                            return match element_is_fixed {
+                                true => return_type,
+                                false => self.freshen_list_element_slots(return_type, id),
+                            };
                         };
                         let mut substitution_context = substitution_context.clone();
                         // A method on a concrete generic instance (`box.unwrap()`

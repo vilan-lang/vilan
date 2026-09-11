@@ -7748,3 +7748,140 @@ fn b288_a_struct_literal_whose_field_is_ready_still_resolves_at_once() {
         "3\n",
     );
 }
+
+// --- B280: `freshen_list_element_slots`' EXTERNAL path -----------------------
+//
+// B263 guarded the DECLARED-function return against freshening a `List<T>`
+// whose `T` is a binder of the declaration the call sits in; the external
+// return took the same helper unguarded. The item recorded "no exhibit found" —
+// there are three, and the std one needs no `external` of your own.
+
+#[test]
+fn b280_an_external_methods_list_return_keeps_the_callers_rigid_element() {
+    // The std exhibit: `List::sort_by` is `external fun sort_by(own self,
+    // compare: |T, T| Ordering): List<T>`, and reached through a field typed by
+    // the impl's own `T` its element was replaced with a fresh slot — so
+    // indexing the result reported "its element type is never determined" over
+    // complete code.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::Ord;
+
+        struct Holder<T> {
+            items: List<T>,
+        }
+
+        impl Holder<type T: Ord> {
+            fun first_sorted(self): T {
+                self.items.sort_by(|a, b| a.compare(b))[0]
+            }
+        }
+
+        fun main() {
+            let holder: Holder<i32> = Holder { items = [3, 1, 2] };
+            print(i"{holder.first_sorted()}");
+        }
+        main();
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b280_a_user_external_methods_list_return_keeps_the_callers_rigid_element() {
+    // The item's own shape, written out: an `external fun items(self):
+    // List<T>` on a receiver typed by the ENCLOSING impl's `T`.
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        external struct Bag<T>;
+
+        impl Bag<type T> {
+            external fun items(self): List<T>;
+            external fun make(): Bag<T>;
+        }
+
+        struct Holder<T> {
+            bag: Bag<T>,
+        }
+
+        impl Holder<type T> {
+            fun first(self): T {
+                self.bag.items()[0]
+            }
+        }
+
+        fun main() {
+            let holder: Holder<i32> = Holder { bag = Bag::make() };
+            print(i"{holder.first()}");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b280_an_external_list_return_through_a_bounded_receiver_keeps_its_element() {
+    // The bound-reached form: the receiver is a generic `S: Bagged<T>`, so `T`
+    // is the FUNCTION's binder rather than an impl's.
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        external struct Bag<T>;
+
+        trait Bagged<T> {
+            fun bag(self): Bag<T>;
+        }
+
+        impl Bag<type T> {
+            external fun items(self): List<T>;
+        }
+
+        fun first_of<T, S: Bagged<T>>(source: S): T {
+            source.bag().items()[0]
+        }
+
+        fun main() { print("ok"); }
+        "#,
+    );
+}
+
+#[test]
+fn b280_list_new_inside_a_sibling_member_still_takes_a_fresh_element_slot() {
+    // The counterweight, and the one thing the external path needs that the
+    // declared one does not. `List::new()` is declared INSIDE `impl List<type
+    // T>`, so its return element IS the enclosing binder by the name rule — the
+    // guard would stop freshening it, and std's own `map<U>` (`mut result =
+    // List::new()`, then `result.push(fn(item))`, returning `List<U>`) would
+    // stop compiling. The element counts as fixed only when a PARAMETER of the
+    // callee mentions it; `List::new()` takes none.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        struct Holder<T> {
+            items: List<T>,
+        }
+
+        impl Holder<type T> {
+            fun labelled(self, label: |T| str): List<str> {
+                mut result = List::new();
+                for item in self.items {
+                    result.push(label(item));
+                }
+                result
+            }
+        }
+
+        fun main() {
+            let holder: Holder<i32> = Holder { items = [1, 2] };
+            print(holder.labelled(|n| i"{n}").join(","));
+        }
+        main();
+        "#,
+        "1,2\n",
+    );
+}
