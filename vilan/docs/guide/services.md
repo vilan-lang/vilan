@@ -394,6 +394,20 @@ server that changes a handle return to a plain value moves the hash and
 a stale client is refused at connect, instead of decoding a channel id
 as a message.
 
+**A handle method is WebSocket-only.** Its reply is a channel id minted
+in *this connection's* capability table, so the connectionless legs
+cannot serve one. Over `POST {mount}rpc` the call fails naming the
+method — the service's plain methods keep answering beside it, and the
+same mount's WebSocket leg serves the handle fine, so it is the route the
+client dialled that is wrong and not the mount. In process, a `local_rpc`
+transport over a protocol no `for_connection` stamped is refused where it
+is *wired*, before the first call: register the session and stamp it
+(`register_session(id, end, codec)`, then
+`into_protocol(codec).for_connection(id)`) and handles work in process
+too, which is how `vilan/examples/rpc` is written. Everything a generated
+`Client::connect` builds rides the socket, so reaching this at all means
+having assembled the client by hand.
+
 **A handle-returning method must be safe to re-run.** Its return type is
 the declaration that it is a *getter*: the runtime re-issues the call
 when a released mirror is watched again, and again after a reconnect.

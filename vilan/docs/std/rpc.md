@@ -301,8 +301,8 @@ trait Transport {
 | Transport | Wire | Use |
 |---|---|---|
 | `SocketTransport` | WebSocket (reconnecting) | what `connect` gives you, the production client transport |
-| `HttpTransport` | one POST per call | stateless calls, no mirrors |
-| `LocalTransport` | in-process | tests: client and service in one process |
+| `HttpTransport` | one POST per call | stateless calls, no mirrors, no handles |
+| `LocalTransport` | in-process | tests: client and service in one process; handles need a stamped connection |
 
 Below `SocketTransport` sits `SocketDuplex` (the reconnect-surviving socket:
 pending-call registry, inbound dispatch, `on_reconnect` hooks) and the

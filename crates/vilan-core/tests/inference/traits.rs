@@ -3580,3 +3580,372 @@ fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
         "which is not Wire",
     );
 }
+
+// --- B284: `[expose]` on a struct that HANDLES and does not SERVE -----------
+
+/// B284: `[expose]` on a `[client_service]`-ONLY struct was a silent no-op.
+///
+/// It compiled, it contributed an `expose:` entry to the struct's contract
+/// hash — so the two peers had to agree about a channel neither could
+/// mint — and nothing ever minted one: a client-side struct has no reactive
+/// session to export out of, and the expansion generates no `__attach` route
+/// for it at all. Refused at the attribute now, in the field's own vocabulary,
+/// for the same reason every other arm of `check_expose_fields` is said there
+/// (B202): the expansion skips such a field, so without this nothing says why.
+#[test]
+fn b284_an_expose_on_a_client_service_only_struct_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [client_service]
+        struct Handlers {
+            [expose] tally: SignalCell<i32>,
+        }
+        impl Handlers {
+            [rpc]
+            fun session_revoked(self, reason: str) { print(reason); }
+        }
+        fun main() { print(Handlers { tally = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+        "carries only `[client_service]`",
+    );
+}
+
+/// B284's keyed spelling: the refusal is about the STRUCT, not about the shape
+/// of the exposure, so `[expose(keyed)]` over a `Map` element on a client-only
+/// struct is refused by the same arm — and by it ALONE, rather than also
+/// collecting the keyed arms' own complaints, because the early arm answers
+/// first and the field is done.
+#[test]
+fn b284_an_expose_keyed_on_a_client_service_only_struct_is_refused_once() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [client_service]
+        struct Handlers {
+            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
+        }
+        impl Handlers {
+            [rpc]
+            fun session_revoked(self, reason: str) { print(reason); }
+        }
+        fun main() { print(Handlers { tasks = Signal::new(Map::new()) }.contract_hash()); }
+        main();
+        "#,
+        "carries only `[client_service]`",
+    );
+}
+
+/// B284's control, and the reason the refusal is keyed on the DECLARATION
+/// rather than on `[client_service]` being present: a PEER struct carries both
+/// attributes, so it serves as well as handles — it has a dispatcher, an
+/// `__attach` route and a reactive session per connection, and its exposures
+/// are real. A program that wrote one before this landed keeps compiling and
+/// keeps its hash.
+#[test]
+fn b284_an_expose_on_a_peer_struct_that_also_serves_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [service(PeerClient)]
+        [client_service]
+        struct Peer {
+            [expose] tally: SignalCell<i32>,
+        }
+        impl Peer {
+            [rpc]
+            fun bump(self, by: i32) { self.tally.set(self.tally.get() + by); }
+        }
+        fun main() { print(Peer { tally = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+    );
+}
+
+/// B284's other control: a client-only struct with no `[expose]` at all is
+/// untouched. The refusal is the attribute's, not the attribute pair's.
+#[test]
+fn b284_a_client_service_only_struct_without_an_expose_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [client_service]
+        struct Handlers {
+            tally: SignalCell<i32>,
+        }
+        impl Handlers {
+            [rpc]
+            fun session_revoked(self, reason: str) { print(reason); }
+        }
+        fun main() { print(Handlers { tally = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+    );
+}
+
+// --- B285: `[expose(keyed = K)]` over a `KeyedCell<K2, T>` ------------------
+
+/// B285: the `KeyedCell<K, T>` twin of A56/R6 — the field names its key twice
+/// and the two disagree.
+///
+/// The cell's own `K` won, and had to: `expose_keyed_cell` and the
+/// `KeyedSource<K, T>` mirror are typed at it, so a disagreeing argument could
+/// only generate code that does not compile. What was wrong was winning
+/// SILENTLY — the program below hashed byte-identically to the one that writes
+/// `keyed = str`, and mirrored by a key the author had spelled otherwise on the
+/// same line.
+#[test]
+fn b285_an_expose_keyed_argument_that_disagrees_with_the_cells_key_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = i32)] tasks: KeyedCell<str, Task>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "names its key twice and the two disagree",
+    );
+}
+
+/// B285's span, stated as its own claim: the ARGUMENT is the half under
+/// discussion — the cell's type is not wrong, and one of the two ways out does
+/// not touch it — so the refusal points there and not at the annotation. A56's
+/// rule, applied to the second spelling that carries a key.
+#[test]
+fn b285_the_disagreeing_cell_key_refusal_spans_the_attribute_argument() {
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = i32)] tasks: KeyedCell<str, Task>,
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "i32",
+        "names its key twice and the two disagree",
+    );
+}
+
+/// B285's control: an argument that AGREES with the cell's key is redundant,
+/// not wrong. It compiles, and it hashes exactly as the bare form does — the
+/// surface entry is built from the cell's own written key either way.
+#[test]
+fn b285_an_expose_keyed_argument_that_agrees_with_the_cells_key_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed = str)] tasks: KeyedCell<str, Task>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { 1 }
+        }
+        fun main() {
+            print(Store { tasks = KeyedCell::new([]) }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}
+
+/// B285's other two controls, which are the shapes the refusal must NOT reach:
+/// the bare `[expose(keyed)]` over a cell (A54's spelling), and the bare
+/// `[expose]` over one — which is the SAME keyed channel, because the cell
+/// names both types itself and there is nothing for the attribute to add.
+#[test]
+fn b285_a_keyed_cell_exposed_without_an_argument_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] keyed_tasks: KeyedCell<str, Task>,
+            [expose] bare_tasks: KeyedCell<str, Task>,
+        }
+        impl Store {
+            [rpc]
+            fun count(self): i32 { 1 }
+        }
+        fun main() {
+            let keyed: KeyedCell<str, Task> = KeyedCell::new([Task { id = "a" }]);
+            let bare: KeyedCell<str, Task> = KeyedCell::new([Task { id = "b" }]);
+            print(Store { keyed_tasks = keyed, bare_tasks = bare }.contract_hash());
+        }
+        main();
+        "#,
+    );
+}
+
+// --- A78: a handle-returning service on a CONNECTIONLESS mount -------------
+
+/// A78: a `local_rpc` transport over a protocol no connection stamped cannot
+/// answer a handle-returning method, and says so AT WIRING TIME.
+///
+/// A handle's reply is a channel id minted in the CONNECTION's capability
+/// table; `into_protocol` leaves the connection unstamped (`for_connection` is
+/// what stamps it), so the call could only ever fail. It used to fail at the
+/// first such call, as an `RpcError::Remote` raised inside generated code that
+/// named neither the method nor the wiring that had to change — and a service
+/// whose handle method is called on some later code path shipped with the
+/// defect latent. The `[service]` expansion records its handle methods on the
+/// dispatcher (`Dispatcher::handles`), so `local_rpc` can see them before a
+/// call is made.
+#[test]
+fn a78_a_handle_service_on_an_unstamped_local_rpc_protocol_is_refused_at_wiring() {
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::json::json_codec;
+        import std::rpc::local_rpc;
+        [service(NotesClient)]
+        struct Notes {
+            body: SignalCell<str>,
+        }
+        impl Notes {
+            [rpc]
+            fun note(self, id: str): SignalCell<str> { self.body }
+        }
+        fun main() {
+            let notes = Notes { body = Signal::new("hello") };
+            let transport = local_rpc(notes.dispatcher().into_protocol(json_codec()));
+            print("wired");
+        }
+        main();
+        "#,
+        "a signal handle is returned by `note`",
+    );
+}
+
+/// A78's control, and the whole of the test the refusal makes: a STAMPED
+/// protocol is admitted, and the handle round-trips in process.
+///
+/// `vilan/examples/rpc` is written this way — register a session, stamp the
+/// protocol with its connection, serve handles locally — and the refusal must
+/// not reach it. The test is structural (was a connection stamped?) rather
+/// than a `session_of` lookup for this pin's sake and the example's alike: a
+/// session may legitimately be registered after the transport is built, and an
+/// ordering the app is free to choose must not decide whether its build
+/// survives.
+#[test]
+fn a78_a_handle_service_on_a_stamped_local_rpc_protocol_still_round_trips() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::result::Result::{ self, Ok, Err };
+        import std::json::{ Json, FromJson };
+        import std::json::json_codec;
+        import std::rpc::{ local_rpc, duplex_pair, register_session, ReactiveClient, RemoteSource };
+        [service(NotesClient)]
+        struct Notes {
+            body: SignalCell<str>,
+        }
+        impl Notes {
+            [rpc]
+            fun note(self, id: str): SignalCell<str> { self.body }
+        }
+        fun main() {
+            let notes = Notes { body = Signal::new("hello") };
+            let (client_end, server_end) = duplex_pair();
+            let connection = 0;
+            register_session(connection, server_end, json_codec());
+            let transport = local_rpc(notes
+                .dispatcher()
+                .into_protocol(json_codec())
+                .for_connection(connection));
+            let reactive = ReactiveClient::new(client_end, json_codec());
+            let client = NotesClient { transport, codec = json_codec(), reactive };
+            match client.note("welcome") {
+                Ok(let mirror) => {
+                    let reading = mirror.sub(|text| print(i"note = {text}"));
+                    reading.dispose();
+                },
+                Err(let error) => print(i"note err {error.debug()}"),
+            }
+        }
+        main();
+        "#,
+        "note = hello\n",
+    );
+}
+
+/// A78's other control: a service with NO handle method records nothing, so a
+/// plain `local_rpc` mount is untouched. The refusal is about the one return
+/// shape that needs a connection, and a dispatcher written by hand records
+/// nothing either — which is why `handles` is a record and not a rule.
+#[test]
+fn a78_a_plain_service_on_an_unstamped_local_rpc_protocol_still_round_trips() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+        import std::json::{ Json, FromJson };
+        import std::json::json_codec;
+        import std::rpc::local_rpc;
+        [service(NotesClient)]
+        struct Notes {
+            label: str,
+        }
+        impl Notes {
+            [rpc]
+            fun touch(self): i32 { 7 }
+        }
+        fun main() {
+            let notes = Notes { label = "n" };
+            let transport = local_rpc(notes.dispatcher().into_protocol(json_codec()));
+            let client = NotesClient { transport, codec = json_codec() };
+            print(i"touch = {client.touch().unwrap_or(0)}");
+        }
+        main();
+        "#,
+        "touch = 7\n",
+    );
+}

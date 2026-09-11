@@ -981,3 +981,113 @@ fun run_clients(port: i32) {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A78: a handle-returning method reached over the CONNECTIONLESS `{mount}rpc`
+/// POST leg fails naming the method, and the service's plain methods keep
+/// answering beside it.
+///
+/// A handle's reply is a channel id minted in the connection's capability
+/// table, and the POST leg holds no connection — so the call cannot be served
+/// there. The message used to say only that "a source-returning method" needed
+/// a session this request had none of, which reads as a server fault at a call
+/// the author cannot see; it names the method and the transport that does work
+/// now.
+///
+/// This is the leg that CANNOT be refused at the mount, which is the half of
+/// A78 worth pinning explicitly: `ServerBuilder::build` folds an upgrade
+/// handler for every service, so the same mount that answers this POST also
+/// answers the WebSocket the method is fine over. Nothing about the mount is
+/// wrong — only the route the client dialled — and refusing at mount would
+/// refuse every working handle service. `local_rpc`, which really can be wired
+/// with no connection at all, refuses at wiring time instead (pinned in
+/// vilan-core's `inference`).
+#[test]
+fn a_handle_method_over_the_connectionless_post_leg_fails_naming_the_method() {
+    let dir = temp_project("handle_over_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::rpc::{ HttpTransport, ReactiveClient, RemoteSource, duplex_pair };
+import std::http::Server;
+import std::rpc_server::Service;
+
+[service(NotesClient)]
+struct Notes {
+	body: SignalCell<str>,
+}
+
+impl Notes {
+	[rpc]
+	fun note(self, id: str): SignalCell<str> {
+		self.body
+	}
+
+	[rpc]
+	fun touch(self): i32 {
+		7
+	}
+}
+
+fun main() {
+	let notes = Notes { body = Signal::new("hello") };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec())))
+		.on_start(|server| run_client(i"{server.url()}rpc"))
+		.build()
+		.start();
+}
+
+fun run_client(url: str) {
+	// The reactive half a handle service's client carries, wired to a duplex
+	// that goes nowhere: the POST leg is the point, and the mirror this call
+	// would mint is never reached.
+	let (client_end, _server_end) = duplex_pair();
+	let client = NotesClient {
+		transport = HttpTransport { url = url },
+		codec = json_codec(),
+		reactive = ReactiveClient::new(client_end, json_codec()),
+	};
+	match client.touch() {
+		Ok(let n) => print(i"touch -> {n}"),
+		Err(let error) => print(i"touch err {error.to_json()}"),
+	}
+	match client.note("welcome") {
+		Ok(let _mirror) => print("note -> minted"),
+		Err(let error) => print(i"note err {error.to_json()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("touch -> 7"),
+        "a plain method must keep answering over the POST leg — the refusal is \
+         the handle's, not the mount's:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("note err"),
+        "a handle method over the POST leg must fail, not answer a channel id \
+         that names nothing:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("`note` returns a signal handle"),
+        "the failure must name the METHOD — the half the reader can act on:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Client::connect"),
+        "the failure must name the transport that does work:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
