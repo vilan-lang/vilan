@@ -16,166 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// A79: the KEYED handle return, over a real WebSocket and read off the
-/// server's own tables.
-const KEYED_HANDLE: &str = r#"import std::io::print;
-import std::process::exit;
-import std::reactive::{ Signal, SignalCell, Subscription };
-import std::result::Result::{ self, Ok, Err };
-import std::json::json_codec;
-import std::http::{ Response, Server };
-import std::rpc::{ KeyedCell, KeyedSource, RemoteSource, session_of };
-import std::rpc_server::Service;
-import std::shared::Shared;
-import std::wire::{ Keyed, Wire };
-
-[derive(Wire, PartialEq, Debug)]
-struct Task {
-	id: i32,
-	title: str,
-}
-
-impl Task with Keyed<i32> {
-	fun key(self): i32 {
-		self.id
-	}
-}
-
-// One board per workspace — the shape the return mapping exists for: a
-// collection the client watches a FRACTION of, and one no `[expose]` field
-// could name (there is one field per exposure, and a workspace is not a set
-// the compiler knows).
-let boards: Shared<List<(str, KeyedCell<i32, Task>)>> = Shared::new([]);
-let asks: Shared<i32> = Shared::new(0);
-
-fun board_for(workspace: str): KeyedCell<i32, Task> {
-	for entry in boards.read() {
-		let (key, cell) = entry;
-		if key == workspace {
-			ret cell;
-		}
-	}
-	let fresh: KeyedCell<i32, Task> = KeyedCell::new([Task { id = 1, title = "first" }]);
-	boards.write().push((workspace, fresh));
-	fresh
-}
-
-[service(BoardClient)]
-struct Board {
-	[expose] name: SignalCell<str>,
-	connection: i32,
-}
-
-impl Board {
-	[rpc]
-	fun tasks_in(self, workspace: str): KeyedCell<i32, Task> {
-		asks.write() = asks.read() + 1;
-		board_for(workspace)
-	}
-
-	// The SAME source, answered as a plain handle: a `KeyedCell`'s `elements`
-	// IS a `SignalCell`, so this method and `tasks_in` offer one cell identity
-	// for two channels that carry different FRAMES.
-	[rpc]
-	fun rows_in(self, workspace: str): SignalCell<List<Task>> {
-		board_for(workspace).elements
-	}
-
-	[rpc]
-	fun add(self, workspace: str, id: i32, title: str): bool {
-		board_for(workspace).insert(Task { id, title });
-		true
-	}
-
-	[rpc]
-	fun stats(self): List<i32> {
-		match session_of(self.connection) {
-			Option::Some(let session) => [
-				session.sources.read().len(),
-				session.live.read().len(),
-				asks.read(),
-			],
-			Option::None => [0 - 1, 0 - 1, 0 - 1],
-		}
-	}
-}
-
-let name: SignalCell<str> = Signal::new("acme");
-
-fun main() {
-	Server::builder()
-		.port(0)
-		.with_service(Service::factory(
-			|connection| Board { name, connection = connection.id },
-			json_codec(),
-		))
-		.on_request(|request| Response::builder().code(404).body("nope").build())
-		.on_start(|server| run(server.port()))
-		.build()
-		.start();
-}
-
-fun run(port: i32) {
-	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
-		Ok(let client) => {
-			let empty: List<i32> = [0 - 1, 0 - 1, 0 - 1];
-			print(i"hash:{client.contract_hash()}");
-			// SYNC and unleased, exactly like the plain form.
-			let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
-			let before = client.stats().unwrap_or(empty);
-			print(i"minted:sources={before[0]} live={before[1]} asks={before[2]} status={tasks.status().get().debug()}");
-			let seen: Shared<i32> = Shared::new(0);
-			let watching = tasks.sub(|rows| {
-				seen.write() = seen.read() + 1;
-				print(i"rows:{rows.len()}");
-			});
-			let _settle = client.stats();
-			let leased = client.stats().unwrap_or(empty);
-			print(i"leased:sources={leased[0]} live={leased[1]} asks={leased[2]} status={tasks.status().get().debug()}");
-			print(i"add:{client.add("alpha", 2, "second").unwrap_or(false)}");
-			let _flush = client.stats();
-			print(i"frames:{seen.read()}");
-			watching.dispose();
-			let _drain = client.stats();
-			let released = client.stats().unwrap_or(empty);
-			print(i"released:sources={released[0]} live={released[1]} asks={released[2]}");
-
-			// A per-KEY lease is a first demand too, and mints the same way.
-			let keyed: KeyedSource<i32, Task> = client.tasks_in("alpha");
-			let one = keyed.sub_key(2, |row| match row {
-				Option::Some(let task) => print(i"key:{task.title}"),
-				Option::None => {},
-			});
-			let _asked = client.stats();
-			let keyleased = client.stats().unwrap_or(empty);
-			print(i"keyleased:sources={keyleased[0]} live={keyleased[1]} asks={keyleased[2]}");
-			one.dispose();
-			let _quiet = client.stats();
-			let keyreleased = client.stats().unwrap_or(empty);
-			print(i"keyreleased:sources={keyreleased[0]} live={keyreleased[1]} asks={keyreleased[2]}");
-
-			// Dedup is by source AND frame shape. These two handles name one
-			// cell and must NOT share a channel: one carries `Patch` frames,
-			// the other `Update`s, and a mirror handed the wrong one would
-			// simply never seed.
-			let patched: KeyedSource<i32, Task> = client.tasks_in("alpha");
-			let whole: RemoteSource<List<Task>> = client.rows_in("alpha");
-			let holding_patched = patched.sub(|_rows| {});
-			let holding_whole = whole.sub(|_rows| {});
-			let _both = client.stats();
-			let shapes = client.stats().unwrap_or(empty);
-			print(i"shapes:sources={shapes[0]} live={shapes[1]}");
-			print(i"patched:{patched.get().unwrap_or([]).len()} whole:{whole.get().unwrap_or([]).len()}");
-			holding_patched.dispose();
-			holding_whole.dispose();
-			print("done");
-			exit(0);
-		},
-		Err(let error) => print(i"err:{error.debug()}"),
-	}
-}
-"#;
-
 /// A `[expose(keyed)]` service, end to end over a real WebSocket: the keyed
 /// channel the macro mints, the `KeyedSource` mirror the generated client
 /// carries, and a per-key subscription taken through it (A39).
@@ -3605,6 +3445,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
+import std::rpc::RemoteSource;
 import std::rpc_server::Service;
 import std::shared::Shared;
 import std::wire::Wire;
@@ -3680,6 +3521,34 @@ impl PlainChat {
 	}
 }
 
+// `HandleChat` with the handle return written as an `Option<SignalCell<..>>`.
+// The client's TYPE is the same (`RemoteSource<MessageBody>` — a `None` reply
+// is `Status::Absent`, not an `Option` to take apart), and the REPLY is not:
+// an `Option<i32>` where the plain form sends an `i32`. So the surface must
+// still tell them apart, or a client generated against one would decode the
+// other's `null` as a channel id.
+[service(OptionChatClient)]
+struct OptionChat {
+	[expose] topic: SignalCell<str>,
+}
+
+impl OptionChat {
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		[]
+	}
+
+	[rpc]
+	fun get_message(self, id: str): Option<SignalCell<MessageBody>> {
+		Option::None
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
 // `HandleChat` with the handle return written as a plain value — the twin that
 // says the mapping is what moved the hash, and not the method list.
 [service(ValueChatClient)]
@@ -3721,27 +3590,30 @@ fun run(port: i32) {
 		Ok(let client) => {
 			let plain = PlainChat { topic = Signal::new("") };
 			let value = ValueChat { topic = Signal::new("") };
+			let optional = OptionChat { topic = Signal::new("") };
 			print(i"handle-hash:{client.contract_hash()}");
 			print(i"plain-hash:{plain.contract_hash()}");
 			print(i"value-hash:{value.contract_hash()}");
+			print(i"option-hash:{optional.contract_hash()}");
 
 			// A hundred ids, one subscription: the lease rule does the rest.
 			let ids = client.get_messages("general", 100).unwrap_or([]);
 			print(i"ids:{ids.len()}");
-			match client.get_message(ids[3]) {
-				Ok(let mirror) => {
-					// Passive before anything watches: the mirror holds
-					// nothing, because nothing asked.
-					print(i"before:{mirror.status().get().debug()}");
-					let watch = mirror.sub(|value| print(i"m3:{value.body}"));
-					print(i"edit:{client.edit(ids[3], "hello").unwrap_or(false)}");
-					print(i"after:{mirror.status().get().debug()}");
-					let missing = MessageBody { id = "?", author = "?", body = "?" };
-					print(i"held:{mirror.get().unwrap_or(missing).body}");
-					watch.dispose();
-				},
-				Err(let error) => print(i"mirror-err:{error.debug()}"),
-			}
+			// SYNC (A92): no `Result`, no await, and no call — the mirror is
+			// minted unleased and the first lease is what asks.
+			let mirror: RemoteSource<MessageBody> = client.get_message(ids[3]);
+			// Passive before anything watches: the mirror holds nothing,
+			// because nothing asked.
+			print(i"before:{mirror.status().get().debug()}");
+			let watch = mirror.sub(|value| print(i"m3:{value.body}"));
+			print(i"edit:{client.edit(ids[3], "hello").unwrap_or(false)}");
+			// One more round trip: the mint the lease issued and the edit were
+			// in flight together, and the seed lands when the channel opens.
+			print(i"settle:{client.edit(ids[4], "other").unwrap_or(false)}");
+			print(i"after:{mirror.status().get().debug()}");
+			let missing = MessageBody { id = "?", author = "?", body = "?" };
+			print(i"held:{mirror.get().unwrap_or(missing).body}");
+			watch.dispose();
 			print("done");
 		},
 		Err(let error) => print(i"err:{error.debug()}"),
@@ -4019,25 +3891,27 @@ fun run(port: i32) {
 			// One channel, and it is the `[expose]`d field's.
 			show("attached", client.stats().unwrap_or(empty));
 
-			// A HUNDRED handles minted, and not one forward started.
+			// A HUNDRED handles minted, and not one CALL made: the stub is
+			// sync and the mirror is unleased (A92).
 			mut mirrors: List<RemoteSource<Body>> = [];
 			mut index = 0;
 			for index < 100 {
-				match client.get_message(i"m{index}") {
-					Ok(let mirror) => mirrors.push(mirror),
-					Err(let error) => print(i"mint-err:{error.debug()}"),
-				}
+				mirrors.push(client.get_message(i"m{index}"));
 				index += 1;
 			}
 			show("minted", client.stats().unwrap_or(empty));
 
-			// TEN of them watched.
+			// TEN of them watched: ten calls, ten capabilities, ten forwards.
+			// Two round trips — the first lets the mints land and their
+			// `Subscribe`s go out, the second reads what the server did with
+			// them.
 			mut leases: List<Subscription> = [];
 			mut watched = 0;
 			for watched < 10 {
 				leases.push(mirrors[watched].sub(|_value| {}));
 				watched += 1;
 			}
+			let _minting = client.stats();
 			show("leased", client.stats().unwrap_or(empty));
 
 			// Every lease released. The `Unsubscribe` rides the turn's settle
@@ -4064,6 +3938,24 @@ fun run(port: i32) {
 			let _drain = client.stats();
 			show("re-released", client.stats().unwrap_or(empty));
 
+			// DEDUP by source identity (A92). Two handles for the same row are
+			// two mirrors and two calls, and ONE channel: the second reply
+			// carries the cell the first one already exported. The first
+			// mirror's release does not revoke it under the second.
+			let twin_left: RemoteSource<Body> = client.get_message("m0");
+			let twin_right: RemoteSource<Body> = client.get_message("m0");
+			let hold_left = twin_left.sub(|_value| {});
+			let hold_right = twin_right.sub(|_value| {});
+			let _minting_twins = client.stats();
+			show("deduped", client.stats().unwrap_or(empty));
+			hold_left.dispose();
+			let _half = client.stats();
+			show("half-released", client.stats().unwrap_or(empty));
+			print(i"twin:{body_text(twin_right)}");
+			hold_right.dispose();
+			let _both = client.stats();
+			show("both-released", client.stats().unwrap_or(empty));
+
 			// The CONTROL: a `[expose]`d field channel's `Unsubscribe` is
 			// demand-only. Its capability survives (A41), where a dynamic
 			// one's does not — and a remount finds it on the same id.
@@ -4076,26 +3968,24 @@ fun run(port: i32) {
 			print(i"field-remount:{client.topic.get().unwrap_or("?")}");
 			again_field.dispose();
 
-			// The OPTION form, both answers. A `None` mints nothing — the
-			// absence IS the reply — and a `Some` is an ordinary mirror.
-			match client.find("nobody") {
-				Ok(let missing) => print(i"find-missing:{missing.is_some()}"),
-				Err(let error) => print(i"find-err:{error.debug()}"),
-			}
-			let _quiet_again = client.stats();
+			// The OPTION form, both answers — one mirror type for both (A92).
+			// A `None` reply mints no channel at all and the mirror says so:
+			// `Absent`, with `get()` still `None`. The absence is what the
+			// server knew at the ask, so the next lease asks again.
+			let missing: RemoteSource<Body> = client.find("nobody");
+			let watching_missing = missing.sub(|_value| {});
+			let _asked = client.stats();
+			print(i"find-missing:{missing.status().get().debug()}");
+			print(i"find-missing-held:{missing.get().is_some()}");
 			show("after-missing", client.stats().unwrap_or(empty));
-			match client.find("m0") {
-				Ok(let found) => match found {
-					Option::Some(let mirror) => {
-						let reading = mirror.sub(|_value| {});
-						let _flush = client.stats();
-						print(i"find-found:{body_text(mirror)}");
-						reading.dispose();
-					},
-					Option::None => print("find-found:absent"),
-				},
-				Err(let error) => print(i"find-err:{error.debug()}"),
-			}
+			watching_missing.dispose();
+			let found: RemoteSource<Body> = client.find("m0");
+			let reading = found.sub(|_value| {});
+			let _flush = client.stats();
+			let _seed = client.stats();
+			print(i"find-found:{body_text(found)}");
+			print(i"find-found-status:{found.status().get().debug()}");
+			reading.dispose();
 			print("done");
 		},
 		Err(let error) => print(i"err:{error.debug()}"),
@@ -5135,6 +5025,166 @@ fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stal
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&toolchain);
 }
+
+/// A79: the KEYED handle return, over a real WebSocket and read off the
+/// server's own tables.
+const KEYED_HANDLE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Subscription };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ KeyedCell, KeyedSource, RemoteSource, session_of };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Task {
+	id: i32,
+	title: str,
+}
+
+impl Task with Keyed<i32> {
+	fun key(self): i32 {
+		self.id
+	}
+}
+
+// One board per workspace — the shape the return mapping exists for: a
+// collection the client watches a FRACTION of, and one no `[expose]` field
+// could name (there is one field per exposure, and a workspace is not a set
+// the compiler knows).
+let boards: Shared<List<(str, KeyedCell<i32, Task>)>> = Shared::new([]);
+let asks: Shared<i32> = Shared::new(0);
+
+fun board_for(workspace: str): KeyedCell<i32, Task> {
+	for entry in boards.read() {
+		let (key, cell) = entry;
+		if key == workspace {
+			ret cell;
+		}
+	}
+	let fresh: KeyedCell<i32, Task> = KeyedCell::new([Task { id = 1, title = "first" }]);
+	boards.write().push((workspace, fresh));
+	fresh
+}
+
+[service(BoardClient)]
+struct Board {
+	[expose] name: SignalCell<str>,
+	connection: i32,
+}
+
+impl Board {
+	[rpc]
+	fun tasks_in(self, workspace: str): KeyedCell<i32, Task> {
+		asks.write() = asks.read() + 1;
+		board_for(workspace)
+	}
+
+	// The SAME source, answered as a plain handle: a `KeyedCell`'s `elements`
+	// IS a `SignalCell`, so this method and `tasks_in` offer one cell identity
+	// for two channels that carry different FRAMES.
+	[rpc]
+	fun rows_in(self, workspace: str): SignalCell<List<Task>> {
+		board_for(workspace).elements
+	}
+
+	[rpc]
+	fun add(self, workspace: str, id: i32, title: str): bool {
+		board_for(workspace).insert(Task { id, title });
+		true
+	}
+
+	[rpc]
+	fun stats(self): List<i32> {
+		match session_of(self.connection) {
+			Option::Some(let session) => [
+				session.sources.read().len(),
+				session.live.read().len(),
+				asks.read(),
+			],
+			Option::None => [0 - 1, 0 - 1, 0 - 1],
+		}
+	}
+}
+
+let name: SignalCell<str> = Signal::new("acme");
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(
+			|connection| Board { name, connection = connection.id },
+			json_codec(),
+		))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let empty: List<i32> = [0 - 1, 0 - 1, 0 - 1];
+			print(i"hash:{client.contract_hash()}");
+			// SYNC and unleased, exactly like the plain form.
+			let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let before = client.stats().unwrap_or(empty);
+			print(i"minted:sources={before[0]} live={before[1]} asks={before[2]} status={tasks.status().get().debug()}");
+			let seen: Shared<i32> = Shared::new(0);
+			let watching = tasks.sub(|rows| {
+				seen.write() = seen.read() + 1;
+				print(i"rows:{rows.len()}");
+			});
+			let _settle = client.stats();
+			let leased = client.stats().unwrap_or(empty);
+			print(i"leased:sources={leased[0]} live={leased[1]} asks={leased[2]} status={tasks.status().get().debug()}");
+			print(i"add:{client.add("alpha", 2, "second").unwrap_or(false)}");
+			let _flush = client.stats();
+			print(i"frames:{seen.read()}");
+			watching.dispose();
+			let _drain = client.stats();
+			let released = client.stats().unwrap_or(empty);
+			print(i"released:sources={released[0]} live={released[1]} asks={released[2]}");
+
+			// A per-KEY lease is a first demand too, and mints the same way.
+			let keyed: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let one = keyed.sub_key(2, |row| match row {
+				Option::Some(let task) => print(i"key:{task.title}"),
+				Option::None => {},
+			});
+			let _asked = client.stats();
+			let keyleased = client.stats().unwrap_or(empty);
+			print(i"keyleased:sources={keyleased[0]} live={keyleased[1]} asks={keyleased[2]}");
+			one.dispose();
+			let _quiet = client.stats();
+			let keyreleased = client.stats().unwrap_or(empty);
+			print(i"keyreleased:sources={keyreleased[0]} live={keyreleased[1]} asks={keyreleased[2]}");
+
+			// Dedup is by source AND frame shape. These two handles name one
+			// cell and must NOT share a channel: one carries `Patch` frames,
+			// the other `Update`s, and a mirror handed the wrong one would
+			// simply never seed.
+			let patched: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let whole: RemoteSource<List<Task>> = client.rows_in("alpha");
+			let holding_patched = patched.sub(|_rows| {});
+			let holding_whole = whole.sub(|_rows| {});
+			let _both = client.stats();
+			let shapes = client.stats().unwrap_or(empty);
+			print(i"shapes:sources={shapes[0]} live={shapes[1]}");
+			print(i"patched:{patched.get().unwrap_or([]).len()} whole:{whole.get().unwrap_or([]).len()}");
+			holding_patched.dispose();
+			holding_whole.dispose();
+			print("done");
+			exit(0);
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+}
+"#;
 
 /// A79: an `[rpc]` method returning a `KeyedCell<K, T>` hands the client a
 /// `KeyedSource<K, T>` — §9.2's third row, in A92's sync unleased shape.
