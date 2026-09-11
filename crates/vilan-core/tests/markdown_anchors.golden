@@ -310,6 +310,7 @@ std/collections.md h3 splicing
 std/collections.md h3 joining
 std/collections.md h2 mapk-v
 std/collections.md h2 sett
+std/collections.md h2 memok-v
 std/collections.md h2 hashable
 std/collections.md h2 range
 std/collections.md h2 iterator

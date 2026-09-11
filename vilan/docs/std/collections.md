@@ -286,6 +286,56 @@ fun main() {
 }
 ```
 
+## `Memo<K, V>`
+
+```vilan,fragment
+impl Memo<type K: Hashable, type V> {
+	fun new(): Memo<K, V>
+	fun get_or(self, key: K, make: || V): V
+	fun get(self, key: K): Option<V>
+	fun forget(self, key: K)
+	fun clear(self)
+	fun len(self): i32
+}
+```
+
+A per-key cache of values **made on first ask**. `get_or` answers what is held
+for `key`, or runs `make`, keeps the result and answers that. `get` is the
+passive read — it makes nothing.
+
+```vilan
+import std::memo::Memo;
+
+fun main() {
+	let squares: Memo<i32, i32> = Memo::new();
+	print(squares.get_or(7, || 7 * 7));   // 49 -- made
+	print(squares.get_or(7, || 0));       // 49 -- held; the maker did not run
+	squares.forget(7);
+	print(squares.len());                 // 0
+}
+```
+
+`make` runs **at the call site**, which is what makes a memo usable for values
+that read an ambient context — the one this exists for is a remote handle:
+
+```vilan,fragment
+// One handle per id, shared by every call site (`guide/services.md`).
+let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
+
+fun body_of(id: str): RemoteSource<MessageBody> {
+	bodies.get_or(id, || client().get_message(id))
+}
+```
+
+Two views asking for the same row then lease the *same* mirror instead of
+minting a second one, so a row that re-renders finds the handle it had.
+Nothing is evicted by itself, and a remote handle needs no eviction to stay
+correct — demand decides its channel's life, and a released mirror re-mints on
+the next lease. `forget` is yours, for a value that turned out wrong.
+
+It holds a `Shared` table inside, so a `Memo` bound with `let` at module level
+is written by every call site that reads it; no `mut` is needed.
+
 ## `Hashable`
 
 A key's value is turned into a `Hash` (a canonical key) by `key.hash()`. Three

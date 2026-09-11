@@ -39,6 +39,7 @@ import pkg::reactive::{
 	fresh_id,
 	get_owner,
 	queue_microtask,
+	register_with_owner,
 	turn,
 };
 import pkg::result::Result::{ self, Err, Ok };
@@ -1752,6 +1753,12 @@ struct Capability {
 	/// dropped, source freed. A field channel has no origin and is re-attached
 	/// positionally, so its `Unsubscribe` stays demand-only (A41).
 	dynamic: bool,
+	/// The SOURCE this channel carries, as the identity of its canonical cell
+	/// (`SignalCell.id`) — `0 - 1` on a channel no cell identity applies to.
+	/// What `expose_dynamic` dedups on (A92): a second reply carrying the
+	/// same cell answers the channel the first one minted, so a getter two
+	/// views call is one capability and one forward rather than two of each.
+	identity: i32,
 }
 
 /// A resolved per-key subscription: which key (canonically), and how to start
@@ -1770,6 +1777,27 @@ struct LiveForward {
 	channel: i32,
 	key: Option<Hash>,
 	subscription: Subscription,
+	/// How many CLIENT mirrors this one forward is serving — every
+	/// `Subscribe` for this demand +1, every `Unsubscribe` −1. One, until
+	/// dedup (A92) put two mirrors on one channel; the forward is disposed at
+	/// zero and NEVER while another mirror still holds it, which is the
+	/// obligation dedup creates: one mirror's last release is no longer the
+	/// demand's.
+	///
+	/// Per DEMAND rather than per channel, because that is the grain a keyed
+	/// channel releases at: two mirrors sharing a keyed channel hold
+	/// independent per-key leases, and one of them dropping key `k` must not
+	/// stop the other's `k` forward.
+	///
+	/// It counts FRAMES, and it can because the client counts LEASES: a
+	/// mirror sends one `Subscribe` per 0→1 and one `Unsubscribe` per flushed
+	/// 1→0, so the two sides agree by construction. A client that asks twice
+	/// holds its OWN channel open until the connection closes and disturbs
+	/// nothing else — the same bargain the idempotent forward always struck.
+	///
+	/// A `Shared` because the list is iterated by VALUE: a copied
+	/// `LiveForward` must still count into the one hold.
+	holds: Shared<i32>,
 }
 
 /// Two subscribed keys, or two absences, are the same demand.
@@ -1831,7 +1859,7 @@ impl ReactiveServer {
 		});
 		self.sources
 			.write()
-			.push((channel, Capability { start = starter, resolve = None, dynamic = false }));
+			.push((channel, Capability { start = starter, resolve = None, dynamic = false, identity = 0 - 1 }));
 		channel
 	}
 
@@ -1856,19 +1884,49 @@ impl ReactiveServer {
 	/// `reply_source`, the only caller that matters — cannot pass an opaque
 	/// `S`. `expose` keeps the open form for the field path, where every call
 	/// site is a concrete field.
+	///
+	/// DEDUPED BY SOURCE IDENTITY (A92). Two calls that answer the same cell
+	/// — the same getter from two views, a re-mint after the last lease left
+	/// — are one source, and minting a second channel for it would cost a
+	/// second capability, a second forward and a second copy of every update
+	/// for a value the client already has. The cell's own `id` is the key;
+	/// the `sources` table is the index, so nothing is retained past a
+	/// `revoke` that a live capability does not already retain.
+	///
+	/// What dedup obliges is the counting on the other side: a shared channel
+	/// outlives any one mirror's release (`LiveForward.holds`).
 	fun expose_dynamic<T: Wire>(self, source: SignalCell<T>): i32 {
-		let channel = fresh_channel();
-		let transport = self.transport;
-		let codec = self.codec;
-		let starter = || source.sub(|value| {
-			transport.send(encode_update(codec, channel, |serializer: Serializer| {
-				value.describe(serializer);
-			}));
-		});
-		self.sources
-			.write()
-			.push((channel, Capability { start = starter, resolve = None, dynamic = true }));
-		channel
+		match self.dynamic_channel_for(source.id) {
+			Some(let held) => held,
+			None => {
+				let channel = fresh_channel();
+				let transport = self.transport;
+				let codec = self.codec;
+				let starter = || source.sub(|value| {
+					transport.send(encode_update(codec, channel, |serializer: Serializer| {
+						value.describe(serializer);
+					}));
+				});
+				self.sources
+					.write()
+					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity = source.id }));
+				channel
+			},
+		}
+	}
+
+	/// The DYNAMIC channel already carrying the source with this identity, if
+	/// this connection has one (A92). A linear scan of the capability table,
+	/// which is the same cost every inbound control frame already pays
+	/// (`capability_of`) and is paid here once per handle mint.
+	fun dynamic_channel_for(self, identity: i32): Option<i32> {
+		for entry in self.sources.read() {
+			let (id, capability) = entry;
+			if capability.dynamic && capability.identity == identity {
+				ret Some(id);
+			}
+		}
+		None
 	}
 
 	/// Export a KEYED `List<T>`: subscribers receive element-grained `Patch`
@@ -1932,7 +1990,7 @@ impl ReactiveServer {
 		};
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false }));
+			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1 }));
 		channel
 	}
 
@@ -1968,7 +2026,7 @@ impl ReactiveServer {
 		};
 		self.sources
 			.write()
-			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false }));
+			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1 }));
 		channel
 	}
 
@@ -1983,16 +2041,60 @@ impl ReactiveServer {
 		None
 	}
 
-	/// Whether a forward for exactly this demand is already running.
-	fun forwarding(self, channel: i32, key: Option<Hash>): bool {
+	/// The forward already running for exactly this demand, if one is.
+	fun forward_for(self, channel: i32, key: Option<Hash>): Option<LiveForward> {
 		for forward in self.live.read() {
 			if forward.channel == channel {
 				if same_demand(forward.key, key) {
-					ret true;
+					ret Some(forward);
 				}
 			}
 		}
-		false
+		None
+	}
+
+	/// Start — or JOIN — the forward for one demand. IDEMPOTENT per demand,
+	/// as it has always been (`proposal/remote-sources.md` §3: one demand, one
+	/// forward, however many times a client asks), and since A92 the join
+	/// also COUNTS: a deduped channel serves two mirrors, and the hold is what
+	/// says how many of them one forward is for.
+	fun open_forward(self, channel: i32, key: Option<Hash>, start: || Subscription) {
+		match self.forward_for(channel, key) {
+			Some(let held) => held.holds.write() = held.holds.read() + 1,
+			None => {
+				let subscription = start();
+				self.live
+					.write()
+					.push(LiveForward { channel, key, subscription, holds = Shared::new(1) });
+			},
+		}
+	}
+
+	/// One hold on a demand released: the forward is disposed when the last
+	/// one goes and kept while any remains. Answers whether the CHANNEL now
+	/// carries no forward at all, which is what withdraws a dynamic one.
+	fun close_forward(self, channel: i32, key: Option<Hash>): bool {
+		mut kept: List<LiveForward> = [];
+		mut remaining = 0;
+		for forward in self.live.read() {
+			mut keep = true;
+			if forward.channel == channel && same_demand(forward.key, key) {
+				let after = forward.holds.read() - 1;
+				forward.holds.write() = after;
+				if after <= 0 {
+					forward.subscription.dispose();
+					keep = false;
+				}
+			}
+			if keep {
+				kept.push(forward);
+				if forward.channel == channel {
+					remaining = remaining + 1;
+				}
+			}
+		}
+		self.live.write() = kept;
+		remaining == 0
 	}
 
 	/// A client subscribed to the whole channel: start its forward. `sub` fires
@@ -2003,14 +2105,8 @@ impl ReactiveServer {
 	/// client never asks twice, and the server does not rely on that for its
 	/// own correctness).
 	fun start(self, channel: i32) {
-		if self.forwarding(channel, None) {
-			ret;
-		}
 		match self.capability_of(channel) {
-			Some(let capability) => {
-				let subscription = (capability.start)();
-				self.live.write().push(LiveForward { channel, key = None, subscription });
-			},
+			Some(let capability) => self.open_forward(channel, None, capability.start),
 			None => {},
 		}
 	}
@@ -2023,14 +2119,7 @@ impl ReactiveServer {
 	fun start_key(self, channel: i32, deserializer: Deserializer) {
 		match self.resolve_key(channel, deserializer) {
 			None => {},
-			Some(let resolved) => {
-				if !self.forwarding(channel, Some(resolved.key)) {
-					let subscription = (resolved.start)();
-					self.live
-						.write()
-						.push(LiveForward { channel, key = Some(resolved.key), subscription });
-				}
-			},
+			Some(let resolved) => self.open_forward(channel, Some(resolved.key), resolved.start),
 		}
 	}
 
@@ -2067,10 +2156,23 @@ impl ReactiveServer {
 	/// added: demand decides, and the server already knows which kind of
 	/// channel it minted.
 	fun release_demand(self, channel: i32) {
-		if self.dynamic_channel(channel) {
+		self.release_hold(channel, None);
+	}
+
+	/// One demand's `Unsubscribe`, whole-collection or keyed: release the
+	/// hold, and — on a DYNAMIC channel that now carries no forward at all —
+	/// withdraw it.
+	///
+	/// "No forward at all" rather than "this forward is gone" is dedup's
+	/// doing (A92): two mirrors may share a channel, and a keyed channel
+	/// carries one forward per demand, so the channel is finished with only
+	/// when the last of them has let go. A dynamic channel that never had a
+	/// forward is withdrawn by the first `Unsubscribe` it sees, which is what
+	/// keeps the owner hook (`release_unleased`) meaning what it did.
+	fun release_hold(self, channel: i32, key: Option<Hash>) {
+		let drained = self.close_forward(channel, key);
+		if drained && self.dynamic_channel(channel) {
 			self.revoke(channel);
-		} else {
-			self.stop(channel);
 		}
 	}
 
@@ -2091,7 +2193,7 @@ impl ReactiveServer {
 	/// such remount silently dead, so revoking a channel is a separate,
 	/// deliberate act: `revoke` (A41).
 	fun stop(self, channel: i32) {
-		self.stop_forward(channel, None);
+		let _drained = self.close_forward(channel, None);
 	}
 
 	/// The keyed half of `stop` — the per-key lease reaching zero. Releases one
@@ -2099,21 +2201,8 @@ impl ReactiveServer {
 	fun stop_key(self, channel: i32, deserializer: Deserializer) {
 		match self.resolve_key(channel, deserializer) {
 			None => {},
-			Some(let resolved) => self.stop_forward(channel, Some(resolved.key)),
+			Some(let resolved) => self.release_hold(channel, Some(resolved.key)),
 		}
-	}
-
-	/// Dispose the forward for exactly one demand.
-	fun stop_forward(self, channel: i32, key: Option<Hash>) {
-		mut kept: List<LiveForward> = [];
-		for forward in self.live.read() {
-			if forward.channel == channel && same_demand(forward.key, key) {
-				forward.subscription.dispose();
-			} else {
-				kept.push(forward);
-			}
-		}
-		self.live.write() = kept;
 	}
 
 	/// Withdraw a channel: stop EVERY forward on it — the whole-collection one
@@ -2625,6 +2714,37 @@ impl ReactiveClient {
 	/// retires `invalidate_dynamic` for every mirror a generated client holds.
 	fun minted_source<T: Wire>(self, channel: i32, origin: Origin): RemoteSource<T> {
 		let mirror: RemoteSource<T> = self.mirror_of(channel, Some(origin));
+		self.watch_minted(mirror);
+		mirror
+	}
+
+	/// A remote handle for a call that has NOT been made yet (A92) — what a
+	/// handle stub hands back now that it is sync. The mirror is minted
+	/// UNLEASED: no channel, no capability on the server, no frame on the
+	/// wire, `released` already true so the first 0→1 lease runs `remint` and
+	/// the shipped re-mint path (`acquire` → `remint` → `rebind`) becomes the
+	/// first mint.
+	///
+	/// The point of the shape is what it costs when nothing watches it, and
+	/// that is now exactly nothing: an app that mints a hundred handles and
+	/// renders ten makes TEN calls, where the async stub made a hundred and
+	/// left ninety capabilities on the server for the connection's life. It
+	/// is also why the stub can be sync at all — there is no reply to await
+	/// when there is no call.
+	///
+	/// The channel id is `0 - 1`, which `fresh_channel` (counting from 0)
+	/// never hands out, so the inbound route this registers matches nothing
+	/// until the mint lands and `rebind` moves the shared id cell.
+	fun unleased_source<T: Wire>(self, origin: Origin): RemoteSource<T> {
+		let mirror: RemoteSource<T> = self.mirror_of(0 - 1, Some(origin));
+		mirror.released.write() = true;
+		self.watch_minted(mirror);
+		mirror
+	}
+
+	/// The two things every minted mirror owes its client, shared by both
+	/// mints: the reconnect REPLAY and the owner hook (R3, point 4).
+	fun watch_minted<T: Wire>(self, mirror: RemoteSource<T>) {
 		// Only a WATCHED mirror is replayed: an unwatched one costs a call it
 		// does not need, and its next lease re-mints anyway (`acquire`).
 		self.replays.write().push(|| {
@@ -2633,7 +2753,6 @@ impl ReactiveClient {
 			}
 		});
 		defer_to_owner(|| mirror.release_unleased());
-		mirror
 	}
 
 	/// Re-issue every WATCHED minted mirror's origin call and rebind it — the
@@ -2690,6 +2809,7 @@ impl ReactiveClient {
 			origin,
 			released = Shared::new(false),
 			leased = Shared::new(false),
+			mint = SignalCell::new(None),
 		}
 	}
 
@@ -2837,8 +2957,10 @@ impl ReactiveClient with Disposable {
 }
 
 /// What is locally KNOWN about a mirror (`RemoteSource::status`): whether a
-/// value has arrived. Derived from the cache alone — so an UNWATCHED mirror
-/// reads `Waiting` forever, correctly: nothing opened its channel.
+/// value has arrived, and — since A92 — what the last MINT said when it did
+/// not answer a channel. Still derived from what the mirror was TOLD, so an
+/// UNWATCHED mirror reads `Waiting` forever, correctly: nothing opened its
+/// channel, and nothing has been asked on its behalf.
 [derive(PartialEq, Debug)]
 enum Status {
 	/// Nothing has arrived yet. This is what an unwatched mirror reads, for
@@ -2846,6 +2968,23 @@ enum Status {
 	Waiting,
 	/// The cache holds a value.
 	Ready,
+	/// The minting call answered "there is no such source": the `None` of an
+	/// `[rpc]` method written `Option<SignalCell<T>>` (A92). No channel was
+	/// minted, so `get()` stays `None` and no frame is owed.
+	///
+	/// An answer about NOW, not forever — a row the server does not have yet
+	/// may exist on the next ask — so the next 0→1 lease asks again, exactly
+	/// as `Failed` does.
+	Absent,
+	/// The minting call FAILED, and this is what it said. The mirror keeps
+	/// whatever it last held (a stale value beats a blank one while the
+	/// channel is gone), and the next 0→1 lease retries.
+	///
+	/// This is the arm that carries an error the async stub used to hand back
+	/// as `Result::Err` at the call site. A sync stub has no `Result` to put
+	/// one in, so the failure lands where every other fact about a mirror
+	/// already lives: in what `status()` reports.
+	Failed(RpcError),
 }
 
 /// A remote read-only handle, typed end to end: the local mirror holds
@@ -2886,11 +3025,22 @@ struct Origin {
 	/// and re-running the method with anything else would be a different
 	/// question.
 	describers: List<|Serializer| void>,
-	/// Issue that call again and answer the fresh channel id. Closed over the
+	/// Issue that call and answer the channel id it named. Closed over the
 	/// generated client's transport and codec at the mint, which is the only
 	/// place both are in hand — `RemoteSource` holds the reactive duplex, not
 	/// the rpc transport, and is generic over its element alone.
-	reissue: async |str, List<|Serializer| void>| Result<i32, RpcError>,
+	///
+	/// The answer is three-valued, which is what the SYNC stub needs (A92):
+	/// `Ok(Some(channel))` is a channel to bind onto, `Ok(None)` is the
+	/// server saying there is no such source (the `Option<SignalCell<T>>`
+	/// form's `None` reply — `Status::Absent`), and `Err(failure)` is the
+	/// call itself failing (`Status::Failed`). The plain form can only answer
+	/// the first two of those and wraps its id in `Some`.
+	///
+	/// It is called for the FIRST mint as well as for every re-mint, because
+	/// under A92 there is no other mint: the stub hands back an unleased
+	/// mirror and this is what the first lease runs.
+	reissue: async |str, List<|Serializer| void>| Result<Option<i32>, RpcError>,
 }
 
 struct RemoteSource<T> {
@@ -2931,6 +3081,18 @@ struct RemoteSource<T> {
 	// server at its last release, so its OWNER's disposal is the only event
 	// that can free the capability it minted.
 	leased: Shared<bool>,
+	// What the last MINT said, when it said something other than "here is
+	// your channel" (A92): `Some(Status::Absent)` for an `Option` handle the
+	// server answered `None` with, `Some(Status::Failed(e))` for a call that
+	// failed. `None` means nothing is wrong and the cache alone decides
+	// between `Waiting` and `Ready`.
+	//
+	// A cell rather than a plain field because `status()` is a live read: a
+	// mirror that fails its mint, is released and re-leased must be seen to
+	// recover, and a `status` observer watching a spinner is exactly who
+	// needs to see it. Cleared by `rebind`, which is the one event that
+	// retires whatever the last attempt said.
+	mint: SignalCell<Option<Status>>,
 }
 
 /// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
@@ -3051,11 +3213,37 @@ impl RemoteSource<type T> {
 	/// correct — the channel was never opened. Any path that renders the value
 	/// when it arrives (`sub`, `map`, `or`) subscribes; the count is what
 	/// makes that harmless.
+	///
+	/// TWO cells feed it since A92 — the cache and what the last mint said —
+	/// so it is written out rather than derived with `map`. `combine` would
+	/// say the same thing in one line and cannot be used: it is variadic over
+	/// DISTINCT element types, and a `RemoteSource<Status>` would hand it two
+	/// `SignalCell<Option<Status>>`s. Both subscriptions are
+	/// `register_with_owner`'s, exactly as `SignalCell::map`'s one is, so
+	/// `status` stays owner-OPTIONAL and callable at the top of `main`.
 	fun status(self): SignalCell<Status> {
-		self.cache.map(|value| match value {
-			Some(let _present) => Status::Ready,
-			None => Status::Waiting,
-		})
+		let derived = SignalCell::new(self.known());
+		let _cached = register_with_owner(self.cache.on_change(|_value| {
+			derived.set(self.known());
+		}));
+		let _minted = register_with_owner(self.mint.on_change(|_told| {
+			derived.set(self.known());
+		}));
+		derived
+	}
+
+	/// `status`'s answer, once: what the mirror was last TOLD wins over what
+	/// it holds, because it is the newer fact about the channel. A mirror
+	/// whose re-mint failed reads `Failed` while still serving its last value
+	/// through `get` — the value is stale and the status is what says so.
+	fun known(self): Status {
+		match self.mint.get() {
+			Some(let told) => told,
+			None => match self.cache.get() {
+				Some(let _present) => Status::Ready,
+				None => Status::Waiting,
+			},
+		}
 	}
 
 	/// Observe each value as it lands, present values only (the `None` before
@@ -3108,6 +3296,18 @@ impl RemoteSource<type T> {
 	/// lands. The cached last value stays as the seed meanwhile: it is what
 	/// the mirror was last told, and painting it beats painting `Waiting` for
 	/// a round trip.
+	/// And under A92 the third case is also the FIRST one: a handle stub hands
+	/// back a mirror minted UNLEASED — no channel, `released` already true —
+	/// so the first lease takes this same branch and the re-mint path IS the
+	/// mint. A handle nothing ever watches therefore costs nothing at all:
+	/// no call, no capability, no frame.
+	///
+	/// A lease taken while a mint is IN FLIGHT joins it rather than issuing a
+	/// second call. `remint` clears `released` before it awaits, so this
+	/// branch is not reached twice, and the rebind that lands re-subscribes
+	/// for whatever demand exists by then (`rebind` reads the count, not the
+	/// lease that started it) — one call, however many leases arrive during
+	/// the round trip.
 	fun acquire(self) {
 		let before = self.count.read();
 		self.count.write() = before + 1;
@@ -3136,15 +3336,29 @@ impl RemoteSource<type T> {
 				// below re-subscribes for whatever demand exists by then.
 				self.released.write() = false;
 				let _reminting = async {
-					let fresh: Result<i32, RpcError> = (origin.reissue)(origin.method, origin.describers);
+					let fresh: Result<Option<i32>, RpcError> = (origin.reissue)(origin.method, origin.describers);
 					match fresh {
-						// Unreachable: the socket is already dying and the
-						// reconnect path re-issues this same origin. Marked
-						// released again so a later lease tries once more.
-						Err(let _unreachable) => {
+						// The call failed. Under A92 this is a REACHABLE arm
+						// and the mirror's only way to say so: the sync stub
+						// handed out no `Result`, so the failure is reported
+						// through `status()` and the mirror is marked released
+						// again, which is what makes the next 0→1 lease retry.
+						Err(let failure) => {
 							self.released.write() = true;
+							self.mint.set(Some(Status::Failed(failure)));
 						},
-						Ok(let channel) => self.rebind(channel, encode_control(self.codec, "Subscribe", channel)),
+						Ok(let answered) => match answered {
+							// The server has no such source (the `Option`
+							// form's `None` reply): nothing was minted, so
+							// there is nothing to bind onto and nothing to
+							// release. Released stays true, so a later lease
+							// asks again — an absence is an answer about now.
+							None => {
+								self.released.write() = true;
+								self.mint.set(Some(Status::Absent));
+							},
+							Some(let channel) => self.rebind(channel, encode_control(self.codec, "Subscribe", channel)),
+						},
 					}
 				};
 			},
@@ -3162,11 +3376,26 @@ impl RemoteSource<type T> {
 	/// connection, which frees every channel it ever minted in one act
 	/// (`drop_session`). That is documented rather than refused — a handle
 	/// fetched at the top of `main` is a real shape, and it is not a leak.
+	/// Under A92 the commonest unleased mirror has nothing to send here at
+	/// all: a handle stub's mirror is born `released`, so a handle the app
+	/// took and never watched never minted a capability in the first place.
+	/// The hook still earns its keep for the mirror that DID mint and whose
+	/// demand is gone — a `[expose]`-less mirror handed out by
+	/// `ReactiveClient::source`, and any mirror a rebind left unwatched.
 	fun release_unleased(self) {
-		if !self.leased.read() && !self.released.read() {
+		if !self.leased.read() && !self.released.read() && self.minted() {
 			self.released.write() = true;
 			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
 		}
+	}
+
+	/// Whether this mirror is pointed at a real channel. `fresh_channel`
+	/// counts from 0, so the negative id an unleased mint (A92) and
+	/// `invalidate_dynamic` both write names no channel any session ever
+	/// hands out — and a control frame carrying it would be noise the server
+	/// can only drop.
+	fun minted(self): bool {
+		self.channel.read() >= 0
 	}
 
 	/// Release a lease. 1→0 marks the mirror closing and defers the
@@ -3230,7 +3459,13 @@ impl RemoteSource<type T> {
 	fun close_now(self) {
 		if self.closing.read() {
 			self.closing.write() = false;
-			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			// A mirror whose mint has not landed yet has no channel to close:
+			// its lease came and went inside the round trip (A92). The
+			// `released` mark below is still owed — the next lease must ask
+			// again rather than `Subscribe` on an id the mirror never had.
+			if self.minted() {
+				(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			}
 			match self.origin {
 				Some(let _minting) => {
 					self.released.write() = true;
@@ -3255,6 +3490,9 @@ impl RemoteSource<type T> {
 		// The fresh channel is live, whatever became of the old one — a
 		// withdrawn dynamic id (R3) or a whole dead session.
 		self.released.write() = false;
+		// And whatever the last mint said is history: an `Absent` or a
+		// `Failed` describes an attempt this one replaced (A92).
+		self.mint.set(None);
 		if self.count.read() > 0 {
 			(self.transport).send(subscribe);
 		}
@@ -4520,6 +4758,9 @@ macro fun service(item: Item): Source {
 	mut handle_kinds: List<str> = [];
 	mut handle_elements: List<str> = [];
 	mut handle_returns: List<str> = [];
+	// What the CONTRACT SURFACE names, which is the stub's type everywhere but
+	// the `Option` form — see below.
+	mut surface_returns: List<str> = [];
 	mut any_handle = false;
 	for method in target.methods {
 		mut kind = "";
@@ -4549,12 +4790,34 @@ macro fun service(item: Item): Source {
 		// the client will decode: a server that turns a handle return into a
 		// plain value moves the hash, and a stale client is refused before it
 		// can read a `ChannelId` as a `MessageBody`.
-		if kind == "plain" {
-			handle_returns.push(i"RemoteSource<{element}>");
-		} else if kind == "option" {
-			handle_returns.push(i"Option<RemoteSource<{element}>>");
-		} else {
+		if kind == "" {
 			handle_returns.push(method.return_type.render());
+		} else {
+			// BOTH written forms map to the same mirror TYPE (A92). The
+			// `Option` is not carried into the client's type: a mirror already
+			// has a vocabulary for "the server has no such source" —
+			// `Status::Absent`, with `get()` answering `None` — and an
+			// `Option<RemoteSource<T>>` would ask the caller to take apart an
+			// absence that was only ever true at the instant of the reply,
+			// then hold whichever half it got forever.
+			handle_returns.push(i"RemoteSource<{element}>");
+		}
+		// The CONTRACT SURFACE is not quite the stub's type, and this is the
+		// one place they part. The two written forms answer the same type and
+		// DECODE DIFFERENTLY — the plain form's reply is an `i32`, the
+		// `Option` form's an `Option<i32>` — so a surface that rendered both
+		// as `RemoteSource<T>` would let a client generated against one
+		// connect to a server written in the other and read a `null` as a
+		// channel. The `?` says "the reply may be absent": it moves the
+		// `Option` form's hash off what it was, keeps the two forms apart, and
+		// leaves the plain form's bytes exactly where they were.
+		if kind == "option" {
+			surface_returns.push(i"RemoteSource<{element}>?");
+		} else {
+			surface_returns.push(match handle_returns.get(handle_returns.len() - 1) {
+				Some(let rendered) => rendered,
+				None => method.return_type.render(),
+			});
 		}
 	}
 
@@ -4575,7 +4838,7 @@ macro fun service(item: Item): Source {
 			}
 			surface = surface + parameter.type_.render();
 		}
-		let rendered_return = match handle_returns.get(surface_index) {
+		let rendered_return = match surface_returns.get(surface_index) {
 			Some(let found) => found,
 			None => method.return_type.render(),
 		};
@@ -4884,68 +5147,63 @@ macro fun service(item: Item): Source {
 		// set — be called from either end without a second spelling.
 		if method.return_type.render() == "void" {
 			stub = stub.expr(i"send_notification(self.transport, self.codec, {label}, [{describer_list}])");
+		} else if kind == "" {
+			stub = stub
+				.returns(i"Result<{mapped}, RpcError>")
+				.expr(i"call(self.transport, self.codec, {label}, [{describer_list}])");
 		} else {
-			stub = stub.returns(i"Result<{mapped}, RpcError>");
-			if kind == "" {
-				stub = stub.expr(i"call(self.transport, self.codec, {label}, [{describer_list}])");
-			} else {
-				// The MINT (§9.2). The reply is a channel id and nothing else; the
-				// mirror is built here, on the client, with the call that produced
-				// it — which is what lets demand return after the server withdrew
-				// the channel (R3) and what lets a reconnect ask for it again.
-				// `reissue` closes over the transport and codec because
-				// `RemoteSource` holds neither: it is generic over its element
-				// alone and carries the reactive duplex, not the rpc transport.
-				let origin = i"Origin \{\n"
-					+ indent(i"method = {label},", 1)
-					+ "\n"
-					+ indent(i"describers = [{describer_list}],", 1)
-					+ "\n"
-					+ indent("reissue = |handle_method: str, handle_args: List<|Serializer| void>| {", 1)
-					+ "\n"
-					+ indent(if kind == "option" {
-						"let handle_reply: Result<Option<i32>, RpcError> =\n"
-							+ indent("call(self.transport, self.codec, handle_method, handle_args);", 1)
-							+ "\n"
-							+ match_of("handle_reply")
-								.arm("Result::Err(let failure)", "Result::Err(failure)")
-								.arm_block("Result::Ok(let answered)", [
-									match_of("answered")
-										.arm("Option::Some(let fresh)", "Result::Ok(fresh)")
-										.arm("Option::None", "Result::Err(RpcError::Remote("
-											+ quote("the source this handle names no longer exists")
-											+ "))")
-										.render(),
-								])
-								.render()
-					} else {
-						"let handle_reply: Result<i32, RpcError> =\n"
-							+ indent("call(self.transport, self.codec, handle_method, handle_args);", 1)
-							+ "\nhandle_reply"
-					}, 2)
-					+ "\n"
-					+ indent("},", 1)
-					+ "\n}";
-				if kind == "option" {
-					stub = stub
-						.line(i"let handle_channel: Result<Option<i32>, RpcError> = call(self.transport, self.codec, {label}, [{describer_list}]);")
-						.expr(match_of("handle_channel!")
-							.arm_block("Option::None", [
-								i"let handle_absent: Option<RemoteSource<{element}>> = Option::None;",
-								"Result::Ok(handle_absent)",
-							])
-							.arm_block("Option::Some(let handle_id)", [
-								i"let handle_mirror: RemoteSource<{element}> = self.reactive.minted_source(handle_id, {origin});",
-								"Result::Ok(Option::Some(handle_mirror))",
-							])
-							.render());
+			// The HANDLE stub (§9.2, as A92 reshaped it): SYNC, and it makes
+			// no call. It hands back a mirror minted UNLEASED — carrying the
+			// call, having made none — and the first lease is what issues it
+			// (`acquire` → `remint` → `rebind`, the shipped re-mint path,
+			// which is therefore also the first mint).
+			//
+			// Three things follow, and they are the whole reason for the
+			// shape. A handle nothing watches costs NOTHING: no call, no
+			// capability, no frame. There is no reply to await, so the stub
+			// needs neither `async` nor `Result` and reads exactly like the
+			// value it stands for — `client.get_message(id).or(empty)` at the
+			// call site, with no bridge between a `Task` and a signal. And
+			// what a failure was, the mirror now says: `status()` reports
+			// `Failed(e)` for a call that failed and `Absent` for a `None`
+			// reply, and the next 0→1 lease asks again.
+			//
+			// `reissue` closes over the transport and codec because
+			// `RemoteSource` holds neither: it is generic over its element
+			// alone and carries the reactive duplex, not the rpc transport.
+			// It answers `Option<i32>` on both forms — `None` is the `Option`
+			// form's absent reply, which the plain form cannot produce and
+			// wraps past in `Some`.
+			let origin = i"Origin \{\n"
+				+ indent(i"method = {label},", 1)
+				+ "\n"
+				+ indent(i"describers = [{describer_list}],", 1)
+				+ "\n"
+				+ indent("reissue = |handle_method: str, handle_args: List<|Serializer| void>| {", 1)
+				+ "\n"
+				+ indent(if kind == "option" {
+					"let handle_reply: Result<Option<i32>, RpcError> =\n"
+						+ indent("call(self.transport, self.codec, handle_method, handle_args);", 1)
+						+ "\nhandle_reply"
 				} else {
-					stub = stub
-						.line(i"let handle_channel: Result<i32, RpcError> = call(self.transport, self.codec, {label}, [{describer_list}]);")
-						.line(i"let handle_mirror: RemoteSource<{element}> = self.reactive.minted_source(handle_channel!, {origin});")
-						.expr("Result::Ok(handle_mirror)");
-				}
-			}
+					"let handle_reply: Result<i32, RpcError> =\n"
+						+ indent("call(self.transport, self.codec, handle_method, handle_args);", 1)
+						+ "\n"
+						+ match_of("handle_reply")
+							.arm("Result::Err(let failure)", "Result::Err(failure)")
+							.arm("Result::Ok(let fresh)", "Result::Ok(Option::Some(fresh))")
+							.render()
+				}, 2)
+				+ "\n"
+				+ indent("},", 1)
+				+ "\n}";
+			// The annotated `let` rather than a tail expression: `T` is solved
+			// from the call's TYPES, and a binding is where this file already
+			// says so every other time it mints a mirror.
+			stub = stub
+				.returns(mapped)
+				.line(i"let handle_mirror: RemoteSource<{element}> = self.reactive.unleased_source({origin});")
+				.expr("handle_mirror");
 		}
 		client_impl = client_impl.method(stub);
 	}

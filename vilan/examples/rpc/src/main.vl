@@ -213,14 +213,14 @@ impl Session {
 
 	// A method whose RETURN TYPE is a source (transport-rpc.md §9.2) — the other
 	// half of `[expose]`, and the one that scales to state the client watches a
-	// FRACTION of. The reply carries a channel id and nothing else; the generated
-	// stub answers `Result<RemoteSource<str>, RpcError>`, so the caller reads it
-	// like any other mirror. Subscription still follows demand: a thousand notes
-	// asked for and three watched is three forwards.
+	// FRACTION of. The generated stub is SYNC and answers a bare
+	// `RemoteSource<str>`: it makes no call at all, and the FIRST LEASE is what
+	// asks (A92). So a thousand notes asked for and three watched is three calls
+	// and three forwards — the other 997 cost nothing, not even a reply.
 	//
-	// It must be safe to RE-RUN — the runtime re-issues the call when a released
-	// mirror is watched again, and after a reconnect — so it is a lookup and
-	// nothing else.
+	// It must be safe to RE-RUN — the runtime issues the call at the first lease,
+	// again when a released mirror is watched afresh, and again after a reconnect
+	// — so it is a lookup and nothing else.
 	[rpc]
 	fun note(self, id: str): SignalCell<str> {
 		self.note_cell(id)
@@ -402,19 +402,30 @@ fun session_demo() {
 	show_login(client.login("ada", "hunter2")); // -> true; "status = online" in the same turn
 	show_whoami(client.whoami()); // the session remembers -> ada (@ada)
 
-	// The handle: one call, one mirror. `note` returns a `SignalCell<str>` on the
-	// server, so the client gets a `RemoteSource<str>` over a channel the reply
-	// minted — and `edit_note`'s write reaches it in that call's own wire turn.
-	match client.note("welcome") {
-		Ok(let note) => {
-			let reading = note.sub(|text| print(i"note = {text}"));
-			print(i"edit -> {client.edit_note("welcome", "hello, ada").unwrap_or(false)}");
-			// The last lease going away withdraws the channel server-side; asking
-			// again re-issues the call, which is why `note` is a lookup.
-			reading.dispose();
-		},
-		Err(let error) => print(i"note rpc error: {error.debug()}"),
-	}
+	// The handle: one mirror, and not one frame until something watches it.
+	// `note` returns a `SignalCell<str>` on the server, so the client gets a
+	// `RemoteSource<str>` straight away — no `Result`, no await, nothing on the
+	// wire. The `sub` below is what issues the call, mints the channel and seeds
+	// the mirror.
+	//
+	// The seed is whatever the server holds WHEN THE CHANNEL OPENS, which is why
+	// only one `note =` line prints here: the mint and `edit_note` are in flight
+	// together, and the edit had landed by the time the forward started. Nothing
+	// is lost — a mirror carries the current value, not a history — and every
+	// write after the channel is open arrives on its own.
+	let note: RemoteSource<str> = client.note("welcome");
+	// Nothing has been asked yet, and the mirror says so.
+	print(i"note status = {note.status().get().debug()}");
+	let reading = note.sub(|text| print(i"note = {text}"));
+	print(i"edit -> {client.edit_note("welcome", "hello, ada").unwrap_or(false)}");
+	// A call that FAILED has no `Err` to hand back — it is reported where every
+	// other fact about a mirror lives: `status()` reads `Failed(error)` then,
+	// `Absent` where the server answered a written `Option` with `None`, and
+	// the next lease retries either way.
+	print(i"note status = {note.status().get().debug()}");
+	// The last lease going away withdraws the channel server-side; asking
+	// again re-issues the call, which is why `note` is a lookup.
+	reading.dispose();
 
 	watching.dispose();
 }

@@ -14,6 +14,7 @@ signal fields, the macro generates:
 // client side
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
+client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source; sync, unleased
 client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
 client.some_map: KeyedSource<K, V>              // per [expose(keyed)] field; a patched mirror (below)
 client.transport: SocketTransport               // connection state lives here
@@ -44,15 +45,26 @@ impl RemoteSource<type T> with Source<Option<T>> {
 
 impl RemoteSource<type T> {
 	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
-	fun status(self): SignalCell<Status>                      // passive: `Waiting` until a value has arrived, then `Ready`
+	fun status(self): SignalCell<Status>                      // passive: what the mirror was last told
 	fun or(self, initial: T): SignalCell<T>                   // counted, owner-scoped: `initial` until the first update
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
 }
 
 [derive(PartialEq, Debug)]
-enum Status { Waiting, Ready }
+enum Status {
+	Waiting,             // nothing has arrived — including "nothing has been asked"
+	Ready,               // the cache holds a value
+	Absent,              // a handle's call answered `None`: no such source
+	Failed(RpcError),    // a handle's call failed, and this is what it said
+}
 ```
+
+`Absent` and `Failed` are a **handle** mirror's arms (the stub of an `[rpc]`
+method that returns a source): they say what the minting call was told, and a
+field mirror never reads either. Both are answers about *now* — the mirror
+keeps whatever it last held, and the next 0→1 lease asks again — and both are
+cleared by the rebind that a successful ask produces.
 
 A mirror is a **`Source<Option<T>>`** (tracker A52), so `on_change`, `effect`,
 `effect_on_change` and every generic `S: Source<…>` consumer — `selector`
@@ -81,6 +93,13 @@ code with no owner: you hold the `Subscription` and `dispose` it.
 `Waiting → Ready`**: `status` reports, it does not ask; until something
 that renders the value subscribes, the mirror stays `Waiting`, and that is
 correct — the channel was never opened.
+
+A **handle** mirror takes that one step further: it is minted with no
+channel at all, and its first lease is what issues the call. So a handle
+nothing watches has not merely opened no channel — it has not asked, and
+costs nothing on either side. What the call answered is then `status()`:
+`Absent` for a `None` reply, `Failed(error)` for a call that failed, and
+the next 0→1 lease asks again in both cases.
 
 The `SignalCell<T>` that `or`/`map` return is a local derivative: writing it
 writes nothing back (the server owns the source) and the next update

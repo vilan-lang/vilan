@@ -272,7 +272,9 @@ about the type pretends otherwise. You read it one of four ways:
   of present values, and a handle you dispose yourself. For code with no
   view and no owner (a probe, a script).
 - `mirror.get(): Option<T>` and `mirror.status(): SignalCell<Status>`
-  (`Waiting` / `Ready`) — passive reads. They open nothing.
+  (`Waiting` / `Ready` / `Absent` / `Failed(RpcError)`) — passive reads.
+  They open nothing. The last two arms are a *handle* mirror's (below): a
+  call that answered "no such source", and a call that failed.
 
 A mirror is also a **`Source<Option<T>>`**, so everything the trait gives
 every other observable value is on it: `on_change` (the lazy attach — no
@@ -355,8 +357,21 @@ channel id, and what the client's stub answers is a mirror:
 
 | the server writes | the client's stub returns |
 | --- | --- |
-| `SignalCell<T>` | `Result<RemoteSource<T>, RpcError>` |
-| `Option<SignalCell<T>>` | `Result<Option<RemoteSource<T>>, RpcError>` |
+| `SignalCell<T>` | `RemoteSource<T>` |
+| `Option<SignalCell<T>>` | `RemoteSource<T>` |
+
+**The stub is sync, and it makes no call.** No `async`, no `!`, no
+`Result` — because there is nothing to await: the mirror is handed back
+*unleased*, and the **first lease** is what issues the call, mints the
+channel and seeds it. A handle nothing watches costs nothing at all —
+not a call, not a capability on the server, not a frame.
+
+Both written forms map to the same mirror. An `Option<SignalCell<T>>`
+does **not** become an `Option<RemoteSource<T>>`: a mirror already has a
+word for "the server has no such source" — `Status::Absent`, with `get()`
+answering `None` — and wrapping it would ask you to take apart an absence
+that was only true at the instant of the reply and then hold whichever
+half you got forever.
 
 ```vilan,fragment
 [service(ChatClient)]
@@ -378,9 +393,9 @@ impl Chat {
 	}
 }
 
-// At the client — one call, one mirror, read like any other:
+// At the client — no await, one mirror, read like any other:
 let ids = client.get_messages("general", 100)!;
-let body = client.get_message(ids[3])!;
+let body = client.get_message(ids[3]);
 view("p").bind_text(body.map(|value| match value {
 	Some(let message) => message.body,
 	None => "loading…",
@@ -390,9 +405,44 @@ view("p").bind_text(body.map(|value| match value {
 Everything you already know about a mirror applies to this one: it is a
 `RemoteSource<T>`, you read it with `or` / `map` / `sub` / `get` /
 `status`, and **subscription follows demand**. That last rule is what
-makes the shape affordable — a hundred handles minted and ten leased is
-a hundred capabilities on the server and **ten forwards**. A handle
-nothing watches costs one table entry and sends no frames at all.
+makes the shape affordable — a hundred handles held and ten watched is
+**ten calls and ten forwards**, and the other ninety are free.
+
+**A failure is a status, not a return.** A sync stub has no `Result` to
+put one in, so what the minting call was told is reported where every
+other fact about a mirror already lives:
+
+| `status()` | what happened |
+| --- | --- |
+| `Waiting` | nothing has arrived — including "nothing has been asked", which is what an unwatched handle reads, forever |
+| `Ready` | the mirror holds a value |
+| `Absent` | the call answered `None` — this is a method written `Option<SignalCell<T>>` saying there is no such source |
+| `Failed(error)` | the call failed, and this is what it said |
+
+`Absent` and `Failed` are both answers about *now*: the mirror keeps
+whatever it last held, and the **next** 0→1 lease asks again. So a row
+that re-renders after a failure retries by itself, and a view that shows
+a spinner or a retry button reads `status()` to decide which.
+
+**One handle per id.** Two views calling `get_message(id)` get two
+mirrors, two calls and two leases of one row. The server collapses the
+*channel* — a reply carrying a source it has already exported answers
+the channel it already minted, and withdraws it only when the last
+mirror lets go — but the client-side fix is yours and it is one line: a
+[`Memo`](../std/collections.md#memokv) keyed by the id, whose maker is
+the call.
+
+```vilan,fragment
+let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
+
+fun body_of(id: str): RemoteSource<MessageBody> {
+	bodies.get_or(id, || client().get_message(id))
+}
+```
+
+The stub does not memoize for you, deliberately: memoizing a handle is a
+decision about *identity* — which asks are the same ask — and generated
+code has no business making it.
 
 **The element must be Wire, not the source.** The `SignalCell` never
 crosses; its values do, one `Update` frame at a time. So the Wire rule
@@ -408,7 +458,8 @@ as a message.
 
 **A handle method is WebSocket-only.** Its reply is a channel id minted
 in *this connection's* capability table, so the connectionless legs
-cannot serve one. Over `POST {mount}rpc` the call fails naming the
+cannot serve one. Over `POST {mount}rpc` the call fails at its first
+lease and `status()` reads `Failed`, naming the
 method — the service's plain methods keep answering beside it, and the
 same mount's WebSocket leg serves the handle fine, so it is the route the
 client dialled that is wrong and not the mount. In process, a `local_rpc`
@@ -421,10 +472,13 @@ too, which is how `vilan/examples/rpc` is written. Everything a generated
 having assembled the client by hand.
 
 **A handle-returning method must be safe to re-run.** Its return type is
-the declaration that it is a *getter*: the runtime re-issues the call
-when a released mirror is watched again, and again after a reconnect.
-Write it as a lookup — `self.cell_for(id)` — not as something that
-counts, charges, or appends.
+the declaration that it is a *getter*: the runtime issues the call at
+the first lease, again when a released mirror is watched afresh, and
+again after a reconnect. Write it as a lookup — `self.cell_for(id)` —
+not as something that counts, charges, or appends. (This is also why the
+method body does not run when you *call* the stub: nothing has been
+asked yet. If you need a server-side effect, that is a plain `[rpc]`
+method, not a handle.)
 
 **When the server frees it.** Demand decides. A mirror's last lease
 going away sends `Unsubscribe`, and for a channel a reply minted that
@@ -437,6 +491,10 @@ channel does *not* work this way: its `Unsubscribe` is demand-only and
 its capability survives, because it is minted once per connection and a
 remount must find it on the same id.)
 
+"Last lease" means the last one on the **channel**, not on your mirror:
+where two mirrors ended up sharing a channel because they named the same
+source, the first to let go withdraws nothing.
+
 Two consequences worth having in mind. A dispose and a remount anywhere
 inside one macrotask — two event handlers, a route change, a `bind_each`
 rebuilding rows — send **nothing**: a handle's close waits for the
@@ -444,11 +502,12 @@ turn's settle and then one microtask, and a lease returning in that
 window cancels it. (A `[expose]`d field mirror keeps the prompter
 cadence: its close is due at the settle and goes then, because its
 channel survives it and there is nothing to buy by waiting.) And a
-handle minted inside a view — anywhere an owner is ambient — that
-nothing ever leases is released when that owner is disposed; minted with
-no ambient owner (at the top of `main`, say) it lives with the
-connection, which frees every channel it ever minted when the socket
-closes.
+handle held inside a view — anywhere an owner is ambient — that nothing
+ever leases is released when that owner is disposed; held with no
+ambient owner (at the top of `main`, say) it lives with the connection,
+which frees every channel it ever minted when the socket closes. A
+handle that never reached a lease has nothing to free either way: it
+never asked.
 
 ### Keyed mirrors: `[expose(keyed)]`
 

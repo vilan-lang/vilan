@@ -1,0 +1,92 @@
+// `std::memo` — `Memo<K, V>`, a per-key cache of values MADE ON FIRST ASK.
+//
+// One line of it: `memo.get_or(key, || make(key))` answers the value this memo
+// already holds for `key`, or makes it, keeps it and answers that. Everything
+// else about the type follows from what it is FOR.
+//
+// It exists for the handle idiom (`proposal/transport-rpc.md` §9.2, A92). A
+// handle stub is sync and hands back a mirror per CALL, so two views asking for
+// the same row get two mirrors — two calls, two leases, two client-side caches
+// of one server value. A memo is the app saying "one handle per id": every call
+// site asking for the same key leases the SAME mirror, so a row that re-renders
+// finds the handle it had instead of minting a second one. The server dedups
+// the channel underneath either way; this is what keeps the CLIENT from asking
+// twice, and it is the app's composition tool rather than something the stub
+// does behind its back — memoizing a handle is a decision about identity, and
+// the generated code has no business making it.
+//
+// **The maker runs at the CALL SITE**, not inside this module, and that is the
+// whole reason `get_or` takes a closure rather than a value. A maker that reads
+// an ambient context — the rpc client, the owner — is then covered by the
+// scope it was called from, which a module-level memo could never be.
+//
+// **Nothing is evicted by itself**, and for a remote handle nothing needs to
+// be: demand decides a channel's life, and a released mirror re-mints itself
+// on the next lease while painting its cached value meanwhile. `forget` is the
+// caller's, for a value that turned out wrong.
+//
+// Where it lives: its own module, like every other collection in std (`Map`,
+// `Set`, `Arena`, `NativeMap` — one type, one file named for it). std has no
+// `collections` module and inventing one for this would be a second organizing
+// principle for the same shelf.
+import pkg::hash::Hashable;
+import pkg::map::Map;
+import pkg::option::Option::{ self, None, Some };
+import pkg::shared::Shared;
+
+/// A per-key cache of values made on first ask.
+///
+/// `Shared` rather than a field the caller must hold mutably: a memo is shared
+/// by every call site that reads it — a module-level `let`, a field on a store
+/// — and `get_or` is a read from the caller's point of view even when it
+/// writes.
+struct Memo<K: Hashable, V> {
+	entries: Shared<Map<K, V>>,
+}
+
+impl Memo<type K: Hashable, type V> {
+	/// An empty memo.
+	fun new(): Memo<K, V> {
+		let entries: Map<K, V> = Map::new();
+		Memo { entries = Shared::new(entries) }
+	}
+
+	/// The value for `key` — made by `make` on the first ask, kept and answered
+	/// on every later one.
+	///
+	/// `make` runs AT THE CALL SITE and only when there is nothing held, so a
+	/// maker that reads a context reads the caller's, and a maker that costs
+	/// something (a handle mint, a parse) is paid for once.
+	fun get_or(self, key: K, make: || V): V {
+		match self.entries.read().get(key) {
+			Some(let held) => held,
+			None => {
+				let made = make();
+				self.entries.write().insert(key, made);
+				made
+			},
+		}
+	}
+
+	/// What this memo holds for `key`, if anything — the passive read, which
+	/// makes nothing.
+	fun get(self, key: K): Option<V> {
+		self.entries.read().get(key)
+	}
+
+	/// Drop the value held for `key`; the next ask makes it again.
+	fun forget(self, key: K) {
+		self.entries.write().remove(key);
+	}
+
+	/// Drop everything.
+	fun clear(self) {
+		let entries: Map<K, V> = Map::new();
+		self.entries.write() = entries;
+	}
+
+	/// How many keys this memo holds.
+	fun len(self): i32 {
+		self.entries.read().len()
+	}
+}
