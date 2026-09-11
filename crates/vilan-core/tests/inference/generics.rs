@@ -7486,3 +7486,265 @@ fn b261_the_written_out_rewrite_the_steer_names_compiles() {
         "2\n",
     );
 }
+
+// --- B288: a closure's return through a USER generic struct ------------------
+//
+// Two doors, one family (B185's: an `Unknown` that is a NOT-YET read as an
+// answer). A struct literal whose field value is still waiting on an
+// unannotated closure parameter PUBLISHED its type anyway — `Remote<any>` when
+// the value was the parameter, `Remote<List>` (an ERASED argument) when it
+// reached the parameter through a container — and both reconcile with
+// anything, so the closure's return-position check against a ground target
+// matched vacuously and never ran again (the literal's type is cached). And a
+// method call whose own generic was bound to a type with an open hole
+// (`U := List<?>`, what an empty `[]` argument binds) counted that as an
+// answer and committed, so the closure's return — which had not typed on that
+// attempt — never got to refine it.
+
+#[test]
+fn b288_a_closure_returning_a_user_generic_struct_is_checked_against_its_target() {
+    // The literal reaches the closure's parameter through a list; the
+    // published type used to be `Remote<List>`, an erased argument.
+    assert_fails_with(
+        r#"
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun take(g: |i32| Remote<List<str>>) {
+            let _ = g(1);
+        }
+
+        fun main() {
+            take(|x| Remote { seed = [x] });
+        }
+        "#,
+        "Expected Remote<List<str>>, but got Remote<List<i32>> instead.",
+    );
+}
+
+#[test]
+fn b288_a_user_generic_struct_field_that_is_the_closure_parameter_is_checked() {
+    // The value IS the parameter, so the parameter went unbound and the
+    // literal published `Remote<any>` — an `any` that satisfied everything.
+    assert_fails_with(
+        r#"
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun take(g: |i32| Remote<str>) {
+            let _ = g(1);
+        }
+
+        fun main() {
+            take(|x| Remote { seed = x });
+        }
+        "#,
+        "Expected Remote<str>, but got Remote<i32> instead.",
+    );
+}
+
+#[test]
+fn b288_a_nested_user_generic_struct_return_is_checked() {
+    // One constructor deeper: the outer literal's field is the inner literal.
+    assert_fails_with(
+        r#"
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun take(g: |i32| Remote<Remote<str>>) {
+            let _ = g(1);
+        }
+
+        fun main() {
+            take(|x| Remote { seed = Remote { seed = x } });
+        }
+        "#,
+        "Expected Remote<Remote<str>>, but got Remote<Remote<i32>> instead.",
+    );
+}
+
+#[test]
+fn b288_an_annotated_closure_parameter_stays_the_control() {
+    // The workaround kolt shipped: an annotated parameter was never a
+    // not-yet, so this door was always right for it.
+    assert_fails_with(
+        r#"
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun take(g: |i32| Remote<List<str>>) {
+            let _ = g(1);
+        }
+
+        fun main() {
+            take(|x: i32| Remote { seed = [x] });
+        }
+        "#,
+        "Expected Remote<List<str>>, but got Remote<List<i32>> instead.",
+    );
+}
+
+#[test]
+fn b288_a_closure_return_binds_a_callee_generic_through_a_user_struct() {
+    // The INFER face. `U` is reachable only through `Remote<U>` in the
+    // closure's return, and the `[]` fallback binds it to a `List` with an
+    // OPEN element — which used to win, leaving `f[0]` "never determined".
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        struct Box<type T> {
+            value: T,
+        }
+
+        impl Box<type T> {
+            fun wrap<U>(self, fallback: U, transform: |T| Remote<U>): U {
+                transform(self.value).seed
+            }
+        }
+
+        fun main() {
+            let b = Box { value = 1 };
+            let f = b.wrap([], |x| Remote { seed = [x] });
+            print(i"{f[0] + 1}");
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b288_an_empty_fallback_does_not_outrank_the_closures_return() {
+    // The REFUSE face of the same call: the annotation disagrees with what
+    // the closure actually returns, and the open `List<?>` the `[]` bound
+    // used to absorb the disagreement.
+    assert_fails_with(
+        r#"
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        struct Box<type T> {
+            value: T,
+        }
+
+        impl Box<type T> {
+            fun wrap<U>(self, fallback: U, transform: |T| Remote<U>): U {
+                fallback
+            }
+        }
+
+        fun main() {
+            let b = Box { value = 1 };
+            let f: List<str> = b.wrap([], |x| Remote { seed = [x] });
+            let _ = f.len();
+        }
+        "#,
+        "Expected List<str>, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b288_an_empty_fallback_does_not_outrank_a_closures_option_return() {
+    // `Option<U>` is the std shape the item claimed was already right; it was
+    // not — the open `List<?>` absorbed there too, and the same gate fixes it.
+    assert_fails_with(
+        r#"
+        struct Box<type T> {
+            value: T,
+        }
+
+        impl Box<type T> {
+            fun wrap<U>(self, fallback: U, transform: |T| Option<U>): U {
+                fallback
+            }
+        }
+
+        fun main() {
+            let b = Box { value = 1 };
+            let f: List<str> = b.wrap([], |x| Some([x]));
+            let _ = f.len();
+        }
+        "#,
+        "Expected List<str>, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b288_a_free_functions_closure_return_binds_through_a_user_struct() {
+    // The FREE-function path: it defers on any unresolved argument, so it
+    // needed only the literal door — the pin is what says so.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun wrap<type T, type U>(fallback: U, item: T, transform: |T| Remote<U>): U {
+            transform(item).seed
+        }
+
+        fun main() {
+            let f = wrap([], 1, |x| Remote { seed = [x] });
+            print(i"{f[0] + 1}");
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b288_a_free_functions_closure_return_is_checked_against_the_annotation() {
+    assert_fails_with(
+        r#"
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun wrap<type T, type U>(fallback: U, item: T, transform: |T| Remote<U>): U {
+            transform(item).seed
+        }
+
+        fun main() {
+            let f: List<str> = wrap([], 1, |x| Remote { seed = [x] });
+            let _ = f.len();
+        }
+        "#,
+        "Expected List<str>, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b288_a_struct_literal_whose_field_is_ready_still_resolves_at_once() {
+    // The non-regression control for the literal door: a field value with
+    // nothing to wait for is not deferred, and a generic struct literal still
+    // binds its parameters from its fields exactly as before.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Remote<type U> {
+            seed: U,
+        }
+
+        fun main() {
+            let r = Remote { seed = [1, 2, 3] };
+            print(i"{r.seed.len()}");
+        }
+        main();
+        "#,
+        "3\n",
+    );
+}

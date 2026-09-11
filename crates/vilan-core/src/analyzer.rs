@@ -28970,6 +28970,63 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// [`Self::own_generics_unbound`] for the CLOSURE-return retry gate
+    /// (B288): a generic bound to a type that still carries an `Unknown` HOLE
+    /// is not an answer either. An empty `[]` argument binds `U := List<?>` —
+    /// a real binding with an open element slot — so the "is anything still
+    /// unbound?" test said no, the call committed, and the closure's return,
+    /// which had not typed on that attempt, never got to refine it. An
+    /// `Unknown` inside the binding is exactly the hole
+    /// `bind_callee_own_generics_from_expectation` already declines to commit
+    /// on; this is the same standard applied to the retry decision.
+    ///
+    /// A binding that is merely ABSTRACT (`U := T`, the enclosing
+    /// declaration's own binder) is an ANSWER and not a hole — the caller
+    /// chose it — which is why this asks about `Unknown` and not about
+    /// [`Self::type_is_fully_determined`].
+    fn own_generics_undetermined(&self, member_id: Id, substitution: &SubstitutionContext) -> bool {
+        self.method_signature_ref(member_id)
+            .is_some_and(|(_, own_generics)| {
+                own_generics
+                    .iter()
+                    .any(|generic| match substitution.get(generic) {
+                        None => true,
+                        Some(bound) => self.type_has_an_unknown_hole(&bound.get_type(self)),
+                    })
+            })
+    }
+
+    /// Whether a type carries an `Unknown` anywhere inside it — the open
+    /// element slot of an empty `[]`, or a parameter nothing has filled.
+    /// `Unresolved` counts too: a type still mid-inference is no answer.
+    fn type_has_an_unknown_hole(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Unknown | Type::Unresolved => true,
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                arguments
+                    .iter()
+                    .any(|argument| self.type_has_an_unknown_hole(&argument.get_type(self)))
+            }
+            Type::Tuple(items) => items
+                .iter()
+                .any(|item| self.type_has_an_unknown_hole(&item.get_type(self))),
+            Type::Array(element_id, _) => self.type_has_an_unknown_hole(&element_id.get_type(self)),
+            Type::Closure(parameter_ids, return_id) => {
+                parameter_ids
+                    .iter()
+                    .any(|parameter| self.type_has_an_unknown_hole(&parameter.get_type(self)))
+                    || self.type_has_an_unknown_hole(&return_id.get_type(self))
+            }
+            Type::Any
+            | Type::Never
+            | Type::Generic(_)
+            | Type::Mapped(..)
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void => false,
+        }
+    }
+
     /// Binds the callee's own generics the call's EXPECTATION fixes — the
     /// `U` of `let widths: List<i32> = points.map(|point| ..)` — for exactly
     /// the generics the receiver and the non-closure arguments left open
@@ -29155,6 +29212,40 @@ impl<'src> Analyzer<'src> {
     /// `Local` indirections to the `Parameter` entity.
     fn is_unknown_closure_parameter(&self, expr_id: Id) -> bool {
         self.unfilled_closure_parameter(expr_id).is_some()
+    }
+
+    /// Whether a VALUE expression is still waiting on an unannotated closure
+    /// parameter's bidirectional fill — [`Self::is_unknown_closure_parameter`]
+    /// asked of the whole subtree rather than of one name, because a value is
+    /// as unready as the readiest thing inside it (`[x]`, `Wrap { inner = x }`,
+    /// `f(x)`).
+    ///
+    /// B288: the struct-literal door needs the subtree form. `is_unknown_..`
+    /// answers for the parameter ITSELF, which is the shape the call-subject,
+    /// subscript and `match` doors all meet; a field VALUE reaches the same
+    /// not-yet one constructor deep, and the literal built around it publishes
+    /// a type that is then permanent.
+    ///
+    /// A nested closure is a TERMINAL here, exactly as it is in
+    /// [`Self::drop_scan_children`] (which is what makes that walk the right
+    /// one to borrow): its own parameters fill from ITS call, and waiting on
+    /// them would be waiting on a different call's answer.
+    fn value_awaits_a_closure_parameter(&self, expr_id: Id) -> bool {
+        let mut pending = vec![expr_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        let mut children = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.is_unknown_closure_parameter(id) {
+                return true;
+            }
+            children.clear();
+            self.drop_scan_children(id, &mut children);
+            pending.extend(children.iter().copied());
+        }
+        false
     }
 
     /// [`Self::is_unknown_closure_parameter`], answering WHICH parameter: the
@@ -35268,7 +35359,7 @@ impl<'src> Analyzer<'src> {
                 // RETURN (`map<U>`'s `U`) would otherwise freeze abstract in the
                 // call's substitution and return type.
                 if unresolved_closure_argument
-                    && self.own_generics_unbound(member_id, &substitution)
+                    && self.own_generics_undetermined(member_id, &substitution)
                 {
                     return Resolution::Deferred;
                 }
@@ -38111,6 +38202,24 @@ impl<'src> Analyzer<'src> {
     ) -> FieldValueVerdict {
         let value_type = self.infer_type(value_id, field_type, substitution_context);
         if let Type::Unresolved = value_type {
+            return FieldValueVerdict::Deferred;
+        }
+        // B288: an unfilled closure parameter inside the value is a NOT-YET,
+        // not an answer — the same rule `resolve_variable` states for a
+        // binding (B185) and `resolve_is`/`resolve_match`/`resolve_subscript`
+        // for a scrutinee. It matters here because the literal's type is
+        // PUBLISHED (`resolved_types`) and read from the cache ever after: a
+        // field value that reads `Unknown` binds the struct's parameter to
+        // nothing and the literal types as `Remote<any>`, and one that reads
+        // through a container (`[x]`) binds it to an ERASED `List` — and both
+        // of those reconcile with ANYTHING, so the closure's return-position
+        // check against a ground target matched vacuously and
+        // `take(|x| Remote { seed = [x] })` satisfied a `|i32| Remote<List<str>>`
+        // parameter. Deferring lets the value type properly on the retry after
+        // the owning call fills the parameter; nothing else about the door
+        // moves, and a value that never fills is reported by the starved
+        // -parameter sweep (B131) rather than silently.
+        if self.value_awaits_a_closure_parameter(value_id) {
             return FieldValueVerdict::Deferred;
         }
         match self.reconcile_type(&value_type, field_type, substitution_context) {
