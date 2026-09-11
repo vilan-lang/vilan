@@ -3580,3 +3580,92 @@ fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
         "which is not Wire",
     );
 }
+
+// --- A86: an INHERENT impl over a bare-trait subject ------------------------
+//
+// A86 asked for `flatten` as a blanket over the read trait —
+// `impl Source<type I: Source<type U>> { fun flatten(self): SignalCell<U> }` —
+// so that any source whose element is itself a source has one, not only a
+// `SignalCell<SignalCell<U>>`. The head compiles; the CALL does not work, in
+// two distinct ways, and these two pins are the minimal repro of each with no
+// std in the picture. The inherent `flatten` stays until they are green.
+//
+// (The third spelling, `impl Source<..> { .. }` with the trait itself as the
+// subject, is refused outright and correctly: `self` is then a bare trait type
+// and "vilan has no trait objects". The generic-subject spelling below is the
+// one `MaybeSignal`'s reactive arm already uses, so it is the shape in
+// question.)
+
+#[test]
+#[ignore = "A86: an inherent blanket over a trait subject does not bind the trait's own argument at the call site"]
+fn a86_an_inherent_blanket_over_a_trait_binds_its_argument_from_the_receiver() {
+    // The member is found and the body monomorphizes — annotating the binding
+    // (`let sampled: i32 = cell.sample();`) compiles and prints 7. What does
+    // not happen is the INFERENCE: `T` is not bound from the receiver's
+    // `Cell<i32>`, so the call's type "is never fully determined" and every
+    // use of the result is refused against an unbounded parameter. That is
+    // what makes the blanket unshippable for `flatten`: it would demand an
+    // annotation at every call site that has done without one since A4,
+    // `vilan/test/reactive-flatten.vl` included.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun sample(self): T { self.get() }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            let sampled = cell.sample();
+            print(sampled + 1);
+        }
+
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+#[ignore = "A86: a blanket whose bound argument is itself bounded cannot resolve the receiver to a concrete impl"]
+fn a86_a_blanket_over_a_nested_bound_resolves_its_receiver_to_a_concrete_impl() {
+    // The nested face, and it fails harder: with the argument of the bound
+    // itself bounded (`I: Read<U>` inside `Read<I>`), the receiver is not
+    // resolved to a concrete implementation at all, so `self.get()` inside the
+    // body resolves to the TRAIT's bodiless requirement and the compiler
+    // stops with an internal error naming it — even with the result annotated,
+    // and even for a fully concrete receiver. This is the shape the A86
+    // `flatten` blanket needs (B268's machinery with B275's gap beside it).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun join(self): U { self.get().get() }
+        }
+
+        fun main() {
+            let inner = Cell { value = 7 };
+            let outer = Cell { value = inner };
+            let joined: i32 = outer.join();
+            print(joined);
+        }
+
+        main();
+        "#,
+        "7\n",
+    );
+}
