@@ -8595,3 +8595,188 @@ fn b273_an_impl_with_clause_grounds_a_sibling_bound_from_its_own_arguments() {
         "'Note' does not implement trait 'Tagged<str>'",
     );
 }
+
+// --- B275: trait ARGUMENTS through a SUPERTRAIT match ------------------------
+//
+// `satisfies_trait_bound` kept the arguments an impl provides for the required
+// trait only when the clause NAMED that trait; a clause naming a SUBTRAIT
+// (`impl SignalCell<type T> with Signal<T>`, and `trait Signal<T> with
+// Source<T>`) threaded none, so the argument comparison passed vacuously and
+// `Source<anything>` satisfied `: Source<str>`. B268 closed the direct-bound
+// half; this is the supertrait half it recorded.
+
+#[test]
+fn b275_a_supertrait_match_threads_the_bounds_arguments() {
+    // The exhibit: the only `Place` impl is the blanket over `Source<str>`, and
+    // a `SignalCell<Panel>` reaches `Source` only through `Signal` — so it used
+    // to satisfy `: Place` and the emission filter's never-empty fallback was
+    // the only thing left between that and an internal-error report.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel {}
+
+        trait Place {
+            fun place(self): str;
+        }
+
+        impl type S: Source<str> with Place {
+            fun place(self): str { "placed" }
+        }
+
+        fun slot<P: Place>(part: P): str {
+            part.place()
+        }
+
+        fun main() {
+            let signal_of_panel: SignalCell<Panel> = Signal::new(Panel {});
+            print(slot(signal_of_panel));
+        }
+        "#,
+        "'SignalCell<Panel>' does not implement trait 'Place'",
+    );
+}
+
+#[test]
+fn b275_a_supertrait_match_at_the_right_argument_still_satisfies() {
+    // The counterweight, and the one that proves the threading SUBSTITUTES
+    // rather than merely refusing: `SignalCell<str>` reaches `Source<str>`
+    // through `Signal<str>`, and the blanket applies to it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Place {
+            fun place(self): str;
+        }
+
+        impl type S: Source<str> with Place {
+            fun place(self): str { "placed" }
+        }
+
+        fun slot<P: Place>(part: P): str {
+            part.place()
+        }
+
+        fun main() {
+            let signal_of_text: SignalCell<str> = Signal::new("hi");
+            print(slot(signal_of_text));
+        }
+        main();
+        "#,
+        "placed\n",
+    );
+}
+
+#[test]
+fn b275_a_user_supertrait_chain_threads_its_arguments() {
+    // Two levels of user traits, with the argument RENAMED on the way up
+    // (`Middle<M>` passes `M` to `Base<M>`): the substitution is the walk's,
+    // not a same-name coincidence.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<B> {
+            fun base(self): B;
+        }
+
+        trait Middle<M> with Base<M> {
+            fun middle(self): M;
+        }
+
+        struct Holder {}
+
+        impl Holder with Middle<i32> {
+            fun base(self): i32 { 1 }
+            fun middle(self): i32 { 1 }
+        }
+
+        fun needs<T: Base<str>>(value: T): str {
+            value.base()
+        }
+
+        fun main() {
+            print(needs(Holder {}));
+        }
+        "#,
+        "'Holder' does not implement trait 'Base<str>'",
+    );
+}
+
+#[test]
+fn b275_a_user_supertrait_chain_at_the_right_argument_satisfies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<B> {
+            fun base(self): B;
+        }
+
+        trait Middle<M> with Base<M> {
+            fun middle(self): M;
+        }
+
+        struct Holder {}
+
+        impl Holder with Middle<str> {
+            fun base(self): str { "base" }
+            fun middle(self): str { "middle" }
+        }
+
+        fun needs<T: Base<str>>(value: T): str {
+            value.base()
+        }
+
+        fun main() {
+            print(needs(Holder {}));
+        }
+        main();
+        "#,
+        "base\n",
+    );
+}
+
+#[test]
+fn b275_a_bool_signal_is_not_an_attribute_value() {
+    // The std face, and the one real program the census found: an element
+    // attribute's blanket is `impl type S: Source<str> with AttrValue`, and a
+    // `SignalCell<bool>` reaches `Source` through `Signal` — so it satisfied
+    // the bound and `set_attribute(name, true)` shipped, correct only by JS
+    // coercion. kolt's `views.vl` carried exactly one such site.
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::view;
+
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _bad = <div data-b(flag) />;
+        }
+        "#,
+        "'SignalCell<bool>' does not implement trait 'AttrValue'",
+    );
+}
+
+#[test]
+fn b275_a_str_signal_is_still_an_attribute_value() {
+    // Its control: the blanket's own instantiation is untouched.
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
+        import std::ui::view;
+
+        fun main() {
+            let text: SignalCell<str> = Signal::new("on");
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                let _good = <div data-a(text) />;
+            });
+        }
+        "#,
+    );
+}

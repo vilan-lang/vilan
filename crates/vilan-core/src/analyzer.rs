@@ -4944,10 +4944,27 @@ impl<'src> Analyzer<'src> {
                 });
         }
         // Each candidate keeps the arguments it provides for the required
-        // trait when it names it DIRECTLY (`with Feed<i32>`); a match via a
-        // subtrait stays trait-level (v1 — supertrait argument threading is
-        // recorded, not taken).
-        let candidates: Vec<(TypeId, Option<Vec<TypeId>>)> = self
+        // trait — written on the clause when it names the trait DIRECTLY
+        // (`with Feed<i32>`), and THREADED THROUGH THE SUPERTRAIT CHAIN when it
+        // names it through a subtrait (B275).
+        //
+        // The threading was recorded and not taken in v1, and the hole it left
+        // is not small: `trait Signal<T> with Source<T>` means `impl SignalCell
+        // <type T> with Signal<T>` reaches `Source` without writing it, so the
+        // argument check below saw no provided arguments at all and passed
+        // VACUOUSLY. A program whose only `Slot` impl is the blanket `impl type
+        // S: Source<str> with Slot` then admitted a `SignalCell<Panel>` at a
+        // `: Slot` call site, and the emission filter's never-empty fallback —
+        // an internal guard, not a checker — was the only thing between that
+        // and an internal-error report.
+        //
+        // `trait_with_supertraits_at` is the threading, already written for
+        // method lookup: it walks the chain substituting each trait's own
+        // parameters at the arguments the clause below it passes, so
+        // `Signal<T_impl>`'s `Source<T>` comes back as `Source<T_impl>` and the
+        // impl's own binding (`T_impl := Panel`) grounds it at the comparison.
+        // Collected in two steps because the walk takes `&mut self`.
+        let matching: Vec<(TypeId, Vec<(Id, Vec<TypeId>)>)> = self
             .implementations
             .iter()
             .filter(|implementation| {
@@ -4956,13 +4973,22 @@ impl<'src> Analyzer<'src> {
                         .contains(&required_trait_id)
                 })
             })
-            .map(|implementation| {
-                let provided = implementation
-                    .trait_args
-                    .iter()
-                    .find(|(provided_trait, _)| *provided_trait == required_trait_id)
-                    .map(|(_, arguments)| arguments.clone());
-                (implementation.subject, provided)
+            .map(|implementation| (implementation.subject, implementation.trait_args.clone()))
+            .collect();
+        let candidates: Vec<(TypeId, Option<Vec<TypeId>>)> = matching
+            .into_iter()
+            .map(|(subject, trait_args)| {
+                let provided = trait_args.iter().find_map(|(provided_trait, arguments)| {
+                    match *provided_trait == required_trait_id {
+                        true => Some(arguments.clone()),
+                        false => self
+                            .trait_with_supertraits_at(*provided_trait, arguments)
+                            .into_iter()
+                            .find(|(reached, _)| *reached == required_trait_id)
+                            .map(|(_, reached_arguments)| reached_arguments),
+                    }
+                });
+                (subject, provided)
             })
             .collect();
         'candidates: for (subject_id, provided_arguments) in candidates {
