@@ -9877,3 +9877,280 @@ fn b260_a_trait_with_no_arguments_reads_as_it_always_has() {
     assert_fails_with(source, "does not implement trait 'Tagger': missing 'tag'");
     assert_fails_without(source, "Tagger<");
 }
+
+// --- B290: `is` over an unannotated closure parameter ------------------------
+//
+// The `is` door's face of B23's family. `resolve_match` already waits for a
+// closure parameter's bidirectional FILL before typing its legs' captures;
+// `resolve_is` did not, so the pattern was read against the enum's own
+// declaration and the payload came out as the DECLARATION's parameter — a
+// free, unbounded generic. Both faces shipped: a legitimate read of the
+// payload was refused ("cannot call method 'len' on T"), and the same binding
+// satisfied any other type at all.
+
+#[test]
+fn b290_an_is_over_an_unannotated_closure_parameter_reads_its_payload() {
+    // The refuse face, on the std surface kolt hits: `sub`'s `|T| void` fills
+    // the parameter as `Option<List<i32>>`, so the payload is a `List<i32>`
+    // and `len()` is a method it has.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let outer: SignalCell<Option<List<i32>>> = Signal::new(Some([1, 2]));
+            outer.sub(|inner| {
+                if inner is Some(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_payload_on_a_closure_parameter_is_not_a_free_generic() {
+    // The UNSOUND face: the payload typed as `Option`'s own `T` reconciled
+    // with anything, so a `List<i53>` passed for a `str` compiled and ran.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let outer: SignalCell<Option<List<i53>>> = Signal::new(Some([1i53]));
+            let text: SignalCell<str> = Signal::new("");
+            outer.sub(|inner| {
+                if inner is Some(let payload) {
+                    text.set(payload);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i53> instead.",
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_non_generic_callees_closure_parameter_reads_its_payload() {
+    // The callee need not be generic at all — a plain `|Option<List<i32>>|
+    // void` parameter fills the same way, and used to fail the same way.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun main() {
+            take(|inner| {
+                if inner is Some(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_non_generic_callees_closure_parameter_is_checked() {
+    // The same non-generic callee's unsound face.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun sink(value: str) {
+            print(value);
+        }
+
+        fun main() {
+            take(|inner| {
+                if inner is Some(let payload) {
+                    sink(payload);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_result_payload_on_a_closure_parameter_reads_it() {
+    // `Ok(let v)` — the rule is the pattern's, not `Option`'s.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        fun take(g: |Result<List<i32>, str>| void) {
+            g(Ok([1, 2]));
+        }
+
+        fun main() {
+            take(|outcome| {
+                if outcome is Ok(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_user_enum_payload_on_a_closure_parameter_reads_it() {
+    // A user generic enum, whose own parameter is what the payload used to
+    // come out as ("cannot call method 'len' on P").
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        enum Holder<type P> {
+            Full(P),
+            Empty,
+        }
+
+        fun take(g: |Holder<List<i32>>| void) {
+            g(Holder::Full([1, 2]));
+        }
+
+        fun main() {
+            take(|held| {
+                if held is Holder::Full(let sides) {
+                    print(i"{sides.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_user_enum_payload_on_a_closure_parameter_is_checked() {
+    // And its unsound face: the free `P` satisfied a `str` parameter.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        enum Holder<type P> {
+            Full(P),
+            Empty,
+        }
+
+        fun take(g: |Holder<List<i32>>| void) {
+            g(Holder::Full([1, 2]));
+        }
+
+        fun sink(value: str) {
+            print(value);
+        }
+
+        fun main() {
+            take(|held| {
+                if held is Holder::Full(let sides) {
+                    sink(sides);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b290_a_nested_signal_cell_payload_on_a_closure_parameter_reads_it() {
+    // The payload is itself a `SignalCell` — the shape kolt's channel switch
+    // carries, and the one whose `get()` was refused "on T".
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let inner_cell: SignalCell<i32> = Signal::new(7);
+            let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(inner_cell));
+            outer.sub(|held| {
+                if held is Some(let cell) {
+                    print(i"{cell.get()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_guarded_by_a_conjunction_types_its_payload() {
+    // The `&&` spine (B215's frame): the same door, reached through a
+    // compound condition rather than a bare `if`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun sink(value: str) {
+            print(value);
+        }
+
+        fun main() {
+            take(|inner| {
+                if inner is Some(let payload) && true {
+                    sink(payload);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b290_an_annotated_closure_parameter_stays_the_control() {
+    // The shipped workaround (kolt's `channel.vl` re-annotation): an
+    // ANNOTATED parameter never waited on anything, and still does not.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun main() {
+            take(|inner: Option<List<i32>>| {
+                if inner is Some(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}

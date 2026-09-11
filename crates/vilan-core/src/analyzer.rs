@@ -38685,6 +38685,22 @@ impl<'src> Analyzer<'src> {
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
+        // B290: an `is` over an unannotated closure parameter waits for
+        // bidirectional inference to FILL that parameter — the same rule
+        // `resolve_match` states for `|current| match current` (C′'s family,
+        // B23) and `resolve_subscript` for `|list| list[0]`. This door was the
+        // one that drifted. Resolving on the `Unknown` reads the pattern
+        // against the ENUM's own declaration, so `|inner| inner is Some(let
+        // payload)` typed `payload` as `Option`'s declared `T` — a free,
+        // unbounded generic that never revisits and then reconciles with
+        // ANYTHING: `inner.len()` over an `Option<List<i32>>` payload was
+        // refused "cannot call method 'len' on T", and the same binding passed
+        // to a `str` parameter compiled.
+        if matches!(subject_type, Type::Unknown)
+            && self.is_unknown_closure_parameter(prepped.subject_id)
+        {
+            return Resolution::Deferred;
+        }
         let subject_type_id = subject_type.get_type_id(self);
         match self.resolve_pattern(&prepped.pattern, subject_type_id, prepped.scope_id) {
             Some(resolved) => {
