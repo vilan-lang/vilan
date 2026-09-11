@@ -558,6 +558,17 @@ impl StreamingServer {
         StreamingServer { child, lines }
     }
 
+    /// Whether the server has said `needle` YET — everything on its stdout at
+    /// this instant, and no waiting (N68). For a claim about ORDER: what the
+    /// server had not yet done at the moment something else was observed.
+    fn said_yet(&self, needle: &str) -> bool {
+        let mut said = false;
+        while let Ok(line) = self.lines.try_recv() {
+            said |= line.contains(needle);
+        }
+        said
+    }
+
     fn await_line(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1044,6 +1055,24 @@ fun main() {
 /// line — the 101 (or the refusal) exactly as it arrived. Bounded rather than
 /// read-to-close: an accepted upgrade holds the socket open forever.
 fn raw_upgrade(port: u16, path: &str, extra: &str) -> String {
+    raw_upgrade_within(port, path, extra, Duration::from_millis(1500))
+}
+
+/// How long a raw upgrade may take to be ANSWERED before the server is
+/// considered hung (N68). It is a liveness bound, not a claim: no test asserts
+/// a handshake is fast, and every green run returns the moment the answer
+/// lands. It is sized against the one pin that deliberately races a server-side
+/// timer — a verifier that sleeps 30 s against a 300 ms bound — so that "the
+/// refusal arrived while the hook was still sleeping" is a window no loaded box
+/// closes.
+const VERIFIER_LIVENESS: Duration = Duration::from_secs(30);
+
+/// `raw_upgrade` with the read bound named by the caller (N68). A refused
+/// upgrade closes the socket, so the read returns the moment the answer lands
+/// and a green run never pays the bound — which is what lets a test that must
+/// not race the SERVER's own timer pass a liveness number here instead of a
+/// performance one.
+fn raw_upgrade_within(port: u16, path: &str, extra: &str, bound: Duration) -> String {
     raw_http_bounded(
         port,
         &format!(
@@ -1051,7 +1080,7 @@ fn raw_upgrade(port: u16, path: &str, extra: &str) -> String {
              Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
              13\r\n{extra}\r\n"
         ),
-        Duration::from_millis(1500),
+        bound,
     )
 }
 
@@ -1643,10 +1672,21 @@ fun run(port: i32) {
 /// SHOULD retry. It is answered on the timeout's own turn, not when the hook
 /// eventually returns, which is the whole point.
 ///
+/// N68: the claim is ORDER, and it is asserted as order. It used to be a 2,500
+/// ms wall bound over a 300 ms claim — the last wall bound N61's sweep left
+/// standing, and a gate on the runner rather than on the program (M27's rule):
+/// a box that stalls between the 429 landing and this process reading it fails
+/// a server that did exactly the right thing. So the verifier now SAYS when it
+/// wakes, and the pin reads the 429 and asks the server whether the hook had
+/// answered yet. The hook sleeps 30 s, so "not yet" is a window no healthy run
+/// comes near and a green run never waits for: the refusal closes the socket
+/// at the bound, the read returns there, and the sleeping timer dies with the
+/// child. The read bound is a liveness number for the same reason.
+///
 /// Proven red first by planting `authorize_timeout(0)` (the default, and what
-/// every service had before A48): the same handshake reads back EMPTY — the
-/// socket held, unanswered, past the reader's own 1500 ms bound while the
-/// verifier is still sleeping, which is the shape of the item.
+/// every service had before A48): the socket is held, unanswered, while the
+/// verifier sleeps, and what comes back is the eventual 101 rather than the
+/// refusal — which is the shape of the item.
 #[test]
 fn a_verifier_that_does_not_answer_in_time_is_refused_and_the_socket_destroyed() {
     let source = AUTHORIZED_SERVER
@@ -1656,7 +1696,7 @@ fn a_verifier_that_does_not_answer_in_time_is_refused_and_the_socket_destroyed()
         )
         .replace(
             "			.authorize(|handshake: Handshake| match handshake.token() {",
-            "			.authorize_timeout(300)\n			.authorize(|handshake: Handshake| {\n				sleep_for(Duration::millis(3000));\n				match handshake.token() {",
+            "			.authorize_timeout(300)\n			.authorize(|handshake: Handshake| {\n				sleep_for(Duration::millis(30000));\n				print(\"verifier:answered\");\n				match handshake.token() {",
         )
         .replace(
             "				None => Result::Err(Reject::Unauthorized),\n			}))",
@@ -1664,25 +1704,28 @@ fn a_verifier_that_does_not_answer_in_time_is_refused_and_the_socket_destroyed()
         );
     assert!(
         source.contains("authorize_timeout(300)")
-            && source.contains("sleep_for(Duration::millis(3000))"),
-        "the bound and the slow verifier must both be spliced into the server source:\n{source}"
+            && source.contains("sleep_for(Duration::millis(30000))")
+            && source.contains("verifier:answered"),
+        "the bound, the slow verifier and its wake marker must all be spliced into the \
+         server source:\n{source}"
     );
     let (server, port) = spawn_service_server("verifier_bound", &source);
 
-    let started = Instant::now();
-    let refused = raw_upgrade(
+    let refused = raw_upgrade_within(
         port,
         "/",
         "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+        VERIFIER_LIVENESS,
     );
-    let elapsed = started.elapsed();
     assert!(
         refused.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
         "a verifier over its bound must be refused 429: {refused}"
     );
     assert!(
-        elapsed < Duration::from_millis(2500),
-        "the refusal must land on the bound, not when the hook finally answers ({elapsed:?})"
+        !server.said_yet("verifier:answered"),
+        "the refusal must land on the BOUND and not when the hook finally answers: the \
+         verifier had already woken by the time the 429 arrived, so this proves nothing \
+         about the bound. Response was: {refused}"
     );
     assert!(
         !refused.contains("101 Switching Protocols") && !refused.contains("__reject:"),
