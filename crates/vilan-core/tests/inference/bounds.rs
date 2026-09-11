@@ -9078,3 +9078,148 @@ fn b305_a_slot_nothing_fills_is_still_not_an_answer() {
         "#,
     );
 }
+
+// --- B286: a bound-introduced parameter is solved from the bound's APPLICATION
+//
+// A type parameter is solved from a call's TYPES and never from a bound, so a
+// generic reachable only through ANOTHER parameter's parameterized bound could
+// not be solved when that other parameter was itself abstract:
+// `expose_dynamic<T: Wire, S: Source<T>>(source: S)` called from
+// `reply_source<T: Wire, S: Source<T>>(source: S)` bound `S` to the caller's
+// `S` and then had nowhere to get `T`. Both std functions had to take the
+// concrete `SignalCell<T>` instead. The caller's own `S: Source<T>` IS the
+// statement that `S` is a source of the caller's `T`, and reading it is the
+// same act `trait_args_for` performs against an impl.
+
+#[test]
+fn b286_a_source_generic_function_is_callable_from_generic_code() {
+    // The filed exhibit, in its own vocabulary: the inner function's `T` is
+    // reachable only through `S`'s bound, and the caller passes a parameter.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<T: Tagged, S: Read<T>>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() {
+            print(reply_source(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_the_concrete_receiver_form_is_the_control() {
+    // The spelling the estate had to use, unchanged: a CONCRETE argument reads
+    // its arguments off its impl, the channel that always worked.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun main() {
+            print(expose_dynamic(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_the_bound_is_read_through_the_supertrait_chain() {
+    // The caller's bound may name a SUB-trait: the arguments come from the
+    // chain at its own arguments, not from the bound's head alone.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+        trait Live<T> with Read<T> {}
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl Cell<type T> with Live<T> {}
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<T: Tagged, S: Live<T>>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() {
+            print(reply_source(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_a_caller_whose_parameter_carries_no_such_bound_is_still_refused() {
+    // The negative control: the fix reads a bound the caller WROTE. A caller
+    // whose parameter promises nothing about the trait still cannot supply the
+    // inner generic, and still says so.
+    assert_fails_with(
+        r#"
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<S>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() { }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}

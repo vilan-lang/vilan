@@ -31781,6 +31781,38 @@ impl<'src> Analyzer<'src> {
     /// yields `undefined`). `bound_owners` are the constraints whose bounds to inspect;
     /// only bindings for a constraint in `record` are kept (so a method call binds only
     /// its own generics, not the enclosing scope's).
+    /// The arguments an ABSTRACT parameter provides for `trait_id` — read off
+    /// its own declared bounds, walking each bound's supertrait chain at its
+    /// arguments, which is the parameter-side twin of [`Self::trait_args_for`]
+    /// (B286).
+    ///
+    /// A type parameter is solved from a call's TYPES, and never from a bound,
+    /// so a generic whose only channel is another parameter's parameterized
+    /// bound could not be solved when that other parameter was itself abstract:
+    /// `expose_dynamic<T: Wire, S: Source<T>>(source: S)` called from
+    /// `reply_source<T: Wire, S: Source<T>>(source: S)` bound `S` to the
+    /// caller's `S` and then had nowhere to get `T` — "cannot infer 'T' for
+    /// this call; its bound ': Wire' cannot be checked" — so both functions had
+    /// to take the concrete `SignalCell<T>` instead. The caller's `S: Source<T>`
+    /// IS the statement that `S` is a source of the caller's `T`; reading it is
+    /// the same act `trait_args_for` performs against an impl.
+    fn abstract_trait_arguments(
+        &mut self,
+        constraint_id: TypeId,
+        trait_id: Id,
+    ) -> Option<Vec<TypeId>> {
+        for (bound_trait_id, bound_arguments) in self.generic_bound_traits(constraint_id) {
+            for (chain_trait_id, chain_arguments) in
+                self.trait_with_supertraits_at(bound_trait_id, &bound_arguments)
+            {
+                if chain_trait_id == trait_id && !chain_arguments.is_empty() {
+                    return Some(chain_arguments);
+                }
+            }
+        }
+        None
+    }
+
     fn derive_generics_from_bounds(
         &mut self,
         bound_owners: &[TypeId],
@@ -31796,7 +31828,16 @@ impl<'src> Analyzer<'src> {
                 if trait_arguments.is_empty() {
                     continue;
                 }
-                let Some(impl_arguments) = self.trait_args_for(&concrete, trait_id) else {
+                // B286: the argument may itself be a PARAMETER carrying the
+                // bound, and a parameter has no impl to read. Its own declared
+                // bound is the answer, and the only one there is.
+                let provided = match concrete {
+                    Type::Generic(caller_constraint_id) => {
+                        self.abstract_trait_arguments(caller_constraint_id, trait_id)
+                    }
+                    _ => self.trait_args_for(&concrete, trait_id),
+                };
+                let Some(impl_arguments) = provided else {
                     continue;
                 };
                 for (trait_argument, impl_argument) in trait_arguments.iter().zip(impl_arguments) {
