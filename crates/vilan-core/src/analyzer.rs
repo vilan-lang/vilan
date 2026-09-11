@@ -22298,27 +22298,6 @@ impl<'src> Analyzer<'src> {
             .map(|(_, text)| *text)
     }
 
-    /// Element syntax lowers to `std::ui::view` (element-syntax S4): an
-    /// unresolved `view` whose span is MARKUP — it starts with `<`, a span
-    /// only the element desugar produces for an accessor — gets the import
-    /// steer as a note. A hand-written `view` accessor's span is the ident.
-    fn element_view_import_note(&self, id: Id, name: &str) -> Option<Note> {
-        if name != "view" {
-            return None;
-        }
-        let span = **self.span_map.get(&id)?;
-        let source = self.source_of_id(id).unwrap_or(SourceId(0));
-        let text = self.source_text(source)?;
-        if !text.get(span.into_range())?.starts_with('<') {
-            return None;
-        }
-        Some(Note::here(
-            span,
-            "element syntax lowers to std::ui::view; add `import std::ui::{ view, View };`"
-                .to_string(),
-        ))
-    }
-
     /// E119: a miss on a type that came from an OVERLAID `std` layer names the
     /// overlay and why THIS file is analyzed under it.
     ///
@@ -39569,9 +39548,17 @@ impl<'src> Analyzer<'src> {
                         }
                     },
                 );
-                let note = note
-                    .or_else(|| self.element_view_import_note(id, name))
-                    .or_else(|| self.css_style_import_note(id, name));
+                // N69: the element's twin of this steer is gone. B270 made the
+                // desugar's callee a scope-independent `std::ui::view`, so an
+                // element's `view` cannot be unresolved while std has the item
+                // — and in the one state that could still miss it, a std with
+                // no `ui::view` at all, "add `import std::ui::{ view, View };`"
+                // steered at an import that would miss the same way. A note
+                // that can only fire where its own advice is wrong is worse
+                // than no note (`an_element_needs_no_view_import_at_all` is
+                // what holds the reachability claim). The `css` twin below is
+                // in the same state and is its own item.
+                let note = note.or_else(|| self.css_style_import_note(id, name));
                 // B236: the name is not missing — the import that would have
                 // brought it in was refused, and that refusal is already filed
                 // at the import. The expression still becomes an `Expr::Error`,
