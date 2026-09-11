@@ -47467,7 +47467,26 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
 /// is the claim being made and a body that grows one write later would
 /// otherwise turn silent.
 ///
-/// 2. A parameter whose name starts with `__` (B295).
+/// 2. `async` beside `&mut self` (B287, RULED 2026-09-11).
+///
+/// `&mut self` on an `[rpc]` method mutates THIS connection's instance, and
+/// since B281 one connection's handlers INTERLEAVE: another route can run, and
+/// write, between this method's suspension and its resume, so the instance it
+/// returns to is not the instance it saw. `transport-rpc.md`'s Q9 answered that
+/// with "a `&mut self` method is itself a promise that it does not await" and
+/// nothing enforced the promise.
+///
+/// E3's signature rule (`async_view_parameter_message`) already refuses an
+/// async function that takes a `&mut` parameter — but only once the body
+/// actually SUSPENDS, because that rule is about a view held across a
+/// suspension point. `async fun bump(&mut self, by: i32): i32` with no await in
+/// it compiled, which is the hole: the keyword is the promise, and a body that
+/// grows its first await a week later would otherwise turn silent. So this is
+/// keyed on the written `async` KEYWORD and on the receiver, never on the body
+/// — the same standard the `mut self` arm takes — and it says the hazard in the
+/// service's vocabulary rather than in the view checker's.
+///
+/// 3. A parameter whose name starts with `__` (B295).
 ///
 /// `__` is the generator's own prefix: a route is `.on("f", |__request| { .. })`
 /// and the `__attach`/`__contract` routes are spelled with it too. A parameter
@@ -47507,6 +47526,22 @@ pub(crate) fn service_method_refusals(
                 continue;
             }
             let method_name = function.name.0;
+            if function.is_async && function.receiver_spelling() == Some("&mut self") {
+                refusals.push((
+                    function.name.1,
+                    format!(
+                        "`[rpc]` method `{method_name}` is declared `async` and takes `&mut \
+                         self`, and the two cannot both hold: `&mut self` is a view into this \
+                         connection's instance, and one connection's `[rpc]` handlers \
+                         interleave — another route can run, and write, between this method's \
+                         suspension and its resume, so what the view points at is no longer \
+                         what it saw. Drop the `async` keyword, or take `self` and hold the \
+                         state in a `Shared<T>` field, which every handler shares deliberately. \
+                         Refused on the keyword and the receiver rather than on the body: an \
+                         `async` method that never awaits today is a promise about tomorrow"
+                    ),
+                ));
+            }
             if function.receiver_spelling() == Some("mut self") {
                 refusals.push((
                     function.name.1,

@@ -1125,14 +1125,17 @@ handler runs in.
    does not hold a fast second one behind it. Nothing in the protocol
    ever depended on the order; this only makes it visible.
 
-One consequence of the first two, stated because nothing enforces it yet:
-two handlers in flight on one connection share that connection's one
-instance. A `&mut self` method that never awaits runs to completion before
-the next handler starts and is safe by construction; a `&mut self` method
-that AWAITS can have its instance written by another handler underneath
-it. Keep a `&mut self` handler synchronous, or hold the state something
-other than the receiver reaches (a `Shared<T>` field) when the handler
-must await.
+One consequence of the first two, and it is now ENFORCED: two handlers in
+flight on one connection share that connection's one instance. A `&mut
+self` method that never awaits runs to completion before the next handler
+starts and is safe by construction; a `&mut self` method that AWAITS can
+have its instance written by another handler underneath it. So an `[rpc]`
+method declared `async` may not take `&mut self` — the attribute refuses
+it, naming the method — and the rule is read off the KEYWORD and the
+receiver rather than off the body, because a handler that grows its first
+await a week later would otherwise turn silent. Keep a `&mut self`
+handler synchronous, or hold the state somewhere other than the receiver
+reaches (a `Shared<T>` field) when the handler must await.
 
 ### What happens to a peer that has not heard of any of this
 

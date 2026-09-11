@@ -7885,3 +7885,102 @@ fn b280_list_new_inside_a_sibling_member_still_takes_a_fresh_element_slot() {
         "1,2\n",
     );
 }
+
+// === B287 (RULED 2026-09-11): `async` + `&mut self` on an `[rpc]` method ======
+
+/// `async` beside `&mut self` on an `[rpc]` method is refused AT THE ATTRIBUTE.
+///
+/// `&mut self` mutates this connection's instance, and since B281 one
+/// connection's handlers interleave: another route can run, and write, between
+/// this method's suspension and its resume. `transport-rpc.md`'s Q9 answered
+/// that with "a `&mut self` method is itself a promise that it does not await"
+/// and nothing enforced the promise.
+///
+/// E3's signature rule refuses an async function taking a `&mut` parameter —
+/// but only once the body actually SUSPENDS, because that rule is about a view
+/// held across a suspension point. The shape below is the hole: `async` written
+/// on a body with no await in it, which compiled. Keyed on the KEYWORD and the
+/// receiver, never on the body, for the reason row 408 states for `mut self`:
+/// the declaration is the claim, and a body that grows its first await later
+/// would otherwise turn silent.
+#[test]
+fn an_async_rpc_method_taking_a_mutable_self_reference_is_refused_at_the_attribute() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        [service(GateClient)]
+        struct Gate { tally: i32 }
+
+        impl Gate {
+            [rpc]
+            async fun bump(&mut self, by: i32): i32 {
+                self.tally = self.tally + by;
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#,
+        "`[rpc]` method `bump` is declared `async` and takes `&mut self`",
+    );
+}
+
+/// The same refusal when the body DOES suspend — the shape E3's signature rule
+/// already reached, said here in the service's vocabulary. Both fire, and both
+/// are true: one is about the view across the suspension, this one about the
+/// instance two interleaved routes share.
+#[test]
+fn an_async_rpc_method_that_suspends_is_refused_in_the_services_own_vocabulary() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::time::{ sleep_for, Duration };
+
+        [service(GateClient)]
+        struct Gate { tally: i32 }
+
+        impl Gate {
+            [rpc]
+            async fun bump(&mut self, by: i32): i32 {
+                sleep_for(Duration::millis(1));
+                self.tally = self.tally + by;
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#,
+        "`[rpc]` method `bump` is declared `async` and takes `&mut self`",
+    );
+}
+
+/// The two controls, because the refusal is the CONJUNCTION: a sync `&mut self`
+/// method is R-A38b(a)'s honoured receiver and must keep compiling, and an
+/// `async` method over a plain `self` is J2's admitted shape.
+#[test]
+fn a_sync_mutable_self_rpc_and_an_async_plain_self_rpc_both_still_compile() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        [service(GateClient)]
+        struct Gate { tally: i32 }
+
+        impl Gate {
+            [rpc]
+            fun bump(&mut self, by: i32): i32 {
+                self.tally = self.tally + by;
+                self.tally
+            }
+
+            [rpc]
+            async fun peek(self): i32 {
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#,
+    );
+}

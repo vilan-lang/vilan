@@ -443,3 +443,4 @@ row	flagship	key
 413	-	{label} names its key twice and the two disagree: `[expose(keyed = {written})]` says `{written}`, and its `KeyedCell` says `{cell_key}`. A `KeyedCell<K, T>` names both of its types itself and is keyed by the one it names: `expose_keyed_cell` and the `KeyedSource<K, T>` mirror are typed at `{cell_key}`, so the argument cannot be honoured and is not read. Drop it — a `KeyedCell` takes the bare `[expose(keyed)]` — or write the cell with `{written}` as its key
 414	-	`_` is the anonymous type binder: it introduces a generic parameter, and only an `impl` subject introduces one
 415	-	parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts with `__`, which the `[service]` expansion reserves for its own bindings
+416	-	`[rpc]` method `{method_name}` is declared `async` and takes `&mut self`, and the two cannot both hold
