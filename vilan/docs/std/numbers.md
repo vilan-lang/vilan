@@ -161,6 +161,7 @@ struct Vec2 { x: f64, y: f64 }           // a 2-D vector: point, offset, velocit
 impl Vec2 {
 	fun scale(self, factor: f64): Vec2   // both components times a scalar
 	fun length(self): f64                // sqrt(x² + y²)
+	fun length_squared(self): f64        // x² + y², for comparing without the root
 	fun distance(self, other: Vec2): f64 // the length of the vector between two points
 	fun dot(self, other: Vec2): f64      // x*x + y*y; v.dot(v) is v's length squared
 }
@@ -183,8 +184,11 @@ fun main() {
 }
 ```
 
-A threshold does not need the square root: `travelled.dot(travelled)` is the
-length squared, so compare it against the squared threshold on a hot path.
+A threshold does not need the square root: `travelled.length_squared()` is
+`x² + y²`, and `sqrt` is monotonic, so compare it against the *squared*
+threshold on a hot path — a pointer-move handler squares its threshold once
+instead of taking a root per event. Take the root when the number itself is
+the answer.
 `==` is exact `f64` equality, with everything that implies — a vector arrived
 at by arithmetic is rarely `==` one written down, so compare a `distance`
 against a tolerance where that matters.

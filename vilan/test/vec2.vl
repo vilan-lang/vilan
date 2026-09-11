@@ -4,11 +4,13 @@ import std::math::Vec2;
 // `std::math::Vec2` (A83): a 2-D vector VALUE — two `f64` components, the
 // arithmetic a pointer drag needs, and hand-written `Add`/`Sub` impls, so `+`
 // and `-` lower to those impls' own methods rather than to native `+`/`-` on
-// numbers. `length`/`distance` go through `dot` and one `Math.sqrt`; `==`
-// reaches the `PartialEq` impl, which is exact component equality.
+// numbers. `length`/`distance` go through `length_squared` and one
+// `Math.sqrt`; `==` reaches the `PartialEq` impl, which is exact component
+// equality.
 //
 // witness: const offset = sub(pointer, origin);
-// witness: return Math.sqrt(dot(self, self));
+// witness: return Math.sqrt(length_squared(self));
+// witness: return dot(self, self);
 // witness: return self[0] * other[0] + self[1] * other[1];
 fun main() {
 	let origin = Vec2 { x = 3.0, y = 4.0 };
@@ -39,4 +41,12 @@ fun main() {
 	print(now.distance(start) > 3.0);
 	let travelled = now - start;
 	print(travelled.length());
+
+	// The same threshold WITHOUT the root: `sqrt` is monotonic, so squaring
+	// the threshold once decides exactly what comparing the lengths decides,
+	// which is the arithmetic a per-pointer-move handler actually runs.
+	let threshold = 3.0;
+	print(travelled.length_squared());
+	print(travelled.length_squared() > threshold * threshold);
+	print(travelled.length_squared() == travelled.length() * travelled.length());
 }
