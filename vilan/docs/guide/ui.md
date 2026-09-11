@@ -199,9 +199,11 @@ called in holes: `{todo_row(items, todo)}`. Reactivity stays explicit:
 an `if` or `match` inside a hole runs once at build, exactly as it does
 in a chain; reactive structure is `.show`/`.when`/`.swap`/`.bind_each`
 in head position, and `Signal` values in slots. The sugar adds no
-semantics: `import std::ui::{ view, View }` is still required (the
-compiler points the way if it is missing), and everything this guide
-says about ownership, boundaries, and binding types applies unchanged.
+semantics: an element means `std::ui::view` whatever the file has
+imported, so element syntax needs no `view` import of its own (a `View`
+you write as a TYPE still needs one, and the editor offers it), and
+everything this guide says about ownership, boundaries, and binding
+types applies unchanged.
 
 ## Components are just functions
 

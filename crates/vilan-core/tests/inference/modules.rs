@@ -2222,6 +2222,39 @@ fn a35_a_hand_written_view_call_keeps_the_ordinary_arity_message() {
 }
 
 #[test]
+fn n69_an_unresolved_view_is_reported_without_an_import_steer() {
+    // N69: `element_view_import_note` is deleted, not narrowed. It attached
+    // "element syntax lowers to std::ui::view; add `import std::ui::{ view,
+    // View };`" to an unresolved `view` whose span was MARKUP, and after B270
+    // an element's callee is a scope-independent reference to `std::ui::view`
+    // — so the note could only fire for a std with no `ui::view` at all, where
+    // the import it steers at would miss exactly the same way. A note that can
+    // only fire where its own advice is false is worse than no note; the
+    // reachability half is held by `an_element_needs_no_view_import_at_all`
+    // above, which goes red the moment an element needs the import again.
+    //
+    // What is left is the ordinary miss, for the author who wrote the lowered
+    // call by hand: the plain message, and nothing about element syntax they
+    // did not use.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _x = view("div");
+        }
+        "#,
+        "cannot find 'view' in this scope",
+    );
+    assert_fails_without(
+        r#"
+        fun main() {
+            let _x = view("div");
+        }
+        "#,
+        "element syntax lowers to",
+    );
+}
+
+#[test]
 fn b270_an_explicit_view_import_is_still_redundant_rather_than_wrong() {
     // The other control: files that already import `view` — every file written
     // before B270 — keep compiling, and the import keeps meaning what it said.

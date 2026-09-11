@@ -40,10 +40,30 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Runs `vilan run <dir>` under a liveness bound and returns stdout. The bound
-/// is `support::run_liveness()` and not a literal for E40's reason: it wraps a
-/// compile plus a program, and nothing here claims a speed.
+/// Runs `vilan run <dir>` under a liveness bound and returns stdout, insisting
+/// that the program reported NOTHING — which is the right default here: every
+/// phase of the exhibit is a line in a sequence, and a report on stderr means
+/// something failed that the sequence cannot see.
 fn run_project(dir: &Path) -> String {
+    let (stdout, stderr) = run_project_reporting(dir);
+    assert!(
+        stderr.is_empty(),
+        "the debounce program wrote to stderr:\n{stderr}\n{stdout}"
+    );
+    stdout
+}
+
+/// The same run, handing BACK what the program reported (N71).
+///
+/// A free task that fails reports to the console and the program carries on —
+/// that is the whole contract of a free task — so "this failure was reported
+/// AND this loop survived" is one claim about two streams, and a runner that
+/// asserts stderr empty can only ever see half of it. The seam is here rather
+/// than in the emitted runtime deliberately: a hook inside `__task`'s reporting
+/// path would change the bytes of every program that spawns a task, which is a
+/// corpus-golden move for a test's convenience. What the runtime writes is
+/// already observable; it was the harness that was throwing it away.
+fn run_project_reporting(dir: &Path) -> (String, String) {
     let liveness = support::run_liveness() + Duration::from_secs(30);
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
@@ -77,11 +97,7 @@ fn run_project(dir: &Path) -> String {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert!(
-        stderr.is_empty(),
-        "the debounce program wrote to stderr:\n{stderr}\n{stdout}"
-    );
-    stdout
+    (stdout, stderr)
 }
 
 /// Seven phases, each closed by a marker so a misplaced fire is nameable.
@@ -248,6 +264,75 @@ fn b277_a_debounce_survives_the_cancellation_of_the_nursery_that_drove_it() {
         // The cancelled window fires nothing — it was cancelled mid-wait.
         ["mark-cancelled", "after-nursery-cancel", "mark-done"],
         "a debounce must survive its nursery; got:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B277's other half: the app's OWN callback throws.
+const DEBOUNCE_AFTER_A_THROWING_CALLBACK: &str = r#"import std::io::{ print, panic };
+import std::time::{ Debounce, Duration, sleep };
+
+async fun main() {
+	let debounce = Debounce::new(Duration::millis(50));
+	// The fire calls this, and it throws: the driving loop unwinds at the
+	// call site, exactly where a nursery cancellation unwinds it at the
+	// parked wait. Nothing awaits the loop, so the failure takes the
+	// free-task reporting path — the console — and the program carries on.
+	debounce.run(|| panic("the callback exploded"));
+	sleep(1000);
+	print("mark-threw");
+
+	// And the debounce is still a debounce.
+	debounce.run(|| print("after-throw"));
+	sleep(1000);
+	print("mark-done");
+}
+"#;
+
+/// A callback that throws leaves the `Debounce` usable, and says so on the way
+/// out (N71: the seam that makes the second half assertable).
+#[test]
+fn b277_a_debounce_survives_a_callback_that_throws_and_the_failure_is_reported() {
+    // B277's fix is a `finally` around the loop rather than a
+    // nursery-cancellation special case, precisely because the flag must be
+    // cleared on EVERY unwind. The nursery half has been pinned since the fix
+    // landed; this is the half the harness could not see, because a free task
+    // reports its failure to the console and the runner asserted stderr empty.
+    //
+    // Both halves of the claim are asserted here: the failure WAS reported
+    // (unobserved free task, one line, naming the spawn origin), and the loop
+    // SURVIVED it (`after-throw` fires from a fresh window over the same
+    // value). Dropping either one would leave a green test over a dead
+    // debounce or over a silently swallowed failure.
+    let dir = temp_project("throwing_callback");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", DEBOUNCE_AFTER_A_THROWING_CALLBACK);
+    let (stdout, stderr) = run_project_reporting(&dir);
+
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        // Nothing prints for the first window: its callback threw instead.
+        ["mark-threw", "after-throw", "mark-done"],
+        "a debounce must survive its own callback's failure; got:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unhandled task error") && stderr.contains("the callback exploded"),
+        "the driving loop's failure must be REPORTED, not swallowed; \
+         stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("unhandled task error").count(),
+        1,
+        "one failure, one report; stderr was:\n{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

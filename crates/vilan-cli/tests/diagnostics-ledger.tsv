@@ -28,8 +28,12 @@
 #             literal fragments.
 #
 # Two rows are deliberately keyless and absent here: 154 (a forwarding push
-# with no head of its own) and 229 (the nine `ParseErrorReason::Rule`
-# statements, which the parse-rule tests hold instead).
+# with no head of its own) and 229 (the `ParseErrorReason::Rule` statements,
+# which the parse-rule tests hold instead — their population by the gate's
+# RULE_STATEMENT_SITES count, and the CURATED ones, stated through a named
+# constant, by its CURATED_RULE_STATEMENTS enumeration. The count that used
+# to stand here said `nine` for seven orders; N60 and N65 are why it is not
+# written in prose any more).
 row	flagship	key
 1	flagship	'{type}' does not implement trait '{trait}', required by a declared bound of '{owner}'
 2	flagship	{label} of `[derive(Wire)]` type `{type_name}` is `{rendered
@@ -442,3 +446,4 @@ row	flagship	key
 412	-	{label} is `[expose]`d, but that struct carries only `[client_service]`: an exposed field is mirrored out of the SERVER's reactive session through the generated `__attach` route, and a client-side struct has neither — so the attribute moves the contract hash and mints no channel at all. Drop `[expose]`, or write `[service(..)]` beside `[client_service]` if this struct is a peer that serves as well as handles
 413	-	{label} names its key twice and the two disagree: `[expose(keyed = {written})]` says `{written}`, and its `KeyedCell` says `{cell_key}`. A `KeyedCell<K, T>` names both of its types itself and is keyed by the one it names: `expose_keyed_cell` and the `KeyedSource<K, T>` mirror are typed at `{cell_key}`, so the argument cannot be honoured and is not read. Drop it — a `KeyedCell` takes the bare `[expose(keyed)]` — or write the cell with `{written}` as its key
 414	-	`_` is the anonymous type binder: it introduces a generic parameter, and only an `impl` subject introduces one
+415	-	`{derive}` cannot be derived for the resource {kind} `{name}`: a resource is an owned handle, not plain data — {what_it_would_do}; {steer}

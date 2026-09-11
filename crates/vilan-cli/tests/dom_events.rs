@@ -59,68 +59,17 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// A document, a window, and elements that all register AND remove listeners the
 /// way a browser does — by handler identity. `count(target, event)` is what the
 /// negative assertions read.
-const DOM_STUB: &str = r#"class StubTarget {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.value = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    // Identity-matched, exactly as the DOM's is. A `dispose` that reconstructs
-    // the handler instead of holding the registered one removes NOTHING here.
-    removeEventListener(event, handler) {
-        this.listeners[event] = (this.listeners[event] || []).filter(h => h !== handler);
-    }
-    count(event) { return (this.listeners[event] || []).length; }
-    // Slice: a handler that disposes its own registration must not perturb the
-    // iteration it is being dispatched from.
-    fire(event, payload = {}) { for (const h of (this.listeners[event] || []).slice()) h(payload); }
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-}
-
-const documentRoot = new StubTarget("div");
-global.document = {
-    createElement: (tag) => new StubTarget(tag),
-    createElementNS: (namespace, tag) => new StubTarget(tag),
-    getElementById: () => documentRoot,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-global.window = new StubTarget("window");
-
-let failures = 0;
+const DOM_STUB: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/dom_events.js"),
+    r#"let failures = 0;
 const assert = (condition, message) => {
     if (!condition) { failures += 1; console.log("FAIL - " + message); }
     else console.log("ok   - " + message);
 };
 const done = () => process.exit(failures === 0 ? 0 : 1);
-"#;
+"#,
+);
 
 /// Builds `app.vl` for the browser with the real CLI and runs `harness.js` under
 /// node, returning its stdout. Fails loudly with both streams.

@@ -40,7 +40,15 @@
 //!    ([`every_flagship_row_is_quoted_by_the_errors_appendix`]) — a row the
 //!    index marks `flagship` must be quoted by some appendix entry. Dropping an
 //!    entry, or marking a new row flagship without writing one, reds.
-//! 6. **The exemptions expire** (N42/N50, and N27's rule for `#[ignore]`
+//! 6. **The curated rule statements are enumerated** (N65,
+//!    [`every_rule_statement_constant_is_curated`] and
+//!    [`every_curated_rule_statement_still_opens_as_recorded`]). A
+//!    `ParseErrorReason::Rule` stated through a NAMED constant is a message the
+//!    index cannot key on — row 229 is keyless for exactly this reason, and its
+//!    count notices a site added, never a message reworded. The eighteen are
+//!    named with their heads in [`CURATED_RULE_STATEMENTS`], held to the tree in
+//!    both directions.
+//! 7. **The exemptions expire** (N42/N50, and N27's rule for `#[ignore]`
 //!    reasons applied to a list). Four checks ask the INVERSE question, each
 //!    with the predicate of the check it widens: a row
 //!    `ROWS_THE_ENUMERATION_CANNOT_REACH` names that the walk now reaches, a
@@ -191,6 +199,151 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
 const RULE_STATEMENT_SITES: usize = 21;
+
+/// The one literal run of the resource-derive refusal that is neither a slot
+/// nor assembled: what its ledger row is keyed on, and what
+/// [`the_helper_built_resource_derive_refusal_is_rowed`] holds in both
+/// directions (N65).
+const RESOURCE_DERIVE_REFUSAL_FRAGMENT: &str =
+    "`: a resource is an owned handle, not plain data — ";
+
+/// The CURATED rule statements: the messages a `ParseErrorReason::Rule` states
+/// through a NAMED constant rather than a literal written at the site — the
+/// `css` block's four, the two statement-shape steers, the seven nesting
+/// refusals, and the lexer's five, which reach `parsing.rs` through
+/// `LexError::rule` from another file entirely (N65).
+///
+/// This is row 229's twin, and the half a COUNT cannot be. The row is keyless
+/// because the enumeration in check (3) reads the literal written AT its
+/// anchor, and every one of these is at least one indirection away;
+/// [`RULE_STATEMENT_SITES`] stands in for the family by counting its SITES,
+/// which notices a rule statement added or removed and cannot notice a
+/// reworded one. E153 rewrote the `:hover` rule — `CSS_PSEUDO_CLASS_IS_DOTTED`,
+/// three lines below — and had no row to edit, which is the shape of the item:
+/// these were unrowed messages, never red ones.
+///
+/// So each is named here with the head it opens with, [`every_curated_rule_
+/// statement_still_opens_as_recorded`] holds the head to the tree, and
+/// [`every_rule_statement_constant_is_curated`] holds the LIST to the tree in
+/// the other direction. A reworded head reds this row, which is the row to
+/// edit; a new curated constant reds until it has one.
+///
+/// The head, not the whole sentence, for the index's own reason: a ledger key
+/// is a message HEAD (the file's header says so, and the batch-7 generation's
+/// keys are truncated at sixty characters). A head long enough to be
+/// unmistakable is the bar, and a tail edit that leaves the head standing
+/// still lands on a row that names the constant.
+const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "CSS_IS_A_KEYWORD",
+        "`css` is a keyword: it begins a `css { … }` block.",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "CSS_BLOCK_IS_BRACE_INITIAL",
+        "a `css { … }` block is brace-initial,",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "CSS_PSEUDO_CLASS_IS_DOTTED",
+        "a `css` block writes a pseudo-class as a DOTTED rule:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPORTANT_HAS_NO_PLACE",
+        "`!important` has no place in a `css` block:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "BLOCK_LIKE_STATEMENT_IS_COMPLETE",
+        "a `match`, `if`, `for` or `{` form is COMPLETE at its closing brace,",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "LET_MUT_IS_ONE_WORD",
+        "a mutable binding is spelled `mut x = …`:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "NESTING_REFUSAL",
+        "this expression nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "TYPE_NESTING_REFUSAL",
+        "this type nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "PATTERN_NESTING_REFUSAL",
+        "this pattern nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "ITEM_NESTING_REFUSAL",
+        "this declaration nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPORT_NESTING_REFUSAL",
+        "this import path nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "ELEMENT_NESTING_REFUSAL",
+        "this element nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "CSS_NESTING_REFUSAL",
+        "this `css` block nests more than 500 levels deep, which parsing refuses;",
+    ),
+    (
+        "crates/vilan-core/src/lexing.rs",
+        "HASH_IS_NOT_A_TOKEN",
+        "`#` is not a vilan token;",
+    ),
+    (
+        "crates/vilan-core/src/lexing.rs",
+        "AT_IS_NOT_A_TOKEN",
+        "`@` is not a vilan token;",
+    ),
+    (
+        "crates/vilan-core/src/lexing.rs",
+        "HOLE_IS_NOT_AN_EXPRESSION",
+        "an interpolation hole holds one expression, and `{` and `}` delimit it:",
+    ),
+    (
+        "crates/vilan-core/src/lexing.rs",
+        "UNESCAPED_BRACE",
+        "a literal `}` inside an interpolated string is written `\\}`:",
+    ),
+    (
+        "crates/vilan-core/src/lexing.rs",
+        "LINE_BREAK_IN_STRING",
+        "a string cannot span lines unless it is triple-quoted:",
+    ),
+];
+
+/// Where a constant's name has to appear for its text to be a rule statement:
+/// the `Rule` construction itself, the lexer's `rule` field (written both as
+/// `Some(..)` and as a `match` over the character), and the three helpers that
+/// take one as a parameter and state it themselves.
+const RULE_STATEMENT_CONTEXTS: &[&str] = &[
+    "ParseErrorReason::Rule(",
+    "rule: Some(",
+    "rule: match",
+    "parse_nested(",
+    "parse_nested_as(",
+    "refuse_nesting(",
+];
+
+/// How far back from a mention the context may sit. A `parse_nested_as(` call
+/// puts its refusal on the next line under rustfmt, and the lexer's `match`
+/// arm sits two lines under `rule:`; 120 characters covers both and is short
+/// enough that an unrelated `Rule(` up the file cannot reach.
+const RULE_CONTEXT_WINDOW: usize = 120;
 
 /// Appendix heads that cannot be held against the tree literally, with the
 /// reason each cannot. Every one is a COMPOSED head — the entry quotes a
@@ -1169,5 +1322,156 @@ fn the_keyless_row_still_counts_the_rule_sites() {
          here AND the row in `proposal/diagnostics-ledger.md`, which carries the \
          same number in prose.",
         mentions - rendering_arm
+    );
+}
+
+/// Every `&'static str` constant in `path` that a rule statement states, as
+/// `(name, text)` — the declarations, filtered to the ones whose name reaches
+/// one of [`RULE_STATEMENT_CONTEXTS`] (N65).
+fn rule_statement_constants(path: &Path) -> Vec<(String, String)> {
+    let source = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("{}: {error}", path.display());
+    });
+    let characters: Vec<char> = source.chars().collect();
+    let mut found = Vec::new();
+    for (offset, _) in source.match_indices("const ") {
+        let after = &source[offset + "const ".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let declaration = &after[name.len()..];
+        let Some(rest) = declaration
+            .strip_prefix(": &'static str = ")
+            .or_else(|| declaration.strip_prefix(": &str = "))
+        else {
+            continue;
+        };
+        if !rest.starts_with('"') {
+            continue;
+        }
+        let quote = source.len() - rest.len();
+        let quote_index = source[..quote].chars().count();
+        let Some((text, _)) = string_literal(&characters, quote_index) else {
+            continue;
+        };
+        if states_a_rule(&source, &name) {
+            found.push((name, text));
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Whether `name` is MENTIONED where a rule statement is made — the test the
+/// list stands on, asked of the tree rather than of a memory of it.
+fn states_a_rule(source: &str, name: &str) -> bool {
+    source.match_indices(name).any(|(at, _)| {
+        // Back up to a character boundary: the window is a byte count, and
+        // these files are full of `—` and `…`.
+        let mut from = at.saturating_sub(RULE_CONTEXT_WINDOW);
+        while from < at && !source.is_char_boundary(from) {
+            from += 1;
+        }
+        let window = &source[from..at];
+        RULE_STATEMENT_CONTEXTS
+            .iter()
+            .any(|context| window.contains(context))
+    })
+}
+
+#[test]
+fn every_rule_statement_constant_is_curated() {
+    // N65, and N42's rule for a list: the enumeration is only worth its ink
+    // while it is the WHOLE population. A rule statement stated through a new
+    // constant is a message with no row anywhere — not in the index, which
+    // cannot key on it, and not here — and nothing would have said so.
+    let mut in_tree: Vec<String> = Vec::new();
+    for file in [
+        "crates/vilan-core/src/parsing.rs",
+        "crates/vilan-core/src/lexing.rs",
+    ] {
+        for (name, _) in rule_statement_constants(&repository_root().join(file)) {
+            in_tree.push(format!("{file}\t{name}"));
+        }
+    }
+    let listed: BTreeSet<String> = CURATED_RULE_STATEMENTS
+        .iter()
+        .map(|(file, name, _)| format!("{file}\t{name}"))
+        .collect();
+    let in_tree: BTreeSet<String> = in_tree.into_iter().collect();
+    let unlisted: Vec<&String> = in_tree.difference(&listed).collect();
+    assert!(
+        unlisted.is_empty(),
+        "rule statement constant(s) no ledger row records: {unlisted:?}. A curated \
+         rule statement is a message, and row 229 can only count it — add it to \
+         CURATED_RULE_STATEMENTS with the head it opens with, and to \
+         `proposal/diagnostics-ledger.md`'s row 229 population."
+    );
+    let gone: Vec<&String> = listed.difference(&in_tree).collect();
+    assert!(
+        gone.is_empty(),
+        "CURATED_RULE_STATEMENTS names constant(s) the tree no longer states as a \
+         rule: {gone:?}. A row for a message nobody prints is the rot the ledger \
+         exists to catch — delete the entry, or restore the statement."
+    );
+}
+
+#[test]
+fn every_curated_rule_statement_still_opens_as_recorded() {
+    // The half a count cannot make (N65). A reworded rule statement now reds
+    // the row that records it, which is what "a row EDIT" needs: something to
+    // edit.
+    let mut reworded = Vec::new();
+    for (file, name, head) in CURATED_RULE_STATEMENTS {
+        let constants = rule_statement_constants(&repository_root().join(file));
+        let Some((_, text)) = constants.iter().find(|(found, _)| found == name) else {
+            continue; // the check above names it; this one says nothing twice.
+        };
+        if !text.starts_with(head) {
+            let shown: String = text.chars().take(head.chars().count() + 20).collect();
+            reworded.push(format!("  {file}: {name}\n      now opens {shown:?}"));
+        }
+    }
+    assert!(
+        reworded.is_empty(),
+        "{} curated rule statement(s) no longer open with the head recorded in \
+         CURATED_RULE_STATEMENTS. A reworded message is a row EDIT: update the \
+         head here, and the row in `proposal/diagnostics-ledger.md`:\n{}",
+        reworded.len(),
+        reworded.join("\n")
+    );
+}
+
+#[test]
+fn the_helper_built_resource_derive_refusal_is_rowed() {
+    // N65's other half. `analyzer::resource_derive_refusal` builds its sentence
+    // in a helper and hands back a `String`, so the enumeration in check (3) —
+    // which reads the literal written AT a `msg:` anchor — never saw it, and it
+    // carried no row at all: an unrowed message, not a red one. It has one now,
+    // and this is the pin in both directions.
+    //
+    // Forward: the tree still prints it, at the helper the row stands for.
+    let analyzer = normalized(&read("crates/vilan-core/src/analyzer.rs"));
+    assert!(
+        analyzer.contains(RESOURCE_DERIVE_REFUSAL_FRAGMENT),
+        "`resource_derive_refusal` no longer builds {RESOURCE_DERIVE_REFUSAL_FRAGMENT:?} — \
+         reword its row in `{INDEX}` with it"
+    );
+    // Back: a row in the index is keyed on it. Check (2) then holds the key
+    // against the tree on every run, which is the coverage the message never
+    // had.
+    let rowed = index()
+        .into_iter()
+        .any(|row| row.key.contains(RESOURCE_DERIVE_REFUSAL_FRAGMENT));
+    assert!(
+        rowed,
+        "no row in `{INDEX}` is keyed on the resource-derive refusal. It is built \
+         in a helper, so nothing else in this file can reach it: without its row it \
+         has no coverage at all."
     );
 }

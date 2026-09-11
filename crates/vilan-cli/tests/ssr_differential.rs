@@ -137,117 +137,10 @@ main();
 "#;
 
 /// The DOM/history stub plus the canonical serializer (see the module doc).
-const HARNESS: &str = r##"const VOID = new Set(["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"]);
-const escapeText = s => s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-const escapeAttr = s => s.replaceAll("&","&amp;").replaceAll('"',"&quot;");
-
-const SVG_NS = "http://www.w3.org/2000/svg";
-class StubElement {
-    constructor(tag, namespace) {
-        this.tagName = tag;
-        this.namespaceURI = namespace || "http://www.w3.org/1999/xhtml";
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this.text = "";
-        this.attributes = [];
-        // A real createElementNS records no xmlns ATTRIBUTE; the canonical
-        // form folds the namespace into the one the process twin seeds on the
-        // svg root, so the namespace decision lands in the byte comparison.
-        if (namespace === SVG_NS && tag === "svg") this.attributes.push(["xmlns", namespace]);
-        this.styleProperties = new Map();
-        this.style = {
-            setProperty: (n, v) => this._upsertStyle(n, v),
-            getPropertyValue: (n) => this.styleProperties.get(n) || "",
-            removeProperty: (n) => this._upsertStyle(n, ""),
-        };
-    }
-    _upsert(name, value) {
-        const i = this.attributes.findIndex(([n]) => n === name);
-        if (i >= 0) this.attributes[i] = [name, value]; else this.attributes.push([name, value]);
-    }
-    _remove(name) { this.attributes = this.attributes.filter(([n]) => n !== name); }
-    // CSSOM: an empty value REMOVES the declaration, and a repeated name
-    // updates in place rather than appending a second one. `View::show`
-    // restores an element's prior inline `display` by writing back what it
-    // read, which is the empty string when there was none.
-    _upsertStyle(name, value) {
-        if (value === "" || value === null || value === undefined) this.styleProperties.delete(name);
-        else this.styleProperties.set(name, value);
-        if (this.styleProperties.size === 0) { this._remove("style"); return; }
-        const text = [...this.styleProperties].map(([n, v]) => n + ":" + v).join(";");
-        this._upsert("style", text);
-    }
-    set className(v) { this._upsert("class", v); }
-    get className() { const a = this.attributes.find(([n]) => n === "class"); return a ? a[1] : ""; }
-    setAttribute(name, value) { this._upsert(name, value); }
-    set hidden(v) { if (v) this._upsert("hidden", ""); else this._remove("hidden"); }
-    get hidden() { return this.attributes.some(([n]) => n === "hidden"); }
-    set value(v) { this._upsert("value", v); }
-    get value() { const a = this.attributes.find(([n]) => n === "value"); return a ? a[1] : ""; }
-    set textContent(text) { this.text = text; this.children = []; }
-    get textContent() { return this.text; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this; this.children.push(child);
-    }
-    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
-    // plants an empty text node and inserts its content BEFORE it, so a
-    // reactive run keeps its place among static siblings.
-    insertBefore(child, anchor) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        const at = this.children.lastIndexOf(anchor);
-        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
-        return child;
-    }
-    remove() { if (this.parent) { this.parent.children = this.parent.children.filter(c => c !== this); this.parent = null; } }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-}
-/// A text node — a real sibling of the element children: what a `str` or a
-/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
-/// the anchor it inserts before (A71).
-class StubText {
-    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
-    set textContent(text) { this._text = text; }
-    get textContent() { return this._text; }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-}
-
-function serialize(el) {
-    // A71: a text node serializes as its text. A `Region`'s anchor is the
-    // EMPTY one, so it serializes to nothing — which is exactly what the
-    // process twin, which plants no anchor at all, writes there. That is the
-    // whole reason the anchor is an empty text node and not a comment: a
-    // `<!---->` would break this byte equality.
-    if (el instanceof StubText) return escapeText(el.textContent);
-    let out = "<" + el.tagName;
-    for (const [name, value] of el.attributes) out += ` ${name}="${escapeAttr(value)}"`;
-    out += ">";
-    if (VOID.has(el.tagName)) return out;
-    out += escapeText(el.text);
-    for (const c of el.children) out += serialize(c);
-    return out + "</" + el.tagName + ">";
-}
-
-const root = new StubElement("app-root");
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createElementNS: (ns, tag) => new StubElement(tag, ns),
-    createTextNode: (text) => new StubText(text),
-    getElementById: (id) => (id === "app" ? root : null),
-    querySelector: () => null, querySelectorAll: () => [],
-};
-global.window = { addEventListener: () => {} };
-global.location = { pathname: "/" };
-
-require("./client.js");
+const HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/ssr_differential.js"),
+    r##"require("./client.js");
 
 // The cause pin for B37: the svg subtree must be built in the SVG namespace —
 // an HTML-namespace <svg> serializes identically and renders nothing.
@@ -268,7 +161,7 @@ console.log(serialize(root.children[0]));
 // binding is an ambient `effect`, so the attribute must follow the signal.
 // `el.attributes &&`: the walk now meets TEXT nodes — a `Region`'s empty
 // anchor (A71) is one — and they carry no attribute list.
-const byId = (el, id) => el.attributes && el.attributes.some(([n, v]) => n === "id" && v === id)
+const byId = (el, id) => el.attributes && el.attributes.id === id
     ? el
     : el.children.map(c => byId(c, id)).find(Boolean);
 const themed = byId(root, "themed");
@@ -278,8 +171,9 @@ if (!themed || !button) {
     process.exit(1);
 }
 for (const handler of button.listeners.click || []) handler();
-console.log("AFTER " + themed.attributes.find(([n]) => n === "class")[1]);
-"##;
+console.log("AFTER " + themed.attributes.class);
+"##,
+);
 
 fn build(dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))

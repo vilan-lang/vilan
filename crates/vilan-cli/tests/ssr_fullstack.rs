@@ -118,79 +118,10 @@ fn http_get(port: u16, path: &str) -> Vec<u8> {
 /// The A10 DOM stub plus the replace-matrix assertions, run under node against the
 /// built `dist/client.js` (passed as argv[2]). One `ok`/`FAIL` line per assertion;
 /// exits 1 on any failure.
-const BOOT_HARNESS: &str = r##"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-        this.hidden = false;
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    set className(v) { this.attributes["class"] = v; }
-    get className() { return this.attributes["class"] || ""; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    set value(v) { this.attributes["value"] = v; }
-    get value() { return this.attributes["value"] || ""; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter((c) => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    // A71: `appendChild`'s positional counterpart. `std::ui`'s `Region`
-    // plants an empty text node and inserts its content BEFORE it, so a
-    // reactive run keeps its place among static siblings.
-    insertBefore(child, anchor) {
-        if (child.parent) child.parent.children = child.parent.children.filter((c) => c !== child);
-        child.parent = this;
-        const at = this.children.lastIndexOf(anchor);
-        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
-        return child;
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter((c) => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    click() { for (const h of (this.listeners.click || [])) h({ preventDefault() {} }); }
-    // Both walks skip TEXT nodes: a `Region`'s anchor (A71) is one, and these
-    // ask element questions.
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find && c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-    findAll(predicate, acc) {
-        acc = acc || [];
-        if (predicate(this)) acc.push(this);
-        for (const c of this.children) if (c.findAll) c.findAll(predicate, acc);
-        return acc;
-    }
-}
-
-/// A text node — a real sibling of the element children: what a `str` or a
-/// `Source<str>` child rides, and what `std::ui`'s `Region` plants (empty) as
-/// the anchor it inserts before (A71).
-class StubText {
-    constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
-    set textContent(text) { this._text = text; }
-    get textContent() { return this._text; }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter((c) => c !== this);
-            this.parent = null;
-        }
-    }
-}
-
-let failures = 0;
+const BOOT_HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/ssr_fullstack.js"),
+    r##"let failures = 0;
 function check(condition, message) {
     if (condition) console.log("ok   - " + message);
     else { failures += 1; console.error("FAIL - " + message); }
@@ -200,15 +131,14 @@ function check(condition, message) {
 // hand-built mirror of render(app())'s output — the stub has no HTML parser, and
 // the replace path only needs the container non-empty with foreign nodes the
 // client did not build. The texts mirror the server markup phase 1 asserted.
-const container = new StubElement("div");
-const serverMain = new StubElement("main");
+const serverMain = newElement("main");
 serverMain.className = "app";
-const serverList = new StubElement("ul");
-const serverLi1 = new StubElement("li"); serverLi1.textContent = "Render on the server";
-const serverLi2 = new StubElement("li"); serverLi2.textContent = "Replace on boot";
+const serverList = newElement("ul");
+const serverLi1 = newElement("li"); serverLi1.textContent = "Render on the server";
+const serverLi2 = newElement("li"); serverLi2.textContent = "Replace on boot";
 serverList.appendChild(serverLi1);
 serverList.appendChild(serverLi2);
-const serverButton = new StubElement("button"); serverButton.textContent = "idle";
+const serverButton = newElement("button"); serverButton.textContent = "idle";
 serverMain.appendChild(serverList);
 serverMain.appendChild(serverButton);
 container.appendChild(serverMain);
@@ -216,15 +146,9 @@ container.appendChild(serverMain);
 // Pre-boot: the container holds the server-rendered tree, before any client JS.
 check(container.children.length === 1 && container.children[0] === serverMain, "pre-boot: container holds the server-rendered <main>");
 
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createTextNode: (text) => new StubText(text),
-    getElementById: (id) => (id === "app" ? container : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.window = { addEventListener: () => {} };
-global.location = { pathname: "/" };
+// The page the client boots into: the container built above, already holding
+// the server's markup, answering `getElementById("app")`.
+installStubDocument({ root: container, rootId: "app", element: newElement });
 
 // Boot the client bundle: its top-level mount_root("app", ...) runs on require.
 require(process.argv[2]);
@@ -254,7 +178,8 @@ check(container.find((el) => el === serverButton) === null, "dead: the server bu
 check(serverButton.textContent === "idle", "dead: the detached server button got no update from the write");
 
 process.exit(failures === 0 ? 0 : 1);
-"##;
+"##,
+);
 
 #[test]
 fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
