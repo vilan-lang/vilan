@@ -4635,3 +4635,200 @@ fn the_wire_refusal_names_map_and_the_impl_among_the_shapes_it_admits() {
         assert_fails_with(source, escape);
     }
 }
+
+// --- B299: a BARE TRAIT in impl-subject position means "every implementer" ---
+//
+// `impl Source<type I> { fun flatten(self) .. }` parsed and then refused every
+// use of `self`: the body read the subject literally, so `self` was a value of
+// bare trait type — which vilan has none of — and the spelling meant nothing a
+// body could use while looking exactly like the one that does. RULED a DESUGAR
+// (2026-09-11): it means `impl type S: Source<type I> { .. }`, the universal
+// reading B186's parameters and B184's fields already give a bare trait, and
+// the reading SELECTION has always given it (`impl Iterator<type T> with
+// Iterable<T>` is how std writes "every iterator also iterates").
+
+#[test]
+fn b299_a_bare_trait_impl_subject_makes_self_the_implementing_type() {
+    // The filed exhibit, run: `self.get()` inside the body dispatches to the
+    // receiver's own implementation, and the head's `T` binds from it, so the
+    // result is an `i32` at the call site with nothing annotated.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<type T> {
+            fun sample(self): T { self.get() }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            print(cell.sample() + 1);
+        }
+
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b299_the_bare_trait_head_dispatches_per_implementation() {
+    // The claim the compile alone cannot make: ONE body, and each receiver's
+    // own `get` is what runs in it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        struct Doubled { value: i32 }
+        impl Doubled with Read<i32> {
+            fun get(self): i32 { self.value * 2 }
+        }
+
+        impl Read<type T> {
+            fun sample(self): T { self.get() }
+        }
+
+        fun main() {
+            print(Cell { value = 7 }.sample());
+            print(Doubled { value = 7 }.sample());
+        }
+
+        main();
+        "#,
+        "7\n14\n",
+    );
+}
+
+#[test]
+fn b299_the_owners_probe_head_compiles_and_runs() {
+    // The head B299 was filed from, over std's own `Source`: a source of an
+    // OPTIONAL source, with the inner binder anonymous (B294's `_`). `self.get()`
+    // works in it, and so does `inner.get()` on what it yields.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        impl Source<Option<type _: Source<type U>>> {
+            fun peek(self): Option<U> {
+                match self.get() {
+                    Some(let inner) => Some(inner.get()),
+                    None => None,
+                }
+            }
+        }
+
+        fun main() {
+            let inner = Signal::new(7);
+            let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(inner));
+            print(outer.peek().unwrap_or(0));
+            let empty: SignalCell<Option<SignalCell<i32>>> = Signal::new(None);
+            print(empty.peek().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "7\n0\n",
+    );
+}
+
+#[test]
+fn b299_a_body_naming_the_implicit_binder_is_told_the_spelling() {
+    // The implicit binder has NO name, so a body reaching for one finds
+    // nothing — and the fix is a spelling, not a missing declaration. One
+    // steer; the impl itself is legitimate.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<type T> {
+            fun sample(self): T {
+                let me: S = self;
+                me.get()
+            }
+        }
+
+        fun main() { }
+        "#,
+        "name it in the head: `impl type S: Read<..>`",
+    );
+}
+
+#[test]
+fn b299_self_names_the_implementing_type_in_a_bare_trait_impl() {
+    // The spelling the steer offers, working: `Self` is the implementing type
+    // inside such a body — which is what std's `impl Iterator<type T> with
+    // Iterable<T> { fun iter(self): Self { self } }` has always relied on.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<type T> {
+            fun twice(self): T {
+                let me: Self = self;
+                me.get()
+            }
+        }
+
+        fun main() { print(Cell { value = 7 }.twice()); }
+
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b299_a_trait_hung_static_is_still_reached_by_the_traits_name() {
+    // The std control the desugar must not cost: `impl Iterator<type T> {
+    // fun from_fn(..) }` hangs a STATIC off the trait, reached as
+    // `Iterator::from_fn`. The impl still registers under the trait subject,
+    // so the name still finds it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut remaining = 3;
+            let counted = Iterator::from_fn(|| {
+                if remaining > 0 {
+                    remaining = remaining - 1;
+                    Some(remaining)
+                } else {
+                    None
+                }
+            });
+            for value in counted {
+                print(value);
+            }
+        }
+
+        main();
+        "#,
+        "2\n1\n0\n",
+    );
+}

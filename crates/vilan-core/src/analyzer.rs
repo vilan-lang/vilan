@@ -3659,6 +3659,15 @@ pub struct Analyzer<'src> {
     // — without it they were silently discarded (the empty-inner-function /
     // cross-call-collision class).
     static_subject_bindings: HashMap<Id, SubstitutionContext>,
+    /// The type ids an `impl` HEAD walked — its subject and its `with` clause
+    /// (B299). A name that fails to resolve THERE is a name in the head, not a
+    /// body reaching for the implicit binder, so the head's steer would be
+    /// nonsense on it.
+    impl_head_type_ids: HashSet<TypeId>,
+    /// Every `impl` body scope and the subject it was written for (B299) —
+    /// read back once the subject's type is final, to tell a body written for
+    /// EVERY implementer of a trait from one written for a concrete type.
+    impl_body_subjects: HashMap<Id, TypeId>,
     // `Trait::member(receiver, ..)` — the explicit disambiguator (B57 §3.1),
     // keyed by the ACCESSOR expr id, carrying the trait named at the path head
     // and the member. The accessor resolves to the trait's own declaration up
@@ -4778,6 +4787,8 @@ impl<'src> Analyzer<'src> {
             expected_types: HashMap::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
+            impl_body_subjects: HashMap::default(),
+            impl_head_type_ids: HashSet::default(),
             trait_qualified_calls: HashMap::default(),
             own_generic_call_bindings: HashMap::default(),
             spread_packs: HashMap::default(),
@@ -4914,6 +4925,51 @@ impl<'src> Analyzer<'src> {
             scope_id = self.scopes.get(&current).and_then(|scope| scope.parent_id);
         }
         false
+    }
+
+    /// Whether `id` sits inside an `impl` whose SUBJECT is a bare trait
+    /// (B299) — `impl Source<type I> { fun flatten(self) .. }`, the spelling
+    /// that parsed and then refused every use of `self`.
+    ///
+    /// A bare trait in impl-subject position means "for every type that
+    /// implements it", which is the universal reading every other bare-trait
+    /// position already has (B186's parameters, B184's fields) and the reading
+    /// selection has always given it — `impl Iterator<type T> with Iterable<T>`
+    /// is how std writes "every iterator also iterates". The body was the only
+    /// half that read it literally: `self` took the subject's type as written,
+    /// so it was a value of bare trait type, which vilan has none of, and the
+    /// spelling meant nothing a body could use while looking exactly like the
+    /// one that does (`impl type S: Source<type I>`, one token away).
+    ///
+    /// So such a body is `self`-wise exactly a TRAIT DEFAULT body: `self` is
+    /// the implementing type, abstract through analysis, re-dispatched per
+    /// concrete type at codegen. This is that predicate's twin, asked wherever
+    /// the two must agree.
+    ///
+    /// Answered from the RESOLVED subject rather than from the head's syntax,
+    /// because the head is walked before the subject's type is final.
+    fn enclosing_bare_trait_impl_subject(&self, id: Id) -> Option<TypeId> {
+        let scope_id = self.expr_id_to_scope_id_map.get(&id).copied()?;
+        self.bare_trait_impl_subject_in_scope(scope_id)
+    }
+
+    /// [`Self::enclosing_bare_trait_impl_subject`] from a SCOPE rather than an
+    /// entity — for the deferred queues, whose entries carry the scope they
+    /// were walked in and no entity of their own.
+    fn bare_trait_impl_subject_in_scope(&self, scope_id: Id) -> Option<TypeId> {
+        let mut scope_id = Some(scope_id);
+        while let Some(current) = scope_id {
+            if let Some(subject_type_id) = self.impl_body_subjects.get(&current)
+                && matches!(
+                    self.type_id_to_type_map.get(subject_type_id),
+                    Some(Type::Trait(..))
+                )
+            {
+                return Some(*subject_type_id);
+            }
+            scope_id = self.scopes.get(&current).and_then(|scope| scope.parent_id);
+        }
+        None
     }
 
     /// Whether `constraint_id` is a generic parameter of a binder ENCLOSING
@@ -16356,13 +16412,66 @@ impl<'src> Analyzer<'src> {
     /// the trait in view, an arity mismatch, or a position that does not
     /// reconcile leaves the binder as it was, so a program that resolved
     /// before resolves the same way.
+    /// Binds the binders a written type PATTERN carries from the concrete type
+    /// that position actually holds — the inner step of
+    /// [`Self::bind_subject_bound_binders`], shared by its bare-trait subject
+    /// pass and its bound pass. Lenient: a position that is not concrete, or
+    /// that does not reconcile, leaves its binders as they were.
+    fn bind_pattern_binders(
+        &mut self,
+        pattern_id: TypeId,
+        actual_id: TypeId,
+        bindings: &mut SubstitutionContext,
+    ) {
+        let pattern = pattern_id.get_type(self);
+        let actual = actual_id.get_type(self);
+        if !crate::impl_select::is_resolvable(&actual) {
+            return;
+        }
+        let Some((_, pairs)) = self.reconcile_declaration(&actual, &pattern, &pattern) else {
+            return;
+        };
+        let mut pattern_binders = Vec::new();
+        self.collect_subject_binders(pattern_id, &mut pattern_binders);
+        let grounded = self.bindings_for_binders(&pattern_binders, pairs);
+        for (constraint_id, bound_id) in grounded {
+            bindings.entry(constraint_id).or_insert(bound_id);
+        }
+    }
+
     fn bind_subject_bound_binders(
         &mut self,
         impl_subject_id: TypeId,
+        subject_type: &Type,
         bindings: &mut SubstitutionContext,
     ) {
         let mut pending = Vec::new();
         self.collect_subject_binders(impl_subject_id, &mut pending);
+        // A BARE TRAIT subject (B299) is the same question one step out: the
+        // head says the receiver implements this trait, so the receiver's own
+        // impl decides the arguments the head wrote — `impl Read<type T>` on a
+        // `Cell<i32>` binds `T = i32` exactly as `impl type S: Read<type T>`
+        // does, because the two spellings mean the same thing.
+        if let Some(Type::Trait(trait_id, subject_arguments)) =
+            self.type_id_to_type_map.get(&impl_subject_id).cloned()
+            && !subject_arguments.is_empty()
+            && let Some(provided) = self.trait_args_for(subject_type, trait_id)
+            && provided.len() == subject_arguments.len()
+        {
+            for (pattern_id, actual_id) in subject_arguments.into_iter().zip(provided) {
+                self.bind_pattern_binders(pattern_id, actual_id, bindings);
+            }
+        }
+        // The implicit binder itself: the subject's type id is its constraint
+        // id, so binding it to the receiver is what lets a call inside the body
+        // re-dispatch to the concrete implementation (B299).
+        if matches!(
+            self.type_id_to_type_map.get(&impl_subject_id),
+            Some(Type::Trait(..))
+        ) {
+            let receiver_type_id = subject_type.clone().get_type_id(self);
+            bindings.entry(impl_subject_id).or_insert(receiver_type_id);
+        }
         let mut seen: Vec<TypeId> = Vec::new();
         while let Some(binder) = pending.pop() {
             if seen.contains(&binder) {
@@ -16388,21 +16497,7 @@ impl<'src> Analyzer<'src> {
                 }
                 for (pattern_id, actual_id) in bound_arguments.into_iter().zip(provided) {
                     self.collect_subject_binders(pattern_id, &mut pending);
-                    let pattern = pattern_id.get_type(self);
-                    let actual = actual_id.get_type(self);
-                    if !crate::impl_select::is_resolvable(&actual) {
-                        continue;
-                    }
-                    let Some((_, pairs)) = self.reconcile_declaration(&actual, &pattern, &pattern)
-                    else {
-                        continue;
-                    };
-                    let mut pattern_binders = Vec::new();
-                    self.collect_subject_binders(pattern_id, &mut pattern_binders);
-                    let grounded = self.bindings_for_binders(&pattern_binders, pairs);
-                    for (constraint_id, bound_id) in grounded {
-                        bindings.entry(constraint_id).or_insert(bound_id);
-                    }
+                    self.bind_pattern_binders(pattern_id, actual_id, bindings);
                 }
             }
         }
@@ -27179,6 +27274,9 @@ impl<'src> Analyzer<'src> {
                 // The subject may legitimately BE a trait: `impl Iterator<type T>`
                 // and `impl Iterator<type T> with Iterable<T>` blanket over a
                 // bound, which is how std writes "every iterator also iterates".
+                // B299: the head's own type references are banked so the
+                // body-only steer can tell them apart from a body's.
+                let head_prepped_from = self.prepped_type_locals.len();
                 let subject_type_id = self.walk_trait_position_type_node(subject, body_scope_id);
                 // B184: the fourth position that can ground a hidden parameter,
                 // and the one that makes a sugared struct usable at all — a
@@ -27188,6 +27286,17 @@ impl<'src> Analyzer<'src> {
                     .insert(subject_type_id, (id, body_scope_id));
                 // Within an `impl`, `Self` refers to the subject type.
                 self.register_self_type(body_scope_id, subject_type_id);
+                // B299: the subject may BE a bare trait, and then this body is
+                // written for every type that implements it — `self` is that
+                // type, not a value of the trait. Which it is cannot be read
+                // HERE (the subject's slot resolves later, a trait declared
+                // further down the file included), so the scope and its subject
+                // are banked and the question is asked once types are final.
+                self.impl_body_subjects
+                    .insert(body_scope_id, subject_type_id);
+                for (type_id, ..) in &self.prepped_type_locals[head_prepped_from..] {
+                    self.impl_head_type_ids.insert(*type_id);
+                }
                 // Record the subject's generic arguments (the `<...>` on the head)
                 // so `self`'s variant patterns substitute the enum/struct's
                 // declared parameters for these args — e.g. `Some` on a
@@ -35706,19 +35815,26 @@ impl<'src> Analyzer<'src> {
                         // (`List<i32>` against the impl's `List<T>` binds `T = i32`)
                         // so the method body monomorphizes.
                         let impl_subject = impl_subject_id.get_type(self);
-                        if let Some((_, bindings)) =
-                            self.reconcile_declaration(&impl_subject, &subject_type, &impl_subject)
-                        {
-                            // B300(a): the subject's binders alone leave a
-                            // binder written inside a BOUND (`impl type S:
-                            // Read<type T>`) a hole. The receiver's own impl of
-                            // the bound trait decides it, so ground those too
-                            // before the body monomorphizes.
-                            let mut bindings: SubstitutionContext = bindings.into_iter().collect();
-                            self.bind_subject_bound_binders(impl_subject_id, &mut bindings);
-                            if !bindings.is_empty() {
-                                self.method_call_substitution.insert(id, bindings);
-                            }
+                        let mut bindings: SubstitutionContext = self
+                            .reconcile_declaration(&impl_subject, &subject_type, &impl_subject)
+                            .map(|(_, bindings)| bindings.into_iter().collect())
+                            .unwrap_or_default();
+                        // B300(a): the subject's binders alone leave a binder
+                        // written inside a BOUND (`impl type S: Read<type T>`)
+                        // a hole. The receiver's own impl of the bound trait
+                        // decides it, so ground those too before the body
+                        // monomorphizes. B299's bare-trait subject is the same
+                        // question one step out, and a trait subject reconciles
+                        // against a concrete receiver on the arm that binds
+                        // NOTHING — so this runs whether or not the
+                        // reconciliation above had anything to say.
+                        self.bind_subject_bound_binders(
+                            impl_subject_id,
+                            &subject_type,
+                            &mut bindings,
+                        );
+                        if !bindings.is_empty() {
+                            self.method_call_substitution.insert(id, bindings);
                         }
                         // A method that fills a container's inference slot —
                         // `list.push(value)` or `context.run(value, ..)` — unifies
@@ -35829,15 +35945,33 @@ impl<'src> Analyzer<'src> {
                 // (`let x: Display = 5; x.to_string()`) has no concrete type to
                 // dispatch to — vilan has no trait objects — so reject it rather
                 // than silently lowering to the empty abstract method.
-                if member.is_some() && !self.is_in_trait_default(id) {
+                let bare_trait_impl_subject = self.enclosing_bare_trait_impl_subject(id);
+                if member.is_some()
+                    && !self.is_in_trait_default(id)
+                    && bare_trait_impl_subject.is_none()
+                {
                     MethodLookup::BareTraitValue(trait_id)
                 } else {
                     // Inside a trait default body `self`/`Self` is `Type::Trait`;
                     // record the call so codegen re-dispatches it to whatever
                     // concrete type the default is specialized for.
                     if let Some((_, declaring_trait_id, declaring_arguments)) = &declared {
-                        self.generic_dispatch
-                            .insert(id, GenericDispatch::OnType(None, member_name));
+                        // B299: inside a BARE-TRAIT IMPL body `self` is the
+                        // implementing type — an implicit binder whose
+                        // constraint id is the subject's own type id — so the
+                        // call re-dispatches through THAT, the ordinary bounded
+                        // parameter channel, rather than through a trait
+                        // default's specialization (which this is not: the
+                        // member belongs to the impl, and only the CALLER knows
+                        // what the receiver is). The caller records the binding
+                        // (`bind_subject_bound_binders`).
+                        let dispatch = match bare_trait_impl_subject {
+                            Some(subject_type_id) if !self.is_in_trait_default(id) => {
+                                GenericDispatch::OnConstraint(subject_type_id, member_name)
+                            }
+                            _ => GenericDispatch::OnType(None, member_name),
+                        };
+                        self.generic_dispatch.insert(id, dispatch);
                         // B205: a member reached from a SUPERTRAIT is written in
                         // that trait's terms, `Self` included — and inside this
                         // default body `Self` is the SUB-trait. Record the reach
@@ -40677,6 +40811,26 @@ impl<'src> Analyzer<'src> {
                          no head to bind it to — write the type here, or, where the type can be \
                          inferred, leave the annotation off"
                             .to_string()
+                    } else if !self.impl_head_type_ids.contains(&type_id)
+                        && let Some(subject_type_id) =
+                            self.bare_trait_impl_subject_in_scope(scope_id)
+                        && let Some(Type::Trait(trait_id, _)) =
+                            self.type_id_to_type_map.get(&subject_type_id)
+                        && let Some(trait_) = self.traits.get(trait_id)
+                    {
+                        // B299: inside an impl whose SUBJECT is a bare trait,
+                        // the implementing type is a binder the head did not
+                        // name — so a body reaching for it by name finds
+                        // nothing, and the fix is a spelling rather than a
+                        // missing declaration. One steer, no refusal: the
+                        // impl itself is legitimate and compiles.
+                        let trait_name = trait_.name;
+                        format!(
+                            "cannot find type '{name}'; this `impl`'s subject is the trait \
+                             `{trait_name}` itself, so it is written for EVERY type that \
+                             implements it — and that type has no name here. Say `Self`, or \
+                             name it in the head: `impl type {name}: {trait_name}<..>`"
+                        )
                     } else {
                         let steer = self.import_steer(name).unwrap_or_default();
                         format!("cannot find type '{}'{}", name, steer)
