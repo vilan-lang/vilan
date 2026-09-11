@@ -456,3 +456,4 @@ row	flagship	key
 422	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's negation marker; write not(..) inside the condition you want negated
 423	-	a custom property is written with its dashes — var("--button-color"), not var("{name}")
 424	-	a custom property name cannot contain {...} — the name is one token, like --button-color
+425	-	cannot find type '{name}'; this `impl`'s subject is the trait `{trait_name}` itself, so it is written for EVERY type that implements it — and that type has no name here. Say `Self`, or name it in the head: `impl type {name}: {trait_name}<..>`

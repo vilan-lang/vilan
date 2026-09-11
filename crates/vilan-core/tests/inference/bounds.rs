@@ -9309,3 +9309,213 @@ fn b307_a_well_formed_clause_still_has_its_conformance_checked() {
         "returns `Dog`",
     );
 }
+
+#[test]
+fn b305_a_literal_over_an_unfilled_closure_parameter_is_indexable() {
+    // The observable face: `[event][0]` was "cannot index this List: its
+    // element type is never determined" — a refusal over a program that is
+    // perfectly determinate, because the erasure had thrown the element
+    // position away before the parameter was filled. With a slot the index
+    // yields the slot, `is_ev` grounds it, and the same body compiles.
+    // A compile claim, not a run one: `E` is the callee's own generic, so
+    // nothing inside `apply` may call `handler` with a concrete value, and the
+    // closure has no caller to run it.
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_ev(event: Ev): bool { event.code == 0 }
+
+        fun main() {
+            Holder { tag = "h" }.apply(|event| {
+                let first = [event][0];
+                if is_ev(first) { print("ev"); }
+            });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b305_a_literal_over_a_determined_element_is_unchanged() {
+    // The control: an element that DID type still names itself in the
+    // literal's type, and the index reads it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let items = [1, 2, 3];
+            print(items[0] + 1);
+        }
+
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b305_a_slot_nothing_fills_is_still_not_an_answer() {
+    // The negative control: minting a slot is not the same as answering. A
+    // literal whose element nothing ever grounds still has an open element,
+    // and reading it at a concrete type is still refused.
+    assert_fails(
+        r#"
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun wants_number(value: i32): i32 { value + 1 }
+
+        fun main() {
+            Holder { tag = "h" }.apply(|event| {
+                let first = [event][0];
+                let doubled: str = wants_number(first);
+            });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b286_a_source_generic_function_is_callable_from_generic_code() {
+    // The filed exhibit, in its own vocabulary: the inner function's `T` is
+    // reachable only through `S`'s bound, and the caller passes a parameter.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<T: Tagged, S: Read<T>>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() {
+            print(reply_source(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_the_concrete_receiver_form_is_the_control() {
+    // The spelling the estate had to use, unchanged: a CONCRETE argument reads
+    // its arguments off its impl, the channel that always worked.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun main() {
+            print(expose_dynamic(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_the_bound_is_read_through_the_supertrait_chain() {
+    // The caller's bound may name a SUB-trait: the arguments come from the
+    // chain at its own arguments, not from the bound's head alone.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+        trait Live<T> with Read<T> {}
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl Cell<type T> with Live<T> {}
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<T: Tagged, S: Live<T>>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() {
+            print(reply_source(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_a_caller_whose_parameter_carries_no_such_bound_is_still_refused() {
+    // The negative control: the fix reads a bound the caller WROTE. A caller
+    // whose parameter promises nothing about the trait still cannot supply the
+    // inner generic, and still says so.
+    assert_fails_with(
+        r#"
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<S>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() { }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}

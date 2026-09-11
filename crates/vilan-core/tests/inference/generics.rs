@@ -7992,3 +7992,302 @@ fn a_sync_mutable_self_rpc_and_an_async_plain_self_rpc_both_still_compile() {
         "#,
     );
 }
+
+/// The shared source for B296's faces: a generic static whose parameter is
+/// reachable only through the argument's ELEMENT, so an empty list binds
+/// nothing, plus a bound (`T: Named<K>`) whose requirement call is what an
+/// unbound `T` monomorphizes into.
+fn b296_bag_source(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+
+        trait Named<K> {{ fun name(self): K; }}
+
+        struct Task {{ id: str }}
+        impl Task with Named<str> {{
+            fun name(self): str {{ self.id }}
+        }}
+        struct Row {{ n: i32 }}
+        impl Row with Named<i32> {{
+            fun name(self): i32 {{ self.n }}
+        }}
+
+        struct Bag<K, T> {{ items: List<T>, tags: List<K> }}
+
+        impl Bag<type K, type T: Named<K>> {{
+            fun new(initial: List<T>): Bag<K, T> {{
+                mut tags = [];
+                for item in initial {{
+                    tags.push(item.name());
+                }}
+                Bag {{ items = initial, tags = tags }}
+            }}
+        }}
+
+        {body}
+
+        main();
+        "#
+    )
+}
+
+#[test]
+fn b296_two_sibling_struct_literal_fields_do_not_share_one_instantiation() {
+    // The filed shape, at ONE instantiation: both fields the same type, both
+    // `Bag::new([])`. It compiled and then stopped the emitter with
+    // "a call resolved to `Named`'s requirement `name`, which has no body".
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task>, done: Bag<str, Task> }
+
+        fun main() {
+            let store = Store { active = Bag::new([]), done = Bag::new([]) };
+            print(i"{store.active.items.len()}{store.done.items.len()}");
+        }
+        "#,
+        ),
+        "00\n",
+    );
+}
+
+#[test]
+fn b296_two_sibling_struct_literal_fields_keep_their_own_instantiations() {
+    // The same shape at TWO instantiations, which is what made the leak
+    // legible: the second field was reported as
+    // "Expected Bag<i32, Row>, but got Bag<str, Task>" — the FIRST field's
+    // type, read out of the literal's shared context.
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task>, done: Bag<i32, Row> }
+
+        fun main() {
+            let store = Store { active = Bag::new([]), done = Bag::new([]) };
+            print(i"{store.active.items.len()}{store.done.items.len()}");
+        }
+        "#,
+        ),
+        "00\n",
+    );
+}
+
+#[test]
+fn b296_two_sibling_call_arguments_do_not_share_one_instantiation() {
+    // The same defect through the CALL-argument loop rather than the literal's
+    // — the filed item names only the struct literal, and the two loops had
+    // the identical unfiltered record.
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        fun take(a: Bag<str, Task>, b: Bag<i32, Row>) {
+            print(i"{a.items.len()}{b.items.len()}");
+        }
+
+        fun main() { take(Bag::new([]), Bag::new([])); }
+        "#,
+        ),
+        "00\n",
+    );
+}
+
+#[test]
+fn b296_one_such_field_was_always_fine() {
+    // The control the item names: ONE field compiles, which is why the defect
+    // read as "two of them" rather than as "the empty literal".
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task> }
+
+        fun main() {
+            let store = Store { active = Bag::new([]) };
+            print(i"{store.active.items.len()}");
+        }
+        "#,
+        ),
+        "0\n",
+    );
+}
+
+#[test]
+fn b296_a_seeded_sibling_pair_was_always_fine() {
+    // The other control: seeding either list binds the callee's parameter from
+    // the argument, so nothing abstract is ever reported into the shared
+    // context.
+    assert_compiles_and_runs(
+        &b296_bag_source(
+            r#"
+        struct Store { active: Bag<str, Task>, done: Bag<str, Task> }
+
+        fun main() {
+            let store = Store {
+                active = Bag::new([Task { id = "a" }]),
+                done = Bag::new([Task { id = "b" }]),
+            };
+            print(i"{store.active.tags[0]}{store.done.tags[0]}");
+        }
+        "#,
+        ),
+        "ab\n",
+    );
+}
+
+#[test]
+fn b296_a_sibling_field_still_binds_the_structs_own_parameter() {
+    // The narrowing must not cost the bindings that ARE the literal's: a
+    // generic struct whose parameter is inferred from one field still types
+    // the rest of the literal by it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair<T> { left: T, right: T }
+
+        fun main() {
+            let pair = Pair { left = 7, right = 9 };
+            print(pair.left + pair.right);
+        }
+
+        main();
+        "#,
+        "16\n",
+    );
+}
+
+#[test]
+fn b306_a_contradicting_closure_argument_is_reported_exactly_once() {
+    // Two closures for one generic: the first binds `T = i32`, the second
+    // contradicts it. The call's result is unused, so nothing downstream has
+    // any reason to look.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun two<T>(self, f: |T| void, g: |T| void) { }
+        }
+        fun main() {
+            Holder { tag = "h" }.two(|a: i32| { print(a); }, |b: str| { print(b); });
+        }
+        main();
+        "#,
+        "Expected |i32| void, but got |str| void instead.",
+    );
+}
+
+#[test]
+fn b306_a_closure_standing_before_the_argument_that_binds_is_reported_once() {
+    // The ordering face: the closure is reached FIRST and binds `T` itself,
+    // and the value argument after it is what contradicts — so the report
+    // names the closure's instantiation, once.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun closure_first<T>(self, f: |T| void, value: T) { }
+        }
+        fun main() {
+            Holder { tag = "h" }.closure_first(|a: i32| { print(a); }, "s");
+        }
+        main();
+        "#,
+        "but got",
+    );
+}
+
+#[test]
+fn b306_a_contradiction_nested_in_the_closures_parameter_is_reported_once() {
+    // The nested face: the contradiction is one constructor deep in the
+    // closure's parameter (`|List<i32>|` against a `T` bound to `str`).
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun nested<T>(self, f: |List<T>| void, value: T) { }
+        }
+        fun main() {
+            Holder { tag = "h" }.nested(|a: List<i32>| { print(a.len()); }, "s");
+        }
+        main();
+        "#,
+        "Expected |List<str>| void, but got |List<i32>| void instead.",
+    );
+}
+
+#[test]
+fn b306_the_free_function_path_reports_a_contradicting_closure_once_too() {
+    // The free-function path binds through the same pass and reports from its
+    // own positional loop; one diagnostic there as well.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        fun free_two<T>(f: |T| void, g: |T| void) { }
+        fun main() {
+            free_two(|a: i32| { print(a); }, |b: str| { print(b); });
+        }
+        main();
+        "#,
+        "Expected |i32| void, but got |str| void instead.",
+    );
+}
+
+#[test]
+fn b306_an_argument_that_reconciles_on_a_later_attempt_is_not_reported() {
+    // The control that makes the backstop safe: a reconcile may fail on an
+    // early attempt simply because the types have not landed. The recorded
+    // candidate is cleared the moment a later attempt of the same argument
+    // succeeds, so an ordinary unannotated closure — typed only once its
+    // generic is bound — reports nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun each<T>(self, seed: T, f: |T| void): Holder {
+                f(seed);
+                self
+            }
+        }
+        fun main() {
+            Holder { tag = "h" }.each(7, |value| print(value + 1));
+        }
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b306_a_failed_reconcile_at_a_bare_trait_parameter_is_not_a_defect() {
+    // Why the pass must stay silent, not merely why it may. `self.add(self)`
+    // inside `Doubler`'s default body passes a `Doubler`-typed `self` to
+    // `Add::add`, whose parameter is the bare trait: this pass reconciles
+    // parameter-first and lands on `reconcile_type(Trait, Concrete)`, which
+    // REFUSES — while every value-first position, the later argument check
+    // included, accepts. The program is correct and runs; a report from the
+    // binding pass would have refused it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self.add(self) }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+        }
+        impl Money with Doubler {}
+
+        fun main() { print(Money { cents = 3 }.twice().cents); }
+        main();
+        "#,
+        "6\n",
+    );
+}

@@ -287,18 +287,16 @@ impl View {
 	/// nothing about either. `link` IS this method plus an anchor, which is
 	/// the honest relation between the two.
 	///
-	/// `|event: Event|` IS ANNOTATED, and must stay annotated. A process build
-	/// analyzes this browser module to color the program, and the process
-	/// `View::on_event` takes a generic `|E| void` (a server layer cannot name
-	/// `std::dom::Event`). In a free function — `link`'s old body — the
-	/// `plain_left_click(event)` call below pins `E` to `Event` by itself; from
-	/// inside an INHERENT IMPL METHOD it does not, and the process analysis
-	/// fails with "cannot call method 'prevent_default' on E". The annotation
-	/// says what the body already meant. (The asymmetry is a solver gap, not a
-	/// rule — filed from this lane.)
+	/// `|event|` is UNANNOTATED, and the annotation it used to carry was a
+	/// workaround: a process build analyzes this browser module to color the
+	/// program, and the process `View::on_event` takes a generic `|E| void` (a
+	/// server layer cannot name `std::dom::Event`), which the call froze into
+	/// the closure parameter before `plain_left_click(event)` below could pin
+	/// it. B304 closed that (the slot is left open when the expectation is the
+	/// callee's own unbound generic), so the body says what it means.
 	fun link_to<R: Routable>(self, route: R): View {
 		let path = route.to_path();
-		self.attr("href", path).attr("draggable", "false").on_event("click", |event: Event| {
+		self.attr("href", path).attr("draggable", "false").on_event("click", |event| {
 			if plain_left_click(event) {
 				event.prevent_default();
 				navigate(path);

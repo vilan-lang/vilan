@@ -4010,14 +4010,15 @@ fn a78_a_plain_service_on_an_unstamped_local_rpc_protocol_still_round_trips() {
 }
 
 #[test]
-#[ignore = "A86: an inherent blanket over a trait subject does not bind the trait's own argument at the call site"]
 fn a86_an_inherent_blanket_over_a_trait_binds_its_argument_from_the_receiver() {
-    // The member is found and the body monomorphizes — annotating the binding
-    // (`let sampled: i32 = cell.sample();`) compiles and prints 7. What does
-    // not happen is the INFERENCE: `T` is not bound from the receiver's
-    // `Cell<i32>`, so the call's type "is never fully determined" and every
-    // use of the result is refused against an unbounded parameter. That is
-    // what makes the blanket unshippable for `flatten`: it would demand an
+    // `T` is written inside the BOUND, not in the subject, so the
+    // receiver/subject reconciliation binds only `S` and left `T` a hole: the
+    // call's type "was never fully determined" and every use of the result was
+    // refused against an unbounded parameter, so an annotation
+    // (`let sampled: i32 = cell.sample();`) had to do the solver's work. The
+    // receiver's own `Cell<i32>: Read<i32>` decides `T`, and B300 binds it
+    // (`bind_subject_bound_binders`). Unannotated here on purpose — that is
+    // the half that was broken, and `flatten` would otherwise demand an
     // annotation at every call site that has done without one since A4,
     // `vilan/test/reactive-flatten.vl` included.
     assert_compiles_and_runs(
@@ -4047,15 +4048,16 @@ fn a86_an_inherent_blanket_over_a_trait_binds_its_argument_from_the_receiver() {
 }
 
 #[test]
-#[ignore = "A86: a blanket whose bound argument is itself bounded cannot resolve the receiver to a concrete impl"]
 fn a86_a_blanket_over_a_nested_bound_resolves_its_receiver_to_a_concrete_impl() {
-    // The nested face, and it fails harder: with the argument of the bound
-    // itself bounded (`I: Read<U>` inside `Read<I>`), the receiver is not
-    // resolved to a concrete implementation at all, so `self.get()` inside the
-    // body resolves to the TRAIT's bodiless requirement and the compiler
-    // stops with an internal error naming it — even with the result annotated,
-    // and even for a fully concrete receiver. This is the shape the A86
-    // `flatten` blanket needs (B268's machinery with B275's gap beside it).
+    // The nested face, and it failed harder: with the argument of the bound
+    // itself bounded (`I: Read<U>` inside `Read<I>`), `I` stayed a hole too,
+    // so `self.get().get()` inside the body dispatched on an unresolved
+    // receiver, resolved to the TRAIT's bodiless requirement and stopped the
+    // compiler with an internal error naming it — even with the result
+    // annotated, and even for a fully concrete receiver. Binding `I` from the
+    // receiver's `Read` impl makes `I`'s OWN bound answerable, which is what
+    // binds `U`, so B300's worklist closes both at once. This is the shape the
+    // A86 `flatten` blanket needs.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -4080,6 +4082,286 @@ fn a86_a_blanket_over_a_nested_bound_resolves_its_receiver_to_a_concrete_impl() 
         main();
         "#,
         "7\n",
+    );
+}
+
+#[test]
+fn b300_a_bound_argument_under_a_constructor_binds_from_the_receiver() {
+    // A86's `or` shape: the binder sits UNDER a constructor in the bound
+    // (`Read<Option<type T>>`), so binding it needs the receiver's provided
+    // `Option<i32>` matched against the written `Option<T>` — not the
+    // whole-argument shortcut. `initial: T` is the parameter B300's item says
+    // an ARGUMENT could fix; nothing is annotated here, and the `None` arm
+    // proves the parameter typed as `i32` rather than riding the argument.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<Option<type T>> {
+            fun or_default(self, initial: T): T {
+                match self.get() {
+                    Some(let inner) => inner,
+                    None => initial,
+                }
+            }
+        }
+
+        fun main() {
+            let filled: Cell<Option<i32>> = Cell { value = Some(7) };
+            let empty: Cell<Option<i32>> = Cell { value = None };
+            print(filled.or_default(1));
+            print(empty.or_default(2));
+        }
+
+        main();
+        "#,
+        "7\n2\n",
+    );
+}
+
+#[test]
+fn b300_a_multi_parameter_bound_binds_every_argument_from_the_receiver() {
+    // The multi-parameter face: both of the bound's arguments are binders, and
+    // each must come from the receiver's own impl independently — the two
+    // results are used at DIFFERENT concrete types with no annotation, so a
+    // half-done job shows up on whichever side was left a hole.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Pair<A, B> {
+            fun left(self): A;
+            fun right(self): B;
+        }
+        struct Two<A, B> { first: A, second: B }
+        impl Two<type A, type B> with Pair<A, B> {
+            fun left(self): A { self.first }
+            fun right(self): B { self.second }
+        }
+
+        impl type S: Pair<type A, type B> {
+            fun first_of(self): A { self.left() }
+            fun second_of(self): B { self.right() }
+        }
+
+        fun main() {
+            let two = Two { first = 7, second = "x" };
+            print(two.first_of() + 1);
+            print(two.second_of() + "!");
+        }
+
+        main();
+        "#,
+        "8\nx!\n",
+    );
+}
+
+#[test]
+fn b300_a_bound_binder_is_bound_for_a_constructor_headed_subject_too() {
+    // The mixed face: the subject is constructor-headed (`Holder<type S>`) and
+    // the bound rides its binder, so the subject reconciliation binds `S` and
+    // the bound pass must still reach `T` through `S`'s own impl. Nothing here
+    // is a blanket.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        struct Holder<S> { source: S }
+
+        impl Holder<type S: Read<type T>> {
+            fun read(self): T { self.source.get() }
+        }
+
+        fun main() {
+            let held = Holder { source = Cell { value = 7 } };
+            let value = held.read();
+            print(value + 1);
+        }
+
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b300_a_specific_impl_still_outranks_the_bounded_blanket() {
+    // The ordering control: binding the bound's argument must not change WHICH
+    // impl answers. `Cell`'s own inherent `sample` is more specific than the
+    // blanket over every `Read`, so it wins here exactly as it did before —
+    // and the blanket still answers for a type that has no inherent one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        struct Boxed<T> { value: T }
+        impl Boxed<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl Cell<type T> {
+            fun sample(self): T { print("inherent"); self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun sample(self): T { print("blanket"); self.get() }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            print(cell.sample() + 1);
+            let boxed = Boxed { value = 9 };
+            print(boxed.sample() + 1);
+        }
+
+        main();
+        "#,
+        "inherent\n8\nblanket\n10\n",
+    );
+}
+
+#[test]
+fn b300_an_unbounded_blanket_binder_is_left_alone() {
+    // The leniency control: a subject binder whose bound names no arguments
+    // (or none at all) has nothing to ground from the receiver, and the bound
+    // pass must leave it exactly as the subject reconciliation left it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tag { fun tag(self): str; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Tag {
+            fun tag(self): str { "cell" }
+        }
+
+        impl type S: Tag {
+            fun describe(self): str { i"<{self.tag()}>" }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            print(cell.describe());
+        }
+
+        main();
+        "#,
+        "<cell>\n",
+    );
+}
+
+#[test]
+fn a86_two_blankets_bounded_at_different_arguments_may_share_a_member_name() {
+    // The duplicate-member rule compared inherent subjects with `compare_type`,
+    // which consults a bound's TRAIT and not its ARGUMENTS, so any two blankets
+    // over one parameterized trait read as one name declared twice. They are
+    // two impls: no `Option` is a `Read`, so nothing satisfies both bounds —
+    // and this is the pair A86's `flatten` needs (the join, and the join over
+    // an optional inner). The rule now reads the binders' bounds, which is what
+    // the coherence rule one tier down (`same_impl_type_shape`) already says.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun join(self): U { self.get().get() }
+        }
+        impl type S: Read<Option<type I: Read<type U>>> {
+            fun join(self): Option<U> {
+                match self.get() {
+                    Some(let inner) => Some(inner.get()),
+                    None => None,
+                }
+            }
+        }
+
+        fun main() {
+            let nested = Cell { value = Cell { value = 7 } };
+            print(nested.join() + 1);
+            let optional: Cell<Option<Cell<i32>>> = Cell { value = Some(Cell { value = 3 }) };
+            print(optional.join().unwrap_or(0));
+            let empty: Cell<Option<Cell<i32>>> = Cell { value = None };
+            print(empty.join().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "8\n3\n0\n",
+    );
+}
+
+#[test]
+fn a86_two_blankets_bounded_the_same_way_still_collide() {
+    // The control: identical bounds are the repeat the rule exists to refuse,
+    // because tier 1 of method resolution takes the first inherent candidate
+    // without ranking — a silent pick between two bodies.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun peek(self): T { self.get() }
+        }
+        impl type O: Read<type V> {
+            fun peek(self): V { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is already defined for",
+    );
+}
+
+#[test]
+fn a86_a_blanket_and_a_constructor_headed_impl_still_collide() {
+    // The other control: the bounds clause reaches BARE binders only. A
+    // blanket against a concrete subject is the overlap B73 named, and it is
+    // still refused.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun peek(self): T { self.get() }
+        }
+        impl Cell<type T> {
+            fun peek(self): T { self.value }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is already defined for",
     );
 }
 
@@ -4416,4 +4698,293 @@ fn the_wire_refusal_names_map_and_the_impl_among_the_shapes_it_admits() {
         assert_fails_with(source, admitted);
         assert_fails_with(source, escape);
     }
+}
+
+// --- B299: a BARE TRAIT in impl-subject position means "every implementer" ---
+//
+// `impl Source<type I> { fun flatten(self) .. }` parsed and then refused every
+// use of `self`: the body read the subject literally, so `self` was a value of
+// bare trait type — which vilan has none of — and the spelling meant nothing a
+// body could use while looking exactly like the one that does. RULED a DESUGAR
+// (2026-09-11): it means `impl type S: Source<type I> { .. }`, the universal
+// reading B186's parameters and B184's fields already give a bare trait, and
+// the reading SELECTION has always given it (`impl Iterator<type T> with
+// Iterable<T>` is how std writes "every iterator also iterates").
+
+#[test]
+fn b299_a_bare_trait_impl_subject_makes_self_the_implementing_type() {
+    // The filed exhibit, run: `self.get()` inside the body dispatches to the
+    // receiver's own implementation, and the head's `T` binds from it, so the
+    // result is an `i32` at the call site with nothing annotated.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<type T> {
+            fun sample(self): T { self.get() }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            print(cell.sample() + 1);
+        }
+
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b299_the_bare_trait_head_dispatches_per_implementation() {
+    // The claim the compile alone cannot make: ONE body, and each receiver's
+    // own `get` is what runs in it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        struct Doubled { value: i32 }
+        impl Doubled with Read<i32> {
+            fun get(self): i32 { self.value * 2 }
+        }
+
+        impl Read<type T> {
+            fun sample(self): T { self.get() }
+        }
+
+        fun main() {
+            print(Cell { value = 7 }.sample());
+            print(Doubled { value = 7 }.sample());
+        }
+
+        main();
+        "#,
+        "7\n14\n",
+    );
+}
+
+#[test]
+fn b299_the_owners_probe_head_compiles_and_runs() {
+    // The head B299 was filed from, over std's own `Source`: a source of an
+    // OPTIONAL source, with the inner binder anonymous (B294's `_`). `self.get()`
+    // works in it, and so does `inner.get()` on what it yields.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        impl Source<Option<type _: Source<type U>>> {
+            fun peek(self): Option<U> {
+                match self.get() {
+                    Some(let inner) => Some(inner.get()),
+                    None => None,
+                }
+            }
+        }
+
+        fun main() {
+            let inner = Signal::new(7);
+            let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(inner));
+            print(outer.peek().unwrap_or(0));
+            let empty: SignalCell<Option<SignalCell<i32>>> = Signal::new(None);
+            print(empty.peek().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "7\n0\n",
+    );
+}
+
+#[test]
+fn b299_a_body_naming_the_implicit_binder_is_told_the_spelling() {
+    // The implicit binder has NO name, so a body reaching for one finds
+    // nothing — and the fix is a spelling, not a missing declaration. One
+    // steer; the impl itself is legitimate.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<type T> {
+            fun sample(self): T {
+                let me: S = self;
+                me.get()
+            }
+        }
+
+        fun main() { }
+        "#,
+        "name it in the head: `impl type S: Read<..>`",
+    );
+}
+
+#[test]
+fn b299_self_names_the_implementing_type_in_a_bare_trait_impl() {
+    // The spelling the steer offers, working: `Self` is the implementing type
+    // inside such a body — which is what std's `impl Iterator<type T> with
+    // Iterable<T> { fun iter(self): Self { self } }` has always relied on.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<type T> {
+            fun twice(self): T {
+                let me: Self = self;
+                me.get()
+            }
+        }
+
+        fun main() { print(Cell { value = 7 }.twice()); }
+
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b299_a_trait_hung_static_is_still_reached_by_the_traits_name() {
+    // The std control the desugar must not cost: `impl Iterator<type T> {
+    // fun from_fn(..) }` hangs a STATIC off the trait, reached as
+    // `Iterator::from_fn`. The impl still registers under the trait subject,
+    // so the name still finds it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut remaining = 3;
+            let counted = Iterator::from_fn(|| {
+                if remaining > 0 {
+                    remaining = remaining - 1;
+                    Some(remaining)
+                } else {
+                    None
+                }
+            });
+            for value in counted {
+                print(value);
+            }
+        }
+
+        main();
+        "#,
+        "2\n1\n0\n",
+    );
+}
+
+// --- B297: an impl SUBJECT is walked once, so one mistake is one error -------
+//
+// `Node::Impl` walked the subject twice — once for its type, and again
+// per-argument to bank the arguments `self`'s variant patterns substitute
+// through — and each walk prepped its own deferred reference, so an unresolved
+// name in the head was reported TWICE for one mistake. The arguments are read
+// off the resolved subject now; there is nothing to walk a second time.
+
+#[test]
+fn b297_an_unresolved_name_in_an_impl_subject_is_reported_once() {
+    assert_fails_once_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl Read<Option<Nope>> {
+            fun sample(self) { }
+        }
+
+        fun main() { }
+        "#,
+        "cannot find type 'Nope'",
+    );
+}
+
+#[test]
+fn b297_the_let_annotation_is_the_control() {
+    // The same name in the position that always reported once.
+    assert_fails_once_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let x: Option<Nope> = None;
+        }
+        "#,
+        "cannot find type 'Nope'",
+    );
+}
+
+#[test]
+fn b297_a_concrete_impl_subject_reports_its_unresolved_name_once_too() {
+    // Not a trait-subject rule: the second walk was the ARGUMENT bank, which a
+    // concrete generic application reaches identically.
+    assert_fails_once_with(
+        r#"
+        struct Holder<T> { value: T }
+
+        impl Holder<Nope> {
+            fun sample(self) { }
+        }
+
+        fun main() { }
+        "#,
+        "cannot find type 'Nope'",
+    );
+}
+
+#[test]
+fn b297_the_subject_arguments_still_type_selfs_variant_patterns() {
+    // The behaviour the second walk existed for, unchanged: inside
+    // `impl Option<(T, U)>`, `Some`'s payload is the TUPLE, not `Option`'s own
+    // abstract `T`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        impl Option<(type T, type U)> {
+            fun left(self, fallback: T): T {
+                match self {
+                    Some((let first, _)) => first,
+                    None => fallback,
+                }
+            }
+        }
+
+        fun main() {
+            let pair: Option<(i32, str)> = Some((7, "x"));
+            print(pair.left(0));
+            let empty: Option<(i32, str)> = None;
+            print(empty.left(1));
+        }
+
+        main();
+        "#,
+        "7\n1\n",
+    );
 }

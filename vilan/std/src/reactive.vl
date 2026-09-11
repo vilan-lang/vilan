@@ -1062,7 +1062,14 @@ impl Selector<type T: Hashable + PartialEq> {
 // the result — and BOTH halves are the ambient owner's (A28): the outer
 // subscription is registered, and the inner one that happens to be live at
 // disposal is deferred, so nothing survives the boundary.
-impl SignalCell<SignalCell<type U>> {
+//
+// A BLANKET over the READ trait (A86), not an inherent member of the cell: the
+// read contract is `Source`, so a `map` result, a derived cell, a mirror and a
+// plain `SignalCell` all hold inner signals the same way, and only the cell had
+// a join. A default method on `Source<T>` cannot express this — a default
+// cannot add a bound on `T`, and this needs `T` to be a source itself — so the
+// bound-in-the-subject spelling is the honest one.
+impl type S: Source<type I: Source<type U>> {
 	fun flatten(self): SignalCell<U> {
 		let derived = SignalCell::new(self.get().get());
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
@@ -1076,6 +1083,44 @@ impl SignalCell<SignalCell<type U>> {
 		// The outer handle detaches this signal from the outer; whichever inner
 		// is current at that moment needs releasing too, and it is not a handle
 		// anyone else holds.
+		defer_to_owner(|| {
+			inner_subscription.read()?.dispose();
+			inner_subscription.write() = None;
+		});
+		derived
+	}
+}
+
+/// The OPTIONAL join (A86): an outer source of `Option<inner source>` — the
+/// shape a lazily-created signal has, and the one `flatten` above cannot take
+/// because `Option<I>` is not itself a `Source`.
+///
+/// `None` on the outer is `None` on the result, and it DETACHES: whichever
+/// inner was live stops driving. A `Some(inner)` follows that inner from its
+/// current value, wrapped. The ownership story is `flatten`'s exactly — one
+/// registered outer subscription, one rolling inner one deferred to the
+/// ambient owner.
+impl type S: Source<Option<type I: Source<type U>>> {
+	fun flatten(self): SignalCell<Option<U>> {
+		let derived: SignalCell<Option<U>> = SignalCell::new(match self.get() {
+			Some(let inner) => Some(inner.get()),
+			None => None,
+		});
+		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
+		let _outer = register_with_owner(self.sub(|held| {
+			inner_subscription.read()?.dispose();
+			match held {
+				Some(let inner) => {
+					inner_subscription.write() = Some(inner.sub(|value| {
+						derived.set(Some(value));
+					}));
+				},
+				None => {
+					inner_subscription.write() = None;
+					derived.set(None);
+				},
+			}
+		}));
 		defer_to_owner(|| {
 			inner_subscription.read()?.dispose();
 			inner_subscription.write() = None;

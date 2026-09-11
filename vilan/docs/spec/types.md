@@ -339,6 +339,15 @@ per receiver: a `Words: Source<str>` instantiates the impl at `T = str`, a
 `Counts: Source<i32>` at `T = i32`. A name in a bound that no binder
 declares is still unresolved, and is reported where it is written.
 
+A **bare trait in subject position means the same thing with the binder
+left implicit**: `impl Source<type T> { … }` is `impl type S: Source<type
+T> { … }` — the universal reading every other bare-trait position has —
+so `self` inside the body is the implementing type, not a value of the
+trait, and calls on it dispatch through the bound like any other bounded
+parameter. The implicit binder has no name; a body that needs to say it
+writes `Self`, and a body that spells a name out is told which head would
+declare it.
+
 A binder the head never mentions again needs no name, and is written `_` —
 the wildcard of `Some(_)` and `let _`, in the impl-subject position, with
 the same optional bound:

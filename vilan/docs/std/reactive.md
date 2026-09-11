@@ -77,10 +77,26 @@ impl SignalCell<type T> with Source<T> {
 	fun effect_on_change(self, observer: |T| void)  // on change only; owner-registered
 	fun map<U>(self, transform: sync |T| U): SignalCell<U>
 }
-impl SignalCell<SignalCell<type U>> {
+// A BLANKET over the read trait, not a member of the cell (A86): any source
+// whose element is itself a source joins — a `map` result, a derived cell, a
+// mirror, a plain `SignalCell`.
+impl type S: Source<type I: Source<type U>> {
 	fun flatten(self): SignalCell<U>            // follow the current inner signal
 }
+impl type S: Source<Option<type I: Source<type U>>> {
+	fun flatten(self): SignalCell<Option<U>>    // `None` detaches; `Some` follows
+}
 ```
+
+`flatten` is a **blanket over `Source`** rather than a member of
+`SignalCell<SignalCell<U>>`: the read contract is the trait, so an outer that
+is a `map` result or a mirror holds an inner signal exactly as a cell does and
+joins the same way. A default method on `Source<T>` could not say it — a
+default cannot add a bound on `T`, and this one needs `T` to be a source — so
+the bound lives in the impl subject. The `Option` form is the second blanket:
+an outer of `Option<inner source>` (a lazily-created signal) answers `None` with
+`None` and detaches from whichever inner was live, and `Some(inner)` follows
+that inner from its current value.
 
 `update` is **inherent to the cell**, deliberately: its value is in-place
 mutation with one notification, and a generic default could only
