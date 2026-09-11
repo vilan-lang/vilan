@@ -359,6 +359,7 @@ channel id, and what the client's stub answers is a mirror:
 | --- | --- |
 | `SignalCell<T>` | `RemoteSource<T>` |
 | `Option<SignalCell<T>>` | `RemoteSource<T>` |
+| `KeyedCell<K, T>` | `KeyedSource<K, T>` |
 
 **The stub is sync, and it makes no call.** No `async`, no `!`, no
 `Result` — because there is nothing to await: the mirror is handed back
@@ -613,6 +614,38 @@ is the cost per change per connection: 0.0078 ms at 1,000 rows and 0.0103 at
 10,000, where diffing the same edits costs 0.315 and 3.814 (children CPU).
 Bind it locally with `bind_each(messages, …)` — it is a `Source<List<T>>` with
 no `Option` in it, because a cell always holds a collection.
+
+### A keyed handle: a method that returns a `KeyedCell`
+
+`[expose(keyed)]` names one collection per field per connection, which is
+the same limit the plain form has — and the same answer applies. An `[rpc]`
+method whose return type is a `KeyedCell<K, T>` hands the client a
+`KeyedSource<K, T>`, minted per **call**:
+
+```vilan,fragment
+impl Board {
+	// One board per workspace — not a set the compiler can name as fields.
+	[rpc]
+	fun tasks_in(self, workspace: str): KeyedCell<i32, Task> {
+		self.board_for(workspace)
+	}
+}
+
+// At the client — sync and unleased, exactly like a plain handle:
+let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
+view("ul").bind_each(tasks.or([]), |task| task.id, |task| view("li").text(task.title))
+```
+
+Everything a plain handle does, this one does at the keyed type: no call
+until the first lease, `status()` for what that call was told, and demand
+deciding the channel's life. The one difference is what *counts* as demand
+— a **per-key** lease is a first demand too, and mints the channel exactly
+as a whole-collection one does — and what the channel is finished with: a
+keyed channel carries one forward per demand, so it is withdrawn when the
+last of them goes, not when the first does.
+
+An `Option<KeyedCell<K, T>>` is **not** a handle return in v1; it is refused
+as a non-Wire return like any other unrecognized type.
 
 ### Reading a keyed mirror
 

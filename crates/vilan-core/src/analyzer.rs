@@ -15439,6 +15439,10 @@ impl<'src> Analyzer<'src> {
                 arguments.as_slice(),
             ) {
                 ("SignalCell", [element]) => Some(*element),
+                // A79's keyed handle: the ELEMENT is the second argument, and
+                // it is the one whose Wire-ness this rule tests — the key's is
+                // not reached here (see the written twin).
+                ("KeyedCell", [_key, element]) => Some(*element),
                 _ => None,
             },
             Type::Enum(id, arguments) => match (
@@ -46935,8 +46939,9 @@ fn without_spaces(spelling: &str) -> String {
 }
 
 /// The ELEMENT of an `[rpc]` return type the `[service]` expansion reads as a
-/// signal HANDLE — `SignalCell<T>` and `Option<SignalCell<T>>`
-/// (`transport-rpc.md` §9.2) — or `None` for an ordinary value return.
+/// signal HANDLE — `SignalCell<T>`, `Option<SignalCell<T>>` and, since A79,
+/// `KeyedCell<K, T>` (`transport-rpc.md` §9.2) — or `None` for an ordinary
+/// value return.
 ///
 /// The RULE IS THE WRITTEN SPELLING, and it is the macro's rule read back
 /// here: the expansion runs before any type resolves, so it cannot reconcile a
@@ -46950,6 +46955,18 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
         Node::AccessorWithGenerics(name, arguments) if *name == "SignalCell" => {
             match arguments.0.as_slice() {
                 [element] => Some(&element.0),
+                _ => None,
+            }
+        }
+        // A79: `KeyedCell<K, T>` is a handle return too, and its element is
+        // `T`. The KEY also crosses the wire — it rides every `Delta` and
+        // every keyed `Subscribe` — and is NOT tested here: this rule answers
+        // one element, and a non-Wire key still fails, in the generated
+        // `reply_source_keyed`'s `K: Wire` bound rather than in the method's
+        // own vocabulary. Tracked rather than papered over.
+        Node::AccessorWithGenerics(name, arguments) if *name == "KeyedCell" => {
+            match arguments.0.as_slice() {
+                [_key, element] => Some(&element.0),
                 _ => None,
             }
         }

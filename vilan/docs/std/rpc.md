@@ -15,6 +15,7 @@ signal fields, the macro generates:
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
 client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source; sync, unleased
+client.some_keyed(args…): KeyedSource<K, V>     // per [rpc] method returning a KeyedCell; same, keyed
 client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
 client.some_map: KeyedSource<K, V>              // per [expose(keyed)] field; a patched mirror (below)
 client.transport: SocketTransport               // connection state lives here
@@ -109,7 +110,11 @@ takes its element type from the mirror
 
 ## Keyed mirrors: `KeyedSource<K, T>`
 
-The mirror an `[expose(keyed)]` / `[expose(keyed = K)]` field produces.
+The mirror an `[expose(keyed)]` / `[expose(keyed = K)]` field produces — and
+what an `[rpc]` method returning a `KeyedCell<K, T>` hands back, minted per
+call and unleased, exactly like a plain handle. On a minted one a **per-key**
+lease is a first demand too, and the channel is withdrawn when the last demand
+on it goes rather than the first.
 Where a `RemoteSource<T>` receives the whole value on every change, this one
 receives a `Patch` of `Delta` ops and applies them in order — and it can lease
 **one key**.

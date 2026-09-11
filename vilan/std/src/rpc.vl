@@ -1457,6 +1457,26 @@ fun reply_source_option<T: Wire>(request: RpcRequest, source: Option<SignalCell<
 	}
 }
 
+/// `reply_source` for the KEYED form (A79): `KeyedCell<K, T>` in, the channel
+/// id of a DYNAMIC keyed exposure on the wire, `KeyedSource<K, T>` at the
+/// client. Element-grained end to end — the forward sends the ops the mutation
+/// recorded rather than diffing two snapshots — and per-CALL rather than per
+/// field, which is what a per-workspace or per-conversation collection needs.
+///
+/// A plain channel id, not a keyed reply shape of its own: a keyed channel
+/// differs from a plain one in what flows over it (`Patch` frames rather than
+/// `Update`s) and not in how it is named, so the reply is the same `i32` the
+/// plain form sends and the mirror's type is what says which it is.
+fun reply_source_keyed<K: Wire + Hashable, T: Wire + Keyed<K>>(
+	request: RpcRequest,
+	cell: KeyedCell<K, T>,
+): RpcOutcome {
+	match session_of(request.connection) {
+		Some(let session) => reply(session.expose_keyed_cell_dynamic(cell)),
+		None => no_connection_for_handle(request),
+	}
+}
+
 /// One route: a method name and the handler that consumes the request handle
 /// and produces an outcome.
 struct Route {
@@ -1761,6 +1781,19 @@ struct Capability {
 	identity: i32,
 }
 
+impl Capability {
+	/// Whether this channel carries element-grained `Patch` frames rather than
+	/// whole-value `Update`s. Read off the key resolver, which is the one
+	/// thing only a keyed exposure has — the frame shape and the ability to
+	/// answer a keyed `Subscribe` are the same fact.
+	fun keyed(self): bool {
+		match self.resolve {
+			Some(let _reader) => true,
+			None => false,
+		}
+	}
+}
+
 /// A resolved per-key subscription: which key (canonically), and how to start
 /// its forward. The starter is LAZY — the `Unsubscribe` path resolves a key the
 /// same way and throws the starter away.
@@ -1896,7 +1929,7 @@ impl ReactiveServer {
 	/// What dedup obliges is the counting on the other side: a shared channel
 	/// outlives any one mirror's release (`LiveForward.holds`).
 	fun expose_dynamic<T: Wire>(self, source: SignalCell<T>): i32 {
-		match self.dynamic_channel_for(source.id) {
+		match self.dynamic_channel_for(source.id, false) {
 			Some(let held) => held,
 			None => {
 				let channel = fresh_channel();
@@ -1915,15 +1948,26 @@ impl ReactiveServer {
 		}
 	}
 
-	/// The DYNAMIC channel already carrying the source with this identity, if
-	/// this connection has one (A92). A linear scan of the capability table,
-	/// which is the same cost every inbound control frame already pays
-	/// (`capability_of`) and is paid here once per handle mint.
-	fun dynamic_channel_for(self, identity: i32): Option<i32> {
+	/// The DYNAMIC channel already carrying the source with this identity AND
+	/// this frame shape, if this connection has one (A92). A linear scan of
+	/// the capability table, which is the same cost every inbound control
+	/// frame already pays (`capability_of`) and is paid here once per mint.
+	///
+	/// `keyed` is not redundant with the identity, and leaving it out was a
+	/// silent hazard: a `KeyedCell`'s `elements` IS a `SignalCell`, so a
+	/// service with one handle method answering the cell and another
+	/// answering the collection it drives would offer one identity for two
+	/// channels that carry DIFFERENT frames — `Update`s on one, `Patch`es on
+	/// the other. Deduping those together would hand whichever mirror asked
+	/// second a channel speaking a protocol it cannot read. A channel is its
+	/// source and its shape.
+	fun dynamic_channel_for(self, identity: i32, keyed: bool): Option<i32> {
 		for entry in self.sources.read() {
 			let (id, capability) = entry;
 			if capability.dynamic && capability.identity == identity {
-				ret Some(id);
+				if capability.keyed() == keyed {
+					ret Some(id);
+				}
 			}
 		}
 		None
@@ -2028,6 +2072,42 @@ impl ReactiveServer {
 			.write()
 			.push((channel, Capability { start, resolve = Some(resolve), dynamic = false, identity = 0 - 1 }));
 		channel
+	}
+
+	/// `expose_keyed_cell` for a channel minted inside a REPLY (A79) — the
+	/// keyed half of `expose_dynamic`, and deduped by the same source
+	/// identity: a `KeyedCell`'s is its `elements` cell's, the one signal
+	/// every view of it rides.
+	///
+	/// Marked DYNAMIC, which means here exactly what it means on a plain
+	/// channel (R3): the client's mirror carries the call that minted it, so
+	/// the channel is finished with when the last hold on it goes, and holding
+	/// the capability would retain the collection for the life of the
+	/// connection.
+	fun expose_keyed_cell_dynamic<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		cell: KeyedCell<K, T>,
+	): i32 {
+		match self.dynamic_channel_for(cell.elements.id, true) {
+			Some(let held) => held,
+			None => {
+				let channel = fresh_channel();
+				let transport = self.transport;
+				let codec = self.codec;
+				let start = || keyed_cell_forward(transport, codec, channel, cell);
+				let resolve = |deserializer: Deserializer| {
+					let key: K = K::rebuild(deserializer);
+					KeySubscription {
+						key = key.hash(),
+						start = || keyed_cell_key_forward(transport, codec, channel, cell, key),
+					}
+				};
+				self.sources
+					.write()
+					.push((channel, Capability { start, resolve = Some(resolve), dynamic = true, identity = cell.elements.id }));
+				channel
+			},
+		}
 	}
 
 	/// The capability registered for a channel, if it still holds one.
@@ -2821,6 +2901,18 @@ impl ReactiveClient {
 		self,
 		channel: i32,
 	): KeyedSource<K, T> {
+		self.keyed_mirror_of(channel, None)
+	}
+
+	/// `attached_keyed_source`'s body, with the minting call as a parameter —
+	/// the one construction site for a keyed mirror, so a field mirror and a
+	/// minted one can never drift in anything but the origin they carry
+	/// (`mirror_of`'s reason, at the keyed type).
+	fun keyed_mirror_of<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		channel: i32,
+		origin: Option<Origin>,
+	): KeyedSource<K, T> {
 		let channel_cell = Shared::new(channel);
 		let cache: SignalCell<Option<List<T>>> = SignalCell::new(None);
 		let fault: SignalCell<Option<str>> = SignalCell::new(None);
@@ -2835,6 +2927,10 @@ impl ReactiveClient {
 			settle_id = fresh_id(),
 			leases = Shared::new([]),
 			positions = Shared::new(Map::new()),
+			origin,
+			released = Shared::new(false),
+			leased = Shared::new(false),
+			mint = SignalCell::new(None),
 		};
 		let codec = self.codec;
 		// Deliver one routed `Patch`: re-open the frame (the envelope was only
@@ -2860,6 +2956,28 @@ impl ReactiveClient {
 			}
 		};
 		self.routes.write().push((channel_cell, deliver));
+		mirror
+	}
+
+	/// The KEYED half of `unleased_source` (A79): what a handle stub returning
+	/// a `KeyedCell<K, T>` hands back. Minted with no channel and already
+	/// `released`, so the first lease — whole-collection or per-KEY — issues
+	/// the call and the rebind subscribes for whatever demand exists by then.
+	fun unleased_keyed_source<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		origin: Origin,
+	): KeyedSource<K, T> {
+		let mirror: KeyedSource<K, T> = self.keyed_mirror_of(0 - 1, Some(origin));
+		mirror.released.write() = true;
+		// Only a WATCHED mirror is replayed, `minted_source`'s rule: demand
+		// here is whole-collection OR per-key, and either is a reason to ask
+		// again on a fresh session.
+		self.replays.write().push(|| {
+			if mirror.demand() > 0 {
+				mirror.remint();
+			}
+		});
+		defer_to_owner(|| mirror.release_unleased());
 		mirror
 	}
 
@@ -3847,6 +3965,21 @@ struct KeyedSource<K, T> {
 	/// is maintained by `apply` alone (nothing else writes the cache's
 	/// contents) and cleared wherever the cache is.
 	positions: Shared<Map<Hash, i32>>,
+	/// The call that minted this mirror (A79), or `None` for the `[expose]`d
+	/// field twin — `RemoteSource.origin`'s field, at the keyed type, meaning
+	/// exactly what it means there: a mirror that can ask for a fresh channel
+	/// whenever one is needed.
+	origin: Option<Origin>,
+	/// Whether this mirror is pointed at no live channel — either because the
+	/// server withdrew it (R3) or because it has not asked yet, which is how
+	/// a handle stub's mirror is born (A92).
+	released: Shared<bool>,
+	/// Whether this mirror has ever held a lease, whole-collection or per-key.
+	/// The owner hook reads it.
+	leased: Shared<bool>,
+	/// What the last MINT said, when it said something other than "here is
+	/// your channel" — `RemoteSource.mint`, at the keyed type.
+	mint: SignalCell<Option<Status>>,
 }
 
 /// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
@@ -3938,11 +4071,104 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>` —
 	/// `RemoteSource::status`'s sentence, unchanged: it reports, it does not
 	/// ask.
+	/// Written out over two cells for `RemoteSource::status`'s reason (A92):
+	/// the cache and what the last mint said.
 	fun status(self): SignalCell<Status> {
-		self.cache.map(|value| match value {
-			Some(let _present) => Status::Ready,
-			None => Status::Waiting,
-		})
+		let derived = SignalCell::new(self.known());
+		let _cached = register_with_owner(self.cache.on_change(|_value| {
+			derived.set(self.known());
+		}));
+		let _minted = register_with_owner(self.mint.on_change(|_told| {
+			derived.set(self.known());
+		}));
+		derived
+	}
+
+	/// `status`'s answer, once — `RemoteSource::known`, at the keyed type.
+	fun known(self): Status {
+		match self.mint.get() {
+			Some(let told) => told,
+			None => match self.cache.get() {
+				Some(let _present) => Status::Ready,
+				None => Status::Waiting,
+			},
+		}
+	}
+
+	/// Everything this mirror is currently watching: the whole-collection
+	/// lease plus every key's. What decides whether a mint is owed, and
+	/// whether an `Unsubscribe` this mirror just sent was its last — a keyed
+	/// channel carries one forward per demand, so the SERVER withdraws it only
+	/// when every one of them is gone, and the mirror has to agree.
+	fun demand(self): i32 {
+		mut total = self.count.read();
+		for lease in self.leases.read() {
+			total = total + lease.count.read();
+		}
+		total
+	}
+
+	/// Whether this mirror is pointed at a real channel (`RemoteSource::minted`).
+	fun minted(self): bool {
+		self.channel.read() >= 0
+	}
+
+	/// Re-issue the call that minted this mirror and rebind onto the channel
+	/// the fresh reply names — `RemoteSource::remint` at the keyed type, and
+	/// under A79 the FIRST mint as well as every re-mint.
+	fun remint(self) {
+		match self.origin {
+			None => {},
+			Some(let origin) => {
+				self.released.write() = false;
+				let _reminting = async {
+					let fresh: Result<Option<i32>, RpcError> = (origin.reissue)(origin.method, origin.describers);
+					match fresh {
+						Err(let failure) => {
+							self.released.write() = true;
+							self.mint.set(Some(Status::Failed(failure)));
+						},
+						Ok(let answered) => match answered {
+							// A keyed handle has no written `Option` form
+							// (the generator does not read one), so this arm
+							// is the reissue seam's to produce or not; it is
+							// answered the same way the plain form answers it.
+							None => {
+								self.released.write() = true;
+								self.mint.set(Some(Status::Absent));
+							},
+							Some(let channel) => self.rebind(channel),
+						},
+					}
+				};
+			},
+		}
+	}
+
+	/// The owner hook (R3, point 4) at the keyed type: a mirror a call handed
+	/// out, that minted a channel and that nothing holds any more, tells the
+	/// server so when its owner is disposed. A mirror that never reached a
+	/// lease is `released` from birth (A79) and has nothing to say.
+	fun release_unleased(self) {
+		if !self.leased.read() && !self.released.read() && self.minted() {
+			self.released.write() = true;
+			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+		}
+	}
+
+	/// An `Unsubscribe` has just gone out and this mirror now holds NO demand
+	/// at all: the channel carries no forward, so a DYNAMIC one has been
+	/// withdrawn and the next lease must ask again rather than `Subscribe` on
+	/// an id that is gone.
+	fun surrendered(self) {
+		match self.origin {
+			None => {},
+			Some(let _minting) => {
+				if self.demand() == 0 {
+					self.released.write() = true;
+				}
+			},
+		}
 	}
 
 	/// The first protocol fault this mirror saw, if any: an `Update` or
@@ -4038,9 +4264,16 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun acquire(self) {
 		let before = self.count.read();
 		self.count.write() = before + 1;
+		self.leased.write() = true;
 		if before == 0 {
 			if self.closing.read() {
 				self.closing.write() = false;
+			} else if self.released.read() {
+				// No channel to subscribe on: ask for one (A79). The rebind
+				// subscribes for whatever demand exists when it lands, which
+				// is this lease and any other taken meanwhile — and it is
+				// also what drops the per-key subscriptions this one subsumes.
+				self.remint();
 			} else {
 				(self.transport).send(encode_control(self.codec, "Subscribe", self.channel.read()));
 			}
@@ -4071,7 +4304,14 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun flush_close(self) {
 		if self.closing.read() {
 			self.closing.write() = false;
+			// Nothing to close where nothing was opened: a mirror whose mint
+			// has not landed has no channel (A79).
+			if !self.minted() {
+				self.surrendered();
+				ret;
+			}
 			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			self.surrendered();
 			mut resumed = false;
 			for lease in self.leases.read() {
 				if lease.count.read() > 0 && !lease.on_wire.read() {
@@ -4097,9 +4337,16 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun acquire_key(self, lease: KeyLease) {
 		let before = lease.count.read();
 		lease.count.write() = before + 1;
+		self.leased.write() = true;
 		if before == 0 {
 			if lease.closing.read() {
 				lease.closing.write() = false;
+			} else if self.released.read() {
+				// A per-KEY lease is a first demand too (A79), and it mints
+				// exactly as the whole-collection one does. Nothing goes on
+				// the wire here: `rebind` re-subscribes every key whose lease
+				// is counted, this one included.
+				self.remint();
 			} else {
 				if self.count.read() == 0 {
 					lease.on_wire.write() = true;
@@ -4123,9 +4370,15 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun flush_key_close(self, lease: KeyLease) {
 		if lease.closing.read() {
 			lease.closing.write() = false;
-			if lease.on_wire.read() {
+			if lease.on_wire.read() && self.minted() {
 				lease.on_wire.write() = false;
 				(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
+				// The last key on a channel nothing else holds is the channel
+				// (A79): a keyed channel carries one forward per demand, so
+				// its dynamic capability goes when the last of them does.
+				self.surrendered();
+			} else {
+				lease.on_wire.write() = false;
 			}
 		}
 	}
@@ -4264,6 +4517,10 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		self.positions.write() = Map::new();
 		self.cache.set(None);
 		self.closing.write() = false;
+		// The fresh channel is live, and whatever the last mint said about the
+		// old one is history (A79).
+		self.released.write() = false;
+		self.mint.set(None);
 		if self.count.read() > 0 {
 			(self.transport).send(encode_control(self.codec, "Subscribe", channel));
 		}
@@ -4600,6 +4857,20 @@ macro fun route_block(name: str, statements: List<str>): str {
 macro fun handle_element(type_: TypeExpr): str {
 	import macro_std::option::Option::{ Some, None };
 
+	// A `KeyedCell<K, T>` (A79) is a handle too, and its element is the
+	// SECOND argument: the first is the key. It names both types itself,
+	// which is exactly why it can be read here at all — the expansion has no
+	// associated types to ask.
+	if type_.name == "KeyedCell" {
+		if type_.arguments.len() != 2 {
+			ret "";
+		}
+		let keyed_element = match type_.arguments.get(1) {
+			Some(let element) => element.render(),
+			None => "",
+		};
+		ret keyed_element;
+	}
 	if type_.name != "SignalCell" {
 		ret "";
 	}
@@ -4608,6 +4879,25 @@ macro fun handle_element(type_: TypeExpr): str {
 	}
 	match type_.arguments.get(0) {
 		Some(let element) => element.render(),
+		None => "",
+	}
+}
+
+/// The KEY of a return type read as a KEYED signal handle (`KeyedCell<K, T>`,
+/// A79), or `""` for every other return — a plain handle included, which has
+/// no key. What tells the two handle kinds apart everywhere the generator has
+/// to choose between them.
+macro fun handle_key(type_: TypeExpr): str {
+	import macro_std::option::Option::{ Some, None };
+
+	if type_.name != "KeyedCell" {
+		ret "";
+	}
+	if type_.arguments.len() != 2 {
+		ret "";
+	}
+	match type_.arguments.get(0) {
+		Some(let key) => key.render(),
 		None => "",
 	}
 }
@@ -4757,6 +5047,8 @@ macro fun service(item: Item): Source {
 	// `SignalCell<T>` and `"option"` is `Option<SignalCell<T>>`.
 	mut handle_kinds: List<str> = [];
 	mut handle_elements: List<str> = [];
+	// The KEY per keyed handle, `""` for every other method (A79).
+	mut handle_keys: List<str> = [];
 	mut handle_returns: List<str> = [];
 	// What the CONTRACT SURFACE names, which is the stub's type everywhere but
 	// the `Option` form — see below.
@@ -4764,16 +5056,31 @@ macro fun service(item: Item): Source {
 	mut any_handle = false;
 	for method in target.methods {
 		mut kind = "";
+		mut key = "";
 		mut element = handle_element(method.return_type);
-		if element != "" {
+		let written_key = handle_key(method.return_type);
+		if written_key != "" {
+			kind = "keyed";
+			key = written_key;
+		} else if element != "" {
 			kind = "plain";
 		} else if method.return_type.name == "Option" && method.return_type.arguments.len() == 1 {
 			match method.return_type.arguments.get(0) {
 				Some(let inner) => {
-					let inner_element = handle_element(inner);
-					if inner_element != "" {
-						kind = "option";
-						element = inner_element;
+					// `Option<KeyedCell<K, T>>` is NOT a handle in v1, and is
+					// left to the ordinary Wire refusal rather than given a
+					// row of its own: a keyed mirror's absence would need the
+					// same `Absent` vocabulary the plain form got (A92) plus
+					// an answer for what a per-KEY absence means, and nothing
+					// has asked for either. Read as a handle it would mint a
+					// PLAIN mirror over a keyed channel, which is the one
+					// outcome worth ruling out here.
+					if handle_key(inner) == "" {
+						let inner_element = handle_element(inner);
+						if inner_element != "" {
+							kind = "option";
+							element = inner_element;
+						}
 					}
 				},
 				None => {},
@@ -4781,6 +5088,7 @@ macro fun service(item: Item): Source {
 		}
 		handle_kinds.push(kind);
 		handle_elements.push(element);
+		handle_keys.push(key);
 		if kind != "" {
 			any_handle = true;
 		}
@@ -4792,6 +5100,11 @@ macro fun service(item: Item): Source {
 		// can read a `ChannelId` as a `MessageBody`.
 		if kind == "" {
 			handle_returns.push(method.return_type.render());
+		} else if kind == "keyed" {
+			// The keyed mapping (A79): `KeyedCell<K, T>` on the server is
+			// `KeyedSource<K, T>` at the client — the same element-grained
+			// mirror a `[expose(keyed)]` field produces, minted per call.
+			handle_returns.push(i"KeyedSource<{key}, {element}>");
 		} else {
 			// BOTH written forms map to the same mirror TYPE (A92). The
 			// `Option` is not carried into the client's type: a mirror already
@@ -4929,6 +5242,8 @@ macro fun service(item: Item): Source {
 			"reply_source(__request, "
 		} else if kind == "option" {
 			"reply_source_option(__request, "
+		} else if kind == "keyed" {
+			"reply_source_keyed(__request, "
 		} else {
 			"reply("
 		};
@@ -5135,6 +5450,10 @@ macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "",
 		};
+		let key = match handle_keys.get(stub_index) {
+			Some(let found) => found,
+			None => "",
+		};
 		let mapped = match handle_returns.get(stub_index) {
 			Some(let found) => found,
 			None => method.return_type.render(),
@@ -5197,13 +5516,15 @@ macro fun service(item: Item): Source {
 				+ "\n"
 				+ indent("},", 1)
 				+ "\n}";
-			// The annotated `let` rather than a tail expression: `T` is solved
-			// from the call's TYPES, and a binding is where this file already
-			// says so every other time it mints a mirror.
-			stub = stub
-				.returns(mapped)
-				.line(i"let handle_mirror: RemoteSource<{element}> = self.reactive.unleased_source({origin});")
-				.expr("handle_mirror");
+			// The annotated `let` rather than a tail expression: the mirror's
+			// parameters are solved from the call's TYPES, and a binding is
+			// where this file already says so every other time it mints one.
+			let minting = if kind == "keyed" {
+				i"let handle_mirror: KeyedSource<{key}, {element}> = self.reactive.unleased_keyed_source({origin});"
+			} else {
+				i"let handle_mirror: RemoteSource<{element}> = self.reactive.unleased_source({origin});"
+			};
+			stub = stub.returns(mapped).line(minting).expr("handle_mirror");
 		}
 		client_impl = client_impl.method(stub);
 	}
@@ -5374,7 +5695,7 @@ macro fun service(item: Item): Source {
 		""
 	};
 
-	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, call, send_notification, arg, reply, reply_source, reply_source_option, notified, decode_failed, notify, install_client_handlers, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n"
+	let imports = "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, call, send_notification, arg, reply, reply_source, reply_source_option, reply_source_keyed, notified, decode_failed, notify, install_client_handlers, session_of, dial_for_service, dial_for_service_with, SocketDuplex, SocketTransport, bridge, ReactiveClient, dispose_on_close, reattach_mirrors };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"
