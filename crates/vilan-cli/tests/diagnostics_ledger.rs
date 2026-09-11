@@ -246,6 +246,11 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/vilan-core/src/parsing.rs",
+        "A_PATH_CANNOT_START_AT_A_BLOCK",
+        "`::` reaches into a NAMESPACE — a module, a type or an enum — so what",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
         "CSS_PSEUDO_CLASS_IS_DOTTED",
         "a `css` block writes a pseudo-class as a DOTTED rule:",
     ),
