@@ -29322,6 +29322,29 @@ impl<'src> Analyzer<'src> {
                 std::mem::replace(&mut self.inferable_generics, bindable.clone());
             let reconciled = self.reconcile_type(&parameter_type, &argument_type, substitution);
             self.inferable_generics = previously_inferable;
+            // A FAILED reconcile binds nothing and says nothing HERE, and that
+            // is deliberate twice over (B306).
+            //
+            // It is not the last word: a later check always looks. The method
+            // path pushes `MethodArgCheck` over the same arguments before it
+            // returns, the free path re-reconciles each argument in its own
+            // positional loop and reports there, and a call that never resolves
+            // at all is reported by the residual sweep — so a contradicting
+            // argument gets exactly one diagnostic, whichever path it took,
+            // with no later consumer of the call's result needed. Pinned across
+            // the four shapes in `inference/generics.rs`.
+            //
+            // And it is not EVIDENCE. This pass reconciles PARAMETER-first, so
+            // a bare-trait parameter meets a concrete argument on
+            // `reconcile_type(Trait, Concrete)` — the one arm that refuses what
+            // every value-first position accepts (`method-resolution.md` §10,
+            // B4, which is a language question and not a message one). Reporting
+            // the drop here was measured against the estate before it was
+            // rejected: 18 correct programs, `Doubler`'s supertrait defaults
+            // among them, would have been refused with "Expected Add, but got
+            // Doubler instead". So the silence is the rule, and the later
+            // checks — which reconcile in the accepting direction — are what
+            // make it safe.
             if let Some((_, bindings)) = reconciled {
                 for (constraint_id, type_id) in bindings {
                     if bindable.contains(&constraint_id) {

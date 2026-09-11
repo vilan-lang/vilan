@@ -8062,3 +8062,157 @@ fn b296_a_sibling_field_still_binds_the_structs_own_parameter() {
         "16\n",
     );
 }
+
+// --- B306: the failed reconcile stays silent, and a later check always fires -
+//
+// `bind_callee_own_generics` BINDS; it does not check, so an argument whose
+// type contradicts the substituted parameter binds nothing and says nothing
+// there, and detection depends entirely on a later check looking. One always
+// does — these pins are that evidence, over the shapes the item names and with
+// NO later consumer of the call's result: the method path pushes
+// `MethodArgCheck`, the free path re-reconciles in its own positional loop, and
+// each reports EXACTLY ONCE.
+//
+// Recording the drop as a candidate diagnostic — the item's other option — was
+// built and MEASURED before being rejected, and the last pin is why: this pass
+// reconciles PARAMETER-first, so a bare-trait parameter meets a concrete
+// argument on the one `reconcile_type` arm that refuses what every value-first
+// position accepts (B4, `method-resolution.md` §10). The drop there is not
+// evidence of anything, and reporting it refused 18 correct programs across the
+// estate.
+
+#[test]
+fn b306_a_contradicting_closure_argument_is_reported_exactly_once() {
+    // Two closures for one generic: the first binds `T = i32`, the second
+    // contradicts it. The call's result is unused, so nothing downstream has
+    // any reason to look.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun two<T>(self, f: |T| void, g: |T| void) { }
+        }
+        fun main() {
+            Holder { tag = "h" }.two(|a: i32| { print(a); }, |b: str| { print(b); });
+        }
+        main();
+        "#,
+        "Expected |i32| void, but got |str| void instead.",
+    );
+}
+
+#[test]
+fn b306_a_closure_standing_before_the_argument_that_binds_is_reported_once() {
+    // The ordering face: the closure is reached FIRST and binds `T` itself,
+    // and the value argument after it is what contradicts — so the report
+    // names the closure's instantiation, once.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun closure_first<T>(self, f: |T| void, value: T) { }
+        }
+        fun main() {
+            Holder { tag = "h" }.closure_first(|a: i32| { print(a); }, "s");
+        }
+        main();
+        "#,
+        "but got",
+    );
+}
+
+#[test]
+fn b306_a_contradiction_nested_in_the_closures_parameter_is_reported_once() {
+    // The nested face: the contradiction is one constructor deep in the
+    // closure's parameter (`|List<i32>|` against a `T` bound to `str`).
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun nested<T>(self, f: |List<T>| void, value: T) { }
+        }
+        fun main() {
+            Holder { tag = "h" }.nested(|a: List<i32>| { print(a.len()); }, "s");
+        }
+        main();
+        "#,
+        "Expected |List<str>| void, but got |List<i32>| void instead.",
+    );
+}
+
+#[test]
+fn b306_the_free_function_path_reports_a_contradicting_closure_once_too() {
+    // The free-function path binds through the same pass and reports from its
+    // own positional loop; one diagnostic there as well.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        fun free_two<T>(f: |T| void, g: |T| void) { }
+        fun main() {
+            free_two(|a: i32| { print(a); }, |b: str| { print(b); });
+        }
+        main();
+        "#,
+        "Expected |i32| void, but got |str| void instead.",
+    );
+}
+
+#[test]
+fn b306_an_argument_that_reconciles_on_a_later_attempt_is_not_reported() {
+    // The control that makes the backstop safe: a reconcile may fail on an
+    // early attempt simply because the types have not landed. The recorded
+    // candidate is cleared the moment a later attempt of the same argument
+    // succeeds, so an ordinary unannotated closure — typed only once its
+    // generic is bound — reports nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder { tag: str }
+        impl Holder {
+            fun each<T>(self, seed: T, f: |T| void): Holder {
+                f(seed);
+                self
+            }
+        }
+        fun main() {
+            Holder { tag = "h" }.each(7, |value| print(value + 1));
+        }
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b306_a_failed_reconcile_at_a_bare_trait_parameter_is_not_a_defect() {
+    // Why the pass must stay silent, not merely why it may. `self.add(self)`
+    // inside `Doubler`'s default body passes a `Doubler`-typed `self` to
+    // `Add::add`, whose parameter is the bare trait: this pass reconciles
+    // parameter-first and lands on `reconcile_type(Trait, Concrete)`, which
+    // REFUSES — while every value-first position, the later argument check
+    // included, accepts. The program is correct and runs; a report from the
+    // binding pass would have refused it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self.add(self) }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+        }
+        impl Money with Doubler {}
+
+        fun main() { print(Money { cents = 3 }.twice().cents); }
+        main();
+        "#,
+        "6\n",
+    );
+}
