@@ -387,7 +387,7 @@
   "generics": {
    "patterns": [
     {
-     "comment": "A generic argument list (E161). Structured as begin/end rather than matched, for two reasons a `match` cannot serve: a TextMate `match` sees ONE LINE, so a head wrapped across lines lost its closing `>` to the operator fallback (and, at the start of a line, to E115's element terminator); and the list NESTS, so one rule including itself is what makes `Source<Option<_: Source<type U>>>` close three lists with `>>>` instead of reading them as a shift. The begin is a `<` glued to a type-name character \u2014 element syntax's own atom-position rule (S2) read from the other side: a tag `<` opens an atom, so a `<` that does NOT is an argument list. The end is `>`, plus three bail-outs (`{`, `}`, `;`) that give the list back at a statement boundary, so the one shape that could run away \u2014 a glued comparison, which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book \u2014 costs the rest of its own statement rather than the rest of the file. The bail-outs cost one honest form in return: a FIXED-ARRAY argument (`SignalCell<[i32; 4]>`) ends the list at its `;` and the tail falls back to the top-level rules, which is what the whole head did before this rule existed.",
+     "comment": "A generic argument list (E161). Structured as begin/end rather than matched, for two reasons a `match` cannot serve: a TextMate `match` sees ONE LINE, so a head wrapped across lines lost its closing `>` to the operator fallback (and, at the start of a line, to E115's element terminator); and the list NESTS, so one rule including itself is what makes `Source<Option<_: Source<type U>>>` close three lists with `>>>` instead of reading them as a shift. The begin is a `<` glued to a type-name character \u2014 element syntax's own atom-position rule (S2) read from the other side: a tag `<` opens an atom, so a `<` that does NOT is an argument list. The end is `>`, plus three bail-outs (`{`, `}`, `;`) that give the list back at a statement boundary, so the one shape that could run away \u2014 a glued comparison, which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book \u2014 costs the rest of its own statement rather than the rest of the file. The `;` bail-out cost one honest form until E162: a FIXED-ARRAY argument (`SignalCell<[i32; 4]>`) ended the list at the array's LENGTH separator and the tail fell back to the top-level rules. The `[`…`]` sub-rule below is what gives it back — the array is consumed as its own region, so the bail-out never sees that `;` at all.",
      "name": "meta.generic.vilan",
      "begin": "(?<=[A-Za-z0-9_])<",
      "end": ">|(?=[{};])",
@@ -411,6 +411,25 @@
        "comment": "The ANONYMOUS binder `_` (B294) \u2014 a parameter the author declined to name, and a language-defined spelling rather than a type name, so it takes the scope `self` takes.",
        "name": "variable.language.wildcard.vilan",
        "match": "(?<![A-Za-z0-9_])_(?![A-Za-z0-9_])"
+      },
+      {
+       "comment": "A FIXED-ARRAY argument (E162): `SignalCell<[i32; 4]>`. Its own region, and that is the whole fix \u2014 the enclosing list bails out at a `;` so a glued comparison cannot run away, and an array's LENGTH separator is the one `;` a type argument legitimately contains. Consuming the array here means the bail-out is never offered that `;`: a begin/end region's contained rules and its end pattern are matched at their earliest position, and the `[` comes before the `;`. It carries its own `{`/`}` bail-out for the enclosing list's reason \u2014 an unclosed `[` gives itself back at a statement boundary rather than running to the end of the file. Zero occurrences in std, the corpus, the examples or the book, so nothing in the tree changes colour; the shape is legal and the grammar now reads it.",
+       "begin": "\\[",
+       "end": "\\]|(?=[{}])",
+       "patterns": [
+        {
+         "include": "#generics"
+        },
+        {
+         "include": "#numbers"
+        },
+        {
+         "include": "#keywords"
+        },
+        {
+         "include": "#types"
+        }
+       ]
       },
       {
        "include": "#generics"
