@@ -3017,9 +3017,12 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
+        // The same hoist as `semantic_tokens`, for the same reason and over the
+        // same whole-program table (M27/M58).
+        let source_of = program.source_lookup();
         let mut hints: Vec<(usize, String)> = Vec::new();
         for (id, variable) in &program.variables {
-            if variable.annotated || program.source_of(*id) != Some(SourceId(0)) {
+            if variable.annotated || source_of.of(*id) != Some(SourceId(0)) {
                 continue;
             }
             let Some(label) = program.expr_types.get(id) else {
@@ -3056,7 +3059,18 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let entry = |id: Id| program.source_of(id) == Some(SourceId(0));
+        // M27's hoist, which this table never took (M58). `source_of` is a
+        // LINEAR scan of `source_ranges`, and the predicate below is asked once
+        // per row of every whole-program table this walk touches: measured
+        // under callgrind on a WARM re-analysis of kolt's client, 426,198 calls
+        // and 253.5 M Ir — 7.0% of the entire analysis, and 98% of this
+        // function's own cost — for a question about ~60 ranges. `source_lookup`
+        // answers it by binary search, is answer-identical by construction (it
+        // falls back to `source_of`'s own scan when the ranges are not ascending
+        // and disjoint rather than assuming they are), and is taken ONCE here
+        // because the ranges do not move while a walk reads them.
+        let source_of = program.source_lookup();
+        let entry = |id: Id| source_of.of(id) == Some(SourceId(0));
         let mut tokens: Vec<(Span, TokenKind, u32)> = Vec::new();
         let classify_target = |target: Id| -> TokenKind {
             use vilan_core::analyzer::Expr;
@@ -5743,6 +5757,104 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&entry).unwrap();
         let document = Document::analyze(&text, &std_root(), &entry);
         (dir, document)
+    }
+
+    /// M27's `source_lookup` is a BINARY SEARCH standing in for
+    /// `Program::source_of`'s linear scan, and until M58 nothing held the two to
+    /// the same answer — five callers deep, including the two editor tables this
+    /// lane hoisted (`semantic_tokens`, `inlay_hints`), on a promise its own
+    /// doc-comment makes and no test checked.
+    ///
+    /// The premise is that entity ids are minted from a monotonically increasing
+    /// counter, so `source_ranges` comes out ascending and disjoint. The lookup
+    /// refuses to ASSUME that — it verifies once and falls back to the scan when
+    /// it does not hold — which is exactly the branch a pin has to exercise the
+    /// other side of: over a real multi-module program, with `std`, a package
+    /// module and a generated derive in it, every id the program knows must get
+    /// the SAME answer from both.
+    #[test]
+    fn the_hoisted_source_lookup_answers_exactly_what_source_of_answers() {
+        let _guard = base_cache_guard();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::rows::Row;\n\n\
+                 fun main() {\n\tlet row = Row { label: \"a\" };\n\tprint(row.label);\n}\n",
+            ),
+            (
+                "rows.vl",
+                "[derive(Debug)]\nstruct Row {\n\tlabel: str,\n}\n",
+            ),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("the fixture analyzes cleanly");
+
+        // Every id the program holds a row for, whichever table it lives in —
+        // the entity map is the biggest, and the declaration tables carry ids
+        // the entity map does not.
+        let mut checked = 0usize;
+        let lookup = program.source_lookup();
+        let check = |id: Id| {
+            assert_eq!(
+                lookup.of(id),
+                program.source_of(id),
+                "the hoisted lookup and the scan disagree about id {}",
+                id.0,
+            );
+        };
+        for id in program.entity_map.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.variables.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.structs.keys() {
+            check(*id);
+            checked += 1;
+        }
+        assert!(
+            checked > 100,
+            "a std-using two-module program should hold more than {checked} ids — a pin that \
+             checks a handful is not checking the seam",
+        );
+
+        // And the ids that are in NO range: below the first, past the last, and
+        // the sentinel. `source_of` answers `None` for each, and a binary
+        // search's `partition_point` is exactly where an off-by-one would hide.
+        check(Id(u32::MAX));
+        check(Id(0));
+        let past_the_end = program
+            .entity_map
+            .keys()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or_default()
+            + 1;
+        check(Id(past_the_end));
+
+        // The entry's own rows are what the editor tables filter for, so the
+        // agreement has to be non-trivial: some ids ARE the entry's and some
+        // are not.
+        let entry_ids = program
+            .entity_map
+            .keys()
+            .filter(|id| lookup.of(**id) == Some(SourceId(0)))
+            .count();
+        assert!(
+            entry_ids > 0 && entry_ids < program.entity_map.len(),
+            "the fixture must hold both entry and non-entry entities ({entry_ids} of {})",
+            program.entity_map.len(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // An error INSIDE an imported module publishes to that module's path, with
@@ -17328,6 +17440,175 @@ mod session_growth {
             ratio < GROWTH_BOUND,
             "the 2,000-keystroke session's last window cost {ratio:.2}× its first \
              (bound {GROWTH_BOUND})",
+        );
+    }
+}
+
+/// M58 — the WARM re-analysis profile, and the driver that takes it.
+///
+/// Every lane profile in this tree so far has used the COLD shape: one process,
+/// one analysis, `vilan check` from the outside. That is the right subject for
+/// a build and the wrong one for an editor, where the base world is already
+/// resolved, the parse caches are full, and the only new thing in the process
+/// is the entry's own bytes — which is the keystroke path, and where the owner
+/// spends the day. The two shapes profile differently enough that M58 exists to
+/// say so: `post_analysis_passes` is 62.7% of a warm analysis (57.1% after M53)
+/// and nothing like that share of a cold one.
+///
+/// The driver is a COLD analysis followed by a WARM one in the same process,
+/// with the warm half behind [`warm_reanalysis`] — an `#[inline(never)]` frame
+/// that exists for exactly one reason: it is the symbol callgrind toggles
+/// collection on, so the profile contains the warm analysis and not the cold
+/// one that filled the caches for it.
+///
+/// Take a profile (the `profiling` profile is release + symbols, root
+/// `Cargo.toml`):
+///
+/// ```text
+/// cargo build --profile profiling -p vilan-lsp --tests
+/// valgrind --tool=callgrind --collect-atstart=no \
+///     --toggle-collect='*warm_reanalysis*' --callgrind-out-file=warm.out \
+///     <the test binary> --exact --ignored --nocapture \
+///     document::warm_profile::m58_warm_reanalysis_profile
+/// callgrind_annotate --auto=no --inclusive=yes warm.out | head -40
+/// ```
+///
+/// `VILAN_M58_ENTRY` names the entry to profile — a sibling checkout's
+/// `src/client.vl`, say. Absent, the driver profiles the generated exhibit, so
+/// the instrument is runnable with nothing else on the machine (the owner's
+/// standing rule: a sibling checkout is evidence, never a fixture).
+///
+/// `VILAN_PHASE_TIMING=1` on the same run prints the analyzer's own phase line
+/// for both halves, which is the cross-check a callgrind reading wants: Ir
+/// attributes to symbols, the phase line attributes to PASSES, and a profile
+/// whose two readings disagree about which pass dominates is a profile of the
+/// wrong process.
+///
+/// ## The warm profile, 2026-09-11 (kolt's `client.vl`, `profiling`, callgrind)
+///
+/// 3,635,194,953 Ir for one warm re-analysis. The top five, by INCLUSIVE Ir —
+/// and the entries callgrind marks `'2` are left out of the ranking, because
+/// inclusive cost double-counts a recursive function (`Interpreter::eval'2`
+/// reads 143.6% of the program total):
+///
+/// | | | Ir | share |
+/// |-|-|-|-|
+/// | 1 | `post_analysis_passes` (lib.rs) | 1,856,489,029 | 51.07% |
+/// | 2 | `analyzer::analyze_cancellable` | 1,099,268,791 | 30.24% |
+/// | 3 | `const_eval::evaluate` (inside 1) | 827,668,479 | 22.77% |
+/// | 4 | `context::thread_contexts` (inside 1) | 468,847,124 | 12.90% |
+/// | 5 | `async_infer::infer` (inside 1) | 376,042,827 | 10.34% |
+///
+/// then `call_graph::Collector::walk` 357,110,799 (9.82%),
+/// `dispatch_refine::refined_edges` 344,848,848 (9.49%),
+/// `Program::source_of` 262,380,207 (7.22%) and `Document::semantic_tokens`
+/// 258,348,201 (7.11%). M58's own headline reproduces: the post-passes are the
+/// warm analysis's majority, where a COLD profile is dominated by the analyzer.
+///
+/// **What this lane took off the table.** The eighth and ninth rows were the
+/// same row: `semantic_tokens` was 98% `Program::source_of`, which is a LINEAR
+/// scan of `source_ranges` asked once per entity of every whole-program table —
+/// 426,198 calls in one analysis, against about sixty ranges. M27 had already
+/// built the answer (`Program::source_lookup`, a verified binary search that
+/// falls back to the scan rather than assume ranges are disjoint) and this
+/// table never took it. Hoisted: `semantic_tokens` 258,348,201 → 25,518,527 Ir,
+/// `source_of` across the whole analysis 262,380,207 → 7,548,684, and the WARM
+/// RE-ANALYSIS 3,635,194,953 → 3,401,139,236 Ir, **−6.44%**. The residue is
+/// `vilan_ide::completion::CompletionIndex::build`, which asks the same
+/// question 14,580 times for 7.5 M Ir — another lane's file, filed rather than
+/// taken.
+#[cfg(all(test, target_os = "linux"))]
+mod warm_profile {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use crate::keystroke::gate::{
+        EXHIBIT_ENTRY, GATE_FUNCTIONS, exhibit_module, loadavg_1m, process_cpu_now, profile,
+    };
+    use std::time::Duration;
+
+    /// THE PROFILED FRAME. `#[inline(never)]` so the symbol survives release
+    /// codegen and callgrind can toggle on it; it does one warm analysis and
+    /// nothing else, so everything inside the toggle is the thing being
+    /// measured.
+    #[inline(never)]
+    fn warm_reanalysis(text: &str, std_dir: &Path, entry: &Path) -> Duration {
+        let before = process_cpu_now();
+        let document = Document::analyze_on_this_thread(text, std_dir, entry);
+        let after = process_cpu_now();
+        // Dropped inside the frame: a superseded analysis is released in the
+        // server, and the release is part of what a keystroke costs.
+        drop(document);
+        before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default()
+    }
+
+    /// The cold half — named too, so a profile taken with the toggle OFF can
+    /// tell the two apart in one run.
+    #[inline(never)]
+    fn cold_analysis(text: &str, std_dir: &Path, entry: &Path) -> Duration {
+        let before = process_cpu_now();
+        drop(Document::analyze_on_this_thread(text, std_dir, entry));
+        let after = process_cpu_now();
+        before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default()
+    }
+
+    fn report(corpus: &str, phase: &str, cpu: Duration) {
+        println!(
+            "M58 {{\"section\":\"warm_profile\",\"corpus\":\"{corpus}\",\"phase\":\"{phase}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"cpu_ms\":{:.2}}}",
+            profile(),
+            loadavg_1m(),
+            cpu.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// The subject: a sibling checkout's entry when `VILAN_M58_ENTRY` names
+    /// one, else the generated kolt-sized exhibit written to a temp directory.
+    fn subject() -> (Option<PathBuf>, PathBuf, String) {
+        if let Some(entry) = std::env::var_os("VILAN_M58_ENTRY").map(PathBuf::from) {
+            let text = std::fs::read_to_string(&entry)
+                .unwrap_or_else(|error| panic!("VILAN_M58_ENTRY {}: {error}", entry.display()));
+            return (None, entry, text);
+        }
+        let directory = std::env::temp_dir().join(format!("vilan_m58_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(GATE_FUNCTIONS))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, EXHIBIT_ENTRY).expect("write the exhibit entry");
+        (Some(directory), entry, EXHIBIT_ENTRY.to_string())
+    }
+
+    #[test]
+    #[ignore = "M58's warm re-analysis profile: run under callgrind (the module docs give the command)"]
+    fn m58_warm_reanalysis_profile() {
+        let _guard = base_cache_guard();
+        let (directory, entry, text) = subject();
+        let corpus = entry.display().to_string();
+        let (cold, warm) = on_big_stack(move || {
+            let std_dir = std_root();
+            let cold = cold_analysis(&text, &std_dir, &entry);
+            // The edit: a trailing comment, so the entry's bytes move and the
+            // analysis is a real one rather than a cache hit — the same
+            // mutation E106's session driver uses, for the same reason.
+            let edited = format!("{text}\n// warm keystroke\n");
+            let warm = warm_reanalysis(&edited, &std_dir, &entry);
+            (cold, warm)
+        });
+        if let Some(directory) = directory {
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+        report(&corpus, "cold", cold);
+        report(&corpus, "warm", warm);
+        assert!(
+            warm > Duration::ZERO,
+            "the warm analysis measured zero CPU — the clock is not measuring the work",
         );
     }
 }
