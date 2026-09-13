@@ -149,6 +149,9 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     fn leaf_names<'a>(branch: &'a ImportBranch, into: &mut Vec<&'a str>) {
         match branch {
             ImportBranch::Path(name, _, _) => into.push(name),
+            // A selector takes no NAME out of the module (B318 S3), so it is
+            // not evidence about which layer the file wants.
+            ImportBranch::Selector(_) => {}
             ImportBranch::Set(branches) => {
                 for branch in branches {
                     leaf_names(branch, into);
@@ -189,6 +192,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
                         && !twin_files.iter().any(|file| declares(file, name))
                 })
             }
+            ImportBranch::Selector(_) => false,
             ImportBranch::Set(branches) => branches
                 .iter()
                 .any(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
@@ -213,7 +217,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
         nodes.iter().any(|node| walk(node, matches))
     }
     let references_browser = any_node(root, &mut |node| match node {
-        Node::Import(branch) | Node::Use(branch) => imports_browser_layer(branch),
+        Node::Import(branch, _) | Node::Use(branch) => imports_browser_layer(branch),
         _ => false,
     });
     if references_browser {

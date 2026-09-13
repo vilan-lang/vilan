@@ -40,11 +40,14 @@ instead the block's **trailing expression** and supplies the block's value
 ## 3.2 Imports and exports
 
 ```text
-import  = "import" path-branch ;
+import  = "import" path-branch [ "only" ] ;   (* impls-free, §4.3 *)
 use     = "use"    path-branch ;
 path-branch = NAME [ "::" ( path-branch | path-set )
                    | "as" NAME ] ;        (* alias, §4.3 *)
-path-set    = "{" path-branch { "," path-branch } [ "," ] "}" ;
+path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
+set-element = path-branch | impl-selector ;
+impl-selector = "(" "impl" type ")"
+                [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 ```
 
@@ -61,6 +64,21 @@ alternative to the `::` continuation, not something that may follow one
 ordinary identifier everywhere else in the language, including as a
 module or item name, and reads as an alias only where a path segment has
 ended and a NAME follows it.
+
+`only` is a trailing modifier on an `import` STATEMENT, not on a leaf: it
+says the statement brings its names and no implementations (§4.3). Like
+`as` it is **contextual** — an ordinary identifier everywhere else, read
+as the modifier only where the whole path has ended — and a `use` refuses
+it, because a `use` never brought an implementation along.
+
+An `impl-selector` is a brace-set ELEMENT that binds no name: it says
+which of the module's `impl` blocks this file admits, and its optional
+`::` tail names the members it takes (§4.3). `_` stands for any type at
+an argument position (`(impl List<_>)`) and `(impl _)` selects every
+implementation the module declares; a selector writes no `type X` binders
+and takes no `as`. The subject is the ordinary `type` production, and it
+resolves in the IMPORTING file's scope, so `impl S` reaches an alias that
+file bound and `impl item::Struct` is the qualified spelling.
 
 A `::` path may **not cross a line break**: the segment after a `::`
 must begin on the same line the `::` is on. Without the rule `a::` at the

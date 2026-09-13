@@ -164,7 +164,7 @@ pub(crate) fn scope_for<'r>(
         node: &'a Spanned<Node<'a>>,
         out: &mut Vec<(Vec<&'a str>, &'a str, &'a str)>,
     ) {
-        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             crate::analyzer::flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, _leaf_span, alias) in entries {
@@ -534,10 +534,10 @@ fn check_hermetic_block_imports(
 }
 
 fn check_hermetic_imports(node: &Spanned<Node>, diagnostics: &mut Vec<Error>, hermetic: &mut bool) {
-    if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+    if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
         let root = match branch {
             ImportBranch::Path(root, _, _) => Some(*root),
-            ImportBranch::Set(_) => None,
+            ImportBranch::Set(_) | ImportBranch::Selector(_) => None,
         };
         if root != Some("macro_std") {
             diagnostics.push(Error {

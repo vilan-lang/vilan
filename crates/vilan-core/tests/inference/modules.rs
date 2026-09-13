@@ -6822,3 +6822,88 @@ fn b317_a_missing_static_still_says_it_cannot_be_found() {
         "cannot find 'furlongs' in the imported path",
     );
 }
+
+// --- B318 S3: the impl selector's grammar refusals ---------------------------
+//
+// `proposal/visibility.md` §2.5. Every one of these is a CURATED parser rule
+// (`diagnostics-standard.md` B6), so the message states the prohibition and
+// names the sanctioned spelling — and, critically, is anchored INSIDE the
+// selector: before this slice a typo in one made the whole statement fail and
+// the recovery reported `found 'import' expected an expression` at column one
+// (probes P5/P5b/P5c/P10b, all four identical).
+
+/// A selector written outside a brace set is refused where it is written, with
+/// the braced spelling named.
+#[test]
+fn an_impl_selector_outside_a_brace_set_is_refused() {
+    assert_fails_with(
+        "import pkg::a::(impl Thing);\n\nfun main() {}\n",
+        "an `impl` selector is a brace-set ELEMENT",
+    );
+}
+
+/// RULED 2026-09-12: no binders are written in a selector. A NAMED binder and a
+/// BOUND `_` are both refused; the bare `_` placeholder is not.
+#[test]
+fn a_selector_writes_no_binders() {
+    assert_fails_with(
+        "import pkg::a::{ (impl List<type T>) };\n\nfun main() {}\n",
+        "an `impl` selector writes no binders",
+    );
+    assert_fails_with(
+        "import pkg::a::{ (impl List<_: Display>) };\n\nfun main() {}\n",
+        "an `impl` selector writes no binders",
+    );
+}
+
+/// RULED: a method selector refuses `as` — a method is called by NAME on a
+/// receiver, so an alias would produce a name nothing can call. The refusal
+/// names `import a::Length::rem` (B317), which is the spelling that DOES take
+/// an alias, so the two remain tellable apart.
+#[test]
+fn a_selector_refuses_an_alias() {
+    assert_fails_with(
+        "import pkg::a::{ (impl Length)::rem as r };\n\nfun main() {}\n",
+        "an `impl` selector takes no `as`",
+    );
+    assert_fails_with(
+        "import pkg::a::{ (impl Length) as L };\n\nfun main() {}\n",
+        "an `impl` selector takes no `as`",
+    );
+}
+
+/// A malformed selector reports INSIDE the selector — the `)` it is missing —
+/// rather than at the `import` keyword, and says what the shape is.
+#[test]
+fn a_malformed_selector_reports_inside_the_selector() {
+    assert_fails_with(
+        "import pkg::a::{ (impl Thing };\n\nfun main() {}\n",
+        "an `impl` selector is `(impl TYPE)`",
+    );
+    assert_fails_without(
+        "import pkg::a::{ (impl Thing };\n\nfun main() {}\n",
+        "found 'import'",
+    );
+}
+
+/// A selector inside a `use` is refused rather than silently doing nothing: a
+/// `use` reaches no MODULE, and the two productions share a brace set, so the
+/// selector parses there.
+#[test]
+fn a_use_takes_no_impl_selector() {
+    assert_fails_with(
+        "use pkg::a::{ (impl Thing) };\n\nfun main() {}\n",
+        "an `impl` selector belongs to `import`",
+    );
+}
+
+/// B318 §2.4: `only` belongs to `import`. A `use` never brought an
+/// implementation along — it destructures a namespace the file already reaches
+/// — so the word would subtract nothing and read as though it did.
+#[test]
+fn a_use_takes_no_only() {
+    assert_fails_with(
+        "use pkg::a::b only;\n\nfun main() {}\n",
+        "`only` belongs to `import`",
+    );
+}

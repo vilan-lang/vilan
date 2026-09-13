@@ -4341,7 +4341,7 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
 fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
     for item in items {
         if let Node::Export(inner) = &item.0
-            && let Node::Import(branch) | Node::Use(branch) = &inner.0
+            && let Node::Import(branch, _) | Node::Use(branch) = &inner.0
         {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
@@ -4782,6 +4782,10 @@ pub(crate) fn flatten_namespace_branch<'src>(
                 flatten_namespace_branch(child, path.clone(), entries);
             }
         }
+        // B318 S3: a selector binds no NAME, so the leaf walk skips it — what
+        // it says is which implementations the file admits, which the
+        // analyzer's own selector pass banks separately.
+        ImportBranch::Selector(_) => {}
     }
 }
 
@@ -26404,7 +26408,7 @@ impl<'src> Analyzer<'src> {
             // block-granular, like a `let`). They compile to nothing: the
             // `Expr::Void` keeps a statement-position import a well-formed
             // no-op through typing and emission.
-            Node::Import(root_branch) => {
+            Node::Import(root_branch, _modifier) => {
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
                 for (path, name, leaf_span, alias) in entries {
@@ -49918,7 +49922,7 @@ fn contains_service(nodes: &NodeList) -> bool {
 /// or without `export` wrapping) collect in exactly the order they always did.
 fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
     fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, modules: &mut Vec<(&'a str, Span)>) {
-        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, _alias) in entries {
@@ -49962,7 +49966,7 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
 /// the flat program that has always been the common case allocates nothing new.
 fn collect_module_paths<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
     fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, paths: &mut Vec<(&'a str, Span)>) {
-        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, _alias) in entries {
@@ -50020,7 +50024,7 @@ fn collect_module_import_paths<'a>(
         root: &str,
         imports: &mut Vec<(&'a str, Span, Vec<&'a str>)>,
     ) {
-        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, alias) in entries {
