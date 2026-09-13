@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure,
     ExternBinding, Func, GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList,
-    Pattern,
+    Pattern, ServiceAttr,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -2776,6 +2776,15 @@ const WIRE_SCALAR_NAMES: &[&str] = &[
     "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
 ];
 
+/// The scalars `Hashable` is satisfied by outright — the syntactic oracle's
+/// half of the answer (`is_hashable_type`) and the resolved one's
+/// (`resolved_type_is_hashable`) read the SAME list, because a type one accepts
+/// and the other rejects is a field the derive admits and a key the `[rpc]`
+/// return check refuses, or the reverse.
+const HASHABLE_SCALAR_NAMES: &[&str] = &[
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "Hash",
+];
+
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
 /// DECLARATION's entity id — the file every member span indexes into, which the
 /// check cannot ask for later because it runs after `build()` (B112) — plus each
@@ -2973,6 +2982,21 @@ pub struct Analyzer<'src> {
     /// one is legal, which it is nowhere else. Collected across every module,
     /// read by `check_rpc_signatures` once all are walked.
     client_service_subjects: HashSet<&'src str>,
+    /// Every struct carrying `[service(..)]` or `[client_service]` — both
+    /// halves, because both generate a dispatcher and both therefore refuse
+    /// their methods through `service_method_refusals`. Read by
+    /// `check_invalidation` for B313's stand-down; collected across modules
+    /// like `client_service_subjects`, because an `impl` may be walked before
+    /// the struct it is written for.
+    service_subjects: HashSet<&'src str>,
+    /// B313: the RECEIVER parameter of every `[rpc]` method declared `async`
+    /// with a `&mut self` receiver, paired with the name of the `impl` subject
+    /// that declared it — the exact shape `service_method_refusals` refuses at
+    /// the attribute (B287). Recorded here as the method is walked, filtered by
+    /// `service_subjects` once every module is in, and used to STAND DOWN E3's
+    /// signature rule for that receiver: the two reports are both true, in two
+    /// vocabularies, about one mistake, and the attribute is the outer frame.
+    rpc_async_mut_self_receivers: Vec<(Id, &'src str)>,
     /// The declarations of structs carrying `[client_service]` and NOT
     /// `[service(..)]` — the client-only half of the pair above, by id rather
     /// than by name because the one question asked of it is about a specific
@@ -3950,6 +3974,12 @@ pub struct Analyzer<'src> {
     // the bound check computes is the ELEMENT's and the label the refusal
     // reported is the collection's.
     rpc_refused_wire_types: HashSet<String>,
+    /// B319's half of the set above: the KEY types a keyed-handle return
+    /// refusal has already named, whose generated bound failures are `Wire`
+    /// AND `Hashable` (`reply_source_keyed<K: Wire + Hashable, ..>`). Kept
+    /// apart from `rpc_refused_wire_types` because the trait it stands down is
+    /// the wider pair, and only a key earns it.
+    rpc_refused_key_types: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -4063,6 +4093,12 @@ pub struct Analyzer<'src> {
     // struct, and the syntactic allowlist could not see it. `resolved_type_is_wire`
     // asks `satisfies_trait_bound` about this trait once its fast paths miss.
     wire_trait_id: Option<Id>,
+    // The `std::hash` `Hashable` TRAIT, if loaded — `wire_trait_id`'s twin, and
+    // read for the same reason (B319): what is Hashable is what an
+    // `impl .. with Hashable` applies to, and the name set above it cannot see
+    // a hand-written one. `resolved_type_is_hashable` asks
+    // `satisfies_trait_bound` about this trait once its fast paths miss.
+    hashable_trait_id: Option<Id>,
     print_fn_id: Option<Id>,
     // `std::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
@@ -4667,6 +4703,8 @@ impl<'src> Analyzer<'src> {
             drop_call_edges: HashMap::default(),
             rpc_signatures_to_check: Vec::new(),
             client_service_subjects: HashSet::default(),
+            service_subjects: HashSet::default(),
+            rpc_async_mut_self_receivers: Vec::new(),
             client_only_service_declarations: HashSet::default(),
             current_impl_subject_name: None,
             expose_fields_to_check: Vec::new(),
@@ -4856,6 +4894,7 @@ impl<'src> Analyzer<'src> {
             expose_refused_elements: HashSet::default(),
             expose_refused_key_bounds: HashSet::default(),
             rpc_refused_wire_types: HashSet::default(),
+            rpc_refused_key_types: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             field_annotation_type_ids: HashMap::default(),
@@ -4873,6 +4912,7 @@ impl<'src> Analyzer<'src> {
             guard_continuations: Vec::new(),
             source_trait_id: None,
             wire_trait_id: None,
+            hashable_trait_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
@@ -5567,6 +5607,22 @@ impl<'src> Analyzer<'src> {
                         && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
                         && self
                             .rpc_refused_wire_types
+                            .contains(&without_spaces(&type_label))
+                    {
+                        continue;
+                    }
+                    // B319's half of the same stand-down: a keyed handle's KEY
+                    // is held to `Wire + Hashable` (the generated
+                    // `reply_source_keyed`/`expose_keyed_cell` bounds), so a
+                    // key the return refusal has already named fails BOTH in
+                    // generated code — four reports for one annotation. The
+                    // Wire half is covered above; this is the other trait, and
+                    // only for a type a KEY refusal named.
+                    if !self.rpc_refused_key_types.is_empty()
+                        && trait_label == "Hashable"
+                        && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                        && self
+                            .rpc_refused_key_types
                             .contains(&without_spaces(&type_label))
                     {
                         continue;
@@ -6628,13 +6684,9 @@ impl<'src> Analyzer<'src> {
     /// oracles for "is this Hashable?" — this one and `satisfies_trait_bound` over
     /// the impl table — have to agree or a field the key check accepts is rejected.
     fn is_hashable_type(&self, node: &Node) -> bool {
-        const HASHABLE_SCALARS: &[&str] = &[
-            "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
-            "Hash",
-        ];
         match node {
             Node::Accessor(name) => {
-                HASHABLE_SCALARS.contains(name) || self.hashable_names.contains(*name)
+                HASHABLE_SCALAR_NAMES.contains(name) || self.hashable_names.contains(*name)
             }
             Node::AccessorWithGenerics(name, arguments) => {
                 matches!(*name, "List" | "Option")
@@ -15101,6 +15153,65 @@ impl<'src> Analyzer<'src> {
                             method_id,
                         );
                     }
+                    // B319: a KEYED handle's key crosses the wire too, and the
+                    // rule reached only the element — so `KeyedCell<NotWire,
+                    // T>` passed here and failed inside the generated
+                    // `reply_source_keyed`, whose bound is `K: Wire +
+                    // Hashable`, naming a function the author never wrote. Said
+                    // here in the method's own vocabulary instead, on the
+                    // annotation the author did write, and both halves of the
+                    // bound at once because a key that is neither fails both.
+                    if let Some(key) = type_node.and_then(handle_return_key) {
+                        let key_type_id = member_type_id
+                            .and_then(|type_id| self.resolved_handle_return_key(type_id));
+                        // A key whose own annotation never grounded has a
+                        // diagnostic of its own; this one stands down rather
+                        // than adding a second (the element half's rule).
+                        let (key_is_wire, key_is_hashable) = match key_type_id {
+                            Some(key_type_id) => (
+                                self.resolved_type_is_wire(key_type_id),
+                                self.resolved_type_is_hashable(key_type_id),
+                            ),
+                            None => (true, true),
+                        };
+                        if !key_is_wire || !key_is_hashable {
+                            if let Some(key_type_id) = key_type_id {
+                                if !key_is_wire {
+                                    self.record_refused_rpc_wire_type(key_type_id);
+                                }
+                                let label = self.pretty_print_type(
+                                    &key_type_id.get_type(self),
+                                    &HashMap::default(),
+                                );
+                                self.rpc_refused_key_types.insert(without_spaces(&label));
+                            }
+                            let rendered = render_type(key);
+                            let missing = match (key_is_wire, key_is_hashable) {
+                                (false, false) => "neither Wire nor Hashable",
+                                (false, true) => "not Wire",
+                                _ => "not Hashable",
+                            };
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: format!(
+                                        "`[rpc]` method `{method_name}` returns a keyed handle \
+                                         whose key `{rendered}` is {missing}: the client names \
+                                         the key in every keyed `Subscribe`, each `Delta` the \
+                                         channel forwards carries it, and the mirror indexes by \
+                                         it — so a keyed channel's key must be both (a scalar, \
+                                         `str`, `bool`, a backed enum, a `[derive(Wire, \
+                                         Hashable)]` type, or a type with an `impl .. with \
+                                         Wire` and an `impl .. with Hashable`). The ELEMENT's \
+                                         own requirement is unchanged"
+                                    ),
+                                },
+                                method_id,
+                            );
+                        }
+                    }
                     continue;
                 }
                 let member_is_wire =
@@ -15597,6 +15708,39 @@ impl<'src> Analyzer<'src> {
         self.satisfies_trait_bound(&type_, wire_trait_id, &[], 0)
     }
 
+    /// `resolved_type_is_wire`'s twin for `Hashable` (B319): the same shape —
+    /// the syntactic fast paths `is_hashable_type` answers with, then the impl
+    /// table for everything else, so a hand-written `impl .. with Hashable`
+    /// counts exactly as a derived one does.
+    fn resolved_type_is_hashable(&mut self, type_id: TypeId) -> bool {
+        let type_ = type_id.get_type(self);
+        let (name, arguments) = match &type_ {
+            Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
+            Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
+            _ => return false,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        if HASHABLE_SCALAR_NAMES.contains(&name) {
+            return true;
+        }
+        if self.hashable_names.contains(name) {
+            return true;
+        }
+        if matches!(name, "List" | "Option")
+            && arguments
+                .iter()
+                .all(|argument| self.resolved_type_is_hashable(*argument))
+        {
+            return true;
+        }
+        let Some(hashable_trait_id) = self.hashable_trait_id else {
+            return false;
+        };
+        self.satisfies_trait_bound(&type_, hashable_trait_id, &[], 0)
+    }
+
     /// [`handle_return_element`]'s descent, read off a RESOLVED type: the
     /// `SignalCell<T>` element behind an `[rpc]` handle return, through an
     /// optional `Option`.
@@ -15613,9 +15757,8 @@ impl<'src> Analyzer<'src> {
                 arguments.as_slice(),
             ) {
                 ("SignalCell", [element]) => Some(*element),
-                // A79's keyed handle: the ELEMENT is the second argument, and
-                // it is the one whose Wire-ness this rule tests — the key's is
-                // not reached here (see the written twin).
+                // A79's keyed handle: the ELEMENT is the second argument.
+                // Its KEY is `resolved_handle_return_key`'s answer (B319).
                 ("KeyedCell", [_key, element]) => Some(*element),
                 _ => None,
             },
@@ -15624,6 +15767,29 @@ impl<'src> Analyzer<'src> {
                 arguments.as_slice(),
             ) {
                 ("Option", [inner]) => self.resolved_handle_return_element(*inner),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// [`handle_return_key`]'s descent, read off a RESOLVED type (B319) — the
+    /// element descent's twin, one argument to the left, and `None` for a
+    /// handle that is not keyed.
+    fn resolved_handle_return_key(&self, type_id: TypeId) -> Option<TypeId> {
+        match type_id.get_type(self) {
+            Type::Struct(id, arguments) => match (
+                self.structs.get(&id).map(|struct_| struct_.name)?,
+                arguments.as_slice(),
+            ) {
+                ("KeyedCell", [key, _element]) => Some(*key),
+                _ => None,
+            },
+            Type::Enum(id, arguments) => match (
+                self.enums.get(&id).map(|enum_| enum_.name)?,
+                arguments.as_slice(),
+            ) {
+                ("Option", [inner]) => self.resolved_handle_return_key(*inner),
                 _ => None,
             },
             _ => None,
@@ -21262,6 +21428,23 @@ impl<'src> Analyzer<'src> {
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
         let mut pending = ViewSuspensionChecks::default();
+        // B313's stand-down: the RECEIVERS of `[rpc]` methods the `[service]`
+        // attribute has already refused for being `async` beside `&mut self`
+        // (B287). Both reports are true and neither is wrong — E3 says the view
+        // would be held across a suspension, B287 says the receiver is a view
+        // into an instance other routes interleave with — but they are one
+        // mistake, and the ATTRIBUTE is the outer frame: it is what the author
+        // wrote, it names the method, and its sentence carries both fixes. The
+        // set is empty for every program with no service in it, and the
+        // stand-down reaches only the receiver, so a `&mut` PARAMETER beside it
+        // keeps E3's report (it is a different mistake, and one B287 says
+        // nothing about).
+        let stood_down: HashSet<Id> = self
+            .rpc_async_mut_self_receivers
+            .iter()
+            .filter(|(_, subject)| self.service_subjects.contains(subject))
+            .map(|(receiver_id, _)| *receiver_id)
+            .collect();
         for (function_id, statements, tail) in &bodies {
             let mut live = HashSet::default();
             let mut state = InvalidationScanState::default();
@@ -21294,6 +21477,10 @@ impl<'src> Analyzer<'src> {
                     let Some(parameter) = self.parameters.get(parameter_id) else {
                         continue;
                     };
+                    // B313: already reported in the service's vocabulary.
+                    if stood_down.contains(parameter_id) {
+                        continue;
+                    }
                     match parameter.convention {
                         Convention::RefMut => view_parameters.push((*parameter_id, "'&mut'")),
                         Convention::Ref => view_parameters.push((*parameter_id, "'&'")),
@@ -26086,10 +26273,14 @@ impl<'src> Analyzer<'src> {
             // separately, by `std/src/rpc.vl`'s `service` macro (N70 retired
             // the Rust twin that used to do it for a std without `rpc.vl`).
             Node::Service(attribute, inner) => {
-                if let Node::Struct(name, ..) = &inner.0
-                    && attribute.client_side
-                {
-                    self.client_service_subjects.insert(name.0);
+                if let Node::Struct(name, ..) = &inner.0 {
+                    if attribute.client_side {
+                        self.client_service_subjects.insert(name.0);
+                    }
+                    // Either attribute expands, and either expansion refuses
+                    // its own methods (B287/B295/B312) — so B313's stand-down
+                    // is owed to both.
+                    self.service_subjects.insert(name.0);
                 }
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
@@ -26493,6 +26684,19 @@ impl<'src> Analyzer<'src> {
                     // the insert below because that is what moves `parameters`.
                     if function.rpc {
                         self.collect_rpc_signature(function, id, &parameters, return_type_id);
+                        // B313: the shape B287 refuses at the attribute. The
+                        // WRITTEN `async` keyword is the key, as it is there —
+                        // an inferred-async method is not refused by the
+                        // attribute and must keep E3's report.
+                        if function.is_async
+                            && function.receiver_spelling() == Some("&mut self")
+                            && let Some(receiver_id) = parameters.first()
+                        {
+                            self.rpc_async_mut_self_receivers.push((
+                                *receiver_id,
+                                self.current_impl_subject_name.unwrap_or_default(),
+                            ));
+                        }
                     }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
@@ -47539,11 +47743,9 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
             }
         }
         // A79: `KeyedCell<K, T>` is a handle return too, and its element is
-        // `T`. The KEY also crosses the wire — it rides every `Delta` and
-        // every keyed `Subscribe` — and is NOT tested here: this rule answers
-        // one element, and a non-Wire key still fails, in the generated
-        // `reply_source_keyed`'s `K: Wire` bound rather than in the method's
-        // own vocabulary. Tracked rather than papered over.
+        // `T`. Its KEY crosses the wire as well — it rides every `Delta` and
+        // every keyed `Subscribe` — and is `handle_return_key`'s answer (B319),
+        // checked beside this one.
         Node::AccessorWithGenerics(name, arguments) if *name == "KeyedCell" => {
             match arguments.0.as_slice() {
                 [_key, element] => Some(&element.0),
@@ -47553,6 +47755,34 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
         Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
             match arguments.0.as_slice() {
                 [inner] => handle_return_element(&inner.0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The KEY of a keyed handle return, as WRITTEN (B319) —
+/// [`handle_return_element`]'s twin one argument to the left, and `None` for
+/// every return that is not a keyed handle.
+///
+/// A keyed channel's key is as much a wire value as its element: the client
+/// names it in every keyed `Subscribe`, each `Delta` carries it, and the
+/// mirror indexes by it — which is why the generated code's bound is `K: Wire +
+/// Hashable` (`reply_source_keyed`, `expose_keyed_cell`). Before this, a key
+/// that was neither failed four times inside that generated code, naming
+/// functions the author never wrote.
+fn handle_return_key<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
+    match node {
+        Node::AccessorWithGenerics(name, arguments) if *name == "KeyedCell" => {
+            match arguments.0.as_slice() {
+                [key, _element] => Some(&key.0),
+                _ => None,
+            }
+        }
+        Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
+            match arguments.0.as_slice() {
+                [inner] => handle_return_key(&inner.0),
                 _ => None,
             }
         }
@@ -47762,7 +47992,29 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
 /// the collision onto. The prefix is reserved WHOLE rather than the one name,
 /// because the generator is free to mint a second `__` binding and a reservation
 /// that has to be re-read on every such change is not one.
+///
+/// 4. A method whose NAME is one the expansion generates (B312).
+///
+/// B295 reserved the generator's parameter prefix; this is the same reservation
+/// one level out, over the members the expansion declares. The clash is a
+/// DUPLICATE DEFINITION rather than a shadowing, so B295's other half —
+/// qualifying the generated calls — cannot reach it: `[rpc] fun verify` makes
+/// the generated `verify` on the client a second definition of that name, and
+/// what the author sees is "'verify' is already defined for 'EchoClient<T>'"
+/// anchored inside code they never wrote (`contract_hash` and `dispatcher`,
+/// which land on the service itself as well, report three times each).
+///
+/// The two sets are gated exactly as the generator emits them, which is what
+/// the probes found: `dispatcher` and `contract_hash` go on the SERVICE struct
+/// and are therefore reserved for a `[client_service]`-only struct too (its
+/// dispatcher is generated the same way), while `connect`, `connect_with`,
+/// `with_handlers` and `verify` exist only where a transport client is
+/// generated. `dispatcher_for` and `for_connection` are NOT reserved and
+/// compile today: they are declared on a TRAIT impl (`RpcService`,
+/// `ClientProxy`), which is a different declaration site from the inherent one
+/// an author's method lands in.
 pub(crate) fn service_method_refusals(
+    attribute: ServiceAttr<'_>,
     item: &Spanned<Node<'_>>,
     nodes: &NodeList<'_>,
 ) -> Vec<(Span, String)> {
@@ -47770,6 +48022,16 @@ pub(crate) fn service_method_refusals(
         return Vec::new();
     };
     let service_name = name.0;
+    // The client sibling's name, or `None` when the struct carries only
+    // `[client_service]` and no transport client is generated at all — the same
+    // question `construct_service` answers, and the gate on half the reserved
+    // set below.
+    let client_name = attribute.server_side.then(|| {
+        attribute
+            .client_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{service_name}Client"))
+    });
     let mut refusals = Vec::new();
     for (node, _span) in nodes {
         let Node::Impl(subject, impl_traits, body) = node else {
@@ -47841,9 +48103,83 @@ pub(crate) fn service_method_refusals(
                     ),
                 ));
             }
+            if let Some((owner, detail)) =
+                generated_member_collision(method_name, service_name, client_name.as_deref())
+            {
+                refusals.push((
+                    function.name.1,
+                    format!(
+                        "`[rpc]` method `{method_name}` takes a name the `[service]` expansion \
+                         generates on `{owner}`: {detail}, so the expansion would declare \
+                         `{method_name}` twice and the build would stop inside code you never \
+                         wrote. Rename the method — an `[rpc]` method's name is its WIRE name, \
+                         so the surface and both peers move with the rename"
+                    ),
+                ));
+            }
         }
     }
     refusals
+}
+
+/// The members the `[service]` expansion declares itself, per owner — the
+/// reservation B312 closed (`service_method_refusals`, arm 4).
+///
+/// Kept as two lists rather than one because the owners differ and so does the
+/// gate: these two land on the SERVICE struct, whatever the attribute says, so
+/// they are reserved for a `[client_service]`-only struct too.
+const SERVICE_GENERATED_MEMBERS: &[&str] = &["dispatcher", "contract_hash"];
+
+/// The members generated on the CLIENT sibling — reserved only where one is
+/// generated. `contract_hash` is on both: the client carries its own copy to
+/// compare the server's answer against.
+const CLIENT_GENERATED_MEMBERS: &[&str] = &[
+    "connect",
+    "connect_with",
+    "with_handlers",
+    "verify",
+    "contract_hash",
+];
+
+/// The generated-member list as a message reads it: `` `a` ``, `` `b` `` and
+/// `` `c` ``. Built from the list rather than written beside it, so a member
+/// added to the reservation is named by every message that cites it.
+fn quoted_list(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    join_with(&quoted, "and")
+}
+
+/// Whether `method_name` is a name the expansion generates, and on which type —
+/// the service struct first, since a name on both (`contract_hash`) collides
+/// there whether or not a client is generated. `client_name` is `None` for a
+/// struct that generates no transport client.
+fn generated_member_collision(
+    method_name: &str,
+    service_name: &str,
+    client_name: Option<&str>,
+) -> Option<(String, String)> {
+    if SERVICE_GENERATED_MEMBERS.contains(&method_name) {
+        let generated = quoted_list(SERVICE_GENERATED_MEMBERS);
+        return Some((
+            service_name.to_string(),
+            format!(
+                "the expansion writes {generated} on the service itself, beside the methods it \
+                 routes"
+            ),
+        ));
+    }
+    let client_name = client_name?;
+    if CLIENT_GENERATED_MEMBERS.contains(&method_name) {
+        let generated = quoted_list(CLIENT_GENERATED_MEMBERS);
+        return Some((
+            client_name.to_string(),
+            format!(
+                "the generated client declares {generated} of its own, and the stub this method \
+                 generates lands beside them"
+            ),
+        ));
+    }
+    None
 }
 
 /// `[service(.., client = H)]` where `H` is not a `[client_service]` sibling —
@@ -53306,6 +53642,15 @@ fn analyze_inner<'src>(
         .get("wire")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
         .and_then(|scope| scope.name_to_id_map.get("Wire").copied());
+
+    // The `std::hash` `Hashable` TRAIT, if `hash.vl` loaded — captured exactly
+    // as `Wire` is, and read for the same reason (B319): a keyed channel's key
+    // must be Hashable, and a hand-written `impl .. with Hashable` is as good
+    // as a derived one.
+    analyzer.hashable_trait_id = module_scopes
+        .get("hash")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("Hashable").copied());
 
     // The `std::json` `JsonValue` struct, if `json.vl` loaded — same treatment.
     // Its `field` method id is captured after `build()` to lower to `self[name]`.

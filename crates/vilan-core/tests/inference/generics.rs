@@ -7935,9 +7935,13 @@ fn an_async_rpc_method_taking_a_mutable_self_reference_is_refused_at_the_attribu
 }
 
 /// The same refusal when the body DOES suspend — the shape E3's signature rule
-/// already reached, said here in the service's vocabulary. Both fire, and both
-/// are true: one is about the view across the suspension, this one about the
-/// instance two interleaved routes share.
+/// already reached, said here in the service's vocabulary, and since B313 said
+/// ONLY here: both sentences were true (one about the view held across the
+/// suspension, this one about the instance two interleaved routes share) and
+/// both described one mistake, so the attribute — what the author wrote, and
+/// the frame that names the method — keeps it and E3 stands down. The
+/// multiplicity is `an_async_suspending_rpc_method_takes_the_attributes_refusal_alone`'s
+/// claim; this pin holds the refusal itself.
 #[test]
 fn an_async_rpc_method_that_suspends_is_refused_in_the_services_own_vocabulary() {
     assert_fails_with(
@@ -7961,6 +7965,128 @@ fn an_async_rpc_method_that_suspends_is_refused_in_the_services_own_vocabulary()
         "#,
         "`[rpc]` method `bump` is declared `async` and takes `&mut self`",
     );
+}
+
+/// B313: the suspending shape takes ONE report, the attribute's.
+///
+/// E3's `async_view_parameter_message` ("an async function cannot take '&mut'
+/// parameters") and B287's refusal are both true of `async fun bump(&mut self)`
+/// with an await in it, in two vocabularies, about one mistake — and E3's is
+/// the one that cannot say what to do about it here, because the fix it offers
+/// ("pass a value, or a Shared/handle") is half of what the attribute's
+/// sentence already spells out for a service. The stand-down is keyed on the
+/// RECEIVER of a method the `[service]`/`[client_service]` attribute has
+/// already refused, so it can only ever remove a report that stands beside
+/// another one about the same declaration.
+#[test]
+fn an_async_suspending_rpc_method_takes_the_attributes_refusal_alone() {
+    let source = r#"
+        import std::io::print;
+        import std::time::{ sleep_for, Duration };
+
+        [service(GateClient)]
+        struct Gate { tally: i32 }
+
+        impl Gate {
+            [rpc]
+            async fun bump(&mut self, by: i32): i32 {
+                sleep_for(Duration::millis(1));
+                self.tally = self.tally + by;
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#;
+    assert_fails_once_with(
+        source,
+        "`[rpc]` method `bump` is declared `async` and takes `&mut self`",
+    );
+    assert_fails_without(source, "an async function cannot take");
+}
+
+/// B313's three controls: the stand-down reaches exactly the receiver of a
+/// method the attribute refused, and nothing else that E3 was answering before.
+///
+/// (1) The same method on a struct with no `[service]`/`[client_service]` on
+/// it: nothing refused it at an attribute, so E3's report is the only one there
+/// is. (2) A method of a SERVICE struct that is not `[rpc]`: it is not part of
+/// the surface and the expansion never looked at it. (3) An `[rpc]` method with
+/// no `async` KEYWORD whose body suspends anyway — B287 is keyed on the written
+/// keyword and says nothing about this one, so E3 must.
+#[test]
+fn the_async_view_parameter_rule_still_reaches_what_the_service_attribute_does_not_refuse() {
+    let plain_struct = r#"
+        import std::io::print;
+        import std::time::{ sleep_for, Duration };
+
+        struct Counter { tally: i32 }
+
+        impl Counter {
+            async fun bump(&mut self, by: i32): i32 {
+                sleep_for(Duration::millis(1));
+                self.tally = self.tally + by;
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#;
+    assert_fails_with(
+        plain_struct,
+        "an async function cannot take '&mut' parameters",
+    );
+
+    let unmarked_method = r#"
+        import std::io::print;
+        import std::time::{ sleep_for, Duration };
+
+        [service(GateClient)]
+        struct Gate { tally: i32 }
+
+        impl Gate {
+            [rpc]
+            fun peek(self): i32 {
+                self.tally
+            }
+
+            async fun bump(&mut self, by: i32): i32 {
+                sleep_for(Duration::millis(1));
+                self.tally = self.tally + by;
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#;
+    assert_fails_with(
+        unmarked_method,
+        "an async function cannot take '&mut' parameters",
+    );
+
+    let inferred_async = r#"
+        import std::io::print;
+        import std::time::{ sleep_for, Duration };
+
+        [service(GateClient)]
+        struct Gate { tally: i32 }
+
+        impl Gate {
+            [rpc]
+            fun bump(&mut self, by: i32): i32 {
+                sleep_for(Duration::millis(1));
+                self.tally = self.tally + by;
+                self.tally
+            }
+        }
+
+        fun main() { print("built"); }
+        "#;
+    assert_fails_with(
+        inferred_async,
+        "an async function cannot take '&mut' parameters",
+    );
+    assert_fails_without(inferred_async, "is declared `async` and takes `&mut self`");
 }
 
 /// The two controls, because the refusal is the CONJUNCTION: a sync `&mut self`

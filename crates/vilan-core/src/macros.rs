@@ -1713,7 +1713,8 @@ impl Expander<'_, '_> {
                 // with the `__` parameter-name reservation, spanned on the
                 // parameter, for the identical reason: the expansion would fail
                 // over a binding of its own that the author's name rebound.
-                let method_refusals = crate::analyzer::service_method_refusals(item, siblings);
+                let method_refusals =
+                    crate::analyzer::service_method_refusals(*attribute, item, siblings);
                 if !method_refusals.is_empty() {
                     for (span, msg) in method_refusals {
                         self.diagnostics.push(Error {
