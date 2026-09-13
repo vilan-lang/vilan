@@ -5365,10 +5365,17 @@ impl Document {
         let style_tree = style_text
             .as_deref()
             .and_then(|text| vilan_core::parsing::parse(text).0);
-        let surface = match (style_text.as_deref(), style_tree.as_ref()) {
+        let mut surface = match (style_text.as_deref(), style_tree.as_ref()) {
             (Some(text), Some(tree)) => StyleSurface::build(text, &tree.0),
             _ => StyleSurface::default(),
         };
+        // And the CURRENT file's own `impl Style` extensions (E172). The tree
+        // is already in hand — it is the one the chain was found in — so this
+        // costs a walk of the file's top-level items and no parse at all, and
+        // it is what makes the refactor fire on an app's chain: an app's own
+        // shorthand is usually the FIRST link, and a first link with no block
+        // spelling is an empty convertible prefix and no action offered.
+        surface.extend(source, &root.0);
         Some(CssConversion {
             to_chain: false,
             span: node.1,
@@ -5989,7 +5996,8 @@ fn render_css_link(
     Some(out)
 }
 
-/// std's `impl Style` surface, read out of the parsed `style.vl` (E167).
+/// The `impl Style` surface the converter inlines from: std's, read out of the
+/// parsed `style.vl` (E167), and the CURRENT FILE's own extensions (E172).
 ///
 /// The alternative was a hand table beside `STYLE_PROPERTY_METHODS` giving each
 /// method's declarations with holes for its arguments, gated against `style.vl`
@@ -6001,28 +6009,56 @@ fn render_css_link(
 /// with a statement in it) simply HAS no block spelling and splits the chain
 /// rather than being converted wrong.
 ///
+/// std alone was not enough to make the refactor fire on real code (E172): an
+/// app's chain usually opens with the app's OWN shorthand — kolt's
+/// `button_style` starts `style().flex_row()`, `flex_row` being four lines up
+/// the same file — so the convertible prefix was empty and the action offered
+/// nothing on the exhibit it was filed about. The current file is already
+/// raw-parsed here (the conversion reads a raw tree, because neither spelling's
+/// distinguishing node survives desugaring), so its `impl Style` bodies are in
+/// hand for free, and an extension whose body is a self-chain inlines exactly as
+/// a std shorthand does — including one that delegates to another extension,
+/// which is the same recursion under the same depth bound.
+///
+/// A method carries the SOURCE its spans index into, because the two halves come
+/// from different texts and `inline_argument` splices by span.
+///
 /// Empty when `style.vl` cannot be read or parsed, which degrades to the
 /// pre-E167 behaviour (the chokepoint links and the combinators) rather than to
 /// a wrong answer.
 #[derive(Default)]
 struct StyleSurface<'a> {
-    source: &'a str,
     methods: HashMap<&'a str, StyleMethodBody<'a>>,
 }
 
 /// One `impl Style` method's inlinable shape: the names it binds its arguments
-/// to, and the single expression its body is.
+/// to, the single expression its body is, and the text that body's spans index
+/// into (std's `style.vl` or the current file — see [`StyleSurface`]).
 struct StyleMethodBody<'a> {
     parameters: Vec<&'a str>,
     tail: &'a vilan_core::Spanned<Node<'a>>,
+    source: &'a str,
 }
 
 impl<'a> StyleSurface<'a> {
-    /// The `impl Style` methods of a parsed `style.vl`. A method with a
-    /// STATEMENT in its body is skipped outright: a `let`, an `if` or a loop is
-    /// a barrier, and nothing about it has a declaration spelling.
+    /// The `impl Style` methods of a parsed `style.vl`.
     fn build(source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) -> StyleSurface<'a> {
-        let mut methods = HashMap::default();
+        let mut surface = StyleSurface::default();
+        surface.extend(source, items);
+        surface
+    }
+
+    /// One more parsed file's `impl Style` methods folded in — the current
+    /// file's own extensions (E172). A method with a STATEMENT in its body is
+    /// skipped outright: a `let`, an `if` or a loop is a barrier, and nothing
+    /// about it has a declaration spelling.
+    ///
+    /// A name already present is KEPT rather than replaced, so std is the
+    /// authority for a std method name. A file cannot legally redeclare one
+    /// anyway (the call would be ambiguous), and between a guess and the
+    /// shipped body the shipped body is the safer one to inline.
+    fn extend(&mut self, source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) {
+        let methods = &mut self.methods;
         for item in items {
             let Node::Impl(subject, _traits, body) = &item.0 else {
                 continue;
@@ -6054,17 +6090,14 @@ impl<'a> StyleSurface<'a> {
                     }
                 }
                 if spellable {
-                    methods.insert(
-                        function.name.0,
-                        StyleMethodBody {
-                            parameters,
-                            tail: body.0.1.as_ref(),
-                        },
-                    );
+                    methods.entry(function.name.0).or_insert(StyleMethodBody {
+                        parameters,
+                        tail: body.0.1.as_ref(),
+                        source,
+                    });
                 }
             }
         }
-        StyleSurface { source, methods }
     }
 }
 
@@ -6158,7 +6191,7 @@ fn style_link_declarations<'a>(
         };
         let mut inner_arguments = Vec::with_capacity(written.0.len());
         for argument in &written.0 {
-            inner_arguments.push(inline_argument(argument, surface.source, &bindings)?);
+            inner_arguments.push(inline_argument(argument, method.source, &bindings)?);
         }
         declarations.extend(style_link_declarations(
             surface,
@@ -7629,10 +7662,22 @@ pub(crate) mod tests {
     /// [`css_conversion`] over a whole FILE rather than one function body — the
     /// shapes that need their own imports or an `impl Style` of their own.
     fn css_conversion_of(source: &str) -> Option<(bool, String, String)> {
+        css_conversion_across(source, &[])
+    }
+
+    /// [`css_conversion_of`] with SIBLING files beside `main.vl` in the
+    /// workspace — E172's boundary: an `impl Style` in another file of the same
+    /// package is analyzed, and the inliner still cannot read it.
+    fn css_conversion_across(
+        source: &str,
+        siblings: &[(&str, &str)],
+    ) -> Option<(bool, String, String)> {
         let source = source.to_string();
         let offset = source.find('~').expect("fixture needs a `~` cursor");
         let text = source.replace('~', "");
-        let (directory, document) = analyze_workspace(&[("main.vl", &text)]);
+        let mut files: Vec<(&str, &str)> = vec![("main.vl", &text)];
+        files.extend(siblings.iter().copied());
+        let (directory, document) = analyze_workspace(&files);
         let conversion = document
             .css_spelling_conversion(Span {
                 start: offset,
@@ -7746,15 +7791,88 @@ pub(crate) mod tests {
     // and the rest is written as a postfix chain on the block — which parses and
     // types, and keeps its order relative to everything the block holds, so the
     // two spellings mean the same style.
+    //
+    // `select_off` here is kolt's REAL one (E172): its body is
+    // `self.within(..)`, and `within`'s own body carries statements, so the
+    // inliner has nothing to substitute into and the link is a barrier. It used
+    // to be spelled `self.raw("user-select", "none")`, which was a barrier only
+    // because the inliner could not see the current file's bodies at all — that
+    // shape CONVERTS now, and pinning the split on it would have been pinning
+    // the defect.
     #[test]
     fn refactor_splits_a_chain_at_a_link_with_no_block_spelling() {
         let conversion = css_conversion_of(
-            "import std::style::{ Color, Length, Style, space, style };\n\n             impl Style {\n\tfun select_off(self): Style {\n\t\tself.raw(\"user-select\", \"none\")\n\t}\n}\n\n             fun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
+            "import std::style::{ Color, Length, Style, space, style };\n\n             impl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\n             fun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
         )
         .expect("a kolt-shaped chain converts");
         assert_eq!(
             conversion.2,
             "css {\n\t\tpadding: {space(4)};\n\t\toutline: none;\n\t\tborder-radius: {Length::px(4)};\n\t\t.attribute(\"disabled\", None) {\n\t\t\tcolor: {Color::gray(300)};\n\t\t}\n\t}.select_off().hover(style().background(Color::gray(100)))",
+            "{conversion:?}"
+        );
+    }
+
+    // E172: the inliner reads the CURRENT FILE's `impl Style` bodies too, which
+    // is what makes the refactor fire on the exhibit it was filed about. kolt's
+    // `button_style` opens `style().flex_row()` and `flex_row` is four lines up
+    // the same file — so before this the convertible prefix was EMPTY and the
+    // action offered nothing at all on a real app's chain, however many std
+    // shorthands came after. An extension whose body is a self-chain inlines
+    // exactly as a std shorthand does.
+    #[test]
+    fn refactor_inlines_an_impl_style_extension_declared_in_the_current_file() {
+        let conversion = css_conversion_of(
+            "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\n             fun button_style(color: Color): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.gap(space(2))\n\t\t.align_items(AlignItems::Center)\n\t\t.radius(Length::px(4))\n\t\t.color(color)\n}\n",
+        )
+        .expect("kolt's `button_style` shape converts");
+        assert!(!conversion.0, "chain -> block");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tgap: {space(2)};\n\t\talign-items: {AlignItems::Center.value()};\n\t\tborder-radius: {Length::px(4)};\n\t\tcolor: {color};\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // One extension delegating to ANOTHER is the same recursion under the same
+    // depth bound, and it is the shape kolt writes (`ghost` calls `select_off`).
+    // The control beside it is the barrier that E172 does not move: an extension
+    // with a STATEMENT in its body still has no declaration spelling, so the
+    // chain splits there exactly as it does at a std method like `border`.
+    #[test]
+    fn refactor_follows_one_current_file_extension_into_another_and_stops_at_a_statement() {
+        let conversion = css_conversion_of(
+            "import std::style::{ Color, Display, FlexDirection, Length, Style, style };\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n\n\tfun ghost(self): Style {\n\t\tself.raw(\"pointer-events\", \"none\").flex_row()\n\t}\n\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n\n             fun card(): Style {\n\tsty~le()\n\t\t.ghost()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+        )
+        .expect("a delegating extension converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpointer-events: none;\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t}.themed().raw(\"outline\", \"none\")",
+            "{conversion:?}"
+        );
+    }
+
+    // E172's BOUNDARY, pinned rather than left to be found: the inliner reads
+    // the CURRENT file's `impl Style` bodies, and a SIBLING file's are out of
+    // reach even though the analyzer has loaded them. kolt's own `button_style`
+    // runs into this at `.script_label()`, which `theme.vl` declares — so its
+    // chain converts the prefix its own file's `flex_row` opens and splits
+    // there, where before E172 it converted nothing at all. Widening this is a
+    // change of a different kind: the current file is in hand because the
+    // conversion already raw-parses it, and a sibling's body would have to come
+    // off the analyzed impl table instead.
+    #[test]
+    fn refactor_does_not_reach_an_impl_style_extension_in_a_sibling_file() {
+        let conversion = css_conversion_across(
+            "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\n             fun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            &[(
+                "theme.vl",
+                "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
+            )],
+        )
+        .expect("the prefix the file's own extension opens converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t}.script_label().raw(\"outline\", \"none\")",
             "{conversion:?}"
         );
     }
@@ -7777,13 +7895,15 @@ pub(crate) mod tests {
     }
 
     // And a chain with NO convertible link offers nothing at all: a `css { }`
-    // with the whole chain hung off it is not a conversion.
+    // with the whole chain hung off it is not a conversion. The extension is
+    // kolt's own `select_off` again, a barrier for `within`'s sake rather than
+    // for the inliner's reach (E172).
     #[test]
     fn refactor_offers_nothing_when_no_link_has_a_block_spelling() {
         assert_eq!(css_conversion("\tsty~le()\n\t\t.class_list()\n"), None);
         assert_eq!(
             css_conversion_of(
-                "import std::style::{ Style, style };\n\n                 impl Style {\n\tfun select_off(self): Style {\n\t\tself.raw(\"user-select\", \"none\")\n\t}\n}\n\n                 fun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
+                "import std::style::{ Style, style };\n\n                 impl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\n                 fun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
             ),
             None
         );

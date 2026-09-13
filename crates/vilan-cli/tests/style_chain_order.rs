@@ -753,6 +753,101 @@ fn the_css_block_refactor_renders_the_typed_chain_it_converted() {
     );
 }
 
+/// E172's twin of the above, and the exhibit the item was filed about: the
+/// converter now reads the CURRENT FILE's `impl Style` bodies, so a chain that
+/// opens with the app's OWN shorthand converts. kolt's `button_style` is that
+/// chain — `style().flex_row()` with `flex_row` four lines up the same file —
+/// and before E172 the convertible prefix was empty and the action offered
+/// nothing at all on it.
+///
+/// Inlining an app's method is the same substitution as inlining std's and it
+/// is checkable the same way and no other: the two programs must emit the same
+/// stylesheet and resolve the same slots. It matters more here than for a std
+/// body, because `display(Display::Flex)` inlines to
+/// `display: {Display::Flex.value()};` — a HOLE carrying a method call, written
+/// by a body two levels down (`flex_row` → `display` → `raw`) — and nothing
+/// about that is checkable by reading it.
+///
+/// The block below is the refactor's OWN OUTPUT for this chain, byte for byte;
+/// it is pinned as the replacement text in `vilan-lsp`'s
+/// `refactor_inlines_an_impl_style_extension_declared_in_the_current_file`.
+const E172_EXTENSION_CHAIN: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
+    "\n",
+    "impl Style {\n",
+    "\tfun flex_row(self): Style {\n",
+    "\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const style()\n",
+    "\t\t.flex_row()\n",
+    "\t\t.gap(space(2))\n",
+    "\t\t.align_items(AlignItems::Center)\n",
+    "\t\t.radius(Length::px(4))\n",
+    "\t\t.color(Color::gray(900));\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+const E172_CONVERTED_BLOCK: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
+    "\n",
+    "impl Style {\n",
+    "\tfun flex_row(self): Style {\n",
+    "\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const css {\n",
+    "\t\tdisplay: {Display::Flex.value()};\n",
+    "\t\tflex-direction: {FlexDirection::Row.value()};\n",
+    "\t\tgap: {space(2)};\n",
+    "\t\talign-items: {AlignItems::Center.value()};\n",
+    "\t\tborder-radius: {Length::px(4)};\n",
+    "\t\tcolor: {Color::gray(900)};\n",
+    "\t};\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+#[test]
+fn the_css_block_refactor_renders_the_current_files_own_extension() {
+    let temporary = scratch_directory("vilan-style-e172");
+    let chain_dir = temporary.join("chain");
+    let block_dir = temporary.join("block");
+    std::fs::create_dir_all(&chain_dir).expect("create the chain directory");
+    std::fs::create_dir_all(&block_dir).expect("create the block directory");
+    let chain_source = chain_dir.join("converted.vl");
+    let block_source = block_dir.join("converted.vl");
+    std::fs::write(&chain_source, E172_EXTENSION_CHAIN).expect("write the chain");
+    std::fs::write(&block_source, E172_CONVERTED_BLOCK).expect("write the block");
+
+    let chain = build(&chain_source, &chain_dir, false)
+        .unwrap_or_else(|error| panic!("the extension chain did not build:\n{error}"));
+    let block = build(&block_source, &block_dir, false)
+        .unwrap_or_else(|error| panic!("the converted block did not build:\n{error}"));
+    let _ = std::fs::remove_dir_all(&temporary);
+
+    assert_eq!(
+        chain.1, block.1,
+        "the converted `css` block emits a different stylesheet than the chain it was converted \
+         from - the inlined body of the file's own `impl Style` method is writing something the \
+         method does not"
+    );
+    assert_eq!(
+        sort_map_entries(&chain.0),
+        sort_map_entries(&block.0),
+        "the converted `css` block resolves different slots than the chain it was converted from"
+    );
+}
+
 /// The `.mjs` canonicalization must not be able to hide a real difference: a
 /// changed class name, declaration or slot key survives it.
 #[test]
