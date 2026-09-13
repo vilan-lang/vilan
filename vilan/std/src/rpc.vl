@@ -1050,8 +1050,25 @@ fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailur
 			// bundle re-dials — the fresh duplex resyncs from the server exactly as
 			// a K6 reconnect does. Reads the cell at teardown time, so a socket
 			// swapped in by a reconnect is the one closed. A no-op without a shim.
+			//
+			// `close_for_good`, not a bare `socket.close()` (tracker A96): the
+			// swap's teardown list runs in REGISTRATION order and this closure
+			// is registered at DIAL, which is before the mount that owns every
+			// mirror — so a bare close left the duplex reading `Connected`
+			// while the browser socket was already CLOSING, and the mounts torn
+			// down after it each released a lease whose `Unsubscribe` passed
+			// `send`'s `Connected` guard and reached `transmit` on a closing
+			// socket: one console error per remote source, then an `onclose`
+			// that found `Connected`, rejected the in-flight calls and REDIALED
+			// — the dead bundle's duplex living on beside the new one's. Writing
+			// `Closed` first makes the teardown order-independent: the late
+			// releases drop at the guard (the server drops the connection
+			// anyway — those frames were waste) and `handle_drop` stops at its
+			// own state guard, so there is no reject noise, no redial and no
+			// zombie duplex. `on_terminal` runs too, which is what a torn-down
+			// session should do.
 			if hmr_active() {
-				hmr_register_teardown(|| duplex.socket.read().close());
+				hmr_register_teardown(|| close_for_good(duplex));
 			}
 			Ok(duplex)
 		},

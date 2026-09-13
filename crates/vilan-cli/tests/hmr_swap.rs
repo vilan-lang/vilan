@@ -9,6 +9,15 @@
 //! changed + function-local reset; `on_teardown` ran; `stash`/`take` round-trip;
 //! the old bundle's subscriptions disposed).
 //!
+//! The second e2e here is the same machinery pointed at the swap's OTHER
+//! teardown (tracker A96): an app that dials a `SocketDuplex` before it mounts
+//! is torn down socket-first, and what the duplex's own teardown does decides
+//! whether the mount teardowns that follow talk to a socket that is already
+//! closing — and whether the dead bundle's duplex redials and lives on beside
+//! the new one's. It adds a WebSocket stub to the DOM stub, because a browser
+//! answers a send on a closing socket with a console error rather than
+//! anything a test can see.
+//!
 //! House process hygiene: the watcher never exits on its own, so it is killed at
 //! the end; the legs are quick-exit (the node server prints and returns).
 
@@ -501,6 +510,342 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
             "swap harness failed:\n{}\n{}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
+    if outcome.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    outcome.unwrap();
+}
+
+// --- A96: the swap's socket teardown ----------------------------------------
+
+/// A browser client that DIALS before it mounts — kolt's shape (`client.vl`:47
+/// then :60) and the one A96 was filed against: the duplex's HMR teardown is
+/// registered at dial, so the swap runs it BEFORE the mount teardown that
+/// releases every mirror's lease. Two `RemoteSource`s, each watched under the
+/// root owner, so the disposal that follows the socket's teardown owes two
+/// `Unsubscribe` frames. `@@TAG@@` is the bundle's identity: bundle B is this
+/// same program with the other tag, so every mark says which bundle made it and
+/// the rebuilt bytes differ from A's.
+const SOCKET_CLIENT: &str = r#"import std::ui::{ view, View, mount_root };
+import std::rpc::{ ReactiveClient, RemoteSource, bridge, connect_socket };
+import std::json::json_codec;
+import std::option::Option::{ self, Some, None };
+import std::result::Result::{ self, Ok, Err };
+
+[extern("globalThis.__mark")]
+external fun mark(tag: str): void;
+
+[extern("globalThis.__record")]
+external fun record(tag: str, value: i32): void;
+
+fun main() {
+	mark("@@TAG@@:main");
+	match connect_socket("ws://127.0.0.1:1/") {
+		Err(let _reason) => mark("@@TAG@@:dial-failed"),
+		Ok(let socket) => {
+			// Outside the mount, so the swap's teardown cannot dispose it: the
+			// old duplex's state is still observable after the bundle is gone.
+			let _states = socket.state.on_change(|state| mark(i"@@TAG@@:state:{state.debug()}"));
+			let client = ReactiveClient::new(bridge(socket), json_codec());
+			let first: RemoteSource<i32> = client.source(7);
+			let second: RemoteSource<i32> = client.source(8);
+			let _root = mount_root("app", || {
+				first.effect(|value| record("@@TAG@@:first", value.unwrap_or(0 - 1)));
+				second.effect(|value| record("@@TAG@@:second", value.unwrap_or(0 - 1)));
+				view("div")
+			});
+			mark("@@TAG@@:ready");
+		},
+	}
+}
+"#;
+
+fn socket_client_source(tag: &str) -> String {
+    SOCKET_CLIENT.replace("@@TAG@@", tag)
+}
+
+/// The A96 harness: the swap protocol driven against a WebSocket stub that
+/// answers a `Subscribe` with an `Update` and REFUSES to transmit on a socket
+/// that is not OPEN — which is the browser's own behaviour, where such a send
+/// is the console error "WebSocket is already in CLOSING or CLOSED state" and
+/// the frame never leaves. The stub records each one instead of printing it, so
+/// the errors A96 was filed for are assertable here.
+///
+/// A real server is not needed and would not help: what is under test is what
+/// the CLIENT does to its own socket between the teardown and the new bundle's
+/// dial, and a stub is the only way to see a frame that a browser would drop.
+const SOCKET_HARNESS: &str = r#"import fs from "node:fs";
+
+class StubElement {
+    constructor(tag) {
+        this.tagName = tag;
+        this.children = [];
+        this.parent = null;
+        this.listeners = {};
+        this._text = "";
+        this.attributes = {};
+        this.style = { setProperty: () => {} };
+        this.hidden = false;
+    }
+    set textContent(text) { this._text = text; this.children = []; }
+    get textContent() { return this._text; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    appendChild(child) {
+        if (child.parent) child.parent.children = child.parent.children.filter((c) => c !== child);
+        child.parent = this;
+        this.children.push(child);
+    }
+    remove() {
+        if (this.parent) {
+            this.parent.children = this.parent.children.filter((c) => c !== this);
+            this.parent = null;
+        }
+    }
+    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
+    addEventListener(event, handler) {
+        (this.listeners[event] = this.listeners[event] || []).push(handler);
+    }
+}
+
+const appRoot = new StubElement("div");
+globalThis.window = globalThis; // window === globalThis, as in a browser
+globalThis.document = {
+    createElement: (tag) => new StubElement(tag),
+    getElementById: (id) => (id === "app" ? appRoot : null),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+};
+globalThis.location = { reload: () => { globalThis.__reloaded = true; } };
+globalThis.Blob = class {
+    constructor(parts) { this.__text = parts.join(""); }
+};
+URL.createObjectURL = (blob) =>
+    "data:text/javascript;base64," + Buffer.from(blob.__text).toString("base64");
+URL.revokeObjectURL = () => {};
+
+// The socket spy. `readyState` follows the browser's ladder (0 CONNECTING,
+// 1 OPEN, 2 CLOSING, 3 CLOSED) because the whole defect lives in the window
+// between 2 and 3: `close()` is synchronous, `onclose` is not.
+const sockets = [];
+const lateTransmits = [];
+let announced = 0;
+
+class StubSocket {
+    constructor(url, protocols) {
+        this.url = url;
+        this.protocols = protocols;
+        this.readyState = 0;
+        this.sent = [];
+        this.index = sockets.length;
+        sockets.push(this);
+        queueMicrotask(() => {
+            this.readyState = 1;
+            announced += 1;
+            // The server's connection announcement — what resolves the dial.
+            if (this.onmessage) this.onmessage({ data: "__conn:" + announced });
+        });
+    }
+    send(payload) {
+        const frame = String(payload);
+        if (this.readyState !== 1) {
+            lateTransmits.push({ socket: this.index, readyState: this.readyState, frame });
+            return;
+        }
+        this.sent.push(frame);
+        if (!frame.startsWith("d:")) return;
+        const subscribe = /^\{"Subscribe":\[(\d+),null\]\}$/.exec(frame.slice(2));
+        if (!subscribe) return;
+        // The reactive server's seeding answer: channel N holds N * 100.
+        const channel = Number(subscribe[1]);
+        queueMicrotask(() => {
+            if (this.readyState === 1 && this.onmessage) {
+                this.onmessage({ data: 'd:{"Update":[' + channel + "," + channel * 100 + "]}" });
+            }
+        });
+    }
+    close() {
+        if (this.readyState === 3) return;
+        this.readyState = 2;
+        queueMicrotask(() => {
+            this.readyState = 3;
+            if (this.onclose) this.onclose();
+        });
+    }
+}
+globalThis.WebSocket = StubSocket;
+
+const marks = {};
+const records = {};
+globalThis.__mark = (tag) => { marks[tag] = (marks[tag] || 0) + 1; };
+globalThis.__record = (tag, value) => { records[tag] = value; };
+
+let failures = 0;
+function check(condition, message) {
+    if (condition) { console.log("ok   - " + message); }
+    else { failures += 1; console.error("FAIL - " + message); }
+}
+async function settle(ticks = 10) {
+    for (let index = 0; index < ticks; index++) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+}
+
+await import("./bundleA.mjs");
+await settle();
+
+check(sockets.length === 1, "A: one socket dialed");
+check(marks["A:ready"] === 1, "A: the app dialed, mounted and reached ready");
+check(records["A:first"] === 700, "A: the first mirror seeded from the server");
+check(records["A:second"] === 800, "A: the second mirror seeded from the server");
+check(lateTransmits.length === 0, "A: nothing transmitted on a socket that was not OPEN");
+
+const bundleB = fs.readFileSync(new URL("./bundleB.js", import.meta.url), "utf8");
+globalThis.fetch = () => Promise.resolve({ text: () => Promise.resolve(bundleB) });
+
+const hmr = globalThis.window.__VILAN_HMR__;
+await hmr.handleEvent({ kind: "connected", version: hmr.version + 1 });
+await settle();
+
+// (a) The console errors themselves: one per remote source, on the socket the
+// teardown had already put into CLOSING.
+check(lateTransmits.length === 0, "swap: no transmit on a socket that is not OPEN");
+// (b) The old duplex is closed for good, so `onclose` finds a state that stops
+// it: no rejection wave, no redial.
+check(marks["A:state:Closed"] === 1, "swap: the old duplex reached Closed");
+check(marks["A:state:Reconnecting"] === undefined, "swap: the old duplex never went Reconnecting");
+// The dial counter: bundle B's dial and nothing else.
+check(sockets.length === 2, "swap: exactly one fresh dial (the new bundle's)");
+// (c) One connection left standing, not the zombie pair.
+check(
+    sockets.filter((socket) => socket.readyState === 1).length === 1,
+    "swap: one live connection after the swap settled",
+);
+// (d) And the new bundle's mirror is live on it (the K6 resync path).
+check(records["B:first"] === 700, "swap: the new bundle's mirror resynced");
+check(records["B:second"] === 800, "swap: the new bundle's second mirror resynced");
+check(!globalThis.__reloaded, "swap: completed without a fallback reload");
+
+if (failures > 0) {
+    console.error("late transmits: " + JSON.stringify(lateTransmits));
+    console.error("marks: " + JSON.stringify(marks));
+    console.error("records: " + JSON.stringify(records));
+    console.error(
+        "sockets: " +
+            JSON.stringify(
+                sockets.map((socket) => ({
+                    index: socket.index,
+                    readyState: socket.readyState,
+                    sent: socket.sent,
+                })),
+            ),
+    );
+}
+process.exit(failures === 0 ? 0 : 1);
+"#;
+
+/// A96: the swap must not talk to the socket it just closed, and must not leave
+/// the dead bundle's duplex redialing beside the new one's.
+///
+/// The teardown list runs in REGISTRATION order and the duplex registers at
+/// DIAL, before the mount that owns the mirrors — so a teardown that only
+/// called `socket.close()` left the duplex reading `Connected` while the
+/// browser socket was CLOSING, and every lease released by the mount teardown
+/// that followed sent its `Unsubscribe` straight through `send`'s state guard
+/// into a `transmit` the browser answers with a console error. Then `onclose`
+/// found `Connected` too: rejection wave, backoff redial, and the old bundle's
+/// connection alive for the rest of the session. `close_for_good` writes
+/// `Closed` first, which makes both halves stop at a guard they already had.
+///
+/// Driven under the same node/DOM stub as the carry matrix above, plus a
+/// WebSocket stub that records a send on a non-OPEN socket rather than printing
+/// it — the browser's console error, made assertable.
+#[test]
+fn a_swap_closes_the_old_duplex_instead_of_talking_to_a_closing_socket() {
+    let dir = temp_project("duplex");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"swapapp\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &socket_client_source("A"));
+    write(&dir, "src/server.vl", SERVER);
+    write(&dir, "harness.mjs", SOCKET_HARNESS);
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let stdout = watcher.stdout.take().unwrap();
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    });
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let port = wait_for_port(&lines, support::WATCH_LIVENESS)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+
+        // Round 1 is over once `dist/` has landed AND the server leg printed its
+        // boot line — the same event pair (and the same budget derivation) the
+        // carry matrix waits on.
+        let round_one_started = Instant::now();
+        assert!(
+            wait_for_file(&dir.join("dist/client.js"), support::WATCH_LIVENESS),
+            "round 1 should have written dist/client.js"
+        );
+        assert!(
+            wait_for_line(&lines, "server up", support::WATCH_LIVENESS),
+            "round 1 should have booted the server leg"
+        );
+        let round_one = round_one_started.elapsed();
+        let budget = support::round_budget(round_one);
+        let token = dev_token(&dir, "client", support::WATCH_LIVENESS);
+
+        let bundle_a = http_get(port, "/bundle/client.js", &token, budget)
+            .expect("the dev channel should serve bundle A whole");
+        assert!(
+            String::from_utf8_lossy(&bundle_a).contains("__hmr_register_teardown"),
+            "bundle A should carry the shim's teardown registry"
+        );
+        std::fs::write(dir.join("bundleA.mjs"), &bundle_a).unwrap();
+
+        write(&dir, "src/client.vl", &socket_client_source("B"));
+        let start = Instant::now();
+        let bundle_b = loop {
+            if let Some(current) = http_get(port, "/bundle/client.js", &token, budget)
+                && current != bundle_a
+                && current.contains(&b'{')
+            {
+                break current;
+            }
+            assert!(
+                start.elapsed() < budget,
+                "the edited client should rebuild into a new bundle within {budget:?} \
+                 (round 1 itself took {round_one:?})"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        std::fs::write(dir.join("bundleB.js"), &bundle_b).unwrap();
+
+        let run = Command::new("node")
+            .arg("harness.mjs")
+            .current_dir(&dir)
+            .output()
+            .expect("run node harness");
+        assert!(
+            run.status.success(),
+            "duplex teardown harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
         );
     }));
 
