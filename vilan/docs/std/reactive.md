@@ -117,6 +117,14 @@ leaves `count` a `SignalCell<i32>`, `update` and all. Checked wide, kept narrow.
   drain affinity, and dedup behave identically. A read from *inside* the
   closure sees the in-progress value; a re-entrant `update` of the same
   signal is unsupported.
+- What the closure receives is a `&mut` **subject**, not a binding, and a
+  pattern binder under it is a binding like any other: `Some(mut list)`
+  takes rule 1's copy (spec §6.1), so growing `list` grows the copy and
+  the cell keeps the value it had. **Write back through the subject** —
+  `held = Some(list)` — or move the payload out and put one back with
+  `Option::take`/`replace`. Only a `SignalCell` whose value is a *wrapped*
+  collection meets this; `update` on the collection itself mutates the
+  storage directly, as the example above does.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Owner, batch };
@@ -133,6 +141,40 @@ fun main() {
 		todos.update(|&mut list| { list.push("ship it"); });
 		todos.update(|&mut list| { list.push("rest"); });
 	});                                                        // 3
+}
+```
+
+The write-back, both spellings, on a cell whose value is a wrapped list:
+
+```vilan
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+
+fun main() {
+	let held: SignalCell<Option<List<str>>> = Signal::new(Some([]));
+
+	// Through the `&mut` subject: the binder's copy is put back.
+	held.update(|&mut held| {
+		match held {
+			Some(mut list) => {
+				list.push("one");
+				held = Some(list);
+			}
+			None => {}
+		}
+	});
+
+	// Or move the payload out and put one back.
+	held.update(|&mut held| {
+		mut list = held.take().unwrap_or([]);
+		list.push("two");
+		held.replace(list);
+	});
+
+	match held.get() {
+		Some(let list) => print(i"{list.len()}"),   // 2
+		None => print("none"),
+	}
 }
 ```
 - `map`'s result is a live derived signal, and its internal subscription is
