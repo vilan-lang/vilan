@@ -4241,6 +4241,39 @@ pub struct Analyzer<'src> {
     // stands even where a body could be read either way. Populated after `build()`
     // once the container method ids resolve; empty when no container is loaded.
     bumps_tabled: HashSet<Id>,
+    // B318 §1.1 — the visibility sets, filled by the walk beside the scope map
+    // `resolve_import` writes into. "Is `id` visible to file `f`" is then a set
+    // lookup plus, for a narrowed export, one path test.
+    //
+    // Deliberately three sets rather than a field on `Function`/`Struct`/`Enum`/
+    // `Trait`: those are read by the solver and the transformer on hot paths,
+    // and visibility is a property of a NAME IN A MODULE rather than of a
+    // definition.
+    //
+    // Items whose declaration carried `export` (an `impl` block included — an
+    // impl a consumer cannot see contributes no methods to that consumer,
+    // RULED).
+    exported_entities: HashSet<Id>,
+    // Module BODY SCOPES carrying `export *;`. The scope rather than the file,
+    // so an inline `mod m { export *; }` exports `m`'s items and not the whole
+    // file around it.
+    export_all_modules: HashSet<Id>,
+    // The `(in PATH)` narrowings, by declaration id. A narrowing beats
+    // `export *;`, which is what makes `export(in mod)` the way to hold one item
+    // back under a module-wide export.
+    export_scopes: HashMap<Id, Vec<&'src str>>,
+    // Module body scopes that carry ANY export marker — an `export *;` or one
+    // `export`-marked item. The rollout's tooling half (§8): until a module
+    // writes its first marker it has not been curated, so every name it declares
+    // answers "exported" to completion, the add-import quickfix and the B4
+    // steer, and the tooling is exactly what it was before the bit existed.
+    //
+    // It gates the TOOLING and deliberately not the plain-reach WARNING, and the
+    // two are the two halves of one rollout: the warning is what tells an author
+    // to curate (294 of them across the estate at release N, §6), and the
+    // exemption is what stops the compiler punishing them for not having done it
+    // yet. Both go when the reach becomes an error at N+1.
+    curated_modules: HashSet<Id>,
 }
 
 static EMPTY_SPAN: Span = Span { start: 0, end: 0 };
@@ -4265,6 +4298,47 @@ pub struct Importable<'src> {
     /// holds the block, so a module's own row is exactly what its own file
     /// offers.
     pub statics: Vec<&'src str>,
+    /// B318 §1.1: what the declaration's `export` marker says about who may see
+    /// this name — the one bit the whole visibility feature adds to this row.
+    ///
+    /// It lives HERE, on the importable row, rather than on `Function`/`Struct`/
+    /// `Enum`/`Trait`: those structs are read by the solver and the transformer
+    /// on hot paths, and visibility is a property of a NAME IN A MODULE, not of
+    /// a definition — the same definition is public through one module's
+    /// re-export and private in the module that declares it. Keeping it on the
+    /// row is what lets `module_importables` answer the question from a PARSE,
+    /// with no analyzer at all, which is what keeps the three tooling consumers
+    /// cheap.
+    pub exported: Visibility<'src>,
+}
+
+/// What a top-level declaration's `export` marker says about who may see it
+/// (B318 §1). Visibility never gates ACCESS — a reach is spelled — so this is
+/// read by completion, the add-import quickfix, the "import it first" steer and
+/// the two warnings, and by nothing in resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Visibility<'src> {
+    /// Unmarked. The item is the module's own machinery: never offered by
+    /// completion, never a quickfix candidate, never steered toward, and a
+    /// PLAIN import of it from another file of the same package warns.
+    Private,
+    /// `export`, or covered by the module's `export *;`.
+    Exported,
+    /// `export(in PATH)` — published into the scope subtree `PATH` roots, and
+    /// private outside it. `mod` and `pkg` are the reserved heads.
+    Scoped(Vec<&'src str>),
+}
+
+impl Visibility<'_> {
+    /// Whether the marker publishes AT ALL — the question the three tooling
+    /// consumers ask, none of which has an importing file to test a narrowing
+    /// against (a completion list is offered before the import exists). A
+    /// narrowed export counts: offering it and letting the reach warning
+    /// correct an out-of-scope use is better than hiding a name the author of
+    /// the module deliberately published.
+    pub fn is_exported(&self) -> bool {
+        !matches!(self, Visibility::Private)
+    }
 }
 
 /// What an [`Importable`] names.
@@ -4338,8 +4412,49 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
     })
 }
 
+/// The `export` marker on a top-level item, and the item under it (B318 §1.1).
+///
+/// `unwrap_item` is the sibling that answers only the second half; it stays as
+/// it is, because every other reader of a top-level item wants the declaration
+/// and not the marker. This one is `collect_importables`' own, and it is the
+/// change that stops the marker being DISCARDED: before B318 the wrapper was
+/// stripped along with derive/service/macro-attribute, so `export fun f` and
+/// `fun f` produced byte-identical importable rows and one package's author
+/// (`macro_std`, which marks 26 of its 31 declarations) had their intent thrown
+/// away by the compiler.
+fn item_visibility<'a, 'src>(item: &'a Spanned<Node<'src>>) -> (Visibility<'src>, &'a Node<'src>) {
+    let mut visibility = Visibility::Private;
+    let mut node = &item.0;
+    loop {
+        match node {
+            Node::Export(scope, inner) => {
+                visibility = match scope {
+                    Some(scope) => {
+                        Visibility::Scoped(scope.path.iter().map(|(segment, _)| *segment).collect())
+                    }
+                    None => Visibility::Exported,
+                };
+                node = &inner.0;
+            }
+            Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner) => node = &inner.0,
+            _ => return (visibility, node),
+        }
+    }
+}
+
 fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
+    // B318 §2.1: `export *;` sets the bit on every item of the module. An item
+    // carrying its OWN `(in PATH)` keeps that narrowing — which is exactly what
+    // `export(in mod)` is for: one item held back under a module-wide export.
+    let export_all = items.iter().any(|item| matches!(item.0, Node::ExportAll));
     for item in items {
+        let (marked, item_node) = item_visibility(item);
+        let visibility = match marked {
+            Visibility::Private if export_all => Visibility::Exported,
+            marked => marked,
+        };
         if let Node::Export(_, inner) = &item.0
             && let Node::Import(branch) | Node::Use(branch) = &inner.0
         {
@@ -4364,11 +4479,12 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
                     kind: ImportableKind::Reexport,
                     variants: Vec::new(),
                     statics: Vec::new(),
+                    exported: visibility.clone(),
                 });
             }
             continue;
         }
-        let (name, kind, variants) = match unwrap_item(item) {
+        let (name, kind, variants) = match item_node {
             Node::Func(function) => (function.name.0, ImportableKind::Function, Vec::new()),
             Node::MacroFun(function) => (function.name.0, ImportableKind::Macro, Vec::new()),
             Node::Struct(name, ..) => (name.0, ImportableKind::Struct, Vec::new()),
@@ -4387,6 +4503,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             kind,
             variants,
             statics: Vec::new(),
+            exported: visibility,
         });
     }
     // B317, in a second pass because an `impl` block may be written above the
@@ -5049,6 +5166,10 @@ impl<'src> Analyzer<'src> {
             promise_struct_id: None,
             task_struct_id: None,
             bumps_tabled: HashSet::default(),
+            exported_entities: HashSet::default(),
+            export_all_modules: HashSet::default(),
+            export_scopes: HashMap::default(),
+            curated_modules: HashSet::default(),
         }
     }
 
@@ -26711,6 +26832,8 @@ impl<'src> Analyzer<'src> {
             // it takes the same module-level refusal `export` takes, for the same
             // reason.
             Node::ExportAll => {
+                self.export_all_modules.insert(scope_id);
+                self.curated_modules.insert(scope_id);
                 if !self.module_scope_ids.contains(&scope_id) {
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
@@ -26722,7 +26845,7 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Void)
             }
-            Node::Export(_, inner) => {
+            Node::Export(export_scope, inner) => {
                 // Exports shape a module's public surface, so they only mean
                 // something at a module's top level. A block-scoped `import`
                 // (H2) is deliberately not exportable — and any other `export`
@@ -26736,7 +26859,23 @@ impl<'src> Analyzer<'src> {
                             .to_string(),
                     });
                 }
-                self.walk_expr_node(inner, scope_id);
+                let declaration_id = self.walk_expr_node(inner, scope_id);
+                // B318 §1.1: the marker is RECORDED now, where it used to be
+                // discarded. An `export import` records too — the re-export is
+                // an act of publication by a module that can see the item, which
+                // is `prelude.md` §8's "extend by re-export" one level down.
+                self.exported_entities.insert(declaration_id);
+                self.curated_modules.insert(scope_id);
+                if let Some(export_scope) = export_scope {
+                    self.export_scopes.insert(
+                        declaration_id,
+                        export_scope
+                            .path
+                            .iter()
+                            .map(|(segment, _)| *segment)
+                            .collect(),
+                    );
+                }
                 Some(Expr::Void)
             }
             // `[derive(..)]` is transparent: walk the wrapped item; the synthesized
@@ -38830,6 +38969,13 @@ impl<'src> Analyzer<'src> {
             if self.source_of_id(entity) != self.source_of_id(module.id) {
                 continue;
             }
+            // B318 §1: visibility gates the STEER. A module's private machinery
+            // is not something to be pointed at — the author of the module said
+            // it is theirs, and an author who needs it anyway writes the reach
+            // deliberately rather than being talked into it by a compiler note.
+            if !self.is_exported_in(entity, module.body.1) {
+                continue;
+            }
             let is_std = std_members.contains(&module.id);
             match &hit {
                 None => hit = Some((module.name, is_std)),
@@ -38847,6 +38993,22 @@ impl<'src> Analyzer<'src> {
         Some(format!(
             "; import it first (`import std::{module}::{name};`)"
         ))
+    }
+
+    /// Whether `entity`, declared at the top level of the module whose body
+    /// scope is `module_scope`, carries the export bit (B318 §1.1).
+    ///
+    /// Two sets and no path test: this is the question the three TOOLING
+    /// consumers ask — completion, the add-import quickfix and the B4 "import it
+    /// first" steer — none of which has an importing file to test a `(in PATH)`
+    /// narrowing against, because the list is offered before the import exists.
+    /// A narrowed export counts as exported here on purpose: offering a name its
+    /// module deliberately published, and letting the reach warning correct an
+    /// out-of-scope use, is better than hiding it.
+    fn is_exported_in(&self, entity: Id, module_scope: Id) -> bool {
+        self.exported_entities.contains(&entity)
+            || self.export_all_modules.contains(&module_scope)
+            || !self.curated_modules.contains(&module_scope)
     }
 
     /// The short name of a lift container, for region diagnostics — `Option`,
@@ -50592,6 +50754,22 @@ pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<
 /// whole process, and an editor query for a module the user is editing sees the
 /// unsaved buffer. A file that cannot be read answers empty — an editor query
 /// must degrade, never fail.
+/// Whether a module whose rows are `importables` has been CURATED — whether it
+/// carries any `export` marker at all (B318 §8, the rollout's tooling half).
+///
+/// An UNCURATED module offers every name it declares, exactly as it did before
+/// the bit existed: on the day the marker gains meaning, no module in the estate
+/// has written one, and hiding every name in std from completion and from the
+/// add-import quickfix is not a migration, it is an outage. The plain-reach
+/// WARNING is what tells an author to curate; this is what stops the tooling
+/// punishing them for not having done it yet. Both go at the N+1 escalation.
+///
+/// Read off the ROWS rather than off a marker list, so it costs nothing extra:
+/// `export *;` marks every row, so "any row is exported" answers both forms.
+pub fn module_is_curated(importables: &[Importable<'_>]) -> bool {
+    importables.iter().any(|row| row.exported.is_exported())
+}
+
 pub fn module_importables(path: &Path) -> Vec<Importable<'static>> {
     let mut importables = Vec::new();
     if let Some(loaded) = load_package_module(path) {

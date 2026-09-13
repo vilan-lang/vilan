@@ -5053,12 +5053,18 @@ impl Document {
             let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
                 continue;
             };
-            if let Some(surface_path) = &surface
-                && vilan_core::analyzer::module_importables(surface_path)
-                    .iter()
-                    .any(|importable| importable.name == name)
-            {
-                candidates.push(vec![origin.clone()]);
+            if let Some(surface_path) = &surface {
+                let importables = vilan_core::analyzer::module_importables(surface_path);
+                // B318 §1: a PRIVATE item is never a quickfix candidate — the
+                // add-import menu is one of the three things the bit gates. An
+                // uncurated module (no marker anywhere) offers everything, which
+                // is what keeps the menu unchanged until a module opts in.
+                let curated = vilan_core::analyzer::module_is_curated(&importables);
+                if importables.iter().any(|importable| {
+                    importable.name == name && (!curated || importable.exported.is_exported())
+                }) {
+                    candidates.push(vec![origin.clone()]);
+                }
             }
             let mut seen_modules: HashSet<String> = HashSet::new();
             for root in &module_roots {
@@ -5075,13 +5081,13 @@ impl Document {
                     // re-exports, at which point `view` started offering both
                     // `std::ui` and `std::web` and the menu went ambiguous.
                     // Nobody should ever be told to `import std::web::view`.
-                    if vilan_core::analyzer::module_importables(&module_path)
-                        .iter()
-                        .any(|importable| {
-                            importable.name == name
-                                && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
-                        })
-                    {
+                    let importables = vilan_core::analyzer::module_importables(&module_path);
+                    let curated = vilan_core::analyzer::module_is_curated(&importables);
+                    if importables.iter().any(|importable| {
+                        importable.name == name
+                            && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
+                            && (!curated || importable.exported.is_exported())
+                    }) {
                         candidates.push(vec![origin.clone(), module_name]);
                     }
                 }
@@ -6912,6 +6918,81 @@ pub(crate) mod tests {
             reanalyzed.diagnostics.is_empty(),
             "applying the fix should leave the file clean: {:#?}",
             reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B318 §1/§7.1: a PRIVATE item is never an add-import CANDIDATE. The
+    // quickfix menu is one of the three things the bit gates, and it is the one
+    // that would otherwise teach a reader to import a module's own machinery.
+    // An UNCURATED module (no marker anywhere) offers everything, which is what
+    // keeps the menu unchanged until a module opts in (§8).
+    #[test]
+    fn quickfix_never_offers_an_add_import_for_a_private_item() {
+        let curated = "export fun shown() {}\n\nfun help_topic() {}\n";
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", curated),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            !titles.iter().any(|title| title.contains("help_topic")),
+            "a private item is not a candidate: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The exported sibling still is — the filter is the BIT, not a deleted
+        // menu.
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\tshown();\n}\n"),
+            ("topic.vl", curated),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            titles.iter().any(|title| title.contains("pkg::topic")),
+            "an exported item is still a candidate: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // And an uncurated module is exactly what it was before the bit.
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            titles.iter().any(|title| title.contains("pkg::topic")),
+            "an uncurated module offers everything: {titles:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

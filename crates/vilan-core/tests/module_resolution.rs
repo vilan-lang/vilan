@@ -4997,3 +4997,161 @@ fn b318_export_all_is_a_module_level_item_like_every_other_export() {
         "`export *;` at the top level is an item"
     );
 }
+
+/// Writes `files` into a fresh temp directory and hands back the path of
+/// `module` inside it, for the parse-only importable queries. The caller
+/// removes the directory.
+fn write_module_tree(files: &[(&str, &str)]) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_vis_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn b318_the_export_bit_round_trips_through_module_importables() {
+    use vilan_core::analyzer::{Visibility, module_importables, module_is_curated};
+
+    // The marker used to be DISCARDED: `unwrap_item` stripped `Node::Export`
+    // along with derive/service/macro-attribute, so `export fun f` and `fun f`
+    // produced byte-identical rows. The bit is the whole of what S1 adds.
+    let dir = write_module_tree(&[(
+        "curated.vl",
+        "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n\n         export(in mod) fun narrowed(): i32 { 3 }\n",
+    )]);
+    let rows = module_importables(&dir.join("curated.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("shown"), Visibility::Exported);
+    assert_eq!(named("hidden"), Visibility::Private);
+    assert_eq!(named("narrowed"), Visibility::Scoped(vec!["mod"]));
+    assert!(
+        module_is_curated(&rows),
+        "a marker anywhere curates the module"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `export *;` sets the bit on every item — and an item carrying its OWN
+    // narrowing keeps it, which is exactly what `export(in mod)` is for.
+    let dir = write_module_tree(&[(
+        "wide.vl",
+        "export *;\n\nfun a(): i32 { 1 }\n\nexport(in mod) fun b(): i32 { 2 }\n",
+    )]);
+    let rows = module_importables(&dir.join("wide.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("a"), Visibility::Exported);
+    assert_eq!(named("b"), Visibility::Scoped(vec!["mod"]));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // An UNCURATED module is not curated, and the three tooling consumers read
+    // that as "offers everything" (§8, the rollout's tooling half).
+    let dir = write_module_tree(&[("plain.vl", "fun a(): i32 { 1 }\n")]);
+    let rows = module_importables(&dir.join("plain.vl"));
+    assert_eq!(rows[0].exported, Visibility::Private);
+    assert!(!module_is_curated(&rows));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `export import` publishes: a re-export is an act of publication by a
+    // module that can see the item (§10 n).
+    let dir = write_module_tree(&[("surface.vl", "export import pkg::a::helper;\n")]);
+    let rows = module_importables(&dir.join("surface.vl"));
+    assert_eq!(rows[0].name, "helper");
+    assert_eq!(rows[0].exported, Visibility::Exported);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn b318_an_unexported_item_still_imports() {
+    // Visibility NEVER gates ACCESS (§1): `resolve_import` binds what the path
+    // names, exported or not. The release-N posture is a WARNING, and the
+    // program compiles.
+    let files = &[
+        (
+            "a.vl",
+            "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an unexported item still imports: {errors:#?}"
+    );
+}
+
+#[test]
+fn b318_the_import_steer_skips_a_private_item_of_a_curated_module() {
+    // §1: the bit gates the B4 "import it first" steer. A module's private
+    // machinery is not something to point at — the author said it is theirs,
+    // and an author who needs it anyway writes the reach deliberately rather
+    // than being talked into it by a compiler note.
+    //
+    // The module has to be LOADED for the steer to see it at all, so every leg
+    // imports one name from it and then reaches for a second.
+    const CURATED: &str = "export fun shown(): i32 { 1 }\n\n                           export fun other(): i32 { 3 }\n\n                           fun hidden(): i32 { 2 }\n";
+    let steers = |module: &'static str, reached: &str| -> Vec<String> {
+        let entry =
+            format!("import pkg::a::shown;\n\nfun main() {{ let _ = shown() + {reached}(); }}\n");
+        let entry: &'static str = Box::leak(entry.into_boxed_str());
+        analyze_package(
+            &[("a.vl", module), ("main.vl", entry)],
+            "main.vl",
+            Platform::default(),
+        )
+    };
+
+    let private = steers(CURATED, "hidden");
+    assert!(
+        private
+            .iter()
+            .any(|error| error.contains("cannot find 'hidden'")),
+        "the name still does not resolve: {private:#?}"
+    );
+    assert!(
+        !private
+            .iter()
+            .any(|error| error.contains("import it first")),
+        "a private item is not steered toward: {private:#?}"
+    );
+    // The exported sibling still steers, which is what says the filter is the
+    // BIT and not a deleted steer.
+    let exported = steers(CURATED, "other");
+    assert!(
+        exported
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::a::other;`)")),
+        "an exported item still steers: {exported:#?}"
+    );
+    // And an UNCURATED module steers for everything, exactly as before the bit
+    // existed (§8, the rollout's tooling half).
+    let uncurated = steers(
+        "fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        "hidden",
+    );
+    assert!(
+        uncurated
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::a::hidden;`)")),
+        "an uncurated module offers everything: {uncurated:#?}"
+    );
+}
