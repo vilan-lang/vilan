@@ -467,6 +467,61 @@ impl<'src> Lexer<'src> {
         StringScan::Complete(Token::String(content), position + 1)
     }
 
+    /// A string literal written with its quotes ESCAPED — `\"k\"` — which is legal
+    /// in ONE place: inside an interpolation hole (B278). `start` is the `\` of the
+    /// opening `\"`, and the literal closes at the next `\"`.
+    ///
+    /// The escaped spelling buys nothing the raw one does not — a hole is lexed
+    /// from the raw bytes, so `i"{get("k")}"` has always worked — but it is what an
+    /// author writes by habit, having escaped a quote inside a string everywhere
+    /// else, and the two now lex to the SAME token: the body is kept raw, exactly
+    /// as [`Lexer::read_string`] keeps it, and the escapes in it are interpreted at
+    /// code generation. `\\` still takes its pair, so a body may end in an escaped
+    /// backslash (`\"a\\\"` is `a\`) and a `\"` inside the body has no spelling —
+    /// the raw form (`"a\"b"`) is the one that carries an embedded quote.
+    fn read_escaped_quote_string(&self, start: usize) -> StringScan<'src> {
+        let content_start = start + 2;
+        let mut position = content_start;
+        loop {
+            match self.bytes.get(position) {
+                None => return StringScan::Unterminated,
+                // The ban, exactly as in the raw form: a `"…"` never spans lines.
+                Some(b'\n') | Some(b'\r') => {
+                    return StringScan::LineBreak {
+                        content: &self.source[content_start..position],
+                        at: position,
+                    };
+                }
+                Some(b'\\') => {
+                    let Some(escaped) = self.source[position + 1..].chars().next() else {
+                        return StringScan::Unterminated;
+                    };
+                    // The closing delimiter — the one `\X` this scan does not step
+                    // over.
+                    if escaped == '"' {
+                        break;
+                    }
+                    if escaped == '\n' || escaped == '\r' {
+                        return StringScan::LineBreak {
+                            content: &self.source[content_start..position],
+                            at: position + 1,
+                        };
+                    }
+                    position += 1 + escaped.len_utf8();
+                }
+                Some(_) => {
+                    let character = self.source[position..]
+                        .chars()
+                        .next()
+                        .expect("byte present implies a character");
+                    position += character.len_utf8();
+                }
+            }
+        }
+        let content = &self.source[content_start..position];
+        StringScan::Complete(Token::String(content), position + 2)
+    }
+
     // --- Interpolated strings ------------------------------------------------
 
     /// Desugar `i"…{expr}…"` in place into the token sequence for a parenthesised
@@ -809,6 +864,26 @@ impl<'src> Lexer<'src> {
                     Some(token) => inner.push(token),
                     None => break self.position,
                 },
+                // The same string, written with its quotes ESCAPED — `\"k\"` where
+                // `"k"` would also do (B278). The hole is lexed from the raw bytes
+                // and the enclosing literal's quotes never reach it, so the raw
+                // form always worked; the escaped form is what an author writes by
+                // habit, and it read as a stray `\` in no charset — a malformed
+                // hole, three diagnostics deep. Both forms lex to the same token.
+                Some(b'\\') if self.bytes.get(self.position + 1) == Some(&b'"') => {
+                    match self.lex_hole_token() {
+                        Some(token) => inner.push(token),
+                        // The unclosed case, and the one place the two spellings
+                        // differ: the opening delimiter is TWO bytes, so the hole
+                        // has to end at the quote rather than at the backslash for
+                        // the body scan to resume inside the literal's text — where
+                        // it meets the same break the raw form's scan meets, and
+                        // the enclosing i-string states the rule once. Ending at
+                        // the backslash resumes ON the quote, which reads as the
+                        // i-string's own closing one.
+                        None => break self.position + 1,
+                    }
+                }
                 Some(_) => match self.lex_hole_token() {
                     Some(token) => inner.push(token),
                     // A construct no hole token matches — a nested `{` (a block, a
@@ -883,8 +958,14 @@ impl<'src> Lexer<'src> {
     fn lex_hole_token(&mut self) -> Option<Spanned<Token<'src>>> {
         let start = self.position;
         let first = self.bytes[start];
-        let (token, end) = if first == b'"' {
-            match self.read_string(start) {
+        let escaped_quote = first == b'\\' && self.bytes.get(start + 1) == Some(&b'"');
+        let (token, end) = if first == b'"' || escaped_quote {
+            let scan = if escaped_quote {
+                self.read_escaped_quote_string(start)
+            } else {
+                self.read_string(start)
+            };
+            match scan {
                 StringScan::Complete(token, end) => (token, end),
                 // A string inside a hole that does not close — at end of input or
                 // at a line break — cannot be recovered locally; the hole is
@@ -1530,6 +1611,105 @@ mod tests {
                 Token::Ctrl(')'),
             ]
         );
+    }
+
+    #[test]
+    fn a_string_in_a_hole_lexes_the_same_raw_or_escaped() {
+        // B278. The hole is lexed from the raw bytes, so `"k"` in it has always
+        // been a string; `\"k\"` — the spelling an author writes by habit — was a
+        // stray `\` in no charset, and the hole was refused as malformed. Both
+        // spellings are ONE token now, and the same one.
+        let raw = lex(r#"i"{f("k")}""#);
+        let escaped = lex(r#"i"{f(\"k\")}""#);
+        assert_eq!(
+            raw,
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::String("k"),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+            ]
+        );
+        assert_eq!(escaped, raw);
+    }
+
+    #[test]
+    fn an_escaped_quote_string_in_a_hole_keeps_its_body_raw() {
+        // The body is kept raw exactly as `read_string` keeps it — the escapes in
+        // it are interpreted at code generation — and `\\` takes its pair, so the
+        // literal can end in an escaped backslash without eating its delimiter.
+        assert_eq!(
+            lex(r#"i"{f(\"a\nb\")}""#),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::String(r"a\nb"),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+            ]
+        );
+        assert_eq!(
+            lex(r#"i"{f(\"a\\\")}""#),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::String(r"a\\"),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_break_inside_an_escaped_quote_string_in_a_hole_reports_the_rule_once() {
+        // The escaped spelling takes the raw one's recovery with it: a literal in
+        // a hole that does not close ENDS the hole rather than refusing it, so the
+        // break the enclosing i-string holds is what states the rule
+        // (diagnostics-standard B5). Without the arm in `lex_hole` the hole ends
+        // at the BACKSLASH, the body scan resumes on the quote behind it and reads
+        // it as the i-string's own closing one — and the break is never reported
+        // at all.
+        let (_tokens, errors) = lex_rejecting("i\"a{f(\\\"x\ny\\\")}b\"");
+        assert_eq!(errors[0], line_break_error(0, 'i')[0], "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.rule != Some(HOLE_IS_NOT_AN_EXPRESSION)),
+            "the hole is not refused on top of the break: {errors:?}"
+        );
+        // What follows is the salvage's own noise and not a second statement of
+        // the rule: lexing resumes AT the break, so the second line's `\"` is a
+        // stray backslash at the top level, exactly as any `\` outside a string
+        // is. The raw spelling's second line happens to lex (`y")}b"` is a name
+        // and a string), which is the only reason its pin can read as one error.
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert_eq!(errors[1].character, '\\');
+    }
+
+    #[test]
+    fn a_backslash_that_is_not_a_quote_still_makes_a_hole_malformed() {
+        // Only `\"` is a hole token. A lone `\` is in no charset and the hole is
+        // still refused by name (B247's message), which is the control for B278:
+        // the fix opened one spelling, not the backslash.
+        let (_tokens, errors) = lex_rejecting(r#"i"{f(\k)}""#);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].rule, Some(HOLE_IS_NOT_AN_EXPRESSION));
     }
 
     // --- Interpolated triple-quoted strings (backlog H7) ---------------------

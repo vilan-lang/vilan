@@ -621,6 +621,15 @@ Bindings inside patterns are written explicitly (`Some(let x)`), so a
 bare name is always a **variant** reference, never a fresh binding: the
 classic mistyped-variant trap is a resolution error instead of a silent
 catch-all. `bool` and `null` literals match as variants of their enums.
+
+`let` and `mut` are the two binding forms here exactly as they are at a
+declaration (§3.4): `Some(let list)` binds immutably, `Some(mut list)`
+binds mutably, and `mut` at a tuple or array binder stamps every name
+under it. A binder is a **binding**, so it takes rule 1's copy like any
+other (§6.1): mutating `list` leaves the matched value alone, and an
+arm that means to change the subject assigns back through it. Writing
+both forms — `Some(let mut list)`, in either order — is refused, and the
+refusal names `Some(mut list)`.
 The `let`/parameter binder grammar (names and tuples, §3.3) is the
 irrefutable subset; refutable forms (literals, variants) are match-only.
 A tuple pattern is irrefutable only when its elements are: `(let a, let b)`

@@ -13596,6 +13596,49 @@ pub(crate) mod tests {
         );
     }
 
+    // B317: past a module, a STRUCT is a namespace too — the self-less
+    // functions the module's own `impl` blocks declare for it, which is exactly
+    // the set an import through this module can bind.
+    #[test]
+    fn import_descends_into_a_structs_statics() {
+        let labels = completions_at_cursor("import std::style::Length::|\nfun main() {}\n");
+        assert!(
+            labels.contains(&"rem".to_string()) && labels.contains(&"px".to_string()),
+            "a struct's statics are importable: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"css_text".to_string()),
+            "and a `self` method is not, having no bare-name binding: {labels:?}"
+        );
+    }
+
+    // B317's keying, in the editor: an EXTENSION impl's statics are offered
+    // through the module that writes the block, which is where an import
+    // reaches them — and the block's subject may be a name that module
+    // re-exports rather than declares.
+    #[test]
+    fn import_descends_into_an_extension_impls_statics() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::extra::Point::|\nfun main() {}\n"),
+            (
+                "shapes.vl",
+                "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+            ),
+            (
+                "extra.vl",
+                "export import pkg::shapes::Point;\n\nimpl Point {\n\tfun doubled(x: i32): Point {\n\t\tPoint { x = x * 2 }\n\t}\n}\n",
+            ),
+        ]);
+        assert!(
+            labels.contains(&"doubled".to_string()),
+            "the extending module offers the block it writes: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"origin".to_string()),
+            "and not the block another module writes: {labels:?}"
+        );
+    }
+
     // A module that does not resolve answers EMPTY. The request is on the
     // editor's critical path: it degrades, it never errors, and it never panics.
     #[test]

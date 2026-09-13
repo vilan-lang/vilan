@@ -1838,6 +1838,73 @@ fn let_mut_names_the_two_binding_forms() {
 }
 
 #[test]
+fn a_pattern_binder_names_the_two_binding_forms() {
+    // A80, and [`LET_MUT_IS_ONE_WORD`]'s twin inside a pattern: the declaration
+    // syntax is the pattern syntax, so `let` and `mut` are the two forms there
+    // too and writing both is neither. Its own steer, because the declaration's
+    // (`mut x = …`) names an initializer a pattern cannot carry.
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let mut list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "let mut",
+        "a pattern binds mutably with `mut x`",
+    );
+}
+
+#[test]
+fn a_pattern_binder_names_the_two_binding_forms_in_either_order() {
+    // `mut let` is the same mistake written the other way round, and it used to
+    // fail identically: the pattern backtracked and the payload's own `(` was
+    // reported as "found '(' expected '=>'".
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(mut let list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "mut let",
+        "a pattern binds mutably with `mut x`",
+    );
+}
+
+#[test]
+fn a_refused_pattern_binder_no_longer_reports_the_payload_paren() {
+    // The recovery is what makes it ONE diagnostic: the pair is consumed and the
+    // binder taken as mutable, so the arm still parses, the payload's `(` is
+    // never orphaned, and nothing cascades about a binding that cannot be
+    // mutated (diagnostics-standard B5).
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let mut list) => {
+                    list.push(9);
+                    print(list.len());
+                }
+                None => print(0),
+            }
+        }
+        "#,
+        "expected '=>'",
+    );
+}
+
+#[test]
 fn let_mut_no_longer_reports_the_let_as_a_non_statement() {
     assert_fails_without(
         r#"

@@ -152,7 +152,7 @@ row	flagship	key
 115	flagship	index {literal_index} is out of range for an array of length
 116	-	cannot index {} (only a `List` or `[T; n]` array is indexabl
 117	flagship	cannot find '{}' in this scope
-118	-	`use` requires a namespace (a module or an enum)
+118	-	`use` requires a namespace (a module, an enum or a struct)
 119	-	cannot find '{}' in the `use` path
 120	flagship	`{name}` is a type, not a value; construct it (`{name} { .`
 121	flagship	cannot find '{}' in this scope
@@ -462,3 +462,5 @@ row	flagship	key
 428	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
 429	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
 430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait
+431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{name}.vl` that is the module `{module_name}::{name}` — the declaration wins, so the file cannot be reached by any import; rename one of them
+432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported

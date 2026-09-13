@@ -4772,3 +4772,204 @@ fn a65_an_overlay_only_nested_module_resolves() {
         "an overlay-only nested module resolves: {errors:#?}"
     );
 }
+
+// --- A67: a declaration and a same-named file in the module's directory -------
+//
+// A65 gave `member_or_submodule` its order — a module's own items win over a
+// same-named file in its directory — so that ADDING a file could not re-point
+// an existing import. That is still the right winner, and it was still a silent
+// one: while `a.vl` declares `b`, `a/b.vl` cannot be reached by any import at
+// all, and a rename on either side changes what every `pkg::a::b` in the estate
+// means with nothing said. The collision is an ambiguity error now, which is
+// what the file-level twin (`a.vl` beside `a/lib.vl`) has been since A65 — one
+// rule for both collisions.
+
+#[test]
+fn a67_a_declaration_shadowing_a_directory_child_is_ambiguous() {
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b;\n\nfun main() { let _ = b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`b`") && refusal.contains("`a`") && refusal.contains("`b.vl`"),
+        "and names both halves: {refusal}"
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.contains("is ambiguous"))
+            .count(),
+        1,
+        "once, however many imports walk it: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_the_collision_is_reported_with_no_import_of_the_path() {
+    // The ambiguity is a fact about the TREE, not about one import: the file is
+    // unreachable whoever asks. `pkg::a` alone loads both halves, and the
+    // refusal names the pair without anything spelling `pkg::a::b`.
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b as taken;\n\nfun main() { let _ = taken(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("is ambiguous in module")),
+        "an aliased import walks the same collision: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_the_lib_control_stays_the_file_level_ambiguity_alone() {
+    // `a/lib.vl` is module `a`'s own BODY, never a child `a::lib`, so a
+    // declaration named `lib` collides with nothing. The tree is still
+    // degenerate and still refused — by the file-level rule, once
+    // (diagnostics-standard B5: one diagnostic per root cause).
+    let files = &[
+        ("a.vl", "fun lib(): i32 { 1 }\n"),
+        ("a/lib.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::lib;\n\nfun main() { let _ = lib(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("is ambiguous: both") && error.contains("a/lib.vl")),
+        "the file-level ambiguity still fires: {errors:#?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("is ambiguous in module")),
+        "and A67's rule does not fire on top of it: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_a_directory_child_with_no_colliding_declaration_still_resolves() {
+    // The control that says how narrow the rule is: the same two files with the
+    // declaration renamed resolve exactly as A65 left them.
+    let files = &[
+        ("a.vl", "fun surface(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an uncontested directory child resolves: {errors:#?}"
+    );
+}
+
+// --- B317: a type's statics across files -------------------------------------
+//
+// The two shapes a single-file pin cannot hold: the app prelude that RE-EXPORTS
+// a static under a bare name, and an EXTENSION impl, whose statics are reached
+// through the module that writes the block rather than through the module that
+// declares the type. Both fall out of one question — does this block's subject
+// name resolve, in this block's own scope, to the type the path walked to — and
+// the last pin is what that question buys: a module that writes no such block
+// offers nothing, however visible the type is inside it.
+
+#[test]
+fn b317_a_reexported_static_is_consumed_by_a_second_file() {
+    // The app-prelude shape the item was filed from: one module gathers the
+    // spellings an app wants bare, and every other file imports them from it.
+    let files = &[
+        (
+            "sugar.vl",
+            "import pkg::shapes::Point;\n\nexport import pkg::shapes::Point::origin as origin;\n",
+        ),
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::sugar::origin;\n\nfun main() { let _ = origin().x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a re-exported static is importable from the relay: {errors:#?}"
+    );
+}
+
+#[test]
+fn b317_an_extension_impls_static_imports_from_the_extending_module() {
+    // The block is written in `extra.vl`, whose own import is what makes
+    // `Point` resolve there — so `pkg::extra::Point::doubled` is the path, and
+    // the fixpoint over the import queue is what lets the second import wait
+    // for the first.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "extra.vl",
+            "import pkg::shapes::Point;\n\nimpl Point {\n\tfun doubled(x: i32): Point {\n\t\tPoint { x = x * 2 }\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::extra::Point::doubled;\n\nfun main() { let _ = doubled(2).x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an extension impl's static imports from the extending module: {errors:#?}"
+    );
+}
+
+#[test]
+fn b317_a_static_is_not_importable_through_a_module_that_writes_no_block() {
+    // The keying, stated as a refusal. `bare.vl` imports `Point` and writes no
+    // impl, so `pkg::bare::Point::doubled` names nothing — the statics belong
+    // to the modules whose files declare them, not to every module the type is
+    // visible in.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "bare.vl",
+            "import pkg::shapes::Point;\n\nfun anchor(): i32 { 1 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::bare::Point::origin;\n\nfun main() { let _ = origin().x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot find 'origin' in the imported path")),
+        "a module that writes no block offers no statics: {errors:#?}"
+    );
+}

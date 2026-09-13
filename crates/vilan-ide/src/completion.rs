@@ -2816,9 +2816,11 @@ fn origin_completions(roots: &ImportRoots) -> Vec<Completion> {
 /// the disk — `pkg::lib::ui::widget::` is the module `lib/ui/widget.vl` with
 /// nothing past it, while `pkg::lib::util::Tab::` is `lib/util.vl` with an enum
 /// past it. So the longest prefix that resolves is the module, exactly as the
-/// loader decides it, and what is left is the descent: an enum name descends
-/// into that enum's variants, which is the only descent `resolve_import` makes
-/// past a module; anything deeper offers nothing.
+/// loader decides it, and what is left is the descent: a TYPE name descends
+/// into that type's namespace — an enum's variants and, B317, the self-less
+/// functions this module's own `impl` blocks declare for it, which is the whole
+/// of what `resolve_import` descends into past a module; anything deeper offers
+/// nothing.
 ///
 /// A path that resolves to no module at all may still be a pure NAMESPACE — a
 /// directory with no `lib.vl` — and then the children are the whole answer,
@@ -2870,15 +2872,31 @@ fn module_member_completions(
             .iter()
             .find(|importable| {
                 importable.name == *name
-                    && importable.kind == vilan_core::analyzer::ImportableKind::Enum
+                    && (matches!(
+                        importable.kind,
+                        vilan_core::analyzer::ImportableKind::Enum
+                            | vilan_core::analyzer::ImportableKind::Struct
+                    ) || !importable.statics.is_empty())
             })
-            .map(|enumeration| {
-                enumeration
+            .map(|type_| {
+                // B317: a type's namespace, both halves of it — the variants an
+                // enum declares, and the self-less functions this module's own
+                // `impl` blocks declare for it, which is exactly the set an
+                // import through this module can bind. A row that is neither a
+                // struct nor an enum but CARRIES statics is an extension impl
+                // beside an `export import` of the type it extends: the name is
+                // re-exported here and the block is written here, so both are
+                // reachable through this module and this is where they are
+                // offered.
+                type_
                     .variants
                     .iter()
                     .map(|variant| {
                         Completion::bare(variant.to_string(), CompletionKind::EnumVariant)
                     })
+                    .chain(type_.statics.iter().map(|static_| {
+                        Completion::bare(static_.to_string(), CompletionKind::Function)
+                    }))
                     .collect()
             })
             .unwrap_or_default();
