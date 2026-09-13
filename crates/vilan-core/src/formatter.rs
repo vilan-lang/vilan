@@ -967,6 +967,14 @@ pub const STYLE_BREAKPOINT_WIDTHS: &[(&str, &str)] = &[
 /// an arbitrary right-hand `Style` exactly as `add` does, and its chain
 /// position is PRECEDENCE — two `when` links that set the same property resolve
 /// by which one comes last — so reordering it would change what renders.
+///
+/// `on` (A95) is the clearest case the category has: its condition is a VALUE
+/// in the argument list, so the axis the link belongs on is not in the name and
+/// the formatter would have to evaluate the call to find it. Sorting the
+/// condition values INSIDE an `on` head is a real job and a different one
+/// (style-conditions.md §2.6, slice 3) — this row says the LINK is a barrier
+/// until that lands, which is what keeps a chain around one from quietly
+/// reordering against a condition nobody can see.
 #[doc(hidden)]
 pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "rule",
@@ -975,6 +983,7 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "with_color",
     "with_border",
     "child_relation",
+    "on",
     "add",
     "when",
     "class_list",

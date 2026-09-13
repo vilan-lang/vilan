@@ -6967,3 +6967,240 @@ fn a_staged_contribution_survives_when_the_build_still_names_its_token() {
         .collect();
     assert_eq!(probe, vec!["the kept line"], "{assets:?}");
 }
+
+// --- A95 S1: conditions as values, behind the existing surface ---------------
+// A condition is a VALUE and a set of them is the same value; `Style::on` is
+// the one combinator and every named one is sugar over it. The slice's whole
+// acceptance is that nothing a program can see moves — so these pins are about
+// the MODEL: the canonical order, the merge, the refusals, and the two shapes
+// a nest could never spell.
+
+/// The rules a program's styles put on the sheet, `:root` token lines aside.
+fn style_rules(source: &str) -> Vec<String> {
+    collected_assets(source)
+        .into_iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line)
+        .collect()
+}
+
+const CONDITION_PROGRAM: &str = r#"
+    import std::style::{ style, Color, Style, hover, active, attribute, md, within, element, pseudo, children, divide, sm };
+    fun s(): Style {
+        {SET}
+    }
+    let _s = const s();
+    fun main() {}
+    main();
+"#;
+
+fn conditioned(set: &str) -> String {
+    CONDITION_PROGRAM.replace("{SET}", set)
+}
+
+#[test]
+fn a_condition_set_canonicalises_whatever_order_it_was_written_in() {
+    // The content hash is over the slot key, and the key carries the condition
+    // string — so two authors who mean one rule must get one class or the hash
+    // stops being a function of the meaning (§2.1). Written in three orders,
+    // one rule.
+    let written = style_rules(&conditioned(
+        r#"style().on(md() + attribute("data-open") + hover(), style().color(Color::gray(50)))"#,
+    ));
+    let reversed = style_rules(&conditioned(
+        r#"style().on(hover() + attribute("data-open") + md(), style().color(Color::gray(50)))"#,
+    ));
+    let mixed = style_rules(&conditioned(
+        r#"style().on(attribute("data-open") + md() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(written, reversed, "{written:?}");
+    assert_eq!(written, mixed, "{written:?}");
+    assert_eq!(
+        written,
+        vec![
+            "@media (min-width: 768px){.s1uwvpl4[data-open]:hover{color:var(--gray-50)}}"
+                .to_string()
+        ],
+        "{written:?}"
+    );
+}
+
+#[test]
+fn equal_conditions_in_one_set_merge() {
+    // Set semantics: `hover() + hover()` is `hover()`, and the class says so —
+    // it is the class the plain `hover()` rule mints.
+    let doubled = style_rules(&conditioned(
+        r#"style().on(hover() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    let once = style_rules(&conditioned(
+        r#"style().on(hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(doubled, once, "{doubled:?}");
+}
+
+#[test]
+fn nested_on_calls_intersect_their_condition_sets() {
+    // What makes nesting mean anything: `a.on(X, b.on(Y, s))` gives `s` the
+    // set `X ∪ Y`, so the nested spelling and the summed one are one rule.
+    let nested = style_rules(&conditioned(
+        r#"style().on(md(), style().on(hover(), style().color(Color::gray(50))))"#,
+    ));
+    let summed = style_rules(&conditioned(
+        r#"style().on(md() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(nested, summed, "{nested:?}");
+}
+
+#[test]
+fn two_pseudo_classes_on_one_rule_render_as_one_compound() {
+    // B311's whole class, spelled: two pseudo-classes are two VALUES, never a
+    // string carrying the slot key's own `:`. The negation sits on the value it
+    // negates, which is A95's argument in one line.
+    //
+    // The compound comes out `:not(:active):hover` and not the written order,
+    // which is §2.1 working: tokens sort lexically by their BARE token, so
+    // `active` precedes `hover` whichever way round they were written and two
+    // authors meaning one rule get one class. Compound-selector order is
+    // semantically free in CSS — same match set, same (0,3,0) specificity —
+    // so the canonical order costs nothing and buys the hash its determinism.
+    let rules = style_rules(&conditioned(
+        r#"style().on(hover() + active().not(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        rules,
+        vec![".sddio2v:not(:active):hover{color:var(--gray-50)}".to_string()],
+        "{rules:?}"
+    );
+    // …and the reverse spelling is the same rule, which is the claim.
+    let reversed = style_rules(&conditioned(
+        r#"style().on(active().not() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(reversed, rules, "{reversed:?}");
+}
+
+#[test]
+fn a_guard_and_a_child_relation_compose_in_one_set() {
+    // The relation axis could never spell `[data-theme="dark"] .sX > *` — a
+    // guard is a PREFIX and a child relation a SUFFIX, and a nest holds one
+    // relation. A rule carrying a child relation reaches IN, so it is layered
+    // whatever else conditions it (§2.5).
+    let rules = style_rules(&conditioned(
+        r#"style().on(within(attribute("data-theme").eq("dark")) + children(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        rules,
+        vec!["@layer vilan{[data-theme=\"dark\"] .stn8rgh > *{color:var(--gray-50)}}".to_string()],
+        "{rules:?}"
+    );
+}
+
+#[test]
+fn a_pseudo_element_renders_last_in_the_compound() {
+    // kolt smuggled `::selection` through `pseudo(":selection", ..)`'s
+    // free-form name. It is its own kind here, and the token carries `%`
+    // rather than the `::` it renders as, because a `:` inside a condition
+    // mis-aligns every split of the slot key (B311).
+    let rules = style_rules(&conditioned(
+        r#"style().on(element("selection"), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        rules,
+        vec![".svl47w1::selection{color:var(--gray-50)}".to_string()],
+        "{rules:?}"
+    );
+}
+
+#[test]
+fn a_condition_and_its_negation_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(r#"style().on(hover() + hover().not(), style().color(Color::gray(50)))"#),
+        "cannot hold hover and its negation",
+    );
+}
+
+#[test]
+fn two_breakpoints_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(r#"style().on(sm() + md(), style().color(Color::gray(50)))"#),
+        "holds ONE breakpoint",
+    );
+}
+
+#[test]
+fn two_ancestor_guards_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(
+            r#"style().on(
+                within(attribute("data-theme").eq("dark")) + within(attribute("data-dense")),
+                style().color(Color::gray(50)),
+            )"#,
+        ),
+        "holds ONE ancestor guard",
+    );
+}
+
+#[test]
+fn two_child_relations_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(r#"style().on(children() + divide(), style().color(Color::gray(50)))"#),
+        "holds ONE child relation",
+    );
+}
+
+#[test]
+fn two_pseudo_elements_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(
+            r#"style().on(element("selection") + element("before"), style().color(Color::gray(50)))"#,
+        ),
+        "holds ONE pseudo-element",
+    );
+}
+
+#[test]
+fn a_pseudo_element_cannot_be_negated() {
+    assert_fails_with(
+        &conditioned(r#"style().on(element("selection").not(), style().color(Color::gray(50)))"#),
+        "a pseudo-element cannot be negated",
+    );
+}
+
+#[test]
+fn a_breakpoint_cannot_be_negated_as_a_value_either() {
+    assert_fails_with(
+        &conditioned(r#"style().on(md().not(), style().color(Color::gray(50)))"#),
+        "a breakpoint cannot be negated in this version",
+    );
+}
+
+#[test]
+fn not_and_eq_refuse_a_set_rather_than_guessing_which_condition_they_mean() {
+    assert_fails_with(
+        &conditioned(r#"style().on((hover() + active()).not(), style().color(Color::gray(50)))"#),
+        "negates ONE condition and this set holds 2",
+    );
+    assert_fails_with(
+        &conditioned(r#"style().on(hover().eq("true"), style().color(Color::gray(50)))"#),
+        "gives an ATTRIBUTE condition its exact value",
+    );
+}
+
+#[test]
+fn an_ancestor_guard_takes_an_attribute_condition_in_this_version() {
+    // The ruling is that `within` takes a CONDITION, and it does — but the
+    // guard's selector travels inside the slot key, so a pseudo-class in it
+    // would carry the key's own separator. Refused naming the reason and the
+    // form that works.
+    assert_fails_with(
+        &conditioned(r#"style().on(within(hover()), style().color(Color::gray(50)))"#),
+        "guards on an ancestor's ATTRIBUTE in this version",
+    );
+}
+
+#[test]
+fn a_pseudo_class_name_cannot_claim_the_pseudo_element_marker() {
+    assert_fails_with(
+        &conditioned(r#"style().on(pseudo("%selection"), style().color(Color::gray(50)))"#),
+        "a pseudo-class name cannot start with '%'",
+    );
+}

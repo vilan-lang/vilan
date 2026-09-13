@@ -465,3 +465,19 @@ row	flagship	key
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
 433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
 NEW	-	the end-of-evaluation finaliser `{...}` failed: {...}
+NEW	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's pseudo-ELEMENT marker; write element(name) for `::name`, which is its own axis because a pseudo-element comes last in a compound selector and only one may appear
+NEW	-	a condition set cannot hold {...} and its negation — a rule conditioned on a value AND on its absence matches nothing, so one of the two is a mistake rather than an intent; drop it, or negate the condition you meant
+NEW	-	a condition set holds ONE breakpoint, and this one holds {...} and {...} — two min-widths in one query is the narrower of them written twice; keep the narrower and drop the other
+NEW	-	a condition set holds ONE ancestor guard, and this one holds {...} and {...} — one ancestor carrying both conditions is a selector this version does not spell; condition the element ITSELF with attribute(..) for the second
+NEW	-	a condition set holds ONE child relation, and this one holds {...} and {...} — divide() is children() minus the first child, so the two can never agree about that child; pick the one you mean
+NEW	-	a condition set holds ONE pseudo-element, and this one holds {...} and {...} — a compound selector admits one, always last, with nothing after it
+NEW	-	within(..) guards on ONE condition and was given a set — an ancestor carrying several conditions is a selector this version does not spell; guard on the one that identifies the ancestor
+NEW	-	within(..) guards on an ancestor's ATTRIBUTE in this version and was given {...} — the ancestor's selector travels inside the slot key, where a ':' mis-aligns every split of it (B311), so a pseudo-class or a relation cannot ride there yet; write within(attribute(name)) or within(attribute(name).eq(value))
+NEW	-	`.not()` negates ONE condition and this set holds {...} — negate each one where it is written (hover().not() + active()), which is the whole point of a condition being a value
+NEW	-	a breakpoint cannot be negated in this version — `@media not (..)` is a grammar of its own and no ruling has reached it; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead
+NEW	-	a pseudo-element cannot be negated — `:not(::selection)` is not a selector CSS admits; negate a condition that selects the ELEMENT instead
+NEW	-	a double negation is a spelling mistake rather than a cancellation — drop both `.not()`s, or negate the condition you meant
+NEW	-	`.eq(..)` gives ONE attribute condition its value and this set holds {...} — write it on the attribute (attribute(name).eq(value) + hover()), not on the set
+NEW	-	`.eq(..)` gives an ATTRIBUTE condition its exact value and this condition is {...} — a pseudo-class, a relation or a breakpoint has no value to match; attribute(name).eq(value) is the form
+NEW	-	this attribute condition already carries a value ({...}) — `.eq(..)` narrows PRESENCE to one value, so write attribute(name).eq(value) once
+NEW	-	not(..) negates the condition immediately outside it, and this one carries {...} conditions — which of them is negated is not decided by anything; negate the condition itself with `.not()`
