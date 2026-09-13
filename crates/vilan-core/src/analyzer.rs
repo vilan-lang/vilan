@@ -33494,7 +33494,21 @@ impl<'src> Analyzer<'src> {
                 return false;
             }
         };
-        self.record_reference(source_id, root_span, module_id);
+        // B314: `pkg` is an ORIGIN KEYWORD, not a name for the module it
+        // resolves to. `resolve_import_root` maps it to the importing
+        // package's own namespace, whose name is the PACKAGE's (`std` inside
+        // std's sources, `kolt` inside kolt's), so recording a reference here
+        // filed three bytes spelling `pkg` against a definition called
+        // something else — and when the two happened to be the same LENGTH
+        // (`pkg`/`std`) the row survived `narrow`'s exact check and a rename
+        // of the package rewrote the keyword. At any other length the row was
+        // dropped instead, the drop counted, and rename refused: the safe half
+        // of one bug (E158's first breach). Nothing is lost by recording
+        // nothing — `pkg` navigates nowhere a user wants to go, and the
+        // segments AFTER it are recorded exactly as before.
+        if root != "pkg" {
+            self.record_reference(source_id, root_span, module_id);
+        }
         let mut target_id = module_id;
         let mut namespace_scope_id = self.modules.get(&module_id).unwrap().body.1;
         // Which scope is `std`'s own root, so the removed-alias steer fires on
@@ -40727,6 +40741,17 @@ impl<'src> Analyzer<'src> {
                         Type::Module(id) => Some(*id),
                         _ => None,
                     };
+                    // B314: `Self` is a KEYWORD standing for the impl subject,
+                    // not a spelling of the subject's name — `Self` inside
+                    // `trait Wire` resolved to `Wire`, four bytes against four,
+                    // so the row survived `narrow`'s exact check and a rename
+                    // of the trait rewrote the keyword into the new name
+                    // (E158's second breach; at any other length the row was
+                    // dropped, the drop counted, and rename refused instead).
+                    // The row stays for its TYPE LABEL — hover over `Self`
+                    // still reads the subject — but it names no definition, so
+                    // find-references and rename pass it by.
+                    let definition_id = definition_id.filter(|_| name != "Self");
                     // Store the type id; its label is rendered after `build`,
                     // when all referenced types are resolved. Rendering here could
                     // hit a not-yet-resolved type id and panic.
