@@ -2973,6 +2973,21 @@ pub struct Analyzer<'src> {
     /// one is legal, which it is nowhere else. Collected across every module,
     /// read by `check_rpc_signatures` once all are walked.
     client_service_subjects: HashSet<&'src str>,
+    /// Every struct carrying `[service(..)]` or `[client_service]` — both
+    /// halves, because both generate a dispatcher and both therefore refuse
+    /// their methods through `service_method_refusals`. Read by
+    /// `check_invalidation` for B313's stand-down; collected across modules
+    /// like `client_service_subjects`, because an `impl` may be walked before
+    /// the struct it is written for.
+    service_subjects: HashSet<&'src str>,
+    /// B313: the RECEIVER parameter of every `[rpc]` method declared `async`
+    /// with a `&mut self` receiver, paired with the name of the `impl` subject
+    /// that declared it — the exact shape `service_method_refusals` refuses at
+    /// the attribute (B287). Recorded here as the method is walked, filtered by
+    /// `service_subjects` once every module is in, and used to STAND DOWN E3's
+    /// signature rule for that receiver: the two reports are both true, in two
+    /// vocabularies, about one mistake, and the attribute is the outer frame.
+    rpc_async_mut_self_receivers: Vec<(Id, &'src str)>,
     /// The declarations of structs carrying `[client_service]` and NOT
     /// `[service(..)]` — the client-only half of the pair above, by id rather
     /// than by name because the one question asked of it is about a specific
@@ -4667,6 +4682,8 @@ impl<'src> Analyzer<'src> {
             drop_call_edges: HashMap::default(),
             rpc_signatures_to_check: Vec::new(),
             client_service_subjects: HashSet::default(),
+            service_subjects: HashSet::default(),
+            rpc_async_mut_self_receivers: Vec::new(),
             client_only_service_declarations: HashSet::default(),
             current_impl_subject_name: None,
             expose_fields_to_check: Vec::new(),
@@ -21262,6 +21279,23 @@ impl<'src> Analyzer<'src> {
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
         let mut pending = ViewSuspensionChecks::default();
+        // B313's stand-down: the RECEIVERS of `[rpc]` methods the `[service]`
+        // attribute has already refused for being `async` beside `&mut self`
+        // (B287). Both reports are true and neither is wrong — E3 says the view
+        // would be held across a suspension, B287 says the receiver is a view
+        // into an instance other routes interleave with — but they are one
+        // mistake, and the ATTRIBUTE is the outer frame: it is what the author
+        // wrote, it names the method, and its sentence carries both fixes. The
+        // set is empty for every program with no service in it, and the
+        // stand-down reaches only the receiver, so a `&mut` PARAMETER beside it
+        // keeps E3's report (it is a different mistake, and one B287 says
+        // nothing about).
+        let stood_down: HashSet<Id> = self
+            .rpc_async_mut_self_receivers
+            .iter()
+            .filter(|(_, subject)| self.service_subjects.contains(subject))
+            .map(|(receiver_id, _)| *receiver_id)
+            .collect();
         for (function_id, statements, tail) in &bodies {
             let mut live = HashSet::default();
             let mut state = InvalidationScanState::default();
@@ -21294,6 +21328,10 @@ impl<'src> Analyzer<'src> {
                     let Some(parameter) = self.parameters.get(parameter_id) else {
                         continue;
                     };
+                    // B313: already reported in the service's vocabulary.
+                    if stood_down.contains(parameter_id) {
+                        continue;
+                    }
                     match parameter.convention {
                         Convention::RefMut => view_parameters.push((*parameter_id, "'&mut'")),
                         Convention::Ref => view_parameters.push((*parameter_id, "'&'")),
@@ -26115,10 +26153,14 @@ impl<'src> Analyzer<'src> {
             // separately, by `std/src/rpc.vl`'s `service` macro (N70 retired
             // the Rust twin that used to do it for a std without `rpc.vl`).
             Node::Service(attribute, inner) => {
-                if let Node::Struct(name, ..) = &inner.0
-                    && attribute.client_side
-                {
-                    self.client_service_subjects.insert(name.0);
+                if let Node::Struct(name, ..) = &inner.0 {
+                    if attribute.client_side {
+                        self.client_service_subjects.insert(name.0);
+                    }
+                    // Either attribute expands, and either expansion refuses
+                    // its own methods (B287/B295/B312) — so B313's stand-down
+                    // is owed to both.
+                    self.service_subjects.insert(name.0);
                 }
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
@@ -26522,6 +26564,19 @@ impl<'src> Analyzer<'src> {
                     // the insert below because that is what moves `parameters`.
                     if function.rpc {
                         self.collect_rpc_signature(function, id, &parameters, return_type_id);
+                        // B313: the shape B287 refuses at the attribute. The
+                        // WRITTEN `async` keyword is the key, as it is there —
+                        // an inferred-async method is not refused by the
+                        // attribute and must keep E3's report.
+                        if function.is_async
+                            && function.receiver_spelling() == Some("&mut self")
+                            && let Some(receiver_id) = parameters.first()
+                        {
+                            self.rpc_async_mut_self_receivers.push((
+                                *receiver_id,
+                                self.current_impl_subject_name.unwrap_or_default(),
+                            ));
+                        }
                     }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
