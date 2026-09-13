@@ -2135,12 +2135,23 @@ impl Backend {
             session_trace::TraceEvent::Summarize => session_trace::summary(
                 session_trace::StateSizes {
                     documents: self.documents.len(),
+                    // M63: of those documents, how many still hold a program —
+                    // the retention rule's own number, on the page beside the
+                    // memory it is there to bound.
+                    programs: self
+                        .documents
+                        .iter()
+                        .filter(|document| document.value().holds_program())
+                        .count(),
                     semantic_token_cache: self.semantic_token_cache.len(),
                     manifests: self.manifests.len(),
                     pending: self.schedule.len(),
                     line_indices: self.line_indices.len(),
                 },
                 self.analyses.counts(),
+                // E166: the numbers E106 and M63 were found with, on the page
+                // the owner reads when a session starts feeling slow.
+                memory::Memory::sample(),
             ),
         };
         if tokio::runtime::Handle::try_current().is_err() {
@@ -6378,6 +6389,11 @@ mod session_leak_tests {
     fn sizes(backend: &Backend) -> session_trace::StateSizes {
         session_trace::StateSizes {
             documents: backend.documents.len(),
+            programs: backend
+                .documents
+                .iter()
+                .filter(|document| document.value().holds_program())
+                .count(),
             semantic_token_cache: backend.semantic_token_cache.len(),
             manifests: backend.manifests.len(),
             pending: backend.schedule.len(),

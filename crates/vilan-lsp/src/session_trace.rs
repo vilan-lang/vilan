@@ -8,15 +8,29 @@
 //! (the extension's half is instrumented there). This is the other half: what a
 //! long-lived server process can say about itself.
 //!
-//! **Timing, not RSS.** Every request handler already runs through one
-//! synchronous fence (`Backend::fenced`), which makes it the single seam where
-//! every request can be timed without touching a handler. What the trace does
-//! NOT do is read process RSS: `leak_tally`'s module doc is this project's
-//! standing ruling on that — RSS is dominated by allocator retention from
-//! building and dropping a whole `Program` per analysis, which swamps the
-//! genuine per-analysis leak and is far too noisy to attribute anything to. The
-//! leak tally itself is thread-local and each analysis runs on its own spawned
-//! big-stack thread, so it cannot be read from the request thread either.
+//! **Timing, and — since E166 — memory.** Every request handler already runs
+//! through one synchronous fence (`Backend::fenced`), which makes it the single
+//! seam where every request can be timed without touching a handler.
+//!
+//! This module used to refuse to read process RSS at all, on `leak_tally`'s
+//! standing ruling: RSS is dominated by allocator retention from building and
+//! dropping a whole `Program` per analysis, which swamps the genuine
+//! per-analysis leak and is far too noisy to ATTRIBUTE anything to. That ruling
+//! stands for attribution and is the wrong one for a status page. E106 was
+//! found by reading RSS beside `mallinfo2`'s in-use/free split — 738 → 320 MB
+//! in use with 421 MB retained free after closing eighteen documents — and the
+//! field reading that started it was a resident figure off the owner's own
+//! server (4.13 GB after eight hours). A page that reports cardinalities and no
+//! bytes cannot carry either number, so the next report arrived without them.
+//! The split is what makes the reading honest: resident size that stays up
+//! while in-use bytes fall is the allocator's to hand back (M64's `malloc_trim`),
+//! not the server's to free.
+//!
+//! What is still NOT here is the leak tally's own balance: it is THREAD-LOCAL
+//! and every analysis runs on its own spawned big-stack thread, so read from
+//! the request thread it would report that thread's reclaims (a large negative
+//! number) and nothing about the session. `crate::document`'s harness reads it
+//! where it is recorded, which is the only place it means anything.
 //!
 //! **What CAN grow without bound is state, and state is countable.** The
 //! server's retained maps are its session memory: one entry per open document,
@@ -52,6 +66,10 @@ pub struct RequestStat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StateSizes {
     pub documents: usize,
+    /// M63: how many of those documents still hold a `Program`. Bounded by
+    /// `document::RETAINED_PROGRAMS` once the retention rule has run, so a
+    /// number above it on a settled session is the rule not holding.
+    pub programs: usize,
     pub semantic_token_cache: usize,
     pub manifests: usize,
     pub pending: usize,
@@ -222,7 +240,12 @@ impl RequestTally {
     /// "what is this session waiting on", where a per-call mean would hide a
     /// cheap request being sent thousands of times (semantic tokens on every
     /// keystroke is exactly that shape).
-    pub fn summary(&self, state: StateSizes, analyses: AnalysisCounts) -> String {
+    pub fn summary(
+        &self,
+        state: StateSizes,
+        analyses: AnalysisCounts,
+        memory: crate::memory::Memory,
+    ) -> String {
         let mut ordered: Vec<(&&'static str, &RequestStat)> = self.methods.iter().collect();
         // Name breaks the tie so the line is stable between two equal totals,
         // which is what makes two summaries in one session comparable by eye.
@@ -236,17 +259,20 @@ impl RequestTally {
 
         let mut out = format!(
             "session trace after {} requests\n  \
-             retained state: documents={} semantic_token_cache={} manifests={} \
+             retained state: documents={} programs={} semantic_token_cache={} manifests={} \
              pending={} line_indices={}\n  \
+             {}\n  \
              analyses: started={} landed={} cancelled={}\n  \
              lsp-index (M27, editor tables per landed analysis): total={}ms max={}ms\n  \
              requests (count / mean ms / max ms), slowest total first:",
             self.total_requests,
             state.documents,
+            state.programs,
             state.semantic_token_cache,
             state.manifests,
             state.pending,
             state.line_indices,
+            memory.line(),
             analyses.started,
             analyses.landed,
             analyses.cancelled,
@@ -290,13 +316,17 @@ pub fn record(request: &'static str, elapsed_ms: u128) -> TraceEvent {
 
 /// The process tally's summary, given the caller's state cardinalities and
 /// analysis counts.
-pub fn summary(state: StateSizes, analyses: AnalysisCounts) -> String {
+pub fn summary(
+    state: StateSizes,
+    analyses: AnalysisCounts,
+    memory: crate::memory::Memory,
+) -> String {
     let mut guard = TALLY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .get_or_insert_with(RequestTally::new)
-        .summary(state, analyses)
+        .summary(state, analyses, memory)
 }
 
 #[cfg(test)]
@@ -393,6 +423,7 @@ mod tests {
         let summary = tally.summary(
             StateSizes {
                 documents: 4,
+                programs: 2,
                 semantic_token_cache: 4,
                 manifests: 1,
                 pending: 0,
@@ -405,6 +436,7 @@ mod tests {
                 index_total_ms: 0,
                 index_max_ms: 0,
             },
+            crate::memory::Memory::default(),
         );
         let tokens_at = summary
             .find("semantic_tokens_full")
@@ -420,7 +452,8 @@ mod tests {
         );
         assert!(
             summary.contains(
-                "documents=4 semantic_token_cache=4 manifests=1 pending=0 line_indices=37"
+                "documents=4 programs=2 semantic_token_cache=4 manifests=1 pending=0 \
+                 line_indices=37"
             ),
             "the retained-state cardinalities are the growth evidence: {summary}",
         );
@@ -434,12 +467,58 @@ mod tests {
 
     // A mean that is not a whole number still renders — the tenths are computed
     // in integers so the line diffs cleanly against the next summary.
+    /// E166: the status page carries the three memory figures and M63's
+    /// retained-program count — the numbers E106 and M63 were found with, in
+    /// the report the owner sends when a session starts feeling slow.
+    ///
+    /// The page's job is to be QUOTED, so this pin is on the whole line: the
+    /// order, the labels and the unit are what make two readings from one
+    /// session comparable by eye.
+    #[test]
+    fn the_summary_reports_the_process_memory_and_the_retained_programs() {
+        let mut tally = RequestTally::new();
+        tally.record("hover", 3);
+        let summary = tally.summary(
+            StateSizes {
+                documents: 18,
+                programs: 2,
+                semantic_token_cache: 18,
+                manifests: 1,
+                pending: 0,
+                line_indices: 61,
+            },
+            AnalysisCounts::default(),
+            crate::memory::Memory {
+                resident_bytes: Some(532_824_064),
+                heap_in_use_bytes: Some(522_533_888),
+                heap_retained_bytes: Some(103_317_504),
+            },
+        );
+        assert!(
+            summary.contains(
+                "retained state: documents=18 programs=2 semantic_token_cache=18 \
+                 manifests=1 pending=0 line_indices=61"
+            ),
+            "M63's own number belongs beside the documents it bounds: {summary}",
+        );
+        assert!(
+            summary.contains(
+                "memory: rss=508.1 MiB heap_in_use=498.3 MiB heap_retained_free=98.5 MiB"
+            ),
+            "E166's three figures, in MiB, on their own line: {summary}",
+        );
+    }
+
     #[test]
     fn a_fractional_mean_renders_to_one_decimal() {
         let mut tally = RequestTally::new();
         tally.record("hover", 1);
         tally.record("hover", 2);
-        let summary = tally.summary(StateSizes::default(), AnalysisCounts::default());
+        let summary = tally.summary(
+            StateSizes::default(),
+            AnalysisCounts::default(),
+            crate::memory::Memory::default(),
+        );
         assert!(
             summary.contains("hover: 2 / 1.5 / 2"),
             "1 and 2 average to 1.5: {summary}",
@@ -451,7 +530,11 @@ mod tests {
     #[test]
     fn an_empty_tally_summarizes_without_dividing_by_zero() {
         let tally = RequestTally::new();
-        let summary = tally.summary(StateSizes::default(), AnalysisCounts::default());
+        let summary = tally.summary(
+            StateSizes::default(),
+            AnalysisCounts::default(),
+            crate::memory::Memory::default(),
+        );
         assert!(summary.contains("(none yet)"), "{summary}");
     }
 
@@ -481,7 +564,11 @@ mod tests {
             "the peak is kept, not averaged away — it is the keystroke the editor stalled on",
         );
 
-        let summary = RequestTally::new().summary(StateSizes::default(), counts);
+        let summary = RequestTally::new().summary(
+            StateSizes::default(),
+            counts,
+            crate::memory::Memory::default(),
+        );
         assert!(
             summary.contains(
                 "lsp-index (M27, editor tables per landed analysis): \
