@@ -503,6 +503,20 @@ pub struct ExprMatchLeg {
     pub body: Id,
 }
 
+/// How two INHERENT impl subjects claim the same receivers — what
+/// [`Analyzer::subjects_collide`] answers and what the duplicate-member message
+/// says (B315).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubjectCollision {
+    /// One subject written twice: the same type, or two binders bound the same
+    /// way. The duplicate the rule has refused since B57.
+    Same,
+    /// Two BLANKETS whose bound clauses differ but OVERLAP — some type
+    /// satisfies both, so both impls claim it and tier 1 takes whichever came
+    /// first, unranked.
+    OverlappingBounds,
+}
+
 // A fully resolved match pattern, ready for code generation.
 #[derive(Clone, Debug)]
 pub enum ExprPattern {
@@ -6956,8 +6970,8 @@ impl<'src> Analyzer<'src> {
                 by_name.entry(name).or_default().push((index, *member_id));
             }
         }
-        // (member name, first declaration, second declaration, subject).
-        let mut duplicates: Vec<(&'src str, Id, Id, TypeId)> = Vec::new();
+        // (member name, first declaration, second declaration, subject, kind).
+        let mut duplicates: Vec<(&'src str, Id, Id, TypeId, SubjectCollision)> = Vec::new();
         for (member_name, declarations) in &by_name {
             if declarations.len() < 2 {
                 continue;
@@ -7003,20 +7017,21 @@ impl<'src> Analyzer<'src> {
                 let earlier = inherent[..position]
                     .iter()
                     .filter(|(earlier_index, _, _)| earlier_index != index)
-                    .find(|(_, _, earlier_subject)| {
+                    .find_map(|(_, earlier_id, earlier_subject)| {
                         self.subjects_collide(&subject_type, *earlier_subject)
+                            .map(|collision| (*earlier_id, collision))
                     });
-                if let Some((_, earlier_id, _)) = earlier {
-                    duplicates.push((member_name, *earlier_id, *member_id, *subject));
+                if let Some((earlier_id, collision)) = earlier {
+                    duplicates.push((member_name, earlier_id, *member_id, *subject, collision));
                 }
             }
         }
         let duplicates = duplicates
             .into_iter()
-            .map(|(member_name, first_id, second_id, subject)| {
+            .map(|(member_name, first_id, second_id, subject, collision)| {
                 let subject_label =
                     self.pretty_print_type(&subject.get_type(self), &HashMap::default());
-                (member_name, first_id, second_id, subject_label)
+                (member_name, first_id, second_id, subject_label, collision)
             })
             .collect();
         self.report_duplicate_declarations(duplicates);
@@ -7125,7 +7140,7 @@ impl<'src> Analyzer<'src> {
     /// the inherent check skips a same-block pair rather than reporting it a
     /// second time.
     fn check_duplicate_block_members(&mut self) {
-        let mut duplicates: Vec<(&'src str, Id, Id, String)> = Vec::new();
+        let mut duplicates: Vec<(&'src str, Id, Id, String, SubjectCollision)> = Vec::new();
         let blocks = self
             .implementations
             .iter()
@@ -7151,9 +7166,13 @@ impl<'src> Analyzer<'src> {
             let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::default();
             for (member_name, member_id) in declared_members {
                 match first_by_name.get(member_name) {
-                    Some(first_id) => {
-                        duplicates.push((member_name, *first_id, member_id, subject_label.clone()))
-                    }
+                    Some(first_id) => duplicates.push((
+                        member_name,
+                        *first_id,
+                        member_id,
+                        subject_label.clone(),
+                        SubjectCollision::Same,
+                    )),
                     None => {
                         first_by_name.insert(member_name, member_id);
                     }
@@ -7397,7 +7416,7 @@ impl<'src> Analyzer<'src> {
 
     /// Whether two INHERENT impl subjects claim the same receivers for the
     /// purposes of the duplicate-member rule: compatible by the ordinary
-    /// comparison, and — when both are BARE BINDERS — bound the same way.
+    /// comparison, and — when both are BARE BINDERS — bound compatibly.
     ///
     /// The bounds clause is the coherence rule's own reading, one tier down
     /// (`same_impl_type_shape`: "two impl parameters are the same position when
@@ -7412,16 +7431,90 @@ impl<'src> Analyzer<'src> {
     /// declaring one name is still the overlap the rule exists to refuse,
     /// because tier 1 of method resolution takes the first inherent candidate
     /// without ranking.
-    fn subjects_collide(&self, subject_type: &Type, earlier_subject: TypeId) -> bool {
+    ///
+    /// B315: two blankets whose bound clauses are NOT identical but OVERLAP —
+    /// some type satisfies both — collide too, as [`SubjectCollision::
+    /// OverlappingBounds`]. Tier 1 of method resolution takes the first
+    /// inherent candidate UNRANKED (the trait tiers rank, tier 1 does not), so
+    /// admitting both made the winner declaration order: `impl type S:
+    /// Source<type I>` and `impl type S: Source<Option<type I>>` each declaring
+    /// `f` both claim an `S: Source<Option<i32>>` and the rule the doc comment
+    /// above wants — "no silent pick" — was not being kept.
+    fn subjects_collide(
+        &self,
+        subject_type: &Type,
+        earlier_subject: TypeId,
+    ) -> Option<SubjectCollision> {
         let earlier_type = earlier_subject.get_type(self);
         if !self.compare_type(subject_type, &earlier_type, &HashMap::default()) {
-            return false;
+            return None;
         }
         match (subject_type, &earlier_type) {
             (Type::Generic(left_id), Type::Generic(right_id)) => {
-                self.same_generic_bounds(*left_id, *right_id, &mut Vec::new())
+                if self.same_generic_bounds(*left_id, *right_id, &mut Vec::new()) {
+                    Some(SubjectCollision::Same)
+                } else {
+                    self.generic_bounds_overlap(*left_id, *right_id)
+                        .then_some(SubjectCollision::OverlappingBounds)
+                }
             }
-            _ => true,
+            _ => Some(SubjectCollision::Same),
+        }
+    }
+
+    /// Whether two binders' bound clauses OVERLAP: one type could satisfy both,
+    /// so two blankets written over them both claim it (B315). Asked only once
+    /// [`Self::same_generic_bounds`] has said the clauses are not the same.
+    ///
+    /// The clauses must line up trait for trait — a binder bounded by one trait
+    /// and a binder bounded by two demand different things and no widening here
+    /// changes that — and then each ARGUMENT position must be jointly
+    /// inhabitable.
+    fn generic_bounds_overlap(&self, left: TypeId, right: TypeId) -> bool {
+        let left_bounds = self.generic_bound_traits(left);
+        let right_bounds = self.generic_bound_traits(right);
+        if left_bounds.is_empty() || left_bounds.len() != right_bounds.len() {
+            return false;
+        }
+        left_bounds.iter().zip(right_bounds.iter()).all(
+            |((left_trait, left_arguments), (right_trait, right_arguments))| {
+                left_trait == right_trait
+                    && left_arguments.len() == right_arguments.len()
+                    && left_arguments.iter().zip(right_arguments.iter()).all(
+                        |(left_id, right_id)| {
+                            self.bound_argument_positions_overlap(*left_id, *right_id)
+                        },
+                    )
+            },
+        )
+    }
+
+    /// Whether one ARGUMENT position of two bound clauses can be filled by one
+    /// and the same type (B315).
+    ///
+    /// The clause A86 needed is the binder-against-a-written-type one: a binder
+    /// admits a written type exactly when that type carries every trait the
+    /// binder demands, so `type I: Source<type U>` does NOT admit
+    /// `Option<type I: Source<type U>>` — no `Option` is a `Source` — and std's
+    /// two joins stay the disjoint pair A86 made them. An UNBOUNDED binder
+    /// demands nothing and admits everything, which is B315's own pair: `type
+    /// I` beside `Option<type I>` overlaps at every `Option`.
+    fn bound_argument_positions_overlap(&self, left: TypeId, right: TypeId) -> bool {
+        if self.same_impl_type(left, right, &mut Vec::new()) {
+            return true;
+        }
+        match (left.get_type(self), right.get_type(self)) {
+            // Two binders bounded differently. Whether a third type satisfies
+            // both is a question this rule cannot answer from the declarations
+            // alone, and the duplicate family refuses only what it can see —
+            // so they are left as they were before B315: not a collision.
+            (Type::Generic(_), Type::Generic(_)) => false,
+            (Type::Generic(binder), other) | (other, Type::Generic(binder)) => self
+                .generic_bound_traits(binder)
+                .iter()
+                .all(|(trait_id, _)| self.type_implements_trait(&other, *trait_id)),
+            // Two written types that are not the same type name disjoint sets.
+            _ => false,
         }
     }
 
@@ -7534,9 +7627,13 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The shared reporting half of the two duplicate-declaration rules:
-    /// `(member name, first declaration, second declaration, subject label)`.
-    fn report_duplicate_declarations(&mut self, duplicates: Vec<(&'src str, Id, Id, String)>) {
-        for (member_name, first_id, second_id, subject_label) in duplicates {
+    /// `(member name, first declaration, second declaration, subject label,
+    /// collision kind)`.
+    fn report_duplicate_declarations(
+        &mut self,
+        duplicates: Vec<(&'src str, Id, Id, String, SubjectCollision)>,
+    ) {
+        for (member_name, first_id, second_id, subject_label, collision) in duplicates {
             if self.frozen_entity(second_id) {
                 continue;
             }
@@ -7570,15 +7667,28 @@ impl<'src> Analyzer<'src> {
             // fixes — and which one is right is the author's call, not ours.
             let elsewhere = self.other_module_clause(first_id, second_id);
             let span = self.declaration_name_span(second_id);
+            let msg = match collision {
+                SubjectCollision::Same => format!(
+                    "'{member_name}' is already defined for '{subject_label}'{elsewhere}; \
+                     remove or rename this one"
+                ),
+                // B315: the two bound clauses are different, so "already
+                // defined" would be read as a mistake about what the compiler
+                // saw. What is wrong is that they are not disjoint.
+                SubjectCollision::OverlappingBounds => format!(
+                    "'{member_name}' is declared by two blanket impls whose bounds \
+                     OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, \
+                     and an inherent member is taken from the first matching impl without \
+                     ranking. Narrow one bound so the two are disjoint, or declare \
+                     '{member_name}' on a trait"
+                ),
+            };
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
                     note,
                     span,
-                    msg: format!(
-                        "'{member_name}' is already defined for '{subject_label}'{elsewhere}; \
-                         remove or rename this one"
-                    ),
+                    msg,
                 },
                 second_id,
             );

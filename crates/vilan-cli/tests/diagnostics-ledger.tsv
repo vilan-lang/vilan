@@ -457,3 +457,4 @@ row	flagship	key
 423	-	a custom property is written with its dashes — var("--button-color"), not var("{name}")
 424	-	a custom property name cannot contain {...} — the name is one token, like --button-color
 425	-	cannot find type '{name}'; this `impl`'s subject is the trait `{trait_name}` itself, so it is written for EVERY type that implements it — and that type has no name here. Say `Self`, or name it in the head: `impl type {name}: {trait_name}<..>`
+NEW	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait

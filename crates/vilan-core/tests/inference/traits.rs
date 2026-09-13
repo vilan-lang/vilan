@@ -4988,3 +4988,207 @@ fn b297_the_subject_arguments_still_type_selfs_variant_patterns() {
         "7\n1\n",
     );
 }
+
+// --- B315: two blankets whose bounds OVERLAP ------------------------------------
+// A86 taught the duplicate-inherent-member rule to read a bound's ARGUMENTS, so
+// two blankets over one parameterized trait stopped colliding wholesale. What it
+// asked for was SAMENESS, and sameness is narrower than the thing the rule
+// exists to prevent: a pair whose clauses differ but overlap — some type
+// satisfies both — was admitted, and tier 1 of method resolution takes the first
+// inherent candidate UNRANKED, so the winner was declaration order. The rule
+// refuses overlap now, and the clause that keeps A86's own pair legal is the one
+// that says a BOUNDED binder admits only types carrying the traits it demands.
+
+#[test]
+fn b315_two_blankets_whose_bounds_overlap_are_refused() {
+    // `S: Read<type I>` accepts every `S` that reads anything at all, so an `S`
+    // reading an `Option` satisfies both clauses and both impls claim `peek`.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I> {
+            fun peek(self): I { self.get() }
+        }
+        impl type O: Read<Option<type V>> {
+            fun peek(self): Option<V> { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is declared by two blanket impls whose bounds OVERLAP",
+    );
+}
+
+#[test]
+fn b315_the_overlap_refusal_names_the_two_fixes_and_points_at_the_first_impl() {
+    // C3: the message says what to do, and the note says where the other one is.
+    assert_fails_noting(
+        r#"
+        import std::option::Option;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I> {
+            fun peek(self): I { self.get() }
+        }
+        impl type O: Read<Option<type V>> {
+            fun peek(self): Option<V> { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "Narrow one bound so the two are disjoint, or declare 'peek' on a trait",
+        "peek",
+        "'peek' is already defined here",
+    );
+}
+
+#[test]
+fn b315_two_blankets_bounded_at_disjoint_concrete_arguments_may_share_a_name() {
+    // The non-overlapping control: two WRITTEN types that are not the same type
+    // name disjoint sets, so nothing satisfies both clauses.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<i32> {
+            fun peek(self): i32 { self.get() + 1 }
+        }
+        impl type O: Read<str> {
+            fun peek(self): str { self.get() }
+        }
+
+        fun main() {
+            let numbers = Cell { value = 41 };
+            print(numbers.peek());
+            let words = Cell { value = "hi" };
+            print(words.peek());
+        }
+
+        main();
+        "#,
+        "42\nhi\n",
+    );
+}
+
+#[test]
+fn b315_a_bounded_binder_does_not_admit_a_type_that_misses_its_bound() {
+    // A86's pair, stated as the overlap question it now is: the first clause's
+    // `type I` demands `Read`, no `Option` is a `Read`, so an `S` cannot satisfy
+    // both — and the two impls stay two impls. (The behaviour is A86's own pin
+    // `a86_two_blankets_bounded_at_different_arguments_may_share_a_member_name`;
+    // this one holds the CLAUSE that keeps it, by putting a bound on the binder
+    // that the overlapping pair above leaves off.)
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun peek(self): U { self.get().get() }
+        }
+        impl type O: Read<Option<type V: Read<type W>>> {
+            fun peek(self): Option<W> {
+                match self.get() {
+                    Some(let inner) => Some(inner.get()),
+                    None => None,
+                }
+            }
+        }
+
+        fun main() {
+            let nested = Cell { value = Cell { value = 7 } };
+            print(nested.peek());
+            let optional: Cell<Option<Cell<i32>>> = Cell { value = Some(Cell { value = 3 }) };
+            print(optional.peek().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "7\n3\n",
+    );
+}
+
+#[test]
+fn b315_a_binder_bounded_by_a_trait_the_written_type_does_implement_overlaps() {
+    // The other side of the same clause: make the written type carry the trait
+    // the binder demands and the two clauses DO overlap, so the pair is refused.
+    // This is the item's own framing — the hypothetical `Option: Source`.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl Option<type T> with Read<T> {
+            fun get(self): T {
+                match self {
+                    Some(let value) => value,
+                    None => panic("empty"),
+                }
+            }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun peek(self): U { self.get().get() }
+        }
+        impl type O: Read<Option<type V: Read<type W>>> {
+            fun peek(self): Option<W> { None }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is declared by two blanket impls whose bounds OVERLAP",
+    );
+}
+
+#[test]
+fn b315_two_blankets_bounded_the_same_way_keep_the_already_defined_message() {
+    // The families stay apart: an identical pair is still "already defined",
+    // because what is wrong there is that one thing was written twice.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun peek(self): T { self.get() }
+        }
+        impl type O: Read<type V> {
+            fun peek(self): V { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is already defined for",
+    );
+}
