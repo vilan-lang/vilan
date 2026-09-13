@@ -1436,12 +1436,19 @@ impl Painting {
         &self.token_at(needle).scopes
     }
 
-    /// How many generic regions that token sits inside.
-    fn generic_depth(&self, needle: &str) -> usize {
+    /// How many regions named `region` that token sits inside — the nesting
+    /// claims (`meta.generic.vilan` for a head's lists, `meta.tag.vilan` for
+    /// an element head's extent) are what several pins below are about.
+    fn region_depth(&self, needle: &str, region: &str) -> usize {
         self.stack_at(needle)
             .iter()
-            .filter(|scope| *scope == "meta.generic.vilan")
+            .filter(|scope| scope.as_str() == region)
             .count()
+    }
+
+    /// How many generic argument lists that token sits inside.
+    fn generic_depth(&self, needle: &str) -> usize {
+        self.region_depth(needle, "meta.generic.vilan")
     }
 }
 
@@ -1667,6 +1674,195 @@ fn e162_a_fixed_array_argument_stays_inside_the_list() {
     assert_eq!(painting.generic_depth(">) {"), 1);
     assert_eq!(painting.scope_at("1;"), "constant.numeric.vilan");
     assert_eq!(painting.generic_depth("1;"), 0);
+}
+
+// --- E164: a closing tag after text, and the `>` of an attributed head -------
+//
+// Two defects in one rule set, both found the day the tokeniser landed (E163)
+// and neither visible to a pin that reads a regex:
+//
+//   1. `<span>hello</span>` painted `</span>` as `meta.generic.vilan`. The
+//      generic list's begin is a `<` glued to an identifier character, `hello`
+//      ends in one, and the element rule's own atom-position guard REFUSED the
+//      `<` for the same reason — so the list got it. The commonest markup shape
+//      in the language, mis-coloured. The generic begin declines a `</` now and
+//      the closing tag is its own rule, guardless, because a `</` is never an
+//      argument list whatever precedes it.
+//   2. `<div class("row")>` painted its `>` as `keyword.operator.vilan`. The
+//      head was a `match`, a `match` sees one line, and its optional `(/?>)`
+//      could only reach a `>` with nothing between it and the tag name. The
+//      head is a begin/end REGION now, so it ends where it ends — mid-line,
+//      after a closure-valued item, or alone on its own line, which is E115's
+//      line-start terminator subsumed rather than patched beside.
+//
+// Measured over the tree at the fix: of every token in all 257 tracked `.vl`
+// files and all 456 `vilan` fences under `vilan/docs`, exactly 14 characters
+// change scope, and every one is a `>` or `/>` of an element head moving from
+// `keyword.operator.vilan` to `punctuation.definition.tag.vilan`.
+
+/// Both defects and both controls in one program: a generic head and a spaced
+/// comparison that must not move, an attributed head whose `>` must, and a
+/// closing tag straight after text.
+const E164_MARKUP: &str = "\
+fun probe(list: List<i32>): View {
+\tlet cmp = a < b;
+\t<div class(\"row\")>hello</div>
+}
+";
+
+/// A head written one item per line (E115's shape) whose value is a CLOSURE —
+/// the `{` and the `;` inside it are the head region's own bail-out
+/// characters, and `#element-head-value` is what stops them from ever being
+/// offered to it.
+const E164_MULTILINE_HEAD: &str = "\
+fun probe(): View {
+\t<a
+\t\ton:click(|_| { bump(); })
+\t\taria-label(\"x\")
+\t>\"go\"</a>
+}
+";
+
+/// The self-closing form, with the space the formatter writes.
+const E164_SELF_CLOSING_HEAD: &str = "\
+fun probe(): View {
+\t<input type(\"checkbox\") disabled />
+}
+";
+
+/// The head region's own runaway shape: a `<` glued to a name but not glued to
+/// the expression before it. `a<b` is the generic list's misfire (pinned
+/// above); `a <b` is this one's.
+const E164_GLUED_TAG: &str = "\
+fun probe() {
+\tif a <b { print(\"x\"); }
+\tlet after = 1;
+}
+";
+
+#[test]
+fn e164_a_closing_tag_after_text_is_a_tag_and_never_a_generic_list() {
+    let Some(painting) = painting(E164_MARKUP) else {
+        return;
+    };
+    let tag = vec![
+        "punctuation.definition.tag.vilan".to_string(),
+        "entity.name.tag.vilan".to_string(),
+        "punctuation.definition.tag.vilan".to_string(),
+    ];
+    // THE DEFECT: `hello` ends in an identifier character, which is exactly
+    // what the generic list's begin looks for.
+    assert_eq!(painting.scopes_over("</div>"), tag, "the closing tag");
+    assert_eq!(
+        painting.region_depth("</div>", "meta.generic.vilan"),
+        0,
+        "the closing tag is inside a generic argument list again"
+    );
+    // The controls, in the same program: a generic head is still a list and a
+    // spaced comparison is still an operator.
+    assert_eq!(
+        painting.scopes_over("<i32>"),
+        vec![
+            "punctuation.definition.generic.begin.vilan".to_string(),
+            "support.type.primitive.vilan".to_string(),
+            "punctuation.definition.generic.end.vilan".to_string(),
+        ],
+        "`List<i32>`"
+    );
+    assert_eq!(painting.scope_at("< b"), "keyword.operator.vilan");
+}
+
+#[test]
+fn e164_the_bracket_closing_an_attributed_head_is_a_tag_delimiter() {
+    let Some(painting) = painting(E164_MARKUP) else {
+        return;
+    };
+    // THE DEFECT: a head item stood between the tag name and the `>`, so the
+    // `match` never reached it and the operator list did.
+    assert_eq!(
+        painting.scope_at(">hello"),
+        "punctuation.definition.tag.vilan",
+        "the `>` of `<div class(\"row\")>`"
+    );
+    // The head opens and holds its item, which is what makes the `>` its end
+    // rather than a `>` the region happened to run into.
+    assert_eq!(
+        painting.scope_at("<div"),
+        "punctuation.definition.tag.vilan"
+    );
+    assert_eq!(painting.scope_at("div c"), "entity.name.tag.vilan");
+    assert_eq!(painting.region_depth("class", "meta.tag.vilan"), 1);
+    assert_eq!(painting.scope_at("row"), "string.quoted.double.vilan");
+    // And the head ENDS there: the text child is outside it.
+    assert_eq!(painting.region_depth("hello", "meta.tag.vilan"), 0);
+}
+
+#[test]
+fn e164_a_head_spans_lines_and_a_closure_valued_item_does_not_end_it() {
+    let Some(painting) = painting(E164_MULTILINE_HEAD) else {
+        return;
+    };
+    // E115's shape: the `>` alone on its own line. It is the region's end now,
+    // not a line-start rule sitting beside the region.
+    assert_eq!(
+        painting.scope_at(">\"go\""),
+        "punctuation.definition.tag.vilan",
+        "the `>` on its own line"
+    );
+    // THE POINT: `{` and `;` are the head's bail-out characters, and a closure
+    // value contains both. The item's parens are consumed first, so the head
+    // is still open on the line after them.
+    assert_eq!(painting.region_depth("bump", "meta.tag.vilan"), 1);
+    assert_eq!(painting.region_depth("; }", "meta.tag.vilan"), 1);
+    assert_eq!(painting.region_depth("aria-label", "meta.tag.vilan"), 1);
+    // The head's item names paint as attribute names, the event form included.
+    assert_eq!(
+        painting.scope_at("click"),
+        "entity.other.attribute-name.vilan"
+    );
+    assert_eq!(
+        painting.scope_at("aria-label"),
+        "entity.other.attribute-name.vilan"
+    );
+    // The value is ordinary expression ground inside the head.
+    assert_eq!(painting.scope_at("bump"), "entity.name.function.vilan");
+    // And the close is a tag, painted from outside the head.
+    assert_eq!(painting.region_depth("</a>", "meta.tag.vilan"), 0);
+}
+
+#[test]
+fn e164_a_self_closing_head_ends_on_its_own_slash_bracket() {
+    let Some(painting) = painting(E164_SELF_CLOSING_HEAD) else {
+        return;
+    };
+    assert_eq!(
+        painting.scopes_over("/>"),
+        vec!["punctuation.definition.tag.vilan".to_string()],
+        "` />`, the form the formatter normalises to"
+    );
+    assert_eq!(painting.region_depth("/>", "meta.tag.vilan"), 1);
+    assert_eq!(painting.region_depth("}", "meta.tag.vilan"), 0);
+}
+
+#[test]
+fn e164_a_head_that_is_really_a_comparison_gives_itself_back_at_the_statement() {
+    let Some(painting) = painting(E164_GLUED_TAG) else {
+        return;
+    };
+    // The misfire, stated rather than papered over: `<b` glued to a name and
+    // not glued to what precedes it is a head by the rule. The formatter
+    // writes `a < b`, and this shape appears nowhere in std, the corpus, the
+    // examples or the book.
+    assert_eq!(
+        painting.scope_at("<b {"),
+        "punctuation.definition.tag.vilan"
+    );
+    // And the bail-out is what keeps it to one statement — the whole reason
+    // the head region carries the generic list's three boundary characters.
+    assert_eq!(painting.region_depth("{ print", "meta.tag.vilan"), 0);
+    assert_eq!(painting.scope_at("print"), "entity.name.function.vilan");
+    assert_eq!(painting.scope_at("1;"), "constant.numeric.vilan");
+    assert_eq!(painting.region_depth("1;", "meta.tag.vilan"), 0);
 }
 
 /// The book's twin (the third place). highlight.js has no operator rule, so its
