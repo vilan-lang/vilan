@@ -149,6 +149,58 @@ struct ProjectReader {
     site: Cell<(SourceId, Span)>,
     /// What the channel did, with the site that did it — see [`ConstFact`].
     facts: RefCell<Vec<ConstFact>>,
+    /// `asset::stage`'s REGISTRY (B308): every staged contribution of the
+    /// pass, in call order, which is the one order the read-back must not use
+    /// — [`ProjectReader::staged`] orders by `(token, line)` and deduplicates
+    /// on that pair, exactly as the keyed flush does, so the answer is a
+    /// function of the SET of contributions and never of the sequence
+    /// (build-hooks.md §5.1's rule, which the registry is no exception to).
+    ///
+    /// It lives on the reader rather than in the program because the const
+    /// pass gives every site its own interpreter scopes: there is no vilan
+    /// global that can span two `const` expressions, so a module accumulating
+    /// across the build has to accumulate HERE.
+    staged: RefCell<Vec<StagedContribution>>,
+    /// The tokens the build still NAMES — the liveness set, computed once
+    /// after the last const evaluation and `None` until then. A staged
+    /// contribution survives when its token is in here, or when its token is
+    /// empty (an unconditional contribution, which nothing references because
+    /// it names nothing).
+    ///
+    /// `None` is not "nothing is live": it is "the question cannot be answered
+    /// yet", and `staged` says so rather than guessing, because until the last
+    /// site has run a token may still be about to be named.
+    live_tokens: RefCell<Option<Liveness>>,
+}
+
+/// The tokens a build still NAMES, in the two shapes a name reaches a const
+/// result in — see [`live_tokens_of`].
+#[derive(Default)]
+struct Liveness {
+    /// Every result string, and every whitespace-separated word of one. The
+    /// second is what a joined class list is: `Style::class_list` renders
+    /// `"s1ufvr2 s8myyrk"`, and a `const` whose result is that string names
+    /// two tokens, not one.
+    words: HashSet<String>,
+    /// Every result string, concatenated with a separator no token can span.
+    /// The fallback for a token a split did not isolate — a class glued into
+    /// a larger word by interpolation or `+`. Scanned only for a token the set
+    /// misses, which in practice is none.
+    text: String,
+}
+
+impl Liveness {
+    fn names(&self, token: &str) -> bool {
+        self.words.contains(token) || self.text.contains(token)
+    }
+}
+
+/// One `asset::stage` contribution: the kind it belongs to, the LIVENESS TOKEN
+/// that decides whether it survives, and the line itself.
+struct StagedContribution {
+    kind: String,
+    token: String,
+    line: String,
 }
 
 /// One thing the compile-time asset channel did, and the `const` site that did
@@ -655,6 +707,35 @@ impl interpreter::AssetReader for ProjectReader {
             }
         }
     }
+
+    fn stage(&self, kind: &str, token: &str, line: &str) {
+        self.staged.borrow_mut().push(StagedContribution {
+            kind: kind.to_string(),
+            token: token.to_string(),
+            line: line.to_string(),
+        });
+    }
+
+    fn staged(&self, kind: &str) -> Result<Vec<String>, String> {
+        let live = self.live_tokens.borrow();
+        let Some(live) = live.as_ref() else {
+            return Err(
+                "`asset::staged` reads the registry AFTER evaluation has finished, and this                  build is still evaluating — until the last `const` expression has run, a                  token it stages may still be about to be named. Read it from a function                  passed to `asset::schedule_at_end`, which is where the build runs it."
+                    .to_string(),
+            );
+        };
+        let mut surviving: Vec<(String, String)> = self
+            .staged
+            .borrow()
+            .iter()
+            .filter(|contribution| contribution.kind == kind)
+            .filter(|contribution| contribution.token.is_empty() || live.names(&contribution.token))
+            .map(|contribution| (contribution.token.clone(), contribution.line.clone()))
+            .collect();
+        surviving.sort_unstable();
+        surviving.dedup();
+        Ok(surviving.into_iter().map(|(_, line)| line).collect())
+    }
 }
 
 impl ProjectReader {
@@ -778,6 +859,8 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
         // against it: every channel call happens inside an explicit `const`.
         site: Cell::new((SourceId(0), Span::default())),
         facts: RefCell::new(Vec::new()),
+        staged: RefCell::new(Vec::new()),
+        live_tokens: RefCell::new(None),
     };
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));
@@ -785,6 +868,11 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     for &expr_id in &program.const_exprs {
         state.evaluate_one(&mut world, expr_id);
     }
+    // B308: the LIVENESS SET, computed the moment before the finalisers run
+    // and not a moment earlier — every token the build still names. See
+    // [`live_tokens_of`] for what "names" means and why this is the answer
+    // `asset::staged` gives.
+    *reader.live_tokens.borrow_mut() = Some(live_tokens_of(&state.results));
     // G23: the END of evaluation. Every finaliser the pass was asked for runs
     // here, once, in registration order — after the last `const` expression
     // above and before anything reads what the pass produced.
@@ -819,6 +907,72 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
             .map(|row| (row.source, row.name))
             .collect(),
     }
+}
+
+/// Every token the build still NAMES — `asset::staged`'s liveness predicate
+/// (B308), and the whole of what makes late emission a DROP rather than a
+/// delay.
+///
+/// A token is live when some `const` expression's result NAMES it: the token is
+/// one of that result's strings, one of the whitespace-separated words of one
+/// (`Style::class_list` renders a joined list, so a `const` ending in it names
+/// every class at once), or — the fallback, for a token glued into a larger
+/// word by interpolation or `+` — a substring of one. That is the right
+/// question for the styling case it was built for, and the argument is short:
+/// every class name is minted by
+/// `Style::rule` at const time, every `Style` that dresses an element reaches
+/// the program through a const RESULT (`class_list` and `+` are runtime code
+/// that can only read classes already in a const-built map), and a condition
+/// combinator that re-mints an inner style's rules under a composed condition
+/// DROPS the inner — so the inner's class is in no surviving value, and its
+/// rule is dead. The rules that survive are the rules of the styles the
+/// program kept.
+///
+/// It is deliberately an OVER-approximation in the safe direction. A const
+/// result later removed by dead-code elimination still names its tokens, so
+/// its rules still ship; a string that merely looks like a token keeps a rule
+/// alive. Both leave a live sheet correct and only a dead line behind, where
+/// the opposite error would delete a rule an element still wears.
+///
+/// The scan is over every result of the pass, which is also the only place it
+/// could be: a site's value is plain data by the time it lands here, so there
+/// is nothing type-shaped to consult, and nothing in the host knows what a
+/// `Style` is — which is exactly the wall lane styles-33 hit when it priced a
+/// Rust-side flush that "learns `Style` by type".
+fn live_tokens_of(results: &HashMap<Id, interpreter::ConstValue>) -> Liveness {
+    fn collect(value: &interpreter::ConstValue, into: &mut Liveness) {
+        match value {
+            interpreter::ConstValue::Str(text) => {
+                for word in text.split_whitespace() {
+                    if !into.words.contains(word) {
+                        into.words.insert(word.to_string());
+                    }
+                }
+                into.words.insert(text.clone());
+                into.text.push_str(text);
+                // A separator no token can span, so a token is never found
+                // straddling two unrelated results.
+                into.text.push('\u{1}');
+            }
+            interpreter::ConstValue::Array(items) | interpreter::ConstValue::Set(items) => {
+                for item in items {
+                    collect(item, into);
+                }
+            }
+            interpreter::ConstValue::Map(entries) => {
+                for (key, item) in entries {
+                    collect(key, into);
+                    collect(item, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut liveness = Liveness::default();
+    for value in results.values() {
+        collect(value, &mut liveness);
+    }
+    liveness
 }
 
 /// The INFERENCE sweep (const-eval.md §9): fold every `let`/`mut` initializer

@@ -465,8 +465,8 @@ slot and may be sorted freely.
 
 ## Runtime-legal operations
 
-Construction emits rules and therefore lives in `const`; these do not emit
-and work anywhere:
+Construction records rules and therefore lives in `const`; these record
+nothing and work anywhere:
 
 ```vilan,fragment
 style_a + style_b          // merge: per-property, right side wins (impl Add)

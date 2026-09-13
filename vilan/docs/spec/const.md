@@ -82,8 +82,8 @@ stops at a link whose target leaves the project — saying so, since that
 is where the command's scope ends and not a judgement about the link.
 
 A function that reaches any verb of the channel — `emit`, `emit_keyed`,
-`schedule_at_end`, `read`, `bundle`, `bundle_as`, `read_dir`,
-`read_dir_all`, `digest` — is **compile-time-only**,
+`schedule_at_end`, `stage`, `staged`, `read`, `bundle`, `bundle_as`,
+`read_dir`, `read_dir_all`, `digest` — is **compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the
 outermost crossing — the call that leaves ordinary code. A crossing
@@ -129,6 +129,19 @@ the function.
 other const fact. Under `vilan run --watch` that is the end of the
 round: what the round re-evaluated re-schedules and re-emits, and what
 it did not touch keeps the asset the previous round wrote.
+
+The hook's other half is the channel's **registry**. `stage(kind,
+token, line)` records a contribution without writing it, against a
+*liveness token*; `staged(kind)` hands back the staged lines whose
+token the build still **names** — the token appears in a value some
+`const` expression evaluated to — in `(token, line)` order and
+deduplicated on that pair. `staged` answers only after evaluation has
+finished, so it is read from a finaliser and refuses anywhere else.
+That is how `std::style` puts the rules that survived on the sheet
+instead of every rule ever constructed: a condition combinator re-mints
+an inner style's rules under the composed condition and drops the
+inner, so the inner's class is in no surviving style and its rule never
+reaches the file.
 
 ## 9.3 Failure and resource limits
 

@@ -181,6 +181,8 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 fun emit(kind: str, line: str)               // compile-time only: append to a build asset
 fun emit_keyed(kind: str, key: str, line: str)  // …with the contribution's own sort key
 fun schedule_at_end(finaliser: || void)      // compile-time only: run this when evaluation ends
+fun stage(kind: str, token: str, line: str)  // compile-time only: hold a contribution
+fun staged(kind: str): List<str>             // compile-time only: the ones whose token survived
 fun read(path: str): str                     // compile-time only: read a project file
 fun bundle(path: str): str                   // compile-time only: carry a file into the build
 fun bundle_as(path: str, url: str): str      // …at a url the path does not spell
@@ -189,7 +191,7 @@ fun read_dir_all(path: str): List<str>       // …and every file beneath it
 fun digest(path: str): str                   // compile-time only: a file's sha-256
 ```
 
-All nine callable only from `const` evaluation — a runtime call path
+All eleven callable only from `const` evaluation — a runtime call path
 to any of them is a compile error. `emit` is how `std::style` writes the CSS
 file (`emit("css", rule)`). Reach for it directly only for a shape std
 has no spelling for: a whole declaration block under a selector you
@@ -258,6 +260,26 @@ finaliser sees every contribution made after its own scheduling. An
 anonymous closure is refused — its captured scope does not outlive the
 evaluation that made it — and a finaliser that panics fails the build
 naming the function.
+
+`stage` and `staged` are the channel's REGISTRY, and what the hook is
+for. `stage(kind, token, line)` records a contribution without writing
+it; `token` is its **liveness token** — the name the rest of the build
+has to still be using for the line to be worth keeping. `staged(kind)`
+hands back the staged lines whose token the build still **names** (the
+token appears in a value some `const` expression evaluated to), in
+`(token, line)` order and deduplicated on that pair, so the answer is a
+function of the set of contributions and never of the order they were
+made in. A contribution staged with an empty token is unconditional: it
+names nothing, so nothing can stop naming it.
+
+`staged` answers only after evaluation has finished — until the last
+`const` expression has run, a token may still be about to be named — so
+it is read from a finaliser, and reading it anywhere else is a compile
+error saying so. That pairing is how `std::style` writes a stylesheet:
+every rule is staged under its class, and a condition combinator that
+re-mints an inner style's rules under a composed condition drops the
+inner, so the inner's class is in no surviving style and its rule never
+reaches the sheet.
 
 The `css` kind is the one `emit_keyed` refuses: the stylesheet is
 ordered by the cascade rather than by a contribution's key, so a key

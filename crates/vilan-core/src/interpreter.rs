@@ -280,6 +280,22 @@ pub trait AssetReader {
     /// as a tracked build input. Returns the digest and the byte count it was
     /// taken over — the interpreter charges the second (const-eval.md §3.1).
     fn digest(&self, path: &str) -> Result<(String, u64), String>;
+
+    /// `asset::stage` (B308) — a contribution held in the pass's REGISTRY
+    /// under a liveness `token`, rather than written to the kind's file. The
+    /// registry spans the whole const pass, which is what a per-site
+    /// interpreter cannot do for itself: each site gets its own scopes, so a
+    /// module has no global of its own to accumulate into and the host holds
+    /// it instead.
+    fn stage(&self, kind: &str, token: &str, line: &str);
+
+    /// `asset::staged` (B308) — the staged lines of `kind` that SURVIVED, in
+    /// `(token, line)` order and deduplicated on that pair, exactly as the
+    /// flush orders a keyed kind. `Err` is the user-facing reason the question
+    /// cannot be answered yet — which it cannot be until evaluation has
+    /// finished, since until then a token may still be named by a site not
+    /// evaluated.
+    fn staged(&self, kind: &str) -> Result<Vec<String>, String>;
 }
 
 /// Everything one const evaluation produced. The result is what the caller
@@ -1734,6 +1750,58 @@ impl<'a> Interpreter<'a> {
                     self.scheduled.push(Rc::from(name));
                 }
                 Ok(Value::Undefined)
+            }
+            // `asset::stage` / `asset::staged` (B308) — the channel's REGISTRY,
+            // and the reason G23's hook is worth having: a contribution held
+            // under a liveness TOKEN, and the surviving set read back by the
+            // finaliser that emits it. Const-only for `emit`'s reason, and
+            // host-held for a reason of its own — a const pass gives every
+            // site its own scopes, so no vilan global can span one.
+            "__stage_asset" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::stage` outside a `const` expression",
+                    ));
+                }
+                let kind = expect_str(&take(0))?;
+                let token = expect_str(&take(1))?;
+                let line = expect_str(&take(2))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(
+                        "the build's staging registry (`asset::stage`)",
+                    ));
+                };
+                reader.stage(&kind, &token, &line);
+                Ok(Value::Undefined)
+            }
+            "__staged_assets" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::staged` outside a `const` expression",
+                    ));
+                }
+                let kind = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(
+                        "the build's staging registry (`asset::staged`)",
+                    ));
+                };
+                match reader.staged(&kind) {
+                    Ok(lines) => {
+                        // Charged like a read: the lines enter the program, so
+                        // the budget bounds how much a finaliser carries
+                        // exactly as it bounds how much a `read` does.
+                        let total: usize = lines.iter().map(String::len).sum();
+                        self.charge_amount(total as u64)?;
+                        Ok(Value::Array(Rc::new(RefCell::new(
+                            lines
+                                .into_iter()
+                                .map(|line| Value::Str(line.into()))
+                                .collect(),
+                        ))))
+                    }
+                    Err(why) => Err(Failure::new(FailureKind::Thrown, why)),
+                }
             }
             // `asset::read` — the channel's input direction (docs-port.md
             // §3.3): live only under `eval_const`, like `emit`; resolution,

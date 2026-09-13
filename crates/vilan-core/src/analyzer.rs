@@ -54285,6 +54285,8 @@ fn analyze_inner<'src>(
             ("emit", "asset::emit"),
             ("emit_keyed", "asset::emit_keyed"),
             ("schedule_at_end", "asset::schedule_at_end"),
+            ("stage", "asset::stage"),
+            ("staged", "asset::staged"),
             ("read", "asset::read"),
             ("bundle", "asset::bundle"),
             ("bundle_as", "asset::bundle_as"),

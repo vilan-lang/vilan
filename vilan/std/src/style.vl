@@ -40,7 +40,7 @@
 // so a family resolves by AUTHORING order, the way every other merge here
 // does, and never by the class-name sort.
 
-import pkg::asset::emit;
+import pkg::asset::{ emit, schedule_at_end, stage, staged };
 import pkg::io::panic;
 import pkg::map::Map;
 import pkg::operators::Add;
@@ -1055,14 +1055,56 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 	rule
 }
 
+/// The end-of-evaluation finaliser (G23) that WRITES the stylesheet — the one
+/// place a class rule reaches the sheet (B308).
+///
+/// `staged("css")` hands back the rules whose CLASS the build still names: a
+/// class is minted by `rule` below and lives in the `Style` that minted it, so
+/// a class no surviving style carries is a class no element can ever wear.
+/// Every condition combinator re-mints its inner style's rules under the
+/// composed condition and drops the inner, which is exactly how an
+/// intermediate's classes stop being named — `attribute(.., hover(inner))`
+/// leaves `inner`'s own `.sY:hover{..}` staged and unreferenced, and it is
+/// dropped here instead of shipping beside the composed rule it was only ever
+/// scaffolding for.
+///
+/// The band order is `assemble_assets`' and is untouched: these lines go onto
+/// the channel exactly as they did when `rule` emitted them, and the sheet
+/// sorts them by the first byte and the media width as ever (B35,
+/// ui-styling.md §0bis.6).
+fun flush_stylesheet() {
+	for line in staged("css") {
+		emit("css", line);
+	}
+}
+
+/// Records one rendered rule against its class, and makes sure the finaliser
+/// that writes them exists. Scheduling is idempotent on the function's
+/// identity, so asking once per rule costs a set membership test and keeps the
+/// request where the contribution is — nothing has to remember to register the
+/// styling system, and a program with no styles schedules nothing.
+fun stage_rule(class: str, line: str) {
+	schedule_at_end(flush_stylesheet);
+	stage("css", class, line);
+}
+
 impl Style {
-	/// The one chokepoint: hash the slot, emit the atomic rule, insert
-	/// last-wins — across the property's whole FAMILY, so a shorthand set here
-	/// clears the longhands it covers under this condition (§0bis.4).
+	/// The one chokepoint: hash the slot, STAGE the atomic rule against its
+	/// class, insert last-wins — across the property's whole FAMILY, so a
+	/// shorthand set here clears the longhands it covers under this condition
+	/// (§0bis.4).
+	///
+	/// The rule is staged rather than emitted (B308). Emission at construction
+	/// put every `Style` ever built on the sheet, including every intermediate
+	/// a condition combinator wraps and then drops — one dead rule set per
+	/// nesting level per leaf declaration, 27.6% of the corpus stylesheet's
+	/// class-rule bytes. A rule cannot be un-emitted, so the fix is not to emit
+	/// it yet: `flush_stylesheet` above writes the staged rules whose class
+	/// survived, once, at the end of const evaluation.
 	fun rule(self, media: str, condition: str, property: str, declaration: str): Style {
 		let key = media + ":" + condition + ":" + property;
 		let class = class_hash(key + "|" + declaration);
-		emit("css", render_rule(media, condition, property, class, declaration));
+		stage_rule(class, render_rule(media, condition, property, class, declaration));
 		mut rules = without_covered(self.rules, media, condition, property);
 		rules.insert(key, (class, declaration));
 		Style { rules }

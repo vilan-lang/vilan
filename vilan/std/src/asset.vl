@@ -71,6 +71,39 @@ external fun emit_keyed(kind: str, key: str, line: str): void;
 [extern("__schedule_at_end")]
 external fun schedule_at_end(finaliser: || void): void;
 
+// The channel's REGISTRY (B308), and what the hook above is for. `stage(kind,
+// token, line)` records a contribution WITHOUT writing it: the build holds it
+// until evaluation ends, and it reaches the kind's file only if a finaliser
+// puts it there. `token` is the contribution's LIVENESS TOKEN — the name the
+// rest of the build has to still be using for the line to be worth keeping.
+//
+// `staged(kind)` is the read-back: the staged lines of `kind` whose token the
+// build still NAMES — a token appears in a value some `const` expression
+// evaluated to — in `(token, line)` order and deduplicated on that pair, the
+// same order and the same dedup the keyed flush uses, so the answer is a
+// function of the SET of contributions and never of the order they were made
+// in. A contribution staged with an empty token is unconditional: it names
+// nothing, so nothing can stop naming it.
+//
+// It answers only AFTER evaluation has finished — until the last `const`
+// expression has run, a token may still be about to be named — so it is read
+// from a function passed to `schedule_at_end` and reading it anywhere else is
+// a compile error saying so. That pairing is the mechanism: a module stages
+// while the program evaluates, and its finaliser emits what survived.
+//
+// This is how `std::style` writes a stylesheet. Every rule is staged under
+// its class; a condition combinator that re-mints an inner style's rules under
+// a composed condition drops the inner, so the inner's class is in no
+// surviving style and its rule never reaches the sheet.
+//
+// Compile-time-only, exactly like `emit`.
+
+[extern("__stage_asset")]
+external fun stage(kind: str, token: str, line: str): void;
+
+[extern("__staged_assets")]
+external fun staged(kind: str): List<str>;
+
 [extern("__read_asset")]
 external fun read(path: str): str;
 

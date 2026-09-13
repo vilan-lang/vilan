@@ -6815,3 +6815,155 @@ fn scheduling_a_finaliser_outside_a_const_expression_is_refused() {
         "asset::schedule_at_end",
     );
 }
+
+// --- B308: the sheet holds the rules the program KEPT ------------------------
+// `Style::rule` stages its rule against its class and the scheduled finaliser
+// emits the ones whose class the build still names, so an intermediate style a
+// condition combinator wrapped and dropped never reaches the stylesheet.
+
+#[test]
+fn a_nested_condition_emits_the_composed_rule_and_not_its_scaffolding() {
+    // B308's own exhibit. `attribute(.., hover(inner))` mints THREE classes —
+    // `inner`'s base rule, `hover(inner)`'s, and the composed one — and drops
+    // the first two as it goes, so only the third can ever be on an element.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Color, Style };
+        import std::option::Option::Some;
+        fun s(): Style {
+            style().attribute(
+                "data-open",
+                Some("true"),
+                style().hover(style().color(Color::gray(50))),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let rules: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        rules,
+        vec![".sq42fek[data-open=\"true\"]:hover{color:var(--gray-50)}"],
+        "{assets:?}"
+    );
+    // The token line the composed rule needs is unconditional and still there:
+    // it names no class, so nothing can stop naming it.
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--gray-50:#f9fafb}".to_string())),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_standalone_condition_style_still_emits_when_it_is_itself_applied() {
+    // The control that keeps the drop honest: the same `hover(..)` rule that
+    // is scaffolding above is the WHOLE style here, its class is on the
+    // element, and it ships.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Color, Style };
+        fun s(): Style {
+            style().hover(style().color(Color::gray(50)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let rules: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        rules,
+        vec![".s1civwyy:hover{color:var(--gray-50)}"],
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_slot_a_shorthand_covered_never_reaches_the_sheet() {
+    // styles-33's F4, closed by the same mechanism: `without_covered` drops
+    // the longhand's slot from the style, so its class is named by nothing and
+    // its rule is dropped with it. The shorthand's rule is what ships.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().padding_top(space(2)).padding(space(4))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let rules: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        rules,
+        vec!["*.s1ufvr2{padding:var(--space-4)}"],
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn the_registry_cannot_be_read_before_evaluation_has_finished() {
+    // `asset::staged` answers "which of these tokens does the build still
+    // name?", and until the last `const` expression has run the answer is not
+    // yet a fact. Refused, naming the hook that IS the right place to ask.
+    assert_fails_with(
+        r#"
+        import std::asset::{ stage, staged };
+        fun contribute(): i32 {
+            stage("probe", "token", "line");
+            staged("probe").len()
+        }
+        let _contributed = const contribute();
+        fun main() {}
+        main();
+        "#,
+        "reads the registry AFTER evaluation has finished",
+    );
+}
+
+#[test]
+fn a_staged_contribution_survives_when_the_build_still_names_its_token() {
+    // The registry's own rule, away from styling: the token decides. One
+    // contribution's token is the value the program keeps, the other's is a
+    // string nothing names.
+    let assets = collected_assets(
+        r#"
+        import std::asset::{ emit, schedule_at_end, stage, staged };
+        fun flush() {
+            for line in staged("probe") {
+                emit("probe", line);
+            }
+        }
+        fun contribute(): str {
+            schedule_at_end(flush);
+            stage("probe", "kept", "the kept line");
+            stage("probe", "dropped", "the dropped line");
+            "kept"
+        }
+        let _kept = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    let probe: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, _)| kind == "probe")
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(probe, vec!["the kept line"], "{assets:?}");
+}
