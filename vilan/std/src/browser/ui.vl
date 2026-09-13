@@ -33,8 +33,10 @@ import pkg::dom::{
 	Element,
 	Event,
 	Text,
+	create_document_fragment,
 	create_element,
 	create_element_ns,
+	create_range,
 	create_text_node,
 	get_element_by_id,
 	request_animation_frame,
@@ -340,82 +342,17 @@ impl View {
 	/// skips unchanged ones, and the only one that needs both bounds. Two
 	/// siblings drop one bound each (A42): `bind_each_values` keys by the item
 	/// itself, and `bind_each_by` keys by `key` and asks nothing of `T` at all.
-	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
+	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 		self,
 		source: S,
 		key: sync |T| K,
-		render: (sync |T| View) context owner_scope,
+		render: (sync |T| C) context owner_scope,
 	): View {
-		// The rows keep THIS position among the parent's children (A71): the
-		// call sits where they belong, so the anchor goes down now and every
-		// row is inserted before it.
-		let region = Region::open(self);
-		let row_keys: Shared<List<K>> = Shared::new([]);
-		let row_items: Shared<List<T>> = Shared::new([]);
-		let row_views: Shared<List<View>> = Shared::new([]);
-		let row_owners: Shared<List<Owner>> = Shared::new([]);
-		// Whichever rows are live when the enclosing boundary is disposed go
-		// with it, and the anchor goes with them.
-		get_owner().defer(|| {
-			for owner in row_owners.read() {
-				owner.dispose();
-			}
-			region.close();
-		});
-		source.effect(|list: List<T>| {
-			let plan = reconcile(row_keys.read(), row_items.read(), list, key, |before, after| {
-				before == after
-			});
-			let previous_views = row_views.read();
-			let previous_owners = row_owners.read();
-			for index in plan.removed {
-				previous_owners[index].dispose();
-				previous_views[index].element.remove();
-			}
-			mut next_views: List<View> = [];
-			mut next_owners: List<Owner> = [];
-			mut position = 0;
-			for step in plan.steps {
-				let item = list[position];
-				match step {
-					RowStep::Keep(let index) => {
-						next_views.push(previous_views[index]);
-						next_owners.push(previous_owners[index]);
-					},
-					RowStep::Refresh(let index) => {
-						previous_owners[index].dispose();
-						previous_views[index].element.remove();
-						let owner = Owner::new();
-						next_views.push(run_with_owner(owner, || render(item)));
-						next_owners.push(owner);
-					},
-					RowStep::Fresh => {
-						let owner = Owner::new();
-						next_views.push(run_with_owner(owner, || render(item)));
-						next_owners.push(owner);
-					},
-				}
-				position += 1;
-			}
-			// The order pass: place each row in the new order, before the
-			// region's anchor — re-inserting a kept element moves it; a fresh
-			// one inserts.
-			for row in next_views {
-				region.insert(row);
-			}
-			// A88: the region holds the run it now shows, so a disposal in a
-			// parent that survives takes these rows out of the document.
-			region.hold(next_views);
-			mut next_keys: List<K> = [];
-			for item in list {
-				next_keys.push(key(item));
-			}
-			row_keys.write() = next_keys;
-			row_items.write() = list;
-			row_views.write() = next_views;
-			row_owners.write() = next_owners;
-		});
-		self
+		// A85: one line of sugar over the value form. `child` places at this
+		// element's current end, which is where the method's own region always
+		// went — so every call site keeps its meaning, and a run that must sit
+		// BETWEEN siblings is written `{each(..)}` in a child hole instead.
+		self.child(each(source, key, render))
 	}
 
 	/// A reactive list keyed by the ITEM ITSELF — `bind_each` with the key
@@ -427,12 +364,12 @@ impl View {
 	/// what a type carrying a closure has to do — was a second copy of the same
 	/// decision. Semantically identical to `bind_each(source, |item| item,
 	/// render)`, and the same disposal boundary per row.
-	fun bind_each_values<T: PartialEq, S: Source<List<T>>>(
+	fun bind_each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 		self,
 		source: S,
-		render: (sync |T| View) context owner_scope,
+		render: (sync |T| C) context owner_scope,
 	): View {
-		self.bind_each(source, |item| item, render)
+		self.child(each_values(source, render))
 	}
 
 	/// A reactive list keyed by `key`, whose rows UPDATE THROUGH A CELL instead
@@ -458,140 +395,30 @@ impl View {
 	/// PARAMETER cannot be typed by a trait, only by a concrete type or a
 	/// generic. Treat it as read-only — writing it desynchronizes the row from
 	/// the list until the next reconcile.
-	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>>(
+	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 		self,
 		source: S,
 		key: sync |T| K,
-		render: (sync |SignalCell<T>| View) context owner_scope,
+		render: (sync |SignalCell<T>| C) context owner_scope,
 	): View {
-		// A region at this position, exactly as `bind_each` opens one (A71).
-		let region = Region::open(self);
-		let row_keys: Shared<List<K>> = Shared::new([]);
-		let row_items: Shared<List<T>> = Shared::new([]);
-		let row_cells: Shared<List<SignalCell<T>>> = Shared::new([]);
-		let row_views: Shared<List<View>> = Shared::new([]);
-		let row_owners: Shared<List<Owner>> = Shared::new([]);
-		// Whichever rows are live when the enclosing boundary is disposed go
-		// with it, exactly as `bind_each`'s do.
-		get_owner().defer(|| {
-			for owner in row_owners.read() {
-				owner.dispose();
-			}
-			region.close();
-		});
-		source.effect(|list: List<T>| {
-			// A surviving key is ALWAYS kept: the row's cell carries the new
-			// item, so there is nothing for a `Refresh` to rebuild.
-			let plan = reconcile(row_keys.read(), row_items.read(), list, key, |_before, _after| {
-				true
-			});
-			let previous_cells = row_cells.read();
-			let previous_views = row_views.read();
-			let previous_owners = row_owners.read();
-			for index in plan.removed {
-				previous_owners[index].dispose();
-				previous_views[index].element.remove();
-			}
-			mut next_cells: List<SignalCell<T>> = [];
-			mut next_views: List<View> = [];
-			mut next_owners: List<Owner> = [];
-			mut position = 0;
-			for step in plan.steps {
-				let item = list[position];
-				match step {
-					RowStep::Keep(let index) => {
-						let cell = previous_cells[index];
-						cell.set(item);
-						next_cells.push(cell);
-						next_views.push(previous_views[index]);
-						next_owners.push(previous_owners[index]);
-					},
-					// Unreachable: `same` above is constantly true, so
-					// `reconcile` never refreshes here. Kept in step with
-					// `Keep` rather than left to rot differently.
-					RowStep::Refresh(let index) => {
-						let cell = previous_cells[index];
-						cell.set(item);
-						next_cells.push(cell);
-						next_views.push(previous_views[index]);
-						next_owners.push(previous_owners[index]);
-					},
-					RowStep::Fresh => {
-						let cell: SignalCell<T> = SignalCell::new(item);
-						let owner = Owner::new();
-						next_cells.push(cell);
-						next_views.push(run_with_owner(owner, || render(cell)));
-						next_owners.push(owner);
-					},
-				}
-				position += 1;
-			}
-			// The order pass, before the region's anchor: re-inserting a kept
-			// element moves it; a fresh one inserts.
-			for row in next_views {
-				region.insert(row);
-			}
-			// A88: the region holds the run it now shows, so a disposal in a
-			// parent that survives takes these rows out of the document.
-			region.hold(next_views);
-			mut next_keys: List<K> = [];
-			for item in list {
-				next_keys.push(key(item));
-			}
-			row_keys.write() = next_keys;
-			row_items.write() = list;
-			row_cells.write() = next_cells;
-			row_views.write() = next_views;
-			row_owners.write() = next_owners;
-		});
-		self
+		self.child(each_by(source, key, render))
 	}
 
 	/// Conditional CONTENT — the state-dropping boundary: while `condition` is
 	/// true the body's view is mounted under a fresh owner; when it turns
 	/// false the owner is disposed and the content removed. Toggling back on
 	/// re-renders from scratch. (For a state-PRESERVING toggle, use `show`.)
-	fun when<S: Source<bool>>(self, condition: S, body: (sync || View) context owner_scope): View {
-		// The body lands at THIS position among the parent's children (A71),
-		// not at the end: the call sits where the conditional content
-		// belongs, so a `when` between two static siblings toggles on between
-		// them however the chain continues afterwards.
-		let region = Region::open(self);
-		let live_view: Shared<Option<View>> = Shared::new(None);
-		let live_owner: Shared<Option<Owner>> = Shared::new(None);
-		// Live content dies with the enclosing boundary, and the anchor with
-		// it.
-		get_owner().defer(|| {
-			live_owner.read()?.dispose();
-			region.close();
-		});
-		condition.effect(|on| {
-			if on {
-				match live_view.read() {
-					Some(let _present) => {},
-					None => {
-						let owner = Owner::new();
-						let built = run_with_owner(owner, body);
-						region.insert(built);
-						region.hold([built]);
-						live_view.write() = Some(built);
-						live_owner.write() = Some(owner);
-					},
-				}
-			} else {
-				match live_view.read() {
-					Some(let built) => {
-						live_owner.read()?.dispose();
-						built.element.remove();
-						region.hold([]);
-						live_view.write() = None;
-						live_owner.write() = None;
-					},
-					None => {},
-				}
-			}
-		});
-		self
+	fun when<S: Source<bool>, C: Slot>(
+		self,
+		condition: S,
+		body: (sync || C) context owner_scope,
+	): View {
+		// A85: sugar over the value form, exactly as `bind_each` is. The
+		// VALUE is constructed here rather than through the free `when`
+		// because a method name shadows a module-level function of the same
+		// name inside its own `impl` block — `when(condition, body)` in here
+		// is this method, one argument short.
+		self.child(Conditional { condition, body })
 	}
 
 	/// The dynamic-subtree SWAP (backlog A10) — `when`, generalized from a
@@ -611,45 +438,14 @@ impl View {
 	/// reconciliation that leaked the impl's own parameter there. `swap`,
 	/// `swap_split` and `chunk_preload` declare the same generics in the same
 	/// ORDER, because the split gate rebinds their type arguments by position.
-	fun swap<T: PartialEq, S: Source<T>>(
+	fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 		self,
 		source: S,
-		render: (sync |T| View) context owner_scope,
+		render: (sync |T| C) context owner_scope,
 	): View {
-		// The rendered subtree keeps THIS position among the parent's
-		// children (A71): a page container between a header and a footer
-		// stays between them across every navigation.
-		let region = Region::open(self);
-		let last_value: Shared<Option<T>> = Shared::new(None);
-		let live_view: Shared<Option<View>> = Shared::new(None);
-		let live_owner: Shared<Option<Owner>> = Shared::new(None);
-		// The live subtree dies with the enclosing boundary, and the anchor
-		// with it.
-		get_owner().defer(|| {
-			live_owner.read()?.dispose();
-			region.close();
-		});
-		source.effect(|value: T| {
-			let unchanged = match last_value.read() {
-				Some(let previous) => previous == value,
-				None => false,
-			};
-			if !unchanged {
-				live_owner.read()?.dispose();
-				match live_view.read() {
-					Some(let built) => built.element.remove(),
-					None => {},
-				}
-				let owner = Owner::new();
-				let built = run_with_owner(owner, || render(value));
-				region.insert(built);
-				region.hold([built]);
-				last_value.write() = Some(value);
-				live_view.write() = Some(built);
-				live_owner.write() = Some(owner);
-			}
-		});
-		self
+		// A85: sugar over the value form — the literal, for the shadowing
+		// reason `when` above records.
+		self.child(Swap { source, render, gated = None, armed = Shared::new(true), wire = || {} })
 	}
 
 	/// Run `action` with this element once it is IN THE DOCUMENT (backlog
@@ -790,53 +586,13 @@ impl View {
 	/// In a build with no chunk map — every single-file build, which is every
 	/// build that did not ask to split — `chunk_ready` is true for every arm
 	/// and this is `swap`, one derived signal deeper.
-	fun swap_split<T: PartialEq, S: Source<T>>(
+	fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 		self,
 		source: S,
-		render: (sync |T| View) context owner_scope,
+		render: (sync |T| C) context owner_scope,
 	): View {
-		let gated: SignalCell<T> = SignalCell::new(source.get());
-		let wired: Shared<bool> = Shared::new(false);
-		let generation: Shared<i32> = Shared::new(0);
-		let advance = |value: T| {
-			gated.set(value);
-			if !wired.read() {
-				wired.write() = true;
-				let _mounted = self.swap(gated, render);
-			}
-		};
-		source.effect(|value: T| {
-			// Claim this navigation's generation before anything can await, so
-			// a continuation can tell whether it is still the latest.
-			let mine = generation.read() + 1;
-			generation.write() = mine;
-			clear_chunk_error();
-			let arm = chunk_arm(value);
-			if chunk_ready(arm) {
-				// Navigating BACK to loaded code while something is in flight
-				// ends the wait: that fetch has just been superseded, and its
-				// arrival is dropped by the generation guard below.
-				set_chunk_pending(false);
-				advance(value);
-			} else {
-				set_chunk_pending(true);
-				// The continuation lands outside every turn, so it opens its
-				// own — the navigation's DOM work settles as one wave, exactly
-				// as an event handler's would.
-				chunk_load(arm, || turn(FlushPolicy::AtSuspension, || {
-					if generation.read() == mine {
-						set_chunk_pending(false);
-						advance(value);
-					}
-				}), |reason: str| turn(FlushPolicy::AtSuspension, || {
-					if generation.read() == mine {
-						set_chunk_pending(false);
-						chunk_error_signal.set(Some(reason));
-					}
-				}));
-			}
-		});
-		self
+		// A85: sugar over the value form, which is where the gate now lives.
+		self.child(split_route(source, render))
 	}
 }
 
@@ -980,9 +736,29 @@ fun clear_chunk_error() {
 /// them. Nothing in this order changes a signature.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 struct Region {
-	parent: Element,
 	anchor: Text,
 	live: Shared<List<View>>,
+	rows: Shared<List<Row>>,
+}
+
+/// One ROW of a region — the unit a reconciler moves, refreshes and removes.
+///
+/// A row is not an element and not even a fixed set of nodes. Since A91 a
+/// render closure may yield any `Slot`, so a row can be a fragment, a text
+/// node, or a value form that GROWS after it was placed (a `when` inside a row
+/// inserts its body before its own anchor, which no snapshot taken at build
+/// time could know about). What IS stable is the row's leading MARKER — an
+/// empty text node planted immediately before the row's first node — so a
+/// row's extent is "everything after my marker, up to the next boundary", and
+/// the next boundary is the next row's marker or the region's own anchor.
+///
+/// That marker is the one node a row costs beyond its content, and it is the
+/// price of a row whose shape is the app's business rather than std's.
+/// KEEP IN STEP with the process twin's copy (process/ui.vl), where a row is
+/// nothing at all: a server render is one pass in source order, so a row IS
+/// wherever it was written.
+struct Row {
+	marker: Text,
 }
 
 impl Region {
@@ -991,14 +767,75 @@ impl Region {
 	fun open(parent: View): Region {
 		let anchor = create_text_node("");
 		parent.element.append_text(anchor);
-		Region { parent = parent.element, anchor, live = Shared::new([]) }
+		Region { anchor, live = Shared::new([]), rows = Shared::new([]) }
+	}
+
+	/// The element the region currently sits in, read off the anchor rather
+	/// than remembered.
+	///
+	/// That is not an economy, it is the correctness condition A91 needs: a
+	/// region opened INSIDE a row is built in a detached staging parent and
+	/// then planted, and the row is re-inserted on every order pass — so a host
+	/// captured at `open` would be a parent the content has since left, and a
+	/// `when` inside a row would go on toggling into a fragment nobody can see.
+	/// The anchor IS the region's identity; wherever it is, that is where the
+	/// region's content belongs.
+	fun host(self): Element {
+		self.anchor.parent_element()
 	}
 
 	/// Puts `child` at the end of the region, before the anchor. A child that
 	/// is already in the document MOVES, which is what makes this the order
 	/// pass for a reconciled run as well as the insert for a fresh one.
 	fun insert(self, child: View) {
-		self.parent.insert_before(child.element, self.anchor);
+		self.host().insert_before(child.element, self.anchor);
+	}
+
+	/// Places `content` as a NEW ROW at the end of the region, and returns the
+	/// handle the reconciler moves it by (A91).
+	///
+	/// The content is built into a detached fragment first and planted whole.
+	/// That is not an optimisation: `Slot::place` appends to the parent it is
+	/// handed, and appending to the real parent would land the row AFTER the
+	/// region's anchor. A fragment is a parent whose end is the row's own end,
+	/// so a nested region's anchor goes down inside the row, the row's later
+	/// growth stays inside it, and one `insert_before` puts the finished run
+	/// where the marker says.
+	fun open_row<C: Slot>(self, content: C): Row {
+		let marker = create_text_node("");
+		self.host().insert_text_before(marker, self.anchor);
+		let staging = create_document_fragment();
+		content.place(View { element = staging });
+		self.host().insert_before(staging, self.anchor);
+		Row { marker }
+	}
+
+	/// Takes the row's CURRENT nodes out of the document, as a fragment.
+	///
+	/// `end` is whatever bounds the row on the right in the document order
+	/// being read — the next row's marker, or this region's anchor for the
+	/// last row. The marker itself stays where it is, so a whole run can be cut
+	/// row by row before anything moves: every boundary is still meaningful.
+	fun cut_row(self, row: Row, end: Text): Element {
+		let range = create_range();
+		range.set_start_after(row.marker);
+		range.set_end_before(end);
+		range.extract_contents()
+	}
+
+	/// Puts a cut row back at the end of the region: its marker first, then
+	/// its nodes. Re-inserting the marker MOVES it, so this is the order pass
+	/// — the per-row `insert` of a run whose rows are single elements, widened
+	/// to a run of any shape.
+	fun insert_row(self, row: Row, content: Element) {
+		self.host().insert_text_before(row.marker, self.anchor);
+		self.host().insert_before(content, self.anchor);
+	}
+
+	/// Drops a row that is going away: its content has already been cut out,
+	/// so what is left is the marker.
+	fun drop_row(self, row: Row) {
+		row.marker.remove();
 	}
 
 	/// Records the run that is live in this region, for `close` to remove
@@ -1006,19 +843,42 @@ impl Region {
 	/// bookkeeping — after the order pass, after an instantiation, after a
 	/// swap — so the two can never disagree; an empty run is the right answer
 	/// for a `when` that is off.
+	///
+	/// Two spellings, and they are never both non-empty: `hold` is for the
+	/// three reactive CHILD arms, which place exactly the views they were
+	/// handed and so cost no marker, and `hold_rows` is for the forms whose
+	/// content is a `Slot` of the app's choosing (A91).
 	fun hold(self, live: List<View>) {
 		self.live.write() = live;
+	}
+
+	/// Records the ROWS that are live in this region, for `close` (A91).
+	fun hold_rows(self, rows: List<Row>) {
+		self.rows.write() = rows;
 	}
 
 	/// Takes the region out of the document: every live node, then the
 	/// anchor (A88). Called from the `defer` each form registers with the
 	/// enclosing boundary, so the content and the marker die with it rather
 	/// than outliving it in a parent that survives.
+	///
+	/// A row is cut by its span rather than removed node by node, for the
+	/// reason `Row` records: whatever a row's `Slot` placed, and whatever it
+	/// grew afterwards, lies between its marker and the next boundary.
 	fun close(self) {
 		for view in self.live.read() {
 			view.element.remove();
 		}
 		self.live.write() = [];
+		let rows = self.rows.read();
+		mut at = 0;
+		for row in rows {
+			let end = if at + 1 < rows.len() { rows[at + 1].marker } else { self.anchor };
+			let _cut = self.cut_row(row, end);
+			self.drop_row(row);
+			at += 1;
+		}
+		self.rows.write() = [];
 		self.anchor.remove();
 	}
 }
@@ -1168,6 +1028,547 @@ impl type S: Source<List<View>> with Slot {
 			live.write() = next;
 		});
 	}
+}
+// === The positional value forms (A85) ======================================
+//
+// `when`, `swap`, `each`, `each_values` and `each_by` as VALUES that fill a
+// CHILD POSITION, instead of methods that append to a parent. Each is a struct
+// holding its source and its closures, and each `impl .. with Slot` opens its
+// `Region` (A71) where `place` runs — which is where the `{hole}` sits — so a
+// conditional or a keyed run reads as one child among its siblings:
+//
+//     <ul>{header}{each(items, key, row)}{when(more, || footer_row())}</ul>
+//
+// The five METHODS on `View` are one-line sugar over these (`self.child(..)`),
+// and every existing call site keeps its meaning: `child` places at the
+// parent's current end, which is exactly where the method's region went
+// anyway. Reach for the method when this element's content IS the conditional
+// or the run; reach for the value when it is one child among others.
+//
+// THE CLOSURES ARE FIELDS, not type parameters (positional-slots.md §3a), and
+// that is load-bearing: a helper returning one of these has to be able to NAME
+// the type (`fun account(): Conditional<SignalCell<bool>>`), and a type
+// parameterized by a closure's own type is unnameable. A body field carries its
+// `context` clause (B309) WITHOUT the `sync` marker — `sync` is parameter-only
+// by design (it refuses an async ARGUMENT, and a plain closure field already
+// refuses an async store) — so each constructor below takes the marked closure
+// as a PARAMETER and lands it in the unmarked field. The clause is what makes
+// §3e's "ownership unchanged" true: the body answers to the owner ambient at
+// `place`, not to whichever one happened to be ambient where the value was
+// BUILT (a plain closure field captures at CREATION — measured, and pinned as
+// this one's control).
+// KEEP IN STEP with the process twin's copy (process/ui.vl).
+
+/// Conditional content as a child — `View::when`'s value form.
+struct Conditional<S: Source<bool>, C: Slot> {
+	condition: S,
+	body: (|| C) context owner_scope,
+}
+
+/// A dynamic subtree as a child — `View::swap`'s value form.
+///
+/// `gated`, `armed` and `wire` are the ROUTE GATE's, not a user's
+/// (proposal/bundle-splitting.md §2): a `split = true` build's recognizer
+/// retargets the recognized `swap(route, |current| match current { .. })` call
+/// to `swap_split` below, which BUILDS the gate — a cell that does not advance
+/// until the arm's code has landed, and the closure that drives it — and
+/// `place` runs that closure under the boundary the hole sits in.
+///
+/// The gate travels as a closure FIELD rather than being wired at construction
+/// for two reasons, both load-bearing. (1) The retargeted call must have the
+/// same emitted shape as the call it replaces, hidden context arguments
+/// included; a `swap_split` that subscribed at construction would be a
+/// needs-context node where `swap` is not, and the emitted call would arrive
+/// one argument short. (2) `place` then names nothing chunk-shaped — an
+/// ordinary build constructs `wire = || {}` and the whole machinery stays
+/// unreferenced, which is what keeps a flagless build emitting what it always
+/// did (§4).
+struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
+	source: S,
+	render: (|T| C) context owner_scope,
+	gated: Option<SignalCell<T>>,
+	armed: Shared<bool>,
+	wire: (|| void) context owner_scope,
+}
+
+/// A keyed reactive run as a child — `View::bind_each`'s value form.
+struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
+	source: S,
+	key: |T| K,
+	render: (|T| C) context owner_scope,
+}
+
+/// A run keyed by the ITEM ITSELF, as a child (A42).
+struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
+	source: S,
+	render: (|T| C) context owner_scope,
+}
+
+/// A run whose rows update through a cell, as a child (A42).
+struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
+	source: S,
+	key: |T| K,
+	render: (|SignalCell<T>| C) context owner_scope,
+}
+
+/// Conditional CONTENT at THIS position: while `condition` is true the body's
+/// view is mounted under a fresh owner; when it turns false the owner is
+/// disposed and the content removed. The value form of `View::when` — write it
+/// in a child hole when the conditional is one child among siblings.
+fun when<S: Source<bool>, C: Slot>(
+	condition: S,
+	body: (sync || C) context owner_scope,
+): Conditional<S, C> {
+	Conditional { condition, body }
+}
+
+/// The dynamic subtree at THIS position: whenever `source` CHANGES the previous
+/// subtree is disposed and `render` builds the new one under a fresh owner. The
+/// value form of `View::swap`.
+fun swap<T: PartialEq, S: Source<T>, C: Slot>(
+	source: S,
+	render: (sync |T| C) context owner_scope,
+): Swap<T, S, C> {
+	Swap { source, render, gated = None, armed = Shared::new(true), wire = || {} }
+}
+
+/// `swap`, gated on the route's chunk — the value form of `View::swap_split`,
+/// and what the split recognizer retargets a recognized `swap` VALUE to
+/// (`chunks.rs`). It declares the same generics in the same ORDER as `swap`,
+/// because the gate rebinds the call's type arguments by position. An app never
+/// writes it.
+///
+/// The gate is BUILT here and run at `place`, so `place` names nothing
+/// chunk-shaped: a build that did not ask to split never reaches this function,
+/// and none of the machinery below is emitted at all.
+fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
+	source: S,
+	render: (sync |T| C) context owner_scope,
+): Swap<T, S, C> {
+	split_route(source, render)
+}
+
+/// The gate itself, under a name no `View` method shadows — `View::swap_split`
+/// cannot call the free `swap_split` from inside its own `impl` block, where
+/// that name is the method.
+///
+/// The gate is BUILT here and RUN at `place`. Nothing subscribes in this
+/// function, deliberately: the retargeted call must have the same emitted shape
+/// as the `swap` call it replaces, hidden context arguments included, and a
+/// needs-context `swap_split` standing in for a context-free `swap` would
+/// arrive one argument short.
+fun split_route<T: PartialEq, S: Source<T>, C: Slot>(
+	source: S,
+	render: (sync |T| C) context owner_scope,
+): Swap<T, S, C> {
+	let gated: SignalCell<T> = SignalCell::new(source.get());
+	// `place` renders nothing until the gate has advanced at least once: on
+	// boot the route's chunk may still be in flight, and the arm's code is not
+	// there to build with.
+	let armed: Shared<bool> = Shared::new(false);
+	let generation: Shared<i32> = Shared::new(0);
+	// The clause is written out so the NEED does not leak into this function's
+	// own signature: `advance` writes a signal, which wants the ambient turn,
+	// and a `split_route` that took one would be a wider emitted shape than the
+	// `swap` call the gate replaces. Every call below stands in a turn.
+	let advance: (|T| void) context turn_scope = |value: T| {
+		armed.write() = true;
+		gated.set(value);
+	};
+	// Built here, RUN at `place`: the closure carries only the owner clause, so
+	// this function needs no context of its own and the retargeted call keeps
+	// the emitted shape of the `swap` call it replaces.
+	//
+	// Each navigation opens ITS OWN turn — the gate's writes (the pending flag,
+	// the gated route) settle as one wave, exactly as the two chunk-arrival
+	// continuations below have always done, and exactly as an event handler's
+	// would. Threading an ambient turn in from the build instead is what made
+	// this function a context node, which the gate cannot afford.
+	let wire: (|| void) context owner_scope = || {
+		source.effect(|value: T| turn(FlushPolicy::AtSuspension, || {
+			// Claim this navigation's generation before anything can await, so
+			// a continuation can tell whether it is still the latest.
+			let mine = generation.read() + 1;
+			generation.write() = mine;
+			clear_chunk_error();
+			let arm = chunk_arm(value);
+			if chunk_ready(arm) {
+				// Navigating BACK to loaded code while something is in flight
+				// ends the wait: that fetch has just been superseded, and its
+				// arrival is dropped by the generation guard below.
+				set_chunk_pending(false);
+				advance(value);
+			} else {
+				set_chunk_pending(true);
+				chunk_load(arm, || turn(FlushPolicy::AtSuspension, || {
+					if generation.read() == mine {
+						set_chunk_pending(false);
+						advance(value);
+					}
+				}), |reason: str| turn(FlushPolicy::AtSuspension, || {
+					if generation.read() == mine {
+						set_chunk_pending(false);
+						chunk_error_signal.set(Some(reason));
+					}
+				}));
+			}
+		}));
+	};
+	Swap { source, render, gated = Some(gated), armed, wire }
+}
+
+/// A keyed reactive run at THIS position — `View::bind_each`'s rows as a child.
+///
+/// Named `each` and not `bind_each`: the `bind_` prefix means "one property
+/// kept in sync" on every other method in this module, and a value that IS a
+/// child has no property to bind. `{each(items, key, row)}` reads as markup
+/// where `{bind_each(..)}` reads as a setter that has escaped.
+fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	source: S,
+	key: sync |T| K,
+	render: (sync |T| C) context owner_scope,
+): Each<T, K, S, C> {
+	Each { source, key, render }
+}
+
+/// A run keyed by the ITEM ITSELF, as a child (A42).
+fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
+	source: S,
+	render: (sync |T| C) context owner_scope,
+): EachValues<T, S, C> {
+	EachValues { source, render }
+}
+
+/// A run whose rows update through a cell, as a child (A42).
+fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	source: S,
+	key: sync |T| K,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+): EachBy<T, K, S, C> {
+	EachBy { source, key, render }
+}
+
+impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		// The body lands at THIS position among the parent's children (A71),
+		// not at the end: the hole sits where the conditional content belongs,
+		// so a `when` between two static siblings toggles on between them
+		// however the chain continues afterwards.
+		let region = Region::open(parent);
+		let live_row: Shared<Option<Row>> = Shared::new(None);
+		let live_owner: Shared<Option<Owner>> = Shared::new(None);
+		// Live content dies with the enclosing boundary, and the anchor with
+		// it.
+		get_owner().defer(|| {
+			live_owner.read()?.dispose();
+			region.close();
+		});
+		self.condition.effect(|on| {
+			if on {
+				match live_row.read() {
+					Some(let _present) => {},
+					None => {
+						let owner = Owner::new();
+						// The body's own owner is established HERE, at the
+						// call — the clause on the field is what carries the
+						// requirement this far (B309) — and the PLACE runs
+						// under it too, so whatever the body's `Slot` registers
+						// (a nested region's `defer`, above all) dies with the
+						// instantiation rather than with the enclosing
+						// boundary (A91).
+						let row = run_with_owner(owner, || region.open_row((self.body)()));
+						region.hold_rows([row]);
+						live_row.write() = Some(row);
+						live_owner.write() = Some(owner);
+					},
+				}
+			} else {
+				match live_row.read() {
+					Some(let row) => {
+						live_owner.read()?.dispose();
+						// The instantiation is a ROW, not an element: its body
+						// may be a fragment, a text node or a value form that
+						// grew after it was placed, so it leaves by its span.
+						let _cut = region.cut_row(row, region.anchor);
+						region.drop_row(row);
+						region.hold_rows([]);
+						live_row.write() = None;
+						live_owner.write() = None;
+					},
+					None => {},
+				}
+			}
+		});
+	}
+}
+
+impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		// The route gate, when there is one — a no-op closure otherwise. It runs
+		// under the boundary this hole sits in, so its subscription dies with
+		// everything else `place` registers.
+		(self.wire)();
+		match self.gated {
+			Some(let gated) => place_swap(parent, gated, self.render, self.armed),
+			None => place_swap(parent, self.source, self.render, self.armed),
+		}
+	}
+}
+
+impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_each(parent, self.source, self.key, self.render);
+	}
+}
+
+impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_each(parent, self.source, |item| item, self.render);
+	}
+}
+
+impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_each_by(parent, self.source, self.key, self.render);
+	}
+}
+
+/// `swap`'s body, against a region opened at `parent`'s current end — shared by
+/// the value form and, through it, by `View::swap`. `armed` is the route gate's
+/// hold (see `Swap`): `true` for every ordinary swap.
+fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
+	parent: View,
+	source: S,
+	render: (sync |T| C) context owner_scope,
+	armed: Shared<bool>,
+) {
+	// The rendered subtree keeps THIS position among the parent's children
+	// (A71): a page container between a header and a footer stays between them
+	// across every navigation.
+	let region = Region::open(parent);
+	let last_value: Shared<Option<T>> = Shared::new(None);
+	let live_row: Shared<Option<Row>> = Shared::new(None);
+	let live_owner: Shared<Option<Owner>> = Shared::new(None);
+	// The live subtree dies with the enclosing boundary, and the anchor with
+	// it.
+	get_owner().defer(|| {
+		live_owner.read()?.dispose();
+		region.close();
+	});
+	source.effect(|value: T| {
+		let unchanged = match last_value.read() {
+			Some(let previous) => previous == value,
+			None => false,
+		};
+		if armed.read() && !unchanged {
+			live_owner.read()?.dispose();
+			match live_row.read() {
+				Some(let row) => {
+					let _cut = region.cut_row(row, region.anchor);
+					region.drop_row(row);
+				},
+				None => {},
+			}
+			let owner = Owner::new();
+			let row = run_with_owner(owner, || region.open_row(render(value)));
+			region.hold_rows([row]);
+			last_value.write() = Some(value);
+			live_row.write() = Some(row);
+			live_owner.write() = Some(owner);
+		}
+	});
+}
+
+/// `bind_each`'s body, against a region opened at `parent`'s current end —
+/// shared by `Each`, `EachValues` and, through them, by the two methods.
+fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	key: sync |T| K,
+	render: (sync |T| C) context owner_scope,
+) {
+	// The rows keep THIS position among the parent's children (A71): the hole
+	// sits where they belong, so the anchor goes down now and every row is
+	// inserted before it.
+	let region = Region::open(parent);
+	let row_keys: Shared<List<K>> = Shared::new([]);
+	let row_items: Shared<List<T>> = Shared::new([]);
+	let row_rows: Shared<List<Row>> = Shared::new([]);
+	let row_owners: Shared<List<Owner>> = Shared::new([]);
+	// Whichever rows are live when the enclosing boundary is disposed go with
+	// it, and the anchor goes with them.
+	get_owner().defer(|| {
+		for owner in row_owners.read() {
+			owner.dispose();
+		}
+		region.close();
+	});
+	source.effect(|list: List<T>| {
+		let plan = reconcile(row_keys.read(), row_items.read(), list, key, |before, after| {
+			before == after
+		});
+		let previous_rows = row_rows.read();
+		let previous_owners = row_owners.read();
+		// A91's order pass, in two halves. First CUT every live row out, in the
+		// order the document holds them: a row's extent runs from its own
+		// marker to the next row's, and those boundaries are only meaningful
+		// while nothing has moved. What is left in the parent is the markers,
+		// still in the old order, and the region's anchor.
+		mut cut: List<Element> = [];
+		mut at = 0;
+		for row in previous_rows {
+			let end = if at + 1 < previous_rows.len() {
+				previous_rows[at + 1].marker
+			} else {
+				region.anchor
+			};
+			cut.push(region.cut_row(row, end));
+			at += 1;
+		}
+		for index in plan.removed {
+			previous_owners[index].dispose();
+			region.drop_row(previous_rows[index]);
+		}
+		mut next_rows: List<Row> = [];
+		mut next_owners: List<Owner> = [];
+		mut position = 0;
+		// Then put the run back in the NEW order, each row before the anchor:
+		// a kept row is its marker and its cut nodes moved as a unit, a fresh
+		// one is placed from scratch at the same end.
+		for step in plan.steps {
+			let item = list[position];
+			match step {
+				RowStep::Keep(let index) => {
+					region.insert_row(previous_rows[index], cut[index]);
+					next_rows.push(previous_rows[index]);
+					next_owners.push(previous_owners[index]);
+				},
+				RowStep::Refresh(let index) => {
+					previous_owners[index].dispose();
+					region.drop_row(previous_rows[index]);
+					let owner = Owner::new();
+					next_rows.push(run_with_owner(owner, || region.open_row(render(item))));
+					next_owners.push(owner);
+				},
+				RowStep::Fresh => {
+					let owner = Owner::new();
+					next_rows.push(run_with_owner(owner, || region.open_row(render(item))));
+					next_owners.push(owner);
+				},
+			}
+			position += 1;
+		}
+		// A88: the region holds the run it now shows, so a disposal in a parent
+		// that survives takes these rows out of the document.
+		region.hold_rows(next_rows);
+		mut next_keys: List<K> = [];
+		for item in list {
+			next_keys.push(key(item));
+		}
+		row_keys.write() = next_keys;
+		row_items.write() = list;
+		row_rows.write() = next_rows;
+		row_owners.write() = next_owners;
+	});
+}
+
+/// `bind_each_by`'s body, against a region opened at `parent`'s current end.
+fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	key: sync |T| K,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+) {
+	// A region at this position, exactly as `place_each` opens one (A71).
+	let region = Region::open(parent);
+	let row_keys: Shared<List<K>> = Shared::new([]);
+	let row_items: Shared<List<T>> = Shared::new([]);
+	let row_cells: Shared<List<SignalCell<T>>> = Shared::new([]);
+	let row_rows: Shared<List<Row>> = Shared::new([]);
+	let row_owners: Shared<List<Owner>> = Shared::new([]);
+	// Whichever rows are live when the enclosing boundary is disposed go with
+	// it, exactly as `place_each`'s do.
+	get_owner().defer(|| {
+		for owner in row_owners.read() {
+			owner.dispose();
+		}
+		region.close();
+	});
+	source.effect(|list: List<T>| {
+		// A surviving key is ALWAYS kept: the row's cell carries the new item,
+		// so there is nothing for a `Refresh` to rebuild.
+		let plan = reconcile(row_keys.read(), row_items.read(), list, key, |_before, _after| {
+			true
+		});
+		let previous_cells = row_cells.read();
+		let previous_rows = row_rows.read();
+		let previous_owners = row_owners.read();
+		// Cut first, in old document order — `place_each`'s two halves, for
+		// `place_each`'s reason (A91).
+		mut cut: List<Element> = [];
+		mut at = 0;
+		for row in previous_rows {
+			let end = if at + 1 < previous_rows.len() {
+				previous_rows[at + 1].marker
+			} else {
+				region.anchor
+			};
+			cut.push(region.cut_row(row, end));
+			at += 1;
+		}
+		for index in plan.removed {
+			previous_owners[index].dispose();
+			region.drop_row(previous_rows[index]);
+		}
+		mut next_cells: List<SignalCell<T>> = [];
+		mut next_rows: List<Row> = [];
+		mut next_owners: List<Owner> = [];
+		mut position = 0;
+		for step in plan.steps {
+			let item = list[position];
+			match step {
+				RowStep::Keep(let index) => {
+					let cell = previous_cells[index];
+					cell.set(item);
+					next_cells.push(cell);
+					region.insert_row(previous_rows[index], cut[index]);
+					next_rows.push(previous_rows[index]);
+					next_owners.push(previous_owners[index]);
+				},
+				// Unreachable: `same` above is constantly true, so `reconcile`
+				// never refreshes here. Kept in step with `Keep` rather than
+				// left to rot differently.
+				RowStep::Refresh(let index) => {
+					let cell = previous_cells[index];
+					cell.set(item);
+					next_cells.push(cell);
+					region.insert_row(previous_rows[index], cut[index]);
+					next_rows.push(previous_rows[index]);
+					next_owners.push(previous_owners[index]);
+				},
+				RowStep::Fresh => {
+					let cell: SignalCell<T> = SignalCell::new(item);
+					let owner = Owner::new();
+					next_cells.push(cell);
+					next_rows.push(run_with_owner(owner, || region.open_row(render(cell))));
+					next_owners.push(owner);
+				},
+			}
+			position += 1;
+		}
+		// A88: the region holds the run it now shows, so a disposal in a parent
+		// that survives takes these rows out of the document.
+		region.hold_rows(next_rows);
+		mut next_keys: List<K> = [];
+		for item in list {
+			next_keys.push(key(item));
+		}
+		row_keys.write() = next_keys;
+		row_items.write() = list;
+		row_cells.write() = next_cells;
+		row_rows.write() = next_rows;
+		row_owners.write() = next_owners;
+	});
 }
 
 /// Something that can fill an attribute value (proposal/element-syntax.md §5).

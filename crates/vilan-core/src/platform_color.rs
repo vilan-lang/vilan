@@ -245,7 +245,8 @@ struct Violation {
 ///
 /// `extra_roots` covers a root the call graph cannot see: a split build's route
 /// gate is selected by the EMITTER at a recognized `swap` call, so nothing in
-/// source calls `View.swap_split` and the bindings its body reads (the pending
+/// source calls `View.swap_split` — or, since A85, the free `swap_split` the
+/// value form retargets to — and the bindings its body reads (the pending
 /// signal) would otherwise be shaken out from under it
 /// (`bundle-splitting.md` §2).
 pub(crate) fn reachable_bindings(

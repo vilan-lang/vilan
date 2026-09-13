@@ -258,28 +258,25 @@ impl View {
 	/// not establish any boundary. Nothing a row registers survives, so the owner
 	/// is discarded. (`List<T>` is annotated so `get`'s element type resolves —
 	/// the two-parameter-generic inference trap.)
-	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
+	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 		self,
 		source: S,
 		key: sync |T| K,
-		build: (sync |T| View) context owner_scope,
+		build: (sync |T| C) context owner_scope,
 	): View {
-		let items: List<T> = source.get();
-		for item in items {
-			let owner = Owner::new();
-			self.children.write().push(Child::Element(run_with_owner(owner, || build(item))));
-		}
-		self
+		// A85: one line of sugar over the value form, exactly as the browser
+		// twin's is. KEEP IN STEP.
+		self.child(each(source, key, build))
 	}
 
 	/// A reactive list keyed by the ITEM ITSELF, server side — the read-once
 	/// twin of the browser's `bind_each_values` (A42). KEEP IN STEP.
-	fun bind_each_values<T: PartialEq, S: Source<List<T>>>(
+	fun bind_each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 		self,
 		source: S,
-		build: (sync |T| View) context owner_scope,
+		build: (sync |T| C) context owner_scope,
 	): View {
-		self.bind_each(source, |item| item, build)
+		self.child(each_values(source, build))
 	}
 
 	/// A reactive list whose rows update through a cell, server side: one child
@@ -288,34 +285,27 @@ impl View {
 	/// change to follow, so the cell is written once and never again — but it
 	/// must exist, because `build` is the same closure the client runs.
 	/// No bound on `T`, matching the browser twin. KEEP IN STEP.
-	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>>(
+	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 		self,
 		source: S,
 		key: sync |T| K,
-		build: (sync |SignalCell<T>| View) context owner_scope,
+		build: (sync |SignalCell<T>| C) context owner_scope,
 	): View {
-		let items: List<T> = source.get();
-		// The key is client business — it decides which row survives a change,
-		// and no row here outlives the request. Accepted and dropped, like the
-		// event binders' handlers.
-		let _keyed = key;
-		for item in items {
-			let cell: SignalCell<T> = SignalCell::new(item);
-			let owner = Owner::new();
-			self.children.write().push(Child::Element(run_with_owner(owner, || build(cell))));
-		}
-		self
+		self.child(each_by(source, key, build))
 	}
 
 	/// Conditional content: renders the body when `condition` is currently true,
 	/// nothing when false. Read once — no toggling survives the request. The body
 	/// runs under a throwaway owner, like `bind_each`'s rows.
-	fun when<S: Source<bool>>(self, condition: S, body: (sync || View) context owner_scope): View {
-		if condition.get() {
-			let owner = Owner::new();
-			self.children.write().push(Child::Element(run_with_owner(owner, body)));
-		}
-		self
+	fun when<S: Source<bool>, C: Slot>(
+		self,
+		condition: S,
+		body: (sync || C) context owner_scope,
+	): View {
+		// A85: the VALUE is constructed here rather than through the free
+		// `when`, because a method name shadows a module-level function of the
+		// same name inside its own `impl` block. KEEP IN STEP.
+		self.child(Conditional { condition, body })
 	}
 
 	/// The dynamic-subtree swap, server side: renders the branch for `source`'s
@@ -323,15 +313,13 @@ impl View {
 	/// A `Source<T>` bound, in lockstep with the browser twin's `swap` — held
 	/// concrete by A33 for the bare-parameter bound gap, widened with it once
 	/// B168 closed that gap.
-	fun swap<T: PartialEq, S: Source<T>>(
+	fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 		self,
 		source: S,
-		build: (sync |T| View) context owner_scope,
+		build: (sync |T| C) context owner_scope,
 	): View {
-		let value = source.get();
-		let owner = Owner::new();
-		self.children.write().push(Child::Element(run_with_owner(owner, || build(value))));
-		self
+		// A85: the literal, for the shadowing reason `when` above records.
+		self.child(Swap { source, render = build })
 	}
 
 	/// The element mount hook, server side: ACCEPTED AND DROPPED. There is no
@@ -392,6 +380,14 @@ struct Region {
 	parent: View,
 }
 
+/// One row of a run, server side: NOTHING. The browser twin's row is a leading
+/// marker, because a row's content can be any `Slot` and can grow after it was
+/// placed, so "move this row" has to be a span between markers (A91). A server
+/// render is one pass in source order and nothing ever moves, so a row here is
+/// its own position and the struct carries no state at all.
+/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+struct Row {}
+
 impl Region {
 	/// Opens a region at `parent`'s current end.
 	fun open(parent: View): Region {
@@ -403,12 +399,38 @@ impl Region {
 		self.parent.children.write().push(Child::Element(child));
 	}
 
+	/// Places `content` as a new ROW (A91) — which, on this twin, is exactly
+	/// placing it: a server render is one pass in source order, so a row IS
+	/// wherever it was written and needs no marker to keep that place. The
+	/// browser twin plants one, and `Row` is empty here for the same reason
+	/// `Region` plants no anchor. KEEP IN STEP with the browser twin.
+	fun open_row<C: Slot>(self, content: C): Row {
+		content.place(self.parent);
+		Row {}
+	}
+
+	/// Cuts a row out of the document — there is no document to cut it out of,
+	/// and nothing that ever moves. Accepted and dropped. KEEP IN STEP.
+	fun cut_row(self, row: Row, end: Row): Row {
+		row
+	}
+
+	/// Puts a cut row back — see `cut_row`: nothing was ever taken out.
+	/// KEEP IN STEP.
+	fun insert_row(self, row: Row, content: Row) {}
+
+	/// Drops a row — a server render has no removal. KEEP IN STEP.
+	fun drop_row(self, row: Row) {}
+
 	/// Records the live run — accepted and dropped, like the event binders'
 	/// handlers. A88 exists because a browser boundary can be disposed while
 	/// its parent survives; a server render has no disposal and no later
 	/// change to survive, so there is nothing to remember. KEEP IN STEP with
 	/// the browser twin (browser/ui.vl).
 	fun hold(self, live: List<View>) {}
+
+	/// Records the live ROWS — accepted and dropped, with `hold`. KEEP IN STEP.
+	fun hold_rows(self, rows: List<Row>) {}
 
 	/// Drops the anchor — there is none to drop, and no live content to take
 	/// out of a document that does not exist yet (A88). KEEP IN STEP.
@@ -481,6 +503,189 @@ impl type S: Source<List<View>> with Slot {
 		for item in items {
 			parent.children.write().push(Child::Element(item));
 		}
+	}
+}
+// === The positional value forms (A85), server side =========================
+//
+// The browser twin's five value forms, read-once: `when`, `swap`, `each`,
+// `each_values` and `each_by` are VALUES that fill a child position, and the
+// five `View` methods are one-line sugar over them. A server render is one
+// synchronous pass in source order, so a value placed in a child hole writes
+// its content at exactly the point `place` runs — which is what the `Region`
+// below has always said about the anchor the browser twin has to plant, and
+// what A85 finally gives it a reason to be CALLED for.
+//
+// The closure FIELDS carry their `context` clause (B309) and not the `sync`
+// marker (parameter-only), in lockstep with the browser twin: the same
+// component source constructs these on both legs.
+// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+
+/// Conditional content as a child — `View::when`'s value form.
+struct Conditional<S: Source<bool>, C: Slot> {
+	condition: S,
+	body: (|| C) context owner_scope,
+}
+
+/// A dynamic subtree as a child — `View::swap`'s value form. No `gated`/`armed`
+/// half: route chunks are a browser thing (nothing is ever in flight here), so
+/// the server twin holds only what it renders.
+struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
+	source: S,
+	render: (|T| C) context owner_scope,
+}
+
+/// A keyed reactive run as a child — `View::bind_each`'s value form.
+struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
+	source: S,
+	key: |T| K,
+	render: (|T| C) context owner_scope,
+}
+
+/// A run keyed by the ITEM ITSELF, as a child (A42).
+struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
+	source: S,
+	render: (|T| C) context owner_scope,
+}
+
+/// A run whose rows update through a cell, as a child (A42).
+struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
+	source: S,
+	key: |T| K,
+	render: (|SignalCell<T>| C) context owner_scope,
+}
+
+/// Conditional content at THIS position, read once: the body renders when
+/// `condition` is currently true and nothing when it is false.
+fun when<S: Source<bool>, C: Slot>(
+	condition: S,
+	body: (sync || C) context owner_scope,
+): Conditional<S, C> {
+	Conditional { condition, body }
+}
+
+/// The dynamic subtree at THIS position, read once: the branch for `source`'s
+/// CURRENT value.
+fun swap<T: PartialEq, S: Source<T>, C: Slot>(
+	source: S,
+	render: (sync |T| C) context owner_scope,
+): Swap<T, S, C> {
+	Swap { source, render }
+}
+
+/// A keyed reactive run at THIS position, rendered from the current items.
+fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	source: S,
+	key: sync |T| K,
+	render: (sync |T| C) context owner_scope,
+): Each<T, K, S, C> {
+	Each { source, key, render }
+}
+
+/// A run keyed by the ITEM ITSELF, as a child (A42).
+fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
+	source: S,
+	render: (sync |T| C) context owner_scope,
+): EachValues<T, S, C> {
+	EachValues { source, render }
+}
+
+/// A run whose rows update through a cell, as a child (A42).
+fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	source: S,
+	key: sync |T| K,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+): EachBy<T, K, S, C> {
+	EachBy { source, key, render }
+}
+
+impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		if self.condition.get() {
+			let region = Region::open(parent);
+			let owner = Owner::new();
+			let _row = run_with_owner(owner, || region.open_row((self.body)()));
+		}
+	}
+}
+
+impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_swap(parent, self.source, self.render);
+	}
+}
+
+impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_each(parent, self.source, self.key, self.render);
+	}
+}
+
+impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_each(parent, self.source, |item| item, self.render);
+	}
+}
+
+impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_each_by(parent, self.source, self.key, self.render);
+	}
+}
+
+/// `swap`'s body, server side — the branch for the current value, in position.
+fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
+	parent: View,
+	source: S,
+	render: (sync |T| C) context owner_scope,
+) {
+	let region = Region::open(parent);
+	let value = source.get();
+	let owner = Owner::new();
+	let _row = run_with_owner(owner, || region.open_row(render(value)));
+}
+
+/// `bind_each`'s body, server side — one child per element of the CURRENT list,
+/// in order, no reconciliation. Each row runs under a fresh throwaway `Owner`:
+/// `run_with_owner` establishes the `owner_scope` the injected `render` closure
+/// declares, so this is self-contained — the caller need not establish any
+/// boundary. Nothing a row registers survives, so the owner is discarded.
+/// (`List<T>` is annotated so `get`'s element type resolves — the
+/// two-parameter-generic inference trap.)
+fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	key: sync |T| K,
+	render: (sync |T| C) context owner_scope,
+) {
+	let region = Region::open(parent);
+	let items: List<T> = source.get();
+	for item in items {
+		let owner = Owner::new();
+		let _row = run_with_owner(owner, || region.open_row(render(item)));
+	}
+}
+
+/// `bind_each_by`'s body, server side: one child per element of the CURRENT
+/// list, each built against a fresh `SignalCell<T>` holding that element. No
+/// reconciliation and no later change to follow, so the cell is written once
+/// and never again — but it must exist, because `render` is the same closure
+/// the client runs.
+fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	key: sync |T| K,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+) {
+	let region = Region::open(parent);
+	let items: List<T> = source.get();
+	// The key is client business — it decides which row survives a change, and
+	// no row here outlives the request. Accepted and dropped, like the event
+	// binders' handlers.
+	let _keyed = key;
+	for item in items {
+		let cell: SignalCell<T> = SignalCell::new(item);
+		let owner = Owner::new();
+		let _row = run_with_owner(owner, || region.open_row(render(cell)));
 	}
 }
 

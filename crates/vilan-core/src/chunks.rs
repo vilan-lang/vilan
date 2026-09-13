@@ -53,11 +53,17 @@ pub struct ChunkPlan {
 pub struct Gate {
     /// The `swap` call ids the emitter retargets.
     pub calls: Vec<Id>,
-    /// `View.swap` — what those calls resolve to today.
-    pub swap: Id,
-    /// `View.swap_split` — what they resolve to in a split build. Same shape,
-    /// so the call's own type binding carries over by position.
-    pub swap_split: Id,
+    /// The retarget table: what a recognized call resolves to today, what it
+    /// resolves to in a split build, and WHICH ARGUMENT of the emitted call is
+    /// the route source (the boot preload reads it by position).
+    ///
+    /// Two entries since A85, because `swap` is two things: the `View.swap`
+    /// METHOD, whose emitted call carries the receiver first, so its source is
+    /// argument 1; and the free `swap` VALUE form (`{swap(route, render)}` in a
+    /// child hole), whose source is argument 0. Both retarget to their own
+    /// `swap_split`, which declares the same generics in the same order — so
+    /// the call's own type binding carries over by position.
+    pub retarget: Vec<(Id, Id, usize)>,
     /// `std::ui::chunk_preload` — the boot preload the emitter plants ahead of
     /// the statement that mounts the swap (`bundle-splitting.md` §S3). Declares
     /// the same generics as `swap_split` in the same order, so the gate call's
@@ -87,10 +93,22 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         chunks: Vec::new(),
         gate: None,
     };
-    let Some(swap_fn) = view_method(program, "swap") else {
+    // The two shapes a route swap is written in: the `View.swap` METHOD and,
+    // since A85, the free `swap` VALUE placed in a child hole. A value-form
+    // route match that the recognizer did not know would still BUILD — and
+    // would simply stop splitting, silently, which is the worst failure this
+    // gate has — so both are recognized here and both are retargeted below.
+    let mut recognized: Vec<Id> = Vec::new();
+    if let Some(method) = view_method(program, "swap") {
+        recognized.push(method);
+    }
+    if let Some(value) = std_free_function(program, "swap") {
+        recognized.push(value);
+    }
+    if recognized.is_empty() {
         return empty;
-    };
-    let sites = splittable_sites(program, swap_fn);
+    }
+    let sites = splittable_sites(program, &recognized);
     if sites.is_empty() {
         return empty;
     }
@@ -217,12 +235,25 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
     chunks.retain(|chunk| !chunk.functions.is_empty());
 
-    let gate = view_method(program, "swap_split")
-        .zip(std_function(program, "chunk_preload"))
-        .map(|(swap_split, preload)| Gate {
+    // The retarget table, in the order the two shapes were recognized above:
+    // the method's emitted call carries its receiver first (source at 1), the
+    // value form's does not (source at 0). A shape whose gated twin is missing
+    // simply degrades away rather than breaking a build.
+    let mut retarget: Vec<(Id, Id, usize)> = Vec::new();
+    if let Some((from, to)) = view_method(program, "swap").zip(view_method(program, "swap_split")) {
+        retarget.push((from, to, 1));
+    }
+    if let Some((from, to)) =
+        std_free_function(program, "swap").zip(std_free_function(program, "swap_split"))
+    {
+        retarget.push((from, to, 0));
+    }
+    let gate = (!retarget.is_empty())
+        .then(|| std_function(program, "chunk_preload"))
+        .flatten()
+        .map(|preload| Gate {
             calls: sites.iter().map(|site| site.call).collect(),
-            swap: swap_fn,
-            swap_split,
+            retarget,
             preload,
         });
     ChunkPlan {
@@ -302,6 +333,29 @@ fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
         .then(|| implementation.declarations.get(name).copied())
         .flatten()
     })
+}
+
+/// A free std function by name that is NOT an impl member — `std::ui::swap`,
+/// A85's value form, as distinct from the `View.swap` METHOD of the same name.
+/// Both live in std and both are called `swap`, so name alone stopped being an
+/// answer the day the value form existed.
+fn std_free_function(program: &Program<'_>, name: &str) -> Option<Id> {
+    let members: HashSet<Id> = program
+        .implementations
+        .iter()
+        .flat_map(|implementation| implementation.declarations.values().copied())
+        .collect();
+    program
+        .functions
+        .iter()
+        .find(|(id, function)| {
+            function.name == name
+                && !members.contains(id)
+                && program
+                    .source_of(**id)
+                    .is_some_and(|source| program.std_sources.contains(&source))
+        })
+        .map(|(id, _)| *id)
 }
 
 /// A free std function by name — restricted to std sources, so an app function
@@ -391,15 +445,15 @@ impl Arm {
     }
 }
 
-/// The recognized splittable sites: calls to `swap` whose last closure
-/// argument's body is a `match` on that closure's parameter.
-fn splittable_sites(program: &Program<'_>, swap_fn: Id) -> Vec<Site> {
+/// The recognized splittable sites: calls to any of the `swap` shapes whose
+/// last closure argument's body is a `match` on that closure's parameter.
+fn splittable_sites(program: &Program<'_>, swap_fns: &[Id]) -> Vec<Site> {
     let mut sites = Vec::new();
     for (call_id, call) in &program.function_calls {
         let Some(Expr::Local(target)) = program.entity_map.get(&call.subject_id) else {
             continue;
         };
-        if *target != swap_fn {
+        if !swap_fns.contains(target) {
             continue;
         }
         let Some(closure_id) = call.argument_ids.iter().rev().find_map(|argument| {

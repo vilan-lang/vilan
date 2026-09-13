@@ -33,6 +33,33 @@ external fun create_element_ns(namespace: str, tag: str): Element;
 [extern("document.createTextNode")]
 external fun create_text_node(content: str): Text;
 
+/// `document.createDocumentFragment()` — an empty, unattached container whose
+/// CHILDREN move when it is inserted, leaving it empty. `std::ui` builds a row
+/// in one of these and then plants the whole thing with a single
+/// `insert_before`, which is how content of an unknown shape (A91: a row may be
+/// any `Slot`) reaches a position that is not the parent's end.
+///
+/// It is typed `Element` and it is not one: the DOM's insertion and append
+/// methods take any node, a fragment above all, and giving it a struct of its
+/// own would fork `append`/`append_text`/`insert_before` into two copies each
+/// for a handle that is only ever a staging area. `get_element_by_id` already
+/// spends the same coin (a missing id reads back as `null` typed `Element`).
+[extern("document.createDocumentFragment")]
+external fun create_document_fragment(): Element;
+
+/// `document.createRange()` — a live span between two boundary points, used
+/// here for exactly one job: taking a RUN of sibling nodes out of the document
+/// in one call (`extract_contents`).
+///
+/// A `std::ui` run's rows are delimited by empty text markers, and since A91 a
+/// row's node set is not fixed — a row that is itself a `when` or an `each`
+/// grows and shrinks after it was placed. So "move this row" cannot be a list
+/// of remembered nodes; it is "everything between these two markers", which is
+/// what a range names and what nothing else in the DOM does without walking
+/// the sibling chain node by node.
+[extern("document.createRange")]
+external fun create_range(): Range;
+
 /// `document.querySelector(selector)` — the first element matching a CSS selector
 /// (e.g. `"#name"`, `".item"`, `"input[name=email]"`).
 [extern("document.querySelector")]
@@ -182,6 +209,12 @@ impl Element {
 	/// argument that would win.
 	[extern(method, "insertBefore")]
 	external fun insert_before(self, child: Element, anchor: Text): void;
+
+	/// Inserts a text node immediately before `anchor` — the `Text` overload of
+	/// `insert_before` (the same `insertBefore` binding; the DOM takes any
+	/// node). This is how a run plants and MOVES a row's marker.
+	[extern(method, "insertBefore")]
+	external fun insert_text_before(self, child: Text, anchor: Text): void;
 
 	/// Removes the element from the document (`element.remove()`).
 	[extern(method, "remove")]
@@ -446,6 +479,45 @@ impl Text {
 	/// its anchor when the boundary holding it is disposed.
 	[extern(method, "remove")]
 	external fun remove(self): void;
+
+	/// The node's current parent (`node.parentNode`).
+	///
+	/// A `std::ui` `Region` reads its host through this rather than
+	/// remembering one, because since A91 an anchor MOVES: a region opened
+	/// inside a row is built in a detached staging parent and then planted,
+	/// and the row itself is re-inserted on every order pass. The anchor is
+	/// the region's identity; wherever it is, that is where the region's
+	/// content belongs.
+	[extern(get, "parentNode")]
+	external fun parent_element(self): Element;
+}
+
+/// A DOM range — two boundary points in one document, and the one operation
+/// `std::ui` needs from them: cut everything between them out as a fragment.
+///
+/// Both boundaries are `Text` because both are markers std planted: a row's
+/// own leading marker and whatever bounds it on the right (the next row's
+/// marker, or the region's anchor). A range whose boundaries are not siblings
+/// in the order given is not a state this module can reach — the markers are
+/// planted by the same code that reads them, in the order it planted them.
+external struct Range;
+
+impl Range {
+	/// Starts the range immediately after `node` (`range.setStartAfter(node)`).
+	[extern(method, "setStartAfter")]
+	external fun set_start_after(self, node: Text): void;
+
+	/// Ends the range immediately before `node` (`range.setEndBefore(node)`).
+	[extern(method, "setEndBefore")]
+	external fun set_end_before(self, node: Text): void;
+
+	/// Takes every node in the range OUT of the document and returns them as a
+	/// document fragment, in order (`range.extractContents()`). The nodes
+	/// themselves move — identity, listeners and state intact — so a run's
+	/// order pass is a cut and a re-insert, not a rebuild. Typed `Element` for
+	/// the reason `create_document_fragment` records.
+	[extern(method, "extractContents")]
+	external fun extract_contents(self): Element;
 }
 
 /// A DOM event, as delivered to an `on_event` handler — an opaque handle like

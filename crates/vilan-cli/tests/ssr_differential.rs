@@ -61,7 +61,7 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// `show` (hidden), `swap` (a value branch), `bind_value`, a discarded `on`
 /// handler, and nested composition — with `&`/`<`/`>`/`"` in the data to drive
 /// escaping on both sides.
-const COMPONENT: &str = r#"import std::ui::{ view, View };
+const COMPONENT: &str = r#"import std::ui::{ each, each_values, view, when, View };
 import std::reactive::{ Signal, SignalCell };
 import std::style::{ style, space, Style };
 
@@ -93,6 +93,7 @@ fun app(): View {
 	let roomy = const style().padding(space(6));
 	let theme: SignalCell<Style> = Signal::new(compact);
 	let width = Signal::new("40px");
+	let tags: SignalCell<List<str>> = Signal::new(["a & b", "c < d"]);
 	view("main")
 		.class("app")
 		.attr("id", "root")
@@ -105,6 +106,17 @@ fun app(): View {
 			Tab::Home => view("a").text("home"),
 			Tab::Settings => view("a").text("settings & more"),
 		}))
+		// A85/A91: the VALUE forms in child position, and rows that are not
+		// elements — a fragment row, a text row, and a positional `when`. The
+		// browser twin plants markers for every one of them and the server
+		// twin plants none, so this is exactly the shape the differential
+		// exists to hold: an empty text node serializes to nothing.
+		.child(view("ol").child(each(rows, |r: Row| r.id, |r: Row| [
+			view("li").text(r.label),
+			view("li").text("·"),
+		])))
+		.child(view("dl").child(each_values(tags, |t: str| t)))
+		.child(view("p").child(when(show_banner, || view("em").text("more & more"))))
 		.child(view("input").attr("type", "text").bind_value(query))
 		.child(view("button").text("save").on("click", || query.set("x")))
 		.child(view("p").attr("id", "themed").bind_styled(theme).text("styled"))

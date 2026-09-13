@@ -200,6 +200,24 @@ Nesting works the way you'd hope: the workspace page can `swap` on its
 own `WorkspaceRoute` while the outer swap only rebuilds when the
 workspace id changes.
 
+When the page is one child among others — a header above it, a footer below —
+write the [value form](ui.md#putting-one-between-siblings) in a child position
+instead of the dotted link, and the page stays between them:
+
+```vilan,fragment
+<main>
+	{site_header()}
+	{swap(route, |current| match current {
+		Route::Home => home_page(),
+		Route::NotFound => not_found(),
+	})}
+	{site_footer()}
+</main>
+```
+
+Both forms split the same way: a `split = true` entry recognizes either
+spelling of the route match and gates it on the arm's chunk.
+
 ## Links and navigation
 
 `link(label, route)` renders a real `<a href=…>`. Middle-click,

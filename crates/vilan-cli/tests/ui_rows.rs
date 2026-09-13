@@ -240,7 +240,7 @@ fn the_index_form_keeps_the_rows_element_and_updates_through_its_cell() {
     let harness = format!(
         "{DOM_STUB}\nglobal.__first_row = () => {{\n  \
          const list = documentRoot.children[0];\n  \
-         const row = list.children[0];\n  \
+         const row = list.children.find((node) => node.tagName !== \"#text\");\n  \
          return row.tagName + \"#\" + identify(row) + \"'\" + row.textContent + \"'\";\n\
          }};\nrequire(\"./app.js\");\n"
     );
@@ -2193,10 +2193,359 @@ fn a88_the_anchors_go_with_the_content() {
             .filter(|token| token.starts_with("#text#") && !token.contains('\''))
             .count()
     };
-    assert_eq!(anchors("live="), 5, "five regions, five anchors:\n{stdout}");
+    // Five region anchors, plus one marker per ROW (A91): the `when`'s
+    // instantiation, the `swap`'s subtree and the two `bind_each` rows are
+    // rows and carry one each; the two reactive CHILD arms place the views
+    // they were handed and carry none.
+    assert_eq!(
+        anchors("live="),
+        9,
+        "five region anchors and four row markers:\n{stdout}"
+    );
     assert_eq!(
         anchors("disposed="),
         0,
         "a closed region leaves no marker behind:\n{stdout}"
+    );
+}
+
+/// A85: the five value forms, each in a MIDDLE position of one chain, so every
+/// region has to keep its place from the static siblings AND from the other
+/// four. This is the shape the item exists for — `<ul>{header}{each(..)}
+/// {when(..)}</ul>` — and it is unwritable with the methods, which can only
+/// append.
+const A85_VALUE_FORMS: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
+
+fun main() {
+	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
+	let more: SignalCell<bool> = Signal::new(false);
+	let page: SignalCell<i32> = Signal::new(1);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("header").text("H"))
+			.child(each(rows, |item: str| item, |item: str| view("li").text(item)))
+			.child(view("hr"))
+			.child(each_values(rows, |item: str| view("p").text(item)))
+			.child(view("hr"))
+			.child(each_by(rows, |item: str| item, |cell: SignalCell<str>| view("q").bind_text(cell)))
+			.child(when(more, || view("b").text("M")))
+			.child(swap(page, |n: i32| view("section").text(i"p{n}")))
+			.child(view("footer").text("F"))
+	});
+	print(i"start={tree()}");
+	more.set(true);
+	print(i"more={tree()}");
+	rows.set(["b", "a", "c"]);
+	print(i"rows={tree()}");
+	page.set(2);
+	print(i"page={tree()}");
+	more.set(false);
+	print(i"less={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// The tree `A85_VALUE_FORMS` must show: the header, the three runs separated
+/// by their `hr`s, the conditional, the swap, the footer — in the order the
+/// chain writes them, never at the end.
+fn a85_tree(rows: &[&str], more: bool, page: &str) -> Vec<String> {
+    let mut expected = vec![
+        "root".to_string(),
+        "main".to_string(),
+        "header'H'".to_string(),
+    ];
+    for row in rows {
+        expected.push(format!("li'{row}'"));
+    }
+    expected.push("hr".to_string());
+    for row in rows {
+        expected.push(format!("p'{row}'"));
+    }
+    expected.push("hr".to_string());
+    for row in rows {
+        expected.push(format!("q'{row}'"));
+    }
+    if more {
+        expected.push("b'M'".to_string());
+    }
+    expected.push(format!("section'{page}'"));
+    expected.push("footer'F'".to_string());
+    expected
+}
+
+/// A85's whole claim, in one tree: a conditional, a swap and three keyed runs
+/// each sit where their `{hole}` was written, between static siblings and
+/// between each other, across a toggle, a reorder-with-insert and a swap.
+#[test]
+fn a85_the_five_value_forms_place_where_their_hole_is() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a85_value_forms", A85_VALUE_FORMS, &harness);
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("start".to_string(), a85_tree(&["a", "b"], false, "p1")),
+            ("more".to_string(), a85_tree(&["a", "b"], true, "p1")),
+            ("rows".to_string(), a85_tree(&["b", "a", "c"], true, "p1")),
+            ("page".to_string(), a85_tree(&["b", "a", "c"], true, "p2")),
+            ("less".to_string(), a85_tree(&["b", "a", "c"], false, "p2")),
+        ],
+        "every value form must hold the position its child hole was written \
+         at; got:\n{stdout}"
+    );
+}
+
+/// A85 §3e's ownership property, which is the reason the body is a
+/// `context`-typed FIELD and not a plain closure: a `when` VALUE's body runs
+/// under the owner ambient at `place`, and toggling the condition off disposes
+/// the instantiation — so the effect the body registered stops firing, where a
+/// plain-closure field would have registered it into whatever boundary the
+/// VALUE was built in and kept it alive (measured by slots-33, and still the
+/// control in `inference/bounds.rs`).
+const A85_OWNERSHIP: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::ui::{ View, mount_root, view, when };
+
+fun main() {
+	let label: SignalCell<str> = Signal::new("one");
+	let on: SignalCell<bool> = Signal::new(true);
+	let _root = mount_root("app", || {
+		view("main").child(when(on, || {
+			label.effect(|value: str| print(i"body sees {value}"));
+			view("b").text("body")
+		}))
+	});
+	label.set("two");
+	on.set(false);
+	// Nothing may answer this: the instantiation is gone, and the body's
+	// effect went with its owner.
+	label.set("three");
+	label.set("four");
+	// Toggling back on rebuilds from scratch, and the fresh body reads the
+	// CURRENT value — which is why "three" is written and then overwritten:
+	// a leak shows up as an extra line, not as a different one.
+	on.set(true);
+}
+
+main();
+"#;
+
+#[test]
+fn a85_a_toggled_off_when_value_disposes_the_body_it_built() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a85_ownership", A85_OWNERSHIP, &harness);
+    assert_eq!(
+        stdout, "body sees one\nbody sees two\nbody sees four\n",
+        "a toggled-off `when` value must dispose its body's owner: the two \
+         writes while it is off answer nothing, and the line after the toggle \
+         back on is the FRESH body reading the current value. A body stored as \
+         a plain closure would have kept the first instantiation's effect \
+         alive under the enclosing boundary and printed `three` too; \
+         got:\n{stdout}"
+    );
+}
+
+/// A85 §3d: the server twin's value forms. A render is one pass in source
+/// order, so a value placed in a child hole writes its content exactly there —
+/// and the markup is what the METHOD chain below it produces, which is the
+/// claim the two halves are held to.
+const A85_VALUE_FORMS_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, each_values, render, swap, view, when };
+
+fun main() {
+	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
+	let more: SignalCell<bool> = Signal::new(true);
+	let page: SignalCell<i32> = Signal::new(1);
+	print(render(view("main")
+		.child(view("header").text("H"))
+		.child(each_values(rows, |item: str| view("li").text(item)))
+		.child(when(more, || view("b").text("M")))
+		.child(swap(page, |n: i32| view("section").text(i"p{n}")))
+		.child(view("footer").text("F"))));
+	print(render(view("main")
+		.child(view("header").text("H"))
+		.bind_each_values(rows, |item: str| view("li").text(item))
+		.when(more, || view("b").text("M"))
+		.swap(page, |n: i32| view("section").text(i"p{n}"))
+		.child(view("footer").text("F"))));
+}
+
+main();
+"#;
+
+/// The twin renders what the value places, and the value form and the method
+/// form agree byte for byte — which they must, since the method IS the value
+/// form since A85.
+#[test]
+fn a85_the_ssr_twins_of_the_value_forms_render_what_the_methods_do() {
+    let stdout = build_and_run_process("a85_value_forms_ssr", A85_VALUE_FORMS_SSR);
+    let expected = "<main><header>H</header><li>a</li><li>b</li><b>M</b>\
+                    <section>p1</section><footer>F</footer></main>";
+    assert_eq!(
+        stdout,
+        format!("{expected}\n{expected}\n"),
+        "the server twin must render a value form exactly where its hole is, \
+         and exactly as the method form does"
+    );
+}
+
+/// A91: a render closure yields any `Slot`. Three runs over the same list, one
+/// per row shape the widening admits — a FRAGMENT row (two elements), a TEXT
+/// row (one text node), and a VALUE-FORM row (a `when`, which grows and shrinks
+/// after it was placed and is the shape no snapshot of a row's nodes could
+/// follow) — driven through a reorder-with-insert, a toggle and a removal.
+const A91_ROW_SHAPES: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view, when };
+
+fun main() {
+	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
+	let flag: SignalCell<bool> = Signal::new(true);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("header").text("H"))
+			.bind_each_values(rows, |item: str| [view("i").text(item), view("b").text(item)])
+			.child(view("hr"))
+			.bind_each_values(rows, |item: str| item)
+			.child(view("em").text("E"))
+			.bind_each_values(rows, |item: str| when(flag, || view("u").text(item)))
+			.child(view("footer").text("F"))
+	});
+	print(i"start={tree()}");
+	rows.set(["b", "a", "c"]);
+	print(i"reorder={tree()}");
+	flag.set(false);
+	print(i"off={tree()}");
+	rows.set(["c"]);
+	print(i"remove={tree()}");
+	flag.set(true);
+	print(i"on={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+/// The tree `A91_ROW_SHAPES` must show for a given list and `when` state.
+fn a91_tree(rows: &[&str], on: bool) -> Vec<String> {
+    let mut expected = vec![
+        "root".to_string(),
+        "main".to_string(),
+        "header'H'".to_string(),
+    ];
+    for row in rows {
+        expected.push(format!("i'{row}'"));
+        expected.push(format!("b'{row}'"));
+    }
+    expected.push("hr".to_string());
+    for row in rows {
+        expected.push(format!("#text'{row}'"));
+    }
+    expected.push("em'E'".to_string());
+    if on {
+        for row in rows {
+            expected.push(format!("u'{row}'"));
+        }
+    }
+    expected.push("footer'F'".to_string());
+    expected
+}
+
+/// The whole of A91 in one tree: every row shape keeps the run's order through
+/// a reorder-with-insert, a removal, and a change INSIDE a row that the
+/// reconciler never sees. The last readout is the one that would catch a
+/// removed row's owner surviving: the two rows that left would put their `u`
+/// back when the flag turns on again.
+#[test]
+fn a91_a_fragment_a_text_and_a_value_form_row_reorder_and_remove_as_units() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a91_row_shapes", A91_ROW_SHAPES, &harness);
+    assert_eq!(
+        readouts(&stdout),
+        vec![
+            ("start".to_string(), a91_tree(&["a", "b"], true)),
+            ("reorder".to_string(), a91_tree(&["b", "a", "c"], true)),
+            ("off".to_string(), a91_tree(&["b", "a", "c"], false)),
+            ("remove".to_string(), a91_tree(&["c"], false)),
+            ("on".to_string(), a91_tree(&["c"], true)),
+        ],
+        "a row of any `Slot` shape must move and die as a unit; got:\n{stdout}"
+    );
+}
+
+/// The mechanism, asserted where the readout above cannot see it: a row costs
+/// one MARKER — an empty text node planted before its content — and a region
+/// still costs exactly one anchor. Three runs of two rows each plus their three
+/// region anchors is nine empty text nodes; after the run shrinks to one row
+/// per list, three rows and three anchors is six.
+#[test]
+fn a91_a_row_costs_one_empty_text_marker() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run("a91_markers", A91_ROW_SHAPES, &harness);
+    let markers = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line in:\n{stdout}"))
+            .split(' ')
+            .filter(|token| token.starts_with("#text#") && !token.contains('\''))
+            .count()
+    };
+    // Three region anchors, two rows each (six markers), and — inside each of
+    // the two value-form rows — a `when`'s own region anchor and the row IT
+    // placed: 3 + 6 + 2 + 2.
+    assert_eq!(markers("start="), 13, "two rows per run:\n{stdout}");
+    // Three rows each now: 3 + 9 + 3 + 3.
+    assert_eq!(markers("reorder="), 18, "three rows per run:\n{stdout}");
+    // One row each, with the `when` toggled OFF, so its region is there and
+    // its row is not: 3 + 3 + 1 + 0.
+    assert_eq!(markers("remove="), 7, "one row per run:\n{stdout}");
+}
+
+/// A91's server twin: the row renders what its `Slot` renders, in place, and a
+/// value-form row is a `when` that the server takes or drops. The method form
+/// and the value form agree, as they must.
+const A91_ROWS_SSR: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, each_values, render, view, when };
+
+fun main() {
+	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
+	let flag: SignalCell<bool> = Signal::new(true);
+	print(render(view("main")
+		.child(view("header").text("H"))
+		.child(each_values(rows, |item: str| [view("i").text(item), view("b").text(item)]))
+		.child(each_values(rows, |item: str| item))
+		.child(each_values(rows, |item: str| when(flag, || view("u").text(item))))
+		.child(view("footer").text("F"))));
+	print(render(view("main")
+		.child(view("header").text("H"))
+		.bind_each_values(rows, |item: str| [view("i").text(item), view("b").text(item)])
+		.bind_each_values(rows, |item: str| item)
+		.bind_each_values(rows, |item: str| when(flag, || view("u").text(item)))
+		.child(view("footer").text("F"))));
+}
+
+main();
+"#;
+
+#[test]
+fn a91_the_ssr_twin_renders_what_each_row_shape_renders() {
+    let stdout = build_and_run_process("a91_rows_ssr", A91_ROWS_SSR);
+    let expected = "<main><header>H</header><i>a</i><b>a</b><i>b</i><b>b</b>ab\
+                    <u>a</u><u>b</u><footer>F</footer></main>";
+    assert_eq!(
+        stdout,
+        format!("{expected}\n{expected}\n"),
+        "the server twin must render a fragment row, a text row and a \
+         value-form row as what they are, in place"
     );
 }

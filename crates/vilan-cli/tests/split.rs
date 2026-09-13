@@ -1076,3 +1076,114 @@ const STUB: &str = concat!(
     include_str!("support/dom/stub.js"),
     include_str!("support/dom/split.js"),
 );
+
+/// The fixture rewritten to A85's VALUE form: the route match moves out of the
+/// dotted `.swap(..)` link and into a child hole, `{swap(route, ..)}`. Nothing
+/// else changes — same arms, same pages, same module bindings.
+fn stage_value_form(tag: &str) -> PathBuf {
+    let staged = stage(tag, true);
+    let app = staged.join("app.vl");
+    let source = std::fs::read_to_string(&app).expect("read the staged fixture");
+    let method = "\t\t.swap(route, |current| match current {\n\
+                  \t\t\tRoute::Home => home_page(),\n\
+                  \t\t\tRoute::Docs(let page) => docs_page(page),\n\
+                  \t\t\tRoute::NotFound => not_found_page(),\n\
+                  \t\t})";
+    assert!(
+        source.contains(method),
+        "the fixture must still write its route match as the method form"
+    );
+    let value = "\t\t.child(swap(route, |current| match current {\n\
+                 \t\t\tRoute::Home => home_page(),\n\
+                 \t\t\tRoute::Docs(let page) => docs_page(page),\n\
+                 \t\t\tRoute::NotFound => not_found_page(),\n\
+                 \t\t}))";
+    let rewritten = source.replace(method, value).replace(
+        "import std::ui::{ View, mount_root, view };",
+        "import std::ui::{ View, mount_root, swap, view };",
+    );
+    assert!(
+        rewritten.contains("swap, view"),
+        "the rewrite must import the value form"
+    );
+    std::fs::write(&app, rewritten).expect("write the value-form fixture");
+    staged
+}
+
+/// A85's WORST failure mode, pinned: a route match written as the VALUE form
+/// must still split, still gate, and still preload.
+///
+/// This is the one that cannot be caught by reading the output. A recognizer
+/// that knew only the `View.swap` METHOD would compile this program perfectly
+/// and simply stop splitting it — no error, no warning, the bundle merely whole
+/// again and the first load quietly bigger. So the claim is asserted against the
+/// same driver and the same expected transcript as the method form's
+/// (`a_split_bundle_runs_its_routes_and_fetches_one_chunk_at_a_time`): the
+/// chunks exist, the boot preload is on the wire before the shell, the previous
+/// page holds while a chunk is in flight, and an arm never navigated to is never
+/// fetched.
+#[test]
+fn a85_a_value_form_route_swap_splits_exactly_as_the_method_form_does() {
+    let staged = stage_value_form("value_form_run");
+    build(&staged, &[]);
+
+    // The artifacts: one chunk per tagged arm, and the pages in them.
+    for artifact in ARTIFACTS {
+        assert!(
+            staged.join(artifact).exists(),
+            "{artifact} must be emitted for a value-form route match"
+        );
+    }
+    let chunks: String = [
+        "app.Route_Home.js",
+        "app.Route_Docs.js",
+        "app.Route_NotFound.js",
+    ]
+    .iter()
+    .map(|name| read(&staged, name))
+    .collect();
+    for page in ["home_page", "docs_page", "docs_nav", "not_found_page"] {
+        assert!(
+            chunks.contains(&format!("function {page}(")),
+            "{page} must ride its arm's chunk under the value form too"
+        );
+    }
+
+    let stdout = run_under_node(
+        &staged,
+        r#"const stub = require("./stub.js");
+require("./app.js");
+const chunks = globalThis.__vilan_chunks;
+
+(async () => {
+	console.log("preloaded-before-the-shell", stub.first_element_saw_a_fetch());
+	console.log("boot", stub.page());
+	await stub.rendered("scale 6");
+	console.log("home", stub.page());
+	stub.go("/docs/3");
+	console.log("fetching", stub.page());
+	await stub.rendered("page 3");
+	console.log("docs", stub.page());
+	const fetched = Object.keys(chunks.loaded)
+		.map((arm) => chunks.url[arm].replace("app.", "").replace(".js", ""))
+		.sort()
+		.join(",");
+	console.log("fetched", fetched);
+})();
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "init BASE=2\n\
+         init SCALED=6\n\
+         preloaded-before-the-shell true\n\
+         boot <main><nav><a>Home</a><a>Docs</a></nav><p>...</p><p></p></main>\n\
+         home <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         fetching <main><nav><a>Home</a><a>Docs</a></nav><p>...</p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         docs <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><article><section><h2>Docs</h2><p>page 3</p></section><nav><a>Next</a></nav></article></main>\n\
+         fetched Route_Docs,Route_Home\n",
+        "the value form must split, gate and preload exactly as the method \
+         form does"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}

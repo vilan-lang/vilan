@@ -227,8 +227,7 @@ pub fn transform_split_with_plan<'src>(
     transformer.chunk_members = plan.members();
     transformer.chunk_count = plan.chunks.len();
     transformer.chunk_gate = plan.gate.as_ref().map(|gate| ChunkGate {
-        swap: gate.swap,
-        swap_split: gate.swap_split,
+        retarget: gate.retarget.clone(),
         preload: gate.preload,
         calls: gate.calls.iter().copied().collect::<HashSet<Id>>(),
     });
@@ -752,7 +751,7 @@ fn lower_returns_to_break_in_if(branch: &mut js::IfBranch<'_>, exit_temp: Option
 /// which is the behaviour that shipped with S2.
 fn plant_boot_preloads<'src>(
     body: &mut Vec<js::Node<'src>>,
-    gates: &BTreeMap<String, String>,
+    gates: &BTreeMap<String, (String, usize)>,
     total: &mut usize,
 ) -> Vec<usize> {
     if gates.is_empty() {
@@ -789,7 +788,7 @@ fn plant_boot_preloads<'src>(
 /// body wherever it sits, and the block forms — planting there.
 fn descend_for_preload<'src>(
     node: &mut js::Node<'src>,
-    gates: &BTreeMap<String, String>,
+    gates: &BTreeMap<String, (String, usize)>,
     total: &mut usize,
 ) {
     match node {
@@ -847,7 +846,7 @@ fn descend_for_preload<'src>(
 
 fn descend_if_for_preload<'src>(
     branch: &mut js::IfBranch<'src>,
-    gates: &BTreeMap<String, String>,
+    gates: &BTreeMap<String, (String, usize)>,
     total: &mut usize,
 ) {
     match branch {
@@ -868,12 +867,18 @@ fn descend_if_for_preload<'src>(
 /// such a call with a plainly-named source. Deliberately does NOT descend into
 /// function or closure bodies or into block forms: those are statement lists of
 /// their own, and [`plant_boot_preloads`] has already planted in them.
-fn gate_source_name(node: &js::Node, gates: &BTreeMap<String, String>) -> Option<(String, String)> {
+fn gate_source_name(
+    node: &js::Node,
+    gates: &BTreeMap<String, (String, usize)>,
+) -> Option<(String, String)> {
     match node {
         js::Node::Call(subject, arguments) => {
+            // The route source sits at the index the gate recorded: argument 1
+            // for the `View` METHOD (whose receiver is emitted first) and 0 for
+            // A85's value form.
             if let js::Node::Local(name) = subject.as_ref()
-                && let Some(preload) = gates.get(name)
-                && let Some(js::Node::Local(source)) = arguments.get(1)
+                && let Some((preload, source_at)) = gates.get(name)
+                && let Some(js::Node::Local(source)) = arguments.get(*source_at)
             {
                 return Some((preload.clone(), source.clone()));
             }
@@ -2311,7 +2316,7 @@ struct Transformer<'src> {
     // boot preload for the same route type (`bundle-splitting.md` §S3). Recorded
     // at emission, so these are PRE-rename names — which is what the planting
     // pass, which runs before the rename, matches against.
-    gate_call_names: BTreeMap<String, String>,
+    gate_call_names: BTreeMap<String, (String, usize)>,
     // The const pass's per-emission attribution (`const-eval.md` §10.6). `None`
     // for every other transform — an entry build records nothing, and the field
     // is what keeps the emission path it shares with the const pass unchanged.
@@ -2525,12 +2530,14 @@ type FrameSets = (
     BTreeMap<String, BTreeSet<String>>,
 );
 
-/// What a split build's route gate rewires: `View.swap` becomes
-/// `View.swap_split` at the recognized calls, and `std::ui::chunk_preload` is
-/// planted ahead of the statement that mounts each one.
+/// What a split build's route gate rewires: a recognized `swap` call becomes
+/// its `swap_split` twin — the `View` METHOD or, since A85, the free VALUE form
+/// — and `std::ui::chunk_preload` is planted ahead of the statement that mounts
+/// each one. `retarget`'s third element is the emitted call's route-source
+/// argument index, which differs between the two shapes (the method carries its
+/// receiver first).
 struct ChunkGate {
-    swap: Id,
-    swap_split: Id,
+    retarget: Vec<(Id, Id, usize)>,
     preload: Id,
     calls: HashSet<Id>,
 }
@@ -2741,7 +2748,11 @@ impl<'src> Transformer<'src> {
         let gate_roots: Vec<Id> = self
             .chunk_gate
             .as_ref()
-            .map(|gate| vec![gate.swap_split, gate.preload])
+            .map(|gate| {
+                let mut roots: Vec<Id> = gate.retarget.iter().map(|(_, to, _)| *to).collect();
+                roots.push(gate.preload);
+                roots
+            })
             .unwrap_or_default();
         let reachable_bindings =
             crate::platform_color::reachable_bindings(self.program, graph, main_fn.id, &gate_roots);
@@ -4360,7 +4371,8 @@ impl<'src> Transformer<'src> {
                         // letting the view advance (`bundle-splitting.md` §2).
                         // Same shape, so the call's own type binding carries
                         // over by position; every argument is emitted unchanged.
-                        if let Some((gate_target, preload)) = self.split_gate_target(*id, target_id)
+                        if let Some((gate_target, preload, source_at)) =
+                            self.split_gate_target(*id, target_id)
                         {
                             let call_substitution = self.call_substitution(
                                 *id,
@@ -4385,7 +4397,8 @@ impl<'src> Transformer<'src> {
                                 .unwrap_or_default();
                             let preload_name = self.emit_instance(preload, &preload_substitution);
                             let name = self.emit_instance(gate_target, &substitution);
-                            self.gate_call_names.insert(name.clone(), preload_name);
+                            self.gate_call_names
+                                .insert(name.clone(), (preload_name, source_at));
                             return Some(js::Node::Call(Box::new(js::Node::Local(name)), args));
                         }
                         // An external std intrinsic lowers to native JS or a
@@ -7735,10 +7748,15 @@ impl<'src> Transformer<'src> {
     /// The gate this call is retargeted to, if it is one of the split build's
     /// recognized route matches. `None` for every other call in every other
     /// build — which is why a flagless build emits exactly what it always did.
-    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<(Id, Id)> {
+    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<(Id, Id, usize)> {
         let gate = self.chunk_gate.as_ref()?;
-        (target_id == gate.swap && gate.calls.contains(&call_id))
-            .then_some((gate.swap_split, gate.preload))
+        if !gate.calls.contains(&call_id) {
+            return None;
+        }
+        gate.retarget
+            .iter()
+            .find(|(from, _, _)| *from == target_id)
+            .map(|(_, to, source_at)| (*to, gate.preload, *source_at))
     }
 
     /// Re-keys a type substitution from one function's generic parameters onto
