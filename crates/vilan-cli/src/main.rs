@@ -410,21 +410,25 @@ fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
                 .unwrap_or_else(|| "age unknown".to_string()),
         );
     }
-    println!(
-        "{}",
-        paint::out(
-            paint::Style::DIM,
-            &format!(
-                "{kept} entr{} kept (this toolchain's own tree{})",
-                if kept == 1 { "y" } else { "ies" },
-                if all {
-                    ""
-                } else {
-                    ", and anything created in the last seven days"
-                }
+    // The rule, not a claim about the survivors: with `--all` the only entry
+    // that CAN survive is this binary's own, and there may be none.
+    if kept > 0 {
+        println!(
+            "{}",
+            paint::out(
+                paint::Style::DIM,
+                &format!(
+                    "{kept} entr{} kept: this binary's own tree is never pruned{}",
+                    if kept == 1 { "y" } else { "ies" },
+                    if all {
+                        ""
+                    } else {
+                        ", nor is anything created in the last seven days"
+                    }
+                )
             )
-        )
-    );
+        );
+    }
     ExitCode::SUCCESS
 }
 
