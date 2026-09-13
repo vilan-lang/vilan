@@ -9211,9 +9211,7 @@ impl<'src> Analyzer<'src> {
             // Its diagnostics are replayed and the keys it contributed above
             // are already in `reported_structures`, so both halves of what this
             // loop would have produced for it are already here.
-            let visited = !self.reused_source(source);
-            container_site_offered(visited);
-            if !visited {
+            if !self.container_site_visited(ContainerSite::File(source)) {
                 continue;
             }
             let Some(found) =
@@ -9301,7 +9299,7 @@ impl<'src> Analyzer<'src> {
             // M19 T1d: a reused module's native receiver sites are its own — the
             // call is in its body and the diagnostic publishes to its file — so
             // they are skipped with the rest of its tier.
-            if !self.container_site_visited(*call_id) {
+            if !self.container_site_visited(ContainerSite::Entity(*call_id)) {
                 continue;
             }
             let source = self.source_of_id(*call_id).unwrap_or(SourceId(0));
@@ -9435,11 +9433,9 @@ impl<'src> Analyzer<'src> {
         // warm keystroke almost all of them belong to modules whose answer is
         // already recorded.
         //
-        // The question is asked of the ENTITY here rather than of the file, and
-        // it is the same question: `world_ranges` is `source_ranges` filtered
-        // by the reused set, so [`Self::world_entity`] and
-        // [`Self::reused_source`] agree wherever both can be asked (an id
-        // inside no range resolves to the entry, which is in neither). Asking
+        // The question is asked of the ENTITY here rather than of the file,
+        // and it is the same question — see
+        // [`Self::container_site_visited`], which holds both spellings. Asking
         // the entity is what makes the skip free on a COLD analysis: with
         // nothing reused the ranges are empty and the binary search returns on
         // its first branch, where resolving the file would cost a real search
@@ -9454,7 +9450,7 @@ impl<'src> Analyzer<'src> {
             ));
         };
         for expr_id in self.expr_id_to_expr_map.keys().copied() {
-            if !self.container_site_visited(expr_id) {
+            if !self.container_site_visited(ContainerSite::Entity(expr_id)) {
                 continue;
             }
             if let Some(type_id) = self.resolved_type_id_of(expr_id)
@@ -9464,7 +9460,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for variable in self.variables.values() {
-            if !self.container_site_visited(variable.id) {
+            if !self.container_site_visited(ContainerSite::Entity(variable.id)) {
                 continue;
             }
             push(
@@ -9475,7 +9471,7 @@ impl<'src> Analyzer<'src> {
             );
         }
         for parameter in self.parameters.values() {
-            if !self.container_site_visited(parameter.id) {
+            if !self.container_site_visited(ContainerSite::Entity(parameter.id)) {
                 continue;
             }
             if let Some(span) = self.span_map.get(&parameter.id) {
@@ -34934,42 +34930,42 @@ impl<'src> Analyzer<'src> {
         self.frozen_entity(id) || self.world_entity(id)
     }
 
-    /// [`Self::reusable_entity`] asked of a FILE rather than an entity (M19
-    /// T1d): whether this analysis is reusing `source`'s Class A output.
+    /// Whether this analysis VISITS `site` — R10's one reuse predicate — and
+    /// the census of every site it was asked about (M19 T1d).
     ///
-    /// R10's first tier is the one that needs it. A written type application is
-    /// collected at `walk_type_node` as `(TypeId, Span, SourceId)` and has no
-    /// entity id of its own to ask [`Self::world_entity`] about; the two other
-    /// tiers do have one and ask that instead
-    /// ([`Self::container_site_visited`]). Asking the file is the same claim:
-    /// `world_ranges` is exactly `source_ranges` filtered by
-    /// [`Self::reused_sources`], so the two predicates agree wherever both can
-    /// be asked.
+    /// A site is visited unless the module carrying it is one whose Class A
+    /// output this analysis is REUSING: a reused module's R10 diagnostics are
+    /// replayed and the structure keys it contributed are already restored, so
+    /// both halves of what the tier would produce for it are already here.
+    ///
+    /// N80 folded two spellings of this question into one. They were
+    /// `reused_source(SourceId)` — asked by the written-application tier, which
+    /// carries a file and no entity id — and `container_site_visited(Id)`,
+    /// asked by the other two, which carry an entity id and would pay a real
+    /// binary search to resolve a file. That is why both arms survive the fold:
+    /// on a COLD analysis `world_ranges` is empty and [`Self::world_entity`]
+    /// returns on its first branch, where resolving the file per entity would
+    /// cost a search to buy nothing; and the written tier has no id to ask
+    /// with. They agree wherever both can be asked, because `world_ranges` IS
+    /// `source_ranges` filtered by [`Self::reused_sources`] (an id inside no
+    /// range resolves to the entry, which is in neither). What they did NOT
+    /// agree on was polarity — one answered "reused", the other "visited" —
+    /// and only one of them counted the site, which is the shape N66 filed.
     ///
     /// Deliberately NOT `frozen_entity`'s half. A std module is in
     /// `reused_sources` on a base-cache hit like any other module of the
     /// world, and is then covered by a RECORD; the S1 freeze is a different
     /// and stronger claim ("std's diagnostics are known absent") that R10
     /// cannot make, because its inferred tier reads the resolved type of every
-    /// expression and a std expression's type can be ground by user code.
-    /// This predicate is therefore false whenever reuse is off, the full-scan
-    /// override is on, or the world was not served from the cache — the three
-    /// cases in which `reused_sources` is empty.
-    fn reused_source(&self, source: SourceId) -> bool {
-        self.reused_sources.binary_search(&source).is_ok()
-    }
-
-    /// [`Self::reused_source`] asked of the ENTITY that carries an R10 site,
-    /// counting the site into the census either way (M19 T1d).
-    ///
-    /// `world_entity` rather than `reused_source(source_of_id(..))` for a
-    /// reason that is about the COLD path: with nothing reused `world_ranges`
-    /// is empty and the search returns on its first branch, while resolving the
-    /// file would be a real binary search per entity, paid on every cache miss
-    /// to buy nothing. The two agree — `world_ranges` IS `source_ranges`
-    /// filtered by the reused set.
-    fn container_site_visited(&self, id: Id) -> bool {
-        let visited = !self.world_entity(id);
+    /// expression and a std expression's type can be ground by user code. So
+    /// every site is visited whenever reuse is off, the full-scan override is
+    /// on, or the world was not served from the cache — the three cases in
+    /// which `reused_sources` is empty.
+    fn container_site_visited(&self, site: ContainerSite) -> bool {
+        let visited = match site {
+            ContainerSite::File(source) => self.reused_sources.binary_search(&source).is_err(),
+            ContainerSite::Entity(id) => !self.world_entity(id),
+        };
         container_site_offered(visited);
         visited
     }
@@ -47829,6 +47825,23 @@ pub fn table_reuse_census() -> usize {
 thread_local! {
     static CONTAINER_SITE_CENSUS: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
+}
+
+/// One R10 site, in whichever of the two spellings its tier can produce.
+///
+/// The tiers do not all have the same handle on a site. A written type
+/// application is collected at `walk_type_node` as `(TypeId, Span, SourceId)`
+/// and has no entity id of its own; the receiver and inferred tiers are keyed
+/// by an entity id and have no file until one is resolved for a site that
+/// survives. Both spellings decide ONE question —
+/// [`Analyzer::container_site_visited`] — and they agree wherever both can be
+/// asked, because `world_ranges` IS `source_ranges` filtered by the reused set.
+#[derive(Clone, Copy)]
+enum ContainerSite {
+    /// The file the site was collected in (R10's written-application tier).
+    File(SourceId),
+    /// The entity that carries the site (R10's receiver and inferred tiers).
+    Entity(Id),
 }
 
 /// Offer one R10 site to the census, and say whether it was visited.
