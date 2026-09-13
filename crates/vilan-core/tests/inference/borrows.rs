@@ -9639,6 +9639,112 @@ fn b267_a_read_whose_binding_a_closure_captures_copies() {
     assert_compiles_and_runs(source, "3\n");
 }
 
+// --- B274: the copy at a `&mut self` receiver on a temporary read ------------
+//
+// B256 left the temporary free, and one temporary is not free: the RECEIVER of
+// a `&mut self` method. A read hands back the cell's own storage, so the
+// callee's `&mut` binding IS the cell and `shared.read().push(x)` grows it —
+// through a signature that says it hands back a value. It is the only position
+// a value reaches a `&mut` binding through: a `&mut` PARAMETER refuses one
+// outright ("a `&mut` parameter takes a view; pass `&mut <place>`"), so there is
+// no second hole of this shape to close.
+
+#[test]
+fn b274_a_temporary_read_at_a_mutable_receiver_does_not_grow_the_cell() {
+    // The item's own probe, and what four doc pages have always promised:
+    // `tour/memory-model.md:172`, `:240`, `std/cells.md:36` and
+    // `appendix/gotchas.md:44` all say this push is lost. It was not.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let log = Shared::new([1]);
+            log.read().push(9);
+            print(log.read().len());
+            log.write().push(9);
+            print(log.read().len());
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b274_a_mutable_receiver_on_an_ordinary_place_still_mutates_in_place() {
+    // The control that says how narrow the rule is: only a READ is admitted at
+    // the receiver, never a place. A local, a field and an element are the
+    // in-place mutation the `&mut self` convention exists for, and a rule
+    // keyed on `Convention::RefMut` alone would have copied all three.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Box { items: List<i32> }
+        fun main() {
+            mut local = [1];
+            local.push(9);
+            print(local.len());
+            mut box = Box { items = [1] };
+            box.items.push(9);
+            print(box.items.len());
+            mut nested = [[1]];
+            nested[0].push(9);
+            print(nested[0].len());
+        }
+        "#,
+        "2\n2\n2\n",
+    );
+}
+
+#[test]
+fn b274_a_temporary_read_at_a_reading_receiver_still_copies_nothing() {
+    // B256's other half, held against the widening: a receiver that does not
+    // take `&mut self` cannot grow the cell, so it goes on paying nothing.
+    // `len()` takes a bare `self`, and so does std's own `Bytes::set` — which
+    // is why `binary.vl`'s `self.buffer.read().set(..)` writes through to the
+    // host buffer and must go on doing so.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3]);
+            print(h.read().len());
+            for x in h.read() {
+                print(x);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a reading receiver on a temporary read copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n1\n2\n3\n");
+}
+
+#[test]
+fn b274_a_temporary_read_at_a_mutable_receiver_copies_through_a_field_too() {
+    // The shape the trap is actually written in: a cell reached through a
+    // struct, mutated by a method whose receiver is the read. The position is
+    // the receiver rather than the read's own subject, so how the cell was
+    // reached makes no difference.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Log { lines: Shared<List<str>> }
+        fun main() {
+            let log = Log { lines = Shared::new(["a"]) };
+            log.lines.read().push("b");
+            print(log.lines.read().len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
 // --- E157: `::` after a block-like form is its own refusal ---------------------
 //
 // B248/B259's message earns its keep with its STEER, and a steer has to be a

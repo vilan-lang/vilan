@@ -22937,6 +22937,13 @@ impl<'src> Analyzer<'src> {
     /// expression, so that two owners exist afterwards: a construction
     /// literal's element/field/payload, and an `own` argument (which is how
     /// `List::push` declares that it keeps what it is given).
+    ///
+    /// One position is not a store and is here anyway: the RECEIVER of a `&mut
+    /// self` method, and only when a temporary `Shared::read()` stands in it
+    /// (B274). A read hands back the cell's own storage, so the callee's `&mut`
+    /// binding is the cell — `shared.read().push(x)` grows it — and the receiver
+    /// is the only position a value reaches a `&mut` binding through, a `&mut`
+    /// parameter taking a view and nothing else.
     fn compute_clone_sites(&mut self, shared_captures: &HashSet<Id>) -> HashMap<Id, CopyDecision> {
         // Phase 1 — the candidate positions, collected before any classifying
         // so the (`&mut`, memoizing) resource query can run over them.
@@ -23060,11 +23067,25 @@ impl<'src> Analyzer<'src> {
                     for (parameter_id, argument_id) in
                         parameter_ids.iter().zip(&function_call.argument_ids)
                     {
-                        let is_own = self
-                            .parameters
-                            .get(parameter_id)
-                            .is_some_and(|parameter| parameter.convention == Convention::Own);
-                        if is_own {
+                        let Some(parameter) = self.parameters.get(parameter_id) else {
+                            continue;
+                        };
+                        // B274: the RECEIVER of a `&mut self` method, when what
+                        // stands there is a temporary `Shared::read()`. It is the
+                        // one position at which a value reaches a mutable binding
+                        // implicitly — a `&mut` PARAMETER refuses a value outright
+                        // ("a `&mut` parameter takes a view; pass `&mut <place>`",
+                        // there is no implicit borrow), so the receiver's borrow is
+                        // the whole of the hole — and without the copy
+                        // `shared.read().push(x)` GROWS the cell, which is the one
+                        // thing `read()`'s value signature says it cannot do.
+                        // Narrow on purpose: only a read is admitted here, never a
+                        // place, because `c.push(9)` on a local is the in-place
+                        // mutation the whole convention exists for.
+                        let is_shared_read_receiver = parameter.convention == Convention::RefMut
+                            && parameter.name == "self"
+                            && self.is_shared_read(*argument_id);
+                        if parameter.convention == Convention::Own || is_shared_read_receiver {
                             consider(self, *argument_id, None);
                         }
                     }
@@ -44954,8 +44975,11 @@ pub enum Intrinsic {
     // of it: rule 1's copy is the CLONE PASS's business (B256 — a read is a
     // place, so a binding, assignment, construction slot or `own` argument fed
     // by one copies, and B267's cell-aware elision takes it back where nothing
-    // can observe the sharing), and a temporary — `for x in cell.read()`,
-    // `cell.read().len()` — is no position at all and stays free.
+    // can observe the sharing), and a temporary that only READS the slot — `for
+    // x in cell.read()`, `cell.read().len()` — is no position at all and stays
+    // free. The one temporary that is a position is the receiver of a `&mut
+    // self` method (B274): `cell.read().push(x)` would otherwise grow the cell
+    // through a signature that hands back a value.
     SharedValue,
     // `Shared.write()` -> a mutable view of the cell's slot, `self.v`. Same JS as
     // `SharedValue`, but distinguished so a write *through* it rebinds the slot
