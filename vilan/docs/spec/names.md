@@ -67,6 +67,15 @@ over is looked up as items of the module that answered. So
 otherwise the item `c` of the module `a/b.vl`, and otherwise the item
 path `b::c` under `a.vl`.
 
+A segment that names **both** — `a.vl` declares an item `b` and `a/b.vl`
+exists — is an **ambiguity error**, the same answer `a.vl` beside
+`a/lib.vl` gets (§4.1): one of the two has to be renamed. A module's own
+items are matched before its directory's files, so the declaration is
+what an import would land on and the file could not be reached at all;
+a silent winner here is what makes a rename on either side change what
+every existing `pkg::a::b` means. The refusal is raised at the
+declaration, once, whether or not anything imports the path.
+
 Every segment must match the on-disk directory entry **byte for byte**: a
 case-insensitive filesystem that answers `import foo` with `Foo.vl` is a
 **diagnostic naming both spellings**, not a resolution, so that a program

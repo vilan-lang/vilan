@@ -24268,7 +24268,11 @@ impl<'src> Analyzer<'src> {
     ///
     /// The order is the rule: a module's own items win over a same-named file in
     /// its directory, so adding `lib/util.vl` beside a `lib.vl` that already
-    /// declares `util` cannot silently re-point an existing import. Only the
+    /// declares `util` cannot silently re-point an existing import. The
+    /// collision itself is refused ([`Self::refuse_shadowed_submodules`], A67),
+    /// so what the order settles is only what an already-refused program would
+    /// have meant — which is still worth settling, because the refusal names
+    /// the winner. Only the
     /// import path walk asks this; ordinary member access
     /// (`lib::util::hello()` in an expression) asks `member_in_namespace`
     /// alone, which is what keeps a parent import from bringing children into
@@ -24283,6 +24287,74 @@ impl<'src> Analyzer<'src> {
             let children_scope_id = self.module_children_scopes.get(&namespace_module_id?)?;
             self.member_in_namespace(name, *children_scope_id)
         })
+    }
+
+    /// A67: a module that declares an item with the same name as a module file
+    /// in its own directory — `a.vl` declaring `b` beside an `a/b.vl`.
+    ///
+    /// [`Self::member_or_submodule`]'s order decides it silently: the
+    /// declaration wins, so `a/b.vl` cannot be reached by any import while the
+    /// declaration stands, and `import pkg::a::b::greet` reports "cannot find
+    /// 'greet' in the imported path" about a file the author can see on disk.
+    /// The order was chosen so that ADDING a file could not re-point an
+    /// existing import, and that is still the right winner — but a silent
+    /// winner is how a rename goes wrong, in either direction: rename the
+    /// declaration and every `pkg::a::b` in the estate quietly becomes the
+    /// file. So the collision is an ambiguity error, which is what the
+    /// file-level twin (`a.vl` beside `a/lib.vl`) has been since A65: one rule
+    /// for both collisions.
+    ///
+    /// Reported at the DECLARATION, once per collision, whether or not anything
+    /// imports the path — the ambiguity is a fact about the tree, and the
+    /// declaration is the half the author can move. Only a module that was
+    /// LOADED has a children scope, which is the same bound the file-level
+    /// twin's report has.
+    fn refuse_shadowed_submodules(&mut self) {
+        let mut collisions: Vec<(Id, &'src str, &'src str)> = Vec::new();
+        for (module_id, children_scope_id) in &self.module_children_scopes {
+            let Some(module) = self.modules.get(module_id) else {
+                continue;
+            };
+            let Some(children) = self.scopes.get(children_scope_id) else {
+                continue;
+            };
+            for name in children.name_to_id_map.keys() {
+                // `lib` is never a child: `a/lib.vl` is module `a`'s own BODY.
+                // `submodules_in_directory` excludes it for that reason, and a
+                // `lib` reaches this scope only from an import path spelled
+                // `pkg::a::lib`, which resolves the body file a second time
+                // under a second name. That tree is degenerate and already
+                // stated — `a.vl` beside `a/lib.vl` is the file-level ambiguity
+                // — so saying it twice would be two diagnostics for one root
+                // cause (diagnostics-standard B5).
+                if *name == "lib" {
+                    continue;
+                }
+                if let Some(member_id) = self.member_in_namespace(name, module.body.1) {
+                    collisions.push((member_id, module.name, name));
+                }
+            }
+        }
+        // The children scopes are a `HashMap`, so the walk order is not one:
+        // sorted by the declaration's own id, which is its position in the
+        // file, the way every other whole-program check reports.
+        collisions.sort_by_key(|(member_id, _, _)| member_id.0);
+        for (member_id, module_name, name) in collisions {
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&member_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is ambiguous in module `{module_name}`: `{module_name}` \
+                         declares `{name}`, and its directory holds a `{name}.vl` that is the \
+                         module `{module_name}::{name}` — the declaration wins, so the file \
+                         cannot be reached by any import; rename one of them"
+                    ),
+                },
+                member_id,
+            );
+        }
     }
 
     fn try_get_expr_id_by_name(&mut self, name: &'src str, scope_id: Id) -> Option<Id> {
@@ -42180,6 +42252,14 @@ impl<'src> Analyzer<'src> {
     /// a pre-entry world would freeze std constraints the entry still binds
     /// (the chained-`map` failure that pinned this split).
     fn finalize_build(&mut self) {
+        // A67: the module-tree ambiguity. Here rather than in `resolve_world`
+        // because that runs TWICE under the S3 two-phase shape — once over the
+        // pre-entry world and once for the build — and a fact about the tree
+        // must be stated once. Nothing about it depends on the import drain: it
+        // reads the children scopes the loader built and the item scopes the
+        // walk filled, both of which are complete before either pass.
+        self.refuse_shadowed_submodules();
+
         // Hand any still-unresolved constraints back to `self.constraints` so the
         // post-fixpoint passes (the `for…in` commit, the end-of-fixpoint
         // diagnostics) see them where they always have.
@@ -49179,9 +49259,15 @@ fn resolve_module_in_roots(roots: &[&Path], name: &str) -> Option<ModuleResoluti
 /// before.
 ///
 /// Longest-first is deliberate rather than shortest-first: a directory is the
-/// author's own statement that the name below it is a module, and an item of
-/// the parent that happens to share the child's name would otherwise shadow a
-/// file the author can see on disk.
+/// author's own statement that the name below it is a module, so the LOAD of
+/// `a/b.vl` does not depend on what `a.vl` happens to declare.
+///
+/// It does not settle the collision, and never did: the import walk asks
+/// [`Analyzer::member_or_submodule`], whose order makes the parent's own item
+/// win, so a `b` declared in `a.vl` left `a/b.vl` unreachable however the
+/// loader had resolved it. That collision is an ambiguity error now (A67,
+/// [`Analyzer::refuse_shadowed_submodules`]) — the same answer `a.vl` beside
+/// `a/lib.vl` gets — so neither rule decides a program's meaning silently.
 fn longest_module_prefix(roots: &[&Path], path: &str) -> Option<String> {
     let mut candidate = path.to_string();
     loop {
