@@ -1881,6 +1881,31 @@ fn a_pattern_binder_names_the_two_binding_forms_in_either_order() {
 }
 
 #[test]
+fn a_pattern_binder_steer_names_the_write_back_its_copy_needs() {
+    // D7: the second half of the steer. `Some(mut list)` is the spelling A80
+    // offers, and a binder is a BINDING — it takes rule 1's copy (grammar.md
+    // §3.10), so `list.push(..)` inside the arm grows the copy and the subject
+    // is untouched. The shape this refusal is reached from is a
+    // `SignalCell::update` growing a wrapped collection, where stopping at
+    // "`mut x`" sends the author one step down a path that ends where they
+    // started.
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let mut list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "let mut",
+        "assign back through it (`held = Some(list)`) or use `take`/`replace`",
+    );
+}
+
+#[test]
 fn a_refused_pattern_binder_no_longer_reports_the_payload_paren() {
     // The recovery is what makes it ONE diagnostic: the pair is consumed and the
     // binder taken as mutable, so the arm still parses, the payload's `(` is

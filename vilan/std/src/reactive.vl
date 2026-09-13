@@ -884,6 +884,14 @@ impl SignalCell<type T> {
 	/// avoid, and an impl may want its own update logic or none at all. A
 	/// consumer that needs it asks for the cell.
 	///
+	/// `mutate` receives the storage as a `&mut` SUBJECT, and a pattern binder
+	/// under it is a binding like any other: `Some(mut list)` takes rule 1's
+	/// COPY, so `list.push(..)` inside the arm grows the copy and the cell
+	/// keeps the value it had. Write back through the subject
+	/// (`held = Some(list)`), or move the payload out and put one back with
+	/// `take`/`replace`. Only a wrapped collection meets this — `update` on a
+	/// `SignalCell<List<T>>` mutates the storage directly.
+	///
 	/// The notification is UNCONDITIONAL — exactly like `set`, which never
 	/// compares either. A `mutate` that writes nothing still publishes; that
 	/// is cheap and predictable, and it keeps `update` and `set` one rule.

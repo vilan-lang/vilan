@@ -306,10 +306,19 @@ const LET_MUT_IS_ONE_WORD: &str = "a mutable binding is spelled `mut x = …`: `
 /// forms there too and the steer is the pattern spelling the author wanted. Its own
 /// constant rather than a second use of the declaration's, because that one's steer
 /// (`mut x = …`, with an initializer) is not a thing you can write in a pattern.
+///
+/// D7: and it names what `Some(mut list)` then MEANS. The author who reaches for
+/// a mutable binder is usually growing a collection inside a `SignalCell::update`
+/// — the shape A80 was filed from — and the binder is a binding, so it takes rule
+/// 1's copy: the spelling the steer offers still leaves the subject alone without
+/// a write-back. Saying "`mut x`" and stopping sends them one step down a path
+/// that ends where they started.
 const PATTERN_BINDER_IS_ONE_WORD: &str = "a pattern binds mutably with `mut x`: `let` and `mut` are the two binding forms \
      inside a pattern exactly as they are in a declaration, not a keyword and a \
      modifier — `Some(let list)` binds immutably, `Some(mut list)` binds mutably, and \
-     writing both is neither";
+     writing both is neither. A binder is a BINDING, so `Some(mut list)` binds a \
+     copy: to change the subject, assign back through it (`held = Some(list)`) or \
+     use `take`/`replace`";
 
 /// The did-you-mean note for a failure INSIDE an interpolation hole. A `{` in an
 /// `i"…"` opens a hole, so a literal brace has to be escaped — and code that

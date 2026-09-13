@@ -1814,6 +1814,34 @@ struct ImplNamespace<'src> {
     members: Vec<(&'src str, Id)>,
 }
 
+/// The TYPE an import path's last segment named — what the rest of the walk
+/// resolves against (B317, B332).
+///
+/// B332 is the rule it carries: a type segment **replaces** the walk's
+/// namespace. An enum replaces it with its variants scope, a struct with
+/// nothing but its statics, and neither leaves the module scope behind to
+/// answer the next segment. B317 shipped the struct half the other way round —
+/// the type's namespace asked SECOND, so no path that resolved changed meaning
+/// — which left the two kinds inconsistent: `Option::Some` had never been able
+/// to reach past the enum, while a module-level `rem` beside `Length` beat
+/// `Length::rem`, silently, in the file that declares both.
+#[derive(Debug, Clone, Copy)]
+struct ImportTypeSegment<'src> {
+    /// The type's own entity.
+    subject_id: Id,
+    /// The scope the walk was standing in when the segment resolved. It is
+    /// where the type's `impl` blocks are keyed ([`ImplNamespace`]), which is
+    /// what makes a static reachable through the module that WRITES the block;
+    /// the B332 miss reads it too, to say the item is that module's.
+    scope_id: Id,
+    /// The name the segment was spelled with — what the refusals about it name.
+    name: &'src str,
+    /// Whether the type handed the walk a scope to stand in (an enum's
+    /// variants). A struct hands over none, and then nothing but its statics is
+    /// asked: the scope the walk came from is no longer the walk's.
+    brought_a_scope: bool,
+}
+
 /// One impl-declared candidate for `receiver.member` — a member some impl of
 /// the receiver's type declares, before precedence picks between them
 /// (`proposal/method-resolution.md` §3).
@@ -3441,6 +3469,18 @@ pub struct Analyzer<'src> {
     /// body behind it, so it is refused; the children ride along because naming
     /// them is the whole of the fix ("write `pkg::lib::util`").
     namespace_only_modules: HashMap<Id, Vec<String>>,
+    /// B331: the modules whose DIRECTORY holds a `lib.vl` — the ones for which
+    /// the segment `lib` names their own body file rather than anything below
+    /// them.
+    ///
+    /// [`resolve_module_file`] stopped answering `a::lib` with `a/lib.vl`, so
+    /// the walk down `pkg::a::lib` now misses at that segment; "cannot find
+    /// 'lib'" would be false about a file the author can see on disk, and this
+    /// is what lets the miss say what `lib` IS and steer to `pkg::a` instead.
+    /// A module whose own body is `a/lib.vl` is in the set, and so is one
+    /// resolved to `a.vl` beside an `a/lib.vl` (the file-level ambiguity's
+    /// tree): both mean the directory holds a body file under that name.
+    modules_bodied_by_a_lib_file: HashSet<Id>,
     // The prelude (prelude.md §9.2, implementation option 1). `prelude_exports`
     // is every loaded module's importable names by module scope — what a
     // prelude module would publish, read syntactically at load. `prelude_seeds`
@@ -4893,6 +4933,7 @@ impl<'src> Analyzer<'src> {
             entry_module_package: None,
             module_children_scopes: HashMap::default(),
             namespace_only_modules: HashMap::default(),
+            modules_bodied_by_a_lib_file: HashSet::default(),
             prelude_exports: HashMap::default(),
             prelude_seeds: Vec::new(),
             prelude_entry_bindings: Vec::new(),
@@ -24876,17 +24917,16 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             for name in children.name_to_id_map.keys() {
-                // `lib` is never a child: `a/lib.vl` is module `a`'s own BODY.
-                // `submodules_in_directory` excludes it for that reason, and a
-                // `lib` reaches this scope only from an import path spelled
-                // `pkg::a::lib`, which resolves the body file a second time
-                // under a second name. That tree is degenerate and already
-                // stated — `a.vl` beside `a/lib.vl` is the file-level ambiguity
-                // — so saying it twice would be two diagnostics for one root
-                // cause (diagnostics-standard B5).
-                if *name == "lib" {
-                    continue;
-                }
+                // B331 retired the hand-skip of `lib` that stood here. It was
+                // needed while `pkg::a::lib` resolved `a/lib.vl` a second time
+                // under a second name: the loader registered a `lib` child that
+                // was really `a`'s own body, and reporting the collision on top
+                // of the file-level ambiguity would have been two diagnostics
+                // for one root cause. `resolve_module_file` refuses that name
+                // now, so a `lib` reaching this scope is a real directory —
+                // `a/lib/` with a body or children of its own — and a
+                // declaration named `lib` beside it is the ordinary collision,
+                // which is what this rule is for.
                 if let Some(member_id) = self.member_in_namespace(name, module.body.1) {
                     collisions.push((member_id, module.name, name));
                 }
@@ -34404,17 +34444,29 @@ impl<'src> Analyzer<'src> {
         // registers its top-level modules in its own scope and has no submodule
         // scope, so it starts as `None`.
         let mut namespace_module_id: Option<Id> = None;
-        // B317: the TYPE the previous segment named, the scope the walk was
-        // standing in when it did, and the name it was spelled with. A type's
-        // namespace is asked AFTER the scope's own members, so every path that
-        // resolves today resolves to exactly what it resolves to now and the
-        // statics are reached only where the walk used to stop.
-        let mut type_namespace: Option<(Id, Id, &str)> = None;
-        for (part, part_span) in segments {
-            let scope_hit = self.member_or_submodule(part, namespace_scope_id, namespace_module_id);
-            let type_hit = match (scope_hit, type_namespace) {
-                (None, Some((subject_id, subject_scope_id, _))) => {
-                    self.type_namespace_member(subject_id, subject_scope_id, part)
+        // B317/B332: the TYPE the previous segment named — which, after B332,
+        // IS the walk's namespace rather than an extra place to look. A type
+        // segment REPLACES what the rest of the path resolves against: an enum
+        // does it by handing over its variants scope, a struct by handing over
+        // nothing but its statics, and neither leaves the module scope behind
+        // to answer.
+        let mut type_segment: Option<ImportTypeSegment> = None;
+        for (depth, (part, part_span)) in segments.enumerate() {
+            // B332: a type that brought no scope of its own leaves the walk
+            // with nothing to read here. Reading the scope the walk came FROM
+            // is the order this replaced — it is what made a module-level `rem`
+            // beat `Length::rem` in the file that declares both, while
+            // `Option::Some` had never been able to reach one.
+            let scope_hit = match type_segment {
+                Some(segment) if !segment.brought_a_scope => None,
+                _ => self.member_or_submodule(part, namespace_scope_id, namespace_module_id),
+            };
+            // The subject this segment resolves against, taken out of the
+            // walk's state: whatever this segment turns out to be replaces it.
+            let subject = type_segment.take();
+            let type_hit = match (scope_hit, subject) {
+                (None, Some(segment)) => {
+                    self.type_namespace_member(segment.subject_id, segment.scope_id, part)
                 }
                 _ => None,
             };
@@ -34424,10 +34476,11 @@ impl<'src> Analyzer<'src> {
             // because "cannot find" would be false about a member the type
             // plainly has.
             if let Some(member_id) = type_hit
-                && let Some((_, _, subject_name)) = type_namespace
+                && let Some(segment) = subject
                 && self.is_self_method(member_id)
             {
                 if report {
+                    let subject_name = segment.name;
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,
@@ -34440,7 +34493,6 @@ impl<'src> Analyzer<'src> {
                 }
                 return false;
             }
-            type_namespace = None;
             match scope_hit.or(type_hit) {
                 Some(id) => {
                     target_id = id;
@@ -34458,18 +34510,33 @@ impl<'src> Analyzer<'src> {
                             // B317: an enum is BOTH — its variants scope, and
                             // the functions its impls declare. The variants are
                             // asked first, exactly as they always have been.
-                            type_namespace = Some((id, namespace_scope_id, part));
+                            let variants =
+                                self.enums.get(enum_id).map(|enum_| enum_.variants_scope_id);
+                            type_segment = Some(ImportTypeSegment {
+                                subject_id: id,
+                                scope_id: namespace_scope_id,
+                                name: part,
+                                brought_a_scope: variants.is_some(),
+                            });
                             namespace_module_id = None;
-                            self.enums.get(enum_id).map(|enum_| enum_.variants_scope_id)
+                            variants
                         }
                         // B317: a struct namespaces the functions of its impl
                         // blocks — `std::style::Length::rem`, the shape
                         // `names.md` §4.3 has promised since it was written
                         // ("variants, statics"). It is not a SCOPE: the blocks
-                        // are found through the scope the walk is standing in,
-                        // which is what keys them to their declaring module.
+                        // are found through the scope the walk was standing in,
+                        // which is what keys them to their declaring module —
+                        // so it brings the walk no scope to stand in, and
+                        // (B332) the one it came from stops being asked.
                         Some(Expr::Struct(_)) => {
-                            type_namespace = Some((id, namespace_scope_id, part));
+                            type_segment = Some(ImportTypeSegment {
+                                subject_id: id,
+                                scope_id: namespace_scope_id,
+                                name: part,
+                                brought_a_scope: false,
+                            });
+                            namespace_module_id = None;
                             None
                         }
                         // Not a namespace: the walk keeps the scope it is in,
@@ -34487,6 +34554,69 @@ impl<'src> Analyzer<'src> {
                     // scope, so the walk into it can only miss — and saying so
                     // sends the author looking for a name they can see declared.
                     if report && !self.entry_cycle_refusal_covers(Some(source_id), part) {
+                        // B331: `lib` under a module whose directory holds one
+                        // is that module's own body file. It used to resolve —
+                        // the same file loaded a second time under a second
+                        // name — and now it misses, so the miss says what the
+                        // segment IS rather than that the compiler cannot find
+                        // a file the author can see on disk.
+                        if part == "lib"
+                            && namespace_module_id
+                                .is_some_and(|id| self.modules_bodied_by_a_lib_file.contains(&id))
+                        {
+                            let spelled: Vec<&str> = path
+                                .iter()
+                                .map(|(segment, _)| *segment)
+                                .chain((name != "self").then_some(name))
+                                .collect();
+                            let parent = spelled[..=depth].join("::");
+                            let leaf = spelled[depth];
+                            let directory = spelled[1..=depth].join("/");
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: part_span,
+                                msg: format!(
+                                    "`{parent}::lib` is module `{leaf}`'s own BODY FILE, not a \
+                                     module below it: `{directory}/lib.vl` is what `{parent}` \
+                                     resolves to. Import `{parent}` instead — the items that \
+                                     file declares are `{parent}`'s own"
+                                ),
+                            });
+                            return false;
+                        }
+                        // B332: the miss a type segment's replaced namespace
+                        // makes, said as the move it is. `m::Type::x` where `x`
+                        // is an item of `m` used to resolve through a STRUCT
+                        // segment (the module scope was still there to answer)
+                        // and never through an ENUM one, and now resolves
+                        // through neither — so the author whose path stops
+                        // working is handed the spelling that replaces it
+                        // rather than "cannot find" about a name they can see
+                        // declared.
+                        if let Some(segment) = subject
+                            && self.member_in_namespace(part, segment.scope_id).is_some()
+                        {
+                            let spelled: Vec<&str> = path
+                                .iter()
+                                .map(|(segment, _)| *segment)
+                                .chain((name != "self").then_some(name))
+                                .collect();
+                            let subject_name = segment.name;
+                            let module_path = spelled[..depth].join("::");
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: part_span,
+                                msg: format!(
+                                    "`{part}` is not a member of the type `{subject_name}`: it \
+                                     is an item of `{module_path}`, and a type segment REPLACES \
+                                     the path's namespace rather than adding to it. Write \
+                                     `{module_path}::{part}`"
+                                ),
+                            });
+                            return false;
+                        }
                         let msg =
                             removed_std_alias(root, part, namespace_scope_id == root_scope_id)
                                 .unwrap_or_else(|| {
@@ -49115,6 +49245,18 @@ fn module_path_display(name: &str) -> String {
 /// had just created and not yet saved diagnosed as missing while it sat on
 /// screen. The overlay is also the whole filesystem when there is no filesystem,
 /// which is what lets the compiler resolve modules compiled to wasm.
+///
+/// B331: a `lib` LEAF under a directory that already holds it as a body is not
+/// a module here. `a/lib.vl` is the body of `a`, so answering `a::lib` with it
+/// resolves one file under two names — the loader parsed and analyzed it twice,
+/// registered `lib` in `a`'s own submodule scope (which
+/// [`submodules_in_directory`] deliberately never lists), and left A67's
+/// collision rule skipping the name by hand to avoid a second diagnostic for one
+/// root cause. The refusal that answers the import instead is raised by the
+/// walk, which is where the steer to `a` can be written; here the name simply
+/// does not resolve. Only the FLAT candidate is refused: a directory literally
+/// named `lib` with a body of its own (`a/lib/lib.vl`) is a module whose body
+/// file is its own, not `a`'s, and nothing about it is degenerate.
 fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
     let (prefix, last) = module_path_prefix(name)?;
     let flat_relative = prefix.join(format!("{last}.vl"));
@@ -49128,7 +49270,11 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
         relative,
     };
     let exists = |candidate: &Path| candidate.exists() || document_overlay_contains(candidate);
+    // The root's own `lib.vl` is untouched: a package's `lib` is a module (and
+    // std's package surface), because the source root is nobody's body.
+    let names_a_body_file = last == "lib" && !prefix.as_os_str().is_empty();
     match (exists(&flat), exists(&nested)) {
+        (true, _) if names_a_body_file => None,
         (true, both_exist) => Some(resolution(flat_relative, flat, both_exist)),
         (false, true) => Some(resolution(nested_relative, nested, false)),
         (false, false) => None,
@@ -52735,6 +52881,18 @@ fn analyze_inner<'src>(
                 // resolver below will report) — skip, as the previous loader did.
                 continue;
             };
+            // B331: whether this module's own directory holds a `lib.vl`. True
+            // for the nested body (`a/lib.vl` IS `a`), and true for `a.vl`
+            // beside an `a/lib.vl` (the ambiguity's tree, where the flat file
+            // won) — either way the segment `lib` under this module would name
+            // a body file, and the walk's miss says so rather than "cannot
+            // find".
+            let directory_holds_a_lib_body = resolution.ambiguous
+                || (resolution.relative.file_name() == Some(std::ffi::OsStr::new("lib.vl"))
+                    && resolution
+                        .relative
+                        .parent()
+                        .is_some_and(|parent| !parent.as_os_str().is_empty()));
             let module_path = resolution.path;
             if resolution.ambiguous {
                 analyzer.diagnostics.push(Error {
@@ -52998,6 +53156,9 @@ fn analyze_inner<'src>(
             // A body: whatever the directory probe concluded before it loaded is
             // no longer true.
             analyzer.namespace_only_modules.remove(&module_id);
+            if directory_holds_a_lib_body {
+                analyzer.modules_bodied_by_a_lib_file.insert(module_id);
+            }
             // Give the module entity a location (its file, at the top) so a path
             // segment naming it can go-to-definition. A one-id range maps it to its
             // source; the span is the file start.

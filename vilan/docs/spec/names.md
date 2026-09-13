@@ -16,6 +16,14 @@ whether or not `a` has a body of its own; nesting is unbounded, so
 namespace**: it holds modules but is not one, and an `import` naming it
 is a diagnostic listing the modules it does hold.
 
+`lib` is a body's **file name**, not a path segment: `a/lib.vl` is what
+`pkg::a` resolves to, so `pkg::a::lib` would name one file under two
+names and is a **diagnostic** steering to `pkg::a` (whose items are that
+file's). The rule reads the DIRECTORY: a `lib.vl` at the source root is
+the ordinary module `lib`, because the root is nobody's body, and a
+directory literally named `lib` (`a/lib/x.vl`) is a path segment like any
+other.
+
 A module is reached by its **own** path. `import pkg::a` binds the items
 of `a`'s body and nothing below it; `a::b` is reached by
 `import pkg::a::b`. Item lookup through a module in expression position
@@ -105,6 +113,14 @@ importing module's scope:
   `as` forms reach statics like any other leaf, which is what lets an
   app's own prelude module re-export one bare
   (`export import std::style::Length::rem as rem;`).
+- A **type segment replaces** the path's namespace. What follows
+  `Length` is resolved in `Length`'s namespace and nowhere else — its
+  variants, then its statics — so a module-level `rem` declared beside
+  `Length` does not shadow `Length::rem`, and `style::Length::px` does
+  not reach the module's `px`. One rule for both kinds: an enum segment
+  has always worked this way, and a struct segment does too. A path
+  reaching a module's item through a type-named prefix is a diagnostic
+  naming the spelling that replaces it (`style::px`).
 - `import std::json::Json as Document;` binds `Document`. `as` renames the
   leaf and changes nothing else: the path resolves exactly as it would
   without one, and the imported item is the same item under a second
@@ -213,6 +229,11 @@ A type has **one** namespace, and receiver position is not part of a
 name. Two impls of one type declaring the same name — two statics, two
 methods, or one of each — are a compile error at the declaration, since
 nothing ranks them and one would simply never be reachable.
+
+It is also the **whole** namespace of the path that names it: `Type::`
+replaces what the rest of the path resolves against rather than adding to
+it (§4.3), so the module the type is declared in does not answer through
+it. A name that is not in the type's namespace is not in the path's.
 
 That namespace is what `import` and `use` reach into (§4.3), and receiver
 position IS the line they draw: a static binds to a bare name, and a
