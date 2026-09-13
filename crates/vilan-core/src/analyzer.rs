@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure,
     ExternBinding, Func, GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList,
-    Pattern,
+    Pattern, ServiceAttr,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -47763,7 +47763,29 @@ pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String
 /// the collision onto. The prefix is reserved WHOLE rather than the one name,
 /// because the generator is free to mint a second `__` binding and a reservation
 /// that has to be re-read on every such change is not one.
+///
+/// 4. A method whose NAME is one the expansion generates (B312).
+///
+/// B295 reserved the generator's parameter prefix; this is the same reservation
+/// one level out, over the members the expansion declares. The clash is a
+/// DUPLICATE DEFINITION rather than a shadowing, so B295's other half —
+/// qualifying the generated calls — cannot reach it: `[rpc] fun verify` makes
+/// the generated `verify` on the client a second definition of that name, and
+/// what the author sees is "'verify' is already defined for 'EchoClient<T>'"
+/// anchored inside code they never wrote (`contract_hash` and `dispatcher`,
+/// which land on the service itself as well, report three times each).
+///
+/// The two sets are gated exactly as the generator emits them, which is what
+/// the probes found: `dispatcher` and `contract_hash` go on the SERVICE struct
+/// and are therefore reserved for a `[client_service]`-only struct too (its
+/// dispatcher is generated the same way), while `connect`, `connect_with`,
+/// `with_handlers` and `verify` exist only where a transport client is
+/// generated. `dispatcher_for` and `for_connection` are NOT reserved and
+/// compile today: they are declared on a TRAIT impl (`RpcService`,
+/// `ClientProxy`), which is a different declaration site from the inherent one
+/// an author's method lands in.
 pub(crate) fn service_method_refusals(
+    attribute: ServiceAttr<'_>,
     item: &Spanned<Node<'_>>,
     nodes: &NodeList<'_>,
 ) -> Vec<(Span, String)> {
@@ -47771,6 +47793,16 @@ pub(crate) fn service_method_refusals(
         return Vec::new();
     };
     let service_name = name.0;
+    // The client sibling's name, or `None` when the struct carries only
+    // `[client_service]` and no transport client is generated at all — the same
+    // question `construct_service` answers, and the gate on half the reserved
+    // set below.
+    let client_name = attribute.server_side.then(|| {
+        attribute
+            .client_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{service_name}Client"))
+    });
     let mut refusals = Vec::new();
     for (node, _span) in nodes {
         let Node::Impl(subject, impl_traits, body) = node else {
@@ -47842,9 +47874,83 @@ pub(crate) fn service_method_refusals(
                     ),
                 ));
             }
+            if let Some((owner, detail)) =
+                generated_member_collision(method_name, service_name, client_name.as_deref())
+            {
+                refusals.push((
+                    function.name.1,
+                    format!(
+                        "`[rpc]` method `{method_name}` takes a name the `[service]` expansion \
+                         generates on `{owner}`: {detail}, so the expansion would declare \
+                         `{method_name}` twice and the build would stop inside code you never \
+                         wrote. Rename the method — an `[rpc]` method's name is its WIRE name, \
+                         so the surface and both peers move with the rename"
+                    ),
+                ));
+            }
         }
     }
     refusals
+}
+
+/// The members the `[service]` expansion declares itself, per owner — the
+/// reservation B312 closed (`service_method_refusals`, arm 4).
+///
+/// Kept as two lists rather than one because the owners differ and so does the
+/// gate: these two land on the SERVICE struct, whatever the attribute says, so
+/// they are reserved for a `[client_service]`-only struct too.
+const SERVICE_GENERATED_MEMBERS: &[&str] = &["dispatcher", "contract_hash"];
+
+/// The members generated on the CLIENT sibling — reserved only where one is
+/// generated. `contract_hash` is on both: the client carries its own copy to
+/// compare the server's answer against.
+const CLIENT_GENERATED_MEMBERS: &[&str] = &[
+    "connect",
+    "connect_with",
+    "with_handlers",
+    "verify",
+    "contract_hash",
+];
+
+/// The generated-member list as a message reads it: `` `a` ``, `` `b` `` and
+/// `` `c` ``. Built from the list rather than written beside it, so a member
+/// added to the reservation is named by every message that cites it.
+fn quoted_list(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    join_with(&quoted, "and")
+}
+
+/// Whether `method_name` is a name the expansion generates, and on which type —
+/// the service struct first, since a name on both (`contract_hash`) collides
+/// there whether or not a client is generated. `client_name` is `None` for a
+/// struct that generates no transport client.
+fn generated_member_collision(
+    method_name: &str,
+    service_name: &str,
+    client_name: Option<&str>,
+) -> Option<(String, String)> {
+    if SERVICE_GENERATED_MEMBERS.contains(&method_name) {
+        let generated = quoted_list(SERVICE_GENERATED_MEMBERS);
+        return Some((
+            service_name.to_string(),
+            format!(
+                "the expansion writes {generated} on the service itself, beside the methods it \
+                 routes"
+            ),
+        ));
+    }
+    let client_name = client_name?;
+    if CLIENT_GENERATED_MEMBERS.contains(&method_name) {
+        let generated = quoted_list(CLIENT_GENERATED_MEMBERS);
+        return Some((
+            client_name.to_string(),
+            format!(
+                "the generated client declares {generated} of its own, and the stub this method \
+                 generates lands beside them"
+            ),
+        ));
+    }
+    None
 }
 
 /// `[service(.., client = H)]` where `H` is not a `[client_service]` sibling —
