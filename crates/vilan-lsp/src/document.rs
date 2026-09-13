@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
 use vilan_core::cancel::CancelToken;
-use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
+use vilan_core::formatter::{ModuleRescue, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
@@ -1303,6 +1303,25 @@ fn find_linked_tags(
     }
     node.0
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
+}
+
+/// A type's written HEAD name, for B318 S3's organizer rewrite — `Style` for
+/// `Style`, for `List<i32>` and for a `List<type T>` block alike, because that
+/// is what a selector's subject is spelled with.
+fn subject_head_name(program: &Program, subject: vilan_core::type_::TypeId) -> Option<String> {
+    match program.type_id_to_type_map.get(&subject)? {
+        vilan_core::type_::Type::Struct(id, _) => program
+            .structs
+            .get(id)
+            .map(|struct_| struct_.name.to_string()),
+        vilan_core::type_::Type::Enum(id, _) => {
+            program.enums.get(id).map(|enum_| enum_.name.to_string())
+        }
+        vilan_core::type_::Type::Trait(id, _) => {
+            program.traits.get(id).map(|trait_| trait_.name.to_string())
+        }
+        _ => None,
+    }
 }
 
 impl Document {
@@ -4459,7 +4478,9 @@ impl Document {
                 };
                 vilan_core::formatter::organize_import_runs(source, &keep, &keep_module)
             }
-            None => vilan_core::formatter::organize_import_runs(source, &|_| true, &|_| false),
+            None => vilan_core::formatter::organize_import_runs(source, &|_| true, &|_| {
+                vilan_core::formatter::ModuleRescue::No
+            }),
         };
         edits
             .map(|edits| {
@@ -4830,6 +4851,17 @@ impl Document {
         bound_by_leaves: &HashSet<Definition>,
     ) -> bool {
         let entry = SourceId(0);
+        // B318 S3: an `(impl …)` selector is a terminal the organizer prunes,
+        // and it binds no NAME at all — so rule (1)'s question ("does this file
+        // spell the thing this leaf binds") is not the question. The selector's
+        // is narrower and strictly easier: does this file resolve a method to
+        // an implementation the selector ADMITS? The analyzer banked exactly
+        // that set when it resolved the selector, so the answer is a lookup
+        // rather than a provenance guess — which is the generalization
+        // `visibility.md` §7.2 says E168's predicate becomes.
+        if let Some(members) = program.impl_selector_members.get(&(entry, leaf_span)) {
+            return self.selector_member_is_used(members, import_spans);
+        }
         let Some(definition_id) = self.import_path_definition(program, leaf_span) else {
             // The leaf binds nothing this analysis recorded — keep it, since
             // pruning on no evidence is how a green build gets broken.
@@ -4900,6 +4932,30 @@ impl Document {
             );
         }
         false
+    }
+
+    /// Whether this file resolves a method to one of `members` — the impl
+    /// members a selector admitted (B318 S3).
+    ///
+    /// A reference written by the file's own IMPORT LIST is excluded for the
+    /// reason rule (1) excludes one: an import path's segments resolve to the
+    /// definitions it binds, so counting them would let a statement justify
+    /// itself and nothing would ever prune.
+    fn selector_member_is_used(&self, members: &[Id], import_spans: &[Span]) -> bool {
+        let entry = SourceId(0);
+        members.iter().any(|member| {
+            self.reference_index
+                .occurrences_of(Definition::Entity(*member))
+                .any(|occurrence| {
+                    (occurrence.source == DERIVED_SOURCE
+                        || (occurrence.source == entry
+                            && !import_spans.iter().any(|statement| {
+                                statement.start <= occurrence.span.start
+                                    && occurrence.span.end <= statement.end
+                            })))
+                        && !occurrence.is_declaration_of(Definition::Entity(*member))
+                })
+        })
     }
 
     /// The definition an import PATH SEGMENT at `span` binds — a leaf's own, or
@@ -5006,17 +5062,74 @@ impl Document {
         module_span: Span,
         import_spans: &[Span],
         bound_by_leaves: &HashSet<Definition>,
-    ) -> bool {
+    ) -> ModuleRescue {
         let Some(module_id) = self.import_path_definition(program, module_span) else {
-            return false;
+            return ModuleRescue::No;
         };
         if !matches!(
             crate::references::kind_of(program, Definition::Entity(module_id)),
             Some(crate::references::DefinitionKind::Module)
         ) {
-            return false;
+            return ModuleRescue::No;
         }
-        self.module_import_brings_a_use(program, module_id, import_spans, bound_by_leaves)
+        if !self.module_import_brings_a_use(program, module_id, import_spans, bound_by_leaves) {
+            return ModuleRescue::No;
+        }
+        // B318 S3: the module form is the WIDE rescue, and a selector is the
+        // narrow one. When everything this file gets from that module is the
+        // members of one subject's `impl` blocks, the selector says exactly
+        // that and the module import says more than the file needs.
+        match self.rescuing_subject(program, module_id, import_spans, bound_by_leaves) {
+            Some(subject) => ModuleRescue::Selector(subject),
+            None => ModuleRescue::Module,
+        }
+    }
+
+    /// The ONE subject whose `impl` blocks account for everything this file
+    /// uses out of `module_id`'s file, or `None` when the answer is anything
+    /// else — a plain declaration used by a qualified path, or blocks for two
+    /// subjects (`visibility.md` §7.2).
+    ///
+    /// Read over the same occurrences [`Self::module_import_brings_a_use`]
+    /// counts, so the rewrite can only ever narrow a statement that predicate
+    /// already decided to keep.
+    fn rescuing_subject(
+        &self,
+        program: &Program,
+        module_id: Id,
+        import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
+    ) -> Option<String> {
+        let entry = SourceId(0);
+        let home = program.source_of(module_id)?;
+        let mut subject: Option<String> = None;
+        for occurrence in self.reference_index.occurrences_in(entry) {
+            if import_spans.iter().any(|statement| {
+                statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
+            }) || bound_by_leaves.contains(&occurrence.definition)
+                || crate::references::declaration_source(program, occurrence.definition)
+                    != Some(home)
+            {
+                continue;
+            }
+            let Definition::Entity(used) = occurrence.definition else {
+                return None;
+            };
+            let head = program.implementations.iter().find_map(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|member| *member == used)
+                    .then(|| subject_head_name(program, implementation.subject))
+                    .flatten()
+            })?;
+            match &subject {
+                Some(seen) if *seen != head => return None,
+                Some(_) => {}
+                None => subject = Some(head),
+            }
+        }
+        subject
     }
 
     // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
@@ -6455,7 +6568,9 @@ fn splice(source: &str, span: Span, replacement: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
-    use vilan_ide::completion::{import_path_segments, in_import_path};
+    use vilan_ide::completion::{
+        SelectorPosition, impl_selector_position, import_path_segments, in_import_path,
+    };
     use vilan_ide::{AUTO_IMPORT_COMPLETION_CAP, CONSTRUCT_SNIPPETS, CompletionKind};
 
     pub(crate) fn std_root() -> PathBuf {
@@ -12758,6 +12873,61 @@ pub(crate) mod tests {
         assert!(!in_import_path("used = 5", 8), "a word starting with `use`");
     }
 
+    // B318 S3's completion routing (`visibility.md` §7.1's third surface):
+    // inside an `(impl …)` selector the answer is a block the module WRITES,
+    // not a name it offers, so the position is read before the path split — the
+    // selector's own text is not a path and `import_path_segments` declines it.
+    #[test]
+    fn the_impl_selector_position_routes_subject_and_member_completion() {
+        fn at_end(line: &str) -> Option<SelectorPosition<'_>> {
+            impl_selector_position(line, line.len())
+        }
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl "),
+            Some(SelectorPosition::Subject {
+                module: vec!["pkg", "ext"]
+            }),
+            "after `impl `, the module's impl subjects"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Box"),
+            Some(SelectorPosition::Subject {
+                module: vec!["pkg", "ext"]
+            }),
+            "mid-word in the subject"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Boxed<i32>)::"),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Boxed<i32>"
+            }),
+            "after `)::`, the block's methods"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Boxed<i32>)::{ tag, "),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Boxed<i32>"
+            }),
+            "a braced member set is one more member of the same block"
+        );
+        // A closed selector is not a completion position of its own, and
+        // neither is a line that holds no selector at all.
+        assert_eq!(at_end("import pkg::ext::{ (impl Boxed), "), None);
+        assert_eq!(at_end("import pkg::ext::{ Thing, "), None);
+        assert_eq!(at_end("fun main() { implicit"), None);
+        // A tuple subject carries parentheses of its own, so the closing `)` is
+        // found by depth rather than by the first one.
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Pair<(i32, str)>)::"),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Pair<(i32, str)>"
+            }),
+        );
+    }
+
     // E57: the path split that routes every level of import completion. The
     // partial name under the cursor is never a completed segment — that is what
     // makes `import s|` a HEAD position and `import std::|` a one-segment one —
@@ -13414,6 +13584,40 @@ pub(crate) mod tests {
         );
     }
 
+    // B318 S3's completion, end to end against std's real `style.vl`: after
+    // `impl ` the module's impl SUBJECTS, after `)::` the selected block's
+    // members. Both answers come out of the parse cache with no analyzer, which
+    // is the property the whole import-path family rests on
+    // (`visibility.md` §7.1) — the module being selected from is one this
+    // program may never have loaded.
+    #[test]
+    fn an_import_selector_completes_subjects_then_the_blocks_members() {
+        let subjects = completions_at_cursor(
+            "import std::style::{ (impl |
+",
+        );
+        assert!(
+            subjects.contains(&"Length".to_string()) && subjects.contains(&"Color".to_string()),
+            "after `impl `, the module's impl subjects: {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"rem".to_string()),
+            "and not a member of one, which is a level deeper: {subjects:?}"
+        );
+        let members = completions_at_cursor(
+            "import std::style::{ (impl Length)::|
+",
+        );
+        assert!(
+            members.contains(&"rem".to_string()),
+            "after `)::`, the block's members: {members:?}"
+        );
+        assert!(
+            !members.contains(&"Color".to_string()),
+            "and not a subject, which is a level up: {members:?}"
+        );
+    }
+
     // The same descent through an explicit import, which is the spelling a
     // file without a prelude uses.
     #[test]
@@ -13811,8 +14015,16 @@ pub(crate) mod tests {
     // with any import that reaches the module, not only with a whole-module one,
     // so deleting the statement took `doubled` with it and the next analysis
     // said "i32 has no method 'doubled'". The organizer had broken a green
-    // build. The statement is REWRITTEN to the module import instead; the leaf
-    // goes on fading, because it is genuinely unused.
+    // build. The statement is REWRITTEN instead; the leaf goes on fading,
+    // because it is genuinely unused.
+    //
+    // B318 S3 NARROWED the rewrite (`visibility.md` §7.2, and E168's own item —
+    // "re-pointed at B318's selectors later"): everything this file gets out of
+    // `a.vl` is one subject's block, so the statement it needs is the SELECTOR
+    // and not the whole module. `(impl i32)` is the paper's own exhibit for the
+    // form. The module rewrite is still what a file using more than one block
+    // gets — `organize_rewrites_an_emptied_import_to_the_selector_its_file_
+    // actually_needs` is the pair's other half.
     #[test]
     fn organize_rewrites_an_emptied_import_whose_module_still_carries_an_impl() {
         let (dir, document) = analyze_workspace(&[
@@ -13833,12 +14045,162 @@ pub(crate) mod tests {
         );
         assert_eq!(
             organized(&document).expect("the emptied statement offers an edit"),
-            "import pkg::a;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            "import pkg::a::{ (impl i32) };\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
         );
         // The fade is unchanged: `b` IS unused, and E114's contract is that the
         // mark and the fix describe the same statement.
         assert_eq!(faded(&document), vec!["b".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B318 S3's helper module: a free function to strand, a struct, and the
+    /// block whose members are the only thing the entry gets out of the file.
+    const SELECTOR_HELPER: &str = "fun b(): i32 {\n\t1\n}\n\nstruct Widget {\n\tx: i32,\n}\n\n\
+         impl Widget {\n\tfun make(): Widget {\n\t\tWidget { x = 1 }\n\t}\n\n\tfun bump(self): i32 {\n\t\tself.x\n\t}\n}\n";
+
+    // `visibility.md` §3.6 asks that a selector element record a reference at
+    // its TYPE's span, so navigation and rename reach it. It comes for free:
+    // the selector's subject is walked as an ordinary type, in a child of the
+    // statement's own scope, so it lands in `type_references` like any other
+    // type reference — which is also why `impl S` through an alias resolves.
+    #[test]
+    fn a_selectors_subject_navigates_and_hovers_like_any_type() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        let at = document.text.find("(impl Widget").expect("the selector") + 7;
+        let (source_id, _span) = document
+            .definition(at)
+            .expect("go-to-definition on a selector's subject");
+        assert_ne!(
+            source_id,
+            vilan_core::analyzer::SourceId(0),
+            "the subject is declared in a.vl, not the entry"
+        );
+        assert!(
+            document
+                .hover(at)
+                .is_some_and(|hover| hover.contains("struct Widget")),
+            "hover reads the struct the selector names"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B318 S3 re-points E168's rewrite (`visibility.md` §7.2): when everything
+    // the file gets from the module is ONE subject's `impl` blocks, the rescue
+    // is the selector — the precise, minimal statement of what the file needs —
+    // and not the whole module. E168's own item said this is what it becomes.
+    #[test]
+    fn organize_rewrites_an_emptied_import_to_the_selector_its_file_actually_needs() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::b;\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement offers an edit"),
+            "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\n\n\
+             fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+        );
+        // The fade is unchanged: `b` IS unused, which is E114's contract.
+        assert_eq!(faded(&document), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // And the rewritten file still BUILDS, which is the whole of E168: a
+        // selector restricts, so an organizer that narrowed past what the file
+        // needs would break the green build it was rescuing.
+        let (after_dir, after) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            after.diagnostics.is_empty(),
+            "the rewrite must leave the program green: {:?}",
+            after.diagnostics.iter().map(|e| &e.msg).collect::<Vec<_>>(),
+        );
+        let _ = std::fs::remove_dir_all(&after_dir);
+    }
+
+    // A selector is a terminal the organizer prunes on its OWN question — does
+    // this file resolve a method to an implementation the selector admits —
+    // which is rule (2) narrowed from a FILE to an IMPL, and strictly easier
+    // because the answer is the analyzer's own resolution rather than a
+    // provenance guess.
+    #[test]
+    fn organize_keeps_a_used_selector_and_prunes_an_unused_one() {
+        let (used_dir, used) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            used.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            used.diagnostics.iter().map(|e| &e.msg).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&used),
+            None,
+            "the selector is what admits `make` and `bump` — organize must leave it alone",
+        );
+        assert!(
+            faded(&used).is_empty(),
+            "and nothing fades: {:?}",
+            faded(&used)
+        );
+        let _ = std::fs::remove_dir_all(&used_dir);
+
+        let (unused_dir, unused) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tlet w = Widget { x = 1 };\n\tw.x\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            unused.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            unused
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&unused).expect("the unused selector offers an edit"),
+            "import pkg::a::Widget;\n\n\
+             fun main(): i32 {\n\tlet w = Widget { x = 1 };\n\tw.x\n}\n",
+        );
+        assert_eq!(
+            faded(&unused),
+            vec!["(impl Widget)".to_string()],
+            "the fade and the prune describe the same element (E114)",
+        );
+        let _ = std::fs::remove_dir_all(&unused_dir);
     }
 
     // The rewrite fires only when nothing survives the leaf question: a brace

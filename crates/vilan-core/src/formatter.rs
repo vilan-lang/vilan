@@ -7,6 +7,7 @@
 //! input's (ignoring spans, whitespace, and comments); on any mismatch it returns
 //! the source unchanged rather than risk corrupting the file.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::node::{
@@ -1694,6 +1695,25 @@ fn import_module_branch<'src>(
     }
 }
 
+/// What the organizer does with an `import` statement every one of whose leaves
+/// pruned away (E168, re-pointed at B318's selectors).
+///
+/// The statement may still be the only thing carrying an `impl` the file calls
+/// a method from, and the fix is the narrowest spelling that keeps it. Before
+/// selectors that was the whole module; with them it is the selector, when the
+/// file's uses of that module's blocks all come from ONE subject
+/// (`visibility.md` §7.2) — the precise statement of what the file actually
+/// needs, and the thing E168's own item said this would become.
+pub enum ModuleRescue {
+    /// The module brings the file nothing: the statement goes.
+    No,
+    /// `import <module>;` — the file uses more of the module than one block.
+    Module,
+    /// `import <module>::{ (impl <subject>) };` — it uses exactly one block's
+    /// members. The string is the subject as it should be rendered.
+    Selector(String),
+}
+
 /// E168: the statement `branch` becomes when every one of its leaves pruned
 /// away but `keep_module` says the module it reaches into is still needed —
 /// `import pkg::a;`, rendered through the canonical printer like any other
@@ -1707,10 +1727,45 @@ fn import_module_branch<'src>(
 /// drift.
 fn module_only_import_branch<'src>(
     branch: &ImportBranch<'src>,
-    keep_module: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> ModuleRescue,
 ) -> Option<ImportBranch<'src>> {
     let (module, module_span, depth) = import_module_branch(branch)?;
-    (depth >= 2 && keep_module(module_span)).then_some(module)
+    if depth < 2 {
+        return None;
+    }
+    match keep_module(module_span) {
+        ModuleRescue::No => None,
+        ModuleRescue::Module => Some(module),
+        ModuleRescue::Selector(subject) => Some(attach_selector(module, subject)),
+    }
+}
+
+/// `<module>` rewritten as `<module>::{ (impl <subject>) }` — the module path's
+/// terminal segment given a brace set holding one synthesized selector.
+///
+/// The selector carries no subject NODE: it exists to be printed, and the text
+/// is what prints ([`ImplSelector::subject`] says so).
+fn attach_selector<'src>(module: ImportBranch<'src>, subject: String) -> ImportBranch<'src> {
+    match module {
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => ImportBranch::Path(
+            name,
+            span,
+            ImportTail::Continue(Box::new(attach_selector(*child, subject))),
+        ),
+        ImportBranch::Path(name, span, _) => ImportBranch::Path(
+            name,
+            span,
+            ImportTail::Continue(Box::new(ImportBranch::Set(vec![ImportBranch::Selector(
+                Box::new(ImplSelector {
+                    subject: None,
+                    subject_text: Cow::Owned(subject),
+                    members: Vec::new(),
+                    span: Span::default(),
+                }),
+            )]))),
+        ),
+        other => other,
+    }
 }
 
 // --- Canonical element-head order --------------------------------------------
@@ -2164,13 +2219,15 @@ fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
 /// statement `keep` emptied out (E168): an `import` brings every `impl` in the
 /// module's file with it whatever leaf it names, so a statement whose leaves are
 /// all unused may still be the only thing carrying a method the file calls.
-/// Answering `true` rewrites it to `import <module>;` instead of deleting it —
-/// the fade stays on the leaf, which is genuinely unused, and the build stays
-/// green. Pass `|_| false` to prune exactly as before.
+/// Answering [`ModuleRescue::Module`] rewrites it to `import <module>;` instead
+/// of deleting it, and [`ModuleRescue::Selector`] to the narrower
+/// `import <module>::{ (impl T) };` (B318 S3) — the fade stays on the leaf,
+/// which is genuinely unused, and the build stays green. Pass
+/// `|_| ModuleRescue::No` to prune exactly as before.
 pub fn organize_import_runs(
     source: &str,
     keep: &dyn Fn(Span) -> bool,
-    keep_module: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> ModuleRescue,
 ) -> Option<Vec<ImportRunEdit>> {
     let items = parse(source)?;
     let mut printer = Printer {
@@ -2852,7 +2909,7 @@ impl<'src> Printer<'src> {
         &mut self,
         items: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
-        keep_module: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> ModuleRescue,
     ) -> Vec<ImportRunEdit> {
         let mut edits = Vec::new();
         let mut index = 0;
@@ -2876,7 +2933,7 @@ impl<'src> Printer<'src> {
         &mut self,
         run: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
-        keep_module: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> ModuleRescue,
     ) -> Option<ImportRunEdit> {
         let run_start = run[0].1.into_range().start;
         // Reach this run's own trailing comments; a standalone comment before the
@@ -10916,7 +10973,37 @@ mod organize {
     /// rewritten to `import <module>;` instead of being deleted.
     pub(super) fn organize_rescuing(source: &str, dead: &[&str], rescued: &[&str]) -> String {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let keep_module = |span: Span| rescued.contains(&&source[span.into_range()]);
+        let keep_module = |span: Span| match rescued.contains(&&source[span.into_range()]) {
+            true => super::ModuleRescue::Module,
+            false => super::ModuleRescue::No,
+        };
+        let mut edits =
+            organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
+        let mut result = source.to_string();
+        for edit in edits {
+            result.replace_range(edit.span.into_range(), &edit.replacement);
+        }
+        result
+    }
+
+    /// [`organize`] with E168's rescue answering B318's SELECTOR form: a
+    /// statement every one of whose leaves is dead, and whose MODULE segment is
+    /// named in `selected`, is rewritten to
+    /// `import <module>::{ (impl <subject>) };`.
+    pub(super) fn organize_selecting(
+        source: &str,
+        dead: &[&str],
+        selected: &[(&str, &str)],
+    ) -> String {
+        let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
+        let keep_module = |span: Span| match selected
+            .iter()
+            .find(|(module, _)| *module == &source[span.into_range()])
+        {
+            Some((_, subject)) => super::ModuleRescue::Selector((*subject).to_string()),
+            None => super::ModuleRescue::No,
+        };
         let mut edits =
             organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
@@ -10930,7 +11017,8 @@ mod organize {
     /// The organizer offers no edit at all (already organized / nothing to prune).
     fn assert_no_edit(source: &str, dead: &[&str]) {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let edits = organize_import_runs(source, &keep, &|_| false).expect("source parses cleanly");
+        let edits = organize_import_runs(source, &keep, &|_| super::ModuleRescue::No)
+            .expect("source parses cleanly");
         assert!(
             edits.is_empty(),
             "expected no edit, got {} edit(s)",
@@ -10949,6 +11037,71 @@ mod organize {
         assert_eq!(
             organize_rescuing("import pkg::a::b;\n", &["b"], &["a"]),
             "import pkg::a;\n",
+        );
+    }
+
+    // B318 S3 re-points E168's rewrite: when everything the file gets from the
+    // module is one subject's `impl` blocks, the rescue is the SELECTOR — the
+    // precise statement of what the file actually needs — and not the whole
+    // module. `visibility.md` §7.2, and E168's own item ("re-pointed at B318's
+    // selectors later").
+    #[test]
+    fn an_emptied_statement_rescued_by_one_subject_becomes_a_selector() {
+        assert_eq!(
+            organize_selecting("import pkg::a::b;\n", &["b"], &[("a", "Style")]),
+            "import pkg::a::{ (impl Style) };\n",
+        );
+        // A brace set's common prefix is the path before it, so a set whose
+        // members all died rewrites the same way.
+        assert_eq!(
+            organize_selecting("import pkg::a::{ b, c };\n", &["b", "c"], &[("a", "Style")]),
+            "import pkg::a::{ (impl Style) };\n",
+        );
+    }
+
+    // A selector is a TERMINAL the organizer prunes: `keep` is asked at its own
+    // `(impl …)` span, so a selector whose implementation the file does not use
+    // goes, and one it does use stays — beside a name in the same set, which
+    // prunes on its own answer.
+    #[test]
+    fn an_unused_selector_prunes_and_a_used_one_survives() {
+        assert_eq!(
+            organize(
+                "import pkg::a::{ Thing, (impl Thing) };\n",
+                &["(impl Thing)"],
+            ),
+            "import pkg::a::Thing;\n",
+        );
+        assert_eq!(
+            organize("import pkg::a::{ Thing, (impl Thing) };\n", &["Thing"]),
+            "import pkg::a::{ (impl Thing) };\n",
+        );
+        // Every element dead: the statement goes, and the module rescue is a
+        // second question it was not offered here.
+        assert_eq!(
+            organize(
+                "import pkg::a::{ Thing, (impl Thing) };\n",
+                &["Thing", "(impl Thing)"],
+            ),
+            "",
+        );
+    }
+
+    // fmt/organize agreement, extended to the new elements: what the organizer
+    // renders for a run carrying a selector and an `only` is byte-for-byte what
+    // `vilan fmt` renders for it, which is the property `organize_run` depends
+    // on and the one `formatter.rs:1414` says must never break.
+    #[test]
+    fn organize_and_fmt_agree_on_selectors_and_only() {
+        let source =
+            "import pkg::z::y only;\nimport pkg::a::{ (impl Zebra), Thing, (impl Alpha) };\n";
+        assert_eq!(
+            super::organize::organize(source, &[]),
+            super::format(source)
+        );
+        assert_eq!(
+            super::organize::organize(source, &[]),
+            "import pkg::a::{ Thing, (impl Alpha), (impl Zebra) };\nimport pkg::z::y only;\n",
         );
     }
 

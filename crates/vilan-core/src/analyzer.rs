@@ -50804,6 +50804,47 @@ pub fn module_importables(path: &Path) -> Vec<Importable<'static>> {
     importables
 }
 
+/// B318 S3: every `impl` block a module's file writes, as an import SELECTOR
+/// sees it — the subject's written head name and the block's members, `self`
+/// methods included.
+///
+/// [`module_importables`]' sibling, and on the same terms: it reads the parse
+/// cache and runs no analyzer, which is what keeps import-path completion off
+/// the analysis path. The two answer different questions — one is the names an
+/// import may BIND, this is the blocks a selector may ADMIT — and a selector's
+/// `::` tail takes `self` methods, which is exactly the half `Importable::
+/// statics` leaves out.
+///
+/// The subject is the written HEAD (`impl List<i32>` and `impl List<type T>`
+/// both answer `List`), because that is what a completion has to offer before
+/// the reader has written a type for the selector to filter with; the blocks
+/// come back one per `impl`, so a module writing two for one head answers twice
+/// and the members of both are offered together.
+pub fn module_impl_blocks(path: &Path) -> Vec<(String, Vec<String>)> {
+    let Some(loaded) = load_package_module(path) else {
+        return Vec::new();
+    };
+    let mut blocks = Vec::new();
+    for item in &loaded.ast.0 {
+        let Node::Impl(subject, _, body) = unwrap_item(item) else {
+            continue;
+        };
+        let Some(head) = type_head(&subject.0) else {
+            continue;
+        };
+        let members: Vec<String> = body
+            .0
+            .iter()
+            .filter_map(|member| match unwrap_item(member) {
+                Node::Func(function) => Some(function.name.0.to_string()),
+                _ => None,
+            })
+            .collect();
+        blocks.push((head.to_string(), members));
+    }
+    blocks
+}
+
 /// The dependency graph available to a program: the flat set of reachable
 /// dependency packages plus the entry's own direct dependency edges. Empty (the
 /// default) means a single, dependency-free program — the legacy single-package

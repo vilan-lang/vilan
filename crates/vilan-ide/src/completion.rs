@@ -496,6 +496,86 @@ pub fn import_path_segments(text: &str, offset: usize) -> Option<Vec<&str>> {
         .then_some(segments)
 }
 
+/// Where inside an `(impl …)` SELECTOR the cursor sits (B318 S3,
+/// `visibility.md` §7.1's third surface).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelectorPosition<'src> {
+    /// After `impl ` — the module's impl SUBJECTS are the answer.
+    Subject { module: Vec<&'src str> },
+    /// After `)::`, braced or not — the selected block's members are.
+    Member {
+        module: Vec<&'src str>,
+        subject: &'src str,
+    },
+}
+
+/// The selector position of the cursor on the import line ending at `offset`,
+/// or `None` when it is not inside one.
+///
+/// Read from the line's TEXT rather than from tokens, like every other part of
+/// import-path completion (`import_path_segments` next door): a line being
+/// typed does not parse, and what is being reached for does not exist in the
+/// program yet — which is the property E57 rests the whole family on.
+///
+/// The subject may hold parentheses of its own (a tuple type), so the closing
+/// `)` is found by depth rather than by the first one.
+pub fn impl_selector_position(text: &str, offset: usize) -> Option<SelectorPosition<'_>> {
+    let prefix = import_path_prefix(text, offset)?;
+    let open = prefix.rfind("(impl")?;
+    // `(impl` has to stand as a word: `(implementation` is a call, not a
+    // selector.
+    let after = &prefix[open + 5..];
+    match after.as_bytes().first() {
+        None => {}
+        Some(byte) if !is_identifier_byte(*byte) => {}
+        Some(_) => return None,
+    }
+    let module = selector_module_segments(&prefix[..open])?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (at, byte) in after.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' if depth == 0 => {
+                close = Some(at);
+                break;
+            }
+            b')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        // Still inside `(impl …` — the subject is what is being written.
+        return Some(SelectorPosition::Subject { module });
+    };
+    let subject = after[..close].trim();
+    // Past the `)`, only a `::` tail is a completion position at all.
+    let tail = after[close + 1..].trim_start();
+    let tail = tail.strip_prefix("::")?;
+    // `::{ a, ` is the same position as `::` — a further member of the set.
+    let tail = tail.trim_start().strip_prefix('{').unwrap_or(tail);
+    if tail.contains('}') {
+        return None;
+    }
+    Some(SelectorPosition::Member { module, subject })
+}
+
+/// The module path standing before a selector — the segments of `path` up to
+/// the brace set the selector is an element of. `None` when a segment is not an
+/// identifier, the rule [`import_path_segments`] answers by.
+fn selector_module_segments(path: &str) -> Option<Vec<&str>> {
+    let path = match path.rfind('{') {
+        Some(brace) => &path[..brace],
+        None => path,
+    };
+    let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
+    segments.retain(|segment| !segment.is_empty());
+    segments
+        .iter()
+        .all(|segment| is_identifier(segment))
+        .then_some(segments)
+}
+
 /// Whether `name` is a vilan identifier — a non-empty run of identifier bytes
 /// that does not start with a digit.
 fn is_identifier(name: &str) -> bool {
@@ -2236,6 +2316,13 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// that is not there is simply not offered.
     fn import_completions(&self, text: &str, offset: usize) -> Vec<Completion> {
         let program = self.program;
+        // B318 S3: inside an `(impl …)` selector the answer is not a NAME the
+        // module offers — it is a block the module writes, or a member of one.
+        // Asked first, because a selector's own text is not a path and
+        // `import_path_segments` would decline it.
+        if let Some(position) = impl_selector_position(text, offset) {
+            return self.impl_selector_completions(position);
+        }
         let Some(segments) = import_path_segments(text, offset) else {
             return Vec::new();
         };
@@ -2268,6 +2355,66 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 .unwrap_or_default(),
             Some((module, past_module)) => {
                 module_member_completions(&module_roots, module, past_module)
+            }
+        }
+    }
+
+    /// B318 S3's completion surface (`visibility.md` §7.1): after `impl ` the
+    /// module's impl SUBJECTS, after `)::` the selected block's members.
+    ///
+    /// Both come out of the parse cache through
+    /// [`vilan_core::analyzer::module_impl_blocks`], with no analyzer, which is
+    /// the property the whole import-path family keeps: the module being
+    /// selected from is one this program may never have loaded.
+    fn impl_selector_completions(&self, position: SelectorPosition<'_>) -> Vec<Completion> {
+        let (module_path, subject) = match &position {
+            SelectorPosition::Subject { module } => (module, None),
+            SelectorPosition::Member { module, subject } => (module, Some(*subject)),
+        };
+        let Some(roots) = self.import_roots else {
+            return Vec::new();
+        };
+        let Some((origin, rest)) = module_path.split_first() else {
+            return Vec::new();
+        };
+        let Some((module_roots, _surface)) = roots.origin_roots(origin, self.program.platform)
+        else {
+            return Vec::new();
+        };
+        if rest.is_empty() {
+            return Vec::new();
+        }
+        let module_roots: Vec<&Path> = module_roots.to_vec();
+        let Some(file) = vilan_core::analyzer::module_source_file(&module_roots, &rest.join("::"))
+        else {
+            return Vec::new();
+        };
+        let blocks = vilan_core::analyzer::module_impl_blocks(&file);
+        match subject {
+            // After `impl `: one row per SUBJECT the module writes a block for,
+            // deduplicated — two blocks for one head are one thing to select.
+            None => {
+                let mut seen: HashSet<String> = HashSet::new();
+                blocks
+                    .into_iter()
+                    .filter(|(head, _)| seen.insert(head.clone()))
+                    .map(|(head, _)| Completion::bare(head, CompletionKind::Struct))
+                    .collect()
+            }
+            // After `)::`: the members of every block whose head the selector
+            // names. The subject as typed may carry arguments
+            // (`(impl List<i32>)::`), and the block is found by HEAD — which is
+            // also what the selector filters by before its type test runs.
+            Some(subject) => {
+                let head = selector_subject_head(subject);
+                let mut seen: HashSet<String> = HashSet::new();
+                blocks
+                    .into_iter()
+                    .filter(|(block_head, _)| block_head == head)
+                    .flat_map(|(_, members)| members)
+                    .filter(|member| seen.insert(member.clone()))
+                    .map(|member| Completion::bare(member, CompletionKind::Function))
+                    .collect()
             }
         }
     }
@@ -2790,6 +2937,14 @@ fn import_origin_tier(root: &str) -> u8 {
         "std" => 2,
         _ => 1,
     }
+}
+
+/// A selector subject's written HEAD — `List` for `List<i32>`, `Boxed` for
+/// `item::Boxed<_>` — which is what [`vilan_core::analyzer::module_impl_blocks`]
+/// keys its rows on.
+fn selector_subject_head(subject: &str) -> &str {
+    let head = subject.split('<').next().unwrap_or(subject).trim();
+    head.rsplit("::").next().unwrap_or(head).trim()
 }
 
 /// The origins an import path may start with: the two the loader always knows
