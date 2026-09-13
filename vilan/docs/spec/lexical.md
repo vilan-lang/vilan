@@ -137,6 +137,14 @@ and parsed as a single parenthesized expression. The result of the whole
 form is `str`; each part must therefore be valid as a `+` operand with
 `str` (§5's operator dispatch).
 
+A string literal inside a hole may be written either way — `i"{get("k")}"`
+or `i"{get(\"k\")}"` — and the two are the same token. The hole is lexed
+from the source bytes, so the enclosing literal's quotes never reach it and
+the plain spelling needs no escape; the escaped spelling is accepted
+because it is the one a writer reaches for, and it closes at the next `\"`.
+An embedded quote therefore has no escaped spelling: `"a\"b"`, the plain
+form, is the one that carries it.
+
 `i"…"` obeys the single-line rule of its plain twin: a raw line break in
 its body (or a backslash before one) is the same error. Interpolated
 multi-line text is `i"""…"""`, which is how a macro writes the code it
@@ -179,10 +187,6 @@ let report = i"""
     Braces are written \{like this\}.
     """
 ```
-
-*Implementation note: because a hole is re-lexed as ordinary tokens, a
-string literal inside a hole cannot use `\"` escapes; nested quoting
-inside holes is currently a parse error. Bind the value to a local first.*
 
 ### Other literals
 

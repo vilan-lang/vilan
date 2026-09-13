@@ -6382,6 +6382,17 @@ mod reformats {
     }
 
     #[test]
+    fn an_interpolated_string_whose_hole_holds_an_escaped_quote_round_trips() {
+        // B278. The literal is recovered from SOURCE, so the escaped spelling the
+        // author wrote is the spelling that comes back — the formatter neither
+        // unescapes it to `"k"` nor bails on it.
+        assert_formats(
+            "fun f(){print(i\"{g(\\\"k\\\")}\")}\n",
+            "fun f() {\n\tprint(i\"{g(\\\"k\\\")}\")\n}\n",
+        );
+    }
+
+    #[test]
     fn interpolated_triple_quoted_string_is_reprinted_verbatim() {
         // H7. The inner whitespace is semantic (the closing delimiter's
         // indentation is the trim prefix), so the literal reprints verbatim like

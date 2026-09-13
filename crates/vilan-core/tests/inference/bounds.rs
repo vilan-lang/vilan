@@ -3619,6 +3619,57 @@ fn an_interpolated_triple_quoted_hole_may_hold_a_string_with_braces() {
 }
 
 #[test]
+fn a_hole_may_hold_a_string_written_with_escaped_quotes() {
+    // B278. A hole is lexed from the source bytes and the enclosing literal's
+    // quotes never reach it, so the plain spelling has always worked; the
+    // ESCAPED one — what a writer reaches for, having escaped a quote inside a
+    // string everywhere else — was a stray `\` in no charset, and the hole was
+    // refused as malformed. Both spellings are one token now, and the same one,
+    // so a call with a string argument no longer has to be bound first.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun shout(word: str): str {
+            word + "!"
+        }
+        fun main() {
+            print(i"{shout(\"k\")}");
+            print(i"{shout("k")}");
+        }
+        main();
+        "#,
+        "k!\nk!\n",
+    );
+}
+
+#[test]
+fn an_escaped_quote_string_in_a_hole_carries_its_own_escapes() {
+    // The body is kept raw exactly as a plain literal's is, so the escapes in it
+    // are interpreted at code generation: `\n` is a newline and `\\` a
+    // backslash — and `\\` takes its pair, so the literal can end in an escaped
+    // backslash without eating its own closing `\"`. The triple-quoted form's
+    // holes go through the same scanner.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun echo(word: str): str {
+            word
+        }
+        fun main() {
+            print(i"{echo(\"a\nb\")}");
+            print(i"{echo(\"a\\\")}");
+            let text = i"""
+                {echo(\"deep\")}
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "a\nb\na\\\ndeep\n",
+    );
+}
+
+#[test]
 fn an_empty_interpolated_triple_quoted_string_is_empty() {
     assert_compiles_and_runs(
         r#"
