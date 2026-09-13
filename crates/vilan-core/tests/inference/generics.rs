@@ -3328,14 +3328,43 @@ fn calling_an_unannotated_closure_parameter_defers() {
 }
 
 #[test]
-fn doc_hidden_method_stays_callable() {
-    // `[doc(hidden)]` is tooling-only: completion omits it, resolution doesn't.
+fn doc_hidden_is_refused_and_names_export() {
+    // B318 §7.5, RULED 2026-09-13. `[doc(hidden)]` meant "callable, but omitted
+    // from editor completion" — word for word what a PRIVATE item now is — and
+    // it never did it: it parsed, it was stored, it was round-tripped by the
+    // formatter, it was pinned callable here, `appendix/editor.md` recommended
+    // it, and nothing in `vilan-ide` or `vilan-lsp` ever read it. Retired, with
+    // a steer to the marker that does the job.
+    assert_fails_spanning(
+        r#"
+        struct Pt { x: i32 }
+        impl Pt {
+            [doc(hidden)]
+            fun secret(self): i32 { self.x }
+        }
+        fun main() { let _ = Pt { x = 9 }.secret(); }
+        "#,
+        "[doc(hidden)]",
+        "`[doc(hidden)]` is superseded by visibility",
+    );
+    // At a module's top level too — the position the book recommended.
+    assert_fails_spanning(
+        r#"
+        [doc(hidden)]
+        fun secret(): i32 { 9 }
+
+        fun main() { let _ = secret(); }
+        "#,
+        "[doc(hidden)]",
+        "write `export` on the names consumers are meant to find",
+    );
+    // And the method is still callable with the attribute gone, which is what
+    // says the retirement took the MARKER and not the member.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         struct Pt { x: i32 }
         impl Pt {
-            [doc(hidden)]
             fun secret(self): i32 { self.x }
         }
         fun main() { print(Pt { x = 9 }.secret()); }

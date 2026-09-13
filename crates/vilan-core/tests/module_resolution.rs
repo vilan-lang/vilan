@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::manifest::PreludeSpec;
 use vilan_core::{
+
+/// The exposure exhibit: one curated module whose exported items name a private
+/// struct in every signature position B318 §4 lists, plus the body control.
+const EXPOSURE_MODULE: &str = "\
     EntryMode, Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair,
     Workspace, analyze_source,
 };
@@ -1337,7 +1341,11 @@ fn several_parse_errors_in_one_module_keep_distinct_spans() {
     // The 798-error shape in miniature: a generated module holds many, and each
     // needs its own place. They arrive in source order, which is what
     // `normalize_diagnostic_order` sorts by once a span exists to sort on.
-    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\n                  fun d(): i32 { 4 # }\nfun e(): i32 { 5 }\n";
+    // B318 §2.3 took `#` as the import reach marker, so it LEXES: the second
+    // un-lexable byte is a second `@`, which is the one the `css` block still
+    // refuses. The pin is about two errors keeping distinct spans, and it is
+    // unchanged.
+    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\n                  fun d(): i32 { 4 @ }\nfun e(): i32 { 5 }\n";
     let spanned = analyze_package_spanned(
         &[
             (
@@ -3850,8 +3858,11 @@ fn a_non_entry_self_import_stays_clean() {
                 "import pkg::sidebar::Tab;\n\nfun main() {\n\tlet same = Tab::Messages == Tab::Other;\n}\n",
             ),
             (
+                // B318: `main.vl` imports `Tab`, so the module marks it — the
+                // one-line codemod, beside the self-import the pin is about.
                 "sidebar.vl",
-                "import pkg::sidebar::Tab;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n",
+                "export *;\n\nimport pkg::sidebar::Tab;\n\n\
+                 [derive(PartialEq)]\nenum Tab { Messages, Other }\n",
             ),
         ],
         "main.vl",
@@ -5323,5 +5334,570 @@ fn b332_a_self_method_is_still_refused_by_name_under_the_new_order() {
             .iter()
             .any(|error| error.contains("`Point::doubled` takes `self`")),
         "the `self` refusal outranks the miss: {errors:#?}"
+    );
+}
+
+/// As [`analyze_package_raw`], but the program's WARNINGS — B318's two are
+/// non-fatal, so they never appear in the error list.
+fn analyze_package_warnings(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_warn_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        errors.is_empty(),
+        "the exhibit must analyze cleanly: {errors:#?}"
+    );
+    program
+        .map(|program| {
+            program
+                .warnings
+                .iter()
+                .map(|warning| warning.msg.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The Rust-fallback derive path — a derive with NO macro in scope, the case
+/// fixture stds and macro-world compiles hit — must parse its generated impls
+/// through the content cache: an unchanged program's re-analysis reuses the
+/// tree instead of re-leaking one. Pinned here rather than in the LSP leak
+/// harness because it needs a std WITHOUT the std macros, and this file
+/// already owns the hand-built-spec fixtures (the E23 sweep's coverage gap).
+#[test]
+fn rust_fallback_derives_parse_through_the_content_cache() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_fallback_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // A std whose loader-forced modules are empty stubs and which defines no
+    // `macro fun` anywhere: `[derive(PartialEq)]` finds no macro in scope and
+    // falls back to the Rust generators. (The generated prelude's imports then
+    // fail to resolve against the stubs — irrelevant here: the leak this pins
+    // happens at the parse, before resolution.)
+    let std_src = root.join("std").join("src");
+    std::fs::create_dir_all(&std_src).unwrap();
+    for module in [
+        "boolean", "list", "null", "promise", "compare", "default", "debug", "json", "hash",
+    ] {
+        std::fs::write(std_src.join(format!("{module}.vl")), "").unwrap();
+    }
+    let fixture_std = PackageSpec {
+        base_root: std_src,
+        layers: Vec::new(),
+        dependencies: Vec::new(),
+        surface: true,
+        member: false,
+        prelude: Default::default(),
+    };
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let entry_path = app_dir.join("main.vl");
+    let source = "[derive(PartialEq)]\nstruct FallbackPin { x: i32 }\n";
+    std::fs::write(&entry_path, source).unwrap();
+    let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
+
+    let analyze = || {
+        let (_program, _errors) = analyze_source(
+            leaked,
+            &fixture_std,
+            &app_dir,
+            &entry_path,
+            Some(Platform::default()),
+            &Workspace::default(),
+        );
+    };
+    leak_tally::reset();
+    analyze();
+    assert!(
+        leak_tally::bytes(LeakSite::MacroParseText) > 0,
+        "the fixture never took the Rust-fallback path — no generated text was \
+         parsed, and this pin is vacuous"
+    );
+    leak_tally::reset();
+    analyze();
+    let releaked =
+        leak_tally::bytes(LeakSite::MacroParseText) + leak_tally::bytes(LeakSite::MacroParseAst);
+    assert_eq!(
+        releaked, 0,
+        "the Rust-fallback derive re-leaked {releaked} B on an unchanged \
+         re-analysis — `flush_rust_fallback` is not parsing through the \
+         content cache"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn b318_export_all_is_a_module_level_item_like_every_other_export() {
+    // `export *;` carries no inner statement — the marker IS the statement —
+    // so it takes the same refusal `export <item>` takes inside a body, for
+    // the same reason: an export shapes a MODULE's surface and a body has no
+    // surface to shape.
+    let files = &[("main.vl", "fun main() {\n\texport *;\n}\n")];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`export` is a module-level item")),
+        "`export *;` inside a body is refused: {errors:#?}"
+    );
+    // At a module's top level it is clean.
+    let files = &[("main.vl", "export *;\n\nfun main() {}\n")];
+    assert!(
+        analyze_package(files, "main.vl", Platform::default()).is_empty(),
+        "`export *;` at the top level is an item"
+    );
+}
+
+/// Writes `files` into a fresh temp directory and hands back the path of
+/// `module` inside it, for the parse-only importable queries. The caller
+/// removes the directory.
+fn write_module_tree(files: &[(&str, &str)]) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_vis_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn b318_the_export_bit_round_trips_through_module_importables() {
+    use vilan_core::analyzer::{Visibility, module_importables, module_is_curated};
+
+    // The marker used to be DISCARDED: `unwrap_item` stripped `Node::Export`
+    // along with derive/service/macro-attribute, so `export fun f` and `fun f`
+    // produced byte-identical rows. The bit is the whole of what S1 adds.
+    let dir = write_module_tree(&[(
+        "curated.vl",
+        "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n\n         export(in mod) fun narrowed(): i32 { 3 }\n",
+    )]);
+    let rows = module_importables(&dir.join("curated.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("shown"), Visibility::Exported);
+    assert_eq!(named("hidden"), Visibility::Private);
+    assert_eq!(named("narrowed"), Visibility::Scoped(vec!["mod"]));
+    assert!(
+        module_is_curated(&rows),
+        "a marker anywhere curates the module"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `export *;` sets the bit on every item — and an item carrying its OWN
+    // narrowing keeps it, which is exactly what `export(in mod)` is for.
+    let dir = write_module_tree(&[(
+        "wide.vl",
+        "export *;\n\nfun a(): i32 { 1 }\n\nexport(in mod) fun b(): i32 { 2 }\n",
+    )]);
+    let rows = module_importables(&dir.join("wide.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("a"), Visibility::Exported);
+    assert_eq!(named("b"), Visibility::Scoped(vec!["mod"]));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // An UNCURATED module is not curated, and the three tooling consumers read
+    // that as "offers everything" (§8, the rollout's tooling half).
+    let dir = write_module_tree(&[("plain.vl", "fun a(): i32 { 1 }\n")]);
+    let rows = module_importables(&dir.join("plain.vl"));
+    assert_eq!(rows[0].exported, Visibility::Private);
+    assert!(!module_is_curated(&rows));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `export import` publishes: a re-export is an act of publication by a
+    // module that can see the item (§10 n).
+    let dir = write_module_tree(&[("surface.vl", "export import pkg::a::helper;\n")]);
+    let rows = module_importables(&dir.join("surface.vl"));
+    assert_eq!(rows[0].name, "helper");
+    assert_eq!(rows[0].exported, Visibility::Exported);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn b318_an_unexported_item_still_imports() {
+    // Visibility NEVER gates ACCESS (§1): `resolve_import` binds what the path
+    // names, exported or not. The release-N posture is a WARNING, and the
+    // program compiles.
+    let files = &[
+        (
+            "a.vl",
+            "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an unexported item still imports: {errors:#?}"
+    );
+}
+
+#[test]
+fn b318_the_import_steer_skips_a_private_item_of_a_curated_module() {
+    // §1: the bit gates the B4 "import it first" steer. A module's private
+    // machinery is not something to point at — the author said it is theirs,
+    // and an author who needs it anyway writes the reach deliberately rather
+    // than being talked into it by a compiler note.
+    //
+    // The module has to be LOADED for the steer to see it at all, so every leg
+    // imports one name from it and then reaches for a second.
+    const CURATED: &str = "export fun shown(): i32 { 1 }\n\n                           export fun other(): i32 { 3 }\n\n                           fun hidden(): i32 { 2 }\n";
+    let steers = |module: &'static str, reached: &str| -> Vec<String> {
+        let entry =
+            format!("import pkg::a::shown;\n\nfun main() {{ let _ = shown() + {reached}(); }}\n");
+        let entry: &'static str = Box::leak(entry.into_boxed_str());
+        analyze_package(
+            &[("a.vl", module), ("main.vl", entry)],
+            "main.vl",
+            Platform::default(),
+        )
+    };
+
+    let private = steers(CURATED, "hidden");
+    assert!(
+        private
+            .iter()
+            .any(|error| error.contains("cannot find 'hidden'")),
+        "the name still does not resolve: {private:#?}"
+    );
+    assert!(
+        !private
+            .iter()
+            .any(|error| error.contains("import it first")),
+        "a private item is not steered toward: {private:#?}"
+    );
+    // The exported sibling still steers, which is what says the filter is the
+    // BIT and not a deleted steer.
+    let exported = steers(CURATED, "other");
+    assert!(
+        exported
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::a::other;`)")),
+        "an exported item still steers: {exported:#?}"
+    );
+    // And an UNCURATED module steers for everything, exactly as before the bit
+    // existed (§8, the rollout's tooling half).
+    let uncurated = steers(
+        "fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        "hidden",
+    );
+    assert!(
+        uncurated
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::a::hidden;`)")),
+        "an uncurated module offers everything: {uncurated:#?}"
+    );
+}
+
+#[test]
+fn b318_the_exposure_warning_covers_every_signature_position() {
+    // §4, with the RULED wording on the return row. Seven positions, each with
+    // the private type named and the item named, and the BODY control: a
+    // private type used inside an exported function's body is exactly the
+    // encapsulation the feature exists to permit, and never warns.
+    let files = &[
+        ("a.vl", EXPOSURE_MODULE),
+        (
+            "main.vl",
+            "import pkg::a::reachable;\n\nfun main() { let _ = reachable(); }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "main.vl", Platform::default());
+    let says = |needle: &str| {
+        assert!(
+            warnings.iter().any(|warning| warning.contains(needle)),
+            "missing {needle:?} in {warnings:#?}"
+        );
+    };
+    // The RULED sentence, verbatim.
+    says(
+        "`Hidden` is returned here. `returns` is exported, but `Hidden` is not. \
+         A consumer can call `returns` but cannot name the return type.",
+    );
+    says("`Hidden` is this value's type. `registry` is exported");
+    says("`Hidden` is a parameter type here. `takes` is exported");
+    says("`Hidden` is a field's type here. `Boxed` is exported");
+    says("`Hidden` is a variant's payload here. `Holder` is exported");
+    says("`Secret` is a declared bound here. `bounded` is exported");
+    // A generic ARGUMENT is reached: `List<Hidden>` names `Hidden`.
+    says("`generic_return` is exported");
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("`body_only`")),
+        "a private type inside a BODY never warns: {warnings:#?}"
+    );
+    // One warning per declaration, not one per position.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.contains("is exported, but"))
+            .count(),
+        7,
+        "one per exposing declaration: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b318_an_uncurated_module_exposes_nothing() {
+    // §8, the rollout's tooling half: a module that has written no marker has
+    // made no claim about its surface, so nothing it declares reads as private
+    // to the exposure check. Same exhibit with the markers removed from the
+    // TYPES' module — here, the whole module uncurated — is silent.
+    let files = &[
+        (
+            "a.vl",
+            "struct Hidden {\n\tx: i32,\n}\n\nfun returns(): Hidden { Hidden { x = 1 } }\n\n             fun reachable(): i32 { 3 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::reachable;\n\nfun main() { let _ = reachable(); }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "main.vl", Platform::default());
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("is exported, but")),
+        "an uncurated module exposes nothing: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b318_an_exported_type_in_an_exported_signature_is_silent() {
+    // The control that says the check is about the BIT: mark `Hidden` and the
+    // warning goes, with nothing else changed.
+    let files = &[
+        (
+            "a.vl",
+            "export struct Hidden {\n\tx: i32,\n}\n\n             export fun returns(): Hidden { Hidden { x = 1 } }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::returns;\n\nfun main() { let _ = returns().x; }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "main.vl", Platform::default());
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("is exported, but")),
+        "an exported type in an exported signature is silent: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b318_a_plain_reach_of_a_private_item_warns_and_the_marker_silences_it() {
+    // §5 / R1: the warning that makes the default flip non-breaking. The
+    // program COMPILES — visibility never gates access — and the message names
+    // the marked spelling, which is the one-character edit the quickfix makes.
+    const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+    let plain = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        plain.iter().any(|warning| warning
+            == "`pkg::a::hidden` is not exported by `pkg::a`. Importing it anyway is allowed \
+                — mark the reach: `import pkg::a::{ #hidden };`"),
+        "the plain reach warns: {plain:#?}"
+    );
+    // Marked: silent. This is the whole point of paying for `#`.
+    let marked = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::{ #hidden };\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(marked.is_empty(), "a marked reach is silent: {marked:#?}");
+    // Exported: silent, marked or not — except that a marker on an exported
+    // item says something that is not true, and gets its own warning.
+    let exported = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::shown;\n\nfun main() { let _ = shown(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        exported.is_empty(),
+        "an exported item is silent: {exported:#?}"
+    );
+    let redundant = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() { let _ = shown(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        redundant.iter().any(|warning| warning
+            == "`pkg::a` exports `shown`, so the reach marker is redundant — delete the `#`"),
+        "a redundant marker warns: {redundant:#?}"
+    );
+    // `export *;` silences a module wholesale, which is what the codemod writes.
+    let wide = analyze_package_warnings(
+        &[
+            ("a.vl", "export *;\n\nfun hidden(): i32 { 2 }\n"),
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(wide.is_empty(), "`export *;` silences a module: {wide:#?}");
+    // `export(in mod)` holds ONE item back under it.
+    let narrowed = analyze_package_warnings(
+        &[
+            (
+                "a.vl",
+                "export *;\n\nexport(in mod) fun hidden(): i32 { 2 }\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        narrowed
+            .iter()
+            .any(|warning| warning.contains("is not exported by")),
+        "`export(in mod)` hides one item under `export *;`: {narrowed:#?}"
+    );
+    // An ENTRY's own items are imported by nothing, so nothing warns (§10 m):
+    // the flip must not make an application's entry noisy.
+    let entry = analyze_package_warnings(
+        &[(
+            "main.vl",
+            "fun helper(): i32 { 1 }\n\nfun main() { let _ = helper(); }\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(entry.is_empty(), "an entry is never noisy: {entry:#?}");
+    // And a DEPENDENCY's private item is no diagnostic at all (RULED): std's
+    // items are unmarked, and reaching one is silent at any release.
+    let dependency = analyze_package_warnings(
+        &[(
+            "main.vl",
+            "import std::json::JsonValue;\n\nfun main() { let _: Option<JsonValue> = None; }\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        dependency.is_empty(),
+        "a dependency's private item is never a diagnostic: {dependency:#?}"
+    );
+}
+
+#[test]
+fn b318_a_qualified_reach_of_a_private_item_warns_too() {
+    // §5's other door: `import pkg::a;` then `a::hidden()` reaches a private
+    // item with no LEAF to mark, so the message steers to the marked import
+    // instead of to a one-character insertion. Measured at 19 sites in the whole
+    // estate, so it is narrow — and it is the half a leaf-only warning would
+    // leave silently open.
+    const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+    let qualified = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() { let _ = a::hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        qualified.iter().any(|warning| warning
+            == "`pkg::a::hidden` is not exported by `pkg::a`, and this path reaches it through \
+                the module. The spelling that says so is a marked import: \
+                `import pkg::a::{ #hidden };`, and then `hidden` on its own"),
+        "a qualified reach warns: {qualified:#?}"
+    );
+    // The exported sibling, reached the same way, is silent.
+    let exported = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() { let _ = a::shown(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        exported.is_empty(),
+        "an exported item is silent: {exported:#?}"
     );
 }

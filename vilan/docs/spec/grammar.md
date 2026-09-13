@@ -15,7 +15,8 @@ statement = derived-item
           | macro-fun
           | macro-block [ ";" ]
           | macro-invocation [ ";" ]
-          | "export" statement
+          | "export" [ "(" "in" path-branch ")" ] statement
+          | "export" "*" ";"
           | expression ";"
           | if-expr        (* not before "}" — see below *)
           | for-expr       (* not before "}" *)
@@ -42,8 +43,8 @@ instead the block's **trailing expression** and supplies the block's value
 ```text
 import  = "import" path-branch ;
 use     = "use"    path-branch ;
-path-branch = NAME [ "::" ( path-branch | path-set )
-                   | "as" NAME ] ;        (* alias, §4.3 *)
+path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
+                          | "as" NAME ] ;  (* reach marker / alias, §4.3 *)
 path-set    = "{" path-branch { "," path-branch } [ "," ] "}" ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 ```
@@ -51,8 +52,12 @@ NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 `import` brings names from another module into scope; `use` brings names
 from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
-variants). Semantics: §4. `export statement` re-exports an import or
-exposes a declaration to importers of the module.
+variants). Semantics: §4. `export statement` marks a declaration as the
+module's surface, or re-exports an import; `export(in PATH) statement`
+narrows that to a scope subtree (`mod`, `pkg`, or a module path), and
+`export *;` marks every item of the module. A `#` before a path element is
+the **reach** marker: `import pkg::a::{ #hidden };` imports an item the
+module does not export, deliberately (§4.3).
 
 `as` renames the LEAF a branch ends at — `import a::b::c as d;` binds
 `d`, and `import a::{ b as x, c }` binds `x` and `c`. It is an
@@ -79,7 +84,7 @@ together and leave a trailing separator where it was.
 ```text
 function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
-           [ "[" "trait_only" "]" ] [ "[" "doc" "(" "hidden" ")" "]" ]
+           [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
            "fun" IDENT [ generic-params ]

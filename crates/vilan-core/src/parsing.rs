@@ -58,9 +58,9 @@ use crate::lexing;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
     CssItem, CssNested, CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
-    Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
-    ImportBranch, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern,
-    ServiceAttr, StructField, TupleBound,
+    ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
+    GenericParameters, If, ImportBranch, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList,
+    Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -240,6 +240,82 @@ const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as
 pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
+/// The rule `[doc(hidden)]` breaks (B318 §7.5, RULED 2026-09-13). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling.
+///
+/// The marker's one purpose — "callable, but omitted from editor completion" —
+/// is, word for word, what a PRIVATE item now is, so the two overlap completely
+/// and one of them has to go. It is also the one that never worked: it parsed,
+/// landed on `Function::doc_hidden`, was round-tripped by the formatter, was
+/// pinned callable and was recommended by `appendix/editor.md`, and NOTHING in
+/// `vilan-ide` or `vilan-lsp` ever read it — a promise the tool did not keep,
+/// for as long as it existed.
+const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already \
+     reachable and absent from completion, which is the whole of what this marker meant — delete \
+     it, and write `export` on the names consumers are meant to find";
+
+/// The rule a `#` inside a `css` block's VALUE breaks — `HASH_IS_NOT_A_TOKEN`'s
+/// successor (B318 §2.3). Curated (diagnostics-standard.md B6: the prohibition
+/// explains itself and names the sanctioned spelling).
+///
+/// The refusal used to live in the LEXER, unconditionally, which made it a
+/// context-free rule giving context-ful advice: an author writing
+/// `import a::{ #hidden }` was told about hex colours. B318 takes `#` as the
+/// import reach marker, so the byte lexes now and the colour rule moves to the
+/// one place that knows a `#` IS a colour — the block's own value parser. A `#`
+/// there would otherwise be swallowed into a value's text run and emitted as a
+/// raw hex literal, which is the one spelling that can leave the token system
+/// silently.
+///
+/// Public because the language server's quickfix keys on it (css-block S5,
+/// §7.2 fix 1) — one constant rather than a second copy to drift from. The
+/// diagnostic is ONE character wide, exactly as the lexer's was, so the fix
+/// still reads the colour off the text starting at the `#`.
+pub const HASH_IS_NOT_A_CSS_VALUE: &str = "`#` is not a colour here: in a `css` block a colour is a hole — \
+     `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
+     own `:root` line";
+
+/// The rule `export <expression>;` breaks (B321). Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spellings).
+///
+/// [`Parser::parse_export`] takes any STATEMENT, and an expression statement is
+/// one, so `export (helper);` and `export * helper;` (which is `export` of the
+/// deref `*helper`) both compiled clean and published nothing — a form with no
+/// reading, accepted silently. Zero occurrences in the estate.
+const EXPORT_TAKES_AN_ITEM: &str = "`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level \
+     `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for \
+     the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an \
+     expression is none of those, and publishes nothing, checks nothing and emits nothing";
+
+/// The rule a MALFORMED import path breaks (B320). Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spelling).
+///
+/// `import` and `use` are keywords, so neither can begin an expression, and the
+/// statement fork that reads them sits at the END of
+/// [`Parser::parse_statement_inner`]: an import whose PATH the grammar could not
+/// read fell through to the expression attempt, whose farthest failure is
+/// recorded on the `import` keyword itself. Every mistyped import in the
+/// language therefore reported `found 'import' expected an expression` at
+/// column 1 of the statement, whatever the typo and however far into the path it
+/// sat (six probe shapes, identical output — `{ (impl T) }`, `::*`, `{ !name }`).
+///
+/// [`Parser::import_path_failure`] records how far the path grammar actually
+/// got, so the rule reports at the token it stopped on. The expression fallback
+/// is untouched for everything that is not import-led.
+const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an \
+     optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins \
+     none of those";
+
+/// REWRITTEN for B318 (§7.4): every sentence of the old text became false on
+/// the day the marker gained meaning. It said "a module's items are importable
+/// as they stand … so the fix is to delete the word", and the fix is not to
+/// delete the word — it is to WRITE the marker vilan does have. This is the
+/// message a Rust or Swift writer meets in their first hour, which makes it the
+/// most user-visible line in the whole feature.
+///
 /// The rule a program written with a Rust/Swift visibility marker breaks.
 /// Curated (diagnostics-standard.md B6 — the prohibition explains itself and
 /// names the sanctioned spelling): `pub` is an ordinary identifier here, so
@@ -252,12 +328,47 @@ pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` b
 /// `public` is the same reflex one synonym over, and it was being refused in a
 /// word its author never wrote (E109's F21). That is the only reason this is a
 /// function where every other curated rule is a constant.
+/// Whether `export` can take this statement (B321): an ITEM, an `import`/`use`,
+/// or another `export`. The attribute wrappers are transparent — they annotate
+/// the item under them and `export [derive(Wire)] struct S { .. }` is the same
+/// declaration — so they are asked about their inner node rather than admitted
+/// blindly.
+///
+/// [`Node::Error`] is admitted: it is the nesting bound's stand-in, already
+/// refused once, and a second message about the same input is the double-report
+/// diagnostics-standard B5 forbids.
+fn export_takes(node: &Node<'_>) -> bool {
+    match node {
+        Node::Derive(_, inner) | Node::Service(_, inner) | Node::MacroAttribute(_, _, _, inner) => {
+            export_takes(&inner.0)
+        }
+        Node::Func(_)
+        | Node::MacroFun(_)
+        | Node::MacroInvocation(..)
+        | Node::MacroBlock(_)
+        | Node::Struct(..)
+        | Node::Enum(..)
+        | Node::Trait(..)
+        | Node::Impl(..)
+        | Node::Module(..)
+        | Node::Import(_)
+        | Node::Use(_)
+        | Node::Export(..)
+        | Node::ExportAll
+        | Node::Let(..)
+        | Node::LetDestructure(..)
+        | Node::Error => true,
+        _ => false,
+    }
+}
+
 fn visibility_marker_rule(marker: &str) -> String {
     format!(
-        "`{marker}` is not a vilan keyword: a module's items are importable as they stand — \
-         `import pkg::util::helper;` reaches `fun helper` with nothing marking it — so the \
-         fix is to delete the word. (`export` exists, but it RE-exports something this \
-         module imported: `export import pkg::io::panic;`.)"
+        "`{marker}` is not a vilan keyword: the marker is `export`, so write \
+         `export fun helper()` — an item a module does not export is the module's own, and \
+         stays reachable to anyone who asks for it deliberately \
+         (`import pkg::util::{{ #helper }};`). (`export` also RE-exports something this module \
+         imported: `export import pkg::io::panic;`.)"
     )
 }
 
@@ -646,6 +757,20 @@ struct Parser<'a, 'src> {
     /// same way: how deep the input actually went is a fact about the INPUT, not
     /// a claim by whichever branch happened to be exploring when it got there.
     nesting_refusal: Option<ParseError>,
+    /// How far the `import`/`use` PATH grammar got before it declined (B320) —
+    /// the token index a malformed import reports at.
+    ///
+    /// Held outside `farthest_failure` because the path grammar is built from
+    /// speculative `eat_*` probes rather than committed demands, so it records
+    /// nothing there: `import a::{ (impl T) };` explores to the `(` and notes an
+    /// expectation nowhere, leaving the statement's farthest failure on the
+    /// `import` keyword. Recorded only where the path genuinely FAILS — a
+    /// [`Parser::parse_namespace_path_inner`] with no alternative left, or a
+    /// brace-set element that is not a path — never at an alternative a sibling
+    /// production then reads, so a path that parses records nothing at all.
+    /// Cleared at the head of every `import`/`use`, so one statement's record
+    /// can never be read by the next.
+    import_path_failure: Option<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -871,6 +996,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             in_member_body: false,
             nesting_depth: 0,
             nesting_refusal: None,
+            import_path_failure: None,
         }
     }
 
@@ -1132,6 +1258,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.note_expected(TERMINATOR_EXPECTED);
     }
 
+    /// Record that the `import`/`use` path grammar stopped at token `at` (B320),
+    /// keeping the FARTHEST such point — one statement's path is explored
+    /// outside-in, so the deepest stop is the one the reader typed wrong.
+    fn note_import_failure(&mut self, at: usize) {
+        if self
+            .import_path_failure
+            .is_none_or(|recorded| at > recorded)
+        {
+            self.import_path_failure = Some(at);
+        }
+    }
+
     /// B248/B259: refuse an operator — or a `.` chain — that continues an
     /// expression the block-like form just parsed has already ENDED, and steer to
     /// the parentheses that spell what was meant. Called at the four block-bearing
@@ -1266,6 +1404,25 @@ impl<'a, 'src> Parser<'a, 'src> {
                 } else {
                     CSS_IS_A_KEYWORD
                 }),
+                context,
+                hint: None,
+            });
+            return;
+        }
+        // B320: an `import`/`use` whose PATH the grammar could not read. The
+        // located failure is on the keyword — `import` begins no expression, so
+        // the expression fork notes there and nothing deeper notes at all — and
+        // the keyword is the one token that was right. The rule replaces the
+        // message and reports where the path actually stopped.
+        if matches!(
+            self.tokens.get(position),
+            Some((Token::Import | Token::Use, _))
+        ) && let Some(stopped) = self.import_path_failure
+            && stopped > position
+        {
+            self.errors.push(ParseError {
+                span: self.token_span(stopped),
+                reason: ParseErrorReason::Rule(IMPORT_PATH_IS_NAMES_AND_SETS),
                 context,
                 hint: None,
             });
@@ -3592,6 +3749,23 @@ impl<'a, 'src> Parser<'a, 'src> {
                 end = close.end;
                 continue;
             }
+            // B318 §2.3: a `#` lexes now, and a value's loop consumes any token
+            // as TEXT — so without this the block would emit `color: #333` as a
+            // raw hex literal, silently, which is exactly what the lexer's
+            // refusal existed to stop. Reported at the `#` alone (the span the
+            // quickfix reads the colour off) and then consumed as text, so the
+            // declaration still lowers and the block raises one diagnostic.
+            if self.peek_is(&Token::Hash) {
+                self.errors.push(ParseError {
+                    span: self.here_span(),
+                    reason: ParseErrorReason::Rule(HASH_IS_NOT_A_CSS_VALUE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+                end = self.here_span().end;
+                self.bump();
+                continue;
+            }
             // `!important` is refused permanently and with its fix: merge is a
             // record update, so a `Style` that needed it would be a `Style` that
             // had lost the property the whole model is for (§10). Consumed with
@@ -5039,7 +5213,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     // --- Functions -----------------------------------------------------------
 
     /// A function declaration: the ORDERED attribute prefix (`[deprecated(..)]`,
-    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[doc(hidden)]`,
+    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`,
     /// `[platform(..)]` — each optional but IN THIS ORDER, a faithful quirk),
     /// then `async? external?
     /// fun name generics? (params) (: return)? (borrows param)? (block | ;)`.
@@ -5053,7 +5227,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let must_use = self.eat_marker_attribute("must_use");
         let rpc = self.eat_marker_attribute("rpc");
         let trait_only = self.eat_marker_attribute("trait_only");
-        let doc_hidden = self.parse_doc_hidden_attribute();
+        self.refuse_doc_hidden_attribute();
         let platform_fence = self.parse_platform_attribute().unwrap_or_default();
         let is_async = self.eat(&Token::Async);
         let external = self.eat(&Token::External);
@@ -5222,7 +5396,6 @@ impl<'a, 'src> Parser<'a, 'src> {
                 must_use,
                 rpc,
                 trait_only,
-                doc_hidden,
                 platform_fence,
                 generic_parameters,
                 parameters,
@@ -5681,6 +5854,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_import(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Import)?;
+        // B320: one statement's record, never the previous statement's.
+        self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
         Some((Node::Import(path), self.span_from(start)))
     }
@@ -5699,6 +5874,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_use(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Use)?;
+        // B320: one statement's record, never the previous statement's.
+        self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
         Some((Node::Use(path), self.span_from(start)))
     }
@@ -5719,8 +5896,109 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_export(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Export)?;
+        // B318 §2.1: `export *;` is the module-wide marker. The lookahead takes
+        // the `;` as well as the `*`, because a following NAME is a real
+        // expression — `export * helper;` is `export` of the deref `*helper`
+        // (probe P1b) — and reading that as a mistyped `export *;` would take
+        // a shape the language already has. Nothing else in the language has
+        // this one: `*` starts a prefix deref and finds no operand at the `;`.
+        if self.peek_is_op("*") && matches!(self.peek_at(1), Some(Token::Ctrl(';'))) {
+            self.bump();
+            self.bump();
+            return Some((Node::ExportAll, self.span_from(start)));
+        }
+        let scope = self.parse_export_scope();
         let inner = self.parse_statement()?;
-        Some((Node::Export(Box::new(inner)), self.span_from(start)))
+        // B321: `parse_statement` reads an EXPRESSION statement too, so
+        // `export (helper);` and `export * helper;` parsed and meant nothing.
+        // Reported and KEPT — the inner statement is whatever the author wrote
+        // and dropping it would unbind a name the rest of the file uses, which
+        // is `recover_missing_terminator`'s argument applied to a wrapper.
+        if !export_takes(&inner.0) {
+            self.errors.push(ParseError {
+                span: inner.1,
+                reason: ParseErrorReason::Rule(EXPORT_TAKES_AN_ITEM),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
+        Some((Node::Export(scope, Box::new(inner)), self.span_from(start)))
+    }
+
+    /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
+    /// marker carries none.
+    ///
+    /// `in` is already [`Token::In`] (`for … in`), so the inner grammar needs no
+    /// contextual-keyword dance; `mod` is [`Token::Mod`] and is admitted as a
+    /// path segment by name, which is what makes `export(in mod)` spellable
+    /// without reserving a second word. A `(` that is NOT followed by `in`
+    /// declines here and falls to the statement reader, where [`export_takes`]
+    /// refuses it and names this form — which is how `export(pkg)`, the spelling
+    /// that reads as a CALL, gets a steer rather than a silent acceptance.
+    fn parse_export_scope(&mut self) -> Option<Box<ExportScope<'src>>> {
+        self.attempt(|parser| {
+            let start = parser.position;
+            parser.expect_ctrl('(')?;
+            // §2.2: `export(pkg)` — the spelling P2c shows reads as a CALL — is
+            // the scope form with `in` left out. Taken and REPORTED rather than
+            // declined, so the author gets the steer instead of the missing-`;`
+            // three tokens later that the fall-through produced. The `;`
+            // lookahead is what keeps it off `export (helper);`, which is an
+            // expression STATEMENT and B321's case: a scope is followed by the
+            // item it narrows, never by a terminator.
+            let missing_in = !parser.eat(&Token::In);
+            if missing_in && parser.terminates_an_export_group() {
+                return None;
+            }
+            let mut path = Vec::new();
+            loop {
+                let at = parser.position;
+                let segment = if parser.eat(&Token::Mod) {
+                    "mod"
+                } else {
+                    parser.eat_name()?
+                };
+                path.push((segment, parser.span_from(at)));
+                if !parser.eat_op("::") {
+                    break;
+                }
+            }
+            parser.expect_ctrl(')')?;
+            let span = parser.span_from(start);
+            if missing_in {
+                parser.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(EXPORT_TAKES_AN_ITEM),
+                    context: parser.context_stack.clone(),
+                    hint: None,
+                });
+            }
+            Some(Box::new(ExportScope { path, span }))
+        })
+    }
+
+    /// Whether the parenthesised group opening at the current position is
+    /// closed by a `;` — an expression STATEMENT after `export`, not a
+    /// visibility scope. Scans forward at paren depth, stopping at anything a
+    /// balanced group cannot contain.
+    fn terminates_an_export_group(&self) -> bool {
+        let mut depth = 1usize;
+        let mut at = self.position;
+        while let Some((token, _)) = self.tokens.get(at) {
+            match token {
+                Token::Ctrl('(') => depth += 1,
+                Token::Ctrl(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.tokens.get(at + 1), Some((Token::Ctrl(';'), _)));
+                    }
+                }
+                Token::Ctrl('{') | Token::Ctrl('}') | Token::Ctrl(';') => return false,
+                _ => {}
+            }
+            at += 1;
+        }
+        false
     }
 
     /// A `::`-separated namespace path ending in a name or a `{ a, b }` set (H2) —
@@ -5744,7 +6022,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(path) = self.attempt(Self::parse_namespace_single_path) {
             return Some(path);
         }
-        self.parse_namespace_set()
+        let branch = self.parse_namespace_set();
+        if branch.is_none() {
+            // B320: neither alternative reads what stands here, so the path
+            // genuinely stops at this token. A DECLINE of this production always
+            // fails the whole statement (its caller propagates with `?`), which
+            // is what keeps the record free of positions a sibling then reads.
+            self.note_import_failure(self.position);
+        }
+        branch
     }
 
     /// `name ( :: branch | as name )?` — one path in a namespace path (the
@@ -5760,6 +6046,18 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// can follow one — `a::b as c::d` does not parse, and the tail type says
     /// so. It reaches a brace element by the same production: `{ a as b, c }`.
     fn parse_namespace_single_path(&mut self) -> Option<ImportBranch<'src>> {
+        // B318 §1/§2.3: `#` before a segment is the REACH marker — "I know this
+        // is not exported and I want it anyway". It wraps whatever follows
+        // rather than becoming part of it, so it composes with a leaf
+        // (`{ #hidden }`), with a segment mid-path (`a::#m::helper`) and with
+        // S3's selector, and it adds no path segment — which is what keeps
+        // go-to-definition, find-references and RENAME pointing at the name.
+        if self.peek_is(&Token::Hash) {
+            let marker = self.here_span();
+            self.bump();
+            let inner = self.parse_namespace_single_path()?;
+            return Some(ImportBranch::Reach(marker, Box::new(inner)));
+        }
         let start = self.position;
         let name = self.eat_name()?;
         let name_span = self.span_from(start);
@@ -5793,9 +6091,21 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_namespace_set(&mut self) -> Option<ImportBranch<'src>> {
         self.attempt(|parser| {
             parser.expect_ctrl('{')?;
-            let paths = parser.comma_list(Self::parse_namespace_single_path, |parser| {
-                parser.peek_is_ctrl('}')
-            })?;
+            let paths = parser.comma_list(
+                |parser| {
+                    // B320: an element that is not a path stops the set HERE,
+                    // and here is deeper than the `{` the enclosing production
+                    // would otherwise record — `{ (impl T) }` reports on the
+                    // `(`, which is the token that was typed.
+                    let at = parser.position;
+                    let element = parser.parse_namespace_single_path();
+                    if element.is_none() {
+                        parser.note_import_failure(at);
+                    }
+                    element
+                },
+                |parser| parser.peek_is_ctrl('}'),
+            )?;
             parser.expect_ctrl('}')?;
             Some(ImportBranch::Set(paths))
         })
@@ -6154,10 +6464,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
-    /// `[doc(hidden)]` — a tooling marker (omit from completion). Returns whether it
-    /// is present.
-    fn parse_doc_hidden_attribute(&mut self) -> bool {
-        self.attempt(|parser| {
+    /// `[doc(hidden)]` — RETIRED (B318 §7.5). Recognized and REFUSED, rather
+    /// than simply deleted from the grammar: the attribute is in the wild (the
+    /// book recommended it), and "found `[` expected `fun`" would tell its
+    /// author nothing. Consumed, so the item below it parses normally and the
+    /// file raises one diagnostic rather than cascading.
+    fn refuse_doc_hidden_attribute(&mut self) {
+        let start = self.position;
+        let refused = self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("doc")) {
                 return None;
@@ -6171,8 +6485,15 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(())
-        })
-        .is_some()
+        });
+        if refused.is_some() {
+            self.errors.push(ParseError {
+                span: (self.token_span(start).start..self.token_span(self.position - 1).end).into(),
+                reason: ParseErrorReason::Rule(DOC_HIDDEN_IS_SUPERSEDED),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
     }
 
     /// `[platform("a", "b")]` — a platform fence (≥1 string patterns, allow-trailing),
@@ -7463,7 +7784,7 @@ mod tests {
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).
         match only_item("export import shared::config;") {
-            Node::Export(inner) => assert!(matches!(inner.0, Node::Import(_))),
+            Node::Export(_, inner) => assert!(matches!(inner.0, Node::Import(_))),
             other => panic!("expected Export, got {other:?}"),
         }
     }
@@ -7554,9 +7875,11 @@ mod tests {
     #[test]
     fn function_attributes_are_recognized_in_fixed_order() {
         // The full ordered attribute prefix (`deprecated`, `extern`, `must_use`,
-        // `rpc`, `trait_only`, `doc(hidden)`, `platform`) on one external function.
+        // `rpc`, `trait_only`, `platform`) on one external function.
+        // `[doc(hidden)]` used to sit between `trait_only` and `platform`; B318
+        // retired it, and its slot in the order is refused rather than read.
         match only_item(
-            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\")] external fun serve();",
+            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [platform(\"@process\")] external fun serve();",
         ) {
             Node::Func(function) => {
                 assert!(matches!(
@@ -7566,9 +7889,7 @@ mod tests {
                         symbol: "createServer"
                     })
                 ));
-                assert!(
-                    function.must_use && function.rpc && function.trait_only && function.doc_hidden
-                );
+                assert!(function.must_use && function.rpc && function.trait_only);
                 assert_eq!(function.deprecated, Some("use serve_all()"));
                 assert_eq!(function.platform_fence.len(), 1);
                 assert!(function.external);
@@ -7989,6 +8310,244 @@ mod tests {
         // rest still parses — one error, the skipped BEL).
         let errors = rendered_errors("fun main() { \u{0007} }\n");
         assert_eq!(errors, vec!["found '\\u{7}' expected a token".to_string()]);
+    }
+
+    #[test]
+    fn the_reach_marker_lexes_parses_and_reprints() {
+        // B318 §2.3 — the bill for `#`, paid. It marks a LEAF, a segment
+        // mid-path (§10 d: a private `mod` is reachable), and a brace-set
+        // element; `use` shares the grammar; and every one round-trips through
+        // `vilan fmt` unchanged, because the marker is a fact about the author's
+        // intent rather than a formatting decision — stripping it would silently
+        // re-arm the plain-reach warning.
+        for source in [
+            "import pkg::a::{ #hidden };\n",
+            "import pkg::a::#hidden;\n",
+            "import pkg::a::#m::helper;\n",
+            "import pkg::a::{ shown, #hidden, other };\n",
+            "use pkg::a::{ #hidden };\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        // The marker adds no path SEGMENT — it wraps the branch — which is what
+        // keeps go-to-definition, find-references and rename pointing at the
+        // name.
+        let marked = only_item("import pkg::a::#hidden;");
+        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg))) = &marked
+        else {
+            panic!("the path reads as written: {marked:?}");
+        };
+        let ImportBranch::Path("a", _, ImportTail::Continue(after_a)) = after_pkg.as_ref() else {
+            panic!("the path reads as written: {marked:?}");
+        };
+        assert!(
+            matches!(after_a.as_ref(), ImportBranch::Reach(_, _)),
+            "the marker wraps the branch it marks: {marked:?}"
+        );
+        // fmt keeps it, and collapses a marked singleton set exactly as it
+        // collapses a plain one.
+        assert_eq!(
+            crate::formatter::format("import pkg::a::{ #hidden };\n"),
+            "import pkg::a::#hidden;\n"
+        );
+        assert_eq!(
+            crate::formatter::format("import pkg::a::{ shown, #hidden, other };\n"),
+            "import pkg::a::{ #hidden, other, shown };\n"
+        );
+        assert_eq!(
+            crate::formatter::format("import pkg::a::#m::helper;\n"),
+            "import pkg::a::#m::helper;\n"
+        );
+    }
+
+    #[test]
+    fn a_hash_in_a_css_value_still_reports_the_colour_rule() {
+        // The rule the lexer used to carry, re-homed (B318 §2.3). It must stay
+        // ONE character wide — the language server reads the colour off the text
+        // starting there — and it must still fire, because a `css` value's loop
+        // consumes any token as TEXT and would otherwise emit `color: #333` as a
+        // raw hex literal, silently.
+        let (_tree, errors) = parse("fun main() { let s = css { color: #333; }; }\n");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(render(&errors[0]), HASH_IS_NOT_A_CSS_VALUE);
+        assert_eq!(
+            errors[0].span.into_range().len(),
+            1,
+            "one character wide, so the fix can read the colour off the text"
+        );
+        // The sanctioned spelling is clean.
+        assert!(
+            rendered_errors("fun main() { let s = css { color: {Color::hex(\"#333\")}; }; }\n")
+                .is_empty()
+        );
+        // And `#` outside an import and outside a `css` block still refuses —
+        // as a PARSE error now, since the byte lexes.
+        assert_eq!(
+            rendered_errors("fun main() { let x = # 3; }\n"),
+            vec!["found '#' expected an expression".to_string()]
+        );
+    }
+
+    #[test]
+    fn export_all_and_the_scope_narrowing_parse_and_reprint() {
+        // B318 §2.1/§2.2. `export *;` is a `*` + `;` LOOKAHEAD, not "`*` after
+        // `export`": `export * helper;` is a real expression (the deref
+        // `*helper`, probe P1b) and reading it as a mistyped `export *;` would
+        // take a shape the language already has — it stays B321's refusal.
+        assert!(rendered_errors("export *;\n").is_empty());
+        assert!(matches!(only_item("export *;"), Node::ExportAll));
+        assert_eq!(
+            rendered_errors("export * helper;\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        // `(in PATH)` is GENERAL (§10 c): `mod` and `pkg` are reserved heads and
+        // any other path names the module subtree it roots. `mod` is a KEYWORD
+        // token and is admitted as a segment by name, which is what makes
+        // `export(in mod)` spellable without reserving a second word.
+        for source in [
+            "export(in mod) fun helper(): i32 { 1 }\n",
+            "export(in pkg) fun helper(): i32 { 1 }\n",
+            "export(in pkg::a) struct S { x: i32 }\n",
+            "export(in mod) import pkg::io::print;\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        let Node::Export(Some(scope), _) = only_item("export(in pkg::a) struct S { x: i32 }")
+        else {
+            panic!("the narrowing rides the export node");
+        };
+        assert_eq!(
+            scope.path.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["pkg", "a"]
+        );
+        // `export(pkg)` — the spelling that reads as a CALL (probe P2c) — is the
+        // scope with `in` left out, and is REPORTED rather than declined, so the
+        // author gets the steer instead of a missing-`;` three tokens later. The
+        // `;` lookahead keeps that off `export (helper);`, which is B321's.
+        assert_eq!(
+            rendered_errors("export(pkg) fun helper(): i32 { 1 }\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        // fmt reprints both new shapes as written, `::`-joined, no space before
+        // the `(`.
+        assert_eq!(crate::formatter::format("export *;\n"), "export *;\n");
+        assert_eq!(
+            crate::formatter::format("export(in pkg::a) import pkg::io::print;\n"),
+            "export(in pkg::a) import pkg::io::print;\n"
+        );
+    }
+
+    #[test]
+    fn export_refuses_an_expression_and_keeps_every_item() {
+        // B321: `parse_export` took any STATEMENT, so an `export` of a
+        // parenthesised expression — and of `*` followed by a name, which is
+        // `export` of a deref — compiled clean and published nothing. The two
+        // nonsense forms, then every form `export` really takes.
+        for nonsense in ["export (helper);\n", "export * helper;\n"] {
+            assert_eq!(
+                rendered_errors(nonsense),
+                vec![EXPORT_TAKES_AN_ITEM.to_string()],
+                "for {nonsense:?}"
+            );
+        }
+        for item in [
+            "export fun helper(): i32 { 1 }\n",
+            "export struct S { x: i32 }\n",
+            "export enum E { A }\n",
+            "export trait T { fun f(); }\n",
+            "export impl S { fun make(): i32 { 1 } }\n",
+            "export mod m { fun f() {} }\n",
+            "export let answer = 42;\n",
+            "export import pkg::io::print;\n",
+            "export use pkg::a::b;\n",
+            // The attribute wrappers are transparent: the rule asks about the
+            // declaration under them, not about the wrapper.
+            "export [derive(Wire)] struct S { x: i32 }\n",
+            "export external fun serve();\n",
+        ] {
+            assert!(
+                rendered_errors(item).is_empty(),
+                "`export` takes {item:?}: {:?}",
+                rendered_errors(item)
+            );
+        }
+        // The refusal is about the SHAPE, not about the parentheses: a call and
+        // an operator tower are refused with the same rule.
+        assert_eq!(
+            rendered_errors("export helper();\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("export 1 + 1;\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_import_reports_at_the_token_it_stopped_on() {
+        // B320: the six probe shapes of visibility.md §2.7, which before this
+        // all reported `found 'import' expected an expression` at COLUMN 1 of
+        // the statement — the keyword, which is the one token that was right.
+        // Each now reports the import grammar's own rule, anchored on the token
+        // the path actually stopped at. The shapes are B318's new import forms
+        // (a selector, `::*`, a reach marker), which is why the row is owed
+        // before they are built rather than after.
+        for (source, stopped) in [
+            ("import a::{ (impl Thing) };\n", "("),
+            ("import a::{ (impl List<i32>)::{ first, last } };\n", "("),
+            ("import a::{ (impl List<_>) };\n", "("),
+            ("import pkg::a::m::*;\n", "*"),
+            ("import a::{ (impl _) };\n", "("),
+            ("import a::{ !hidden };\n", "!"),
+        ] {
+            let (_tree, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "one diagnostic for {source:?}: {errors:?}");
+            assert_eq!(
+                render(&errors[0]),
+                IMPORT_PATH_IS_NAMES_AND_SETS,
+                "the import grammar's rule, for {source:?}"
+            );
+            assert_eq!(
+                &source[errors[0].span.into_range()],
+                stopped,
+                "anchored on the token the path stopped at, for {source:?}"
+            );
+        }
+        // `use` shares the path grammar and the rule names both.
+        assert_eq!(
+            rendered_errors("use a::{ (impl T) };\n"),
+            vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_well_formed_import_keeps_every_other_reading() {
+        // The rule REPLACES nothing it should not: a path the grammar reads is
+        // clean, a missing `;` still reports at the gap (the record is only
+        // written where the path genuinely fails, so a parsed path leaves it
+        // empty), an unclosed brace is still unclosed, and a statement that is
+        // not import-led keeps the expression fallback.
+        assert!(rendered_errors("import pkg::a::{ b, c as d };\n").is_empty());
+        assert_eq!(
+            rendered_errors("import pkg::a only;\n"),
+            vec!["expected `;` to end this statement".to_string()]
+        );
+        assert_eq!(
+            rendered_errors("import a::{ b\n"),
+            vec!["unclosed `{`: expected a matching `}`".to_string()]
+        );
+        assert_eq!(
+            rendered_errors("nonsense *;\n"),
+            vec!["found ';' expected an expression".to_string()]
+        );
     }
 
     #[test]

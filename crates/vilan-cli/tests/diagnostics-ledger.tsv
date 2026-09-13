@@ -366,7 +366,6 @@ row	flagship	key
 332	flagship	`std::{name}` was removed: `{name}` is a primitive and is always in scope — delete the import (its module path, if you need it, is `std::{home}::{name}`)
 333	flagship	`std::{name}` was removed: `{name}` is in the default prelude (no import needed), and its module path is `std::{home}::{name}`
 334	flagship	`std::{name}` was removed: its module path is `std::{home}::{name}`
-335	flagship	`#` is not a vilan token; in a `css` block a colour is a hole — `color: {Color::hex("#333")};` — which routes it through the `Color` type that carries its own `:root` line
 336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::style::declare`
 337	-	std::db migrate: could not begin a transaction for migration '{step.name}': {message}
 338	-	std::db migrate: migration '{step.name}' failed and was not applied: {message}
@@ -484,3 +483,11 @@ row	flagship	key
 451	-	`.eq(..)` gives an ATTRIBUTE condition its exact value and this condition is {...} — a pseudo-class, a relation or a breakpoint has no value to match; attribute(name).eq(value) is the form
 452	-	this attribute condition already carries a value ({...}) — `.eq(..)` narrows PRESENCE to one value, so write attribute(name).eq(value) once
 453	-	not(..) negates the condition immediately outside it, and this one carries {...} conditions — which of them is negated is not decided by anything; negate the condition itself with `.not()`
+454	-	an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
+455	-	`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an expression is none of those, and publishes nothing, checks nothing and emits nothing
+456	-	`{type}` {position}. `{item}` is exported, but `{type}` is not. A consumer can {verb} `{item}` but cannot name {noun}.
+457	flagship	`#` is not a colour here: in a `css` block a colour is a hole — `color: {Color::hex("#333")};` — which routes it through the `Color` type that carries its own `:root` line
+458	-	`{path}` is not exported by `{module}`. Importing it anyway is allowed — mark the reach: `import {module}::{ #{leaf} };`
+459	-	`{module}` exports `{leaf}`, so the reach marker is redundant — delete the `#`
+460	-	`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already reachable and absent from completion, which is the whole of what this marker meant — delete it, and write `export` on the names consumers are meant to find
+461	-	`{path}` is not exported by `{module}`, and this path reaches it through the module. The spelling that says so is a marked import: `import {module}::{ #{leaf} };`, and then `{leaf}` on its own

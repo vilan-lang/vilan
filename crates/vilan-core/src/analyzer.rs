@@ -755,9 +755,6 @@ pub struct Function<'src> {
     /// reachable only through a trait bound, never on a concrete type's own
     /// surface (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
-    /// Declared `[doc(hidden)]`: callable, but omitted from editor completion
-    /// (a tooling marker for the language server; no resolution change).
-    pub doc_hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4307,6 +4304,112 @@ pub struct Analyzer<'src> {
     // stands even where a body could be read either way. Populated after `build()`
     // once the container method ids resolve; empty when no container is loaded.
     bumps_tabled: HashSet<Id>,
+    // B318 §1.1 — the visibility sets, filled by the walk beside the scope map
+    // `resolve_import` writes into. "Is `id` visible to file `f`" is then a set
+    // lookup plus, for a narrowed export, one path test.
+    //
+    // Deliberately three sets rather than a field on `Function`/`Struct`/`Enum`/
+    // `Trait`: those are read by the solver and the transformer on hot paths,
+    // and visibility is a property of a NAME IN A MODULE rather than of a
+    // definition.
+    //
+    // Items whose declaration carried `export` (an `impl` block included — an
+    // impl a consumer cannot see contributes no methods to that consumer,
+    // RULED), each mapped to the module body scope the marker was written at.
+    //
+    // The scope rides along because a module-level `let` is a BINDING rather
+    // than an item — it declares through `declare_scope_value`, not
+    // `declare_scope_item` — so a module's `declaration_order` cannot answer
+    // "which module exported this" for every sort, and the walk that saw the
+    // marker already knows.
+    exported_entities: HashMap<Id, Id>,
+    // Module BODY SCOPES carrying `export *;`. The scope rather than the file,
+    // so an inline `mod m { export *; }` exports `m`'s items and not the whole
+    // file around it.
+    export_all_modules: HashSet<Id>,
+    // The `(in PATH)` narrowings, by declaration id. A narrowing beats
+    // `export *;`, which is what makes `export(in mod)` the way to hold one item
+    // back under a module-wide export.
+    export_scopes: HashMap<Id, Vec<&'src str>>,
+    // Module body scopes that carry ANY export marker — an `export *;` or one
+    // `export`-marked item. The rollout's tooling half (§8): until a module
+    // writes its first marker it has not been curated, so every name it declares
+    // answers "exported" to completion, the add-import quickfix and the B4
+    // steer, and the tooling is exactly what it was before the bit existed.
+    //
+    // It gates the TOOLING and deliberately not the plain-reach WARNING, and the
+    // two are the two halves of one rollout: the warning is what tells an author
+    // to curate (294 of them across the estate at release N, §6), and the
+    // exemption is what stops the compiler punishing them for not having done it
+    // yet. Both go when the reach becomes an error at N+1.
+    curated_modules: HashSet<Id>,
+    // Every import leaf that RESOLVED, for the plain-reach warning (B318 §5).
+    // Recorded by `resolve_import` and read once post-`build()`, rather than
+    // decided at the import: the module a leaf reaches into may not have been
+    // walked yet when the importing file resolves, so the export sets are only
+    // complete after the whole program is loaded.
+    import_reaches: Vec<ImportReach<'src>>,
+    // `(file, leaf span)` for every import leaf a `#` marker covers (§2.3).
+    // Kept beside the reaches rather than threaded through `NamespaceEntry`,
+    // because the marker adds no path SEGMENT: every consumer of a flattened
+    // entry asks exactly what it asked before, and the one reader that needs the
+    // extra bit looks it up by the leaf's own span.
+    reach_marked_spans: HashSet<(SourceId, Span)>,
+}
+
+/// One resolved import leaf, for `check_plain_reaches` (B318 §5).
+#[derive(Clone, Debug)]
+struct ImportReach<'src> {
+    /// What the leaf bound.
+    target: Id,
+    /// The path as written, root first, the leaf NOT included.
+    path: Vec<&'src str>,
+    /// The leaf's own name and span — what the warning anchors on and what the
+    /// reach marker is written before.
+    leaf: &'src str,
+    leaf_span: Span,
+    /// The file the import statement is IN.
+    source: SourceId,
+    /// The whole `import`/`use` STATEMENT's span, or the qualified path's own —
+    /// what a diagnostic already filed against this reach would overlap.
+    statement_span: Span,
+    /// Whether the reach is a QUALIFIED path (`a::hidden()` after
+    /// `import pkg::a;`) rather than an import leaf. The other door §5 names:
+    /// there is no leaf to mark, so the message steers to the marked IMPORT
+    /// instead of to a one-character insertion, and the language server offers
+    /// no edit for it.
+    qualified: bool,
+}
+
+/// Where an exported signature names an unexported type (B318 §4) — the seven
+/// positions, each with the three phrases its message is built from: what the
+/// type IS here, what a consumer can do with the item, and what they cannot
+/// name. The RULED wording is the RETURN row, verbatim.
+#[derive(Clone, Copy, Debug)]
+enum ExposurePosition {
+    Value,
+    Parameter,
+    Return,
+    Field,
+    Payload,
+    Bound,
+}
+
+impl ExposurePosition {
+    fn wording(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            ExposurePosition::Value => ("is this value's type", "read", "its type"),
+            ExposurePosition::Parameter => {
+                ("is a parameter type here", "call", "the parameter's type")
+            }
+            ExposurePosition::Return => ("is returned here", "call", "the return type"),
+            ExposurePosition::Field => ("is a field's type here", "name", "the field's type"),
+            ExposurePosition::Payload => {
+                ("is a variant's payload here", "name", "the payload's type")
+            }
+            ExposurePosition::Bound => ("is a declared bound here", "call", "the bound"),
+        }
+    }
 }
 
 static EMPTY_SPAN: Span = Span { start: 0, end: 0 };
@@ -4331,6 +4434,47 @@ pub struct Importable<'src> {
     /// holds the block, so a module's own row is exactly what its own file
     /// offers.
     pub statics: Vec<&'src str>,
+    /// B318 §1.1: what the declaration's `export` marker says about who may see
+    /// this name — the one bit the whole visibility feature adds to this row.
+    ///
+    /// It lives HERE, on the importable row, rather than on `Function`/`Struct`/
+    /// `Enum`/`Trait`: those structs are read by the solver and the transformer
+    /// on hot paths, and visibility is a property of a NAME IN A MODULE, not of
+    /// a definition — the same definition is public through one module's
+    /// re-export and private in the module that declares it. Keeping it on the
+    /// row is what lets `module_importables` answer the question from a PARSE,
+    /// with no analyzer at all, which is what keeps the three tooling consumers
+    /// cheap.
+    pub exported: Visibility<'src>,
+}
+
+/// What a top-level declaration's `export` marker says about who may see it
+/// (B318 §1). Visibility never gates ACCESS — a reach is spelled — so this is
+/// read by completion, the add-import quickfix, the "import it first" steer and
+/// the two warnings, and by nothing in resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Visibility<'src> {
+    /// Unmarked. The item is the module's own machinery: never offered by
+    /// completion, never a quickfix candidate, never steered toward, and a
+    /// PLAIN import of it from another file of the same package warns.
+    Private,
+    /// `export`, or covered by the module's `export *;`.
+    Exported,
+    /// `export(in PATH)` — published into the scope subtree `PATH` roots, and
+    /// private outside it. `mod` and `pkg` are the reserved heads.
+    Scoped(Vec<&'src str>),
+}
+
+impl Visibility<'_> {
+    /// Whether the marker publishes AT ALL — the question the three tooling
+    /// consumers ask, none of which has an importing file to test a narrowing
+    /// against (a completion list is offered before the import exists). A
+    /// narrowed export counts: offering it and letting the reach warning
+    /// correct an out-of-scope use is better than hiding a name the author of
+    /// the module deliberately published.
+    pub fn is_exported(&self) -> bool {
+        !matches!(self, Visibility::Private)
+    }
 }
 
 /// What an [`Importable`] names.
@@ -4404,9 +4548,50 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
     })
 }
 
+/// The `export` marker on a top-level item, and the item under it (B318 §1.1).
+///
+/// `unwrap_item` is the sibling that answers only the second half; it stays as
+/// it is, because every other reader of a top-level item wants the declaration
+/// and not the marker. This one is `collect_importables`' own, and it is the
+/// change that stops the marker being DISCARDED: before B318 the wrapper was
+/// stripped along with derive/service/macro-attribute, so `export fun f` and
+/// `fun f` produced byte-identical importable rows and one package's author
+/// (`macro_std`, which marks 26 of its 31 declarations) had their intent thrown
+/// away by the compiler.
+fn item_visibility<'a, 'src>(item: &'a Spanned<Node<'src>>) -> (Visibility<'src>, &'a Node<'src>) {
+    let mut visibility = Visibility::Private;
+    let mut node = &item.0;
+    loop {
+        match node {
+            Node::Export(scope, inner) => {
+                visibility = match scope {
+                    Some(scope) => {
+                        Visibility::Scoped(scope.path.iter().map(|(segment, _)| *segment).collect())
+                    }
+                    None => Visibility::Exported,
+                };
+                node = &inner.0;
+            }
+            Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner) => node = &inner.0,
+            _ => return (visibility, node),
+        }
+    }
+}
+
 fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
+    // B318 §2.1: `export *;` sets the bit on every item of the module. An item
+    // carrying its OWN `(in PATH)` keeps that narrowing — which is exactly what
+    // `export(in mod)` is for: one item held back under a module-wide export.
+    let export_all = items.iter().any(|item| matches!(item.0, Node::ExportAll));
     for item in items {
-        if let Node::Export(inner) = &item.0
+        let (marked, item_node) = item_visibility(item);
+        let visibility = match marked {
+            Visibility::Private if export_all => Visibility::Exported,
+            marked => marked,
+        };
+        if let Node::Export(_, inner) = &item.0
             && let Node::Import(branch) | Node::Use(branch) = &inner.0
         {
             let mut entries = Vec::new();
@@ -4430,11 +4615,12 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
                     kind: ImportableKind::Reexport,
                     variants: Vec::new(),
                     statics: Vec::new(),
+                    exported: visibility.clone(),
                 });
             }
             continue;
         }
-        let (name, kind, variants) = match unwrap_item(item) {
+        let (name, kind, variants) = match item_node {
             Node::Func(function) => (function.name.0, ImportableKind::Function, Vec::new()),
             Node::MacroFun(function) => (function.name.0, ImportableKind::Macro, Vec::new()),
             Node::Struct(name, ..) => (name.0, ImportableKind::Struct, Vec::new()),
@@ -4453,6 +4639,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             kind,
             variants,
             statics: Vec::new(),
+            exported: visibility,
         });
     }
     // B317, in a second pass because an `impl` block may be written above the
@@ -4524,7 +4711,7 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
 /// attribute) down to the item itself.
 fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
     let mut node = &item.0;
-    while let Node::Export(inner)
+    while let Node::Export(_, inner)
     | Node::Derive(_, inner)
     | Node::Service(_, inner)
     | Node::MacroAttribute(_, _, _, inner) = node
@@ -4843,9 +5030,57 @@ pub(crate) fn flatten_namespace_branch<'src>(
                 flatten_namespace_branch(child, path, entries);
             }
         },
+        // B318 §2.3: the marker adds no SEGMENT — it is a statement about the
+        // reach, not part of the path — so flattening walks straight through it
+        // and every consumer of the entries sees exactly what it saw before.
+        // Which leaves were marked is recorded separately, by span.
+        ImportBranch::Reach(_, inner) => flatten_namespace_branch(inner, path, entries),
         ImportBranch::Set(branches) => {
             for child in branches {
                 flatten_namespace_branch(child, path.clone(), entries);
+            }
+        }
+    }
+}
+
+/// The LEAF spans a reach marker covers (B318 §2.3), for the file `source`.
+///
+/// Recorded by span rather than threaded through `NamespaceEntry` because the
+/// marker is not part of the path: every consumer of a flattened entry — the
+/// import walk, the macro world, the language server's three readers — asks the
+/// same question it always asked, and exactly one reader (the plain-reach
+/// warning) needs the extra bit, which it looks up by the leaf's own span.
+pub(crate) fn collect_reach_marked_spans(
+    branch: &ImportBranch<'_>,
+    marked: bool,
+    out: &mut Vec<Span>,
+) {
+    match branch {
+        ImportBranch::Path(_, span, tail) => match tail {
+            ImportTail::Leaf => {
+                if marked {
+                    out.push(*span);
+                }
+            }
+            ImportTail::Alias(_, alias_span) => {
+                if marked {
+                    out.push(*alias_span);
+                }
+            }
+            // A marker on an intermediate segment marks THAT segment, not the
+            // leaf below it: `import a::#m::helper;` reaches a private `mod m`
+            // and says nothing about `helper`.
+            ImportTail::Continue(child) => {
+                if marked {
+                    out.push(*span);
+                }
+                collect_reach_marked_spans(child, false, out);
+            }
+        },
+        ImportBranch::Reach(_, inner) => collect_reach_marked_spans(inner, true, out),
+        ImportBranch::Set(branches) => {
+            for child in branches {
+                collect_reach_marked_spans(child, marked, out);
             }
         }
     }
@@ -5116,6 +5351,12 @@ impl<'src> Analyzer<'src> {
             promise_struct_id: None,
             task_struct_id: None,
             bumps_tabled: HashSet::default(),
+            exported_entities: HashMap::default(),
+            export_all_modules: HashSet::default(),
+            export_scopes: HashMap::default(),
+            curated_modules: HashSet::default(),
+            import_reaches: Vec::new(),
+            reach_marked_spans: HashSet::default(),
         }
     }
 
@@ -18883,7 +19124,7 @@ impl<'src> Analyzer<'src> {
             analyzer.declare_scope_item(module_scope_id, name, id);
         };
         match node {
-            Node::Export(inner)
+            Node::Export(_, inner)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner) => {
@@ -26467,6 +26708,7 @@ impl<'src> Analyzer<'src> {
             // `Expr::Void` keeps a statement-position import a well-formed
             // no-op through typing and emission.
             Node::Import(root_branch) => {
+                self.record_reach_marks(root_branch);
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
                 for (path, name, leaf_span, alias) in entries {
@@ -26483,6 +26725,7 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Void)
             }
             Node::Use(root_branch) => {
+                self.record_reach_marks(root_branch);
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
                 for (path, name, leaf_span, alias) in entries {
@@ -26768,7 +27011,25 @@ impl<'src> Analyzer<'src> {
                     Some(Expr::Error)
                 }
             }
-            Node::Export(inner) => {
+            // `export *;` (B318 §2.1) — every item of this module is exported.
+            // The marker IS the statement, so there is nothing under it to walk;
+            // it takes the same module-level refusal `export` takes, for the same
+            // reason.
+            Node::ExportAll => {
+                self.export_all_modules.insert(scope_id);
+                self.curated_modules.insert(scope_id);
+                if !self.module_scope_ids.contains(&scope_id) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: "`export` is a module-level item and cannot appear inside a body"
+                            .to_string(),
+                    });
+                }
+                Some(Expr::Void)
+            }
+            Node::Export(export_scope, inner) => {
                 // Exports shape a module's public surface, so they only mean
                 // something at a module's top level. A block-scoped `import`
                 // (H2) is deliberately not exportable — and any other `export`
@@ -26782,7 +27043,23 @@ impl<'src> Analyzer<'src> {
                             .to_string(),
                     });
                 }
-                self.walk_expr_node(inner, scope_id);
+                let declaration_id = self.walk_expr_node(inner, scope_id);
+                // B318 §1.1: the marker is RECORDED now, where it used to be
+                // discarded. An `export import` records too — the re-export is
+                // an act of publication by a module that can see the item, which
+                // is `prelude.md` §8's "extend by re-export" one level down.
+                self.exported_entities.insert(declaration_id, scope_id);
+                self.curated_modules.insert(scope_id);
+                if let Some(export_scope) = export_scope {
+                    self.export_scopes.insert(
+                        declaration_id,
+                        export_scope
+                            .path
+                            .iter()
+                            .map(|(segment, _)| *segment)
+                            .collect(),
+                    );
+                }
                 Some(Expr::Void)
             }
             // `[derive(..)]` is transparent: walk the wrapped item; the trait
@@ -27326,7 +27603,6 @@ impl<'src> Analyzer<'src> {
                                 .collect(),
                             rpc: function.rpc,
                             trait_only: function.trait_only,
-                            doc_hidden: function.doc_hidden,
                         },
                     );
                     Some(Expr::Function(id))
@@ -34711,6 +34987,23 @@ impl<'src> Analyzer<'src> {
             }
             None => bind_name,
         };
+        // B318 §5: record the reach for the post-build warning. This tail is
+        // reached only when the whole path RESOLVED, and `resolve_world` drops a
+        // resolved item from its retry queue, so each leaf records exactly once
+        // — the `report` flag is about whether a MISS is diagnosed and says
+        // nothing about this. Not a `self` leaf, which re-binds the namespace it
+        // sits in rather than naming an item.
+        if name != "self" {
+            self.import_reaches.push(ImportReach {
+                target: target_id,
+                path: path.iter().map(|(segment, _)| *segment).collect(),
+                leaf: name,
+                leaf_span,
+                source: source_id,
+                statement_span: span,
+                qualified: false,
+            });
+        }
         let scope = self.mut_scope_for_scope_id(scope_id);
         scope.name_to_id_map.insert(bind_name, target_id);
         true
@@ -38969,6 +39262,13 @@ impl<'src> Analyzer<'src> {
             if self.source_of_id(entity) != self.source_of_id(module.id) {
                 continue;
             }
+            // B318 §1: visibility gates the STEER. A module's private machinery
+            // is not something to be pointed at — the author of the module said
+            // it is theirs, and an author who needs it anyway writes the reach
+            // deliberately rather than being talked into it by a compiler note.
+            if !self.is_exported_in(entity, module.body.1) {
+                continue;
+            }
             let is_std = std_members.contains(&module.id);
             match &hit {
                 None => hit = Some((module.name, is_std)),
@@ -38986,6 +39286,500 @@ impl<'src> Analyzer<'src> {
         Some(format!(
             "; import it first (`import std::{module}::{name};`)"
         ))
+    }
+
+    /// Whether `entity`, declared at the top level of the module whose body
+    /// scope is `module_scope`, carries the export bit (B318 §1.1).
+    ///
+    /// Two sets and no path test: this is the question the three TOOLING
+    /// consumers ask — completion, the add-import quickfix and the B4 "import it
+    /// first" steer — none of which has an importing file to test a `(in PATH)`
+    /// narrowing against, because the list is offered before the import exists.
+    /// A narrowed export counts as exported here on purpose: offering a name its
+    /// module deliberately published, and letting the reach warning correct an
+    /// out-of-scope use, is better than hiding it.
+    fn is_exported_in(&self, entity: Id, module_scope: Id) -> bool {
+        self.exported_entities.contains_key(&entity)
+            || self.export_all_modules.contains(&module_scope)
+            || !self.curated_modules.contains(&module_scope)
+    }
+
+    /// Every top-level DECLARATION of a module, mapped to that module's body
+    /// scope and its own name (B318 §1.1) — "which module offers this name",
+    /// which is the half the visibility sets do not carry.
+    ///
+    /// Read off `declaration_order`, which is exactly the module's own
+    /// declarations: a plain `import` at a module's top level lands in
+    /// `name_to_id_map` and never here, which is the same line
+    /// `collect_importables` draws for the same reason.
+    fn module_declaration_scopes(&self) -> HashMap<Id, (Id, &'src str)> {
+        let mut out: HashMap<Id, (Id, &'src str)> = HashMap::default();
+        for scope_id in &self.module_scope_ids {
+            let Some(scope) = self.scopes.get(scope_id) else {
+                continue;
+            };
+            for (name, id) in &scope.declaration_order {
+                out.insert(*id, (*scope_id, name));
+            }
+            // A module-level `let` declares through `declare_scope_value`
+            // rather than `declare_scope_item` — it is a BINDING with a
+            // lifetime, not an item — so it lands in the value map instead,
+            // and it is an importable name like any other.
+            for (name, declarations) in &scope.local_value_declarations {
+                for declaration in declarations {
+                    out.insert(declaration.id, (*scope_id, name));
+                }
+            }
+        }
+        out
+    }
+
+    /// The visibility index the two warnings share: every module-level NOMINAL
+    /// declaration keyed by the id a `Type` carries for it, with its name,
+    /// whether it is exported, and the declaring entity.
+    ///
+    /// `Type::Struct`/`Enum`/`Trait` carry the STRUCT id, not the declaration
+    /// entity's — `Expr::Struct(struct_id)` is the indirection — so a walk over
+    /// a signature cannot ask `exported_entities` directly, and this is the
+    /// bridge.
+    fn nominal_visibility(
+        &self,
+        declaring: &HashMap<Id, (Id, &'src str)>,
+    ) -> HashMap<Id, (&'src str, bool, Id)> {
+        let mut out: HashMap<Id, (&'src str, bool, Id)> = HashMap::default();
+        for (entity, (module_scope, name)) in declaring {
+            let exported = self.is_exported_in(*entity, *module_scope);
+            let key = match self.expr_id_to_expr_map.get(entity) {
+                Some(Expr::Struct(struct_id)) => Some(*struct_id),
+                Some(Expr::Enum(enum_id)) => Some(*enum_id),
+                Some(Expr::Trait(trait_id)) => Some(*trait_id),
+                _ => None,
+            };
+            if let Some(key) = key {
+                out.insert(key, (name, exported, *entity));
+            }
+        }
+        out
+    }
+
+    /// The first UNEXPORTED nominal type inside `type_id`, by a depth-first walk
+    /// through generic arguments, tuple elements, array elements and closure
+    /// signatures — `List<S>` and `Map<K, S>` reach `S`, which is B318 §4's
+    /// "a generic argument in any of the above".
+    fn first_unexported_type(
+        &self,
+        type_id: TypeId,
+        nominals: &HashMap<Id, (&'src str, bool, Id)>,
+        seen: &mut HashSet<TypeId>,
+    ) -> Option<(&'src str, Id)> {
+        if !seen.insert(type_id) {
+            return None;
+        }
+        let (head, arguments) = match self.borrow_type_by_type_id(type_id).clone() {
+            Type::Struct(id, arguments)
+            | Type::Enum(id, arguments)
+            | Type::Trait(id, arguments) => (Some(id), arguments),
+            Type::Tuple(elements) => (None, elements),
+            Type::Array(element, _) => (None, vec![element]),
+            Type::Generic(inner) => (None, vec![inner]),
+            Type::Closure(parameters, return_type, _) => {
+                let mut all = parameters;
+                all.push(return_type);
+                (None, all)
+            }
+            Type::Mapped(binder, source, template) => (None, vec![binder, source, template]),
+            _ => (None, Vec::new()),
+        };
+        if let Some(id) = head
+            && let Some((name, exported, entity)) = nominals.get(&id)
+            && !exported
+        {
+            return Some((name, *entity));
+        }
+        arguments
+            .into_iter()
+            .find_map(|argument| self.first_unexported_type(argument, nominals, seen))
+    }
+
+    /// The SIGNATURE positions of an exported declaration (B318 §4) — and only
+    /// these. A body is never one: a private type used inside an exported
+    /// function's body is exactly the encapsulation the feature exists to
+    /// permit.
+    fn signature_positions(&self, entity: Id) -> Vec<(TypeId, ExposurePosition)> {
+        let mut out = Vec::new();
+        let bounds = |out: &mut Vec<(TypeId, ExposurePosition)>, ids: &[TypeId]| {
+            out.extend(ids.iter().map(|id| (*id, ExposurePosition::Bound)));
+        };
+        match self.expr_id_to_expr_map.get(&entity) {
+            Some(Expr::Function(function_id)) => {
+                let Some(function) = self.functions.get(function_id) else {
+                    return out;
+                };
+                bounds(&mut out, &function.generic_parameter_constraint_ids);
+                for parameter in &function.parameters {
+                    if let Some(declared) = self.parameters.get(parameter) {
+                        out.push((declared.type_id, ExposurePosition::Parameter));
+                    }
+                }
+                if let Some(return_type_id) = function.return_type_id {
+                    out.push((return_type_id, ExposurePosition::Return));
+                }
+            }
+            Some(Expr::ExternalFunction(external_id)) => {
+                let Some(external) = self.external_functions.get(external_id) else {
+                    return out;
+                };
+                bounds(&mut out, &external.generic_parameter_constraint_ids);
+                for parameter in &external.parameters {
+                    if let Some(declared) = self.parameters.get(parameter) {
+                        out.push((declared.type_id, ExposurePosition::Parameter));
+                    }
+                }
+                out.push((external.return_type_id, ExposurePosition::Return));
+            }
+            Some(Expr::Struct(struct_id)) => {
+                let Some(struct_) = self.structs.get(struct_id) else {
+                    return out;
+                };
+                bounds(&mut out, &struct_.generic_parameter_constraint_ids);
+                out.extend(
+                    struct_
+                        .fields
+                        .iter()
+                        .map(|field| (field.type_id, ExposurePosition::Field)),
+                );
+            }
+            Some(Expr::Enum(enum_id)) => {
+                let Some(enum_) = self.enums.get(enum_id) else {
+                    return out;
+                };
+                bounds(&mut out, &enum_.generic_parameter_constraint_ids);
+                for variant in &enum_.variants {
+                    out.extend(
+                        variant
+                            .data_type_ids
+                            .iter()
+                            .map(|type_id| (*type_id, ExposurePosition::Payload)),
+                    );
+                }
+            }
+            // A module-level `let` — its own type, and the one position with no
+            // declaration struct behind it. A `mod` and a `trait` have no
+            // signature of their own (a trait's MEMBERS are a later slice's).
+            Some(Expr::Module(_) | Expr::Trait(_)) => {}
+            Some(Expr::Variable(variable_id)) => {
+                if let Some(variable) = self.variables.get(variable_id) {
+                    out.push((variable.type_id, ExposurePosition::Value));
+                }
+            }
+            // A module-level `let` — its own type, and the one position with
+            // no declaration struct behind it: the type lives on the BINDING
+            // the entity names, which is what `resolved_type_id_of` falls
+            // through to.
+            _ => {}
+        }
+        out
+    }
+
+    /// B318 §4: an EXPORTED item whose signature names an unexported type. The
+    /// consumer can reach the item and cannot name the type it is written in
+    /// terms of, which is a shape the author almost never meant.
+    ///
+    /// It runs post-`build()` because that is where a signature's TYPES are
+    /// known: written annotations resolve through the constraint fixpoint, so
+    /// "after declaration hoisting, before bodies" — where B318 put it — is a
+    /// place where the answer does not exist yet. It sits after
+    /// `check_trait_conformance` (the family's own marker for "signature types
+    /// are settled") and before the duplicate family, so an exposure warning
+    /// reads ahead of a collision error about the same declaration.
+    ///
+    /// It pushes to `warnings`, not `diagnostics`, and that matters beyond
+    /// severity: 62 sites gate on `diagnostics.is_empty()`, including the
+    /// organizer's "a file carrying a diagnostic never prunes", and a warning
+    /// must not disable Organize Imports.
+    ///
+    /// An UNCURATED module's types count as exported (§8, the rollout's tooling
+    /// half): until a module has written its first marker it has made no claim
+    /// about its surface, and warning that `std::ui::View` is unexported would
+    /// be a warning about work that is scheduled rather than about the signature
+    /// in front of the reader. The plain-reach warning beside this one is what
+    /// tells an author to curate.
+    fn check_exposed_unexported_types(&mut self) {
+        if self.exported_entities.is_empty() {
+            return;
+        }
+        let declaring = self.module_declaration_scopes();
+        let nominals = self.nominal_visibility(&declaring);
+        let mut exported: Vec<(Id, &'src str)> = self
+            .exported_entities
+            .keys()
+            .copied()
+            .filter(|entity| !self.frozen_entity(*entity))
+            .filter_map(|entity| Some((entity, self.exported_item_name(entity)?)))
+            .collect();
+        // A set is unordered and a diagnostic list is not (the C1 discipline).
+        exported.sort_by_key(|(entity, _)| {
+            let span = self.declaration_name_span(*entity);
+            (
+                self.source_of_id(*entity).map(|source| source.0),
+                span.start,
+                span.end,
+            )
+        });
+        let mut sites: Vec<(Span, SourceId, &'src str, &'src str, Id, ExposurePosition)> =
+            Vec::new();
+        for (entity, item) in exported {
+            let span = self.declaration_name_span(entity);
+            let source = self.source_of_id(entity).unwrap_or(SourceId(0));
+            // ONE warning per declaration: the fix is the same edit whichever
+            // position found it, and a signature naming a private type three
+            // times is one mistake (diagnostics-standard B5).
+            for (type_id, position) in self.signature_positions(entity) {
+                let mut seen = HashSet::default();
+                if let Some((exposed, exposed_entity)) =
+                    self.first_unexported_type(type_id, &nominals, &mut seen)
+                {
+                    sites.push((span, source, item, exposed, exposed_entity, position));
+                    break;
+                }
+            }
+        }
+        for (span, source, item, exposed, exposed_entity, position) in sites {
+            let (clause, reach, noun) = position.wording();
+            let mut msg = format!(
+                "`{exposed}` {clause}. `{item}` is exported, but `{exposed}` is not. \
+                 A consumer can {reach} `{item}` but cannot name {noun}."
+            );
+            // §4's dependency arm: `S`'s declaration is not this package's to
+            // edit, so there is no "Export `S`" to offer and the message says
+            // what the two ways out actually are.
+            if let Some(module) = self.foreign_package_module_of(exposed_entity, source) {
+                msg.push_str(&format!(
+                    " `{exposed}` is declared by `{module}`, in another package, and cannot be \
+                     exported from here — the shape has to change, or that package has to \
+                     export it."
+                ));
+            }
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// The NAME an exported declaration was written under — every sort,
+    /// including the module-level `let` whose entity is an `Expr::Variable`.
+    fn exported_item_name(&self, entity: Id) -> Option<&'src str> {
+        match self.expr_id_to_expr_map.get(&entity)? {
+            Expr::Function(function_id) => self
+                .functions
+                .get(function_id)
+                .map(|function| function.name),
+            Expr::ExternalFunction(external_id) => self
+                .external_functions
+                .get(external_id)
+                .map(|external| external.name),
+            Expr::Struct(struct_id) => self.structs.get(struct_id).map(|struct_| struct_.name),
+            Expr::Enum(enum_id) => self.enums.get(enum_id).map(|enum_| enum_.name),
+            Expr::Variable(variable_id) => self
+                .variables
+                .get(variable_id)
+                .map(|variable| variable.name),
+            // A `trait` and a `mod` have no signature of their own, and an
+            // `export import` names a re-export rather than a declaration.
+            _ => None,
+        }
+    }
+
+    /// The module name of `entity` when it lives in a DIFFERENT package from
+    /// `source` — the §4 arm that has no fix to offer. `None` when the two are
+    /// in one package (or when either package is unknown, which is the
+    /// single-package loader path and the conservative answer).
+    fn foreign_package_module_of(&self, entity: Id, source: SourceId) -> Option<&'src str> {
+        let declared_in = self.source_of_id(entity)?;
+        let here = self.package_of_source.get(&source)?;
+        let there = self.package_of_source.get(&declared_in)?;
+        (here != there)
+            .then(|| self.module_name_of_id(entity))
+            .flatten()
+    }
+
+    /// Files the `#`-marked leaf spans of one `import`/`use` statement into
+    /// `reach_marked_spans`, against the file being walked (B318 §2.3).
+    fn record_reach_marks(&mut self, branch: &ImportBranch<'src>) {
+        let mut spans = Vec::new();
+        collect_reach_marked_spans(branch, false, &mut spans);
+        let source = self.current_source_id;
+        self.reach_marked_spans
+            .extend(spans.into_iter().map(|span| (source, span)));
+    }
+
+    /// Whether `target`, declared at the top level of the module whose body
+    /// scope is `module_scope`, is visible TO the file `importer` (B318 §1).
+    ///
+    /// The STRICT question, with no uncurated-module exemption: this is what the
+    /// plain-reach warning asks, and the warning is what tells an author to
+    /// curate. `is_exported_in` is the lenient twin the three tooling consumers
+    /// ask, and the two differ on exactly that clause.
+    fn export_reaches_file(&self, target: Id, module_scope: Id, importer: SourceId) -> bool {
+        // A narrowing beats `export *;` — which is what makes `export(in mod)`
+        // the way to hold one item back under a module-wide export.
+        if let Some(scope) = self.export_scopes.get(&target) {
+            return match scope.first() {
+                // "this module and its inline `mod` blocks" — the declaring
+                // FILE, which is the only reader of a file-private item.
+                Some(&"mod") => self.source_of_id(target) == Some(importer),
+                // "the item's own package".
+                Some(&"pkg") => {
+                    let declared_in = self.source_of_id(target);
+                    declared_in.is_some_and(|declared_in| {
+                        self.package_of_source.get(&declared_in)
+                            == self.package_of_source.get(&importer)
+                    })
+                }
+                // A general path (`export(in pkg::a)`) names a module SUBTREE,
+                // and a subtree is a question about file paths, which the
+                // analyzer does not hold (`sources` lives on `Program`). S1
+                // parses, stores, formats and reprints the form and admits it
+                // here — the conservative direction, since being wrong the other
+                // way is a warning about a program that is correct. Zero
+                // occurrences in the estate; the subtree test is a follow-up.
+                _ => true,
+            };
+        }
+        self.exported_entities.contains_key(&target)
+            || self.export_all_modules.contains(&module_scope)
+    }
+
+    /// B318 §5 / R1: a PLAIN import of a private item — the warning that makes
+    /// the default flip non-breaking — and its twin, a reach marker on an item
+    /// that is exported anyway.
+    ///
+    /// Three things it does NOT fire on, each ruled rather than tuned:
+    ///
+    /// - a reach into ANOTHER PACKAGE. RULED: whether an item should be exported
+    ///   is the author's judgement and the consumer's need is real evidence
+    ///   against it, so a dependency's private item reached from here is no
+    ///   diagnostic at any release, marked or not.
+    /// - a reach whose importing file is STD's own. std's curation is its own
+    ///   slice (§8: std curates from release N, from the 118 measured cross-file
+    ///   imports up to whatever `docs/std/` documents), and until it runs, every
+    ///   one of those 118 would fire — which would turn
+    ///   `every_std_module_is_clean_under_full_scan`, a release blocker, into a
+    ///   permanent red. It is the `check_deprecated` A2 precedent exactly ("a use
+    ///   inside std itself is silent"), keyed on `std_sources`, which is
+    ///   populated under both scan scopes and so keeps the differential exact.
+    /// - a leaf that is not a module's own top-level declaration: an enum
+    ///   variant, a type's static (B317), a module FILE. None of those carries a
+    ///   marker of its own, and a file has no `export` to write.
+    fn check_plain_reaches(&mut self) {
+        if self.import_reaches.is_empty() {
+            return;
+        }
+        let declaring = self.module_declaration_scopes();
+        let reaches = std::mem::take(&mut self.import_reaches);
+        // An import the compiler already REFUSED gets no second word about its
+        // visibility (diagnostics-standard B5): `import pkg::client::helper;`
+        // where `client` is the program's own entry file is one mistake, and the
+        // refusal that names it is the one worth reading. Matched by span
+        // overlap on the statement, per file.
+        let refused: Vec<(SourceId, Span)> = self
+            .diagnostics
+            .iter()
+            .enumerate()
+            .map(|(index, diagnostic)| (self.diagnostic_source_at(index), diagnostic.span))
+            .collect();
+        let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+        for reach in &reaches {
+            if refused.iter().any(|(source, span)| {
+                *source == reach.source
+                    && span.start < reach.statement_span.end
+                    && reach.statement_span.start < span.end
+            }) {
+                continue;
+            }
+            let Some(&(module_scope, _)) = declaring.get(&reach.target) else {
+                continue;
+            };
+            let marked = self
+                .reach_marked_spans
+                .contains(&(reach.source, reach.leaf_span));
+            let visible = self.export_reaches_file(reach.target, module_scope, reach.source);
+            let module = reach.path.join("::");
+            // A qualified path carries no marker (there is no leaf to write one
+            // on), so the redundancy question does not arise for it.
+            if marked && !reach.qualified {
+                // §9 S2: a marker on an item that is exported anyway says
+                // something about the author's belief that is not true, and the
+                // fix is to delete a character.
+                if visible {
+                    sites.push((
+                        reach.leaf_span,
+                        reach.source,
+                        format!(
+                            "`{module}` exports `{leaf}`, so the reach marker is redundant — \
+                             delete the `#`",
+                            leaf = reach.leaf
+                        ),
+                    ));
+                }
+                continue;
+            }
+            if visible || self.std_sources.contains(&reach.source) {
+                continue;
+            }
+            let Some(declared_in) = self.source_of_id(reach.target) else {
+                continue;
+            };
+            // A module importing its OWN name is not a reach past a fence — it
+            // is the fence — and it is a shape real packages carry (a module
+            // that names itself, `a_non_entry_self_import_stays_clean`). Silent,
+            // like every other question a file asks about itself.
+            if declared_in == reach.source {
+                continue;
+            }
+            if self.package_of_source.get(&declared_in) != self.package_of_source.get(&reach.source)
+            {
+                continue;
+            }
+            sites.push((
+                reach.leaf_span,
+                reach.source,
+                if reach.qualified {
+                    format!(
+                        "`{module}::{leaf}` is not exported by `{module}`, and this path reaches \
+                         it through the module. The spelling that says so is a marked import: \
+                         `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own",
+                        leaf = reach.leaf
+                    )
+                } else {
+                    format!(
+                        "`{module}::{leaf}` is not exported by `{module}`. Importing it anyway is \
+                         allowed — mark the reach: `import {module}::{{ #{leaf} }};`",
+                        leaf = reach.leaf
+                    )
+                },
+            ));
+        }
+        // The reaches are recorded in resolution order, which is the program's
+        // load order rather than the file's — sorted so the list a `vilan check`
+        // prints is stable (the C1 discipline) — and deduplicated by SITE,
+        // because a package with two entries resolves a shared module's imports
+        // once per entry world and one import statement is one mistake (B5).
+        sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+        sites.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+        for (span, source, msg) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            self.warning_sources.push(source);
+        }
     }
 
     /// The short name of a lift container, for region diagnostics — `Option`,
@@ -42702,6 +43496,23 @@ impl<'src> Analyzer<'src> {
                             let rc = self.reference_count.entry(member_id).or_insert(0);
                             *rc += 1;
                             self.expr_id_to_expr_map.insert(id, Expr::Local(member_id));
+                            // B318 §5: the OTHER door. `import pkg::a;` then
+                            // `a::hidden()` reaches a private item with no leaf
+                            // to mark, so the reach is recorded here and the
+                            // same post-build check answers it. The module path
+                            // is reconstructed as `pkg::<module>` rather than
+                            // read off the source, which is exact for every
+                            // warning that can fire: the check is same-package
+                            // only, so `pkg` is always the right root.
+                            self.import_reaches.push(ImportReach {
+                                target: member_id,
+                                path: vec!["pkg", module_name],
+                                leaf: member_name,
+                                leaf_span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                source: self.source_of_id(id).unwrap_or(SourceId(0)),
+                                statement_span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                qualified: true,
+                            });
                         }
                         None => {
                             self.diagnostics.push(Error {
@@ -50035,6 +50846,22 @@ pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<
 /// whole process, and an editor query for a module the user is editing sees the
 /// unsaved buffer. A file that cannot be read answers empty — an editor query
 /// must degrade, never fail.
+/// Whether a module whose rows are `importables` has been CURATED — whether it
+/// carries any `export` marker at all (B318 §8, the rollout's tooling half).
+///
+/// An UNCURATED module offers every name it declares, exactly as it did before
+/// the bit existed: on the day the marker gains meaning, no module in the estate
+/// has written one, and hiding every name in std from completion and from the
+/// add-import quickfix is not a migration, it is an outage. The plain-reach
+/// WARNING is what tells an author to curate; this is what stops the tooling
+/// punishing them for not having done it yet. Both go at the N+1 escalation.
+///
+/// Read off the ROWS rather than off a marker list, so it costs nothing extra:
+/// `export *;` marks every row, so "any row is exported" answers both forms.
+pub fn module_is_curated(importables: &[Importable<'_>]) -> bool {
+    importables.iter().any(|row| row.exported.is_exported())
+}
+
 pub fn module_importables(path: &Path) -> Vec<Importable<'static>> {
     let mut importables = Vec::new();
     if let Some(loaded) = load_package_module(path) {
@@ -54794,6 +55621,18 @@ fn analyze_over_world<'src>(
         // convention, arity, parameter conventions/types, and return type. Runs
         // post-build so declared types are resolved.
         analyzer.check_trait_conformance();
+        // B318 §4: an exported item whose signature names an unexported type.
+        // Here because `check_trait_conformance` above is the family's own
+        // marker for "signature types are settled", and before the duplicate
+        // family so an exposure warning reads ahead of a collision error about
+        // the same declaration.
+        analyzer.check_exposed_unexported_types();
+        // B318 §5 / R1: the plain reach of a private item, and the redundant
+        // marker on an exported one. Beside the exposure warning because they
+        // are the two halves of one release: one tells a module's author what to
+        // curate, the other tells a module's CONSUMER what they are reaching
+        // past.
+        analyzer.check_plain_reaches();
         analyzer.check_duplicate_module_declarations();
         // Two impls declaring one name for one subject (B57): a coherence rule, so
         // it runs at the definition site rather than waiting for a call to pick

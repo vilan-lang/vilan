@@ -301,7 +301,6 @@ safety:
 external fun get_align(): Align;              // out of set is a BUG — trap
 
 [extern("getAlign")]
-[doc(hidden)]
 external fun get_align_raw(): str;            // out of set is an INPUT
 fun read_align(): Option<Align> { Align::parse(get_align_raw()) }
 ```

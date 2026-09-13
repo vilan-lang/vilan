@@ -236,6 +236,14 @@ impl<'src> Lexer<'src> {
         } else if first.is_ascii_digit() {
             let (token, end) = self.read_number(start);
             self.push(token, start, end);
+        } else if first == b'#' {
+            // B318 §2.3: `#` is the import reach marker, so it is a TOKEN. It
+            // used to reach `skip_illegal` and carry a curated rule about hex
+            // colours — a context-free refusal giving context-ful advice, which
+            // told an author writing `import a::{ #hidden }` about `Color::hex`.
+            // The colour rule moved to the `css` block's own value parser, the
+            // one place that knows a `#` is a colour.
+            self.push(Token::Hash, start, start + 1);
         } else if is_ident_start(first) {
             let (token, end) = self.read_identifier(start);
             self.push(token, start, end);
@@ -278,7 +286,6 @@ impl<'src> Lexer<'src> {
             position: self.position,
             character,
             rule: match character {
-                '#' => Some(HASH_IS_NOT_A_TOKEN),
                 '@' => Some(AT_IS_NOT_A_TOKEN),
                 _ => None,
             },
@@ -1017,27 +1024,13 @@ enum IStringEnd {
     Unterminated,
 }
 
-/// The rule a `#` breaks. It is in no charset, so it cannot lex — and lexing is
-/// context-free by spec (`lexical.md` §2.5) and by construction, so a `css` block
-/// cannot make it lex there either (proposal/css-block.md §4.1). The byte's one
-/// realistic use is a hex colour, and the refusal is the right one: the vilan
-/// spelling routes the value through `Color`, which carries its own `:root`
-/// line, where a raw hex would be the one spelling that can silently produce a
-/// literal outside the token system. Curated (diagnostics-standard.md B6).
-///
-/// Public because the language server's quickfix keys on it (css-block S5,
-/// §7.2 fix 1) — one constant rather than a second copy to drift from.
-pub const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` block a colour is a hole — \
-     `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
-     own `:root` line";
-
-/// The rule an `@` breaks — [`HASH_IS_NOT_A_TOKEN`]'s twin, and the reason a
+/// The rule an `@` breaks — the `css` block's one remaining un-lexable byte, and the reason a
 /// `css` block has no at-rules of any kind (proposal/css-block.md §10). A media
 /// query's spelling is the breakpoint combinator; `@supports`, `@font-face` and
 /// `@keyframes` have none yet.
 ///
-/// Public for the same reason as [`HASH_IS_NOT_A_TOKEN`]: §7.2's fix 2 keys on
-/// it. That the combinator spelling exists only for a min-width media query is
+/// Public because the language server's quickfix keys on it (css-block S5,
+/// §7.2 fix 2) — one constant rather than a second copy to drift from. That the combinator spelling exists only for a min-width media query is
 /// exactly why the fix offers nothing for the other three at-rules.
 pub const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
      breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is \
@@ -1893,19 +1886,35 @@ mod tests {
         );
     }
 
-    // The two bytes a `css` block makes an author reach for
-    // (proposal/css-block.md §4.1/§7.3): neither lexes — lexing is
-    // context-free — so each carries a curated rule naming the vilan spelling,
+    // The byte a `css` block makes an author reach for
+    // (proposal/css-block.md §4.1/§7.3): `@` does not lex — lexing is
+    // context-free — so it carries a curated rule naming the vilan spelling,
     // the `UNESCAPED_BRACE` precedent. Every OTHER un-lexable character keeps
     // the generic "found X expected a token".
+    //
+    // `#` used to be its twin and is a TOKEN now (B318 §2.3): it lexes with no
+    // error at all, and the colour rule it carried lives in the `css` block's
+    // own value parser, which is the only place that knows a `#` is a colour.
     #[test]
     fn the_css_bytes_carry_their_own_rules() {
-        let (_, hash) = tokenize("color: #333");
+        let (tokens, hash) = tokenize("color: #333");
+        assert!(hash.is_empty(), "`#` lexes now: {hash:?}");
         assert_eq!(
-            hash.iter().map(|error| error.rule).collect::<Vec<_>>(),
-            vec![Some(HASH_IS_NOT_A_TOKEN)]
+            tokens
+                .iter()
+                .map(|(token, _)| token.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Token::Ident("color"),
+                Token::Op(":"),
+                Token::Hash,
+                Token::Number("333", None, None),
+            ]
         );
-        assert!(HASH_IS_NOT_A_TOKEN.contains("Color::hex"), "names the fix");
+        assert!(
+            tokenize("import a::{ #hidden };").1.is_empty(),
+            "the reach marker lexes with no error at all"
+        );
         let (_, at) = tokenize("@media");
         assert_eq!(
             at.iter().map(|error| error.rule).collect::<Vec<_>>(),

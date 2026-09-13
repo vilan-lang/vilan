@@ -160,18 +160,18 @@ fn collect_markdown(dir: &Path, into: &mut Vec<PathBuf>) {
 /// Whole-file S3 constructs that the repo corpus happens NOT to exercise (so the
 /// file-derived sweep never reaches them), each a clean program the parser must
 /// accept. Only PARSED here (types need not resolve), so bare type names are fine.
-/// This closes the corpus's coverage gaps — notably `[trait_only]` / `[doc(hidden)]`
-/// (zero corpus uses) and the tuple-bound endpoint variants — alongside the
-/// (durable) in-module pins in `parsing.rs`.
+/// This closes the corpus's coverage gaps — notably `[trait_only]` (zero corpus
+/// uses) and the tuple-bound endpoint variants — alongside the (durable)
+/// in-module pins in `parsing.rs`. (`[doc(hidden)]` was the other one until
+/// B318 retired it: it is a refusal now, pinned in `inference/generics.rs`.)
 fn corpus_absent_constructs() -> Vec<(String, String)> {
     [
-        // The two attributes with zero corpus uses.
+        // The attribute with zero corpus uses.
         ("trait_only", "trait Surface { [trait_only] fun hidden(&self): i32; }"),
-        ("doc_hidden", "[doc(hidden)] fun helper(): i32 { 0 }"),
         // Every function attribute at once, in the one legal (fixed) order.
         (
             "all_attributes",
-            "[extern(\"m\", \"s\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\", \"browser\")] external fun everything(): i32;",
+            "[extern(\"m\", \"s\")] [must_use] [rpc] [trait_only] [platform(\"@process\", \"browser\")] external fun everything(): i32;",
         ),
         // Tuple-bound endpoint variants: both, hi-only, and an element bound.
         ("tuple_bound_both", "fun a<T: (2..10)>(): T { default() }"),

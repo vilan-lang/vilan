@@ -266,7 +266,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 23;
+const RULE_STATEMENT_SITES: usize = 28;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -334,6 +334,16 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/vilan-core/src/parsing.rs",
+        "EXPORT_TAKES_AN_ITEM",
+        "`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`,",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPORT_PATH_IS_NAMES_AND_SETS",
+        "an `import`/`use` path is `::`-separated NAMES, ending in a name",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
         "LET_MUT_IS_ONE_WORD",
         "a mutable binding is spelled `mut x = …`:",
     ),
@@ -378,9 +388,14 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "this `css` block nests more than 500 levels deep, which parsing refuses;",
     ),
     (
-        "crates/vilan-core/src/lexing.rs",
-        "HASH_IS_NOT_A_TOKEN",
-        "`#` is not a vilan token;",
+        "crates/vilan-core/src/parsing.rs",
+        "DOC_HIDDEN_IS_SUPERSEDED",
+        "`[doc(hidden)]` is superseded by visibility:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "HASH_IS_NOT_A_CSS_VALUE",
+        "`#` is not a colour here: in a `css` block a colour is a hole",
     ),
     (
         "crates/vilan-core/src/lexing.rs",

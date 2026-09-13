@@ -316,7 +316,7 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Await(inner) => Node::Await(desugar_boxed(inner, source)),
         Node::Async(inner) => Node::Async(desugar_boxed(inner, source)),
         Node::FuncReturn(value) => Node::FuncReturn(desugar_opt(value, source)),
-        Node::Export(inner) => Node::Export(desugar_boxed(inner, source)),
+        Node::Export(scope, inner) => Node::Export(scope, desugar_boxed(inner, source)),
         Node::Const(inner) => Node::Const(desugar_boxed(inner, source)),
         Node::Derive(names, inner) => Node::Derive(names, desugar_boxed(inner, source)),
         Node::Service(attribute, inner) => Node::Service(attribute, desugar_boxed(inner, source)),

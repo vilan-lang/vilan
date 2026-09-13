@@ -650,8 +650,8 @@ with a string that is none of the variants — but nothing has to: an
 exhaustive `match` on a backed enum traps and names the value rather than
 returning a confident wrong variant. Where an unrecognized value is an
 answer you expect rather than a bug, hand-edit the binding to the guarded
-shape: bind the raw `str` under a `[doc(hidden)]` name and forward through
-`Align::parse`, which returns `Option<Align>`. The generated file is
+shape: bind the raw `str` under a name the module does not `export` and
+forward through `Align::parse`, which returns `Option<Align>`. The generated file is
 ordinary source, and that edit is one of the reasons it is yours to keep.
 
 An *inline* `"left" | "right"` is widened to `str` instead — safe and

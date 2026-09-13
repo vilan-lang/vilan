@@ -370,7 +370,7 @@ fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<(&'a Func<'src>, Span)
         .iter()
         .filter_map(|(node, span)| match node {
             Node::MacroFun(function) => Some((&**function, *span)),
-            Node::Export(inner) => match &inner.0 {
+            Node::Export(_, inner) => match &inner.0 {
                 Node::MacroFun(function) => Some((&**function, inner.1)),
                 _ => None,
             },
@@ -559,12 +559,19 @@ fn check_hermetic_block_imports(
     }
 }
 
+/// The ROOT segment of an import path — the origin a hermetic macro world
+/// checks. A reach marker adds no segment, so it delegates.
+fn import_root<'src>(branch: &ImportBranch<'src>) -> Option<&'src str> {
+    match branch {
+        ImportBranch::Path(root, _, _) => Some(*root),
+        ImportBranch::Reach(_, inner) => import_root(inner),
+        ImportBranch::Set(_) => None,
+    }
+}
+
 fn check_hermetic_imports(node: &Spanned<Node>, diagnostics: &mut Vec<Error>, hermetic: &mut bool) {
     if let Node::Import(branch) | Node::Use(branch) = &node.0 {
-        let root = match branch {
-            ImportBranch::Path(root, _, _) => Some(*root),
-            ImportBranch::Set(_) => None,
-        };
+        let root = import_root(branch);
         if root != Some("macro_std") {
             diagnostics.push(Error {
                 trace: Vec::new(),
@@ -1605,7 +1612,7 @@ impl Expander<'_, '_> {
     /// question, not this pass's to answer.)
     fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>, derived_hashable: bool) {
         match &node.0 {
-            Node::Export(inner)
+            Node::Export(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner) => {
                 self.collect_backed_enum_impls_in(inner, derived_hashable)
@@ -1658,7 +1665,7 @@ impl Expander<'_, '_> {
         depth: u32,
     ) {
         match &node.0 {
-            Node::Export(inner) => self.expand_item_position(inner, siblings, text, depth),
+            Node::Export(_, inner) => self.expand_item_position(inner, siblings, text, depth),
             // `mod` bodies are item position too (a service there gathers its
             // rpc surface from the mod's own items). What a derive there
             // generates belongs to the `mod`'s scope, so the path is tracked

@@ -1497,7 +1497,6 @@ fn b76_the_parse_path_is_the_non_panicking_alternative() {
         import std::option::Option;
         enum Align { Start = "flex-start", End = "flex-end" }
         [extern("String")]
-        [doc(hidden)]
         external fun host_align_raw(text: str): str;
         fun host_align(text: str): Option<Align> { Align::parse(host_align_raw(text)) }
         fun main() {
