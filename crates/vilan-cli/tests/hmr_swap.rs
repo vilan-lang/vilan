@@ -277,68 +277,16 @@ fun main() {
 const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"server up\");\n}\n";
 
 /// The DOM/host stub plus the swap-matrix assertions, run under node against the
-/// two instrumented bundles. `window === globalThis` (as in a browser) so the
-/// `__hmr_active` helper sees the shim's singleton; `Blob`/`URL.createObjectURL`
-/// are stubbed to a data: URL (node has no `blob:` loader — the sanctioned S2b
-/// fallback). One `ok`/`FAIL` line per named assertion; exits 1 on any failure.
-const HARNESS: &str = r#"import fs from "node:fs";
-
-class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-        this.hidden = false;
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter((c) => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter((c) => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) {
-        (this.listeners[event] = this.listeners[event] || []).push(handler);
-    }
-    click() { for (const h of (this.listeners.click || [])) h({ preventDefault() {} }); }
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-}
-
-const appRoot = new StubElement("div");
-globalThis.window = globalThis; // window === globalThis, as in a browser
-globalThis.document = {
-    createElement: (tag) => new StubElement(tag),
-    getElementById: (id) => (id === "app" ? appRoot : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-globalThis.location = { reload: () => { globalThis.__reloaded = true; } };
-// No EventSource: the shim's connect() is skipped under the stub.
-globalThis.Blob = class {
-    constructor(parts) { this.__text = parts.join(""); }
-};
-// Extend (do NOT replace) the real URL so `new URL(...)` still works; node has
-// no blob: loader, so the shim's object URL becomes an importable data: URL.
-URL.createObjectURL = (blob) =>
-    "data:text/javascript;base64," + Buffer.from(blob.__text).toString("base64");
-URL.revokeObjectURL = () => {};
-
+/// two instrumented bundles. The DOM is the shared one (`support/dom/stub.js`,
+/// N73) with this suite's host facts layered on it (`support/dom/hmr_swap.js`):
+/// `window === globalThis` as in a browser, so the `__hmr_active` helper sees
+/// the shim's singleton, and `Blob`/`URL.createObjectURL` stubbed to a `data:`
+/// URL (node has no `blob:` loader — the sanctioned S2b fallback). One
+/// `ok`/`FAIL` line per named assertion; exits 1 on any failure.
+const HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/hmr_swap.js"),
+    r#"
 const marks = {};
 const records = {};
 const signals = {};
@@ -372,7 +320,12 @@ const hmr = globalThis.window.__VILAN_HMR__;
 check(hmr.exposed["pkg::count"].getter() === 3, "A: count mutated to 3");
 check(hmr.exposed["pkg::tally"].getter() === 3, "A: tally payload mutated to 3");
 
-const bundleB = fs.readFileSync(new URL("./bundleB.js", import.meta.url), "utf8");
+// Read through a DYNAMIC import so this file carries no module-level `import`
+// of its own: the harness is concatenated together from the shared stub, this
+// suite's layer and the block you are reading, and a hoisted `import` two
+// thirds of the way down the result reads as a mistake.
+const { readFileSync } = await import("node:fs");
+const bundleB = readFileSync(new URL("./bundleB.js", import.meta.url), "utf8");
 
 // The heal path (the infinite-refresh regression): a `connected` event at our
 // own version is a no-op; one ahead of us fetches the current bundle from the
@@ -399,7 +352,8 @@ check(tallyA[1].v.length === 0, "swap: bundle A subscription disposed (old subsc
 check(!globalThis.__reloaded, "swap: completed without a fallback reload");
 
 process.exit(failures === 0 ? 0 : 1);
-"#;
+"#
+);
 
 #[test]
 fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
