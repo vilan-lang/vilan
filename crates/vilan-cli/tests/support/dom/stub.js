@@ -98,9 +98,17 @@ class StubElement {
     get className() { return this._className; }
     set hidden(on) { this._hidden = on; }
     get hidden() { return this._hidden; }
+    get parentNode() { return this.parent; }
     setAttribute(name, value) { this.attributes[name] = value; notifyMutation(); }
     removeAttribute(name) { delete this.attributes[name]; notifyMutation(); }
     appendChild(child) {
+        // A DOM insertion SPLICES a document fragment: its children move and
+        // the fragment is left empty. A91 builds a row inside one, so this is
+        // the path every row of a keyed run takes.
+        if (child.tagName === "#fragment") {
+            for (const node of child.take()) this.appendChild(node);
+            return child;
+        }
         if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
         child.parent = this;
         this.children.push(child);
@@ -111,6 +119,10 @@ class StubElement {
     // plants an empty text node and inserts its content BEFORE it, so a
     // reactive run keeps its place among static siblings.
     insertBefore(child, anchor) {
+        if (child.tagName === "#fragment") {
+            for (const node of child.take()) this.insertBefore(node, anchor);
+            return child;
+        }
         if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
         child.parent = this;
         const at = this.children.lastIndexOf(anchor);
@@ -224,6 +236,9 @@ class StubText {
     constructor(text) { this.tagName = "#text"; this.children = []; this.parent = null; this._text = text; }
     set textContent(text) { this._text = text; notifyMutation(); }
     get textContent() { return this._text; }
+    // A91: a `Region` reads its host off its anchor, because an anchor MOVES
+    // when the row holding it is planted or re-ordered.
+    get parentNode() { return this.parent; }
     remove() {
         if (this.parent) {
             this.parent.children = this.parent.children.filter(c => c !== this);
@@ -232,6 +247,64 @@ class StubText {
         notifyMutation();
     }
     render() { return this._text; }
+}
+
+/// A document fragment — a staging container whose CHILDREN move when it is
+/// inserted (A91). `std::ui` builds a row in one of these and plants the whole
+/// thing with a single `insertBefore`, which is how content of an unknown
+/// shape reaches a position that is not the parent's end.
+class StubFragment {
+    constructor() { this.tagName = "#fragment"; this.children = []; this.parent = null; this._text = ""; }
+    appendChild(child) {
+        if (child.tagName === "#fragment") {
+            for (const node of child.take()) this.appendChild(node);
+            return child;
+        }
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        this.children.push(child);
+        return child;
+    }
+    insertBefore(child, anchor) {
+        if (child.tagName === "#fragment") {
+            for (const node of child.take()) this.insertBefore(node, anchor);
+            return child;
+        }
+        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
+        child.parent = this;
+        const at = this.children.lastIndexOf(anchor);
+        if (at < 0) this.children.push(child); else this.children.splice(at, 0, child);
+        return child;
+    }
+    /// Empties the fragment and hands back what was in it, in order.
+    take() {
+        const held = this.children;
+        this.children = [];
+        for (const node of held) node.parent = null;
+        return held;
+    }
+    render() { return this.children.map(c => c.render()).join(""); }
+}
+
+/// A DOM range, reduced to the one thing `std::ui` asks of it: cut every node
+/// between two sibling markers out of the document in one call (A91). A row's
+/// node set is not fixed — a row that is itself a `when` or an `each` grows
+/// after it was placed — so "move this row" is a span between markers rather
+/// than a list of remembered nodes.
+class StubRange {
+    setStartAfter(node) { this.start = node; }
+    setEndBefore(node) { this.end = node; }
+    extractContents() {
+        const fragment = new StubFragment();
+        const parent = this.start.parent;
+        if (!parent) return fragment;
+        const from = parent.children.lastIndexOf(this.start) + 1;
+        const to = parent.children.lastIndexOf(this.end);
+        if (to < from) return fragment;
+        for (const node of parent.children.slice(from, to)) fragment.appendChild(node);
+        notifyMutation();
+        return fragment;
+    }
 }
 
 /// Whether `node` is reachable from the document root by parent links — the
@@ -329,6 +402,8 @@ function installStubDocument(options = {}) {
         createElement: (tag) => settings.element(tag),
         createElementNS: (namespace, tag) => settings.element(tag, namespace),
         createTextNode: (text) => settings.text(text),
+        createDocumentFragment: () => new StubFragment(),
+        createRange: () => new StubRange(),
         getElementById: (id) => (settings.rootId === null || id === settings.rootId ? documentRoot : null),
         querySelector: () => null,
         querySelectorAll: () => [],

@@ -218,6 +218,17 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
+        "Region.host",
+        Side::BrowserOnly,
+        "A91: the element a region currently sits in, read off its ANCHOR \
+         rather than remembered — because an anchor MOVES (a region opened \
+         inside a row is built in a detached staging parent and then planted, \
+         and the row is re-inserted on every order pass). The process twin's \
+         `Region` holds its parent directly and has no anchor to read: a server \
+         render is one pass in source order, so nothing it places ever moves.",
+    ),
+    (
+        "ui",
         "split_route",
         Side::BrowserOnly,
         "A85, with `swap_split`: the gate's body under a name no `View` method \

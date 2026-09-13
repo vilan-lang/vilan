@@ -272,12 +272,12 @@ too.
 | `toggle_attr` | `(name: str, source: S): View`; `S: Source<bool>` | reactive BOOLEAN attribute — presence, not value (`inert`, `disabled`, `hidden`, `open`): present when true, removed when false |
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
-| `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |
-| `bind_each_values` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<List<T>>` | `bind_each` keyed by the item itself |
-| `bind_each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| View) context owner_scope): View`; `K: PartialEq, S: Source<List<T>>` — **no bound on `T`** | keyed rows that UPDATE through the row's own cell instead of rebuilding |
-| `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
-| `swap` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<T>` | dispose + rebuild per changed value |
-| `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
+| `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot` | keyed rows; each row is a disposal boundary |
+| `bind_each_values` | `(source: S, render: (sync \|T\| C) context owner_scope): View`; `T: PartialEq, S: Source<List<T>>, C: Slot` | `bind_each` keyed by the item itself |
+| `bind_each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| C) context owner_scope): View`; `K: PartialEq, S: Source<List<T>>, C: Slot` — **no bound on `T`** | keyed rows that UPDATE through the row's own cell instead of rebuilding |
+| `when` | `(condition: S, body: (sync \|\| C) context owner_scope): View`; `S: Source<bool>, C: Slot` | state-DROPPING conditional |
+| `swap` | `(source: S, render: (sync \|T\| C) context owner_scope): View`; `T: PartialEq, S: Source<T>, C: Slot` | dispose + rebuild per changed value |
+| `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>, C: Slot` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
 | `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve |
@@ -294,11 +294,11 @@ after them:
 
 | function | signature | returns |
 |---|---|---|
-| `when` | `(condition: S, body: (sync \|\| View) context owner_scope)`; `S: Source<bool>` | `Conditional<S>` |
-| `swap` | `(source: S, render: (sync \|T\| View) context owner_scope)`; `T: PartialEq, S: Source<T>` | `Swap<T, S>` |
-| `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope)`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | `Each<T, K, S>` |
-| `each_values` | `(source: S, render: (sync \|T\| View) context owner_scope)`; `T: PartialEq, S: Source<List<T>>` | `EachValues<T, S>` |
-| `each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| View) context owner_scope)`; `K: PartialEq, S: Source<List<T>>` | `EachBy<T, K, S>` |
+| `when` | `(condition: S, body: (sync \|\| C) context owner_scope)`; `S: Source<bool>, C: Slot` | `Conditional<S, C>` |
+| `swap` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<T>, C: Slot` | `Swap<T, S, C>` |
+| `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
+| `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |
+| `each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `K: PartialEq, S: Source<List<T>>, C: Slot` | `EachBy<T, K, S, C>` |
 
 Each returned struct implements `Slot`, so it fills any child
 position — including a `{hole}` in element syntax — and the five methods are
@@ -317,10 +317,29 @@ The run named `each` rather than `bind_each`: the `bind_` prefix means "one
 property kept in sync" everywhere else in the module, and a value that IS a
 child has no property to bind.
 
+**A row, a body or a branch can be any `Slot`.** A render closure returns
+`C: Slot`, not `View` — so a row may be a fragment, a text node, or another
+value form, and the run owns whatever the child placed:
+
+```vilan,fragment
+view("ul").bind_each_values(items, |item: str| [
+	view("li").text(item),
+	view("li").class("sep"),
+])
+```
+
+The reconciler moves and removes a row by its SPAN — an empty text marker is
+planted before each row's content, and the row is everything between that
+marker and the next boundary — because a row that is itself a `when` or an
+`each` grows and shrinks after it was placed, and no snapshot of its nodes
+could follow that. One marker per row is what the generality costs; a run's
+own region still costs exactly one anchor.
+
 **Naming one in a return type.** vilan has no trait objects and no opaque-type
 kind, so a helper that hands one back spells its concrete type —
-`fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>>`. The
-closures are FIELDS, not type parameters, exactly so that type is nameable.
+`fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>, View>`, the
+last argument being the row shape the closure yields. The closures are FIELDS,
+not type parameters, exactly so that type is nameable.
 
 **Ownership** is the methods' unchanged: the body of a `when`, the subtree of a
 `swap` and every row of an `each` run under a fresh owner established where the

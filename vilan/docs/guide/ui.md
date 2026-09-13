@@ -550,13 +550,31 @@ it anyway. The run is called `each` rather than `bind_each` because `bind_`
 means "one property kept in sync" everywhere else, and a value that *is* a
 child has no property to bind.
 
-A helper that returns one names its type, since vilan has no trait objects:
+A helper that returns one names its type, since vilan has no trait objects —
+the last argument is the shape the closure yields (below):
 
 ```vilan,fragment
-fun account_menu(signed_in: SignalCell<bool>): Conditional<SignalCell<bool>> {
+fun account_menu(signed_in: SignalCell<bool>): Conditional<SignalCell<bool>, View> {
 	when(signed_in, || <nav>"Account"</nav>)
 }
 ```
+
+### A row, a body or a branch can be anything `Slot`
+
+The render closures are not limited to `View`. A row may be a fragment, a bare
+string, or another value form, and the run owns whatever it placed:
+
+```vilan,fragment
+<ul>
+	{each_values(items, |item: str| <><li>{item}</li><li class("sep")/></>)}
+</ul>
+```
+
+That is what makes a wrapper element unnecessary in the last place one was
+still needed — a row that is several nodes. It costs one empty text marker per
+row: a row's content can grow after it was placed (a `when` inside a row
+toggles later), so the reconciler moves and removes a row by the SPAN between
+its marker and the next one rather than by a list of nodes it remembered.
 
 Ownership is the same either way: the body, the subtree and every row run
 under a fresh owner established where the value is *placed*, and that owner is

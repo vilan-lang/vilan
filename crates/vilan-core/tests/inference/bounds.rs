@@ -9441,12 +9441,12 @@ fn a85_a_helper_returns_a_value_form_by_name() {
         r#"
         import std::reactive::{ Signal, SignalCell, owner_scope };
         import std::ui::{ Conditional, Each, View, each, mount_root, view, when };
-        fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>> {
+        fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>, View> {
             when(flag, || view("nav"))
         }
         fun themes(
             list: SignalCell<List<str>>,
-        ): Each<str, str, SignalCell<List<str>>> {
+        ): Each<str, str, SignalCell<List<str>>, View> {
             each(list, |item: str| item, |item: str| view("li").text(item))
         }
         fun main() {
@@ -9535,6 +9535,64 @@ fn a85_a_generic_slot_helper_keeps_the_requirement_per_instantiation() {
         main();
         "#,
         "this code can be reached without an enclosing `run`",
+    );
+}
+
+/// A91: a render closure yields `C: Slot`, not `View`. Every row shape the
+/// child contract admits is a row shape a run admits — a fragment, a bare
+/// string, a reactive text source, and a value form (a row that is itself a
+/// `when`, which is the shape that made the reconciler's per-row remove/move
+/// become per-REGION).
+#[test]
+fn a91_a_render_closure_may_yield_any_slot() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view, when };
+        fun main() {
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            let flag: SignalCell<bool> = Signal::new(true);
+            let tab: SignalCell<i32> = Signal::new(1);
+            let _root = mount_root("app", || {
+                view("main")
+                    .bind_each_values(rows, |item: str| [view("i").text(item), view("b")])
+                    .bind_each_values(rows, |item: str| item)
+                    .bind_each(rows, |item: str| item, |item: str| when(flag, || view("u")))
+                    .bind_each_by(rows, |item: str| item, |cell: SignalCell<str>| cell)
+                    .when(flag, || [view("p"), view("p")])
+                    .swap(tab, |value: i32| when(flag, || view("section")))
+            });
+        }
+        "#,
+    );
+}
+
+/// A91's cost to B253's spelling (positional-slots.md §6): the row shape is a
+/// type ARGUMENT of the value form, so a helper that returns one names it.
+/// Inferable at the call, unwritable at the return — the same bill §6 priced,
+/// one argument longer.
+#[test]
+fn a91_a_value_form_names_the_row_shape_it_yields() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ Conditional, EachValues, View, each_values, mount_root, view, when };
+        fun banner(flag: SignalCell<bool>): Conditional<SignalCell<bool>, List<View>> {
+            when(flag, || [view("i"), view("b")])
+        }
+        fun labels(
+            list: SignalCell<List<str>>,
+        ): EachValues<str, SignalCell<List<str>>, str> {
+            each_values(list, |item: str| item)
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let list: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || {
+                view("main").child(banner(flag)).child(labels(list))
+            });
+        }
+        "#,
     );
 }
 

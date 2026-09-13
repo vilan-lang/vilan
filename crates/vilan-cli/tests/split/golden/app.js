@@ -423,20 +423,44 @@ function clear_chunk_error($bp) {
 function open(parent) {
 	const anchor = document.createTextNode("");
 	parent[0].appendChild(anchor);
-	return [ __clone(parent[0]), anchor, __shared_new([  ]) ];
+	return [ anchor, __shared_new([  ]), __shared_new([  ]) ];
 }
-function insert(self, child) {
-	self[0].insertBefore(child[0], self[1]);
+function host(self) {
+	return self[0].parentNode;
 }
-function hold(self, live) {
-	self[2].v = __clone(live);
+function cut_row(self, row, end) {
+	const range = document.createRange();
+	range.setStartAfter(row[0]);
+	range.setEndBefore(end);
+	return range.extractContents();
+}
+function drop_row(self, row) {
+	row[0].remove();
+}
+function hold_rows(self, rows) {
+	self[2].v = __clone(rows);
 }
 function close(self) {
-	for (const view2 of self[2].v) {
+	for (const view2 of self[1].v) {
 		view2[0].remove();
 	}
+	self[1].v = [  ];
+	const rows = __clone(self[2].v);
+	let at = 0;
+	for (const row of rows) {
+		let $cj = null;
+		if (at + 1 < rows.length) {
+			$cj = __at(rows, at + 1)[0];
+		} else {
+			$cj = self[0];
+		}
+		const end = $cj;
+		cut_row(self, row, end);
+		drop_row(self, row);
+		at = at + 1;
+	}
 	self[2].v = [  ];
-	self[1].remove();
+	self[0].remove();
 }
 function place(self, parent) {
 	parent[0].appendChild(self[0]);
@@ -459,11 +483,11 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $cw = $q([ 1 ], ($ct) => {
-		return $cu(body);
+	const $cA = $q([ 1 ], ($cx) => {
+		return $cy(body);
 	});
-	const built = $cw[0];
-	const root = $cw[1];
+	const built = $cA[0];
+	const root = $cA[1];
 	mount(id, built);
 	if (__hmr_active()) {
 		const element = document.getElementById(id);
@@ -564,20 +588,20 @@ function app(route2, $T, $U) {
 	}, $T, $U);
 }
 function eq(self, other) {
-	const $cl = [ self, other ];
-	let $cm = null;
-	if ($cl[0][0] === 0 && $cl[1][0] === 0) {
-		$cm = true;
-	} else if ($cl[0][0] === 1 && $cl[1][0] === 1) {
-		const s0 = $cl[0][1];
-		const o0 = $cl[1][1];
-		$cm = s0 === o0;
-	} else if ($cl[0][0] === 2 && $cl[1][0] === 2) {
-		$cm = true;
+	const $cm = [ self, other ];
+	let $cn = null;
+	if ($cm[0][0] === 0 && $cm[1][0] === 0) {
+		$cn = true;
+	} else if ($cm[0][0] === 1 && $cm[1][0] === 1) {
+		const s0 = $cm[0][1];
+		const o0 = $cm[1][1];
+		$cn = s0 === o0;
+	} else if ($cm[0][0] === 2 && $cm[1][0] === 2) {
+		$cn = true;
 	} else {
-		$cm = false;
+		$cn = false;
 	}
-	return $cm;
+	return $cn;
 }
 function $a(value) {
 	let subscribers = [  ];
@@ -901,13 +925,21 @@ function $ce(self) {
 	const $cf = self;
 	return $cf[0] === 1;
 }
-function $cs(owner, body) {
+function $ct(self, content, $cu, $cv) {
+	const marker = document.createTextNode("");
+	host(self).insertBefore(marker, self[0]);
+	const staging = document.createDocumentFragment();
+	place(content, [ __clone(staging) ], $cu, $cv);
+	host(self).insertBefore(staging, self[0]);
+	return [ marker ];
+}
+function $cw(owner, body) {
 	return body(owner);
 }
 function $bX(parent, source, render, armed, $bY, $bZ) {
 	const region = open(parent);
 	const last_value = __shared_new([ 1 ]);
-	const live_view = __shared_new([ 1 ]);
+	const live_row = __shared_new([ 1 ]);
 	const live_owner = __shared_new([ 1 ]);
 	defer(get_owner($bZ), () => {
 		const $ca = live_owner.v;
@@ -922,41 +954,42 @@ function $bX(parent, source, render, armed, $bY, $bZ) {
 		return;
 	});
 	$bN(source, (value) => {
-		const $cj = last_value.v;
-		let $ck = null;
-		if ($cj[0] === 0) {
-			const previous = $cj[1];
-			$ck = eq(previous, value);
+		const $ck = last_value.v;
+		let $cl = null;
+		if ($ck[0] === 0) {
+			const previous = $ck[1];
+			$cl = eq(previous, value);
 		} else {
-			$ck = false;
+			$cl = false;
 		}
-		const unchanged = $ck;
+		const unchanged = $cl;
 		if (armed.v && !(unchanged)) {
-			const $cn = live_owner.v;
-			let $co = null;
-			if ($cn[0] === 1) {
-				$co = $cn;
+			const $co = live_owner.v;
+			let $cp = null;
+			if ($co[0] === 1) {
+				$cp = $co;
 			} else {
-				$co = [ 0, dispose2($cn[1]) ];
+				$cp = [ 0, dispose2($co[1]) ];
 			}
-			$co;
-			const $cp = live_view.v;
-			let $cq = null;
-			if ($cp[0] === 0) {
-				const built = $cp[1];
-				$cq = built[0].remove();
+			$cp;
+			const $cq = live_row.v;
+			let $cr = null;
+			if ($cq[0] === 0) {
+				const row = $cq[1];
+				cut_row(region, row, region[0]);
+				drop_row(region, row);
+				$cr = undefined;
 			} else {
-				$cq = undefined;
+				$cr = undefined;
 			}
-			$cq;
+			$cr;
 			const owner = new3();
-			const built2 = $cs(owner, ($cr) => {
-				return render(value, $cr);
+			const row2 = $cw(owner, ($cs) => {
+				return $ct(region, render(value, $cs), $bY, $cs);
 			});
-			insert(region, built2);
-			hold(region, [ __clone(built2) ]);
+			hold_rows(region, [ __clone(row2) ]);
 			last_value.v = [ 0, __clone(value) ];
-			live_view.v = [ 0, built2 ];
+			live_row.v = [ 0, row2 ];
 			live_owner.v = [ 0, owner ];
 		}
 		return;
@@ -981,7 +1014,7 @@ function $bR(self, content, $an, $ao) {
 function $ba(self, source, render, $bb, $bc) {
 	return $bR(self, $bd(source, render, $bb), $bb, $bc);
 }
-function $cu(body) {
+function $cy(body) {
 	const scope = new3();
 	const result = body(scope);
 	return [ result, scope ];
