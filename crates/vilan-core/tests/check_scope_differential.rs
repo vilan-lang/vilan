@@ -19,7 +19,7 @@ mod replay_harness;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use replay_harness::{std_root, std_spec};
+use replay_harness::{refuse_a_manifest_directory, std_root, std_spec};
 use vilan_core::{BuildOptions, Platform, Workspace, analyze_source, transform};
 
 static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
@@ -289,6 +289,10 @@ fn observe_in_package(
     entry_path: &Path,
     entry_source: String,
 ) -> ReuseObservation {
+    // N66: the harness's guard, on this binary's own twin of the helper too —
+    // the trap is the ARGUMENT, so it has to be refused wherever the argument
+    // is taken.
+    refuse_a_manifest_directory(pkg_root);
     let pkg_root = pkg_root.to_path_buf();
     let entry_path = entry_path.to_path_buf();
     std::thread::Builder::new()
@@ -348,6 +352,68 @@ fn warm_pair(pkg_root: &Path, entry_path: &Path) -> ReuseObservation {
 /// deliberate error, analyzed from a dependent twice: the second analysis
 /// publishes the identical diagnostic, at the identical span, attributed to
 /// the identical file — without having re-derived it.
+#[test]
+fn n66_the_harness_refuses_a_packages_manifest_directory() {
+    // N66. `pkg_root` is the manifest's `root`, not the directory the manifest
+    // sits in, and getting it wrong is SILENT: the analyzer loads whatever
+    // resolves from the directory it was handed and reports the rest as
+    // ordinary import misses. Measured that way, kolt loaded 39 sources instead
+    // of 69 and reported 22 "cannot find … in the imported path" errors, which
+    // reads as a finding about the package and is a finding about the argument.
+    // Both halves are pinned here: the resolution, and the refusal.
+    let directory = std::env::temp_dir().join(format!("vilan_n66_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(directory.join("src")).expect("create the package");
+
+    // The shape kolt has: no `root` key at all, so the source root is the
+    // DEFAULT, `src` — the case a reader is least likely to look up.
+    std::fs::write(
+        directory.join("vilan.toml"),
+        "[package]\nname = \"probe\"\n",
+    )
+    .expect("write the manifest");
+    assert_eq!(
+        replay_harness::package_root(&directory),
+        Some(directory.join("src")),
+        "an undeclared `root` resolves to `src`, which is what makes the manifest \
+         directory the wrong argument"
+    );
+    let refused = std::panic::catch_unwind(|| refuse_a_manifest_directory(&directory));
+    let message = *refused
+        .expect_err("the manifest directory must be refused")
+        .downcast::<String>()
+        .expect("the guard panics with a message");
+    assert!(
+        message.contains("analysis wants the SOURCE root")
+            && message.contains(directory.join("src").display().to_string().as_str()),
+        "the refusal names the directory to pass instead: {message}"
+    );
+
+    // Control 1: the source root itself is what the guard is FOR, and it holds
+    // no manifest, so it passes.
+    refuse_a_manifest_directory(&directory.join("src"));
+    // Control 2: a package whose `root` is the package directory names no
+    // subdirectory, so the manifest directory IS the source root.
+    std::fs::write(
+        directory.join("vilan.toml"),
+        "[package]\nname = \"probe\"\nroot = \".\"\n",
+    )
+    .expect("rewrite the manifest");
+    assert_eq!(
+        replay_harness::package_root(&directory),
+        Some(directory.join(".")),
+        "`root = \".\"` resolves to the package directory"
+    );
+    refuse_a_manifest_directory(&directory);
+    // Control 3: every fixture in this file is a bare directory with no
+    // manifest at all, and the guard has nothing to say about those.
+    let (fixture, _entry) = write_module_package("n66_control", "fun unused() {}\n");
+    refuse_a_manifest_directory(&fixture);
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 #[test]
 fn a_reused_module_replays_its_own_diagnostic() {
     let _guard = OVERRIDE_LOCK
