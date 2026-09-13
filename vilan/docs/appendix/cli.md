@@ -673,3 +673,32 @@ release, downloading for your platform and swapping the pair atomically
 (`vilan-lsp` first, so the two are never newer-cli/older-lsp). The
 licenses and third-party notices travel along. `--check` reports whether
 a newer release exists and changes nothing.
+
+`vilan upgrade` also prunes the std cache described below while it has
+`~/.vilan` open.
+
+## `vilan cache prune`
+
+Deletes materialized std trees no binary can use any more.
+
+An installed `vilan` carries its standard library inside the binary and
+writes it out once, to `~/.vilan/std-cache/<content hash>/`, so the
+compiler and your editor read ordinary files. The directory is keyed by
+the std's content, so each *build* of the toolchain gets its own — which
+is invisible if you install releases, and adds up quickly if you build
+vilan from source.
+
+Two things prune it for you: writing a new tree sweeps the root it just
+grew, and `vilan upgrade` sweeps while it is there. Both keep anything
+created in the last seven days, because a compile reads std files lazily
+and a young tree may belong to one that is still running. This command
+is the same sweep, on demand:
+
+```sh
+vilan cache prune            # entries older than seven days
+vilan cache prune --dry-run  # print what would go, with sizes; delete nothing
+vilan cache prune --all      # every entry, guard and all
+```
+
+The tree this binary itself uses is never deleted, `--all` included: the
+next command would write it straight back.

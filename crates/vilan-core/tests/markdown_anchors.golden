@@ -25,6 +25,7 @@ appendix/cli.md h3 why-every-interface-becomes-an-external-struct
 appendix/cli.md h3 closed-string-sets
 appendix/cli.md h3 scope
 appendix/cli.md h2 vilan-upgrade
+appendix/cli.md h2 vilan-cache-prune
 appendix/editor.md h1 the-editor
 appendix/editor.md h2 getting-it
 appendix/editor.md h2 what-it-gives-you

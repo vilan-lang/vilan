@@ -381,12 +381,14 @@ fn download_verify_swap(
     );
 
     // Housekeeping while we own ~/.vilan: drop std-cache entries no current
-    // binary can use (each build materializes under its own content hash and
-    // nothing deletes the old ones). The week-long age guard keeps any entry
-    // a running binary might still be reading.
+    // binary can use. The week-long age guard keeps any entry a running binary
+    // might still be reading. Materialization prunes on the same guard now
+    // (L21), so this is the second of two chances rather than the only one —
+    // which matters for a toolchain built from source, which never runs this
+    // command at all.
     let pruned = vilan_embedded_std::prune_stale(
         &vilan_embedded_std::default_cache_root(),
-        std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        vilan_embedded_std::STALE_AFTER,
     );
     if pruned > 0 {
         println!(

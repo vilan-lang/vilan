@@ -53,38 +53,122 @@ fn toolchain_cache(leaf: &str) -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("vilan-{leaf}")))
 }
 
+/// How old a cache entry must be before anything will remove it: one week.
+///
+/// One constant, three consumers — [`materialize_into`]'s prune, `vilan
+/// upgrade`'s housekeeping, and `vilan cache prune`'s default — because they
+/// are one policy and a second spelling of it would be a second policy.
+pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// One entry of the std cache: a content-hash tree, or a crashed `.staging-*`
+/// leftover.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    /// The directory name — a content hash, or `.staging-<hash>-<pid>`.
+    pub name: String,
+    pub path: PathBuf,
+    /// Bytes on disk, summed over the tree.
+    pub bytes: u64,
+    /// How long ago the entry was created, from its directory mtime — `None`
+    /// when the platform will not answer (the entry is then treated as young).
+    pub age: Option<std::time::Duration>,
+    /// Whether this is the tree THIS binary materializes into. It is never
+    /// removed: the next resolution would write it straight back, and a
+    /// concurrent compile is reading it right now.
+    pub current: bool,
+}
+
+/// Every entry under `cache_root`, in `read_dir` order. A missing or unreadable
+/// root is an empty list, not an error.
+pub fn cache_entries(cache_root: &Path) -> Vec<CacheEntry> {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now();
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok());
+        out.push(CacheEntry {
+            current: name == CONTENT_HASH,
+            bytes: directory_bytes(&path),
+            name,
+            path,
+            age,
+        });
+    }
+    out
+}
+
+/// Bytes under `directory`, summed over every file it holds. An unreadable
+/// entry contributes nothing rather than failing the walk: this number is
+/// reported to a human, never depended on.
+fn directory_bytes(directory: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => total += directory_bytes(&entry.path()),
+            Ok(_) => total += entry.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            Err(_) => {}
+        }
+    }
+    total
+}
+
 /// Remove cache entries (content-hash trees and crashed `.staging-*`
 /// leftovers) whose directory mtime — their creation time; entries are never
-/// touched after the atomic rename — is older than `max_age`. Returns how many
-/// were removed; a missing root or an unremovable entry is not an error.
+/// touched after the atomic rename — is older than `max_age`, or EVERY entry
+/// when `max_age` is `None`. Returns the entries removed, in `read_dir` order;
+/// `dry_run` returns exactly the same list and removes nothing. A missing root
+/// or an unremovable entry is not an error.
 ///
 /// The age guard is the concurrency story: an entry younger than `max_age` may
 /// belong to a running binary (std files are read lazily during compilation),
 /// so it is left alone. In the rare race — a long-running old binary whose
 /// entry ages past the guard while an upgrade prunes — the next resolution
 /// simply re-materializes: [`materialize_into`] is idempotent and atomic.
-pub fn prune_stale(cache_root: &Path, max_age: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(cache_root) else {
-        return 0;
-    };
-    let now = std::time::SystemTime::now();
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+///
+/// THIS binary's own entry ([`CONTENT_HASH`]) is never removed, at any age and
+/// under `None` alike. Removing it would delete a tree the running compile is
+/// reading and buy nothing: the next resolution writes it straight back.
+pub fn prune(
+    cache_root: &Path,
+    max_age: Option<std::time::Duration>,
+    dry_run: bool,
+) -> Vec<CacheEntry> {
+    let mut removed = Vec::new();
+    for entry in cache_entries(cache_root) {
+        if entry.current {
             continue;
         }
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > max_age);
-        if stale && std::fs::remove_dir_all(&path).is_ok() {
-            removed += 1;
+        let stale = match max_age {
+            None => true,
+            Some(max_age) => entry.age.is_some_and(|age| age > max_age),
+        };
+        if !stale {
+            continue;
+        }
+        if dry_run || std::fs::remove_dir_all(&entry.path).is_ok() {
+            removed.push(entry);
         }
     }
     removed
+}
+
+/// [`prune`] by age, counted — the shape `vilan upgrade` has always called.
+pub fn prune_stale(cache_root: &Path, max_age: std::time::Duration) -> usize {
+    prune(cache_root, Some(max_age), false).len()
 }
 
 /// [`materialize`] into an explicit cache root (the seam tests use).
@@ -110,7 +194,24 @@ pub fn materialize_into(cache_root: &Path) -> Result<PathBuf, String> {
             .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     }
     match fs::rename(&staging, &target) {
-        Ok(()) => Ok(std_dir),
+        Ok(()) => {
+            // L21: the moment a NEW hash lands is the only moment the cache
+            // GROWS, so it is the moment to drop what no binary can use.
+            // Before this, `vilan upgrade` was the sole pruner — and a
+            // toolchain refreshed from source never runs it, so every lane
+            // binary and every release build left a tree behind forever (374
+            // entries, 316 MB on the owner's machine in two months).
+            //
+            // Safe by construction, and the guard does the work: an entry's
+            // mtime is its creation time and nothing touches it after the
+            // rename, so the tree written a moment ago is the youngest thing
+            // in the root and survives its own prune — as does every entry a
+            // binary started this week might still be reading. The race a week
+            // opens is the one `upgrade` has always accepted, and its cost is
+            // a re-materialization.
+            prune_stale(cache_root, STALE_AFTER);
+            Ok(std_dir)
+        }
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
             if target.is_dir() {

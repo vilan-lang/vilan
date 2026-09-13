@@ -9211,9 +9211,7 @@ impl<'src> Analyzer<'src> {
             // Its diagnostics are replayed and the keys it contributed above
             // are already in `reported_structures`, so both halves of what this
             // loop would have produced for it are already here.
-            let visited = !self.reused_source(source);
-            container_site_offered(visited);
-            if !visited {
+            if !self.container_site_visited(ContainerSite::File(source)) {
                 continue;
             }
             let Some(found) =
@@ -9301,7 +9299,7 @@ impl<'src> Analyzer<'src> {
             // M19 T1d: a reused module's native receiver sites are its own — the
             // call is in its body and the diagnostic publishes to its file — so
             // they are skipped with the rest of its tier.
-            if !self.container_site_visited(*call_id) {
+            if !self.container_site_visited(ContainerSite::Entity(*call_id)) {
                 continue;
             }
             let source = self.source_of_id(*call_id).unwrap_or(SourceId(0));
@@ -9435,11 +9433,9 @@ impl<'src> Analyzer<'src> {
         // warm keystroke almost all of them belong to modules whose answer is
         // already recorded.
         //
-        // The question is asked of the ENTITY here rather than of the file, and
-        // it is the same question: `world_ranges` is `source_ranges` filtered
-        // by the reused set, so [`Self::world_entity`] and
-        // [`Self::reused_source`] agree wherever both can be asked (an id
-        // inside no range resolves to the entry, which is in neither). Asking
+        // The question is asked of the ENTITY here rather than of the file,
+        // and it is the same question — see
+        // [`Self::container_site_visited`], which holds both spellings. Asking
         // the entity is what makes the skip free on a COLD analysis: with
         // nothing reused the ranges are empty and the binary search returns on
         // its first branch, where resolving the file would cost a real search
@@ -9454,7 +9450,7 @@ impl<'src> Analyzer<'src> {
             ));
         };
         for expr_id in self.expr_id_to_expr_map.keys().copied() {
-            if !self.container_site_visited(expr_id) {
+            if !self.container_site_visited(ContainerSite::Entity(expr_id)) {
                 continue;
             }
             if let Some(type_id) = self.resolved_type_id_of(expr_id)
@@ -9464,7 +9460,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for variable in self.variables.values() {
-            if !self.container_site_visited(variable.id) {
+            if !self.container_site_visited(ContainerSite::Entity(variable.id)) {
                 continue;
             }
             push(
@@ -9475,7 +9471,7 @@ impl<'src> Analyzer<'src> {
             );
         }
         for parameter in self.parameters.values() {
-            if !self.container_site_visited(parameter.id) {
+            if !self.container_site_visited(ContainerSite::Entity(parameter.id)) {
                 continue;
             }
             if let Some(span) = self.span_map.get(&parameter.id) {
@@ -26723,8 +26719,8 @@ impl<'src> Analyzer<'src> {
                 self.walk_expr_node(inner, scope_id);
                 Some(Expr::Void)
             }
-            // `[derive(..)]` is transparent: walk the wrapped item; the synthesized
-            // trait impls are appended separately (see `derive_impl_source`).
+            // `[derive(..)]` is transparent: walk the wrapped item; the trait
+            // impls are the std macro's, expanded before this walk ever runs.
             Node::Derive(derives, inner) => {
                 for (name, name_span) in derives {
                     self.record_macro_reference(name, *name_span, scope_id);
@@ -34934,42 +34930,42 @@ impl<'src> Analyzer<'src> {
         self.frozen_entity(id) || self.world_entity(id)
     }
 
-    /// [`Self::reusable_entity`] asked of a FILE rather than an entity (M19
-    /// T1d): whether this analysis is reusing `source`'s Class A output.
+    /// Whether this analysis VISITS `site` — R10's one reuse predicate — and
+    /// the census of every site it was asked about (M19 T1d).
     ///
-    /// R10's first tier is the one that needs it. A written type application is
-    /// collected at `walk_type_node` as `(TypeId, Span, SourceId)` and has no
-    /// entity id of its own to ask [`Self::world_entity`] about; the two other
-    /// tiers do have one and ask that instead
-    /// ([`Self::container_site_visited`]). Asking the file is the same claim:
-    /// `world_ranges` is exactly `source_ranges` filtered by
-    /// [`Self::reused_sources`], so the two predicates agree wherever both can
-    /// be asked.
+    /// A site is visited unless the module carrying it is one whose Class A
+    /// output this analysis is REUSING: a reused module's R10 diagnostics are
+    /// replayed and the structure keys it contributed are already restored, so
+    /// both halves of what the tier would produce for it are already here.
+    ///
+    /// N80 folded two spellings of this question into one. They were
+    /// `reused_source(SourceId)` — asked by the written-application tier, which
+    /// carries a file and no entity id — and `container_site_visited(Id)`,
+    /// asked by the other two, which carry an entity id and would pay a real
+    /// binary search to resolve a file. That is why both arms survive the fold:
+    /// on a COLD analysis `world_ranges` is empty and [`Self::world_entity`]
+    /// returns on its first branch, where resolving the file per entity would
+    /// cost a search to buy nothing; and the written tier has no id to ask
+    /// with. They agree wherever both can be asked, because `world_ranges` IS
+    /// `source_ranges` filtered by [`Self::reused_sources`] (an id inside no
+    /// range resolves to the entry, which is in neither). What they did NOT
+    /// agree on was polarity — one answered "reused", the other "visited" —
+    /// and only one of them counted the site, which is the shape N66 filed.
     ///
     /// Deliberately NOT `frozen_entity`'s half. A std module is in
     /// `reused_sources` on a base-cache hit like any other module of the
     /// world, and is then covered by a RECORD; the S1 freeze is a different
     /// and stronger claim ("std's diagnostics are known absent") that R10
     /// cannot make, because its inferred tier reads the resolved type of every
-    /// expression and a std expression's type can be ground by user code.
-    /// This predicate is therefore false whenever reuse is off, the full-scan
-    /// override is on, or the world was not served from the cache — the three
-    /// cases in which `reused_sources` is empty.
-    fn reused_source(&self, source: SourceId) -> bool {
-        self.reused_sources.binary_search(&source).is_ok()
-    }
-
-    /// [`Self::reused_source`] asked of the ENTITY that carries an R10 site,
-    /// counting the site into the census either way (M19 T1d).
-    ///
-    /// `world_entity` rather than `reused_source(source_of_id(..))` for a
-    /// reason that is about the COLD path: with nothing reused `world_ranges`
-    /// is empty and the search returns on its first branch, while resolving the
-    /// file would be a real binary search per entity, paid on every cache miss
-    /// to buy nothing. The two agree — `world_ranges` IS `source_ranges`
-    /// filtered by the reused set.
-    fn container_site_visited(&self, id: Id) -> bool {
-        let visited = !self.world_entity(id);
+    /// expression and a std expression's type can be ground by user code. So
+    /// every site is visited whenever reuse is off, the full-scan override is
+    /// on, or the world was not served from the cache — the three cases in
+    /// which `reused_sources` is empty.
+    fn container_site_visited(&self, site: ContainerSite) -> bool {
+        let visited = match site {
+            ContainerSite::File(source) => self.reused_sources.binary_search(&source).is_err(),
+            ContainerSite::Entity(id) => !self.world_entity(id),
+        };
         container_site_offered(visited);
         visited
     }
@@ -47831,6 +47827,23 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
 }
 
+/// One R10 site, in whichever of the two spellings its tier can produce.
+///
+/// The tiers do not all have the same handle on a site. A written type
+/// application is collected at `walk_type_node` as `(TypeId, Span, SourceId)`
+/// and has no entity id of its own; the receiver and inferred tiers are keyed
+/// by an entity id and have no file until one is resolved for a site that
+/// survives. Both spellings decide ONE question —
+/// [`Analyzer::container_site_visited`] — and they agree wherever both can be
+/// asked, because `world_ranges` IS `source_ranges` filtered by the reused set.
+#[derive(Clone, Copy)]
+enum ContainerSite {
+    /// The file the site was collected in (R10's written-application tier).
+    File(SourceId),
+    /// The entity that carries the site (R10's receiver and inferred tiers).
+    Entity(Id),
+}
+
 /// Offer one R10 site to the census, and say whether it was visited.
 fn container_site_offered(visited: bool) {
     CONTAINER_SITE_CENSUS.with(|census| {
@@ -48198,276 +48211,6 @@ fn render_type(node: &Node<'_>) -> String {
         }
         _ => "_".to_string(),
     }
-}
-
-/// The synthesized trait impls for a `[derive(..)]` enum. Each derive is built
-/// from the variants (their names and payload arities) via a `match`. `Default`
-/// is skipped — an enum has no unambiguous default variant. A GENERIC enum is
-/// spelled through its [`DerivedSubject`]: `Either<L, R>` in every type role,
-/// `impl Either<type L: Debug, type R: Debug>` on the header (B194).
-fn derive_enum_impls(
-    derives: &[&str],
-    subject: &DerivedSubject<'_>,
-    variants: &Spanned<Vec<Spanned<crate::node::EnumVariant<'_>>>>,
-    backing_type: Option<&'static str>,
-) -> String {
-    let enum_name = subject.name;
-    let applied = subject.applied();
-    // §3.9: a BACKED enum serializes AS ITS BACKING VALUE, for both `Json` and
-    // `Wire`. `Align::Start` encodes as `"start"`, not `"Start"`.
-    //
-    // This is a DIVERGENCE from the derive's own history, not an extension of
-    // it: the derive has always keyed on the variant NAME and ignored the
-    // discriminant entirely, so `Ordering::Greater` used to go on the wire as
-    // `"Greater"` and now goes as `1`. §1.6 checked what that costs and the
-    // answer was nothing — there is no `[derive(Wire)]` or `[derive(Json)]`
-    // enum anywhere in `vilan/std/src/`, the only derive sites being structs —
-    // so the divergence is taken now, while it is free, rather than after the
-    // first user ships a format. Adding or removing a backing value on a
-    // derived enum is a wire-format break; that is a sentence in
-    // `docs/std/encoding.md`, not a compiler mechanism.
-    // (variant name, payload type names — its arity is the length).
-    let variants: Vec<(&str, Vec<String>)> = variants
-        .0
-        .iter()
-        .map(|variant| {
-            let payload_types = variant
-                .0
-                .1
-                .iter()
-                .map(|payload| render_type(&payload.0))
-                .collect();
-            (variant.0.0, payload_types)
-        })
-        .collect();
-    let mut out = String::new();
-    for derive in derives {
-        match *derive {
-            // The canonical key is the JSON of the value (I1).
-            "Hashable" => {
-                out.push_str(&format!(
-                    "impl {enum_name}{} with Hashable {{\n\
-                     \tfun hash(self): Hash {{\n\
-                     \t\tcanonical_hash(self)\n\
-                     \t}}\n\
-                     }}\n",
-                    subject.binders("Hashable"),
-                ));
-            }
-            "PartialEq" => {
-                // `match (self, other) { (E::V(let s0,..), E::V(let o0,..)) => s0
-                // == o0 && .., (E::W, E::W) => true, _ => false }`.
-                let mut arms = String::new();
-                for (name, payload_types) in &variants {
-                    let arity = payload_types.len();
-                    if arity == 0 {
-                        arms.push_str(&format!(
-                            "\t\t\t({enum_name}::{name}, {enum_name}::{name}) => true,\n"
-                        ));
-                    } else {
-                        let bind = |prefix: char| {
-                            (0..arity)
-                                .map(|i| format!("let {prefix}{i}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-                        let comparison = (0..arity)
-                            .map(|i| format!("s{i} == o{i}"))
-                            .collect::<Vec<_>>()
-                            .join(" && ");
-                        arms.push_str(&format!(
-                            "\t\t\t({enum_name}::{name}({}), {enum_name}::{name}({})) => {comparison},\n",
-                            bind('s'),
-                            bind('o'),
-                        ));
-                    }
-                }
-                arms.push_str("\t\t\t_ => false,\n");
-                out.push_str(&format!(
-                    "impl {enum_name}{} with PartialEq {{\n\
-                     \tfun eq(self, other: {applied}): bool {{\n\
-                     \t\tmatch (self, other) {{\n{arms}\t\t}}\n\
-                     \t}}\n\
-                     }}\n",
-                    subject.binders("PartialEq"),
-                ));
-            }
-            "Debug" => {
-                // `match self { E::V(let p0,..) => "V(" + p0.debug() + ", " + .. +
-                // ")", E::W => "W" }`.
-                let mut arms = String::new();
-                for (name, payload_types) in &variants {
-                    let arity = payload_types.len();
-                    if arity == 0 {
-                        arms.push_str(&format!("\t\t\t{enum_name}::{name} => \"{name}\",\n"));
-                    } else {
-                        let binds = (0..arity)
-                            .map(|i| format!("let p{i}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let parts = (0..arity)
-                            .map(|i| format!("p{i}.debug()"))
-                            .collect::<Vec<_>>()
-                            .join(" + \", \" + ");
-                        arms.push_str(&format!(
-                            "\t\t\t{enum_name}::{name}({binds}) => \"{name}(\" + {parts} + \")\",\n"
-                        ));
-                    }
-                }
-                out.push_str(&format!(
-                    "impl {enum_name}{} with Debug {{\n\
-                     \tfun debug(self): str {{\n\
-                     \t\tmatch self {{\n{arms}\t\t}}\n\
-                     \t}}\n\
-                     }}\n",
-                    subject.binders("Debug"),
-                ));
-            }
-            // B301: `Json` emits the JSON pair, `Wire` the §6.1 visitor, and
-            // `[derive(Json, Wire)]` — two derives, two passes of this loop —
-            // emits both. The arm is shared because the two codecs read the
-            // same declaration, never because either implies the other; `Wire`
-            // used to emit the JSON pair beside its visitor ("additive until
-            // the codec re-plumb consumes it") and the residue made a Wire
-            // type's fields have to be Json as well.
-            "Json" | "Wire" => {
-                // §3.9's backed form: the value on the wire IS the backing
-                // value, and it round-trips through the synthesized `parse`.
-                // Both directions delegate — `value()` folds to the identity
-                // and `<backing>::to_json` already escapes correctly — so
-                // neither direction re-implements JSON quoting here.
-                if let Some(backing_type) = backing_type {
-                    if *derive == "Json" {
-                        out.push_str(&format!(
-                            "impl {enum_name}{} with Json {{\n\
-                         \tfun to_json(self): str {{\n\
-                         \t\tself.value().to_json()\n\
-                         \t}}\n\
-                         }}\n",
-                            subject.binders("Json"),
-                        ));
-                        let coerce = match backing_type {
-                            "str" => "coerce_str",
-                            "i53" => "coerce_i53",
-                            _ => "coerce_i32",
-                        };
-                        out.push_str(&format!(
-                        "impl {enum_name}{} with FromJson {{\n\
-                         \tfun from_json(text: str): Result<{applied}, str> {{\n\
-                         \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
-                         \t}}\n\
-                         \tfun from_json_value(value: JsonValue): Result<{applied}, str> {{\n\
-                         \t\t{enum_name}::parse({coerce}(value)).ok_or(\"unknown value in JSON for enum {enum_name}\")\n\
-                         \t}}\n\
-                         }}\n",
-                        subject.binders("FromJson"),
-                    ));
-                    }
-                    if *derive == "Wire" {
-                        let first_variant =
-                            variants.first().map(|(name, _)| *name).unwrap_or(enum_name);
-                        out.push_str(&backed_enum_wire_visitor_impls(
-                            subject,
-                            backing_type,
-                            first_variant,
-                        ));
-                    }
-                    continue;
-                }
-                // Externally tagged: no payload -> `"V"`; one -> `{"V":<p>}`;
-                // many -> `{"V":[<p0>,<p1>]}`.
-                if *derive == "Json" {
-                    let mut arms = String::new();
-                    for (name, payload_types) in &variants {
-                        let arity = payload_types.len();
-                        if arity == 0 {
-                            arms.push_str(&format!(
-                                "\t\t\t{enum_name}::{name} => \"\\\"{name}\\\"\",\n"
-                            ));
-                        } else if arity == 1 {
-                            arms.push_str(&format!(
-                            "\t\t\t{enum_name}::{name}(let p0) => \"{{\\\"{name}\\\":\" + p0.to_json() + \"}}\",\n"
-                        ));
-                        } else {
-                            let binds = (0..arity)
-                                .map(|i| format!("let p{i}"))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let parts = (0..arity)
-                                .map(|i| format!("p{i}.to_json()"))
-                                .collect::<Vec<_>>()
-                                .join(" + \",\" + ");
-                            arms.push_str(&format!(
-                            "\t\t\t{enum_name}::{name}({binds}) => \"{{\\\"{name}\\\":[\" + {parts} + \"]}}\",\n"
-                        ));
-                        }
-                    }
-                    out.push_str(&format!(
-                        "impl {enum_name}{} with Json {{\n\
-                     \tfun to_json(self): str {{\n\
-                     \t\tmatch self {{\n{arms}\t\t}}\n\
-                     \t}}\n\
-                     }}\n",
-                        subject.binders("Json"),
-                    ));
-                    // The reverse direction: read the externally-tagged discriminator,
-                    // then rebuild that variant from the host value. A no-payload tag is
-                    // the bare string; a single payload is `value.field(tag)`; several
-                    // are positional elements of the tagged array. Each payload is
-                    // coerced via its own type's `from_json_value`.
-                    // Decoding is fallible (I3): validate the tag (unknown = a decode
-                    // error, not a panic) and thread each payload leaf with `!`.
-                    let mut arms = String::new();
-                    for (name, payload_types) in &variants {
-                        let arity = payload_types.len();
-                        if arity == 0 {
-                            arms.push_str(&format!(
-                                "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}),\n"
-                            ));
-                        } else if arity == 1 {
-                            let payload_type = &payload_types[0];
-                            arms.push_str(&format!(
-                            "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({payload_type}::from_json_value(value.field(\"{name}\"))!)),\n"
-                        ));
-                        } else {
-                            let elements = payload_types
-                            .iter()
-                            .enumerate()
-                            .map(|(index, payload_type)| {
-                                format!(
-                                    "{payload_type}::from_json_value(value.field(\"{name}\").field(\"{index}\"))!"
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                            arms.push_str(&format!(
-                                "\t\t\t\"{name}\" => Result::Ok({enum_name}::{name}({elements})),\n"
-                            ));
-                        }
-                    }
-                    arms.push_str(&format!(
-                    "\t\t\t_ => Result::Err(\"unknown variant in JSON for enum {enum_name}\"),\n"
-                ));
-                    out.push_str(&format!(
-                    "impl {enum_name}{} with FromJson {{\n\
-                     \tfun from_json(text: str): Result<{applied}, str> {{\n\
-                     \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
-                     \t}}\n\
-                     \tfun from_json_value(value: JsonValue): Result<{applied}, str> {{\n\
-                     \t\tmatch value.tag() {{\n{arms}\t\t}}\n\
-                     \t}}\n\
-                     }}\n",
-                    subject.binders("FromJson"),
-                ));
-                }
-                if *derive == "Wire" {
-                    out.push_str(&enum_wire_visitor_impls(subject, &variants));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Whether an exposed field's SOLE written type argument is a `Map<K, V>` — the
@@ -49260,333 +49003,6 @@ fn integer_backing_type(variants: &[VariantBacking<'_>]) -> &'static str {
     }
 }
 
-/// How a derive generator must SPELL its subject (B194). A generic subject is
-/// an APPLICATION of its own parameters in every type role — `Handle<T>`, never
-/// the bare `Handle`, which is an under-supplied application (B188) — and each
-/// generated impl BINDS those parameters under the trait it derives:
-/// `impl Handle<type T: Wire> with Wire`.
-///
-/// THE RULE (ruled, B194): the derived trait is required on EVERY parameter —
-/// Rust's derive rule — because the generated body calls that trait's members
-/// on every field, and a field may be typed by any parameter. The declaration's
-/// own bounds and defaults belong to the declaration, not to the impl, so
-/// neither is repeated in the binder list.
-///
-/// A path HEAD (`Handle::from_json_value(..)`), a struct LITERAL head
-/// (`Handle { index = .. }`) and display text name a namespace or a word rather
-/// than an application, and keep the bare name.
-///
-/// The mirror of `macro_std::meta`'s `subject_spelling` / `derive_binders`,
-/// which the vilan derive macros spell their subjects with; the two backends
-/// must not disagree.
-struct DerivedSubject<'a> {
-    name: &'a str,
-    /// Each declared parameter and whether the generated body REACHES it —
-    /// some field type (struct) or variant payload (enum) is written in terms
-    /// of it, so the body will call the derived trait's members on a value of
-    /// that type. A parameter nothing reaches is PHANTOM.
-    parameters: Vec<(&'a str, bool)>,
-}
-
-impl<'a> DerivedSubject<'a> {
-    /// `member_types` is every written field type or variant payload type — it
-    /// is what decides reachability, so a caller that cannot supply them would
-    /// call every parameter phantom and under-bind.
-    fn of(
-        name: &'a str,
-        generic_parameters: Option<&'a GenericParameters<'a>>,
-        member_types: &[&Spanned<Node<'a>>],
-    ) -> Self {
-        let parameters = generic_parameters
-            .iter()
-            .flat_map(|parameters| &parameters.0)
-            .map(|parameter| {
-                let reached = member_types
-                    .iter()
-                    .any(|member| type_mentions(&member.0, parameter.name));
-                (parameter.name, reached)
-            })
-            .collect();
-        Self { name, parameters }
-    }
-
-    /// `Handle<T>` — the subject in a type role; the bare name when it has no
-    /// parameters.
-    fn applied(&self) -> String {
-        match self.parameters.is_empty() {
-            true => self.name.to_string(),
-            false => format!(
-                "{}<{}>",
-                self.name,
-                self.parameters
-                    .iter()
-                    .map(|(parameter, _)| *parameter)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
-
-    /// `<type T: Wire>` — the binder list of an impl deriving `trait_name`;
-    /// empty for a non-generic subject. A REACHED parameter carries the trait;
-    /// a phantom one takes a bare binder (`<type T>`), which is the C7
-    /// departure from Rust's rule that `derive_binders` in
-    /// `macro_std/src/meta.vl` documents in full.
-    fn binders(&self, trait_name: &str) -> String {
-        match self.parameters.is_empty() {
-            true => String::new(),
-            false => format!(
-                "<{}>",
-                self.parameters
-                    .iter()
-                    .map(|(parameter, reached)| match reached {
-                        true => format!("type {parameter}: {trait_name}"),
-                        false => format!("type {parameter}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
-}
-
-/// Whether a written type MENTIONS `parameter` at any depth: `T` does,
-/// `List<T>` does, `Option<Map<str, T>>` does, `i32` does not.
-///
-/// Every form this cannot decompose answers `true` — a tuple, a closure, a
-/// reference may mention any parameter, and reading them as reaching all of
-/// them falls back to Rust's rule (over-constrain, which the use site reports
-/// plainly) rather than to a bare binder over a body that will not compile.
-/// The mirror of `mentions` / `opaque_type_text` in `macro_std/src/meta.vl`.
-fn type_mentions(node: &Node<'_>, parameter: &str) -> bool {
-    match node {
-        Node::Accessor(name) => *name == parameter,
-        Node::AccessorWithGenerics(name, arguments) => {
-            *name == parameter
-                || arguments
-                    .0
-                    .iter()
-                    .any(|argument| type_mentions(&argument.0, parameter))
-        }
-        _ => true,
-    }
-}
-
-pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> String {
-    if let Node::Enum(name, generic_parameters, resource, variants) = &item.0 {
-        let backing_type = enum_backing_type(
-            name.0,
-            generic_parameters.as_deref(),
-            *resource,
-            &variants.0,
-        );
-        let payloads: Vec<&Spanned<Node>> =
-            variants.0.iter().flat_map(|variant| &variant.0.1).collect();
-        let subject = DerivedSubject::of(name.0, generic_parameters.as_deref(), &payloads);
-        return derive_enum_impls(derives, &subject, variants, backing_type);
-    }
-    let Node::Struct(name, generic_parameters, _external, _resource, Some(fields)) = &item.0 else {
-        return String::new();
-    };
-    let struct_name = name.0;
-    let field_types: Vec<&Spanned<Node>> = fields
-        .0
-        .iter()
-        .filter_map(|field| field.0.1.as_ref())
-        .collect();
-    let subject = DerivedSubject::of(struct_name, generic_parameters.as_deref(), &field_types);
-    let applied = subject.applied();
-    let fields: Vec<(&str, String)> = fields
-        .0
-        .iter()
-        .map(|field| {
-            let field_name = field.0.0.0;
-            let field_type = field
-                .0
-                .1
-                .as_ref()
-                .map(|type_| render_type(&type_.0))
-                .unwrap_or_else(|| "_".to_string());
-            (field_name, field_type)
-        })
-        .collect();
-    let mut out = String::new();
-    for derive in derives {
-        match *derive {
-            "PartialEq" => {
-                // `self.a == other.a && self.b == other.b` (a field-less struct is
-                // always equal).
-                let comparison = if fields.is_empty() {
-                    "true".to_string()
-                } else {
-                    fields
-                        .iter()
-                        .map(|(field, _)| format!("self.{field} == other.{field}"))
-                        .collect::<Vec<_>>()
-                        .join(" && ")
-                };
-                let binders = subject.binders("PartialEq");
-                out.push_str(&format!(
-                    "impl {struct_name}{binders} with PartialEq {{\n\
-                     \tfun eq(self, other: {applied}): bool {{\n\
-                     \t\t{comparison}\n\
-                     \t}}\n\
-                     }}\n"
-                ));
-            }
-            // The canonical key is the JSON of the value (I1); the all-fields
-            // check has already rejected any non-Hashable field.
-            "Hashable" => {
-                let binders = subject.binders("Hashable");
-                out.push_str(&format!(
-                    "impl {struct_name}{binders} with Hashable {{\n\
-                     \tfun hash(self): Hash {{\n\
-                     \t\tcanonical_hash(self)\n\
-                     \t}}\n\
-                     }}\n"
-                ));
-            }
-            "Default" => {
-                // `{ a = i32::default(), b = Point::default() }`.
-                let initializers = fields
-                    .iter()
-                    .map(|(field, type_)| format!("{field} = {type_}::default()"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let binders = subject.binders("Default");
-                out.push_str(&format!(
-                    "impl {struct_name}{binders} with Default {{\n\
-                     \tfun default(): {applied} {{\n\
-                     \t\t{struct_name} {{ {initializers} }}\n\
-                     \t}}\n\
-                     }}\n"
-                ));
-            }
-            "Debug" => {
-                // `"T { " + "a = " + self.a.debug() + ", " + … + " }"`; a
-                // field-less struct is just its name.
-                let body = if fields.is_empty() {
-                    format!("\"{struct_name}\"")
-                } else {
-                    let parts = fields
-                        .iter()
-                        .map(|(field, _)| format!("\"{field} = \" + self.{field}.debug()"))
-                        .collect::<Vec<_>>()
-                        .join(" + \", \" + ");
-                    format!("\"{struct_name} {{ \" + {parts} + \" }}\"")
-                };
-                let binders = subject.binders("Debug");
-                out.push_str(&format!(
-                    "impl {struct_name}{binders} with Debug {{\n\
-                     \tfun debug(self): str {{\n\
-                     \t\t{body}\n\
-                     \t}}\n\
-                     }}\n"
-                ));
-            }
-            // B301: `Json` emits the JSON pair, `Wire` the §6.1 visitor,
-            // `[derive(Json, Wire)]` both (see the enum arm's note).
-            "Json" | "Wire" => {
-                if *derive == "Json" {
-                    // `"{" + "\"a\":" + self.a.to_json() + "," + "\"b\":" +
-                    // self.b.to_json() + "}"` — a JSON object with the real field
-                    // names; each value serializes via its own `to_json`.
-                    let mut body = String::from("\"{\"");
-                    for (index, (field, _)) in fields.iter().enumerate() {
-                        if index > 0 {
-                            body.push_str(" + \",\"");
-                        }
-                        body.push_str(" + \"\\\"");
-                        body.push_str(field);
-                        body.push_str("\\\":\" + self.");
-                        body.push_str(field);
-                        body.push_str(".to_json()");
-                    }
-                    body.push_str(" + \"}\"");
-                    out.push_str(&format!(
-                        "impl {struct_name}{} with Json {{\n\
-                     \tfun to_json(self): str {{\n\
-                     \t\t{body}\n\
-                     \t}}\n\
-                     }}\n",
-                        subject.binders("Json"),
-                    ));
-                    // The reverse direction (I3): decoding is fallible, so `from_json`
-                    // yields a `Result`. Each field is checked present (naming a
-                    // missing one), then coerced via the field type's own
-                    // `from_json_value` (nested structs recurse), threading a leaf
-                    // failure with `!`.
-                    let mut presence = String::new();
-                    for (field, _) in &fields {
-                        presence.push_str(&format!(
-                        "\t\tif !value.has_field(\"{field}\") {{ ret Result::Err(\"missing field {field}\") }}\n"
-                    ));
-                    }
-                    let initializers = fields
-                        .iter()
-                        .map(|(field, type_)| {
-                            format!("{field} = {type_}::from_json_value(value.field(\"{field}\"))!")
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    out.push_str(&format!(
-                    "impl {struct_name}{} with FromJson {{\n\
-                     \tfun from_json(text: str): Result<{applied}, str> {{\n\
-                     \t\t{struct_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
-                     \t}}\n\
-                     \tfun from_json_value(value: JsonValue): Result<{applied}, str> {{\n\
-                     {presence}\t\tResult::Ok({struct_name} {{ {initializers} }})\n\
-                     \t}}\n\
-                     }}\n",
-                    subject.binders("FromJson"),
-                ));
-                }
-                if *derive == "Wire" {
-                    out.push_str(&struct_wire_visitor_impls(&subject, &fields));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The §6.1 visitor impls for a `[derive(Wire)]` struct: `describe` narrates
-/// each field (name, then the value's own describe) to the serializer, and
-/// `rebuild` pulls them back in declaration order — the field's source type
-/// text carries the static dispatch, exactly like the derived `from_json`.
-fn struct_wire_visitor_impls(subject: &DerivedSubject<'_>, fields: &[(&str, String)]) -> String {
-    let struct_name = subject.name;
-    let applied = subject.applied();
-    let binders = subject.binders("Wire");
-    let mut describe = format!("\t\tserializer.begin_struct({});\n", fields.len());
-    for (field, _) in fields {
-        describe.push_str(&format!("\t\tserializer.field(\"{field}\");\n"));
-        describe.push_str(&format!("\t\tself.{field}.describe(serializer);\n"));
-    }
-    describe.push_str("\t\tserializer.end_struct();");
-    let mut rebuild = String::from("\t\tdeserializer.begin_struct();\n");
-    for (field, field_type) in fields {
-        rebuild.push_str(&format!("\t\tdeserializer.field(\"{field}\");\n"));
-        rebuild.push_str(&format!(
-            "\t\tlet {field} = {field_type}::rebuild(deserializer);\n"
-        ));
-    }
-    rebuild.push_str("\t\tdeserializer.end_struct();\n");
-    let initializers = fields
-        .iter()
-        .map(|(field, _)| format!("{field} = {field}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    rebuild.push_str(&format!("\t\t{struct_name} {{ {initializers} }}"));
-    format!(
-        "impl {struct_name}{binders} with Wire {{\n\
-         \tfun describe<S: Serialize>(self, serializer: S) {{\n{describe}\n\t}}\n\
-         \tfun rebuild<D: Deserialize>(deserializer: D): {applied} {{\n{rebuild}\n\t}}\n\
-         }}\n"
-    )
-}
-
 /// The backing type of a `[derive(..)]` enum's variants, or `None` when the
 /// enum is not backed (backed-enums.md §3.9). The same §10 reading every other
 /// synthesized member goes through, so the wire shape and the runtime
@@ -49625,138 +49041,6 @@ fn backing_type_name(read: &EnumBacking<'_>) -> &'static str {
         // integer-backed enum resolves every variant.
         _ => integer_backing_type(&read.variants),
     }
-}
-
-/// The §6.1 visitor impls for a BACKED `[derive(Wire)]` enum (§3.9): the
-/// backing value is what crosses, so both directions delegate to the backing
-/// type's own `Wire` impl and to the synthesized `parse`.
-///
-/// The unknown-value path is the one the plain form already had, kept: a host
-/// sending a value outside the set decodes to a reported failure plus a poisoned
-/// zero-construction, not to garbage.
-fn backed_enum_wire_visitor_impls(
-    subject: &DerivedSubject<'_>,
-    backing_type: &str,
-    first_variant: &str,
-) -> String {
-    let enum_name = subject.name;
-    let applied = subject.applied();
-    let binders = subject.binders("Wire");
-    format!(
-        "impl {enum_name}{binders} with Wire {{\n\
-         \tfun describe<S: Serialize>(self, serializer: S) {{\n\
-         \t\tself.value().describe(serializer);\n\
-         \t}}\n\
-         \tfun rebuild<D: Deserialize>(deserializer: D): {applied} {{\n\
-         \t\tlet raw = {backing_type}::rebuild(deserializer);\n\
-         \t\tmatch {enum_name}::parse(raw) {{\n\
-         \t\t\tOption::Some(let variant) => variant,\n\
-         \t\t\tOption::None => {{\n\
-         \t\t\t\tdeserializer.fail(i\"unknown value for enum {enum_name}\");\n\
-         \t\t\t\t{enum_name}::{first_variant}\n\
-         \t\t\t}},\n\
-         \t\t}}\n\
-         \t}}\n\
-         }}\n"
-    )
-}
-
-/// The §6.1 visitor impls for a `[derive(Wire)]` enum, mirroring the derived
-/// JSON shape: externally-tagged variants, arity>1 payloads as an array. The
-/// unknown-tag arm reports a sticky decode failure and zero-constructs the
-/// first variant through the (now poisoned) deserializer — the caller
-/// discards the value on `Err`. An empty enum gets no impls (nothing to
-/// construct; the missing impl surfaces naturally at a use site).
-fn enum_wire_visitor_impls(
-    subject: &DerivedSubject<'_>,
-    variants: &[(&str, Vec<String>)],
-) -> String {
-    if variants.is_empty() {
-        return String::new();
-    }
-    let enum_name = subject.name;
-    let applied = subject.applied();
-    let binders = subject.binders("Wire");
-    let mut describe_arms = String::new();
-    for (name, payload_types) in variants {
-        let arity = payload_types.len();
-        if arity == 0 {
-            describe_arms.push_str(&format!(
-                "\t\t\t{enum_name}::{name} => {{\n\
-                 \t\t\t\tserializer.begin_variant(\"{name}\", 0);\n\
-                 \t\t\t\tserializer.end_variant();\n\
-                 \t\t\t}},\n"
-            ));
-        } else {
-            let binds = (0..arity)
-                .map(|i| format!("let p{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut body = format!("\t\t\t\tserializer.begin_variant(\"{name}\", {arity});\n");
-            for index in 0..arity {
-                body.push_str(&format!("\t\t\t\tp{index}.describe(serializer);\n"));
-            }
-            body.push_str("\t\t\t\tserializer.end_variant();\n");
-            describe_arms.push_str(&format!(
-                "\t\t\t{enum_name}::{name}({binds}) => {{\n{body}\t\t\t}},\n"
-            ));
-        }
-    }
-    let mut rebuild_arms = String::new();
-    for (name, payload_types) in variants {
-        let arity = payload_types.len();
-        let mut body = format!("\t\t\t\tdeserializer.begin_variant(\"{name}\", {arity});\n");
-        for (index, payload_type) in payload_types.iter().enumerate() {
-            body.push_str(&format!(
-                "\t\t\t\tlet p{index} = {payload_type}::rebuild(deserializer);\n"
-            ));
-        }
-        body.push_str("\t\t\t\tdeserializer.end_variant();\n");
-        let construct = if arity == 0 {
-            format!("{enum_name}::{name}")
-        } else {
-            let args = (0..arity)
-                .map(|i| format!("p{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{enum_name}::{name}({args})")
-        };
-        body.push_str(&format!("\t\t\t\t{construct}\n"));
-        rebuild_arms.push_str(&format!("\t\t\t\"{name}\" => {{\n{body}\t\t\t}},\n"));
-    }
-    let (first_name, first_payloads) = &variants[0];
-    let mut fallback_body = String::new();
-    for (index, payload_type) in first_payloads.iter().enumerate() {
-        fallback_body.push_str(&format!(
-            "\t\t\t\tlet f{index} = {payload_type}::rebuild(deserializer);\n"
-        ));
-    }
-    let fallback = if first_payloads.is_empty() {
-        format!("{enum_name}::{first_name}")
-    } else {
-        let args = (0..first_payloads.len())
-            .map(|index| format!("f{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{enum_name}::{first_name}({args})")
-    };
-    rebuild_arms.push_str(&format!(
-        "\t\t\t_ => {{\n\
-         \t\t\t\tdeserializer.fail(i\"unknown variant '{{tag}}'\");\n{fallback_body}\
-         \t\t\t\t{fallback}\n\
-         \t\t\t}},\n"
-    ));
-    format!(
-        "impl {enum_name}{binders} with Wire {{\n\
-         \tfun describe<S: Serialize>(self, serializer: S) {{\n\
-         \t\tmatch self {{\n{describe_arms}\t\t}}\n\
-         \t}}\n\
-         \tfun rebuild<D: Deserialize>(deserializer: D): {applied} {{\n\
-         \t\tlet tag = deserializer.variant_tag();\n\
-         \t\tmatch tag {{\n{rebuild_arms}\t\t}}\n\
-         \t}}\n\
-         }}\n"
-    )
 }
 
 /// Builds the path to a module file under the `std` package's source root.

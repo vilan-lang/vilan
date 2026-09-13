@@ -199,6 +199,32 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Work on the toolchain's own caches under `~/.vilan`.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Delete materialized std trees no binary can use any more.
+    ///
+    /// Each build of the toolchain materializes its std under its own content
+    /// hash, so a machine that builds vilan from source accumulates one tree
+    /// per build. Materialization and `vilan upgrade` both prune on the same
+    /// seven-day guard; this is the explicit gesture for the times that is not
+    /// enough.
+    Prune {
+        /// Delete every entry, not only those older than seven days. This
+        /// binary's own tree is still kept — the next command would write it
+        /// straight back.
+        #[arg(long)]
+        all: bool,
+        /// Print what would be deleted, with sizes, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// The stack every compile runs on — the one this process's whole CLI runs on,
@@ -336,6 +362,84 @@ fn run_cli() -> ExitCode {
             stats,
         } => bindgen::bindgen(file, output, platform, only, stdout, stats),
         Command::Upgrade { check } => upgrade::upgrade(check),
+        Command::Cache { command } => match command {
+            CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
+        },
+    }
+}
+
+/// `vilan cache prune` (L21): drop materialized std trees, reporting what went
+/// and what it freed.
+///
+/// The age guard is the default because it is the safe one — an entry younger
+/// than a week may belong to a compile running right now, which reads std files
+/// lazily — and `--all` is the gesture for a machine that knows it is idle. The
+/// running binary's own tree is kept under both, so the command can never make
+/// the very next command re-materialize.
+fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
+    let root = vilan_embedded_std::default_cache_root();
+    let max_age = (!all).then_some(vilan_embedded_std::STALE_AFTER);
+    let before = vilan_embedded_std::cache_entries(&root).len();
+    let removed = vilan_embedded_std::prune(&root, max_age, dry_run);
+    let kept = before - removed.len();
+    let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    if removed.is_empty() {
+        println!(
+            "{}: nothing to prune ({kept} entr{} kept)",
+            root.display(),
+            if kept == 1 { "y" } else { "ies" }
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{}: {} {} entr{} ({})",
+        root.display(),
+        if dry_run { "would prune" } else { "pruned" },
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" },
+        human_bytes(freed),
+    );
+    for entry in &removed {
+        println!(
+            "  {}  {:>9}  {}",
+            entry.name,
+            human_bytes(entry.bytes),
+            entry
+                .age
+                .map(|age| format!("{} days old", age.as_secs() / (24 * 60 * 60)))
+                .unwrap_or_else(|| "age unknown".to_string()),
+        );
+    }
+    // The rule, not a claim about the survivors: with `--all` the only entry
+    // that CAN survive is this binary's own, and there may be none.
+    if kept > 0 {
+        println!(
+            "{}",
+            paint::out(
+                paint::Style::DIM,
+                &format!(
+                    "{kept} entr{} kept: this binary's own tree is never pruned{}",
+                    if kept == 1 { "y" } else { "ies" },
+                    if all {
+                        ""
+                    } else {
+                        ", nor is anything created in the last seven days"
+                    }
+                )
+            )
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// A byte count for a human: `468 KB`, `1.4 MB`. Decimal units, because that is
+/// what a disk reports.
+fn human_bytes(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1_000.0),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", bytes as f64 / 1_000_000.0),
+        _ => format!("{:.1} GB", bytes as f64 / 1_000_000_000.0),
     }
 }
 

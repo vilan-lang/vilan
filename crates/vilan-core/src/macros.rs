@@ -36,10 +36,36 @@ use crate::span::{Span, Spanned};
 use crate::transformer::{JsProgram, js, transform_functions};
 use crate::{PackageSpec, Platform, Workspace, analyze_source};
 
-/// The derive names the RUST generators still serve when no macro is in
-/// scope (fixture stds without the std macros; the macro world's own nested
-/// compile). Frozen byte-identical copies of the migrated macros.
-const RUST_DERIVES: &[&str] = &["PartialEq", "Default", "Debug", "Json", "Wire", "Hashable"];
+/// The six derive names std declares a `macro fun` for, each with the std
+/// module that declares it — `Json` and `Wire` share `json.vl` (B301 split the
+/// impls, not the file).
+///
+/// This used to be a list of the names a RUST generator stood behind when no
+/// macro was in scope. There is no such generator any more (N79, and N70 before
+/// it for `[service]`): a std that does not declare the macro is told so.
+/// The table survives the generators because the REFUSAL needs it — the name
+/// alone cannot say which module a reader is missing.
+///
+/// A name that is not here keeps the behaviour it has always had: nothing is
+/// generated and nothing is said, because an unknown `[derive(Foo)]` is a
+/// missing `Foo` macro, which the missing impl reports at the use site.
+const STD_DERIVE_MACROS: &[(&str, &str)] = &[
+    ("PartialEq", "compare.vl"),
+    ("Default", "default.vl"),
+    ("Debug", "debug.vl"),
+    ("Json", "json.vl"),
+    ("Wire", "json.vl"),
+    ("Hashable", "hash.vl"),
+];
+
+/// The std module declaring `derive`'s macro, or `None` for a name std has
+/// never declared one for.
+fn std_derive_module(derive: &str) -> Option<&'static str> {
+    STD_DERIVE_MACROS
+        .iter()
+        .find(|(name, _)| *name == derive)
+        .map(|(_, module)| *module)
+}
 
 /// The per-package expansion budgets (`vilan.toml [macro]`, macro-engine.md
 /// §5/§12): `fuel` bounds one macro run's interpreter steps; `depth` bounds
@@ -663,8 +689,15 @@ thread_local! {
     /// Set while a macro WORLD is being analyzed. A world's own analysis must
     /// not register macros (std's prelude modules contain `macro fun`s —
     /// registering them would recursively compile their worlds, unboundedly);
-    /// expansion still runs there, with an empty scope, so std's own derives
-    /// generate through the byte-identical Rust fallback.
+    /// expansion still runs there, with an empty scope. Nothing a world sees
+    /// carries a `[derive(..)]` today: the entry is BLANKED to its macro
+    /// definitions, macro_std declares none, and the std modules a world force-
+    /// loads are `boolean`/`list`/`null`/`promise`/`compare`/`default`/`debug`/
+    /// `json`/`hash`/`number`/`string`, none of which derives anything. So the
+    /// derive path below is not reached from inside a world — which matters
+    /// now, because N79 deleted the Rust generators that used to serve it and
+    /// a derive written into one of those eleven modules would be refused here
+    /// as a load-ordering bug it is not.
     static IN_MACRO_WORLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1430,13 +1463,17 @@ pub(crate) struct ExpansionOutput {
     pub(crate) world_errors: Vec<(SourceId, Error)>,
 }
 
-/// One declaring scope's Rust-generated fallback: the generated text plus the
+/// One declaring scope's SYNTHESIZED members: the generated vilan text plus the
 /// prelude imports that text needs in scope. Bucketed per scope so a
-/// `mod`-nested derive's impl and its imports land where its subject is (B201).
+/// `mod`-nested enum's members and their imports land where its subject is
+/// (B201).
+///
+/// Only the backed-enum generators write here now. It used to carry the derive
+/// fallback's impls too, and a `traits` set naming which trait preludes those
+/// impls needed; N79 deleted the generators and the set went with them.
 #[derive(Default)]
-struct RustFallback {
+struct SynthesizedMembers {
     source: String,
-    traits: std::collections::HashSet<&'static str>,
     /// Whether this scope declared a backed enum whose `value()`/`parse()` were
     /// generated, so the generated block gets `Option` in scope for its `parse`
     /// (backed-enums.md §3.8).
@@ -1455,14 +1492,15 @@ struct Expander<'r, 'd> {
     scope: &'r MacroScope<'r>,
     std: &'r PackageSpec,
     limits: MacroLimits,
-    /// Rust-generated fallback text (derive/service names with no macro in
-    /// scope — fixture stds without the std macros), bucketed by the DECLARING
-    /// scope's inline-`mod` path. Each bucket is flushed as ONE list,
-    /// prelude-first, ahead of that scope's macro-generated lists — the shape
-    /// the pre-unification channel produced, per scope rather than per file
+    /// Synthesized member text (a backed enum's `value()`/`parse()` and a
+    /// bare-lowered enum's `Hashable` impl — the members the LANGUAGE gives an
+    /// enum, which no macro declares), bucketed by the DECLARING scope's
+    /// inline-`mod` path. Each bucket is flushed as ONE list, prelude-first,
+    /// ahead of that scope's macro-generated lists — the shape the
+    /// pre-unification channel produced, per scope rather than per file
     /// (B201: a backed enum inside a `mod` generated its `value()`/`parse()`
     /// at the file's top level, where the enum is out of scope).
-    rust_fallback: Vec<(Vec<String>, RustFallback)>,
+    synthesized_members: Vec<(Vec<String>, SynthesizedMembers)>,
     /// The inline-`mod` path currently being expanded, outermost first — empty
     /// at a file's top level. Every generated list records it, so the walk can
     /// place the list in the scope that declares its subject (B201).
@@ -1504,7 +1542,7 @@ pub(crate) fn expand_source(
         scope,
         std,
         limits,
-        rust_fallback: Vec::new(),
+        synthesized_members: Vec::new(),
         module_path: Vec::new(),
         diagnostics,
         site_counter,
@@ -1513,26 +1551,26 @@ pub(crate) fn expand_source(
     };
     expander.collect_backed_enum_impls(nodes);
     expander.expand_list(nodes, text, depth);
-    expander.flush_rust_fallback();
+    expander.flush_synthesized_members();
     expander.output
 }
 
 impl Expander<'_, '_> {
-    /// The Rust-fallback bucket for the scope being expanded — the file's top
-    /// level, or the inline `mod` the walk is inside (B201). Buckets are kept
-    /// in first-seen order so the flush is deterministic.
-    fn fallback(&mut self) -> &mut RustFallback {
+    /// The synthesized-member bucket for the scope being expanded — the file's
+    /// top level, or the inline `mod` the walk is inside (B201). Buckets are
+    /// kept in first-seen order so the flush is deterministic.
+    fn synthesized(&mut self) -> &mut SynthesizedMembers {
         match self
-            .rust_fallback
+            .synthesized_members
             .iter()
             .position(|(path, _)| *path == self.module_path)
         {
-            Some(index) => &mut self.rust_fallback[index].1,
+            Some(index) => &mut self.synthesized_members[index].1,
             None => {
-                self.rust_fallback
-                    .push((self.module_path.clone(), RustFallback::default()));
+                self.synthesized_members
+                    .push((self.module_path.clone(), SynthesizedMembers::default()));
                 &mut self
-                    .rust_fallback
+                    .synthesized_members
                     .last_mut()
                     .expect("the bucket just pushed")
                     .1
@@ -1588,16 +1626,16 @@ impl Expander<'_, '_> {
                 if !derived_hashable {
                     let hashable = crate::analyzer::backed_enum_hashable_source(node);
                     if !hashable.is_empty() {
-                        let fallback = self.fallback();
-                        fallback.bare_lowered_enums = true;
-                        fallback.source.push_str(&hashable);
+                        let bucket = self.synthesized();
+                        bucket.bare_lowered_enums = true;
+                        bucket.source.push_str(&hashable);
                     }
                 }
                 let source = crate::analyzer::backed_enum_impl_source(node);
                 if !source.is_empty() {
-                    let fallback = self.fallback();
-                    fallback.backed_enums = true;
-                    fallback.source.push_str(&source);
+                    let bucket = self.synthesized();
+                    bucket.backed_enums = true;
+                    bucket.source.push_str(&source);
                 }
             }
             _ => {}
@@ -1645,10 +1683,10 @@ impl Expander<'_, '_> {
                 self.sweep_expressions(item, text, depth);
             }
             // `[derive(Name)]`: a macro named `Name` in scope dispatches like
-            // an attribute with no arguments; the historical built-in names
-            // fall back to the Rust generators when no macro is in scope
-            // (fixture stds); unknown names keep today's behavior (skip — the
-            // missing impl surfaces at the use site).
+            // an attribute with no arguments; one of the six names std declares
+            // a macro for, with no macro in scope, is REFUSED (N79); unknown
+            // names keep today's behavior (skip — the missing impl surfaces at
+            // the use site).
             Node::Derive(names, item) => {
                 for (name, name_span) in names.iter() {
                     // `Wire`/`Json` on a `resource` type is refused HERE, above
@@ -1667,13 +1705,46 @@ impl Expander<'_, '_> {
                     }
                     if self.scope.get(name).is_some() {
                         self.run_attribute(name, *name_span, item, &[], text, depth);
-                    } else if let Some(known) =
-                        RUST_DERIVES.iter().find(|known| **known == *name).copied()
-                    {
-                        let source = crate::analyzer::derive_impl_source(&[name], item);
-                        let fallback = self.fallback();
-                        fallback.traits.insert(known);
-                        fallback.source.push_str(&source);
+                    } else if let Some(module) = std_derive_module(name) {
+                        // There is no second generator to fall back to (N79).
+                        // There used to be — a Rust twin of the `Json`/`Wire`/
+                        // `PartialEq`/`Default`/`Debug`/`Hashable` macros std
+                        // declares — and it was N70's twin exactly: unpinned,
+                        // reachable only from a std missing the module, and
+                        // free to drift from the macro it stood in for with
+                        // nothing in the suite to notice. A silently DIFFERENT
+                        // expansion is the worst of the three outcomes here;
+                        // both remaining ones are a sentence.
+                        //
+                        // Which sentence depends on WHY the macro is missing,
+                        // exactly as it does for `[service]` below. A std that
+                        // HAS the module reaching here means the module was not
+                        // loaded before this expansion — the B21 ordering
+                        // class, and a compiler bug. A std with no such module
+                        // in it at all is not a bug: it is a std that does not
+                        // carry the derive, and the author of that std is the
+                        // reader.
+                        let msg = if self.std.base_root.join(module).is_file() {
+                            format!(
+                                "`[derive({name})]` expanded before std's `{module}` declared its \
+                                 `{name}` macro: a compiler load-ordering bug (B21's class); \
+                                 please report how this module is reached"
+                            )
+                        } else {
+                            format!(
+                                "`[derive({name})]` needs std's `{module}`, and the std this \
+                                 package resolves to does not carry one: the derive is expanded \
+                                 by the `{name}` macro that module declares, and there is no \
+                                 second generator behind it. Build against a std that has \
+                                 `{module}`, or write the impl by hand"
+                            )
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *name_span,
+                            msg,
+                        });
                     }
                 }
                 self.sweep_expressions(item, text, depth);
@@ -1888,15 +1959,15 @@ impl Expander<'_, '_> {
         );
     }
 
-    /// Flushes each declaring scope's Rust-generated fallback text (if any) as
-    /// the FIRST items list for that scope, prefixed with the trait-import
-    /// prelude the Rust generators assume — exactly the pre-unification
-    /// channel's shape, per scope rather than per file (B201).
-    fn flush_rust_fallback(&mut self) {
-        let buckets = std::mem::take(&mut self.rust_fallback);
+    /// Flushes each declaring scope's synthesized member text (if any) as the
+    /// FIRST items list for that scope, prefixed with the import prelude that
+    /// text needs — exactly the pre-unification channel's shape, per scope
+    /// rather than per file (B201).
+    fn flush_synthesized_members(&mut self) {
+        let buckets = std::mem::take(&mut self.synthesized_members);
         let mut flushed = Vec::new();
-        for (module_path, fallback) in buckets {
-            if let Some(items) = self.rust_fallback_items(&module_path, &fallback) {
+        for (module_path, bucket) in buckets {
+            if let Some(items) = self.synthesized_member_items(&module_path, &bucket) {
                 flushed.push(items);
             }
         }
@@ -1904,54 +1975,27 @@ impl Expander<'_, '_> {
     }
 
     /// One bucket's parsed items — `None` when it generated nothing.
-    fn rust_fallback_items(
+    ///
+    /// The prelude is two lines at most now. It used to carry one import line
+    /// per derived trait, read off the bucket's `traits` set; N79 deleted the
+    /// derive generators that filled that set, and what a std macro's expansion
+    /// needs in scope is the macro's own business, written in the macro.
+    fn synthesized_member_items(
         &mut self,
         module_path: &[String],
-        fallback: &RustFallback,
+        bucket: &SynthesizedMembers,
     ) -> Option<GeneratedItems> {
-        if fallback.source.trim().is_empty() {
+        if bucket.source.trim().is_empty() {
             return None;
         }
         let mut prelude = String::new();
-        if fallback.traits.contains("PartialEq") {
-            prelude.push_str("import std::compare::PartialEq;\n");
-        }
-        if fallback.traits.contains("Default") {
-            prelude.push_str("import std::default::Default;\n");
-        }
-        // B301: `Wire` no longer emits the JSON pair, so only `Json` needs
-        // the JSON prelude. A module deriving both carries both preludes,
-        // exactly as it carries both sets of impls.
-        if fallback.traits.contains("Json") {
-            // Mirrors the `Json`/`Wire` macro entry points: the validating
-            // `from_json` yields a `Result` (I3), so the output needs `Result`
-            // in scope; it reads JSON through methods (`try_parse_json`,
-            // `has_field`), so no `parse_json_value`/`panic` import.
-            prelude.push_str("import std::json::{ Json, FromJson, JsonValue };\n");
-            // A BACKED enum's decode reads the bare backing value out of the
-            // JSON rather than a variant tag (backed-enums.md §3.9), so the
-            // coercions come along.
-            prelude.push_str("import std::json::{ coerce_i32, coerce_i53, coerce_str };\n");
-            prelude.push_str("import std::result::Result;\n");
-        }
-        if fallback.traits.contains("Wire") {
-            prelude.push_str(
-                "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n",
-            );
-        }
-        if fallback.traits.contains("Debug") {
-            prelude.push_str("import std::debug::Debug;\n");
-        }
-        // One import line serves both producers of an `impl .. with Hashable`:
-        // the `[derive(Hashable)]` fallback generator and a bare-lowered enum's
-        // synthesized impl. A module with both must not import it twice.
-        if fallback.traits.contains("Hashable") || fallback.bare_lowered_enums {
+        if bucket.bare_lowered_enums {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
         }
-        if fallback.backed_enums {
+        if bucket.backed_enums {
             prelude.push_str("import std::option::Option;\n");
         }
-        let combined = format!("{prelude}{}", fallback.source);
+        let combined = format!("{prelude}{}", bucket.source);
         // Deterministic per input (fixed prelude order, file-order source
         // accumulation, no gensyms), so it caches like any other generated
         // text: an unchanged program's re-analysis reuses the tree instead of
@@ -1968,7 +2012,7 @@ impl Expander<'_, '_> {
                     note: None,
                     span: (0..0).into(),
                     msg: format!(
-                        "the built-in derive generators produced invalid Vilan ({message})"
+                        "the built-in enum member generators produced invalid Vilan ({message})"
                     ),
                 });
                 None

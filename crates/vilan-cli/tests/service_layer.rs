@@ -5026,6 +5026,95 @@ fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stal
     let _ = std::fs::remove_dir_all(&toolchain);
 }
 
+/// N79: there is no Rust fallback DERIVE generator any more either, and the one
+/// path that reached it is answered with a sentence.
+///
+/// The twin of the pin above, and it lives beside it because the two are one
+/// mechanism: an annotation whose only expander is a macro a std module
+/// declares. `analyzer::derive_impl_source` was a Rust copy of the
+/// `Json`/`Wire`/`PartialEq`/`Default`/`Debug`/`Hashable` macros — 729 lines of
+/// generator, reachable only from a std missing the module that declares the
+/// macro, pinned by nothing, and free to drift from the macro it stood in for
+/// with nothing in the suite to notice. N70 is what that drift looks like when
+/// it is allowed to run: a contract hash the two halves disagreed about. So the
+/// derive refuses rather than serving a second answer.
+///
+/// The fixture is a real std with exactly one file removed, driven through
+/// `VILAN_STD`, because that is precisely the state the fallback existed for.
+/// The control is the same program against the shipped std: it compiles, which
+/// is what makes the refusal a statement about `json.vl` and not about
+/// `[derive(Json)]`.
+#[test]
+fn a_derive_over_a_std_without_its_macro_is_refused_instead_of_falling_back_to_a_rust_twin() {
+    let toolchain = temp_project("std_without_json");
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    copy_tree(&shipped.join("std"), &toolchain.join("std"));
+    // Macros resolve `macro_std` BESIDE `std`, so the fixture needs the sibling.
+    copy_tree(&shipped.join("macro_std"), &toolchain.join("macro_std"));
+    std::fs::remove_file(toolchain.join("std/src/json.vl")).expect("remove json.vl");
+
+    let dir = temp_project("derive_without_json");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "[derive(Json)]\nstruct Point {\n\tx: i32,\n}\n\nfun main() {}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .env("VILAN_STD", toolchain.join("std"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[derive(Json)]` over a std with no `json.vl` must not compile:\n{text}"
+    );
+    // The message owes an author three things: which derive, which std module
+    // it comes from, and that there is nothing behind it to fall back to.
+    for expected in [
+        "`[derive(Json)]` needs std's `json.vl`",
+        "the `Json` macro that module declares",
+        "there is no second generator behind it",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{text}"
+    );
+
+    // The control: the same program against the SHIPPED std compiles, so what
+    // is being refused is the missing module and not the derive.
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    assert!(
+        output.status.success(),
+        "the same derive must compile against the shipped std:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&toolchain);
+}
+
 /// A79: the KEYED handle return, over a real WebSocket and read off the
 /// server's own tables.
 const KEYED_HANDLE: &str = r#"import std::io::print;
