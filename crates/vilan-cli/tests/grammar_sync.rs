@@ -463,6 +463,60 @@ fn regex_matches(regex: &str, texts: &[&str]) -> Vec<bool> {
         .collect()
 }
 
+/// Every place `regex` matches in `text`, as `(offset, matched text)` — the
+/// global run of the same node `RegExp` [`regex_matches`] compiles. "Does it
+/// match anywhere" is not the question a POSITIONAL guard raises: the book's
+/// element-tag rule matches `<span>hello</span>` either way, and what E171 is
+/// about is whether it matches the closing tag as well as the opening one.
+fn regex_match_positions(regex: &str, text: &str) -> Vec<(usize, String)> {
+    const SCRIPT: &str = r#"
+        const compiled = new RegExp(process.env.VILAN_REGEX, "g");
+        const text = process.env.VILAN_TEXTS;
+        let found;
+        while ((found = compiled.exec(text)) !== null) {
+            console.log(found.index + "\t" + found[0]);
+            // An empty match would spin here; the rule cannot produce one, and
+            // a rule that starts to is a defect this loop should not hide.
+            if (found.index === compiled.lastIndex) compiled.lastIndex += 1;
+        }
+    "#;
+    let output = Command::new("node")
+        .args(["-e", SCRIPT])
+        .env("VILAN_REGEX", regex)
+        .env("VILAN_TEXTS", text)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "evaluating {regex:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            let (at, matched) = line.split_once('\t').expect("offset and text");
+            (at.parse().expect("a match offset"), matched.to_string())
+        })
+        .collect()
+}
+
+/// The book's element-tag rule: its ONE `name` rule. Addressed by className
+/// rather than by a fragment of its own regex — E161's pin found it with
+/// `regex.contains("</?")`, and E171 is exactly the change that stops the
+/// closing form being spelled that way, so the finder would have gone missing
+/// on the change it is meant to be watching.
+fn book_element_tag_rule(grammar: &Grammar) -> &Rule {
+    let rules = grammar.rules("name");
+    assert_eq!(
+        rules.len(),
+        1,
+        "{HIGHLIGHT_THEME}: one `name` (element-tag) rule expected, found {} — \
+         did its shape change?",
+        rules.len()
+    );
+    rules[0]
+}
+
 /// The rule of `grammar` under `key` whose regex spells exactly `word` — the
 /// contextual rules are one word each, so this addresses one of them.
 fn contextual_rule<'a>(grammar: &'a Grammar, key: &str, word: &str) -> &'a Rule {
@@ -1865,21 +1919,113 @@ fn e164_a_head_that_is_really_a_comparison_gives_itself_back_at_the_statement() 
     assert_eq!(painting.region_depth("1;", "meta.tag.vilan"), 0);
 }
 
+// --- E170: a head item's NAME is an attribute, not a call or a keyword ------
+//
+// `<div class("row")>` painted `class` `entity.name.function.vilan` and
+// `<input type("checkbox")>` painted `type` `storage.type.vilan` — the call
+// rule and the declaration-keyword rule reaching text inside a head, because
+// the head region had only `$self` to offer its items and the attribute
+// vocabulary lived in two rules that never asked to be in a head at all (the
+// `on:` form and a hyphenated name, both guarded by their own spelling). So
+// the head form's names were coloured by what they happen to look like
+// elsewhere: `class` like a call, `type` and `for` like the keywords they
+// spell. E164's head REGION is what makes the fix one rule — the vocabulary
+// can be asked for inside a head and nowhere else.
+//
+// Measured over the tree at the fix: of every token in all 257 tracked `.vl`
+// files and all 456 `vilan` fences under `vilan/docs`, 7 tokens change scope
+// (22 characters in `vilan/test/element-syntax.vl` — `class`, `title`, `type`,
+// `viewBox`, `d`; 16 in two doc fences — `class`, `placeholder`), and every
+// one is a head item's own name. The builder spelling is untouched, which is
+// the control that matters: `view("p").class("summary")` is a CALL and stays
+// `entity.name.function.vilan` in all six `.vl` files that write it.
+
+/// Every shape the rule has to tell apart, in one program: a plain attribute
+/// name, two keyword-named ones, the `on:` form and a hyphenated name (the two
+/// that already worked), a chained call inside a head item, a call outside any
+/// head, and a postfix chain hanging off the element.
+const E170_HEAD_ITEM_NAMES: &str = "\
+fun probe(flag: bool): View {
+\tlet widget = compute(\"x\");
+\t<label class(\"row\") for(\"name\") hidden.show(flag)>
+\t\t<input type(\"checkbox\") on:click(|_| { bump(); }) aria-label(\"y\") />
+\t\t{widget}
+\t</label>.child(<span>\"tail\"</span>)
+}
+";
+
+#[test]
+fn e170_a_head_items_name_is_an_attribute_name_whatever_it_spells() {
+    let Some(painting) = painting(E170_HEAD_ITEM_NAMES) else {
+        return;
+    };
+    let attribute = "entity.other.attribute-name.vilan";
+    // THE DEFECT: a plain name went to the call rule, and a name that spells a
+    // keyword went to the keyword list — `for` to `keyword.control.vilan` and
+    // `type` to `storage.type.vilan`, the scope the declaration keyword takes.
+    assert_eq!(painting.scope_at("class"), attribute, "a plain name");
+    assert_eq!(painting.scope_at("for("), attribute, "a control keyword");
+    assert_eq!(
+        painting.scope_at("type("),
+        attribute,
+        "a declaration keyword"
+    );
+    // The two that already carried it, from rules of their own, unchanged.
+    assert_eq!(painting.scope_at("click"), attribute, "the `on:` form");
+    assert_eq!(
+        painting.scope_at("aria-label"),
+        attribute,
+        "a hyphenated name"
+    );
+    // And every one of them is inside the head, which is the only place this
+    // vocabulary is offered.
+    for name in ["class", "for(", "type(", "click", "aria-label"] {
+        assert_eq!(painting.region_depth(name, "meta.tag.vilan"), 1, "{name}");
+    }
+}
+
+#[test]
+fn e170_a_call_is_still_a_call_inside_a_head_item_and_outside_one() {
+    let Some(painting) = painting(E170_HEAD_ITEM_NAMES) else {
+        return;
+    };
+    let call = "entity.name.function.vilan";
+    // Inside a head, but not a head item's own name: the rule's lookbehind
+    // declines a name glued to a `.`, so a chained call keeps the call scope.
+    assert_eq!(painting.scope_at("show"), call, "`hidden.show(flag)`");
+    assert_eq!(painting.region_depth("show", "meta.tag.vilan"), 1);
+    // Inside a head item's VALUE — `#element-head-value`'s region, which this
+    // rule is not part of, so an argument paints as it would anywhere.
+    assert_eq!(painting.scope_at("bump"), call, "a call in a closure value");
+    assert_eq!(painting.region_depth("bump", "meta.tag.vilan"), 1);
+    // Outside any head: an ordinary call, and the postfix chain the element
+    // itself hangs — the head has ended at its `>` before the `.child(` runs.
+    assert_eq!(
+        painting.scope_at("compute"),
+        call,
+        "a call before the element"
+    );
+    assert_eq!(painting.region_depth("compute", "meta.tag.vilan"), 0);
+    assert_eq!(
+        painting.scope_at("child"),
+        call,
+        "the element's postfix chain"
+    );
+    assert_eq!(painting.region_depth("child", "meta.tag.vilan"), 0);
+}
+
 /// The book's twin (the third place). highlight.js has no operator rule, so its
 /// brackets were never mis-scoped — but its element-tag rule made the very same
 /// `<type` mistake, and takes the very same guard.
 #[test]
 fn e161_the_books_tag_rule_ignores_a_generic_head_too() {
     let grammar = highlight_grammar(&[]);
-    let tag = grammar
-        .rules("name")
-        .into_iter()
-        .map(|rule| rule.regex.clone())
-        .find(|regex| regex.contains("</?"))
-        .expect("the book's element-tag rule");
+    // Addressed by className (E171): this pin used to find the rule by
+    // `regex.contains("</?")`, which is the very spelling E171 changed.
+    let tag = &book_element_tag_rule(&grammar).regex;
     assert_eq!(
         regex_matches(
-            &tag,
+            tag,
             &[
                 "Option<type _>",
                 "SignalCell<str>",
@@ -1890,8 +2036,73 @@ fn e161_the_books_tag_rule_ignores_a_generic_head_too() {
         "the book still reads a generic head as a tag: {tag}"
     );
     assert_eq!(
-        regex_matches(&tag, &["<div>", "</div>", "<my-tag>"]),
+        regex_matches(tag, &["<div>", "</div>", "<my-tag>"]),
         vec![true, true, true],
         "the book stopped matching an element: {tag}"
     );
+}
+
+// --- E171: the book's closing tag carries the argument list's guard ---------
+//
+// E164 fixed the closing tag in the TextMate grammar by giving it a rule of
+// its own, deliberately without the opening form's atom-position guard. The
+// book's element-tag rule is ONE regex for both forms, and the guard sat
+// outside them both: `(?<=(?<![A-Za-z0-9_])</?)`, which reads "the `<` of
+// either form, and not after an identifier character". That guard is only ever
+// about an argument list — a tag `<` OPENS an atom, so a `<` glued to a name
+// is `SignalCell<str>` and not markup — and a `</` is never an argument list
+// whatever precedes it. So the book refused a closing tag glued to text for a
+// reason that cannot apply to it. The one-regex fix moves the guard inside:
+// `(?<=</|(?<![A-Za-z0-9_])<)`.
+//
+// LATENT, and measured rather than asserted. At the REGEX level the shape IS
+// reached — over all 456 `vilan` fences under `vilan/docs` and all 257 tracked
+// `.vl` files the fixed rule gains 10 matches in 6 files — but every one of
+// them is inside a STRING or a COMMENT (`encode_utf8("<h1>hello</h1>")`,
+// `markup + "\t</body>\n</html>\n"`, `// <p class="greeting">world</p>`), and
+// `hljs.COMMENT`, the three string modes and the i-string modes all sit BEFORE
+// the element rule in the language's `contains`, so the text is consumed
+// before the tag rule is offered it and nothing rendered moves. In vilan
+// itself a bare text child is a parse error, which is why no LIVE closing tag
+// in the tree follows an identifier character: every one follows a `"`, a `}`
+// or a `>`.
+
+/// The shape the guard refused: a closing tag whose `<` is glued to text
+/// ending in an identifier character. `<span>hello</span>` — `<` at 0, `span`
+/// at 1, `</` at 11, `span` at 13.
+const E171_GLUED_CLOSING_TAG: &str = "<span>hello</span>";
+
+#[test]
+fn e171_the_books_closing_tag_is_a_tag_after_an_identifier_character() {
+    let grammar = highlight_grammar(&[]);
+    let tag = &book_element_tag_rule(&grammar).regex;
+    // THE DEFECT: only the opening tag matched — the closing one was refused
+    // by the argument-list guard, for a reason a `</` cannot raise.
+    assert_eq!(
+        regex_match_positions(tag, E171_GLUED_CLOSING_TAG),
+        vec![(1, "span".to_string()), (13, "span".to_string())],
+        "{HIGHLIGHT_THEME}: both tags of {E171_GLUED_CLOSING_TAG:?} are tags: {tag}"
+    );
+    // The closing form that always worked, because a `}` is not an identifier
+    // character — unchanged, which is what says the guard MOVED rather than
+    // went.
+    assert_eq!(
+        regex_match_positions(tag, "<p>{name}</p>"),
+        vec![(1, "p".to_string()), (11, "p".to_string())],
+        "{HIGHLIGHT_THEME}: a closing tag after a hole: {tag}"
+    );
+    // And the guard still does its own job on the OPENING form: a `<` glued to
+    // a name is an argument list (E161), and a spaced comparison is neither.
+    for probe in [
+        "SignalCell<str>",
+        "Option<type _>",
+        "Source<Option<type _: Source<type U>>>",
+        "let flag = a < b;",
+    ] {
+        assert_eq!(
+            regex_match_positions(tag, probe),
+            Vec::new(),
+            "{HIGHLIGHT_THEME}: {probe:?} is not markup: {tag}"
+        );
+    }
 }

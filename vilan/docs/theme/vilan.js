@@ -118,9 +118,22 @@
 		// rule fired on `<type`, `<str`, `<sync` — any lowercase word glued to
 		// a `<` — and painted the binder keyword as an element name, the same
 		// mistake the TextMate grammar made in the same head.
+		//
+		// That guard belongs to the OPENING form only (E171). Written
+		// `(?<=(?<![A-Za-z0-9_])</?)` it sat before the `<` of both, so a
+		// CLOSING tag glued to text — `<span>hello</span>`, where `hello`
+		// ends in an identifier character — was refused for a reason that is
+		// only ever about an argument list, and a `</` is never one whatever
+		// precedes it. The TextMate grammar had the same defect in the same
+		// head and E164 fixed it there by giving the closing tag a guardless
+		// rule of its own; here the two forms are one regex, so the guard
+		// moves inside it: `</` unconditionally, or a bare `<` in atom
+		// position. Latent rather than live — a bare text child is a parse
+		// error in vilan, so every closing tag in the book follows a `"`, a
+		// `}` or a `>` — and this is what it costs to keep it that way.
 		const ELEMENT_TAG = {
 			className: "name",
-			begin: "(?<=(?<![A-Za-z0-9_])</?)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
+			begin: "(?<=</|(?<![A-Za-z0-9_])<)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
 		};
 		const ELEMENT_EVENT = {
 			className: "attr",

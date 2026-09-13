@@ -281,3 +281,14 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 Everything but the two paths applies live. **Vilan: Restart Language
 Server** is in the command palette when you want the blunt instrument, and
 the **Vilan Language Server** output channel carries the server's own log.
+
+**Vilan: Show Language Server Status** writes this session's profile to that
+same channel: the extension's request tally first — session age, server
+starts, per-request count / mean / max, slowest total first — and then the
+server's own page, which adds its retained-state cardinalities (open
+documents, how many still hold a program, caches, pending analyses), the
+analysis counts, its own per-request profile, and its memory reading:
+resident size with the heap split into in-use and retained-free. The server
+writes that page by itself every 500 requests; the command asks for it now,
+which is when a session has started feeling slow. A figure the host declines
+to report prints `?` rather than a zero.

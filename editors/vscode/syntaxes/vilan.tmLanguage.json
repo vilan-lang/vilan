@@ -484,6 +484,11 @@
        "include": "#element-head-value"
       },
       {
+       "comment": "A head item's NAME (E170). Inside a head, `class(\"row\")` is an ATTRIBUTE and not a call, and `type(\"checkbox\")` / `for(\"name\")` are attributes too rather than the declaration and control keywords they happen to spell. Before this rule the head had only `$self` to offer them, so a plain name was painted `entity.name.function.vilan` by the call rule and a keyword-named one by the keyword list \u2014 and only the `on:` form and a hyphenated name carried the attribute vocabulary, each by a rule of its own that needs no head to fire. E164's head REGION is what makes this one rule enough: the vocabulary can now be asked for inside a head and nowhere else. It sits before `$self` so it wins the tie at the name's first character (TextMate takes the leftmost match and breaks a tie by list order), and the lookbehind is what keeps it to a head item's OWN name: a `.` leaves a chained call alone (`hidden.show(..)`), a `-` leaves a hyphenated name to the rule that paints the whole of it rather than its last segment, and a `:` leaves `on:click` to the event rule. A value's parentheses are `#element-head-value`'s region, which this rule is not part of, so a genuine call inside a value (`on:click(|| go())`) is still a call.",
+       "match": "(?<![A-Za-z0-9_.:-])([a-z][a-zA-Z0-9_]*)(?=\\()",
+       "name": "entity.other.attribute-name.vilan"
+      },
+      {
        "include": "$self"
       }
      ]

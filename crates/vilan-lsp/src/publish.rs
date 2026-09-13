@@ -525,27 +525,34 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
     // completed union and is EMPTY whenever there is none, which is the
     // withdraw-on-edit rule: a gray is a claim the user acts on by deleting, so
     // it may be arbitrarily stale toward fewer grays and never toward more.
-    let mut faded: Vec<(String, Vec<Span>)> = vec![
-        ("unused import".to_string(), document.unused_import_spans()),
-        ("unused local".to_string(), document.unused_local_spans()),
-        ("unreachable code".to_string(), document.unreachable_spans()),
-        (
-            "no entry uses this item".to_string(),
-            document.dead_item_spans(),
-        ),
-    ];
-    faded.extend(document.unloaded_module_paint());
-    for (message, spans) in faded {
-        for span in spans {
-            entry_group.push(Diagnostic {
-                range: document.analyzed_range(&span),
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("vilan".to_string()),
-                message: message.clone(),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+    //
+    // The group carries a message PER SPAN since E173, rather than one message
+    // over a producer's whole list. Four of the five producers still answer one
+    // message for every span they hand back — they are one fix each, which was
+    // the reason for the shape — but the imports third is not: a leaf whose
+    // statement Organize Imports REWRITES rather than deletes (E168) needs to
+    // say so, and said "unused import" instead, which is the one place the fade
+    // and the action it names disagreed.
+    let mut faded: Vec<(Span, String)> = document.unused_import_spans();
+    for (message, spans) in [
+        ("unused local", document.unused_local_spans()),
+        ("unreachable code", document.unreachable_spans()),
+        ("no entry uses this item", document.dead_item_spans()),
+    ] {
+        faded.extend(spans.into_iter().map(|span| (span, message.to_string())));
+    }
+    if let Some((message, spans)) = document.unloaded_module_paint() {
+        faded.extend(spans.into_iter().map(|span| (span, message.clone())));
+    }
+    for (span, message) in faded {
+        entry_group.push(Diagnostic {
+            range: document.analyzed_range(&span),
+            severity: Some(DiagnosticSeverity::HINT),
+            source: Some("vilan".to_string()),
+            message,
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
     }
     let mut groups = vec![(owner.clone(), entry_group)];
     groups.extend(extra_groups);
@@ -785,6 +792,62 @@ mod tests {
                 .iter()
                 .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
             "a clean file with an unused import has no errors or warnings: {published:#?}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E173 at the wire: the group carries a message PER SPAN now, and the one
+    /// span that needs its own is the leaf whose statement Organize Imports
+    /// REWRITES rather than deletes (E168). The point of the pin is that the
+    /// widening changed the TEXT and nothing else — same HINT severity, same
+    /// `Unnecessary` tag, same range over the leaf rather than the statement,
+    /// and still nothing else published — because the severity is the posture
+    /// and a message that arrived as a Warning would enter the count the owner
+    /// asked these to stay out of.
+    #[test]
+    fn a_rewritten_imports_leaf_publishes_its_own_text_at_the_same_severity() {
+        let (directory, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            (
+                "a.vl",
+                "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        let uri = Url::from_file_path(directory.join("main.vl")).expect("a file URL");
+        let published = PublishState::new()
+            .plan_publish(&uri, &document)
+            .into_iter()
+            .find(|(target, _)| *target == uri)
+            .map(|(_, group)| group)
+            .expect("the entry publishes");
+        let faded: Vec<&Diagnostic> = published
+            .iter()
+            .filter(|item| item.tags.as_deref() == Some(&[DiagnosticTag::UNNECESSARY]))
+            .collect();
+        assert_eq!(faded.len(), 1, "one faded leaf: {published:#?}");
+        assert_eq!(faded[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(
+            faded[0].message,
+            "unused; the module's impls are in use — Organize Imports rewrites this to \
+             `import pkg::a;`",
+        );
+        assert_eq!(
+            faded[0].range,
+            range_of(
+                &std::fs::read_to_string(directory.join("main.vl")).expect("readable"),
+                "b",
+                0
+            ),
+            "over the leaf, not the whole statement",
+        );
+        assert!(
+            published
+                .iter()
+                .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
+            "a green file with a widened import has no errors or warnings: {published:#?}",
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
