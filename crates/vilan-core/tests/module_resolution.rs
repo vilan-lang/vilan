@@ -5150,3 +5150,169 @@ fn b331_a_declaration_shadowing_a_real_lib_directory_is_ambiguous() {
         "the collision the hand-skip hid is reported: {errors:#?}"
     );
 }
+
+// --- B332: a type segment REPLACES the walk's namespace ----------------------
+//
+// B317 shipped the struct half the safe way round — a type's namespace asked
+// SECOND, after the scope the walk was standing in, so no path that resolved
+// changed meaning. That left the two kinds of type segment inconsistent: an
+// ENUM segment had always replaced the scope with its variants, while a STRUCT
+// segment kept the module scope, so a module-level `rem` beside `Length` beat
+// `Length::rem` in the file that declares both, silently. One rule now: a type
+// segment replaces the namespace, enum and struct alike. The estate was
+// censused before the change — no import in std, the corpus, `examples/`, the
+// templates, the benchmarks, the docs' fences or kolt reaches a module item
+// through a type-named prefix — and the miss the change makes is curated, so a
+// path outside the tree that did is handed the spelling that replaces it.
+
+/// The shadowing pair the item is filed on, in miniature: one module declaring
+/// both a type with a `rem` static and a module-level `rem` of its own.
+const B332_SHADOWING_PAIR: &str = "struct Length {\n\tvalue: i32,\n}\n\nimpl Length {\n\tfun \
+                                   rem(value: i32): Length {\n\t\tLength { value = value }\n\t}\n}\
+                                   \n\nfun rem(value: i32): i32 { value * 16 }\n";
+
+#[test]
+fn b332_a_struct_segment_replaces_the_module_scope() {
+    // `Length::rem` is the static, in the one file where the old order made it
+    // the module's function. The RESULT TYPE is the assertion: the static
+    // answers a `Length` (which has `.value`), the module-level `rem` an `i32`
+    // (which does not), so a pin on the meaning rather than on a message.
+    let files = &[
+        ("style.vl", B332_SHADOWING_PAIR),
+        (
+            "main.vl",
+            "import pkg::style::Length::rem;\n\nfun main() { let _ = rem(1).value; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "the type's namespace is the path's namespace: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_the_module_item_keeps_its_own_path() {
+    // The other half of the same pair, and the reason the change costs nothing:
+    // the module-level `rem` is reached by the module's path, which is what it
+    // always meant. `i32 * 16` has no `.value`, so this pins the opposite
+    // meaning as sharply as the pin above.
+    let files = &[
+        ("style.vl", B332_SHADOWING_PAIR),
+        (
+            "main.vl",
+            "import pkg::style::rem;\n\nfun main() { let _ = rem(1) + 1; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a module item is reached through its module: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_a_module_item_is_not_reachable_through_a_type_segment() {
+    // The BREAKING half, and its curated steer. `px` is an item of the module,
+    // not a member of `Length`; the old order let the module scope answer under
+    // the type prefix, and the miss that replaces it names the spelling that
+    // works rather than reporting a name the author can see declared as
+    // missing.
+    let files = &[
+        (
+            "style.vl",
+            "struct Length {\n\tvalue: i32,\n}\n\nimpl Length {\n\tfun rem(value: i32): Length \
+             {\n\t\tLength { value = value }\n\t}\n}\n\nfun px(value: i32): i32 { value }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::style::Length::px;\n\nfun main() { let _ = px(1); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is not a member of the type"))
+        .unwrap_or_else(|| panic!("a module item under a type prefix is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`px`") && refusal.contains("`Length`"),
+        "and names both: {refusal}"
+    );
+    assert!(
+        refusal.contains("Write `pkg::style::px`"),
+        "and hands over the spelling that replaces it: {refusal}"
+    );
+}
+
+#[test]
+fn b332_an_enum_segment_is_the_control_it_always_was() {
+    // The kind the rule is copied FROM: an enum segment has always replaced the
+    // scope with its variants, so a module-level `fallback` never shadowed
+    // `Colour::fallback`. Unchanged by B332, and here to say so — the struct
+    // arm agrees with this one now instead of contradicting it.
+    let files = &[
+        (
+            "colour.vl",
+            "enum Colour {\n\tRed,\n\tGreen,\n}\n\nimpl Colour {\n\tfun fallback(): Colour \
+             {\n\t\tColour::Red\n\t}\n}\n\nfun fallback(): i32 { 1 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::colour::Colour;\nimport pkg::colour::Colour::fallback;\n\nfun main() { \
+             let _ = match fallback() { Colour::Red => 1, Colour::Green => 2 }; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "the enum's static outranks a module-level twin, as it always has: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_an_enums_variants_still_travel_their_path() {
+    // The control that says how much of the enum walk is untouched: the
+    // variants scope is still what the segment hands over, and `self` still
+    // binds the type beside them.
+    let files = &[
+        (
+            "colour.vl",
+            "enum Colour {\n\tRed,\n\tGreen,\n}\n\nfun Red(): i32 { 9 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::colour::Colour::{ self, Red, Green };\n\nfun main() { let colour: \
+             Colour = Red; let _ = match colour { Red => 1, Green => 2 }; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a brace set of variants is unmoved: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_a_self_method_is_still_refused_by_name_under_the_new_order() {
+    // B317's refusal reads the same subject the walk now stands in, so it must
+    // still fire: a `self` method is in the type's namespace and is not
+    // importable out of it.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun doubled(self): i32 {\n\t\tself.x \
+             * 2\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::shapes::Point::doubled;\n\nfun main() {}\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`Point::doubled` takes `self`")),
+        "the `self` refusal outranks the miss: {errors:#?}"
+    );
+}

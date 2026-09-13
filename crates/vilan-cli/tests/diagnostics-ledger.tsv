@@ -465,3 +465,4 @@ row	flagship	key
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
 433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
 NEW	-	`{parent}::lib` is module `{leaf}`'s own BODY FILE, not a module below it: `{directory}/lib.vl` is what `{parent}` resolves to. Import `{parent}` instead — the items that file declares are `{parent}`'s own
+NEW	-	`{part}` is not a member of the type `{subject_name}`: it is an item of `{module_path}`, and a type segment REPLACES the path's namespace rather than adding to it. Write `{module_path}::{part}`
