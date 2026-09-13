@@ -1,7 +1,9 @@
 //! Pins for the embedded toolchain (proposal/releases.md §3): the embedded
 //! table must mirror the working tree exactly (both directions — a collector
 //! that misses a directory is a silently incomplete toolchain), and
-//! materialization must produce a complete, idempotent, real-file copy.
+//! materialization must produce a complete, idempotent, real-file copy — and
+//! PRUNE the root it just grew (L21), which is what keeps a machine that builds
+//! the toolchain from source from accumulating one std tree per build.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -145,6 +147,162 @@ fn pruning_removes_only_entries_older_than_the_guard() {
     // A missing root is a quiet no-op, not an error.
     let _ = fs::remove_dir_all(&cache_root);
     assert_eq!(prune_stale(&cache_root, one_day), 0);
+}
+
+/// L21: materializing a NEW hash prunes the root it just grew.
+///
+/// `vilan upgrade` was the only pruner, and a toolchain refreshed from source
+/// never runs it — so every lane binary and every release build left a tree
+/// behind forever (374 entries, 316 MB on the owner's machine in two months).
+/// The moment the cache GROWS is the moment worth pruning at, and it is the
+/// only moment: an existing entry returns before any of this.
+///
+/// The guard is what makes it safe rather than the ordering: an entry's mtime
+/// is its creation time and nothing touches it after the rename, so the tree
+/// written a moment ago is the youngest thing in the root. Both halves are
+/// pinned here — the week-old sibling goes, the fresh one stays, and the entry
+/// this call just wrote is present at the end.
+#[test]
+fn materializing_a_new_hash_prunes_a_stale_sibling_and_keeps_a_fresh_one() {
+    let cache_root = std::env::temp_dir().join(format!(
+        "vilan-embedded-std-materialize-prune-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache_root);
+    for sibling in ["fresh-sibling", "stale-sibling"] {
+        fs::create_dir_all(cache_root.join(sibling).join("std")).expect("seed sibling");
+    }
+    let eight_days = std::time::Duration::from_secs(8 * 24 * 60 * 60);
+    backdate(
+        &cache_root.join("stale-sibling"),
+        std::time::SystemTime::now() - eight_days,
+    );
+
+    let std_dir = materialize_into(&cache_root).expect("materialize");
+
+    assert!(
+        !cache_root.join("stale-sibling").exists(),
+        "a sibling past the seven-day guard must go when a new hash lands"
+    );
+    assert!(
+        cache_root.join("fresh-sibling").is_dir(),
+        "a sibling inside the guard may belong to a running binary and must stay"
+    );
+    assert!(
+        std_dir.join("vilan.toml").is_file(),
+        "the entry this call wrote must survive its own prune"
+    );
+
+    let _ = fs::remove_dir_all(&cache_root);
+}
+
+/// L21: the current hash survives, at any age.
+///
+/// Two independent reasons, and the pin holds both at once. A cache HIT returns
+/// before the prune runs at all — nothing landed, so nothing is swept — and
+/// `prune` exempts [`CONTENT_HASH`]'s own entry however old it is, because
+/// deleting a tree the running compile is reading buys nothing: the next
+/// resolution writes it straight back.
+#[test]
+fn the_current_hash_survives_its_own_prune_however_old_it_is() {
+    let cache_root = std::env::temp_dir().join(format!(
+        "vilan-embedded-std-current-survives-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache_root);
+    let std_dir = materialize_into(&cache_root).expect("materialize");
+    let current = cache_root.join(CONTENT_HASH);
+    let eight_days = std::time::Duration::from_secs(8 * 24 * 60 * 60);
+    backdate(&current, std::time::SystemTime::now() - eight_days);
+
+    // The cache-hit path: it returns before the prune, and answers the same.
+    assert_eq!(materialize_into(&cache_root).expect("second"), std_dir);
+    assert!(current.is_dir(), "a cache hit must not sweep anything");
+
+    // And the sweep itself declines it, under the age guard and under `--all`.
+    let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+    assert!(
+        vilan_embedded_std::prune(&cache_root, Some(one_day), false).is_empty(),
+        "this binary's own tree is never pruned by age"
+    );
+    assert!(
+        vilan_embedded_std::prune(&cache_root, None, false).is_empty(),
+        "this binary's own tree is never pruned by `--all` either"
+    );
+    assert!(current.is_dir());
+
+    let _ = fs::remove_dir_all(&cache_root);
+}
+
+/// L21: a dry run reports exactly what a real run would remove, and removes
+/// nothing.
+///
+/// The two calls are made against the SAME root in sequence — the dry run
+/// first, then the real one — so the claim is not that the two lists look alike
+/// but that the first list is the second's, entry for entry.
+#[test]
+fn a_dry_run_names_what_would_go_and_removes_nothing() {
+    let cache_root =
+        std::env::temp_dir().join(format!("vilan-embedded-std-dry-run-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&cache_root);
+    for entry in ["fresh-entry", "stale-entry", ".staging-stale"] {
+        fs::create_dir_all(cache_root.join(entry).join("std")).expect("seed entry");
+        fs::write(cache_root.join(entry).join("std/vilan.toml"), "x").expect("seed file");
+    }
+    let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+    let long_ago = std::time::SystemTime::now() - 2 * one_day;
+    for stale in ["stale-entry", ".staging-stale"] {
+        backdate(&cache_root.join(stale), long_ago);
+    }
+
+    let would_go = vilan_embedded_std::prune(&cache_root, Some(one_day), true);
+    let mut named: Vec<&str> = would_go.iter().map(|entry| entry.name.as_str()).collect();
+    named.sort_unstable();
+    assert_eq!(named, [".staging-stale", "stale-entry"]);
+    assert!(
+        would_go.iter().all(|entry| entry.bytes > 0),
+        "a dry run reports sizes, so it must read them: {would_go:?}"
+    );
+    for entry in ["fresh-entry", "stale-entry", ".staging-stale"] {
+        assert!(cache_root.join(entry).is_dir(), "a dry run removed {entry}");
+    }
+
+    let went = vilan_embedded_std::prune(&cache_root, Some(one_day), false);
+    let mut really: Vec<&str> = went.iter().map(|entry| entry.name.as_str()).collect();
+    really.sort_unstable();
+    assert_eq!(really, named, "the dry run named something else than went");
+    assert!(cache_root.join("fresh-entry").is_dir());
+    assert!(!cache_root.join("stale-entry").exists());
+
+    let _ = fs::remove_dir_all(&cache_root);
+}
+
+/// L21: `--all` drops the age guard and nothing else — `prune(.., None, ..)`.
+#[test]
+fn pruning_everything_ignores_the_age_guard_and_keeps_the_current_tree() {
+    let cache_root = std::env::temp_dir().join(format!(
+        "vilan-embedded-std-prune-all-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache_root);
+    materialize_into(&cache_root).expect("materialize");
+    for entry in ["fresh-entry", "another-fresh-entry"] {
+        fs::create_dir_all(cache_root.join(entry).join("std")).expect("seed entry");
+    }
+
+    let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+    assert!(
+        vilan_embedded_std::prune(&cache_root, Some(one_day), false).is_empty(),
+        "nothing here is a day old"
+    );
+    let went = vilan_embedded_std::prune(&cache_root, None, false);
+    assert_eq!(went.len(), 2, "`--all` takes both young siblings: {went:?}");
+    assert!(
+        cache_root.join(CONTENT_HASH).is_dir(),
+        "`--all` still keeps this binary's own tree"
+    );
+
+    let _ = fs::remove_dir_all(&cache_root);
 }
 
 /// Set a cache entry's modification time, so the prune guard sees it as old.

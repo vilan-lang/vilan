@@ -4,6 +4,12 @@
 //! "release" binaries are shell scripts that identify themselves, so a swap
 //! is observable by running the result.
 //!
+//! `vilan cache prune` (L21) is pinned here too, and for the fixture rather
+//! than for the command: the scratch `HOME` below already seeds a std cache
+//! with one entry inside the seven-day guard and one past it, which is exactly
+//! what a prune has to tell apart. The cache is the one piece of `~/.vilan`
+//! both commands work on.
+//!
 //! **The whole file is unix** (windows-support.md §4, §8), not just a test or
 //! two: the fake release binaries are `#!/bin/sh` scripts, they are made
 //! executable through `PermissionsExt`'s `0o755` (the import below does not
@@ -147,6 +153,17 @@ impl Fixture {
                 .env("HOME", &self.home)
                 .env("VILAN_UPGRADE_BASE", &self.base_url)
                 .env("VILAN_UPGRADE_LATEST", latest),
+        )
+    }
+
+    /// `vilan cache prune` against the fixture's scratch `HOME`, so the
+    /// command resolves the seeded cache and never the machine's own.
+    fn cache(&self, arguments: &[&str]) -> Output {
+        run_retrying(
+            Command::new(self.bin.join("vilan"))
+                .arg("cache")
+                .args(arguments)
+                .env("HOME", &self.home),
         )
     }
 
@@ -393,4 +410,70 @@ fn run_retrying(command: &mut Command) -> Output {
             other => return other.expect("run the binary"),
         }
     }
+}
+
+/// L21: `vilan cache prune --dry-run` names the stale entry, with its size, and
+/// deletes nothing.
+///
+/// The fixture's scratch `HOME` is what makes this safe to run at all: the
+/// command resolves `~/.vilan/std-cache` through the same `home_dir` the
+/// compiler does, so the pin drives the real path over a seeded cache instead
+/// of the machine's own.
+#[test]
+fn cache_prune_dry_run_names_the_stale_entry_and_deletes_nothing() {
+    let fixture = Fixture::new("cache-dry-run");
+    let output = fixture.cache(&["prune", "--dry-run"]);
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        output.status.success(),
+        "`cache prune --dry-run` failed:\n{text}"
+    );
+    assert!(
+        text.contains("would prune 1 entry"),
+        "a dry run says what it WOULD do:\n{text}"
+    );
+    assert!(
+        text.contains("stale-entry"),
+        "the entry that would go is named:\n{text}"
+    );
+    assert!(
+        !text.contains("fresh-entry"),
+        "an entry inside the guard is not offered for removal:\n{text}"
+    );
+    assert!(
+        fixture.cache_entry("stale-entry").is_dir(),
+        "a dry run must delete nothing"
+    );
+    assert!(fixture.cache_entry("fresh-entry").is_dir());
+}
+
+/// L21: `vilan cache prune` deletes what the dry run named, and only that.
+///
+/// The explicit gesture, for the machine the two automatic prunes did not
+/// catch up with — materialization prunes when a new hash lands and `vilan
+/// upgrade` prunes while it owns `~/.vilan`, and a developer who neither
+/// upgrades nor materializes a new std is exactly who this command is for.
+#[test]
+fn cache_prune_deletes_the_stale_entry_and_keeps_the_fresh_one() {
+    let fixture = Fixture::new("cache-prune");
+    let output = fixture.cache(&["prune"]);
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(output.status.success(), "`cache prune` failed:\n{text}");
+    assert!(
+        text.contains("pruned 1 entry") && text.contains("stale-entry"),
+        "the run reports what went:\n{text}"
+    );
+    assert!(!fixture.cache_entry("stale-entry").exists());
+    assert!(
+        fixture.cache_entry("fresh-entry").is_dir(),
+        "an entry inside the seven-day guard may belong to a running compile"
+    );
+
+    // A second run has nothing left to do and says so rather than failing.
+    let again = fixture.cache(&["prune"]);
+    let text = String::from_utf8_lossy(&again.stdout).to_string();
+    assert!(again.status.success());
+    assert!(text.contains("nothing to prune"), "{text}");
 }
