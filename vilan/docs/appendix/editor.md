@@ -186,7 +186,7 @@ and two source actions:
 
 | Action | Does |
 |---|---|
-| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. Offered only when it would change something |
+| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* to the bare module import (`import pkg::a::b;` becomes `import pkg::a;`) when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. Offered only when it would change something |
 | **Add All Missing Imports** | applies every unambiguous import quickfix in the file at once, skipping the ambiguous ones |
 
 An import the **prelude** covers is stripped for the same reason an unused

@@ -4133,11 +4133,22 @@ impl Document {
                 // the file's import list, so a reference written there is not
                 // mistaken for the file using the import.
                 let import_spans = vilan_core::formatter::import_statement_spans(source);
-                let keep =
-                    |leaf_span: Span| self.import_leaf_is_used(program, leaf_span, &import_spans);
-                vilan_core::formatter::organize_import_runs(source, &keep)
+                // E169: what this file's OTHER import leaves already bind, so a
+                // whole-module leaf is judged on what the module import ALONE
+                // brings. Computed once for the pass — it is a walk of every
+                // leaf, and asking it per leaf would be that walk squared.
+                let bound = self.definitions_bound_by_import_leaves(program, source);
+                let keep = |leaf_span: Span| {
+                    self.import_leaf_is_used(program, leaf_span, &import_spans, &bound)
+                };
+                // E168: the second question, asked only of a statement the
+                // first emptied out.
+                let keep_module = |module_span: Span| {
+                    self.import_module_is_used(program, module_span, &import_spans, &bound)
+                };
+                vilan_core::formatter::organize_import_runs(source, &keep, &keep_module)
             }
-            None => vilan_core::formatter::organize_import_runs(source, &|_| true),
+            None => vilan_core::formatter::organize_import_runs(source, &|_| true, &|_| false),
         };
         edits
             .map(|edits| {
@@ -4182,9 +4193,10 @@ impl Document {
         // since a stale document decides nothing above.
         let source = self.analyzed_text();
         let import_spans = vilan_core::formatter::import_statement_spans(source);
+        let bound = self.definitions_bound_by_import_leaves(program, source);
         vilan_core::formatter::import_leaf_name_spans(source)
             .into_iter()
-            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans))
+            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans, &bound))
             .collect()
     }
 
@@ -4496,16 +4508,10 @@ impl Document {
         program: &Program,
         leaf_span: Span,
         import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
     ) -> bool {
         let entry = SourceId(0);
-        let Some(definition_id) = program
-            .type_references
-            .iter()
-            .find_map(|(source, span, definition, _)| {
-                (*source == entry && *span == leaf_span).then_some(*definition)
-            })
-            .flatten()
-        else {
+        let Some(definition_id) = self.import_path_definition(program, leaf_span) else {
             // The leaf binds nothing this analysis recorded — keep it, since
             // pruning on no evidence is how a green build gets broken.
             return true;
@@ -4566,22 +4572,132 @@ impl Document {
         if matches!(
             crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
-        ) && let Some(home) = program.source_of(definition_id)
-        {
-            // A module whose file is this one brings nothing new, and would
-            // otherwise match every local declaration and never prune.
-            if home != entry {
-                return self
-                    .reference_index
-                    .occurrences_in(entry)
-                    .any(|occurrence| {
-                        !written_in_an_import(occurrence.span)
-                            && crate::references::declaration_source(program, occurrence.definition)
-                                == Some(home)
-                    });
-            }
+        ) {
+            return self.module_import_brings_a_use(
+                program,
+                definition_id,
+                import_spans,
+                bound_by_leaves,
+            );
         }
         false
+    }
+
+    /// The definition an import PATH SEGMENT at `span` binds — a leaf's own, or
+    /// an intermediate module's. `resolve_import` records every segment as a
+    /// reference at its own span (`flatten_namespace_branch`/`record_reference`),
+    /// so one lookup answers for both, and a segment this analysis did not
+    /// record answers `None`.
+    fn import_path_definition(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .type_references
+            .iter()
+            .find_map(|(source, at, definition, _)| {
+                (*source == SourceId(0) && *at == span).then_some(*definition)
+            })
+            .flatten()
+    }
+
+    /// Every definition this file's top-level import LEAVES bind, aliases
+    /// included — E169's exclusion set.
+    ///
+    /// A whole-module import is kept by rule (2) when the file resolves
+    /// something declared in the module's file. That test counted EVERYTHING
+    /// declared there, including the names the file imported by their own
+    /// leaves — so `import pkg::a;` sitting beside `import pkg::a::b;` was kept
+    /// forever by `b`'s uses, although it is `b`'s own leaf that provides them
+    /// and the module import brings nothing the file spells. Subtracting what
+    /// the other leaves bind leaves exactly what the module import ALONE
+    /// carries: the methods of the `impl`s declared in that file, and anything
+    /// reached by `a::` qualification (which references the module leaf itself
+    /// and is rule (1)'s).
+    ///
+    /// Keyed on the DEFINITION, alias-aware, so the set is the same address
+    /// space [`Self::import_leaf_is_used`] tests occurrences in.
+    fn definitions_bound_by_import_leaves(
+        &self,
+        program: &Program,
+        source: &str,
+    ) -> HashSet<Definition> {
+        let entry = SourceId(0);
+        vilan_core::formatter::import_leaf_name_spans(source)
+            .into_iter()
+            .filter_map(|leaf_span| {
+                let definition_id = self.import_path_definition(program, leaf_span)?;
+                let alias = program.import_alias_spans.get(&(entry, leaf_span)).copied();
+                Some(Definition::Entity(alias.unwrap_or(definition_id)))
+            })
+            .collect()
+    }
+
+    /// Rule (2), asked of a MODULE — the one question E168 and E169 share.
+    ///
+    /// A whole-module import brings more than its own name: every `impl` in that
+    /// module's file arrives with it, and with ANY import that reaches the
+    /// module, not only a whole-module one. So a method call whose
+    /// implementation lives there IS a use of the import even though the module
+    /// name is never written, and pruning it breaks the build — the over-pruning
+    /// half of kolt.local 004, and E168's whole subject.
+    ///
+    /// The accounting is the analyzer's own provenance: did this file resolve
+    /// anything DECLARED in the file this import reaches into, that it is not
+    /// already getting from another import leaf of its own (E169)? A module
+    /// whose file is this one brings nothing new and would otherwise match every
+    /// local declaration and never prune.
+    fn module_import_brings_a_use(
+        &self,
+        program: &Program,
+        module_id: Id,
+        import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
+    ) -> bool {
+        let entry = SourceId(0);
+        let Some(home) = program.source_of(module_id) else {
+            return false;
+        };
+        if home == entry {
+            return false;
+        }
+        self.reference_index
+            .occurrences_in(entry)
+            .any(|occurrence| {
+                !import_spans.iter().any(|statement| {
+                    statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
+                }) && !bound_by_leaves.contains(&occurrence.definition)
+                    && crate::references::declaration_source(program, occurrence.definition)
+                        == Some(home)
+            })
+    }
+
+    /// E168's rescue: whether the MODULE an emptied-out import statement reaches
+    /// into is still needed, asked at that module segment's own span.
+    ///
+    /// `import pkg::a::b;` with `b` unused used to be DELETED, and `a.vl`'s
+    /// `impl Style { fun select_off(self) … }` went with it — the next analysis
+    /// said "Style has no method 'select_off'" and the organizer had broken a
+    /// green build. `b` is genuinely unused and goes on fading; what changes is
+    /// the EDIT, which rewrites the statement to `import pkg::a;` rather than
+    /// removing it. The test is [`Self::module_import_brings_a_use`]'s, applied
+    /// to the statement's module instead of to a module LEAF — one predicate,
+    /// two callers, so the two halves cannot disagree about what a module
+    /// import is worth.
+    fn import_module_is_used(
+        &self,
+        program: &Program,
+        module_span: Span,
+        import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
+    ) -> bool {
+        let Some(module_id) = self.import_path_definition(program, module_span) else {
+            return false;
+        };
+        if !matches!(
+            crate::references::kind_of(program, Definition::Entity(module_id)),
+            Some(crate::references::DefinitionKind::Module)
+        ) {
+            return false;
+        }
+        self.module_import_brings_a_use(program, module_id, import_spans, bound_by_leaves)
     }
 
     // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
@@ -12690,6 +12806,170 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// E168/E169's helper module: a free function the entry can import by name,
+    /// and an `impl` that travels with ANY import reaching the module. The two
+    /// together are what the leaf question and the module question disagree
+    /// about — `b` is provided by its own leaf, `doubled` only by the import
+    /// reaching `a.vl`.
+    const LEAF_AND_IMPL: &str =
+        "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n";
+
+    // E168 (the s1c shape): `import pkg::a::b;` with `b` unused is NOT deleted
+    // when `a.vl`'s `impl` is what the file calls a method from — impls travel
+    // with any import that reaches the module, not only with a whole-module one,
+    // so deleting the statement took `doubled` with it and the next analysis
+    // said "i32 has no method 'doubled'". The organizer had broken a green
+    // build. The statement is REWRITTEN to the module import instead; the leaf
+    // goes on fading, because it is genuinely unused.
+    #[test]
+    fn organize_rewrites_an_emptied_import_whose_module_still_carries_an_impl() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement offers an edit"),
+            "import pkg::a;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+        );
+        // The fade is unchanged: `b` IS unused, and E114's contract is that the
+        // mark and the fix describe the same statement.
+        assert_eq!(faded(&document), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The rewrite fires only when nothing survives the leaf question: a brace
+    // set with one live member prunes to that member exactly as before.
+    #[test]
+    fn organize_prunes_rather_than_rewrites_while_a_leaf_still_survives() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ b, c };\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+            ),
+            (
+                "a.vl",
+                "fun b(): i32 {\n\t1\n}\n\nfun c(): i32 {\n\t2\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document).expect("the dead leaf offers an edit"),
+            "import pkg::a::c;\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // And when the module brings nothing either, the statement still DELETES —
+    // the rescue is a second question, not a second chance.
+    #[test]
+    fn organize_deletes_an_emptied_import_whose_module_brings_nothing() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\t1\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document).expect("the unused import offers an edit"),
+            "\nfun main(): i32 {\n\t1\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E169 (the s2 shape), the OVER-keeping half: a whole-module import beside a
+    // named import of the same module, with only the NAME used. Rule (2) kept
+    // the module leaf because the file resolved something declared in `a.vl` —
+    // but `b`'s uses come from `b`'s own leaf, and the module import brings
+    // nothing the file spells. Counted against what the module import ALONE
+    // provides, it is unused: it fades, and it prunes.
+    #[test]
+    fn organize_prunes_a_module_import_whose_only_evidence_is_another_leaf() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(faded(&document), vec!["a".to_string()]);
+        assert_eq!(
+            organized(&document).expect("the module import is unused"),
+            "import pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E169's EDGE, and why the refinement is not simply "a module import beside
+    // a named one dies": a definition reached BOTH ways keeps the module import,
+    // because the qualified use writes the module's own name and that is rule
+    // (1)'s question, not rule (2)'s.
+    #[test]
+    fn organize_keeps_a_module_import_a_qualified_path_names() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb() + a::b()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        assert_eq!(organized(&document), None, "both imports are used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The s4 control, which E169 must not disturb: a whole-module import whose
+    // only contribution is an `impl` method survives the refinement, because
+    // nothing binds `doubled` by a leaf of its own.
+    #[test]
+    fn organize_keeps_a_module_import_beside_a_leaf_when_an_impl_is_the_use() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tlet n = b();\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        assert_eq!(
+            organized(&document),
+            None,
+            "the module import brings `doubled`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// One build-preservation case: a workspace whose entry file has imports
     /// organize must act on. `entry` is the first file.
     struct OrganizeCase {
@@ -12750,6 +13030,29 @@ pub(crate) mod tests {
                     "main.vl",
                     "import std::result::Result::{ self, Err, Ok };\n\nfun main(): Result<i32, str> {\n\tOk(1)\n}\n",
                 )],
+            },
+            OrganizeCase {
+                label: "E168: a named import whose module carries the impl in use",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+                    ),
+                    (
+                        "a.vl",
+                        "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+                    ),
+                ],
+            },
+            OrganizeCase {
+                label: "E169: a module import beside a named import of the same module",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+                    ),
+                    ("a.vl", "fun b(): i32 {\n\t1\n}\n"),
+                ],
             },
             OrganizeCase {
                 label: "a shuffled run where every leaf is used",

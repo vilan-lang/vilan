@@ -1484,6 +1484,58 @@ fn prune_import_branch<'src>(
     }
 }
 
+/// The MODULE an import statement reaches into: its path with the leaves
+/// removed, the span of that module's own segment, and how many segments the
+/// truncation left (E168).
+///
+/// `import pkg::a::b;` reaches into `pkg::a`; so does `import pkg::a::{ b, c };`
+/// — a brace set's common prefix IS the path before it, which is why one
+/// truncation answers both. A statement whose leaf is its second segment
+/// (`import pkg::a;`, `import std::json;`) truncates to the ORIGIN alone, and an
+/// origin is not a module whose file declares anything: the count is returned so
+/// the caller can refuse that case rather than rewrite `import pkg::a;` into
+/// `import pkg;`.
+fn import_module_branch<'src>(
+    branch: &ImportBranch<'src>,
+) -> Option<(ImportBranch<'src>, Span, usize)> {
+    match branch {
+        // This segment IS the leaf: there is no module path below it, and the
+        // parent turns itself into the terminal segment on the `None`.
+        ImportBranch::Path(_, _, ImportTail::Leaf | ImportTail::Alias(..)) => None,
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => {
+            match import_module_branch(child) {
+                Some((inner, module_span, depth)) => Some((
+                    ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(inner))),
+                    module_span,
+                    depth + 1,
+                )),
+                None => Some((ImportBranch::Path(name, *span, ImportTail::Leaf), *span, 1)),
+            }
+        }
+        // A brace set with no path before it has no module to name.
+        ImportBranch::Set(_) => None,
+    }
+}
+
+/// E168: the statement `branch` becomes when every one of its leaves pruned
+/// away but `keep_module` says the module it reaches into is still needed —
+/// `import pkg::a;`, rendered through the canonical printer like any other
+/// surviving statement. `None` when the module is not wanted, or when the
+/// truncation would leave an ORIGIN rather than a module (see
+/// [`import_module_branch`]).
+///
+/// The predicate is asked at the module SEGMENT's span, which is the span the
+/// analyzer recorded the module's own reference at — so the editor answers it
+/// from the same table it answers the leaf question from, and the two cannot
+/// drift.
+fn module_only_import_branch<'src>(
+    branch: &ImportBranch<'src>,
+    keep_module: &dyn Fn(Span) -> bool,
+) -> Option<ImportBranch<'src>> {
+    let (module, module_span, depth) = import_module_branch(branch)?;
+    (depth >= 2 && keep_module(module_span)).then_some(module)
+}
+
 // --- Canonical element-head order --------------------------------------------
 //
 // `vilan fmt` canonicalizes the order of the items in an element HEAD (E151) —
@@ -1926,9 +1978,18 @@ fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
 /// `name_span` survives; pass `|_| true` for sort-only. `None` when the source
 /// doesn't parse cleanly (no edit would be safe). Block-scoped imports live
 /// inside item bodies, not the top-level list, so they are never considered.
+///
+/// `keep_module(module_span)` is the SECOND question, and it is asked only of a
+/// statement `keep` emptied out (E168): an `import` brings every `impl` in the
+/// module's file with it whatever leaf it names, so a statement whose leaves are
+/// all unused may still be the only thing carrying a method the file calls.
+/// Answering `true` rewrites it to `import <module>;` instead of deleting it —
+/// the fade stays on the leaf, which is genuinely unused, and the build stays
+/// green. Pass `|_| false` to prune exactly as before.
 pub fn organize_import_runs(
     source: &str,
     keep: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> bool,
 ) -> Option<Vec<ImportRunEdit>> {
     let items = parse(source)?;
     let mut printer = Printer {
@@ -1941,7 +2002,7 @@ pub fn organize_import_runs(
         split: Split::Off,
         probing: false,
     };
-    Some(printer.organize_runs(&items, keep))
+    Some(printer.organize_runs(&items, keep, keep_module))
 }
 
 // --- Insert an import (the add-import quickfix and auto-import completion) --
@@ -2596,13 +2657,14 @@ impl<'src> Printer<'src> {
         &mut self,
         items: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> bool,
     ) -> Vec<ImportRunEdit> {
         let mut edits = Vec::new();
         let mut index = 0;
         while index < items.len() {
             if import_kind_and_branch(&items[index].0).is_some() {
                 let run_end = self.import_run_end(items, index);
-                if let Some(edit) = self.organize_run(&items[index..run_end], keep) {
+                if let Some(edit) = self.organize_run(&items[index..run_end], keep, keep_module) {
                     edits.push(edit);
                 }
                 index = run_end;
@@ -2619,6 +2681,7 @@ impl<'src> Printer<'src> {
         &mut self,
         run: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> bool,
     ) -> Option<ImportRunEdit> {
         let run_start = run[0].1.into_range().start;
         // Reach this run's own trailing comments; a standalone comment before the
@@ -2638,7 +2701,14 @@ impl<'src> Printer<'src> {
             let statement = match &item.0 {
                 // A re-export is surface, not usage — never pruned.
                 Node::Export(_) => Some(PrunedStatement::ReExport(&item.0)),
+                // E168: an `import` emptied of its leaves is offered to
+                // `keep_module` before it is dropped — the module it reaches
+                // into may be the only thing bringing an `impl` the file calls
+                // a method from. A `use` is not rewritten: it binds a name out
+                // of a namespace into this scope, and a namespace with no name
+                // taken out of it binds nothing at all.
                 Node::Import(branch) => prune_import_branch(branch, keep)
+                    .or_else(|| module_only_import_branch(branch, keep_module))
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned))),
                 Node::Use(branch) => prune_import_branch(branch, keep)
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Use(pruned))),
@@ -8743,7 +8813,7 @@ mod import_set_layout {
     //! every save.
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::{assert_over_budget, columns};
-    use super::organize::organize;
+    use super::organize::{organize, organize_rescuing};
     use super::{LINE_BUDGET, format};
 
     /// The motivating line, from `std/src/rpc.vl`: an import at 184 columns.
@@ -8937,6 +9007,20 @@ mod import_set_layout {
                 ]
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
+        );
+        // E168's rewrite rides the same printer: the module-only statement the
+        // rescue produces is what `fmt` would print for a hand-written
+        // `import std::rpc;`, and it sorts into the run at the place `fmt` puts
+        // it — before the deeper path, because `BranchKey` orders by segment.
+        // An action that rendered it any other way would be undone by the next
+        // format-on-save.
+        let run = "import std::rpc::{ Dispatcher, call };\nimport std::task::Task;\n";
+        let rewritten = organize_rescuing(run, &["Dispatcher", "call"], &["rpc"]);
+        assert_eq!(rewritten, "import std::rpc;\nimport std::task::Task;\n");
+        assert_eq!(
+            rewritten,
+            format(&rewritten),
+            "fmt leaves the rewrite alone"
         );
     }
 }
@@ -10378,8 +10462,17 @@ mod organize {
     /// Applies the organizer's edits to `source`, treating every leaf named in
     /// `dead` as unused. Edits apply back-to-front so earlier offsets stay valid.
     pub(super) fn organize(source: &str, dead: &[&str]) -> String {
+        organize_rescuing(source, dead, &[])
+    }
+
+    /// [`organize`] with E168's second predicate wired: a statement every one of
+    /// whose leaves is dead, and whose MODULE segment is named in `rescued`, is
+    /// rewritten to `import <module>;` instead of being deleted.
+    pub(super) fn organize_rescuing(source: &str, dead: &[&str], rescued: &[&str]) -> String {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let mut edits = organize_import_runs(source, &keep).expect("source parses cleanly");
+        let keep_module = |span: Span| rescued.contains(&&source[span.into_range()]);
+        let mut edits =
+            organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
         let mut result = source.to_string();
         for edit in edits {
@@ -10391,12 +10484,70 @@ mod organize {
     /// The organizer offers no edit at all (already organized / nothing to prune).
     fn assert_no_edit(source: &str, dead: &[&str]) {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let edits = organize_import_runs(source, &keep).expect("source parses cleanly");
+        let edits = organize_import_runs(source, &keep, &|_| false).expect("source parses cleanly");
         assert!(
             edits.is_empty(),
             "expected no edit, got {} edit(s)",
             edits.len()
         );
+    }
+
+    // E168: a statement whose every leaf is dead but whose MODULE is still
+    // wanted is REWRITTEN, not deleted — `import pkg::a::b;` becomes
+    // `import pkg::a;`, rendered through the canonical printer and sorted into
+    // place like any other surviving statement. The `impl`s in `a.vl` travel
+    // with any import that reaches the module, so deleting the statement is what
+    // broke the build; the leaf `b` is unused either way.
+    #[test]
+    fn an_emptied_statement_whose_module_is_wanted_is_rewritten() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::b;\n", &["b"], &["a"]),
+            "import pkg::a;\n",
+        );
+    }
+
+    // The rewrite fires only when NOTHING survives: a brace set with a live
+    // member prunes to that member, exactly as before, and never widens back to
+    // the module.
+    #[test]
+    fn a_partly_live_brace_set_prunes_rather_than_widening_to_the_module() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::{ b, c };\n", &["b"], &["a"]),
+            "import pkg::a::c;\n",
+        );
+    }
+
+    // A module nobody wants still deletes — the rescue is a second question,
+    // not a second chance.
+    #[test]
+    fn an_emptied_statement_whose_module_is_unwanted_is_deleted() {
+        assert_eq!(organize_rescuing("import pkg::a::b;\n", &["b"], &[]), "");
+    }
+
+    // The truncation refuses to leave an ORIGIN: `import pkg::a;` reaches into
+    // `pkg`, which is not a module whose file declares anything, so a dead leaf
+    // there deletes rather than becoming `import pkg;`.
+    #[test]
+    fn an_emptied_statement_one_segment_deep_is_never_rewritten_to_its_origin() {
+        assert_eq!(organize_rescuing("import pkg::a;\n", &["a"], &["pkg"]), "");
+    }
+
+    // A brace set's common prefix IS the path before it, so a set whose members
+    // all died rewrites to that prefix.
+    #[test]
+    fn an_emptied_brace_set_rewrites_to_its_common_prefix() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::{ b, c };\n", &["b", "c"], &["a"]),
+            "import pkg::a;\n",
+        );
+    }
+
+    // A `use` is NOT rewritten. It binds a name out of a namespace into this
+    // scope; a namespace with no name taken out of it binds nothing, so there
+    // is no module-only spelling to fall back to.
+    #[test]
+    fn an_emptied_use_is_deleted_rather_than_widened() {
+        assert_eq!(organize_rescuing("use pkg::a::b;\n", &["b"], &["a"]), "");
     }
 
     // Sort-only (nothing dead): a shuffled run reorders exactly as `vilan fmt`.
