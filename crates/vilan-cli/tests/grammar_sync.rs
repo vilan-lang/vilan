@@ -463,6 +463,60 @@ fn regex_matches(regex: &str, texts: &[&str]) -> Vec<bool> {
         .collect()
 }
 
+/// Every place `regex` matches in `text`, as `(offset, matched text)` — the
+/// global run of the same node `RegExp` [`regex_matches`] compiles. "Does it
+/// match anywhere" is not the question a POSITIONAL guard raises: the book's
+/// element-tag rule matches `<span>hello</span>` either way, and what E171 is
+/// about is whether it matches the closing tag as well as the opening one.
+fn regex_match_positions(regex: &str, text: &str) -> Vec<(usize, String)> {
+    const SCRIPT: &str = r#"
+        const compiled = new RegExp(process.env.VILAN_REGEX, "g");
+        const text = process.env.VILAN_TEXTS;
+        let found;
+        while ((found = compiled.exec(text)) !== null) {
+            console.log(found.index + "\t" + found[0]);
+            // An empty match would spin here; the rule cannot produce one, and
+            // a rule that starts to is a defect this loop should not hide.
+            if (found.index === compiled.lastIndex) compiled.lastIndex += 1;
+        }
+    "#;
+    let output = Command::new("node")
+        .args(["-e", SCRIPT])
+        .env("VILAN_REGEX", regex)
+        .env("VILAN_TEXTS", text)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "evaluating {regex:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            let (at, matched) = line.split_once('\t').expect("offset and text");
+            (at.parse().expect("a match offset"), matched.to_string())
+        })
+        .collect()
+}
+
+/// The book's element-tag rule: its ONE `name` rule. Addressed by className
+/// rather than by a fragment of its own regex — E161's pin found it with
+/// `regex.contains("</?")`, and E171 is exactly the change that stops the
+/// closing form being spelled that way, so the finder would have gone missing
+/// on the change it is meant to be watching.
+fn book_element_tag_rule(grammar: &Grammar) -> &Rule {
+    let rules = grammar.rules("name");
+    assert_eq!(
+        rules.len(),
+        1,
+        "{HIGHLIGHT_THEME}: one `name` (element-tag) rule expected, found {} — \
+         did its shape change?",
+        rules.len()
+    );
+    rules[0]
+}
+
 /// The rule of `grammar` under `key` whose regex spells exactly `word` — the
 /// contextual rules are one word each, so this addresses one of them.
 fn contextual_rule<'a>(grammar: &'a Grammar, key: &str, word: &str) -> &'a Rule {
@@ -1966,15 +2020,12 @@ fn e170_a_call_is_still_a_call_inside_a_head_item_and_outside_one() {
 #[test]
 fn e161_the_books_tag_rule_ignores_a_generic_head_too() {
     let grammar = highlight_grammar(&[]);
-    let tag = grammar
-        .rules("name")
-        .into_iter()
-        .map(|rule| rule.regex.clone())
-        .find(|regex| regex.contains("</?"))
-        .expect("the book's element-tag rule");
+    // Addressed by className (E171): this pin used to find the rule by
+    // `regex.contains("</?")`, which is the very spelling E171 changed.
+    let tag = &book_element_tag_rule(&grammar).regex;
     assert_eq!(
         regex_matches(
-            &tag,
+            tag,
             &[
                 "Option<type _>",
                 "SignalCell<str>",
@@ -1985,8 +2036,73 @@ fn e161_the_books_tag_rule_ignores_a_generic_head_too() {
         "the book still reads a generic head as a tag: {tag}"
     );
     assert_eq!(
-        regex_matches(&tag, &["<div>", "</div>", "<my-tag>"]),
+        regex_matches(tag, &["<div>", "</div>", "<my-tag>"]),
         vec![true, true, true],
         "the book stopped matching an element: {tag}"
     );
+}
+
+// --- E171: the book's closing tag carries the argument list's guard ---------
+//
+// E164 fixed the closing tag in the TextMate grammar by giving it a rule of
+// its own, deliberately without the opening form's atom-position guard. The
+// book's element-tag rule is ONE regex for both forms, and the guard sat
+// outside them both: `(?<=(?<![A-Za-z0-9_])</?)`, which reads "the `<` of
+// either form, and not after an identifier character". That guard is only ever
+// about an argument list — a tag `<` OPENS an atom, so a `<` glued to a name
+// is `SignalCell<str>` and not markup — and a `</` is never an argument list
+// whatever precedes it. So the book refused a closing tag glued to text for a
+// reason that cannot apply to it. The one-regex fix moves the guard inside:
+// `(?<=</|(?<![A-Za-z0-9_])<)`.
+//
+// LATENT, and measured rather than asserted. At the REGEX level the shape IS
+// reached — over all 456 `vilan` fences under `vilan/docs` and all 257 tracked
+// `.vl` files the fixed rule gains 10 matches in 6 files — but every one of
+// them is inside a STRING or a COMMENT (`encode_utf8("<h1>hello</h1>")`,
+// `markup + "\t</body>\n</html>\n"`, `// <p class="greeting">world</p>`), and
+// `hljs.COMMENT`, the three string modes and the i-string modes all sit BEFORE
+// the element rule in the language's `contains`, so the text is consumed
+// before the tag rule is offered it and nothing rendered moves. In vilan
+// itself a bare text child is a parse error, which is why no LIVE closing tag
+// in the tree follows an identifier character: every one follows a `"`, a `}`
+// or a `>`.
+
+/// The shape the guard refused: a closing tag whose `<` is glued to text
+/// ending in an identifier character. `<span>hello</span>` — `<` at 0, `span`
+/// at 1, `</` at 11, `span` at 13.
+const E171_GLUED_CLOSING_TAG: &str = "<span>hello</span>";
+
+#[test]
+fn e171_the_books_closing_tag_is_a_tag_after_an_identifier_character() {
+    let grammar = highlight_grammar(&[]);
+    let tag = &book_element_tag_rule(&grammar).regex;
+    // THE DEFECT: only the opening tag matched — the closing one was refused
+    // by the argument-list guard, for a reason a `</` cannot raise.
+    assert_eq!(
+        regex_match_positions(tag, E171_GLUED_CLOSING_TAG),
+        vec![(1, "span".to_string()), (13, "span".to_string())],
+        "{HIGHLIGHT_THEME}: both tags of {E171_GLUED_CLOSING_TAG:?} are tags: {tag}"
+    );
+    // The closing form that always worked, because a `}` is not an identifier
+    // character — unchanged, which is what says the guard MOVED rather than
+    // went.
+    assert_eq!(
+        regex_match_positions(tag, "<p>{name}</p>"),
+        vec![(1, "p".to_string()), (11, "p".to_string())],
+        "{HIGHLIGHT_THEME}: a closing tag after a hole: {tag}"
+    );
+    // And the guard still does its own job on the OPENING form: a `<` glued to
+    // a name is an argument list (E161), and a spaced comparison is neither.
+    for probe in [
+        "SignalCell<str>",
+        "Option<type _>",
+        "Source<Option<type _: Source<type U>>>",
+        "let flag = a < b;",
+    ] {
+        assert_eq!(
+            regex_match_positions(tag, probe),
+            Vec::new(),
+            "{HIGHLIGHT_THEME}: {probe:?} is not markup: {tag}"
+        );
+    }
 }
