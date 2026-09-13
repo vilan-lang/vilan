@@ -2821,11 +2821,12 @@ const WIRE_SCALAR_NAMES: &[&str] = &[
     "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
 ];
 
-/// The scalars `Hashable` is satisfied by outright — the syntactic oracle's
-/// half of the answer (`is_hashable_type`) and the resolved one's
-/// (`resolved_type_is_hashable`) read the SAME list, because a type one accepts
-/// and the other rejects is a field the derive admits and a key the `[rpc]`
-/// return check refuses, or the reverse.
+/// The scalars `Hashable` is satisfied by outright — the fast path
+/// [`Analyzer::resolved_type_is_hashable`] answers with before it asks the impl
+/// table. B327 left that function as the single oracle: the derive's
+/// all-fields check and the `[rpc]` key check both ask it, so a type one
+/// accepts and the other rejects — a field the derive admits and a key the
+/// return check refuses, or the reverse — is no longer expressible.
 const HASHABLE_SCALAR_NAMES: &[&str] = &[
     "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "Hash",
 ];
@@ -6787,36 +6788,20 @@ impl<'src> Analyzer<'src> {
             .push((name, declaration_id, members));
     }
 
-    /// A field type is Hashable iff it is a scalar (any numeric, `str`, `bool`), a
-    /// `List`/`Option` of Hashable (recursing into the element), a bare-lowered
-    /// enum (its backing value is its key), or a named `[derive(Hashable)]` type.
-    /// A closure, `Set`/`Map`/`Shared`, or a view is not — `canonical_hash` would
-    /// mangle it. (Tuple *fields* are deferred, like `Wire`.)
-    ///
-    /// The bare-lowered enums reach this through `hashable_names`, recorded by the
-    /// enum walk off the authoritative `Enum::backing` rather than re-derived here:
-    /// this predicate is syntactic (it runs on `&Node`, pre-resolution) and the two
-    /// oracles for "is this Hashable?" — this one and `satisfies_trait_bound` over
-    /// the impl table — have to agree or a field the key check accepts is rejected.
-    fn is_hashable_type(&self, node: &Node) -> bool {
-        match node {
-            Node::Accessor(name) => {
-                HASHABLE_SCALAR_NAMES.contains(name) || self.hashable_names.contains(*name)
-            }
-            Node::AccessorWithGenerics(name, arguments) => {
-                matches!(*name, "List" | "Option")
-                    && arguments
-                        .0
-                        .iter()
-                        .all(|argument| self.is_hashable_type(&argument.0))
-            }
-            _ => false,
-        }
-    }
-
     /// Enforce the Hashable boundary (I1): every field of a `[derive(Hashable)]`
     /// type must itself be Hashable, else the derived `canonical_hash(self)` would
     /// silently produce a broken key. Runs after all modules are walked.
+    ///
+    /// B327: the question is put to [`Self::resolved_type_is_hashable`] — the
+    /// same oracle the `[rpc]` key check asks — and not to a syntactic
+    /// predicate over the written node. The syntactic one read the scalars and
+    /// `hashable_names` (the derives and the backed enums) and nothing else, so
+    /// a HAND-WRITTEN `impl Custom with Hashable` was invisible to it and
+    /// `[derive(Hashable)] struct Key { inner: Custom }` was refused for a
+    /// field that is Hashable — B289's class for `Wire`, which
+    /// `check_wire_boundary` closed the same way. One oracle, one answer: a
+    /// field this rule accepts and a key the return rule refuses (or the
+    /// reverse) was always the failure mode both were written to avoid.
     fn check_hashable_boundary(&mut self) {
         let checks = std::mem::take(&mut self.hashable_types_to_check);
         for (type_name, declaration_id, members) in &checks {
@@ -6844,7 +6829,7 @@ impl<'src> Analyzer<'src> {
                     }, *declaration_id);
                     continue;
                 }
-                if !self.is_hashable_type(type_node) {
+                if !self.resolved_type_is_hashable(*field_type_id) {
                     let rendered = render_type(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
                         note: None,
@@ -6852,8 +6837,9 @@ impl<'src> Analyzer<'src> {
                         msg: format!(
                             "{label} of `[derive(Hashable)]` type `{type_name}` is `{rendered}`, \
                              which is not `Hashable`: every field must be (a scalar, `str`, \
-                             `bool`, `List`/`Option` of `Hashable`, a backed enum, or another \
-                             `[derive(Hashable)]` type)"
+                             `bool`, `List`/`Option` of `Hashable`, a backed enum, another \
+                             `[derive(Hashable)]` type, or a type with an `impl .. with \
+                             Hashable`)"
                         ),
                     }, *declaration_id);
                 }
@@ -27952,7 +27938,7 @@ impl<'src> Analyzer<'src> {
                 // A bare-lowered enum IS a `str`/number at runtime and carries a
                 // synthesized `impl .. with Hashable` (`backed_enum_hashable_source`),
                 // so it counts as Hashable for the derive's all-fields check too —
-                // otherwise the impl table and `is_hashable_type` would disagree and
+                // otherwise the impl table and `hashable_names` would disagree and
                 // `[derive(Hashable)] struct Key { align: Align }` would be rejected
                 // for a field the key check accepts. A resource is excluded on both
                 // sides for the same reason it is excluded there.

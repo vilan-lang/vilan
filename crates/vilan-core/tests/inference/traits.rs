@@ -3666,6 +3666,61 @@ fn b326_an_option_around_a_plain_handle_is_still_a_handle_return() {
     );
 }
 
+/// B327: the `[derive(Hashable)]` boundary sees a HAND-WRITTEN `impl .. with
+/// Hashable`.
+///
+/// The check asked a syntactic predicate that read the scalars and the names of
+/// the derives and backed enums, so an impl written by hand was invisible to it
+/// and a field of such a type was refused for not being Hashable — B289's class
+/// for `Wire`, and it only ever rejected valid programs. It asks
+/// `resolved_type_is_hashable` now, which is the same oracle the `[rpc]` keyed
+/// return check asks, so the two cannot disagree about one type.
+#[test]
+fn b327_a_hand_written_hashable_impl_satisfies_the_derive_boundary() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::hash::{ Hash, Hashable, canonical_hash };
+        struct Custom { id: i32 }
+        impl Custom with Hashable {
+            fun hash(self): Hash { canonical_hash(self.id) }
+        }
+        [derive(Hashable)]
+        struct Key { inner: Custom }
+        fun main() { print("key"); }
+        main();
+        "#,
+    );
+}
+
+/// The control: the same field with NO `Hashable` impl anywhere is still
+/// refused, and the refusal now names the impl among the shapes it admits.
+#[test]
+fn b327_a_field_with_no_hashable_impl_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Custom { id: i32 }
+        [derive(Hashable)]
+        struct Key { inner: Custom }
+        fun main() { print("key"); }
+        main();
+        "#,
+        "field `inner` of `[derive(Hashable)]` type `Key` is `Custom`, which is not `Hashable`",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Custom { id: i32 }
+        [derive(Hashable)]
+        struct Key { inner: Custom }
+        fun main() { print("key"); }
+        main();
+        "#,
+        "or a type with an `impl .. with Hashable`",
+    );
+}
+
 /// B319: a KEYED handle's key is held to `Wire + Hashable` in the method's own
 /// vocabulary, on the annotation the author wrote.
 ///
