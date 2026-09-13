@@ -15541,15 +15541,29 @@ impl<'src> Analyzer<'src> {
             match element {
                 Some(element) if !self.resolved_type_is_wire(element) => {
                     let element_type = element.get_type(self);
-                    let rendered = self.pretty_print_type(&element_type, &HashMap::default());
+                    let resolved_label = self.pretty_print_type(&element_type, &HashMap::default());
+                    // B329: the SENTENCE names the element as the author wrote
+                    // it. `pretty_print_type` renders a nominal type by its bare
+                    // name, so a field annotated `SignalCell<models::Note>` was
+                    // told its element `Note` is not Wire while every sibling
+                    // refusal in this family — the derive boundaries, the `[rpc]`
+                    // parameter and return, the `[expose]` field just above —
+                    // says `models::Note` (B302). One annotation, two answers.
+                    let rendered = written_source_element(type_node)
+                        .map(render_type)
+                        .unwrap_or_else(|| resolved_label.clone());
                     // B189: this field's exposure is now reported, so the
                     // generated subscription's bound failure on it is a
                     // restatement and stands down (`call_covered_by_expose_
                     // refusal`, consulted one pass later). Both keys: the
                     // FIELD, for the call handed it, and the ELEMENT this
                     // sentence names, for the mirror that only mentions it.
+                    //
+                    // The element key stays the RESOLVED spelling: the stand-down
+                    // compares it against `pretty_print_type` of the generated
+                    // mirror's own value type, which never sees a written path.
                     self.expose_refused_field_slots.insert(field_type_id);
-                    self.expose_refused_elements.insert(rendered.clone());
+                    self.expose_refused_elements.insert(resolved_label);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -48504,6 +48518,30 @@ fn sole_argument_is_list(type_node: Option<&Node<'_>>) -> bool {
 /// the annotation. A local alias for `KeyedCell` would therefore be missed
 /// here and by the expansion alike — one refusal, said once, rather than two
 /// halves disagreeing.
+/// The ELEMENT of an exposed source as the author WROTE it (B329) — the sole
+/// type argument of the field's annotation, or a `KeyedCell`'s second.
+///
+/// The element the `[expose]` rule TESTS comes off the `Source` impl and is a
+/// resolved type id, which renders through `pretty_print_type` and so by bare
+/// name; the refusal is about an annotation, and an annotation is quoted as
+/// written ([`render_type`], B302). Where the annotation names no element —
+/// a bare `Signal`, an alias, a source whose element is not a type argument at
+/// all — there is nothing written to quote and the resolved rendering stands.
+fn written_source_element<'a>(type_node: Option<&'a Node<'a>>) -> Option<&'a Node<'a>> {
+    let arguments = match type_node? {
+        Node::AccessorWithGenerics(_, arguments) => arguments,
+        Node::StaticAccessor(_, _, Some(arguments)) => arguments,
+        _ => return None,
+    };
+    match arguments.0.as_slice() {
+        [element] => Some(&element.0),
+        // A79's keyed source: the element is the second argument, the key the
+        // first — the same split `handle_return_element` reads.
+        [_key, element] if annotation_is_keyed_cell(type_node) => Some(&element.0),
+        _ => None,
+    }
+}
+
 fn annotation_is_keyed_cell(type_node: Option<&Node<'_>>) -> bool {
     matches!(
         type_node,

@@ -5566,6 +5566,57 @@ fn b302_a_path_of_three_segments_renders_whole() {
     );
 }
 
+/// B329: the `[expose]` ELEMENT refusal quotes the annotation as written.
+///
+/// The element it tests comes off the field's `Source` impl and is a resolved
+/// type id, so it rendered through `pretty_print_type` — by BARE NAME. Every
+/// sibling refusal in this family renders the written node through
+/// `render_type` (B302), so a field annotated `SignalCell<models::Note>` was
+/// told its element `Note` is not Wire while the derive boundaries, the `[rpc]`
+/// parameter and return, and the `[expose]` FIELD refusal one arm over all said
+/// `models::Note`. One annotation, two answers.
+#[test]
+fn b329_the_expose_element_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        mod models {
+            struct Note { body: || void }
+        }
+        [service(SessionClient)]
+        struct Session {
+            [expose] note: SignalCell<models::Note>,
+        }
+        fun main() { print("session"); }
+        main();
+        "#,
+        "is `[expose]`d, but its element `models::Note` is not Wire",
+    );
+}
+
+/// The control: a bare-name element still renders bare, and the field refusal
+/// beside it is unmoved. Nothing about the resolved-type KEY changes — the
+/// stand-down that suppresses the generated mirror's own bound failure compares
+/// against `pretty_print_type` on both sides, so the report is still ONE.
+#[test]
+fn b329_a_bare_element_name_still_renders_bare_and_reports_once() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Note { body: || void }
+        [service(SessionClient)]
+        struct Session {
+            [expose] note: SignalCell<Note>,
+        }
+        fun main() { print("session"); }
+        main();
+        "#,
+        "is `[expose]`d, but its element `Note` is not Wire",
+    );
+}
+
 #[test]
 fn b302_the_derive_wire_field_refusal_names_the_path_as_written() {
     assert_fails_with(
