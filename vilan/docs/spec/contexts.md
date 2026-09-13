@@ -186,27 +186,74 @@ fun with_flavor<T>(body: (|| T) context flavor): T {
 }
 ```
 
-A parameter (or `let` binding) whose closure type carries
-`context <name>` declares an **injected** closure:
+A parameter, a `let` binding, a **struct field**, a **generic argument**
+or a **return type** whose closure type carries `context <name>`
+declares an **injected** closure:
 
-- A closure **literal** supplied to that position does not capture at
-  creation; it takes its own hidden parameter, bound anew at each call.
+- A closure **literal** written where one is expected does not capture
+  at creation; it takes its own hidden parameter, bound anew at each
+  call.
 - Each **call through** the injected value demands the context from the
   *caller* like a strict read, and supplies the caller's value.
 - An unannotated local binding holding a closure literal, passed into a
   clause position, **adopts** the clause (as if the literal were
   written inline).
 
+The clause is part of the closure **type**, not a property of the
+parameter that happened to write it, so it travels wherever the type
+does. A struct can hold an injected body:
+
+```vilan,fragment
+struct Conditional {
+	body: (|| i32) context flavor,
+}
+
+fun hold(body: (|| i32) context flavor): Conditional {
+	Conditional { body }
+}
+
+fun value(held: Conditional): i32 {
+	flavor.run(2, held.body)
+}
+```
+
+Reading such a field yields an injected value carrying the same
+restrictions the parameter had, and a closure literal written where the
+field is initialised is born under the clause's extent — which is what
+makes the value's body run under the ambient value at the **call**, not
+at the value's construction. A generic argument carries the clause the
+same way (`Conditional<(|| i32) context flavor>`, where the field is
+declared as the parameter), and so does a return type:
+
+```vilan,fragment
+fun make(): (|| i32) context flavor {
+	|| flavor.get()
+}
+```
+
+A clause written after a **non-closure** return type is the function's
+own declared requirement instead (§8.6): `fun f(): i32 context flavor`
+says what the body may read, while `fun f(): (|| i32) context flavor`
+says what the returned closure demands of its caller. The return type
+decides which reading applies, because only a closure type can carry a
+clause at all.
+
 Because the binding is deferred, an injected value may only flow where
 the threading can follow it: it can be **called**, **forwarded** to a
-parameter with the same clause, or passed as **`run`'s body**. Any
-other use (storing it in a field, returning it, putting it in a
-collection) is a compile error ("an injected (`context`-typed) closure
-can only be called, forwarded …, or passed to `run`").
+position with the same clause, or passed as **`run`'s body**. Any other
+use (putting it in a collection, handing it to a position with no
+clause) is a compile error ("an injected (`context`-typed) closure can
+only be called, forwarded …, or passed to `run`"). Forwarding is
+clause-for-clause: a value carrying one clause landing in a position
+demanding another is refused naming both.
 
 A clause may name several contexts (`context (a, b)`); the clause must
 name context bindings, and it composes with the closure-type markers of
 §7.4 (`(sync || T) context turn_scope` is the reactive layer's shape).
+The `sync` marker itself stays a **parameter** contract: it means "an
+async argument is refused here", and a parameter is the only position
+that could otherwise accept one — a plain closure type already refuses
+an async store everywhere else.
 
 ## 8.6 Declared requirements: the `context` clause on a `fun`
 

@@ -9168,7 +9168,7 @@ impl<'src> Transformer<'src> {
                     self.collect_type_generics(argument, depth + 1, out);
                 }
             }
-            Some(Type::Closure(parameters, return_type_id)) => {
+            Some(Type::Closure(parameters, return_type_id, _)) => {
                 let parameters = parameters.clone();
                 let return_type_id = *return_type_id;
                 for parameter in parameters {
@@ -9490,7 +9490,12 @@ impl<'src> Transformer<'src> {
                 out.push_str("Tup");
                 self.write_type_key_arguments(elements, out);
             }
-            Type::Closure(parameters, return_type_id) => {
+            // B309: the clause is NOT part of the monomorphization key — by
+            // the time the transformer runs, `context::thread_contexts` has
+            // already rewritten every threading site into ordinary parameters
+            // and arguments, so two instantiations differing only in a clause
+            // emit the same code.
+            Type::Closure(parameters, return_type_id, _) => {
                 out.push_str("Fn");
                 self.write_type_key_arguments(parameters, out);
                 out.push_str("->");

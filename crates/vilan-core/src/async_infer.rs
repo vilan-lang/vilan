@@ -223,7 +223,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
             let Some(parameter_record) = program.parameters.get(parameter) else {
                 continue;
             };
-            let Some(Type::Closure(_, return_type)) = program
+            let Some(Type::Closure(_, return_type, _)) = program
                 .type_id_to_type_map
                 .get(&parameter_record.type_id)
                 .cloned()
@@ -1369,7 +1369,7 @@ fn parameter_is_closure(program: &Program, parameter_id: Id) -> bool {
         .parameters
         .get(&parameter_id)
         .and_then(|parameter| program.type_id_to_type_map.get(&parameter.type_id))
-        .is_some_and(|type_| matches!(type_, Type::Closure(_, _)))
+        .is_some_and(|type_| matches!(type_, Type::Closure(..)))
 }
 
 /// Whether the parameter's type is a closure with a RESOLVED, non-void
@@ -1379,7 +1379,7 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
     let Some(parameter) = program.parameters.get(&parameter_id) else {
         return false;
     };
-    let Some(Type::Closure(_, return_type)) =
+    let Some(Type::Closure(_, return_type, _)) =
         program.type_id_to_type_map.get(&parameter.type_id).cloned()
     else {
         return false;
@@ -1409,7 +1409,7 @@ struct FieldStore {
 /// about — i.e. NOT void (A.3: void positions keep spawn semantics) and not
 /// still unresolved.
 fn plain_closure_position(program: &Program, type_id: TypeId) -> bool {
-    let Some(Type::Closure(_, return_type)) = program.type_id_to_type_map.get(&type_id) else {
+    let Some(Type::Closure(_, return_type, _)) = program.type_id_to_type_map.get(&type_id) else {
         return false;
     };
     !matches!(

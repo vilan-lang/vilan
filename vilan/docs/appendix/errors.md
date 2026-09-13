@@ -831,7 +831,8 @@ severed. Wrap it in a closure literal at the use site instead.
 **"an injected (`context`-typed) closure can only be called, forwarded …, or passed to `run`"**
 Injected closures (the ones with `context` clauses in their type) are
 deliberately restricted so the ambient value can always be threaded to
-them. Don't store them; call or forward them.
+them. Call one, forward it to a position carrying the same clause — a
+parameter, a struct field, a return — or pass it as `run`'s body.
 → [Functions & closures](../tour/functions-and-closures.md)
 
 **"unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard."**

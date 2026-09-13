@@ -379,9 +379,11 @@ pub fn bind_subject(
         (Type::Array(pattern_element, _), Type::Array(concrete_element, _)) => {
             bind_subject(program, pattern_element, concrete_element, out);
         }
+        // B309: a clause binds no generic — it names context BINDINGS, not
+        // types — so impl-argument recovery walks the shape and ignores it.
         (
-            Type::Closure(pattern_parameters, pattern_return),
-            Type::Closure(concrete_parameters, concrete_return),
+            Type::Closure(pattern_parameters, pattern_return, _),
+            Type::Closure(concrete_parameters, concrete_return, _),
         ) => {
             zip_arguments(out, &pattern_parameters, &concrete_parameters);
             bind_subject(program, pattern_return, concrete_return, out);

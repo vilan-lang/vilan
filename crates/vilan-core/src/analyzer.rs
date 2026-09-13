@@ -3601,7 +3601,14 @@ pub struct Analyzer<'src> {
     // in `build()`, where the ambient source is the entry's and the spans
     // carried along are not (every sibling `prepped_*` list captures it for
     // the same reason).
-    prepped_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
+    /// B309: `context` clauses waiting on the import fixpoint, keyed by the
+    /// TYPE they were written on — the closure type's own slot, which the
+    /// resolution rewrites in place so the clause becomes part of the type.
+    /// The trailing `Option<Id>` is the DECLARATION that wrote it (a parameter,
+    /// a `let` binding) where there is one, so `parameter_contexts` — the
+    /// entity-keyed index the hover label and the context pass read — can be
+    /// derived from the same single record instead of being a second one.
+    prepped_type_context_clauses: Vec<(TypeId, Vec<(&'src str, Span)>, Id, SourceId, Option<Id>)>,
     /// B242's clauses: the same shape, keyed by the FUNCTION's entity instead
     /// of a parameter's, resolved by the same deferred pass into
     /// [`Program::declared_function_contexts`].
@@ -4793,7 +4800,7 @@ impl<'src> Analyzer<'src> {
             division_generic_lhs: HashMap::default(),
             prepped_number_literals: Vec::new(),
             parameter_contexts: HashMap::default(),
-            prepped_context_clauses: Vec::new(),
+            prepped_type_context_clauses: Vec::new(),
             prepped_function_context_clauses: Vec::new(),
             declared_function_contexts: HashMap::default(),
             function_context_clause_spans: HashMap::default(),
@@ -7451,9 +7458,14 @@ impl<'src> Analyzer<'src> {
                 left_length == right_length
                     && self.same_impl_type(*left_item, *right_item, comparing)
             }
+            // B309: the `context` clause is deliberately NOT compared. Impl
+            // identity is the SHAPE a value has — parameters and return — and a
+            // clause is a threading discipline over that shape, not a second
+            // type. Two closure types that differ only in their clause select
+            // the same impl, exactly as they unify.
             (
-                Type::Closure(left_parameters, left_return),
-                Type::Closure(right_parameters, right_return),
+                Type::Closure(left_parameters, left_return, _),
+                Type::Closure(right_parameters, right_return, _),
             ) => {
                 self.same_impl_types(left_parameters, right_parameters, comparing)
                     && self.same_impl_type(*left_return, *right_return, comparing)
@@ -8011,7 +8023,7 @@ impl<'src> Analyzer<'src> {
             Type::Array(element, _) => {
                 self.mentions_self_trait(&element.get_type(self), self_trait, depth + 1)
             }
-            Type::Closure(parameters, return_type) => {
+            Type::Closure(parameters, return_type, _) => {
                 mentions(self, parameters)
                     || self.mentions_self_trait(&return_type.get_type(self), self_trait, depth + 1)
             }
@@ -8166,8 +8178,9 @@ impl<'src> Analyzer<'src> {
                     self.substitute_member_type(&element, self_trait, subject, context);
                 Type::Array(substituted.get_type_id(self), *length)
             }
-            Type::Closure(parameter_ids, return_type_id) => {
+            Type::Closure(parameter_ids, return_type_id, contexts) => {
                 let parameter_ids = parameter_ids.clone();
+                let contexts = contexts.clone();
                 let return_type = return_type_id.get_type(self);
                 let parameters = self.substitute_member_argument_types(
                     &parameter_ids,
@@ -8178,7 +8191,10 @@ impl<'src> Analyzer<'src> {
                 let return_type = self
                     .substitute_member_type(&return_type, self_trait, subject, context)
                     .get_type_id(self);
-                Type::Closure(parameters, return_type)
+                // B309: the clause rides through substitution. It names context
+                // BINDINGS, which no type substitution can rename, and losing it
+                // here would silently un-inject a trait member's declared body.
+                Type::Closure(parameters, return_type, contexts)
             }
             _ => type_.clone(),
         }
@@ -8366,7 +8382,7 @@ impl<'src> Analyzer<'src> {
                 | Type::Void
                 | Type::Unknown
                 | Type::Unresolved
-                | Type::Closure(_, _)
+                | Type::Closure(..)
                 | Type::Function(_)
                 | Type::Module(_)
                 | Type::Trait(_, _)
@@ -8696,7 +8712,7 @@ impl<'src> Analyzer<'src> {
             | Type::Void
             | Type::Unknown
             | Type::Unresolved
-            | Type::Closure(_, _)
+            | Type::Closure(..)
             | Type::Function(_)
             | Type::Module(_)
             | Type::Trait(_, _)
@@ -8821,7 +8837,10 @@ impl<'src> Analyzer<'src> {
                 self.render_type_canonical(element, depth + 1, visiting, buf);
                 buf.push_str(&format!("; {length}]"));
             }
-            Type::Closure(parameters, return_id) => {
+            // B309: the clause is not rendered into the CANONICAL key — the
+            // key is a structural identity (same shape = same entry), and the
+            // clause is a discipline over the shape.
+            Type::Closure(parameters, return_id, _) => {
                 buf.push_str("fn(");
                 for (index, parameter) in parameters.iter().enumerate() {
                     if index > 0 {
@@ -10218,7 +10237,7 @@ impl<'src> Analyzer<'src> {
             Type::Trait(_, arguments) => any(self, &arguments, visited),
             Type::Tuple(members) => any(self, &members, visited),
             Type::Array(element, _length) => any(self, &[element], visited),
-            Type::Closure(parameters, return_) => {
+            Type::Closure(parameters, return_, _) => {
                 any(self, &parameters, visited) || any(self, &[return_], visited)
             }
             Type::Mapped(binder, source, template) => {
@@ -17003,6 +17022,138 @@ impl<'src> Analyzer<'src> {
         self.function_signature_label_for(function, None)
     }
 
+    /// Record a `context` clause against the TYPE it was written on (B309),
+    /// for resolution once the import fixpoint has run — the clause may name an
+    /// imported context, which walk-time lookup cannot see.
+    ///
+    /// `owner` is the DECLARATION that wrote it where there is one (a
+    /// parameter, a `let` binding); a struct field, a function return and a
+    /// generic argument have none, which is exactly why the record had to move
+    /// off the entity and onto the type.
+    fn record_type_context_clause(
+        &mut self,
+        type_id: TypeId,
+        names: &[(&'src str, Span)],
+        scope_id: Id,
+        owner: Option<Id>,
+    ) {
+        self.prepped_type_context_clauses.push((
+            type_id,
+            names.to_vec(),
+            scope_id,
+            self.current_source_id,
+            owner,
+        ));
+    }
+
+    /// One `context` clause's names, resolved to the context bindings they
+    /// refer to, in written order (which is the hidden-argument order at call
+    /// sites). Diagnostics are attributed to the file that WROTE the clause,
+    /// which in `build()` is not the ambient source: `std::reactive`'s own
+    /// clauses arrived as references belonging to the file being edited, at
+    /// offsets into reactive.vl.
+    fn resolve_context_clause_names(
+        &mut self,
+        names: Vec<(&'src str, Span)>,
+        scope_id: Id,
+        source_id: SourceId,
+    ) -> Vec<Id> {
+        let mut context_ids: Vec<Id> = Vec::new();
+        let diagnostics_before = self.diagnostics.len();
+        for (name, name_span) in names {
+            let Some(target) = self.try_get_expr_id_by_name(name, scope_id) else {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: name_span,
+                    msg: format!("cannot find context `{name}` in this scope"),
+                });
+                continue;
+            };
+            // An imported name binds to the IMPORT's local entity; follow it to
+            // the defining binding so the context pass and the clause agree on
+            // identity.
+            let target = match self.expr_id_to_expr_map.get(&target) {
+                Some(Expr::Local(inner)) => *inner,
+                _ => target,
+            };
+            if context_ids.contains(&target) {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: name_span,
+                    msg: format!("duplicate context `{name}` in this clause"),
+                });
+                continue;
+            }
+            self.record_reference(source_id, name_span, target);
+            context_ids.push(target);
+        }
+        self.attribute_new_diagnostics(diagnostics_before, source_id);
+        context_ids
+    }
+
+    /// Resolve every `context` clause the walk recorded — the FUNCTION clauses
+    /// B242 declares, and (B309) the TYPE clauses, whose resolved list is
+    /// written into the closure type's own slot.
+    ///
+    /// Runs BEFORE the constraint fixpoint, which is what makes the clause a
+    /// genuine part of the type rather than a late annotation: every
+    /// substitution, every reconcile and every inferred binding the fixpoint
+    /// performs already sees it. It could not run at the WALK, because a clause
+    /// may name an imported context and the import fixpoint has not run yet.
+    fn resolve_context_clauses(&mut self) {
+        for (function_id, names, scope_id, source_id) in
+            std::mem::take(&mut self.prepped_function_context_clauses)
+        {
+            let context_ids = self.resolve_context_clause_names(names, scope_id, source_id);
+            if !context_ids.is_empty() {
+                self.declared_function_contexts
+                    .insert(function_id, context_ids);
+            }
+        }
+        for (type_id, names, scope_id, source_id, owner) in
+            std::mem::take(&mut self.prepped_type_context_clauses)
+        {
+            let context_ids = self.resolve_context_clause_names(names, scope_id, source_id);
+            if context_ids.is_empty() {
+                continue;
+            }
+            if let Some(Type::Closure(parameters, return_type_id, _)) =
+                self.type_id_to_type_map.get(&type_id).cloned()
+            {
+                self.write_type_slot(
+                    type_id,
+                    Type::Closure(parameters, return_type_id, context_ids.clone()),
+                );
+            }
+            // The entity-keyed INDEX, derived from the one record: the hover
+            // label and the context pass ask "does this parameter / binding
+            // hold an injected closure?", and neither should have to walk a
+            // type to find out.
+            if let Some(owner) = owner {
+                self.parameter_contexts.insert(owner, context_ids);
+            }
+        }
+    }
+
+    /// A `context` clause rendered as it is written — ` context owner_scope`,
+    /// or ` context (a, b)` for several. One spelling, shared by the signature
+    /// label (E9's hover) and by `Type::Closure`'s own printed form (B309),
+    /// because after B309 the clause is a property of the TYPE and shows up
+    /// wherever a type does.
+    fn context_clause_label(&self, contexts: &[Id]) -> String {
+        let names: Vec<&str> = contexts
+            .iter()
+            .filter_map(|context_id| self.variables.get(context_id).map(|variable| variable.name))
+            .collect();
+        match names.as_slice() {
+            [] => String::new(),
+            [single] => format!(" context {single}"),
+            many => format!(" context ({})", many.join(", ")),
+        }
+    }
+
     /// [`function_signature_label`] rendered FOR one side of a trait/impl pair:
     /// a `Self` position, and a `= Self`-defaulted parameter, take what they
     /// mean there rather than the trait's own name (B206, E128). `None` renders
@@ -17034,17 +17185,7 @@ impl<'src> Analyzer<'src> {
                 // A `context` clause is part of the signature's contract —
                 // render it (E9: hover shows clauses).
                 if let Some(contexts) = self.parameter_contexts.get(parameter_id) {
-                    let names: Vec<&str> = contexts
-                        .iter()
-                        .filter_map(|context_id| {
-                            self.variables.get(context_id).map(|variable| variable.name)
-                        })
-                        .collect();
-                    match names.as_slice() {
-                        [] => {}
-                        [single] => label.push_str(&format!(" context {single}")),
-                        many => label.push_str(&format!(" context ({})", many.join(", "))),
-                    }
+                    label.push_str(&self.context_clause_label(contexts));
                 }
                 parameters.push(label);
             }
@@ -26359,12 +26500,46 @@ impl<'src> Analyzer<'src> {
                 // function returns an async closure, so calls THROUGH the
                 // returned value await.
                 let mut return_type_node = function.return_type.as_deref();
-                if let Some(Node::AsyncType(inner)) = return_type_node.map(|node| &node.0) {
-                    self.async_returning.insert(id);
+                // B309: a RETURN may carry a `context` clause — the returned
+                // closure is injected, and its caller supplies the context at
+                // each call through it. The parser binds a clause after a
+                // non-closure return type to the FUNCTION (B242's declared
+                // clause); one after a closure return type reaches here and is
+                // the type's.
+                let mut return_clause: Option<&Vec<(&'src str, Span)>> = None;
+                if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
+                    return_type_node.map(|node| (&node.0, node.1))
+                {
+                    if !clause_target_is_a_closure(&inner.0) {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: clause_span,
+                            msg: "a `context` clause is only supported on a closure type"
+                                .to_string(),
+                        });
+                    }
+                    return_clause = Some(names);
                     return_type_node = Some(inner);
+                }
+                match return_type_node.map(|node| &node.0) {
+                    Some(Node::AsyncType(inner)) => {
+                        self.async_returning.insert(id);
+                        return_type_node = Some(inner);
+                    }
+                    Some(Node::Tuple(elements)) if elements.len() == 1 => {
+                        if let Node::AsyncType(inner) = &elements[0].0 {
+                            self.async_returning.insert(id);
+                            return_type_node = Some(inner);
+                        }
+                    }
+                    _ => {}
                 }
                 let return_type_id = return_type_node
                     .map(|return_type| self.walk_type_node(return_type, body_scope_id));
+                if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
+                    self.record_type_context_clause(return_type_id, names, body_scope_id, None);
+                }
                 if function.external {
                     // An `external` function is an intrinsic: no Vilan body, a
                     // declared (or void) return type, registered as an external
@@ -26870,14 +27045,11 @@ impl<'src> Analyzer<'src> {
                 // and calling it is a read at the call site. Resolution is
                 // deferred past the import fixpoint, like parameters'.
                 let mut annotation: Option<&Spanned<Node>> = type_.as_deref();
+                let mut clause: Option<&Vec<(&'src str, Span)>> = None;
                 if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
                     annotation.map(|node| (&node.0, node.1))
                 {
-                    let grouped = match &inner.0 {
-                        Node::Tuple(elements) if elements.len() == 1 => &elements[0].0,
-                        other => other,
-                    };
-                    if !matches!(grouped, Node::ClosureType(..)) {
+                    if !clause_target_is_a_closure(&inner.0) {
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
@@ -26886,12 +27058,7 @@ impl<'src> Analyzer<'src> {
                                 .to_string(),
                         });
                     }
-                    self.prepped_context_clauses.push((
-                        id,
-                        names.iter().map(|(name, span)| (*name, *span)).collect(),
-                        scope_id,
-                        self.current_source_id,
-                    ));
+                    clause = Some(names);
                     annotation = Some(inner);
                 }
                 // Peel the `async` marker (J2), like parameters.
@@ -26920,6 +27087,12 @@ impl<'src> Analyzer<'src> {
                     }
                     None => Type::Unknown.get_type_id(self),
                 };
+                // B309: the clause goes on the annotation's TYPE, with this
+                // binding named as its owner so the entity-keyed index still
+                // knows it is an injected closure.
+                if let Some(names) = clause {
+                    self.record_type_context_clause(type_id, names, scope_id, Some(id));
+                }
                 // An annotated let EXPECTS its value at the annotation — the
                 // same seed the function tail gets from its declared return
                 // type, so expectation-readers (`match` leg propagation, `!`'s
@@ -27089,9 +27262,40 @@ impl<'src> Analyzer<'src> {
                     // An `async || T` field peels its marker (J2): calls
                     // through the field await.
                     let mut field_type_node = child.0.1.as_ref();
-                    if let Some(Node::AsyncType(inner)) = field_type_node.map(|node| &node.0) {
-                        self.async_fields.insert((id, fields.len()));
+                    // B309: a field may carry a `context` clause —
+                    // `body: (|| View) context owner_scope` — so the clause
+                    // peels FIRST and the marker peel below sees the closure
+                    // type underneath, exactly as at a parameter.
+                    let mut field_clause: Option<&Vec<(&'src str, Span)>> = None;
+                    if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
+                        field_type_node.map(|node| (&node.0, node.1))
+                    {
+                        if !clause_target_is_a_closure(&inner.0) {
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: clause_span,
+                                msg: "a `context` clause is only supported on a closure type"
+                                    .to_string(),
+                            });
+                        }
+                        field_clause = Some(names);
                         field_type_node = Some(inner);
+                    }
+                    match field_type_node.map(|node| &node.0) {
+                        Some(Node::AsyncType(inner)) => {
+                            self.async_fields.insert((id, fields.len()));
+                            field_type_node = Some(inner);
+                        }
+                        // The `(..)` the clause's grammar needs is grouping, so
+                        // an `(async || T) context c` field still peels.
+                        Some(Node::Tuple(elements)) if elements.len() == 1 => {
+                            if let Node::AsyncType(inner) = &elements[0].0 {
+                                self.async_fields.insert((id, fields.len()));
+                                field_type_node = Some(inner);
+                            }
+                        }
+                        _ => {}
                     }
                     let type_id = match field_type_node {
                         Some(node) => {
@@ -27108,6 +27312,12 @@ impl<'src> Analyzer<'src> {
                         }
                         None => Type::Unknown.get_type_id(self),
                     };
+                    // B309: a field's clause has no declaration entity to index
+                    // — a field is not a value binding — so the TYPE is the
+                    // whole record, which is the point of the change.
+                    if let Some(names) = field_clause {
+                        self.record_type_context_clause(type_id, names, body_scope_id, None);
+                    }
                     // An `[expose]`d field's type must implement `std::Source`
                     // over a Wire element — recorded now with the type it walked
                     // to, checked once every module's Wire names and impls are
@@ -27815,19 +28025,11 @@ impl<'src> Analyzer<'src> {
         // signature's scope; written order is recorded (it is the
         // hidden-argument order at call sites).
         let mut declared_type: Option<&Spanned<Node<'src>>> = parameter_type.as_deref();
+        let mut clause: Option<&Vec<(&'src str, Span)>> = None;
         if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
             declared_type.map(|node| (&node.0, node.1))
         {
-            // `(|| void)` parses as a 1-tuple in type position — grouping,
-            // like the expression rule; peel it for the closure check.
-            let grouped = match &inner.0 {
-                Node::Tuple(elements) if elements.len() == 1 => &elements[0].0,
-                other => other,
-            };
-            if !matches!(
-                grouped,
-                Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
-            ) {
+            if !clause_target_is_a_closure(&inner.0) {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
@@ -27837,13 +28039,11 @@ impl<'src> Analyzer<'src> {
             }
             // Resolution is DEFERRED past the import fixpoint: the clause may
             // name an imported context (`import std::reactive::owner_scope`),
-            // which walk-time lookup cannot see yet.
-            self.prepped_context_clauses.push((
-                parameter_id,
-                names.iter().map(|(name, span)| (*name, *span)).collect(),
-                type_scope_id,
-                self.current_source_id,
-            ));
+            // which walk-time lookup cannot see yet. The clause is peeled HERE,
+            // rather than left for `walk_type_node`, so the `async` / `sync`
+            // marker peel below meets the closure type unchanged — and the
+            // resolved clause lands on the type this walk produces (B309).
+            clause = Some(names);
             declared_type = Some(inner);
         }
         // Peel the `async` / `sync` marker (J2 / async-polymorphism.md A.2):
@@ -27893,6 +28093,15 @@ impl<'src> Analyzer<'src> {
                 .unwrap_or_else(|| Type::Unknown.get_type_id(self)),
             (_, None) => Type::Unknown.get_type_id(self),
         };
+        // B309: the clause is the TYPE's, and this parameter owns it. A clause
+        // written on a type that cannot carry one (`(i32) context c`) was
+        // refused above; the record is still made, because the entity-keyed
+        // index is what the context pass reads to say "this parameter's clause
+        // names a value that is not a context" — the same two refusals the
+        // shape produced before the clause moved into the type.
+        if let Some(names) = clause {
+            self.record_type_context_clause(type_id, names, type_scope_id, Some(parameter_id));
+        }
         // A tuple binder is not referenceable by name; `_` keeps it positional.
         let name = match pattern {
             Pattern::Binding(name, _, _) => *name,
@@ -28656,7 +28865,13 @@ impl<'src> Analyzer<'src> {
                     .as_ref()
                     .map(|return_type| self.walk_type_node(return_type, scope_id))
                     .unwrap_or_else(|| Type::Unknown.get_type_id(self));
-                Some(Type::Closure(t_parameter_type_ids, t_return_type_id))
+                // A bare closure type carries no clause; `Node::TypeWithContexts`
+                // below is the one arm that fills the third slot (B309).
+                Some(Type::Closure(
+                    t_parameter_type_ids,
+                    t_return_type_id,
+                    Vec::new(),
+                ))
             }
             // A context clause reaching the general type walk is misplaced —
             // `walk_parameter` peels it off parameter types, the one position
@@ -28687,15 +28902,39 @@ impl<'src> Analyzer<'src> {
                 });
                 return self.walk_type_node(inner, scope_id);
             }
-            Node::TypeWithContexts(inner, _) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: node.1,
-                    msg: "a `context` clause is only supported on a parameter's closure type"
-                        .to_string(),
-                });
-                return self.walk_type_node(inner, scope_id);
+            // B309: a `context` clause in a type position the walk does not
+            // peel for itself — most usefully a GENERIC ARGUMENT,
+            // `Conditional<(|| View) context owner_scope>`. The clause is part
+            // of the type, so it records against THIS slot and rides
+            // substitution into whatever position the argument lands in. (The
+            // four positions that also record an owner — a parameter, a `let`
+            // annotation, a struct field, a function return — peel it
+            // themselves, because their `async` / `sync` marker peels have to
+            // see the closure type underneath.)
+            Node::TypeWithContexts(inner, names) => {
+                if !clause_target_is_a_closure(&inner.0) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: "a `context` clause is only supported on a closure type".to_string(),
+                    });
+                    return self.walk_type_node(inner, scope_id);
+                }
+                let inner_type_id = self.walk_type_node(inner, scope_id);
+                // The clause takes a slot of its OWN rather than being
+                // stamped onto the inner one: the grouping and marker arms
+                // above RETURN an id another walk already minted and may
+                // already have handed out, and a clause is a property of the
+                // position that wrote it, not of every reader of that id.
+                // Copying the type is safe — a `Type::Closure`'s component ids
+                // resolve in place, so the copy tracks the original.
+                let Some(inner_type) = self.type_id_to_type_map.get(&inner_type_id).cloned() else {
+                    return inner_type_id;
+                };
+                self.write_type_slot(type_id, inner_type);
+                self.record_type_context_clause(type_id, names, scope_id, None);
+                return type_id;
             }
             // A mapped tuple type `(U in T: F<U>)`. Walk the source in this scope;
             // bind `U` in a child scope and walk the template there. Expand now if
@@ -29291,7 +29530,7 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
             Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
-            Type::Closure(parameter_ids, return_id) => {
+            Type::Closure(parameter_ids, return_id, _) => {
                 parameter_ids
                     .iter()
                     .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
@@ -29714,7 +29953,7 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .any(|item| self.type_has_an_unknown_hole(&item.get_type(self))),
             Type::Array(element_id, _) => self.type_has_an_unknown_hole(&element_id.get_type(self)),
-            Type::Closure(parameter_ids, return_id) => {
+            Type::Closure(parameter_ids, return_id, _) => {
                 parameter_ids
                     .iter()
                     .any(|parameter| self.type_has_an_unknown_hole(&parameter.get_type(self)))
@@ -29830,7 +30069,7 @@ impl<'src> Analyzer<'src> {
             | Type::Function(_)
             | Type::Module(_)
             | Type::Void => false,
-            Type::Closure(parameter_type_ids, return_type_id) => {
+            Type::Closure(parameter_type_ids, return_type_id, _) => {
                 parameter_type_ids
                     .iter()
                     .any(|parameter_type_id| self.type_has_hole(*parameter_type_id))
@@ -29987,7 +30226,7 @@ impl<'src> Analyzer<'src> {
         parameter_type: &Type,
         substitution: &SubstitutionContext,
     ) -> bool {
-        let Type::Closure(closure_parameter_ids, _) = parameter_type else {
+        let Type::Closure(closure_parameter_ids, _, _) = parameter_type else {
             return false;
         };
         let Some((_, own_generics)) = self.method_signature_ref(member_id) else {
@@ -30864,7 +31103,7 @@ impl<'src> Analyzer<'src> {
                     Type::Unresolved => Type::Unresolved,
                     // Calling a closure-typed value (e.g. `(self.fn)()`)
                     // yields the closure's return type.
-                    Type::Closure(_, return_type_id) => {
+                    Type::Closure(_, return_type_id, _) => {
                         let return_type = return_type_id.get_type(self);
                         self.substitute_type(&return_type, substitution_context)
                     }
@@ -31425,7 +31664,7 @@ impl<'src> Analyzer<'src> {
                 // matching arity, fill any unannotated (`Unknown`) parameter from
                 // it — so `|res|` passed where `|Res| void` is expected types
                 // `res` as `Res`.
-                if let Type::Closure(expected_parameter_ids, _) = constraint.as_ref()
+                if let Type::Closure(expected_parameter_ids, _, _) = constraint.as_ref()
                     && expected_parameter_ids.len() == parameter_ids.len()
                 {
                     let expected = expected_parameter_ids.clone();
@@ -31490,7 +31729,7 @@ impl<'src> Analyzer<'src> {
                     None => None,
                 };
                 if target_return_type_id.is_none()
-                    && let Type::Closure(expected_parameter_ids, expected_return_type_id) =
+                    && let Type::Closure(expected_parameter_ids, expected_return_type_id, _) =
                         constraint.as_ref()
                     && expected_parameter_ids.len() == parameter_type_ids.len()
                 {
@@ -31573,7 +31812,11 @@ impl<'src> Analyzer<'src> {
                                     exprs_seen,
                                 );
                             }
-                            return Type::Closure(parameter_type_ids, target_return_type_id);
+                            return Type::Closure(
+                                parameter_type_ids,
+                                target_return_type_id,
+                                Vec::new(),
+                            );
                         }
                         ReturnPositionCheck::Mismatched(msg) => {
                             // The regime-1/1' wording (editing-dx.md §3.7)
@@ -31637,7 +31880,11 @@ impl<'src> Analyzer<'src> {
                             // produced: the mismatch is reported here, at
                             // the body, not a second time at every place the
                             // closure is compared as a whole value.
-                            return Type::Closure(parameter_type_ids, target_return_type_id);
+                            return Type::Closure(
+                                parameter_type_ids,
+                                target_return_type_id,
+                                Vec::new(),
+                            );
                         }
                     }
                 }
@@ -31671,7 +31918,16 @@ impl<'src> Analyzer<'src> {
                 };
                 match return_type {
                     Type::Unresolved => Type::Unresolved,
-                    _ => Type::Closure(parameter_type_ids, return_type.get_type_id(self)),
+                    // B309: a closure LITERAL is born with no clause of its
+                    // own — it takes the one belonging to the position it lands
+                    // in (a parameter, a `let`, a field, a return), which is
+                    // exactly what "the literal defers its context binding to
+                    // its call sites" means.
+                    _ => Type::Closure(
+                        parameter_type_ids,
+                        return_type.get_type_id(self),
+                        Vec::new(),
+                    ),
                 }
             }
             // `ret`/`jump` never produce a value where they stand — a match
@@ -32363,7 +32619,14 @@ impl<'src> Analyzer<'src> {
                 inferred.get_type_id(self)
             }
         };
-        Some(Type::Closure(parameter_type_ids, return_type_id))
+        // A named function has no `context` clause of its own (B242's clause is
+        // a DECLARATION about its body, not a threading discipline on a value),
+        // so its coerced closure type carries none.
+        Some(Type::Closure(
+            parameter_type_ids,
+            return_type_id,
+            Vec::new(),
+        ))
     }
 
     /// `function_closure_type` for read-only paths (`compare_type`): an
@@ -32374,7 +32637,11 @@ impl<'src> Analyzer<'src> {
             self.coercible_function_signature(function_id)?;
         let return_type_id =
             return_type_id.or_else(|| self.inferred_return_types.get(&function_id).copied())?;
-        Some(Type::Closure(parameter_type_ids, return_type_id))
+        Some(Type::Closure(
+            parameter_type_ids,
+            return_type_id,
+            Vec::new(),
+        ))
     }
 
     /// `(U in T: U)` — a mapped type whose template IS its own binder — sends
@@ -32682,10 +32949,20 @@ impl<'src> Analyzer<'src> {
                     self.reconcile_argument_types(l_arguments, r_arguments, substitution_context)?;
                 (Type::Trait(*l_id, arguments), bindings)
             }
+            // B309: the clause plays no part in COMPATIBILITY — a clause-less
+            // literal reconciling against a clause-carrying position is the
+            // normal case — but the reconciled type keeps whichever side has
+            // one, so the answer written back into the slot still says the
+            // value is injected.
             (
-                Type::Closure(l_parameter_ids, l_return_id),
-                Type::Closure(r_parameter_ids, r_return_id),
+                Type::Closure(l_parameter_ids, l_return_id, l_contexts),
+                Type::Closure(r_parameter_ids, r_return_id, r_contexts),
             ) => {
+                let contexts = if l_contexts.is_empty() {
+                    r_contexts.clone()
+                } else {
+                    l_contexts.clone()
+                };
                 if l_parameter_ids.len() != r_parameter_ids.len() {
                     return None;
                 }
@@ -32708,7 +32985,7 @@ impl<'src> Analyzer<'src> {
                 all_bindings.extend(bindings);
                 let return_type_id = return_type.get_type_id(self);
                 (
-                    Type::Closure(result_parameter_ids, return_type_id),
+                    Type::Closure(result_parameter_ids, return_type_id, contexts),
                     all_bindings,
                 )
             }
@@ -32914,9 +33191,10 @@ impl<'src> Analyzer<'src> {
             (Type::Trait(l_id, l_arguments), Type::Trait(r_id, r_arguments)) if l_id == r_id => {
                 self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
             }
+            // B309: clauses are not compared — see `Type::Closure`'s own note.
             (
-                Type::Closure(l_parameter_ids, l_return_id),
-                Type::Closure(r_parameter_ids, r_return_id),
+                Type::Closure(l_parameter_ids, l_return_id, _),
+                Type::Closure(r_parameter_ids, r_return_id, _),
             ) => {
                 l_parameter_ids.len() == r_parameter_ids.len()
                     && l_parameter_ids.iter().zip(r_parameter_ids.iter()).all(
@@ -33092,14 +33370,19 @@ impl<'src> Analyzer<'src> {
             // generic method parameter `|T| U` becomes `|i32| U` under `T = i32` —
             // without this an unannotated closure argument's parameter stays the
             // abstract `T`.
-            Type::Closure(parameters, return_type_id) => {
+            Type::Closure(parameters, return_type_id, contexts) => {
                 let parameters = parameters.clone();
+                let contexts = contexts.clone();
                 let return_type = return_type_id.get_type(self);
                 let parameters = self.substitute_argument_types(&parameters, substitution_context);
                 let return_type = self
                     .substitute_type(&return_type, substitution_context)
                     .get_type_id(self);
-                Type::Closure(parameters, return_type)
+                // B309: the clause survives substitution — this is the arm that
+                // makes a GENERIC ARGUMENT able to carry one, since a field
+                // declared `held: T` reads its clause out of the argument `T`
+                // was bound to.
+                Type::Closure(parameters, return_type, contexts)
             }
             Type::Tuple(element_ids) => {
                 let element_ids = element_ids.clone();
@@ -35088,7 +35371,7 @@ impl<'src> Analyzer<'src> {
 
         // Calling a closure-typed value, e.g. `(self.fn)()`: type-check the
         // arguments against the closure's parameter types.
-        if let Type::Closure(parameter_type_ids, _) = &subject_type {
+        if let Type::Closure(parameter_type_ids, _, _) = &subject_type {
             if argument_ids.len() != parameter_type_ids.len() {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -37024,7 +37307,7 @@ impl<'src> Analyzer<'src> {
         match type_id.get_type(self) {
             Type::Generic(_) | Type::Unknown | Type::Unresolved => false,
             Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
-            Type::Closure(parameter_type_ids, return_type_id) => {
+            Type::Closure(parameter_type_ids, return_type_id, _) => {
                 parameter_type_ids
                     .iter()
                     .all(|parameter_type_id| self.type_is_ground(*parameter_type_id))
@@ -42057,6 +42340,13 @@ impl<'src> Analyzer<'src> {
             self.wire_prepped_assignment(target_id, value_id);
         }
 
+        // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
+        // after the import fixpoint (a clause may name an imported context) and
+        // BEFORE the fixpoint below, so the clause a closure type carries is
+        // part of that type for every substitution and reconcile the solver
+        // performs.
+        self.resolve_context_clauses();
+
         // --- Constraint solving loop ---
         // A true fixpoint: each pass resolves the constraints whose dependencies
         // have landed (their blocked dependents resolve on later passes), in
@@ -43784,7 +44074,7 @@ impl<'src> Analyzer<'src> {
                                 .to_string()
                         }
                         (
-                            Type::Closure(_, _)
+                            Type::Closure(..)
                             | Type::Function(_)
                             | Type::Tuple(_)
                             | Type::Array(_, _),
@@ -43819,7 +44109,7 @@ impl<'src> Analyzer<'src> {
                              expression it comes from produces no value — a function that returns \
                              nothing, an `if` with no `else`, a statement"
                         ),
-                        (Type::Closure(_, _) | Type::Function(_), _) => format!(
+                        (Type::Closure(..) | Type::Function(_), _) => format!(
                             "`{symbol}` models `{trait_name}`, and `{type_name}` does not \
                              implement it: a function value has no `{trait_name}`, and none can \
                              be written for one — the host would have compared references instead"
@@ -43845,68 +44135,6 @@ impl<'src> Analyzer<'src> {
                         },
                         binary_id,
                     );
-                }
-            }
-        }
-
-        // --- Resolve `context` clauses (ambient-owner.md §5, B242) --- after
-        // the import fixpoint, so a clause may name an imported context. The
-        // two kinds resolve identically and differ only in where the answer
-        // lands: a parameter's (or `let`'s) clause makes an INJECTED closure,
-        // a function's DECLARES what its body may read.
-        let function_clauses: Vec<Id> = self
-            .prepped_function_context_clauses
-            .iter()
-            .map(|(id, ..)| *id)
-            .collect();
-        let prepped: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)> =
-            std::mem::take(&mut self.prepped_context_clauses)
-                .into_iter()
-                .chain(std::mem::take(&mut self.prepped_function_context_clauses))
-                .collect();
-        for (parameter_id, names, scope_id, source_id) in prepped {
-            let mut context_ids: Vec<Id> = Vec::new();
-            // Both the references and the diagnostics below carry spans into the
-            // file that WROTE the clause, which in `build()` is not the ambient
-            // source: `std::reactive`'s own clauses were arriving as references
-            // belonging to the file being edited, at offsets into reactive.vl.
-            let diagnostics_before = self.diagnostics.len();
-            for (name, name_span) in names {
-                let Some(target) = self.try_get_expr_id_by_name(name, scope_id) else {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: name_span,
-                        msg: format!("cannot find context `{name}` in this scope"),
-                    });
-                    continue;
-                };
-                // An imported name binds to the IMPORT's local entity; follow
-                // it to the defining binding so the context pass and the
-                // clause agree on identity.
-                let target = match self.expr_id_to_expr_map.get(&target) {
-                    Some(Expr::Local(inner)) => *inner,
-                    _ => target,
-                };
-                if context_ids.contains(&target) {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: name_span,
-                        msg: format!("duplicate context `{name}` in this clause"),
-                    });
-                    continue;
-                }
-                self.record_reference(source_id, name_span, target);
-                context_ids.push(target);
-            }
-            self.attribute_new_diagnostics(diagnostics_before, source_id);
-            if !context_ids.is_empty() {
-                if function_clauses.contains(&parameter_id) {
-                    self.declared_function_contexts
-                        .insert(parameter_id, context_ids);
-                } else {
-                    self.parameter_contexts.insert(parameter_id, context_ids);
                 }
             }
         }
@@ -44547,7 +44775,7 @@ impl<'src> Analyzer<'src> {
                     self.collect_generics(&argument.get_type(self), depth + 1, out);
                 }
             }
-            Type::Closure(parameters, return_id) => {
+            Type::Closure(parameters, return_id, _) => {
                 for parameter in parameters {
                     self.collect_generics(&parameter.get_type(self), depth + 1, out);
                 }
@@ -44760,7 +44988,10 @@ impl<'src> Analyzer<'src> {
                 }
             }
 
-            Type::Closure(parameters, return_id) => {
+            Type::Closure(parameters, return_id, contexts) => {
+                if !contexts.is_empty() {
+                    buf.push('(');
+                }
                 buf.push('|');
                 for (i, parameter_id) in parameters.iter().enumerate() {
                     if i > 0 {
@@ -44782,6 +45013,13 @@ impl<'src> Analyzer<'src> {
                     depth + 1,
                     visiting,
                 ));
+                // B309: the clause is part of the type, so it is part of the
+                // type's printed form — `(|| View) context owner_scope` — and
+                // a mismatch report names it without a second channel.
+                if !contexts.is_empty() {
+                    buf.push(')');
+                    buf.push_str(&self.context_clause_label(contexts));
+                }
             }
 
             Type::Tuple(items) => {
@@ -44858,6 +45096,20 @@ pub struct AdaptedInstance {
     pub callee_bits: HashMap<Id, Vec<Id>>,
     /// Nested closures that are async under this instance's bits.
     pub async_closures: HashSet<Id>,
+}
+
+/// Whether a type node a `context` clause was written on can carry one: a
+/// closure type, under the `(..)` the clause's grammar needs (grouping, like
+/// the expression rule) and under an `async` / `sync` marker.
+fn clause_target_is_a_closure(node: &Node<'_>) -> bool {
+    let grouped = match node {
+        Node::Tuple(elements) if elements.len() == 1 => &elements[0].0,
+        other => other,
+    };
+    matches!(
+        grouped,
+        Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
+    )
 }
 
 /// A call or accessor that dispatches generically: the analyzer can't pin the
@@ -55350,7 +55602,8 @@ mod walk_type_node_fence_tests {
         let void = analyzer.type_id_for_type(Type::Void);
         let generic = analyzer.type_id_for_type(Type::Generic(unresolved));
         let tuple = analyzer.type_id_for_type(Type::Tuple(vec![void, unresolved, generic]));
-        let closure = analyzer.type_id_for_type(Type::Closure(vec![tuple, void], generic));
+        let closure =
+            analyzer.type_id_for_type(Type::Closure(vec![tuple, void], generic, Vec::new()));
         let array = analyzer.type_id_for_type(Type::Array(tuple, 3));
         let slots = [unresolved, void, generic, tuple, closure, array];
         assert!(

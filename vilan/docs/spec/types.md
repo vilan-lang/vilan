@@ -15,9 +15,12 @@ The type forms (grammar §3.9) denote:
   `()` and one-element tuples do not exist as distinct types (`(T)` is
   `T`; the unit is `void`).
 - **Closure types**: `|T, U| R`, `|| R`, `|| void`; structural in their
-  parameter and return types. An `async` closure type (§7.4) and a
-  `context`-claused type (§8.5) are distinct from their plain
-  counterparts.
+  parameter and return types. An `async` closure type (§7.4) is distinct
+  from its plain counterpart. A `context` clause (§8.5) is carried by the
+  type too, but is not part of what makes two closure types compatible: a
+  closure LITERAL is born clause-less and takes the clause of the position
+  it lands in, and the restriction on where an injected value may then flow
+  is what keeps it honest.
 - **View types**: `&T`, `&mut T` (§6). Views are second-class: these
   types appear in parameter and return positions and in short-lived
   locals only.

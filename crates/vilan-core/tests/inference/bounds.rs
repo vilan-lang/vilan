@@ -9024,48 +9024,74 @@ fn b275_a_str_signal_is_still_an_attribute_value() {
     );
 }
 
-// --- A85: a `context` clause lives on a PARAMETER, and only there ------------
+// --- B309: a `context` clause lives in the TYPE, so it flows ----------------
 //
 // A85 (positional slots) asks for `when`/`swap`/`each` as VALUES — structs
 // implementing `Slot` whose body/render closure is a FIELD — with the five
 // parent methods rewritten as one-line sugar over them. Its §5 named the one
 // implementation risk and told the build to probe it first: a struct field
-// typed as a context-carrying closure, `body: (sync || View) context
-// owner_scope`, which is the only shape in the design std does not already
-// write. The probe answers NO, three ways, and the three pins below are the
-// answer written down where it cannot be lost.
+// typed as a context-carrying closure, `body: (|| View) context owner_scope`,
+// which is the only shape in the design std does not already write. slots-33
+// probed it and the answer was NO, three ways, because a clause was recorded
+// SIDE-BAND by parameter id (`parameter_contexts`) and
+// `Type::Closure(parameters, return)` carried none — so a clause flowed
+// through no field, generic argument or return, and the plain-closure fallback
+// was not a fallback at all: a closure captures its context at CREATION.
 //
-// The blocker is `ambient-owner.md` §5's v1 restriction, not a solver gap: a
-// clause is recorded SIDE-BAND, keyed by parameter id (`parameter_contexts`),
-// and `Type::Closure(parameters, return)` carries no clause at all — so a
-// clause cannot flow through a struct field, a generic argument or a return
-// type, and `context.rs`'s threading follows LOCALS. Lifting it is a language
-// change to the context model (a clause in the type, or a parallel field map
-// plus its own flow rules), which is A85's own ruling to reopen and not a
-// lane's to make. See the report for the measured consequence: a PLAIN closure
-// field is not a fallback — it captures its context at CREATION, so `place`'s
-// fresh per-instantiation owner never reaches the body, and the value forms
-// would leak every body's subscriptions into the enclosing boundary.
+// B309 (ruled 2026-09-13, shape (1)) moved the record INTO the type.
+// `Type::Closure` carries the clause; the four positions that can write one —
+// a parameter, a `let` annotation, a struct field, a function return — put it
+// there; a generic ARGUMENT carries it through substitution; and
+// `context::thread_contexts` follows the value wherever it flows. The pins
+// below are the four that held the wall, flipped, plus the shapes the flip
+// makes expressible.
 
-/// What the language does TODAY. This is the CONTROL for the two `#[ignore]`d
-/// pins below: the day the context model admits a field clause, this pin goes
-/// red and points at them.
+/// The pin slots-33 left as the wall's own CONTROL: "the day the context model
+/// admits a field clause, this pin goes red and points at [the ignored ones]".
+/// It did, and this is what it became — a clause OFF a parameter is exactly as
+/// legal as one on it. What is still refused is a clause on a type that cannot
+/// carry one, which was always the honest half of the old refusal.
 #[test]
-fn a85_a_context_clause_is_refused_off_a_parameter() {
-    let source = r#"
+fn a85_a_context_clause_is_legal_off_a_parameter() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (|| View) context owner_scope,
+        }
+        fun main() {}
+        "#,
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::owner_scope;
+        struct Sized {
+            size: (i32) context owner_scope,
+        }
+        "#,
+        "a `context` clause is only supported on a closure type",
+    );
+}
+
+/// The `sync` contract stays parameter-only, and deliberately: `sync` means
+/// "an async argument is refused HERE", and the only position that could
+/// otherwise accept one is a function parameter (async-polymorphism.md A.2) —
+/// a plain closure type already refuses an async store everywhere else. So
+/// A85's field is spelled `(|| View) context owner_scope`, and the marker is
+/// still the one half of the old three-way refusal that has not moved.
+#[test]
+fn a85_a_sync_marker_on_a_context_typed_field_is_still_refused() {
+    assert_fails_with(
+        r#"
         import std::reactive::{ Source, owner_scope };
         import std::ui::{ View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
             body: (sync || View) context owner_scope,
         }
-        "#;
-    assert_fails_with(
-        source,
-        "a `context` clause is only supported on a parameter's closure type",
-    );
-    assert_fails_with(
-        source,
+        "#,
         "a `sync` closure contract is only supported on parameters",
     );
 }
@@ -9073,9 +9099,8 @@ fn a85_a_context_clause_is_refused_off_a_parameter() {
 /// A85 §3a: the value forms' bodies are FIELDS, not type parameters, because a
 /// helper returning one has to be able to NAME the type (§6) and a type
 /// parameterized by a closure's own type is unnameable. So the field must
-/// carry the clause, and today it cannot.
+/// carry the clause — and now does.
 #[test]
-#[ignore = "A85: a struct field cannot carry a `context` clause — the clause is recorded per PARAMETER and is not part of `Type::Closure`, so it flows through no field; lifting it is a context-model change (ambient-owner.md §5 v1)"]
 fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
     assert_compiles_browser(
         r#"
@@ -9083,7 +9108,7 @@ fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
         import std::ui::{ Region, Slot, View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
-            body: (sync || View) context owner_scope,
+            body: (|| View) context owner_scope,
         }
         fun when<S: Source<bool>>(
             condition: S,
@@ -9097,18 +9122,16 @@ fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
                 region.insert((self.body)());
             }
         }
+        fun main() {}
         "#,
     );
 }
 
 /// A85 §3b: `View::when` becomes `self.child(when(condition, body))`. That
 /// rewrite needs the method's own INJECTED parameter to reach a struct, and
-/// the value-flow restriction refuses every escape an injected closure makes
-/// other than being called, forwarded to a parameter with the same clause, or
-/// passed to `run`. So the methods cannot become sugar over the values either,
-/// which is the half that made the surface a no-migration change.
+/// the value-flow restriction admits a forward only to a position with the
+/// SAME clause — which a struct field now is.
 #[test]
-#[ignore = "A85: an injected (`context`-typed) parameter cannot be stored — the value-flow restriction admits only a call, a forward to the same clause, or `run`, so the parent methods cannot become sugar over the value forms"]
 fn a85_an_injected_body_reaches_the_value_form_that_stores_it() {
     assert_compiles_browser(
         r#"
@@ -9116,7 +9139,7 @@ fn a85_an_injected_body_reaches_the_value_form_that_stores_it() {
         import std::ui::{ View, view };
         struct Conditional<S: Source<bool>> {
             condition: S,
-            body: (sync || View) context owner_scope,
+            body: (|| View) context owner_scope,
         }
         fun when<S: Source<bool>>(
             condition: S,
@@ -9124,19 +9147,165 @@ fn a85_an_injected_body_reaches_the_value_form_that_stores_it() {
         ): Conditional<S> {
             Conditional { condition, body }
         }
+        fun main() {}
         "#,
     );
 }
 
-/// The MEASURED consequence, which is why the plain-closure fallback the work
-/// order named is not one: a closure captures its context AT CREATION
-/// (`reactive.vl`'s own note on `owner_scope`), so a body stored as a plain
+/// The three things a value read out of a `context`-typed field may do, in one
+/// program: be CALLED (the call demands the context on its caller and threads
+/// the value's argument), be FORWARDED to a position carrying the same clause,
+/// and be passed to `run` as its body.
+#[test]
+fn b309_a_field_read_may_be_called_forwarded_or_passed_to_run() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held {
+            body: (|| void) context current,
+        }
+
+        fun forward(body: (|| void) context current) {
+            body();
+        }
+
+        fun call_it(held: Held) {
+            (held.body)();
+        }
+
+        fun forward_it(held: Held) {
+            forward(held.body);
+        }
+
+        fun run_it(held: Held) {
+            current.run(7, held.body);
+        }
+
+        fun main() {
+            let held = Held { body = || print(i"saw {current.get()}") };
+            current.run(1, || call_it(held));
+            current.run(2, || forward_it(held));
+            run_it(held);
+        }
+        main();
+        "#,
+        "saw 1\nsaw 2\nsaw 7\n",
+    );
+}
+
+/// A generic ARGUMENT carries the clause: `Held<(|| void) context current>`'s
+/// `body` field is declared as the abstract `T` and reads its clause out of
+/// the argument the instantiation bound — through `substitute_type`, which
+/// carries the clause across substitution. This is the position B309 named
+/// that neither a parameter nor a plain field reaches on its own, and it is
+/// the shape A91's render closures will be written against.
+///
+/// The clause reaches the argument from the VALUE's own type, which is why the
+/// constructor takes its body as a clause-carrying parameter: a bare closure
+/// LITERAL is born clause-less (that is what makes it deferrable), so binding
+/// `T` from one binds a clause-less `T`. `hold` is the shape a value form's
+/// free function already has.
+#[test]
+fn b309_a_generic_argument_carries_the_clause_into_the_field_it_binds() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        fun hold(body: (|| void) context current): Held<(|| void) context current> {
+            Held { body }
+        }
+
+        fun call_it(held: Held<(|| void) context current>) {
+            (held.body)();
+        }
+
+        fun main() {
+            let held = hold(|| print(i"saw {current.get()}"));
+            current.run(3, || call_it(held));
+        }
+        main();
+        "#,
+        "saw 3\n",
+    );
+}
+
+/// A RETURN carries the clause: the closure a function hands back is injected,
+/// so its caller supplies the context at the call THROUGH it rather than the
+/// producing function capturing one it may not have.
+///
+/// The parser's disambiguation is the reason this reads as it does: a clause
+/// after a NON-closure return type binds to the function (B242 — what the body
+/// may read), and one after a closure return type is the type's.
+#[test]
+fn b309_a_return_type_carries_the_clause_to_its_caller() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun make(): (|| void) context current {
+            || print(i"saw {current.get()}")
+        }
+
+        fun main() {
+            let body = make();
+            current.run(5, || body());
+        }
+        main();
+        "#,
+        "saw 5\n",
+    );
+}
+
+/// A clause is matched, not merely present: forwarding a value carrying one
+/// clause into a position demanding another is refused, and the refusal names
+/// both clauses rather than saying only what the position takes.
+#[test]
+fn b309_a_mismatched_clause_at_a_field_is_refused_naming_both() {
+    assert_fails_with(
+        r#"
+        import std::context::Context;
+
+        let left: Context<i32> = Context::new();
+        let right: Context<i32> = Context::new();
+
+        struct Held {
+            body: (|| void) context right,
+        }
+
+        fun store(body: (|| void) context left): Held {
+            Held { body }
+        }
+
+        fun main() {}
+        main();
+        "#,
+        "an injected closure forwards only to a position carrying the SAME `context` clause",
+    );
+}
+
+/// The MEASURED consequence that made the plain-closure fallback not one: a
+/// closure captures its context AT CREATION, so a body stored as a plain
 /// `|| T` field answers to the owner that was ambient where the VALUE was
 /// built, and re-entering a fresh owner around the CALL does not reach it.
 /// Here the effect registered inside the stored body survives the disposal of
-/// the owner it was called under and dies only with the outer one — which for
-/// `when`/`swap`/`each` would mean every instantiation's subscriptions
-/// outliving the instantiation, against A85 §3e's "ownership unchanged".
+/// the owner it was called under and dies only with the outer one.
+///
+/// Kept as the CONTROL for the pin below: this is still exactly what a plain
+/// closure field does, and it is still the wrong thing for a value form.
 #[test]
 fn a85_a_plain_closure_field_answers_to_the_owner_it_was_built_under() {
     assert_compiles_and_runs(
@@ -9166,6 +9335,46 @@ fn a85_a_plain_closure_field_answers_to_the_owner_it_was_built_under() {
         main();
         "#,
         "body sees one\nbody sees two\n",
+    );
+}
+
+/// The same program with the field's type carrying the clause — the leak
+/// slots-33 measured, now impossible by construction. The body's effect
+/// registers under the owner ambient at the CALL, so disposing that owner ends
+/// it: `label.set("two")` after `inner.dispose()` prints nothing, where the
+/// plain-closure control above prints a second line.
+///
+/// This is A85 §3e's "ownership unchanged" made true: every instantiation's
+/// subscriptions die with the instantiation instead of with the boundary the
+/// value happened to be built in.
+#[test]
+fn b309_a_context_typed_field_answers_to_the_owner_ambient_at_the_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope, run_with_owner };
+        struct Body {
+            build: (|| i32) context owner_scope,
+        }
+        fun main() {
+            let label: SignalCell<str> = Signal::new("one");
+            let outer = Owner::new();
+            let held = run_with_owner(outer, || Body {
+                build = || {
+                    label.effect(|value: str| print(i"body sees {value}"));
+                    0
+                },
+            });
+            let inner = Owner::new();
+            let _first = run_with_owner(inner, || (held.build)());
+            inner.dispose();
+            label.set("two");
+            outer.dispose();
+            label.set("three");
+        }
+        main();
+        "#,
+        "body sees one\n",
     );
 }
 
