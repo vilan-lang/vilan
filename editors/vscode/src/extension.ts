@@ -17,6 +17,7 @@ import {
 } from 'vscode';
 import {
     DidChangeConfigurationNotification,
+    ExecuteCommandRequest,
     LanguageClient,
     LanguageClientOptions,
     MessageSignature,
@@ -151,6 +152,39 @@ function sessionStatusLines(context: ExtensionContext): string[] {
         lines.push(`  ${method}: ${stat.count} / ${mean} / ${stat.maxMilliseconds}`);
     }
     return lines;
+}
+
+/// E174: the server's own `workspace/executeCommand`, spelled exactly as
+/// `vilan-lsp`'s `LOG_SESSION_SUMMARY` declares it. The two spellings are gated
+/// against each other by `book_sync`, which reads this file.
+const LOG_SESSION_SUMMARY = 'vilan.logSessionSummary';
+
+/// Ask the server to put ITS session summary on the channel now (E174).
+///
+/// E166 put the memory numbers — resident size, the heap in-use/retained-free
+/// split, `programs=` — on that summary, and until this the only way to see
+/// them was to wait for the server's 500-request tick: the status command
+/// printed the CLIENT's tally and opened the channel the server's page would
+/// eventually arrive on. They are read when a session starts feeling slow,
+/// which is the moment the user runs the command.
+///
+/// The server logs the page rather than returning it, and its log goes to this
+/// same output channel (the client is constructed with it), so the two tallies
+/// land one after the other under one palette entry.
+async function requestServerSessionSummary(): Promise<void> {
+    if (!client) {
+        outputChannel?.info('  server session summary: no client attached');
+        return;
+    }
+    try {
+        await client.sendRequest(ExecuteCommandRequest.type, { command: LOG_SESSION_SUMMARY });
+    } catch (error) {
+        outputChannel?.warn(
+            `the server did not answer ${LOG_SESSION_SUMMARY} ` +
+                `(${error instanceof Error ? error.message : String(error)}); ` +
+                'its summary still arrives on its own every 500 requests',
+        );
+    }
 }
 
 /// Windows executables carry a `.exe` suffix and nothing else does, so every use
@@ -382,11 +416,15 @@ export function activate(context: ExtensionContext): void {
 
     // E106: the tally on demand, for the moment the session starts feeling slow.
     context.subscriptions.push(
-        commands.registerCommand('vilan.showServerStatus', () => {
+        commands.registerCommand('vilan.showServerStatus', async () => {
             outputChannel?.show(true);
             outputChannel?.info(
                 ['language server session status:', ...sessionStatusLines(context)].join('\n  '),
             );
+            // E174: and the SERVER's own page, asked for rather than waited
+            // for — the client's tally says what this half spent, and E166's
+            // memory numbers are on the other half's.
+            await requestServerSessionSummary();
         }),
     );
 

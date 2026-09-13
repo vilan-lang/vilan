@@ -2114,6 +2114,58 @@ impl Backend {
         }
     }
 
+    /// The session summary as this server would write it now: the request
+    /// profile, the retained-state cardinalities, the analysis counts and
+    /// E166's memory reading.
+    ///
+    /// Its own method since E174, because it has two callers and they must not
+    /// be able to produce two different pages: the 500-request tick below, and
+    /// [`Backend::execute_command`] when the user asks for it.
+    fn session_summary(&self) -> String {
+        session_trace::summary(
+            session_trace::StateSizes {
+                documents: self.documents.len(),
+                // M63: of those documents, how many still hold a program —
+                // the retention rule's own number, on the page beside the
+                // memory it is there to bound.
+                programs: self
+                    .documents
+                    .iter()
+                    .filter(|document| document.value().holds_program())
+                    .count(),
+                semantic_token_cache: self.semantic_token_cache.len(),
+                manifests: self.manifests.len(),
+                pending: self.schedule.len(),
+                line_indices: self.line_indices.len(),
+            },
+            self.analyses.counts(),
+            // E166: the numbers E106 and M63 were found with, on the page
+            // the owner reads when a session starts feeling slow.
+            memory::Memory::sample(),
+        )
+    }
+
+    /// What one `workspace/executeCommand` puts on the client's channel
+    /// (E174) — the handler minus the send, so the payload is pinnable without
+    /// a live client socket.
+    ///
+    /// A command the server does not declare is a client bug rather than a
+    /// user error: it is NAMED at warning level and answered, instead of
+    /// raising a protocol error the editor would show as a failed action.
+    fn execute_command_log(&self, command: &str) -> (MessageType, String) {
+        if command == LOG_SESSION_SUMMARY {
+            (MessageType::INFO, self.session_summary())
+        } else {
+            (
+                MessageType::WARNING,
+                format!(
+                    "workspace/executeCommand: this server declares only `{LOG_SESSION_SUMMARY}`, \
+                     and was sent `{command}`"
+                ),
+            )
+        }
+    }
+
     /// E106: fold one request's duration into the session tally, and put the
     /// trace's own verdict on the client's output channel.
     ///
@@ -2132,27 +2184,7 @@ impl Backend {
         let text = match session_trace::record(request, elapsed_ms) {
             session_trace::TraceEvent::Quiet => return,
             session_trace::TraceEvent::Slow(line) => line,
-            session_trace::TraceEvent::Summarize => session_trace::summary(
-                session_trace::StateSizes {
-                    documents: self.documents.len(),
-                    // M63: of those documents, how many still hold a program —
-                    // the retention rule's own number, on the page beside the
-                    // memory it is there to bound.
-                    programs: self
-                        .documents
-                        .iter()
-                        .filter(|document| document.value().holds_program())
-                        .count(),
-                    semantic_token_cache: self.semantic_token_cache.len(),
-                    manifests: self.manifests.len(),
-                    pending: self.schedule.len(),
-                    line_indices: self.line_indices.len(),
-                },
-                self.analyses.counts(),
-                // E166: the numbers E106 and M63 were found with, on the page
-                // the owner reads when a session starts feeling slow.
-                memory::Memory::sample(),
-            ),
+            session_trace::TraceEvent::Summarize => self.session_summary(),
         };
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -2554,6 +2586,20 @@ impl Backend {
 /// for, and by omission every one it does not. A pure value, so the book's
 /// editor page can be held to it (`book_sync.rs`): the page's "what it gives
 /// you" and "what it does not have" are claims about exactly this struct.
+/// E174: the one `workspace/executeCommand` this server declares — put the
+/// session summary on the client's channel NOW.
+///
+/// E166 put RSS, the heap split and `programs=` on that summary, and the only
+/// way to see them was to wait for the 500-request tick: `Vilan: Show Language
+/// Server Status` printed the CLIENT's tally and opened the channel the
+/// server's summary would eventually arrive on. The numbers exist to be read
+/// when a session starts feeling slow, which is the moment the user asks — not
+/// five hundred requests later.
+///
+/// The extension sends this name from `editors/vscode/src/extension.ts`; the
+/// two spellings are gated against each other in `book_sync`.
+pub const LOG_SESSION_SUMMARY: &str = "vilan.logSessionSummary";
+
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -2618,6 +2664,11 @@ fn server_capabilities() -> ServerCapabilities {
             ]),
             ..Default::default()
         })),
+        // E174: the session summary, on demand.
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![LOG_SESSION_SUMMARY.to_string()],
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -2776,6 +2827,32 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// E174: `workspace/executeCommand`, the server's first. One command, and
+    /// it exists so the session summary can be READ when the user wants it
+    /// rather than when the 500-request tick comes round — see
+    /// [`LOG_SESSION_SUMMARY`]. The extension's `Vilan: Show Language Server
+    /// Status` sends it, so one palette entry now prints both tallies onto the
+    /// one output channel: the client's, then the server's.
+    ///
+    /// Answers `null`: the payload is the LOG LINE, not a return value. Fenced
+    /// and timed like every other handler — building the summary walks four
+    /// maps and takes a memory reading, which is exactly the kind of work the
+    /// trace exists to notice.
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        let (level, text) = self.fenced(
+            "execute_command",
+            (MessageType::INFO, String::new()),
+            || self.execute_command_log(&params.command),
+        );
+        if !text.is_empty() {
+            self.client.log_message(level, text).await;
+        }
+        Ok(None)
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -8530,5 +8607,94 @@ mod base_cache_budget_denomination {
              counter's currency must be the SMALLER of the two — this reds if \
              the factor is ever inverted"
         );
+    }
+}
+
+/// E174: the session summary on demand.
+///
+/// E166 put the numbers that locate a leak — RSS, the heap in-use/retained-free
+/// split, `programs=` — on the server's session summary, and left them
+/// unreachable until the 500-request tick came round: `Vilan: Show Language
+/// Server Status` printed the CLIENT's tally and opened the channel the
+/// server's page would eventually arrive on. A page nobody can ask for is a
+/// page that is read after the session it was meant to describe.
+///
+/// The handler is pinned through [`Backend::execute_command_log`], which is the
+/// handler minus the send — the summary is a LOG line, not a return value, so
+/// what is worth asserting is the text and the level it goes out at.
+#[cfg(test)]
+mod execute_command_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    #[test]
+    fn the_declared_command_answers_the_session_summary() {
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            Url::parse("file:///summary/main.vl").expect("a url"),
+            Document::analyze("fun main() {}\n", &std_root(), Path::new("main.vl")),
+        );
+        let (level, text) = server.execute_command_log(LOG_SESSION_SUMMARY);
+        assert_eq!(level, MessageType::INFO, "{text}");
+        // E166's page, whole: the trace's own head, the retained-state line
+        // carrying the document just opened, and the memory reading that is the
+        // entire reason for asking on demand.
+        assert!(
+            text.starts_with("session trace after "),
+            "not the summary: {text}"
+        );
+        assert!(
+            text.contains("retained state: documents=1 "),
+            "the open document is not on the page: {text}"
+        );
+        assert!(
+            text.contains("\n  memory: rss="),
+            "E166's memory line is the payload: {text}"
+        );
+        assert!(
+            text.contains("analyses: started="),
+            "the analysis counts are part of the page: {text}"
+        );
+    }
+
+    #[test]
+    fn the_command_the_extension_sends_is_the_one_the_server_declares() {
+        let declared = server_capabilities()
+            .execute_command_provider
+            .expect("the server declares `workspace/executeCommand`")
+            .commands;
+        assert_eq!(declared, vec![LOG_SESSION_SUMMARY.to_string()]);
+    }
+
+    // A command this server does not own is a CLIENT bug, and it is named
+    // rather than turned into a protocol error the editor reports as a failed
+    // action — the user did nothing wrong, and a warning naming both spellings
+    // is what the next bug report needs.
+    #[test]
+    fn an_undeclared_command_is_named_at_warning_level() {
+        let (service, _socket) = backend();
+        let (level, text) = service.inner().execute_command_log("vilan.notACommand");
+        assert_eq!(level, MessageType::WARNING);
+        assert!(text.contains("vilan.notACommand"), "{text}");
+        assert!(text.contains(LOG_SESSION_SUMMARY), "{text}");
+    }
+
+    // And the handler itself: fenced, timed, and answering `null` — the payload
+    // went to the channel, not to the caller.
+    #[tokio::test]
+    async fn the_handler_answers_null_and_logs() {
+        let (service, _socket) = backend();
+        let answer = service
+            .inner()
+            .execute_command(ExecuteCommandParams {
+                command: LOG_SESSION_SUMMARY.to_string(),
+                arguments: Vec::new(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("the command is answered");
+        assert_eq!(answer, None, "the summary is a log line, not a result");
     }
 }

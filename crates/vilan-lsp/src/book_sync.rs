@@ -1270,6 +1270,37 @@ fn editor_page_capabilities_are_the_servers() {
     );
 }
 
+/// E174: every `workspace/executeCommand` the server DECLARES is a command the
+/// extension actually sends, spelled the same way.
+///
+/// Two literals in two languages, and a typo in either is silent: the editor
+/// would send a name the server does not own (a warning on the channel and no
+/// summary), or the server would advertise a command nothing ever invokes. The
+/// extension's spelling is read out of its source rather than restated here,
+/// which is the same posture the code-action titles are held to above.
+#[test]
+fn the_servers_declared_commands_are_the_ones_the_extension_sends() {
+    let declared = server_capabilities()
+        .execute_command_provider
+        .expect("the server declares `workspace/executeCommand`")
+        .commands;
+    assert!(
+        !declared.is_empty(),
+        "server_capabilities() advertises `workspace/executeCommand` with no commands"
+    );
+    let extension = read(&repo_root().join(EXTENSION_SOURCE));
+    for command in &declared {
+        assert!(
+            extension.contains(&format!("'{command}'")),
+            "{EXTENSION_SOURCE} never spells `{command}`, which the server declares"
+        );
+    }
+}
+
+/// The extension's one source file — read as TEXT, like the server's own
+/// sources above, because what is gated is a string literal in it.
+const EXTENSION_SOURCE: &str = "editors/vscode/src/extension.ts";
+
 fn extension_manifest() -> serde_json::Value {
     let path = repo_root().join("editors/vscode/package.json");
     serde_json::from_str(&read(&path)).expect("editors/vscode/package.json is JSON")
@@ -1332,14 +1363,22 @@ fn editor_page_settings_are_the_extensions() {
             )
         })
         .collect();
-    assert!(
-        flattened(&page).contains("**Vilan: Restart Language Server**"),
-        "{EDITOR_PAGE} no longer names the restart command in bold — update this check with the page"
-    );
-    assert!(
-        commands.contains(&"Vilan: Restart Language Server".to_string()),
-        "package.json's commands are {commands:?}; the page promises `Vilan: Restart Language Server`"
-    );
+    // Both palette entries the page promises. The status one is E174's: it
+    // prints the client's tally and then asks the SERVER for its own page, so
+    // the page describing it is a claim about two halves at once.
+    for promised in [
+        "Vilan: Restart Language Server",
+        "Vilan: Show Language Server Status",
+    ] {
+        assert!(
+            flattened(&page).contains(&format!("**{promised}**")),
+            "{EDITOR_PAGE} no longer names `{promised}` in bold — update this check with the page"
+        );
+        assert!(
+            commands.contains(&promised.to_string()),
+            "package.json's commands are {commands:?}; the page promises `{promised}`"
+        );
+    }
     // And the book the hovers link into is the book the listing links to.
     assert_eq!(
         manifest["homepage"].as_str(),
