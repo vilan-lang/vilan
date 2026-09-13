@@ -180,6 +180,7 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 ```vilan,fragment
 fun emit(kind: str, line: str)               // compile-time only: append to a build asset
 fun emit_keyed(kind: str, key: str, line: str)  // …with the contribution's own sort key
+fun schedule_at_end(finaliser: || void)      // compile-time only: run this when evaluation ends
 fun read(path: str): str                     // compile-time only: read a project file
 fun bundle(path: str): str                   // compile-time only: carry a file into the build
 fun bundle_as(path: str, url: str): str      // …at a url the path does not spell
@@ -188,7 +189,7 @@ fun read_dir_all(path: str): List<str>       // …and every file beneath it
 fun digest(path: str): str                   // compile-time only: a file's sha-256
 ```
 
-All eight callable only from `const` evaluation — a runtime call path
+All nine callable only from `const` evaluation — a runtime call path
 to any of them is a compile error. `emit` is how `std::style` writes the CSS
 file (`emit("css", rule)`). Reach for it directly only for a shape std
 has no spelling for: a whole declaration block under a selector you
@@ -231,6 +232,32 @@ appears twice and the same contribution made twice appears once.
 `emit(kind, line)` is exactly `emit_keyed(kind, line, line)`, which is
 why an un-keyed kind's file comes out lexically ordered by line and why
 mixing the two spellings in one kind needs no rule of its own.
+
+`schedule_at_end` is the channel's other axis: it does not contribute a
+line, it postpones one. `schedule_at_end(f)` asks the build to call the
+named function `f` once, after every const evaluation of this compile
+has finished and in a const context of its own, so a module can gather
+contributions while the program evaluates and emit the finished result
+in one go — which is how `std::style` puts the rules that survived on
+the sheet instead of every rule ever constructed:
+
+```vilan,fragment
+fun flush() {
+	asset::emit("routes", "GET /health");
+}
+fun register(): i32 {
+	asset::schedule_at_end(flush);
+	1
+}
+let _registered = const register();
+```
+
+The function's name is its identity: three requests schedule one
+finaliser, finalisers run in the order they were first asked for, and a
+finaliser sees every contribution made after its own scheduling. An
+anonymous closure is refused — its captured scope does not outlive the
+evaluation that made it — and a finaliser that panics fails the build
+naming the function.
 
 The `css` kind is the one `emit_keyed` refuses: the stylesheet is
 ordered by the cascade rather than by a contribution's key, so a key

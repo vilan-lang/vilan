@@ -785,6 +785,10 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     for &expr_id in &program.const_exprs {
         state.evaluate_one(&mut world, expr_id);
     }
+    // G23: the END of evaluation. Every finaliser the pass was asked for runs
+    // here, once, in registration order — after the last `const` expression
+    // above and before anything reads what the pass produced.
+    state.run_finalisers(&mut world);
     // Destructure first: `state` holds the borrow of `reader`, and the borrow
     // must end before the recorded inputs move out of it.
     let State {
@@ -1433,6 +1437,16 @@ struct State<'p, 'src> {
     /// `asset::read`'s host — present in [`Mode::Explicit`], `None` in
     /// [`Mode::Inferred`] (the inferred form's channels are closed, §9.2).
     reader: Option<&'p ProjectReader>,
+    /// The END-OF-EVALUATION finalisers the pass has been asked for (G23), as
+    /// `(emitted name, the site that asked)`, in REGISTRATION order and
+    /// deduplicated on the name — the item's set, so three requests for one
+    /// function are one finaliser. The site is kept because a finaliser is
+    /// re-entered from a program of its own and that program's reach and
+    /// prelude are the scheduling site's ([`transformer::ConstWorld::
+    /// stage_finaliser`]); the FIRST site to ask is the one recorded, so which
+    /// program a finaliser runs against is a function of registration order
+    /// and not of how many times it was asked for.
+    scheduled: Vec<(String, Id)>,
 }
 
 /// How a const expression's free variable is (or isn't) compile-time-known.
@@ -1466,6 +1480,7 @@ impl<'p, 'src> State<'p, 'src> {
             in_progress: HashSet::default(),
             errors: Vec::new(),
             reader,
+            scheduled: Vec::new(),
         }
     }
 
@@ -1628,6 +1643,15 @@ impl<'p, 'src> State<'p, 'src> {
                                 }
                             }
                             self.assets.extend(outcome.assets);
+                            // G23: the site's finaliser requests join the
+                            // pass's list here, deduplicated on the emitted
+                            // name — one name generator serves the whole pass,
+                            // so the name IS the function's identity.
+                            for name in outcome.scheduled {
+                                if !self.scheduled.iter().any(|(already, _)| already == &name) {
+                                    self.scheduled.push((name, expr_id));
+                                }
+                            }
                             true
                         }
                         Err(failure) => {
@@ -1655,6 +1679,121 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
             };
+        }
+    }
+
+    /// **G23 — the end of evaluation.** Every finaliser
+    /// `asset::schedule_at_end` was asked for, run ONCE, in REGISTRATION
+    /// order, after the last `const` expression of the build has been
+    /// evaluated and in a const context of its own (so `emit` and the rest of
+    /// the channel are live, which is the whole point: a module accumulates
+    /// during evaluation and processes + emits the result in one go here).
+    ///
+    /// **What "the end" is.** The end of ONE COMPILE's const pass — this
+    /// function's caller is [`evaluate`], and `evaluate` runs once per
+    /// compile, per leg (`const-eval.md` §3's "a two-target build evaluates
+    /// consts per compile"). Under `run --watch`'s HMR rounds that is the end
+    /// of the ROUND: a round recompiles the entry it invalidated, the modules
+    /// it re-evaluates re-schedule and re-emit, and a module the round did not
+    /// touch neither re-schedules nor re-emits — its asset is retained by the
+    /// round's artifact record, which is the machinery B276/M59 already built
+    /// for every other asset. A finaliser therefore never has to ask whether
+    /// it is in a first build or a rebuild; it is handed one complete pass
+    /// either way.
+    ///
+    /// **A finaliser sees every contribution made after its scheduling**,
+    /// because it runs after every const expression rather than at the
+    /// scheduling site: a style module schedules on its FIRST rule and still
+    /// flushes the last one.
+    ///
+    /// **A finaliser that schedules** joins the same list and runs in the same
+    /// pass (the walk is by index over a list that may grow), and one that
+    /// re-schedules ITSELF is a no-op — the set is deduplicated on the
+    /// function's identity, which is what makes "runs once" true whoever asks
+    /// and however often.
+    ///
+    /// **A finaliser that panics fails the build naming it**, at the site that
+    /// scheduled it — the only span the pass has, since the interpreted tree
+    /// carries none (§8.2) — with the function's own declaration as the note.
+    fn run_finalisers<'w>(&mut self, world: &mut transformer::ConstWorld<'w>) {
+        let mut index = 0;
+        while index < self.scheduled.len() {
+            let (name, scheduler) = self.scheduled[index].clone();
+            index += 1;
+            self.run_finaliser(world, &name, scheduler);
+        }
+    }
+
+    /// One finaliser, against a program of its own: the scheduling site's
+    /// reach and prelude with a synthetic body that calls the function
+    /// ([`transformer::ConstWorld::stage_finaliser`] says why that reach is
+    /// the right one).
+    fn run_finaliser<'w>(
+        &mut self,
+        world: &mut transformer::ConstWorld<'w>,
+        name: &str,
+        scheduler: Id,
+    ) {
+        let free = self.free_locals(scheduler);
+        let external: HashSet<Id> = free.iter().map(|(_, binding)| *binding).collect();
+        let lower_started = crate::PhaseClock::now();
+        // The scheduling site was evaluated, so its bindings resolved; a
+        // straggler here would have been reported at that site and is not
+        // reported twice.
+        let (reach, prelude, _unresolved) = world.prepare(scheduler, &external, &self.results);
+        world.stage_finaliser(name, scheduler);
+        let site = world.finaliser_site(name, &reach, prelude);
+        phase_add(&PHASE_LOWER, lower_started);
+        if let Some(recorder) = self.reader {
+            recorder.enter_site(self.source_of(scheduler), self.span_of(scheduler));
+        }
+        let reader = self
+            .reader
+            .map(|reader| reader as &dyn interpreter::AssetReader);
+        let interp_started = crate::PhaseClock::now();
+        let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, reader);
+        phase_add(&PHASE_INTERP, interp_started);
+        match evaluated {
+            Ok(outcome) => {
+                FUEL_MAX.with(|cell| cell.set(cell.get().max(outcome.fuel_used)));
+                if let Some(recorder) = self.reader {
+                    let mut seen: BTreeSet<&str> = BTreeSet::new();
+                    for asset in &outcome.assets {
+                        if seen.insert(&asset.kind) {
+                            recorder.record(ConstFactKind::Emitted {
+                                kind: asset.kind.clone(),
+                            });
+                        }
+                    }
+                }
+                self.assets.extend(outcome.assets);
+                for scheduled in outcome.scheduled {
+                    if !self
+                        .scheduled
+                        .iter()
+                        .any(|(already, _)| already == &scheduled)
+                    {
+                        self.scheduled.push((scheduled, scheduler));
+                    }
+                }
+            }
+            Err(failure) => {
+                let trace = [name.to_string()];
+                let source_name = world
+                    .resolve_trace(&trace)
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map(|function_id| self.program.functions[&function_id].name);
+                let frames = world.resolve_trace(&failure.trace);
+                let mut error = self.failure_error(scheduler, failure, &frames);
+                let finaliser = source_name.unwrap_or(name);
+                error.msg = format!(
+                    "the end-of-evaluation finaliser `{finaliser}` failed: {}",
+                    error.msg
+                );
+                self.report(scheduler, error);
+            }
         }
     }
 
@@ -1715,6 +1854,21 @@ impl<'p, 'src> State<'p, 'src> {
         let mut worklist: Vec<Id> = Vec::new();
         let mut boundary_errors: Vec<(Id, Id)> = Vec::new(); // (call site, callee)
         let mut owned_calls: HashSet<Id> = HashSet::default();
+        // G23's one carve-out from the value-escape rule below, collected here
+        // because this is the loop that already resolves a call to a channel
+        // verb: the ARGUMENT of `asset::schedule_at_end` is a const-only
+        // function NAMED as a value, which is what §2's escape rule refuses —
+        // and it is also the entire point of the hook. The value never becomes
+        // a runtime one: it is handed to the const pass, which re-enters it at
+        // the end of evaluation and nowhere else. Narrow on purpose — the
+        // argument expression of a call to this one verb, nothing wider.
+        let schedule_at_end = self
+            .program
+            .asset_channel_fns
+            .iter()
+            .find(|(_, path)| *path == "asset::schedule_at_end")
+            .map(|(id, _)| *id);
+        let mut scheduled_arguments: HashSet<Id> = HashSet::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
                 owned_calls.insert(call.call_id);
@@ -1722,6 +1876,11 @@ impl<'p, 'src> State<'p, 'src> {
                     CallTarget::External(target) if const_only.contains(&target) => target,
                     _ => continue,
                 };
+                if Some(target) == schedule_at_end
+                    && let Some(scheduled) = self.program.function_calls.get(&call.call_id)
+                {
+                    scheduled_arguments.extend(scheduled.argument_ids.iter().copied());
+                }
                 if self.in_const_subtree(call.call_id) {
                     continue;
                 }
@@ -1922,7 +2081,7 @@ impl<'p, 'src> State<'p, 'src> {
             ));
         }
 
-        self.check_value_escapes(graph, &in_r, &reaches);
+        self.check_value_escapes(graph, &in_r, &reaches, &scheduled_arguments);
     }
 
     /// The value-escape half of §2's rule. Two shapes make a runtime function
@@ -1938,11 +2097,17 @@ impl<'p, 'src> State<'p, 'src> {
     /// narrowest span that identifies the problem (diagnostics-standard A1).
     /// A reference inside a `const` subtree is untouched: there the interpreter
     /// makes the call, which is the whole styling shape.
+    ///
+    /// `scheduled_arguments` is G23's carve-out: the argument of an
+    /// `asset::schedule_at_end` call names a const-only function on purpose,
+    /// and the name never leaves the const pass — it is the identity the pass
+    /// re-enters the function by at the end of evaluation.
     fn check_value_escapes(
         &mut self,
         graph: &CallGraph,
         in_r: &HashSet<Id>,
         reaches: &HashMap<Id, Id>,
+        scheduled_arguments: &HashSet<Id>,
     ) {
         let mut escapes: Vec<(Id, Option<Id>)> = Vec::new(); // (site, named function)
 
@@ -1957,7 +2122,10 @@ impl<'p, 'src> State<'p, 'src> {
             .chain(self.program.module_level_bindings());
         for owner in reference_owners {
             for &(reference_id, function_id) in graph.function_references_of(owner) {
-                if !in_r.contains(&function_id) || self.in_const_subtree(reference_id) {
+                if !in_r.contains(&function_id)
+                    || self.in_const_subtree(reference_id)
+                    || scheduled_arguments.contains(&reference_id)
+                {
                     continue;
                 }
                 escapes.push((reference_id, Some(function_id)));

@@ -6700,3 +6700,118 @@ fn a93_the_two_shipped_relations_are_the_controls() {
         "{assets:?}"
     );
 }
+
+// --- G23: the const-eval END-OF-EVALUATION HOOK -------------------------------
+// `asset::schedule_at_end(f)` records `f` by identity and the const pass runs
+// the list once, in registration order, after the LAST const evaluation of the
+// compile — the hook B308's late emission rides (const-eval.md §3, G23).
+
+#[test]
+fn three_requests_for_one_finaliser_run_it_once() {
+    // The idempotence pin, and it is read off the RAW collection on purpose:
+    // the flush deduplicates by `(key, line)`, so a finaliser that ran three
+    // times would still write one line into the sidecar and the mistake would
+    // be invisible in the file. `collected_assets` is the pass's own vector,
+    // in contribution order, where a second run IS a second entry.
+    let assets = collected_assets(
+        r#"
+        import std::asset::{ emit, schedule_at_end };
+        fun flush() {
+            emit("probe", "flushed");
+        }
+        fun contribute(): i32 {
+            schedule_at_end(flush);
+            schedule_at_end(flush);
+            schedule_at_end(flush);
+            7
+        }
+        let _contributed = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    let runs = assets
+        .iter()
+        .filter(|(kind, line)| kind == "probe" && line == "flushed")
+        .count();
+    assert_eq!(runs, 1, "{assets:?}");
+}
+
+#[test]
+fn a_finaliser_runs_after_every_const_expression_including_later_ones() {
+    // The run-once-AT-END pin: the finaliser is scheduled by the FIRST const
+    // site and must still land after a contribution made by a site evaluated
+    // later, which is what lets a registry be complete when it is read. Order
+    // is the observable — the raw vector is in contribution order.
+    let assets = collected_assets(
+        r#"
+        import std::asset::{ emit, schedule_at_end };
+        fun flush() {
+            emit("probe", "zzz-the-end");
+        }
+        fun first(): i32 {
+            schedule_at_end(flush);
+            emit("probe", "aaa-first");
+            1
+        }
+        fun second(): i32 {
+            emit("probe", "mmm-second");
+            2
+        }
+        let _first = const first();
+        let _second = const second();
+        fun main() {}
+        main();
+        "#,
+    );
+    let probe: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, _)| kind == "probe")
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        probe,
+        vec!["aaa-first", "mmm-second", "zzz-the-end"],
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_panicking_finaliser_fails_the_build_naming_the_function() {
+    assert_fails_with(
+        r#"
+        import std::asset::{ emit, schedule_at_end };
+        import std::io::panic;
+        fun flush() {
+            emit("probe", "never");
+            panic("the registry is inconsistent");
+        }
+        fun contribute(): i32 {
+            schedule_at_end(flush);
+            1
+        }
+        let _contributed = const contribute();
+        fun main() {}
+        main();
+        "#,
+        "the end-of-evaluation finaliser `flush` failed",
+    );
+}
+
+#[test]
+fn scheduling_a_finaliser_outside_a_const_expression_is_refused() {
+    // `schedule_at_end` joins the const-only channel for the reason every
+    // other verb does: a runtime call path reaching it compiles clean and
+    // carries a live `__schedule_at_end` with no runtime binding.
+    assert_fails_with(
+        r#"
+        import std::asset::schedule_at_end;
+        fun flush() {}
+        fun main() {
+            schedule_at_end(flush);
+        }
+        main();
+        "#,
+        "asset::schedule_at_end",
+    );
+}

@@ -82,8 +82,8 @@ stops at a link whose target leaves the project — saying so, since that
 is where the command's scope ends and not a judgement about the link.
 
 A function that reaches any verb of the channel — `emit`, `emit_keyed`,
-`read`, `bundle`, `bundle_as`, `read_dir`, `read_dir_all`, `digest` — is
-**compile-time-only**,
+`schedule_at_end`, `read`, `bundle`, `bundle_as`, `read_dir`,
+`read_dir_all`, `digest` — is **compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the
 outermost crossing — the call that leaves ordinary code. A crossing
@@ -101,7 +101,34 @@ one as a value (passing it to a higher-order function, binding it, or
 writing a closure literal that reaches the channel) is an error at
 that reference, outside a `const`. Inside a `const` the restriction
 lifts entirely — the interpreter makes the call, so
-`const apply(styled)` is legal where `apply(styled)` is not.
+`const apply(styled)` is legal where `apply(styled)` is not. The one
+other place it lifts is `schedule_at_end`'s own argument, below: the
+name is handed to the const pass and never becomes a runtime value.
+
+The channel has a fourth direction, and it is a direction in TIME
+rather than in data: `schedule_at_end(f)` asks the build to call `f`
+once, after every const evaluation of this compile has finished, in a
+const context of its own. A module can then accumulate while the
+program evaluates and process and emit the whole result in one go at
+the end, instead of emitting each piece the moment it is minted and
+being unable to take any of it back — which is how `std::style` writes
+a stylesheet holding the rules that survived rather than every rule
+ever built.
+
+`f` must be a named function and its name is its identity: scheduling
+the same function three times schedules it once, so every contributor
+can ask without coordinating, and finalisers run in the order they were
+first asked for. A finaliser sees every contribution made *after* its
+scheduling, which is the point — it runs after the last const
+expression, not after the one that asked for it. It may schedule
+another finaliser (that one runs in the same pass); re-scheduling
+itself does nothing. A finaliser that panics fails the build, naming
+the function.
+
+"The end" is the end of one compile's const pass — per leg, like every
+other const fact. Under `vilan run --watch` that is the end of the
+round: what the round re-evaluated re-schedules and re-emits, and what
+it did not touch keeps the asset the previous round wrote.
 
 ## 9.3 Failure and resource limits
 

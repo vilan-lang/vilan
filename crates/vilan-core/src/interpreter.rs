@@ -291,6 +291,9 @@ pub trait AssetReader {
 struct ConstRun {
     value: ConstValue,
     assets: Vec<crate::const_eval::EmittedAsset>,
+    /// The end-of-evaluation finalisers this run requested (G23), by emitted
+    /// name, in registration order.
+    scheduled: Vec<String>,
     stdout: String,
     exited: Option<i32>,
     fuel_used: u64,
@@ -322,9 +325,15 @@ fn run_const<'a>(
     // on the error paths as much as the success one (leak-soak.md §7.8).
     interpreter.clear_scopes();
     let fuel_used = limits.fuel - interpreter.fuel;
+    let scheduled = interpreter
+        .scheduled
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     Ok(ConstRun {
         value: value?,
         assets: interpreter.assets,
+        scheduled,
         stdout: interpreter.stdout,
         exited: interpreter.exited,
         fuel_used,
@@ -337,6 +346,9 @@ fn run_const<'a>(
 pub struct ConstOutcome {
     pub value: ConstValue,
     pub assets: Vec<crate::const_eval::EmittedAsset>,
+    /// The end-of-evaluation finalisers this site requested (G23), by the
+    /// EMITTED name of each function, in registration order.
+    pub scheduled: Vec<String>,
     pub fuel_used: u64,
 }
 
@@ -354,6 +366,7 @@ pub fn eval_const<'a>(
     Ok(ConstOutcome {
         value: run.value,
         assets: run.assets,
+        scheduled: run.scheduled,
         fuel_used: run.fuel_used,
     })
 }
@@ -758,6 +771,13 @@ struct Interpreter<'a> {
     /// set means the context has no file channel (the wasm playground outside
     /// its overlay); the read then fails as a clean capability miss.
     reader: Option<&'a dyn AssetReader>,
+    /// The end-of-evaluation finalisers this run requested (G23), by the
+    /// EMITTED name of the function each request named, in registration order
+    /// and deduplicated — a set, so three requests for one function are one
+    /// finaliser. The emitted name is the identity because one name generator
+    /// serves the whole const pass, so two reached functions can never share
+    /// one emitted name (`ConstWorld::resolve_trace` rests on the same fact).
+    scheduled: Vec<Rc<str>>,
     /// The per-run scope registry (leak-soak.md §7.8): every scope this run
     /// created, weakly held. A hoisted or expression-position function is a
     /// `Value::Closure` whose `env` is the scope holding it — a reference
@@ -781,6 +801,7 @@ impl<'a> Interpreter<'a> {
             assets: Vec::new(),
             allow_assets,
             reader: None,
+            scheduled: Vec::new(),
             scopes: Vec::new(),
         }
     }
@@ -1674,6 +1695,44 @@ impl<'a> Interpreter<'a> {
                     key: key.to_string(),
                     line: line.to_string(),
                 });
+                Ok(Value::Undefined)
+            }
+            // `asset::schedule_at_end` (G23) — the END-OF-EVALUATION HOOK.
+            // Const-only for the reason `emit` is: a runtime path reaching it
+            // would compile clean and carry a live `__schedule_at_end` call
+            // with no runtime binding.
+            //
+            // The argument must be a NAMED function, and the name is the
+            // identity: a repeat request for the same function is a no-op
+            // (the item's set), and the pass RE-ENTERS the function at the end
+            // of evaluation from a site of its own — which an anonymous
+            // closure could not survive, because its environment belongs to
+            // the run that made it and is torn down with that run
+            // (`clear_scopes`). Refusing it here is what keeps the hook's
+            // contract ("it runs, once, at the end") true rather than
+            // sometimes true.
+            "__schedule_at_end" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::schedule_at_end` outside a `const` expression",
+                    ));
+                }
+                let Value::Closure(closure) = take(0) else {
+                    return Err(Failure::internal(
+                        "`asset::schedule_at_end` took a non-function",
+                    ));
+                };
+                let Some(name) = closure.name else {
+                    return Err(Failure::unsupported(
+                        "`asset::schedule_at_end` on an anonymous closure (it takes a named \
+                         function: the name is the identity that makes a repeat request a \
+                         no-op, and a closure's captured scope does not outlive the \
+                         evaluation that made it)",
+                    ));
+                };
+                if !self.scheduled.iter().any(|already| &**already == name) {
+                    self.scheduled.push(Rc::from(name));
+                }
                 Ok(Value::Undefined)
             }
             // `asset::read` — the channel's input direction (docs-port.md

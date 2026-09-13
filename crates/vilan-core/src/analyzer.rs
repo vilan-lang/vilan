@@ -54274,15 +54274,17 @@ fn analyze_inner<'src>(
             .and_then(|scope| scope.name_to_id_map.get("print").copied());
     }
     // Remember `std::asset`'s const-only compile-time channel — lines out (in
-    // both spellings), text in, whole files out (in both spellings), a
-    // directory listing in, a digest in (const-eval.md §2-3 and §3.1,
-    // docs-port.md §3.3, build-hooks.md §5.3, kolt.local 029/035); the const
-    // pass enforces that no runtime call path reaches any of them. Order is
-    // the diagnostic's, so it is fixed here and read nowhere else.
+    // both spellings), the end-of-evaluation hook, text in, whole files out
+    // (in both spellings), a directory listing in, a digest in (const-eval.md
+    // §2-3 and §3.1, docs-port.md §3.3, build-hooks.md §5.3, G23,
+    // kolt.local 029/035); the const pass enforces that no runtime call path
+    // reaches any of them. Order is the diagnostic's, so it is fixed here and
+    // read nowhere else.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
         analyzer.asset_channel_fns = [
             ("emit", "asset::emit"),
             ("emit_keyed", "asset::emit_keyed"),
+            ("schedule_at_end", "asset::schedule_at_end"),
             ("read", "asset::read"),
             ("bundle", "asset::bundle"),
             ("bundle_as", "asset::bundle_as"),

@@ -477,6 +477,64 @@ fn a_watch_round_prunes_a_kind_that_stopped_emitting_from_dist() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_watch_round_reruns_the_finalisers_of_what_it_recompiled_and_retains_the_rest() {
+    // G23's HMR answer, end to end. "The end" is the end of ONE COMPILE's
+    // const pass, and a watch ROUND recompiles the legs its edit invalidated —
+    // so the leg that was re-evaluated re-schedules and its finaliser writes
+    // the new bytes, and the leg the round did not touch neither re-schedules
+    // nor re-emits: its sidecar is what the previous round wrote, retained by
+    // the round's artifact record exactly as every other asset is (B276/M59).
+    // Without that, a late-emitting styling system would blank the untouched
+    // leg's stylesheet on the first edit anywhere in the project.
+    let dir = temp_project("watch_finaliser");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(
+        &dir,
+        "src/client.vl",
+        "import std::asset::{ emit, schedule_at_end };\n\nfun flush_client() {\n\temit(\"probe\", \"client-flush\");\n}\n\nfun register(): i32 {\n\tschedule_at_end(flush_client);\n\t1\n}\n\nlet _r = const register();\n\nfun main() {}\n",
+    );
+    let server = |line: &str| {
+        format!(
+            "import std::io::print;\nimport std::asset::{{ emit, schedule_at_end }};\n\nfun flush_server() {{\n\temit(\"probe\", \"{line}\");\n}}\n\nfun register(): i32 {{\n\tschedule_at_end(flush_server);\n\t1\n}}\n\nlet _r = const register();\n\nfun main() {{\n\tprint(\"srv\");\n}}\n"
+        )
+    };
+    write(&dir, "src/server.vl", &server("server-flush-one"));
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", dir.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let client_probe = dir.join("dist/client.probe");
+    let server_probe = dir.join("dist/server.probe");
+    let deadline = support::WATCH_LIVENESS;
+    let client_round_one = wait_for_contents(&client_probe, "client-flush\n", deadline);
+    let server_round_one = wait_for_contents(&server_probe, "server-flush-one\n", deadline);
+
+    write(&dir, "src/server.vl", &server("server-flush-two"));
+    let server_round_two = wait_for_contents(&server_probe, "server-flush-two\n", deadline);
+    let client_after = std::fs::read_to_string(&client_probe);
+
+    support::kill_watcher(&mut watcher);
+
+    client_round_one.expect("round 1 should have run the client leg's finaliser");
+    server_round_one.expect("round 1 should have run the server leg's finaliser");
+    server_round_two.expect("the round after the edit should have re-run the server finaliser");
+    assert_eq!(
+        client_after.ok().as_deref(),
+        Some("client-flush\n"),
+        "the untouched leg's finaliser output must be retained, not blanked"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A quick-exit single-file program whose `const` initializer emits one CSS line.
 /// `main` prints and returns, so Node exits on its own — safe to `run` (and to
 /// spawn under `--watch` and kill).
