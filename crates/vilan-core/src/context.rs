@@ -34,7 +34,7 @@ use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
 use crate::error::{Error, Note, TraceHop};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
-use crate::type_::Type;
+use crate::type_::{Type, TypeId};
 
 /// How many upstream calls a coverage refusal's requirement trace labels
 /// (backlog E78) before it elides the rest behind an honest "… N more" tail.
@@ -277,6 +277,123 @@ fn is_context_binding(program: &Program, id: Id) -> bool {
         })
 }
 
+/// The `context` clause a TYPE carries (B309) — a closure type's third
+/// component, in written order. An empty list is no clause, which is every
+/// closure type written before the clause moved into the type.
+fn clause_of_type<'a>(program: &'a Program<'_>, type_id: TypeId) -> Option<&'a [Id]> {
+    match program.type_id_to_type_map.get(&type_id) {
+        Some(Type::Closure(_, _, contexts)) if !contexts.is_empty() => Some(contexts),
+        _ => None,
+    }
+}
+
+/// The type a struct FIELD has at one instantiation: its declared type, or —
+/// where the field is declared AS one of the struct's own generic parameters
+/// (`held: T`) — the argument that parameter was bound to at `instance`.
+///
+/// This is the arm that makes a GENERIC ARGUMENT able to carry a clause
+/// (B309): `Holder<(|| View) context owner_scope>`'s `held` field reads its
+/// clause out of the argument, because the field's own declared type is the
+/// abstract `T` and has none. Falls back to the declared type wherever the
+/// instantiation is not on record — the answer is then "no clause", which is
+/// the conservative direction: the value-flow restriction stays closed.
+fn field_type_at(
+    program: &Program,
+    struct_id: Id,
+    field_index: usize,
+    instance: Option<Id>,
+) -> Option<TypeId> {
+    let declaration = program.structs.get(&struct_id)?;
+    let field = declaration.fields.get(field_index)?;
+    let Some(Type::Generic(parameter)) = program.type_id_to_type_map.get(&field.type_id) else {
+        return Some(field.type_id);
+    };
+    let position = declaration
+        .generic_parameter_constraint_ids
+        .iter()
+        .position(|id| id == parameter)?;
+    let arguments = match instance
+        .and_then(|instance| value_type_of(program, instance))
+        .and_then(|type_id| program.type_id_to_type_map.get(&type_id))
+    {
+        Some(Type::Struct(id, arguments)) if *id == struct_id => arguments,
+        _ => return Some(field.type_id),
+    };
+    Some(arguments.get(position).copied().unwrap_or(field.type_id))
+}
+
+/// The type an expression has, as this pass can see it: a reference to a
+/// binding or a parameter answers with the DECLARATION's type, everything else
+/// with whatever the solver recorded.
+///
+/// The declaration wins deliberately. `expr_type_ids` holds a type only where
+/// one is PRODUCED, and a plain `Expr::Local` read produces nothing — so a
+/// field read through a parameter (`(held.body)()` inside `fun call_it(held:
+/// Held<(|| void) context current>)`) had no instantiation to resolve `T`
+/// against and silently lost the clause, which is a call that threads no
+/// argument and a context read as `undefined`.
+fn value_type_of(program: &Program, entity: Id) -> Option<TypeId> {
+    if let Some(Expr::Local(target)) = program.entity_map.get(&entity) {
+        if let Some(parameter) = program.parameters.get(target) {
+            return Some(parameter.type_id);
+        }
+        if let Some(variable) = program.variables.get(target) {
+            return Some(variable.type_id);
+        }
+    }
+    program.expr_type_ids.get(&entity).copied()
+}
+
+/// The clause a FIELD READ yields (B309). Reading a `context`-typed field hands
+/// back an INJECTED closure carrying exactly a parameter's restrictions — it
+/// may be called, forwarded to a position with the same clause, or passed to
+/// `run`, and nothing else.
+fn field_read_clause(program: &Program, expr: &Expr<'_>) -> Option<Vec<Id>> {
+    let Expr::Field(subject, struct_id, field_index) = expr else {
+        return None;
+    };
+    let type_id = field_type_at(program, *struct_id, *field_index, Some(*subject))?;
+    clause_of_type(program, type_id).map(<[Id]>::to_vec)
+}
+
+/// The clause a VALUE carries wherever this pass can see one (B309): a
+/// reference to a clause-typed binding or parameter, or a read of a
+/// clause-typed field. `None` is an ordinary value.
+fn clause_carried_by(
+    program: &Program,
+    value_contexts: &HashMap<Id, Vec<Id>>,
+    injected_values: &HashMap<Id, Vec<Id>>,
+    entity: Id,
+) -> Option<Vec<Id>> {
+    match program.entity_map.get(&entity) {
+        Some(Expr::Local(source)) => value_contexts.get(source).cloned(),
+        _ => injected_values.get(&entity).cloned(),
+    }
+}
+
+/// The refusal a value earns for landing in a `context`-typed position it does
+/// not fit (B309). A value carrying a DIFFERENT clause is its own mistake and
+/// names both clauses — the threading can follow a forward only to a position
+/// demanding the same contexts, in the same order — while anything else is
+/// told what the position takes.
+fn landing_refusal(
+    program: &Program,
+    position: &str,
+    expected: &[Id],
+    found: Option<&[Id]>,
+) -> String {
+    match found {
+        Some(found) => format!(
+            "this value carries `{}` and this {position} demands `{}`: an injected closure forwards only to a position carrying the SAME `context` clause",
+            clause_spelling(program, found),
+            clause_spelling(program, expected),
+        ),
+        None => format!(
+            "a `context`-typed {position} takes a closure literal, or a value with the same `context` clause"
+        ),
+    }
+}
+
 /// The span of a function's declared `context` clause, falling back to the
 /// function's own span for a clause the parser recorded without one.
 fn clause_span_of(program: &Program, function: Id) -> crate::span::Span {
@@ -500,13 +617,17 @@ fn analyze(
                 });
             // An injected `context`-typed closure VALUE is a legal body when
             // its clause is exactly this context (the deferred argument is
-            // what `run` supplies) — proposal/ambient-owner.md §5.
+            // what `run` supplies) — proposal/ambient-owner.md §5. B309: a
+            // READ of a `context`-typed field is such a value too, which is
+            // what lets a value form hold its body and run it under the owner
+            // ambient at PLACE time.
             let injected_body = closure_entity
                 .and_then(|entity| match program.entity_map.get(&entity) {
-                    Some(Expr::Local(target)) => program.parameter_contexts.get(target),
-                    _ => None,
+                    Some(Expr::Local(target)) => program.parameter_contexts.get(target).cloned(),
+                    Some(expr) => field_read_clause(program, expr),
+                    None => None,
                 })
-                .is_some_and(|clause| context.is_some_and(|context| clause == &vec![context]));
+                .is_some_and(|clause| context.is_some_and(|context| clause == vec![context]));
             let (Some(context), Some(value_id), Some(closure_entity)) =
                 (context, value_id, closure_entity)
             else {
@@ -834,13 +955,22 @@ fn analyze(
         }
     };
 
-    // --- Injected (`context`-typed) closures — proposal/ambient-owner.md §5. ---
-    // A clause on a parameter's closure type defers that closure's context
-    // binding to its CALL sites: the literal passed in takes its own hidden
-    // parameter (no creation capture), each call through the parameter is a
-    // read-like demand on the caller (and a threading site), and the value
-    // may only flow where the threading can follow it — a call, a forward to
-    // a parameter with the SAME clause, or `run`'s body position.
+    // --- Injected (`context`-typed) closures — proposal/ambient-owner.md §5,
+    // B309. ---
+    // A clause on a closure TYPE defers that closure's context binding to its
+    // CALL sites: the literal that lands there takes its own hidden parameter
+    // (no creation capture), each call through the value is a read-like demand
+    // on the caller (and a threading site), and the value may only flow where
+    // the threading can follow it — a call, a forward to a position with the
+    // SAME clause, or `run`'s body position.
+    //
+    // B309 made the clause part of `Type::Closure`, so the positions that can
+    // carry one are a parameter, a `let` annotation, a struct FIELD, a generic
+    // ARGUMENT and a RETURN — and each of them gets the same two rules: a
+    // closure LITERAL written there is born under the clause's extent, and a
+    // value read out of there is injected. That is what lets a value form hold
+    // its body (`Conditional { body }`) instead of capturing it at
+    // construction, which is the ownership divergence A85 measured.
     let mut deferred: HashMap<Id, HashSet<Id>> = HashMap::default(); // ctx -> closures
     let mut injected_calls: HashMap<Id, Vec<(Node, Id)>> = HashMap::default(); // ctx -> (caller, call)
     // The working clause map: declared clauses (parameters AND `let`
@@ -849,6 +979,21 @@ fn analyze(
     // then `.on("click", add)`), exactly as if the literal were written
     // inline: its literal defers, and its direct calls become injected calls.
     let mut value_contexts: HashMap<Id, Vec<Id>> = program.parameter_contexts.clone();
+    // B309: and from the TYPES, which is where the clause now lives. A
+    // parameter or binding whose type carries a clause holds an injected
+    // closure however it came by it — including an UNANNOTATED `let body =
+    // make()` whose clause arrived with the return type it was inferred from,
+    // which no entity-keyed record could ever have known about.
+    for (&parameter_id, parameter) in &program.parameters {
+        if let Some(clause) = clause_of_type(program, parameter.type_id) {
+            value_contexts.insert(parameter_id, clause.to_vec());
+        }
+    }
+    for (&binding_id, variable) in &program.variables {
+        if let Some(clause) = clause_of_type(program, variable.type_id) {
+            value_contexts.insert(binding_id, clause.to_vec());
+        }
+    }
     // --- B242: the clauses functions DECLARE. Validated exactly like a
     // parameter's (a clause names context bindings, nothing else) and admitted
     // to the per-context loop, since a declared context may have no `get` or
@@ -898,8 +1043,24 @@ fn analyze(
         }
 
         // Closure literals landing in annotated positions defer; annotated
-        // values may forward to a parameter with the SAME clause.
+        // values may forward to a position with the SAME clause.
         let mut allowed_forwards: HashSet<Id> = HashSet::default();
+
+        // B309: the values a `context`-typed FIELD read hands back, keyed by
+        // the READ's own entity. A field read IS the value (there is no binding
+        // to key on), which is why it needs a map of its own beside
+        // `value_contexts`.
+        let mut injected_values: HashMap<Id, Vec<Id>> = HashMap::default();
+        // Values a LANDING rule already refused. One mistake earns one report:
+        // a value refused for not fitting the position it landed in must not
+        // also earn the value-flow restriction's refusal for appearing
+        // somewhere the threading cannot follow — it is the same appearance.
+        let mut refused_landings: HashSet<Id> = HashSet::default();
+        for (&entity, expr) in &program.entity_map {
+            if let Some(clause) = field_read_clause(program, expr) {
+                injected_values.insert(entity, clause);
+            }
+        }
 
         // Clause-typed LET bindings (the ui-boundary follow-up): the
         // binding is a NAMED injected closure. Its initializer literal
@@ -925,9 +1086,112 @@ fn analyze(
                 {
                     allowed_forwards.insert(initial);
                 }
+                Some(expr) if field_read_clause(program, expr).as_deref() == Some(clause) => {
+                    allowed_forwards.insert(initial);
+                }
                 _ => {
-                    errors.push(anchored(program, initial, "a `context`-typed binding takes a closure literal, or a value with the same `context` clause"
-                            .to_string()));
+                    let found =
+                        clause_carried_by(program, &value_contexts, &injected_values, initial);
+                    refused_landings.insert(initial);
+                    errors.push(anchored(
+                        program,
+                        initial,
+                        landing_refusal(program, "binding", clause, found.as_deref()),
+                    ));
+                }
+            }
+        }
+
+        // --- B309: a closure LITERAL written where a `context`-typed FIELD is
+        // initialised is born under the clause's extent. ---
+        // Exactly the rule an argument to a clause-typed parameter has had
+        // since ambient-owner.md §5: the literal takes its own hidden parameter
+        // instead of capturing the context where the VALUE was built, which is
+        // what makes `Conditional { body }` run its body under the owner
+        // ambient at `place` time and not at construction.
+        let mut field_stores: Vec<(Id, Id, usize, Id)> = Vec::new();
+        for (&entity, expr) in &program.entity_map {
+            let Expr::StructInitializer(_, fields) = expr else {
+                continue;
+            };
+            // The variant's first field is the INITIALIZER's own id; the
+            // declaration it builds is `struct_initializer_to_def`'s answer.
+            let Some(&struct_id) = program.struct_initializer_to_def.get(&entity) else {
+                continue;
+            };
+            for (&index, &value) in fields {
+                field_stores.push((entity, struct_id, index, value));
+            }
+        }
+        // `entity_map` iteration is not ordered; the refusals below are.
+        field_stores.sort_by_key(|(entity, _, index, _)| (entity.0, *index));
+        for (entity, struct_id, index, value) in field_stores {
+            let Some(clause) = field_type_at(program, struct_id, index, Some(entity))
+                .and_then(|type_id| clause_of_type(program, type_id))
+                .map(<[Id]>::to_vec)
+            else {
+                continue;
+            };
+            match program.entity_map.get(&value) {
+                Some(Expr::Closure(closure_id)) => {
+                    for &context in &clause {
+                        deferred.entry(context).or_default().insert(*closure_id);
+                    }
+                }
+                Some(Expr::Local(source)) if value_contexts.get(source) == Some(&clause) => {
+                    allowed_forwards.insert(value);
+                }
+                Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
+                    allowed_forwards.insert(value);
+                }
+                _ => {
+                    let found =
+                        clause_carried_by(program, &value_contexts, &injected_values, value);
+                    refused_landings.insert(value);
+                    errors.push(anchored(
+                        program,
+                        value,
+                        landing_refusal(program, "field", &clause, found.as_deref()),
+                    ));
+                }
+            }
+        }
+
+        // --- B309: the same two rules at a RETURN. ---
+        // `fun body(): (|| View) context owner_scope` hands back an injected
+        // closure: the literal it returns is born under the clause, and the
+        // caller supplies the context at each call through the value.
+        for &(function_id, value) in &program.return_sites {
+            let Some(clause) = program
+                .functions
+                .get(&function_id)
+                .and_then(|function| function.return_type_id)
+                .and_then(|type_id| clause_of_type(program, type_id))
+                .map(<[Id]>::to_vec)
+            else {
+                continue;
+            };
+            match program.entity_map.get(&value) {
+                Some(Expr::Closure(closure_id)) => {
+                    for &context in &clause {
+                        deferred.entry(context).or_default().insert(*closure_id);
+                    }
+                }
+                Some(Expr::Local(source)) if value_contexts.get(source) == Some(&clause) => {
+                    allowed_forwards.insert(value);
+                }
+                Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
+                    allowed_forwards.insert(value);
+                }
+                _ => {
+                    let found =
+                        clause_carried_by(program, &value_contexts, &injected_values, value);
+                    refused_landings.insert(value);
+                    errors.push(anchored(
+                        program,
+                        value,
+                        landing_refusal(program, "return", &clause, found.as_deref()),
+                    ));
                 }
             }
         }
@@ -973,9 +1237,31 @@ fn analyze(
                         }
                         allowed_forwards.insert(*argument);
                     }
+                    // B309: a read of a same-clause FIELD is a forward — the
+                    // value form's `place` hands its body straight on.
+                    Some(expr)
+                        if field_read_clause(program, expr).as_deref() == Some(&clause[..]) =>
+                    {
+                        allowed_forwards.insert(*argument);
+                    }
                     _ => {
-                        errors.push(anchored(program, *argument, "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
-                                .to_string()));
+                        let found = clause_carried_by(
+                            program,
+                            &value_contexts,
+                            &injected_values,
+                            *argument,
+                        );
+                        refused_landings.insert(*argument);
+                        if let Some(found) = found {
+                            errors.push(anchored(
+                                program,
+                                *argument,
+                                landing_refusal(program, "parameter", &clause, Some(&found)),
+                            ));
+                        } else {
+                            errors.push(anchored(program, *argument, "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
+                                    .to_string()));
+                        }
                     }
                 }
             }
@@ -989,10 +1275,15 @@ fn analyze(
                 let Some(function_call) = program.function_calls.get(&call.call_id) else {
                     continue;
                 };
-                if let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id)
-                    && let Some(clause) = value_contexts.get(target)
-                {
-                    for &context in clause {
+                let through = match program.entity_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(target)) => value_contexts.get(target).cloned(),
+                    // B309: `(self.body)()` — a call through a `context`-typed
+                    // FIELD demands the context on its caller exactly as a call
+                    // through an injected parameter does.
+                    _ => injected_values.get(&function_call.subject_id).cloned(),
+                };
+                if let Some(clause) = through {
+                    for &context in &clause {
                         injected_calls
                             .entry(context)
                             .or_default()
@@ -1006,20 +1297,29 @@ fn analyze(
         // appears is an escape the threading cannot follow.
         let run_body_entities: HashSet<Id> =
             plan.runs.iter().map(|site| site.closure_entity).collect();
-        for (&entity, expr) in &program.entity_map {
-            let Expr::Local(target) = expr else {
-                continue;
-            };
-            if !value_contexts.contains_key(target) {
-                continue;
-            }
+        // B309: every place an injected value can APPEAR, whichever way it was
+        // obtained — a reference to a clause-typed binding or parameter, or a
+        // read of a clause-typed field. The rule is closed by default: a use
+        // this list does not name is refused, never threaded.
+        let mut injected_appearances: Vec<Id> = program
+            .entity_map
+            .iter()
+            .filter(|(entity, expr)| match expr {
+                Expr::Local(target) => value_contexts.contains_key(target),
+                _ => injected_values.contains_key(entity),
+            })
+            .map(|(&entity, _)| entity)
+            .collect();
+        injected_appearances.sort_by_key(|entity| entity.0);
+        for entity in injected_appearances {
             if call_subject_entities.contains(&entity)
                 || allowed_forwards.contains(&entity)
                 || run_body_entities.contains(&entity)
+                || refused_landings.contains(&entity)
             {
                 continue;
             }
-            errors.push(anchored(program, entity, "an injected (`context`-typed) closure can only be called, forwarded to a parameter with the same `context` clause, or passed to `run`"
+            errors.push(anchored(program, entity, "an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`"
                     .to_string()));
         }
     }

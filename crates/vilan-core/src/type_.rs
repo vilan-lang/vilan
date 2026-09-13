@@ -38,7 +38,27 @@ pub enum Type {
     // other side (a diverging match leg doesn't constrain the match's
     // type), unlike `Any`, which absorbs. Internal — not written in source.
     Never,
-    Closure(Vec<TypeId>, TypeId),
+    // A closure type: the parameter types, the return type, and the `context`
+    // clause it carries (B309) — the context bindings an INJECTED closure is
+    // threaded with, in written order, empty for an ordinary closure.
+    //
+    // The clause is part of the TYPE, not a side-band keyed by the parameter
+    // that happened to declare it (`ambient-owner.md` §5 v1 recorded it by
+    // parameter id, which is why it flowed through no field, generic argument
+    // or return). Carrying it here is what lets `body: (|| View) context
+    // owner_scope` be a struct FIELD, a generic ARGUMENT and a RETURN type, and
+    // what lets the coverage check follow the value wherever it flows.
+    //
+    // UNIFICATION IGNORES IT. Compatibility is the parameters and the return:
+    // a closure LITERAL is born clause-less and takes the clause of the
+    // position it lands in (that is the whole point — the literal defers its
+    // context binding to its call sites instead of capturing at creation), so
+    // demanding equal clauses here would refuse every legal program. The
+    // discipline that keeps a clause-carrying value honest is
+    // `context::thread_contexts`' value-flow rule — a call, a forward to a
+    // same-clause position, or `run` — and it is closed by default: a use the
+    // rule does not name is refused, not threaded.
+    Closure(Vec<TypeId>, TypeId, Vec<Id>),
     // A nominal enum/struct and its type arguments (`Option<i32>` ->
     // `Enum(option_id, [i32])`, `List<str>` -> `Struct(list_id, [str])`). The
     // arguments are empty for a non-generic type, or where they are not (yet)

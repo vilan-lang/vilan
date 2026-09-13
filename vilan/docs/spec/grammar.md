@@ -578,14 +578,19 @@ context-clause = "context" ( IDENT | "(" IDENT { "," IDENT } [ "," ] ")" ) ;
 ```
 
 `context` here is the contextual keyword (§2.2); in TYPE position the
-clause is only valid on closure types, checked semantically (§8.5). The
-same production is the DECLARATION clause a `fun` may carry (§8.6). With a
-return type written, the type rule above takes it first — `fun f(): i32
-context settings` parses its clause here and the declaration peels it back
-off, so it binds to the FUNCTION and `i32` is the return type; with no
-return type the clause is read by the function production above instead.
-Written after the return type it precedes a `borrows` clause, and written
-without one it follows it; the formatter prints it where it was written.
+clause is only valid on closure types, checked semantically (§8.5), and it
+is part of the closure's type wherever one may be written — a parameter, a
+`let` annotation, a struct field, a generic argument, a return type. The
+same production is the DECLARATION clause a `fun` may carry (§8.6), and the
+RETURN TYPE is where the two meet: the type rule above takes the clause
+first, and the declaration peels it back off only when the return type
+cannot carry one. So `fun f(): i32 context settings` binds its clause to the
+FUNCTION (`i32` is the return type), while `fun f(): (|| i32) context
+settings` leaves it on the closure TYPE — the returned closure is injected
+(§8.5). With no return type at all the clause is read by the function
+production above instead. Written after the return type it precedes a
+`borrows` clause, and written without one it follows it; the formatter
+prints it where it was written.
 
 `sync` is likewise
 contextual (§7.4: the synchronous contract; parameters only). A closure

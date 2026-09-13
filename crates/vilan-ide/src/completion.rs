@@ -2129,7 +2129,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // A closure-typed callee (`let render = || …; render().`).
         let subject_type_id = self.expression_type_id(subject_id, depth + 1)?;
         match program.type_id_to_type_map.get(&subject_type_id)? {
-            Type::Closure(_, return_type_id) => Some(*return_type_id),
+            Type::Closure(_, return_type_id, _) => Some(*return_type_id),
             _ => None,
         }
     }

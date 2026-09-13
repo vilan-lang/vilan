@@ -323,6 +323,26 @@ const BRACE_IN_AN_ISTRING: &str = "a `{` inside an `i\"…\"` string opens an in
 /// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
 /// is skipping (a `{` above it excepted: a block or closure body holds ordinary
 /// statements, and a nested `fun` is one of them).
+/// Whether a RETURN type can carry a `context` clause of its own (B309): a
+/// closure type, under the `(..)` grouping the clause's grammar needs and under
+/// an `async` / `sync` marker.
+///
+/// This is the one disambiguation the two clause readings need. `fun f(): i32
+/// context settings` declares what the BODY may read (B242) — `i32` cannot
+/// carry a clause, so nothing is lost by binding it to the function. `fun f():
+/// (|| View) context owner_scope` returns an INJECTED closure, and binding that
+/// clause to the function would quietly mean something else entirely.
+fn return_type_carries_its_own_clause(node: &Node<'_>) -> bool {
+    let grouped = match node {
+        Node::Tuple(elements) if elements.len() == 1 => &elements[0].0,
+        other => other,
+    };
+    matches!(
+        grouped,
+        Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
+    )
+}
+
 fn starts_item(token: &Token<'_>) -> bool {
     matches!(
         token,
@@ -5077,10 +5097,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         //
         //   `fun f(): i32 context settings`  — `parse_type` swallowed it as a
         //     clause on the return type `i32`, where it means nothing and was
-        //     refused ("a `context` clause is only supported on a parameter's
-        //     closure type"). PEELED here: the clause binds to the FUNCTION and
+        //     refused. PEELED here: the clause binds to the FUNCTION and
         //     `i32` is the return type, which is the reading anyone writing it
         //     meant.
+        //
+        // B309 splits that rule in two, because a CLOSURE return type can now
+        // carry a clause of its own: `fun f(): (|| View) context owner_scope`
+        // returns an INJECTED closure, and the clause is the type's. So the
+        // peel happens only where the return type cannot carry one — which is
+        // every shape B242 was written for, and none of B309's.
         //   `fun f(x: i32) context settings` — no return type to swallow it, so
         //     it is still on the token stream; parsed below, after `borrows`.
         //
@@ -5094,7 +5119,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
         if let Some(annotation) = return_type.take() {
             match annotation.0 {
-                Node::TypeWithContexts(inner, names) => {
+                Node::TypeWithContexts(inner, names)
+                    if !return_type_carries_its_own_clause(&inner.0) =>
+                {
                     let clause_start = names
                         .first()
                         .map(|(_, span)| span.start)

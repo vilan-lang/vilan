@@ -91,7 +91,6 @@ row	flagship	key
 54	-	cannot destructure {rendered} as a fixed array: 
 55	-	literal pattern of type {} cannot match type {}
 56	-	an `async` closure type is only supported on parameters, `let` annotations, struct fields, and function return types
-57	-	a `context` clause is only supported on a parameter's closur
 58	-	this array literal has {} element{}, but its type is `[_; {l
 59	flagship	Expected {expected} (this literal's element type), but got {
 60	flagship	Expected {expected} (this literal's element type), but got {
@@ -252,9 +251,9 @@ row	flagship	key
 216	-	`run` must be called on a named context with a closure literal body
 217	-	`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context
 218	-	this parameter's `context` clause names a value that is not a context
-219	-	a `context`-typed binding takes a closure literal, or a value with the same `context` clause
+219	-	a `context`-typed {position} takes a closure literal, or a value with the same `context` clause
 220	-	a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)
-221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a parameter with the same `context` clause, or passed to `run`
+221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`
 222	flagship	context `{}` is read here, but this code can be reached without an enclosing `run`
 223	-	an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`
 224	flagship	`{}` reads context `{}`, so it can't be used as a value
@@ -464,3 +463,4 @@ row	flagship	key
 430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait
 431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{name}.vl` that is the module `{module_name}::{name}` — the declaration wins, so the file cannot be reached by any import; rename one of them
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
+433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
