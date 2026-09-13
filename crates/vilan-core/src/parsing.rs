@@ -240,6 +240,26 @@ const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as
 pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
+/// The rule a MALFORMED import path breaks (B320). Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spelling).
+///
+/// `import` and `use` are keywords, so neither can begin an expression, and the
+/// statement fork that reads them sits at the END of
+/// [`Parser::parse_statement_inner`]: an import whose PATH the grammar could not
+/// read fell through to the expression attempt, whose farthest failure is
+/// recorded on the `import` keyword itself. Every mistyped import in the
+/// language therefore reported `found 'import' expected an expression` at
+/// column 1 of the statement, whatever the typo and however far into the path it
+/// sat (six probe shapes, identical output — `{ (impl T) }`, `::*`, `{ !name }`).
+///
+/// [`Parser::import_path_failure`] records how far the path grammar actually
+/// got, so the rule reports at the token it stopped on. The expression fallback
+/// is untouched for everything that is not import-led.
+const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an \
+     optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins \
+     none of those";
+
 /// The rule a program written with a Rust/Swift visibility marker breaks.
 /// Curated (diagnostics-standard.md B6 — the prohibition explains itself and
 /// names the sanctioned spelling): `pub` is an ordinary identifier here, so
@@ -637,6 +657,20 @@ struct Parser<'a, 'src> {
     /// same way: how deep the input actually went is a fact about the INPUT, not
     /// a claim by whichever branch happened to be exploring when it got there.
     nesting_refusal: Option<ParseError>,
+    /// How far the `import`/`use` PATH grammar got before it declined (B320) —
+    /// the token index a malformed import reports at.
+    ///
+    /// Held outside `farthest_failure` because the path grammar is built from
+    /// speculative `eat_*` probes rather than committed demands, so it records
+    /// nothing there: `import a::{ (impl T) };` explores to the `(` and notes an
+    /// expectation nowhere, leaving the statement's farthest failure on the
+    /// `import` keyword. Recorded only where the path genuinely FAILS — a
+    /// [`Parser::parse_namespace_path_inner`] with no alternative left, or a
+    /// brace-set element that is not a path — never at an alternative a sibling
+    /// production then reads, so a path that parses records nothing at all.
+    /// Cleared at the head of every `import`/`use`, so one statement's record
+    /// can never be read by the next.
+    import_path_failure: Option<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -862,6 +896,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             in_member_body: false,
             nesting_depth: 0,
             nesting_refusal: None,
+            import_path_failure: None,
         }
     }
 
@@ -1123,6 +1158,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.note_expected(TERMINATOR_EXPECTED);
     }
 
+    /// Record that the `import`/`use` path grammar stopped at token `at` (B320),
+    /// keeping the FARTHEST such point — one statement's path is explored
+    /// outside-in, so the deepest stop is the one the reader typed wrong.
+    fn note_import_failure(&mut self, at: usize) {
+        if self
+            .import_path_failure
+            .is_none_or(|recorded| at > recorded)
+        {
+            self.import_path_failure = Some(at);
+        }
+    }
+
     /// B248/B259: refuse an operator — or a `.` chain — that continues an
     /// expression the block-like form just parsed has already ENDED, and steer to
     /// the parentheses that spell what was meant. Called at the four block-bearing
@@ -1257,6 +1304,25 @@ impl<'a, 'src> Parser<'a, 'src> {
                 } else {
                     CSS_IS_A_KEYWORD
                 }),
+                context,
+                hint: None,
+            });
+            return;
+        }
+        // B320: an `import`/`use` whose PATH the grammar could not read. The
+        // located failure is on the keyword — `import` begins no expression, so
+        // the expression fork notes there and nothing deeper notes at all — and
+        // the keyword is the one token that was right. The rule replaces the
+        // message and reports where the path actually stopped.
+        if matches!(
+            self.tokens.get(position),
+            Some((Token::Import | Token::Use, _))
+        ) && let Some(stopped) = self.import_path_failure
+            && stopped > position
+        {
+            self.errors.push(ParseError {
+                span: self.token_span(stopped),
+                reason: ParseErrorReason::Rule(IMPORT_PATH_IS_NAMES_AND_SETS),
                 context,
                 hint: None,
             });
@@ -5672,6 +5738,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_import(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Import)?;
+        // B320: one statement's record, never the previous statement's.
+        self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
         Some((Node::Import(path), self.span_from(start)))
     }
@@ -5690,6 +5758,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_use(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Use)?;
+        // B320: one statement's record, never the previous statement's.
+        self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
         Some((Node::Use(path), self.span_from(start)))
     }
@@ -5735,7 +5805,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(path) = self.attempt(Self::parse_namespace_single_path) {
             return Some(path);
         }
-        self.parse_namespace_set()
+        let branch = self.parse_namespace_set();
+        if branch.is_none() {
+            // B320: neither alternative reads what stands here, so the path
+            // genuinely stops at this token. A DECLINE of this production always
+            // fails the whole statement (its caller propagates with `?`), which
+            // is what keeps the record free of positions a sibling then reads.
+            self.note_import_failure(self.position);
+        }
+        branch
     }
 
     /// `name ( :: branch | as name )?` — one path in a namespace path (the
@@ -5784,9 +5862,21 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_namespace_set(&mut self) -> Option<ImportBranch<'src>> {
         self.attempt(|parser| {
             parser.expect_ctrl('{')?;
-            let paths = parser.comma_list(Self::parse_namespace_single_path, |parser| {
-                parser.peek_is_ctrl('}')
-            })?;
+            let paths = parser.comma_list(
+                |parser| {
+                    // B320: an element that is not a path stops the set HERE,
+                    // and here is deeper than the `{` the enclosing production
+                    // would otherwise record — `{ (impl T) }` reports on the
+                    // `(`, which is the token that was typed.
+                    let at = parser.position;
+                    let element = parser.parse_namespace_single_path();
+                    if element.is_none() {
+                        parser.note_import_failure(at);
+                    }
+                    element
+                },
+                |parser| parser.peek_is_ctrl('}'),
+            )?;
             parser.expect_ctrl('}')?;
             Some(ImportBranch::Set(paths))
         })
@@ -7980,6 +8070,65 @@ mod tests {
         // rest still parses — one error, the skipped BEL).
         let errors = rendered_errors("fun main() { \u{0007} }\n");
         assert_eq!(errors, vec!["found '\\u{7}' expected a token".to_string()]);
+    }
+
+    #[test]
+    fn a_malformed_import_reports_at_the_token_it_stopped_on() {
+        // B320: the six probe shapes of visibility.md §2.7, which before this
+        // all reported `found 'import' expected an expression` at COLUMN 1 of
+        // the statement — the keyword, which is the one token that was right.
+        // Each now reports the import grammar's own rule, anchored on the token
+        // the path actually stopped at. The shapes are B318's new import forms
+        // (a selector, `::*`, a reach marker), which is why the row is owed
+        // before they are built rather than after.
+        for (source, stopped) in [
+            ("import a::{ (impl Thing) };\n", "("),
+            ("import a::{ (impl List<i32>)::{ first, last } };\n", "("),
+            ("import a::{ (impl List<_>) };\n", "("),
+            ("import pkg::a::m::*;\n", "*"),
+            ("import a::{ (impl _) };\n", "("),
+            ("import a::{ !hidden };\n", "!"),
+        ] {
+            let (_tree, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "one diagnostic for {source:?}: {errors:?}");
+            assert_eq!(
+                render(&errors[0]),
+                IMPORT_PATH_IS_NAMES_AND_SETS,
+                "the import grammar's rule, for {source:?}"
+            );
+            assert_eq!(
+                &source[errors[0].span.into_range()],
+                stopped,
+                "anchored on the token the path stopped at, for {source:?}"
+            );
+        }
+        // `use` shares the path grammar and the rule names both.
+        assert_eq!(
+            rendered_errors("use a::{ (impl T) };\n"),
+            vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_well_formed_import_keeps_every_other_reading() {
+        // The rule REPLACES nothing it should not: a path the grammar reads is
+        // clean, a missing `;` still reports at the gap (the record is only
+        // written where the path genuinely fails, so a parsed path leaves it
+        // empty), an unclosed brace is still unclosed, and a statement that is
+        // not import-led keeps the expression fallback.
+        assert!(rendered_errors("import pkg::a::{ b, c as d };\n").is_empty());
+        assert_eq!(
+            rendered_errors("import pkg::a only;\n"),
+            vec!["expected `;` to end this statement".to_string()]
+        );
+        assert_eq!(
+            rendered_errors("import a::{ b\n"),
+            vec!["unclosed `{`: expected a matching `}`".to_string()]
+        );
+        assert_eq!(
+            rendered_errors("nonsense *;\n"),
+            vec!["found ';' expected an expression".to_string()]
+        );
     }
 
     #[test]
