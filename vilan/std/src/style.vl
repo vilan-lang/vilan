@@ -1641,7 +1641,20 @@ impl Style {
 	/// UNCONDITIONED in v1 — a pseudo or attribute under a child combinator
 	/// would bind to the child's compound (`.sX > *:hover`), semantics no
 	/// ruling has settled — and media wraps from outside as ever.
+	///
+	/// The TOKEN is `children`'s and `divide`'s, and the fence says so (A93).
+	/// This method is reachable from outside std only because the language has
+	/// no visibility yet, and the token it takes goes into the slot key
+	/// unexamined — so a token that is neither `>*` nor `>*+*` landed in the
+	/// PSEUDO slot, skipped the `@layer vilan` wrap and the `> *` suffix, and
+	/// rendered a rule about the element ITSELF from a child-relation method
+	/// (`child_relation("not([hidden])", ..)` rendering `.sX:not([hidden])`).
+	/// That is a raw-selector hatch, not a relation, and A89 gave what it was
+	/// reached for a real spelling: `attribute(name, value, not(..))`.
 	fun child_relation(self, token: str, name: str, inner: Style): Style {
+		if token != ">*" && token != ">*+*" {
+			panic(i"child_relation takes one of the two shipped relations — >* (children) or >*+* (divide) — and got {token}: it is those two methods' shared chokepoint, not a raw-selector hatch. A condition on the element ITSELF is attribute(name, value, ..) or within(name, value, ..), and a negated one is not(..) inside the condition it negates.");
+		}
 		mut out = self;
 		for key in inner.rules.keys() {
 			check_wrappable_slot(key, name);

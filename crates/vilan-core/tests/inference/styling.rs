@@ -6613,3 +6613,73 @@ fn b311_a_style_carrying_a_raw_pseudo_token_still_merges_and_applies() {
         "2\n3\n",
     );
 }
+
+// --- A93: `child_relation`'s token is `children`'s and `divide`'s ---------------
+// The method is reachable from outside std only because the language has no
+// visibility yet (B318), and its token went into the slot key unexamined — so
+// a token that is neither `>*` nor `>*+*` landed in the PSEUDO slot, skipped
+// the `@layer vilan` wrap and the `> *` suffix, and rendered a rule about the
+// element ITSELF from a child-relation method. A89 gave what it was reached for
+// a real spelling, so the hatch closes.
+
+#[test]
+fn a93_a_child_relation_token_outside_the_two_relations_is_refused() {
+    // kolt's `views.vl` site, which rendered `.sX:not([hidden])` — a rule about
+    // the element, from a method whose whole subject is its children.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().child_relation("not([hidden])", "display", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let refusal = diagnostics
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .find(|message| message.contains("child_relation takes one of the two shipped relations"))
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    assert!(refusal.contains("not([hidden])"), "{refusal}");
+    assert!(refusal.contains("attribute(name, value, ..)"), "{refusal}");
+    assert!(
+        refusal.contains("not(..) inside the condition it negates"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a93_the_two_shipped_relations_are_the_controls() {
+    // Non-vacuity, beside the refusal: both legitimate tokens still reach the
+    // sheet with their own rendering — `children` the bare `> *`, `divide` the
+    // `:not(:first-child)` refinement — so the fence rejects the hatch and
+    // nothing else.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style()
+                .children(style().margin_top(space(2)))
+                .divide(style().margin_top(space(4)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.") && line.ends_with(" > *{margin-top:var(--space-2)}}")
+        }),
+        "{assets:?}"
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.")
+                && line.ends_with(" > :not(:first-child){margin-top:var(--space-4)}}")
+        }),
+        "{assets:?}"
+    );
+}
