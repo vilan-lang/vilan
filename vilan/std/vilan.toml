@@ -7,13 +7,27 @@
 [library]
 name = "std"
 # std compiles with NO ambient scope (`prelude.md` §10.1). Three reasons, in
-# order of weight: std's own resolution stays greppable — 264 names across 59
-# files, every symbol somebody's lang item, and "where does this name come from"
-# must be answerable by reading the file; the bootstrapping order becomes
-# trivial rather than delicate, since the prelude's members are std definitions;
-# and it exercises the `false` path in the one package every user of the
-# language builds. Stated here rather than special-cased in the compiler, so a
-# reader sees the posture and no "std is different" branch can drift.
+# order of weight: std's own resolution stays greppable — 664 top-level
+# declarations across 63 files, every symbol somebody's lang item, and "where
+# does this name come from" must be answerable by reading the file; the
+# bootstrapping order becomes trivial rather than delicate, since the prelude's
+# members are std definitions; and it exercises the `false` path in the one
+# package every user of the language builds. Stated here rather than
+# special-cased in the compiler, so a reader sees the posture and no "std is
+# different" branch can drift.
+#
+# The census, measured at e4d192e3 and refreshable from this directory — a
+# declaration is a top-level `fun`/`external fun`/`struct`/`trait`/`enum`/`let`,
+# which is the set `visibility.md` §6 counts:
+#
+#     grep -rhE '^(external fun|fun|struct|trait|enum|let) ' --include='*.vl' src | wc -l   # 664
+#     find src -name '*.vl' | wc -l                                                         # 63
+#
+# 118 of the 664 are imported BY NAME by another std file — std's cross-file
+# reach, 18% of the declarations, and the floor of its curated export surface
+# under B318. That number is `visibility.md` §6's table and not a grep: it walks
+# the import statements (five of std's span lines) and resolves each leaf
+# against the declaring module.
 #
 # std still CONTAINS the two prelude modules (`src/prelude.vl`, `src/web.vl`) —
 # that is a fact about contents, not about resolution.
