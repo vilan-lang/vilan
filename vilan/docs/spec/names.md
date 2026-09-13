@@ -16,6 +16,14 @@ whether or not `a` has a body of its own; nesting is unbounded, so
 namespace**: it holds modules but is not one, and an `import` naming it
 is a diagnostic listing the modules it does hold.
 
+`lib` is a body's **file name**, not a path segment: `a/lib.vl` is what
+`pkg::a` resolves to, so `pkg::a::lib` would name one file under two
+names and is a **diagnostic** steering to `pkg::a` (whose items are that
+file's). The rule reads the DIRECTORY: a `lib.vl` at the source root is
+the ordinary module `lib`, because the root is nobody's body, and a
+directory literally named `lib` (`a/lib/x.vl`) is a path segment like any
+other.
+
 A module is reached by its **own** path. `import pkg::a` binds the items
 of `a`'s body and nothing below it; `a::b` is reached by
 `import pkg::a::b`. Item lookup through a module in expression position

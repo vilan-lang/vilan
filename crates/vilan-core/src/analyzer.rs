@@ -3441,6 +3441,18 @@ pub struct Analyzer<'src> {
     /// body behind it, so it is refused; the children ride along because naming
     /// them is the whole of the fix ("write `pkg::lib::util`").
     namespace_only_modules: HashMap<Id, Vec<String>>,
+    /// B331: the modules whose DIRECTORY holds a `lib.vl` — the ones for which
+    /// the segment `lib` names their own body file rather than anything below
+    /// them.
+    ///
+    /// [`resolve_module_file`] stopped answering `a::lib` with `a/lib.vl`, so
+    /// the walk down `pkg::a::lib` now misses at that segment; "cannot find
+    /// 'lib'" would be false about a file the author can see on disk, and this
+    /// is what lets the miss say what `lib` IS and steer to `pkg::a` instead.
+    /// A module whose own body is `a/lib.vl` is in the set, and so is one
+    /// resolved to `a.vl` beside an `a/lib.vl` (the file-level ambiguity's
+    /// tree): both mean the directory holds a body file under that name.
+    modules_bodied_by_a_lib_file: HashSet<Id>,
     // The prelude (prelude.md §9.2, implementation option 1). `prelude_exports`
     // is every loaded module's importable names by module scope — what a
     // prelude module would publish, read syntactically at load. `prelude_seeds`
@@ -4893,6 +4905,7 @@ impl<'src> Analyzer<'src> {
             entry_module_package: None,
             module_children_scopes: HashMap::default(),
             namespace_only_modules: HashMap::default(),
+            modules_bodied_by_a_lib_file: HashSet::default(),
             prelude_exports: HashMap::default(),
             prelude_seeds: Vec::new(),
             prelude_entry_bindings: Vec::new(),
@@ -24880,17 +24893,16 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             for name in children.name_to_id_map.keys() {
-                // `lib` is never a child: `a/lib.vl` is module `a`'s own BODY.
-                // `submodules_in_directory` excludes it for that reason, and a
-                // `lib` reaches this scope only from an import path spelled
-                // `pkg::a::lib`, which resolves the body file a second time
-                // under a second name. That tree is degenerate and already
-                // stated — `a.vl` beside `a/lib.vl` is the file-level ambiguity
-                // — so saying it twice would be two diagnostics for one root
-                // cause (diagnostics-standard B5).
-                if *name == "lib" {
-                    continue;
-                }
+                // B331 retired the hand-skip of `lib` that stood here. It was
+                // needed while `pkg::a::lib` resolved `a/lib.vl` a second time
+                // under a second name: the loader registered a `lib` child that
+                // was really `a`'s own body, and reporting the collision on top
+                // of the file-level ambiguity would have been two diagnostics
+                // for one root cause. `resolve_module_file` refuses that name
+                // now, so a `lib` reaching this scope is a real directory —
+                // `a/lib/` with a body or children of its own — and a
+                // declaration named `lib` beside it is the ordinary collision,
+                // which is what this rule is for.
                 if let Some(member_id) = self.member_in_namespace(name, module.body.1) {
                     collisions.push((member_id, module.name, name));
                 }
@@ -34414,7 +34426,7 @@ impl<'src> Analyzer<'src> {
         // resolves today resolves to exactly what it resolves to now and the
         // statics are reached only where the walk used to stop.
         let mut type_namespace: Option<(Id, Id, &str)> = None;
-        for (part, part_span) in segments {
+        for (depth, (part, part_span)) in segments.enumerate() {
             let scope_hit = self.member_or_submodule(part, namespace_scope_id, namespace_module_id);
             let type_hit = match (scope_hit, type_namespace) {
                 (None, Some((subject_id, subject_scope_id, _))) => {
@@ -34491,6 +34503,37 @@ impl<'src> Analyzer<'src> {
                     // scope, so the walk into it can only miss — and saying so
                     // sends the author looking for a name they can see declared.
                     if report && !self.entry_cycle_refusal_covers(Some(source_id), part) {
+                        // B331: `lib` under a module whose directory holds one
+                        // is that module's own body file. It used to resolve —
+                        // the same file loaded a second time under a second
+                        // name — and now it misses, so the miss says what the
+                        // segment IS rather than that the compiler cannot find
+                        // a file the author can see on disk.
+                        if part == "lib"
+                            && namespace_module_id
+                                .is_some_and(|id| self.modules_bodied_by_a_lib_file.contains(&id))
+                        {
+                            let spelled: Vec<&str> = path
+                                .iter()
+                                .map(|(segment, _)| *segment)
+                                .chain((name != "self").then_some(name))
+                                .collect();
+                            let parent = spelled[..=depth].join("::");
+                            let leaf = spelled[depth];
+                            let directory = spelled[1..=depth].join("/");
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: part_span,
+                                msg: format!(
+                                    "`{parent}::lib` is module `{leaf}`'s own BODY FILE, not a \
+                                     module below it: `{directory}/lib.vl` is what `{parent}` \
+                                     resolves to. Import `{parent}` instead — the items that \
+                                     file declares are `{parent}`'s own"
+                                ),
+                            });
+                            return false;
+                        }
                         let msg =
                             removed_std_alias(root, part, namespace_scope_id == root_scope_id)
                                 .unwrap_or_else(|| {
@@ -49831,6 +49874,18 @@ fn module_path_display(name: &str) -> String {
 /// had just created and not yet saved diagnosed as missing while it sat on
 /// screen. The overlay is also the whole filesystem when there is no filesystem,
 /// which is what lets the compiler resolve modules compiled to wasm.
+///
+/// B331: a `lib` LEAF under a directory that already holds it as a body is not
+/// a module here. `a/lib.vl` is the body of `a`, so answering `a::lib` with it
+/// resolves one file under two names — the loader parsed and analyzed it twice,
+/// registered `lib` in `a`'s own submodule scope (which
+/// [`submodules_in_directory`] deliberately never lists), and left A67's
+/// collision rule skipping the name by hand to avoid a second diagnostic for one
+/// root cause. The refusal that answers the import instead is raised by the
+/// walk, which is where the steer to `a` can be written; here the name simply
+/// does not resolve. Only the FLAT candidate is refused: a directory literally
+/// named `lib` with a body of its own (`a/lib/lib.vl`) is a module whose body
+/// file is its own, not `a`'s, and nothing about it is degenerate.
 fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
     let (prefix, last) = module_path_prefix(name)?;
     let flat_relative = prefix.join(format!("{last}.vl"));
@@ -49844,7 +49899,11 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
         relative,
     };
     let exists = |candidate: &Path| candidate.exists() || document_overlay_contains(candidate);
+    // The root's own `lib.vl` is untouched: a package's `lib` is a module (and
+    // std's package surface), because the source root is nobody's body.
+    let names_a_body_file = last == "lib" && !prefix.as_os_str().is_empty();
     match (exists(&flat), exists(&nested)) {
+        (true, _) if names_a_body_file => None,
         (true, both_exist) => Some(resolution(flat_relative, flat, both_exist)),
         (false, true) => Some(resolution(nested_relative, nested, false)),
         (false, false) => None,
@@ -53451,6 +53510,18 @@ fn analyze_inner<'src>(
                 // resolver below will report) — skip, as the previous loader did.
                 continue;
             };
+            // B331: whether this module's own directory holds a `lib.vl`. True
+            // for the nested body (`a/lib.vl` IS `a`), and true for `a.vl`
+            // beside an `a/lib.vl` (the ambiguity's tree, where the flat file
+            // won) — either way the segment `lib` under this module would name
+            // a body file, and the walk's miss says so rather than "cannot
+            // find".
+            let directory_holds_a_lib_body = resolution.ambiguous
+                || (resolution.relative.file_name() == Some(std::ffi::OsStr::new("lib.vl"))
+                    && resolution
+                        .relative
+                        .parent()
+                        .is_some_and(|parent| !parent.as_os_str().is_empty()));
             let module_path = resolution.path;
             if resolution.ambiguous {
                 analyzer.diagnostics.push(Error {
@@ -53714,6 +53785,9 @@ fn analyze_inner<'src>(
             // A body: whatever the directory probe concluded before it loaded is
             // no longer true.
             analyzer.namespace_only_modules.remove(&module_id);
+            if directory_holds_a_lib_body {
+                analyzer.modules_bodied_by_a_lib_file.insert(module_id);
+            }
             // Give the module entity a location (its file, at the top) so a path
             // segment naming it can go-to-definition. A one-id range maps it to its
             // source; the span is the file start.

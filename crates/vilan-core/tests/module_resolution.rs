@@ -4973,3 +4973,180 @@ fn b317_a_static_is_not_importable_through_a_module_that_writes_no_block() {
         "a module that writes no block offers no statics: {errors:#?}"
     );
 }
+
+// --- B331: `lib` is a body file, never a segment below its own directory -----
+//
+// `a/lib.vl` IS module `a`. The loader used to answer `a::lib` with it as well,
+// so one file was parsed, analyzed and entity-numbered twice under two names,
+// `lib` landed in `a`'s submodule scope (which `submodules_in_directory` has
+// never listed), and A67's collision rule had to skip the name by hand to avoid
+// saying one root cause twice. `resolve_module_file` refuses the name now and
+// the walk's miss says what the segment is, with the parent path to write
+// instead.
+
+/// The package the pins share: `a`'s body is its directory's `lib.vl`.
+const B331_NESTED_BODY: &[(&str, &str)] = &[("a/lib.vl", "fun greet(): i32 { 7 }\n")];
+
+#[test]
+fn b331_a_body_file_is_not_a_module_under_its_own_directory() {
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::a::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("own BODY FILE"))
+        .unwrap_or_else(|| panic!("`lib` under `a` is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`pkg::a::lib`") && refusal.contains("`a/lib.vl`"),
+        "and names the segment and the file it is: {refusal}"
+    );
+    assert!(
+        refusal.contains("Import `pkg::a` instead"),
+        "and steers to the parent path: {refusal}"
+    );
+}
+
+#[test]
+fn b331_the_segment_alone_is_refused_the_same_way() {
+    // `import pkg::a::lib;` has no leaf to blame, and it resolved to the body
+    // file under a second name exactly as the deeper path did.
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push(("main.vl", "import pkg::a::lib;\n\nfun main() {}\n"));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("own BODY FILE")
+                && error.contains("Import `pkg::a` instead")),
+        "the bare segment is refused with the same steer: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_the_steers_own_spelling_resolves() {
+    // The other half of the pin the item asked for: what the refusal tells the
+    // author to write compiles. `a/lib.vl`'s items are `pkg::a`'s items.
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::a::greet;\n\nfun main() { let _ = greet(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "`pkg::a::greet` reaches what `pkg::a::lib::greet` was aiming at: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_a_deeper_body_file_names_its_own_parent() {
+    // The steer is built from the segments WALKED, not from the root: two
+    // levels down it says `pkg::x::a` and `x/a/lib.vl`.
+    let files = &[
+        ("x/a/lib.vl", "fun greet(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::x::a::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("own BODY FILE"))
+        .unwrap_or_else(|| panic!("the nested body is refused too: {errors:#?}"));
+    assert!(
+        refusal.contains("`pkg::x::a::lib`")
+            && refusal.contains("`x/a/lib.vl`")
+            && refusal.contains("Import `pkg::x::a` instead"),
+        "and spells the path it walked: {refusal}"
+    );
+}
+
+#[test]
+fn b331_a_root_level_lib_module_is_untouched() {
+    // The narrowness control the refusal must not swallow: the SOURCE ROOT is
+    // nobody's body, so `lib.vl` beside `main.vl` is the ordinary module `lib`
+    // (and is std's own package surface). Only a `lib` with a directory prefix
+    // names a body file.
+    let files = &[
+        ("lib.vl", "fun greet(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a root-level `lib.vl` is a module like any other: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_a_directory_named_lib_below_a_module_still_resolves() {
+    // The second control: `a/lib/` is a DIRECTORY whose own body would be
+    // `a/lib/lib.vl` — `lib` there names that directory, not `a`'s body, and
+    // nothing about it is degenerate. Only the flat candidate is refused.
+    let files = &[
+        ("a.vl", "fun surface(): i32 { 1 }\n"),
+        ("a/lib/x.vl", "fun hello(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::lib::x::hello;\n\nfun main() { let _ = hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a real `lib` directory is still a path segment: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_the_body_file_is_loaded_once_under_one_name() {
+    // The root cause, stated as behaviour rather than as a message: `a/lib.vl`
+    // declares `greet` once. While the loader answered `a::lib` with it too, the
+    // file was analyzed a second time as a second module — and the duplicate
+    // declaration rule is what notices a name declared twice in one module.
+    // Neither name is reported, because there is only one module now.
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::a::greet;\nimport pkg::a;\n\nfun main() { let _ = greet(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "one file, one module, however many paths reach it: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_a_declaration_shadowing_a_real_lib_directory_is_ambiguous() {
+    // What the refusal bought A67. `refuse_shadowed_submodules` used to skip
+    // the name `lib` outright, because the loader's second resolution of a body
+    // file put one in every such module's submodule scope and the collision
+    // would have been said twice. With that resolution gone, a `lib` in a
+    // submodule scope is a real directory — here `a/lib/` with a body of its own
+    // — and a declaration named `lib` beside it is the ordinary A67 collision,
+    // which the hand-skip was hiding.
+    let files = &[
+        ("a.vl", "fun lib(): i32 { 1 }\n"),
+        ("a/lib/lib.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`lib` is ambiguous in module `a`")
+                && error.contains("the declaration wins")),
+        "the collision the hand-skip hid is reported: {errors:#?}"
+    );
+}
