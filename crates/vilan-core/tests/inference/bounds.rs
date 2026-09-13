@@ -9291,6 +9291,148 @@ fn b309_a_generic_argument_carries_the_clause_into_the_field_it_binds() {
     );
 }
 
+/// B323: the same generic argument written as an ANNOTATION rather than
+/// carried in by a constructor's parameter. `Held<(|| void) context current>`
+/// binds `T` from the VALUE's type, and a closure literal is born clause-less
+/// — that is what makes it deferrable — so the literal bound a clause-less `T`
+/// and the annotation reached nothing: the field landing never fired, the
+/// literal captured at construction, and the program printed the context of
+/// its CONSTRUCTION site (`saw 9`) rather than of its call (`saw 3`).
+///
+/// The landing now reads the annotated EXPECTED type of the literal, so the
+/// two spellings agree. `hold` above is the control: the constructor shape has
+/// always worked and still does.
+#[test]
+fn b323_an_annotated_generic_argument_carries_the_clause_into_the_literal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        fun main() {
+            current.run(9, || {
+                let held: Held<(|| void) context current> =
+                    Held { body = || print(i"saw {current.get()}") };
+                current.run(3, || (held.body)());
+            });
+        }
+        main();
+        "#,
+        "saw 3\n",
+    );
+}
+
+/// B324: a `context` clause is only meaningful where a LANDING RULE follows
+/// it, and `List<T>` has none — `List` is `external` and declares no field, so
+/// there is no field type for the argument to bind. The clause parsed,
+/// type-checked and meant nothing: the literal captured at creation, the
+/// value-flow restriction never saw a value it recognized as injected, and the
+/// program answered to the context of its CONSTRUCTION site. Sound and silent,
+/// which is why the answer is a refusal rather than a rewrite.
+#[test]
+fn b324_a_clause_inside_a_list_is_refused_rather_than_silently_inert() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun main() {
+            current.run(9, || {
+                let bodies: List<(|| void) context current> =
+                    [|| print(i"saw {current.get()}")];
+                current.run(3, || {
+                    let body = bodies[0];
+                    body();
+                });
+            });
+        }
+        main();
+        "#,
+        "a `context` clause the threading cannot follow",
+    );
+}
+
+/// The same hole one type constructor over: `Map<K, V>`'s value position. The
+/// clause rides in on the annotation and the literal lands at `insert`'s `V`
+/// parameter, whose DECLARED type is the abstract `V` and carries no clause —
+/// so nothing the landing rules read ever sees one.
+#[test]
+fn b324_a_clause_inside_a_map_value_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::map::Map;
+
+        let current: Context<i32> = Context::new();
+
+        fun main() {
+            current.run(1, || {
+                mut bodies: Map<str, (|| void) context current> = Map::new();
+                bodies.insert("a", || print(i"saw {current.get()}"));
+            });
+        }
+        main();
+        "#,
+        "a `context` clause the threading cannot follow",
+    );
+}
+
+/// The CONTROLS the refusal above is held against: every position B309 gave a
+/// landing rule still takes its clause, in one program — a parameter, a `let`
+/// annotation, a struct FIELD, a generic ARGUMENT the struct binds to a field,
+/// and a RETURN type. The new check walks one level IN from each of these, so
+/// a clause written AT one of them is never its business.
+#[test]
+fn b324_the_landing_positions_still_admit_their_clause() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        struct Plain {
+            body: (|| void) context current,
+        }
+
+        fun takes(body: (|| void) context current) {
+            body();
+        }
+
+        fun makes(): (|| void) context current {
+            || print(i"saw {current.get()}")
+        }
+
+        fun main() {
+            let annotated: (|| void) context current = || print(i"saw {current.get()}");
+            let held: Held<(|| void) context current> =
+                Held { body = || print(i"saw {current.get()}") };
+            let plain = Plain { body = || print(i"saw {current.get()}") };
+            current.run(1, || takes(annotated));
+            current.run(2, || (held.body)());
+            current.run(3, || (plain.body)());
+            let made = makes();
+            current.run(4, || made());
+        }
+        main();
+        "#,
+        "saw 1\nsaw 2\nsaw 3\nsaw 4\n",
+    );
+}
+
 /// A RETURN carries the clause: the closure a function hands back is injected,
 /// so its caller supplies the context at the call THROUGH it rather than the
 /// producing function capturing one it may not have.
@@ -9318,6 +9460,67 @@ fn b309_a_return_type_carries_the_clause_to_its_caller() {
         main();
         "#,
         "saw 5\n",
+    );
+}
+
+/// B325: an UNANNOTATED binding of an injected closure is a forward, not an
+/// escape. B309 moved clause resolution ahead of the fixpoint, so `let held =
+/// body;` infers a type that carries the clause and the threading can follow
+/// it exactly as far as it follows the annotated spelling — but the binding
+/// landing rule had stayed keyed on the ANNOTATION, so this earned the
+/// value-flow refusal for a forward the pass could already see was legal. The
+/// annotated form is the control beside it: both run, and both print the
+/// context ambient at the CALL.
+#[test]
+fn b325_an_unannotated_binding_of_an_injected_closure_is_a_forward() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun unannotated(body: (|| void) context current) {
+            let held = body;
+            held();
+        }
+
+        fun annotated(body: (|| void) context current) {
+            let held: (|| void) context current = body;
+            held();
+        }
+
+        fun main() {
+            current.run(5, || unannotated(|| print(i"saw {current.get()}")));
+            current.run(6, || annotated(|| print(i"saw {current.get()}")));
+        }
+        main();
+        "#,
+        "saw 5\nsaw 6\n",
+    );
+}
+
+/// B325 changes what an unannotated binding means, and nothing about a
+/// MISMATCHED one: a value carrying one clause bound at an annotation
+/// demanding another is still refused, naming both.
+#[test]
+fn b325_a_mismatched_clause_at_a_binding_is_still_refused_naming_both() {
+    assert_fails_with(
+        r#"
+        import std::context::Context;
+
+        let left: Context<i32> = Context::new();
+        let right: Context<i32> = Context::new();
+
+        fun forward(body: (|| void) context left) {
+            let held: (|| void) context right = body;
+            held();
+        }
+
+        fun main() {}
+        main();
+        "#,
+        "this value carries `context left` and this binding demands `context right`",
     );
 }
 

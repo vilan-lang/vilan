@@ -4472,6 +4472,13 @@ main();
 
 // The value-flow restriction: an injected closure may be called, forwarded to
 // a matching clause, or handed to `run` — nothing else.
+//
+// The escape was written `let escaped = body;` until B325, which admitted that
+// spelling: an unannotated binding takes its clause FROM the initializer, so it
+// is a forward to a position carrying the same clause by construction and the
+// threading follows it. A parameter that carries NO clause is the escape the
+// rule is actually about — the value would have to capture, and there is no
+// hidden argument at that call to thread.
 #[test]
 fn an_injected_closure_cannot_escape() {
     let source = r#"
@@ -4479,8 +4486,10 @@ import std::context::Context;
 
 let current: Context<i32> = Context::new();
 
+fun plain(fn: || void) {}
+
 fun hold(body: (|| void) context current) {
-    let escaped = body;
+    plain(body);
 }
 
 fun main() {}

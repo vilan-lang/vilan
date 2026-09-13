@@ -9256,33 +9256,48 @@ impl<'src> Transformer<'src> {
     /// The resolved type id of an expression, used for tuple flat-layout
     /// decisions. Falls back through a binding reference to the binding's type
     /// (a bare `Expr::Local`/`Parameter` use carries no type on its own id).
+    ///
+    /// B328: an `Expr::Local` naming a PARAMETER answers too. A reference to a
+    /// parameter is spelled `Expr::Local(parameter_id)` — `Expr::Parameter` is
+    /// the DECLARATION — so `variables.get` alone missed every one of them, and
+    /// this read `None` for a form the program writes constantly. It was
+    /// harmless only by accident: the tuple decision consults
+    /// `tuple_element_types` second (B310) and that entry covers every element
+    /// form, and `drop_argument_type_id` carried a private copy of this arm.
+    /// Neither is a reason for the general answer to be wrong, and the next
+    /// consumer to read a parameter's type through here would not have had one.
     fn expr_type_id(&self, expr_id: Id) -> Option<TypeId> {
         if let Some(type_id) = self.program.expr_type_ids.get(&expr_id) {
             return Some(*type_id);
         }
         match self.program.entity_map.get(&expr_id)? {
-            Expr::Local(binding) | Expr::Variable(binding) => {
-                self.program.variables.get(binding).map(|v| v.type_id)
-            }
+            Expr::Local(binding) | Expr::Variable(binding) => self
+                .program
+                .variables
+                .get(binding)
+                .map(|variable| variable.type_id)
+                .or_else(|| {
+                    self.program
+                        .parameters
+                        .get(binding)
+                        .map(|parameter| parameter.type_id)
+                }),
             Expr::Parameter(binding) => self.program.parameters.get(binding).map(|p| p.type_id),
             _ => None,
         }
     }
 
     /// The type of a `drop(x)` argument, for the early-teardown rewrite. Like
-    /// `expr_type_id` but a bare `Expr::Local` of a PARAMETER id also resolves (a
-    /// plain `drop(param)` would otherwise read as untyped and no-op, leaking the
-    /// parameter), and a VALUE argument — a call result, which stores no type on
-    /// its own id and names no binding — resolves through the analyzer's B68
-    /// recording (`drop_sink_value_types`, affine-moves.md §9.4). Kept separate
-    /// from `expr_type_id` so the tuple/set layout decisions that read it stay
-    /// byte-identical.
+    /// `expr_type_id`, plus a VALUE argument — a call result, which stores no
+    /// type on its own id and names no binding — resolved through the
+    /// analyzer's B68 recording (`drop_sink_value_types`, affine-moves.md
+    /// §9.4).
+    ///
+    /// The parameter arm that used to live here is `expr_type_id`'s now (B328):
+    /// a plain `drop(param)` reading as untyped and no-opping — which leaks the
+    /// parameter — was this function's own bug report about the general one.
     fn drop_argument_type_id(&self, expr_id: Id) -> Option<TypeId> {
         self.expr_type_id(expr_id)
-            .or_else(|| match self.program.entity_map.get(&expr_id)? {
-                Expr::Local(binding) => self.program.parameters.get(binding).map(|p| p.type_id),
-                _ => None,
-            })
             .or_else(|| self.program.drop_sink_value_types.get(&expr_id).copied())
     }
 

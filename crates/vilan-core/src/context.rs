@@ -312,14 +312,39 @@ fn field_type_at(
         .generic_parameter_constraint_ids
         .iter()
         .position(|id| id == parameter)?;
-    let arguments = match instance
-        .and_then(|instance| value_type_of(program, instance))
-        .and_then(|type_id| program.type_id_to_type_map.get(&type_id))
-    {
-        Some(Type::Struct(id, arguments)) if *id == struct_id => arguments,
-        _ => return Some(field.type_id),
-    };
-    Some(arguments.get(position).copied().unwrap_or(field.type_id))
+    let argument = instance
+        .into_iter()
+        .flat_map(|instance| instance_types_of(program, instance))
+        .find_map(|type_id| match program.type_id_to_type_map.get(&type_id) {
+            Some(Type::Struct(id, arguments)) if *id == struct_id => {
+                arguments.get(position).copied()
+            }
+            _ => None,
+        });
+    Some(argument.unwrap_or(field.type_id))
+}
+
+/// The types this pass will read an INSTANCE's generic arguments out of, in
+/// preference order: the ANNOTATION that expected a struct literal (B323)
+/// first, the value's own type second.
+///
+/// The annotation wins because a closure LITERAL is born clause-less — that is
+/// what makes it deferrable — so `Held { body = || .. }` binds the struct's
+/// parameter from a clause-less closure type and the literal's own record
+/// carries no `context` clause at all. Under `let held: Held<(|| void) context
+/// current> = Held { body = || .. }` the annotation is the only place the
+/// clause is written; reading past it left the field landing silent, the
+/// literal capturing the context of its construction site, and the program
+/// printing it (B323's `saw 9`). Unification ignores the clause, so the two
+/// answers differ in nothing else, and a non-struct or wrong-struct
+/// expectation simply falls through to the value's own type.
+fn instance_types_of(program: &Program, entity: Id) -> impl Iterator<Item = TypeId> {
+    program
+        .struct_literal_expectations
+        .get(&entity)
+        .copied()
+        .into_iter()
+        .chain(value_type_of(program, entity))
 }
 
 /// The type an expression has, as this pass can see it: a reference to a
@@ -392,6 +417,102 @@ fn landing_refusal(
             "a `context`-typed {position} takes a closure literal, or a value with the same `context` clause"
         ),
     }
+}
+
+/// Whether `struct_id`'s declaration binds its `position`-th generic parameter
+/// to a FIELD's type — the one arm through which a landing rule follows a
+/// clause into a generic ARGUMENT ([`field_type_at`]'s `Type::Generic` case).
+///
+/// `Held<(|| void) context current>` passes because `Held` declares `body: T`;
+/// `List<(|| void) context current>` does not, because `List` is `external` and
+/// declares no field at all — which is precisely why a literal written into one
+/// is born clause-less (B324).
+fn struct_binds_parameter_to_a_field(program: &Program, struct_id: Id, position: usize) -> bool {
+    let Some(declaration) = program.structs.get(&struct_id) else {
+        return false;
+    };
+    let Some(parameter) = declaration
+        .generic_parameter_constraint_ids
+        .get(position)
+        .copied()
+    else {
+        return false;
+    };
+    declaration.fields.iter().any(|field| {
+        matches!(
+            program.type_id_to_type_map.get(&field.type_id),
+            Some(Type::Generic(id)) if *id == parameter
+        )
+    })
+}
+
+/// B324: the first `context` clause written INSIDE `type_id` at a position no
+/// landing rule reaches — `List<(|| i32) context c>`, `Map<str, (|| i32)
+/// context c>`, `Option<..>`, a tuple element, an array element.
+///
+/// B309 gave the clause four WRITING positions (a parameter, a `let`
+/// annotation, a struct FIELD, a RETURN) plus the generic ARGUMENT a struct
+/// binds to one of its fields, and each of those has a landing rule: the
+/// literal written there is born under the clause's extent instead of capturing
+/// at creation. Everywhere else the clause parses, type-checks and means
+/// nothing — the literal captures, the value-flow restriction never sees it,
+/// and the program silently answers to the context of its construction site.
+/// Sound, and silent, which is the half that makes it a bug.
+///
+/// A clause on the type ITSELF is not this rule's business: whether it lands is
+/// the enclosing position's question, and the landing rules answer it. So the
+/// walk starts one level in, and stops at a closure type — a clause under a
+/// closure's own parameter or return is that closure's parameter's clause, and
+/// a parameter is a landing position.
+fn unfollowable_clause(
+    program: &Program,
+    type_id: TypeId,
+    seen: &mut HashSet<TypeId>,
+) -> Option<Vec<Id>> {
+    if !seen.insert(type_id) {
+        return None;
+    }
+    // Each child, paired with whether a landing rule follows a clause there.
+    let children: Vec<(TypeId, bool)> = match program.type_id_to_type_map.get(&type_id)? {
+        Type::Closure(..) => return None,
+        Type::Struct(struct_id, arguments) => arguments
+            .iter()
+            .enumerate()
+            .map(|(position, &argument)| {
+                (
+                    argument,
+                    struct_binds_parameter_to_a_field(program, *struct_id, position),
+                )
+            })
+            .collect(),
+        Type::Enum(_, arguments) | Type::Trait(_, arguments) => arguments
+            .iter()
+            .map(|&argument| (argument, false))
+            .collect(),
+        Type::Tuple(elements) => elements.iter().map(|&element| (element, false)).collect(),
+        Type::Array(element, _) => vec![(*element, false)],
+        Type::Mapped(binder, source, template) => {
+            vec![(*binder, false), (*source, false), (*template, false)]
+        }
+        _ => return None,
+    };
+    children.into_iter().find_map(|(child, followed)| {
+        match clause_of_type(program, child) {
+            Some(clause) if !followed => Some(clause.to_vec()),
+            // A followed argument still gets walked: `Held<List<(|| void)
+            // context c>>` writes the inert clause one level deeper.
+            _ => unfollowable_clause(program, child, seen),
+        }
+    })
+}
+
+/// The refusal a `context` clause earns for being written where the threading
+/// cannot follow it (B324). One row.
+fn unfollowable_refusal(program: &Program, position: &str, clause: &[Id]) -> String {
+    format!(
+        "a closure written at this {position} would be born under `{}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array",
+        clause_spelling(program, clause),
+    )
 }
 
 /// The span of a function's declared `context` clause, falling back to the
@@ -1067,9 +1188,17 @@ fn analyze(
         // defers exactly like a literal in a clause parameter position; a
         // same-clause value initializer is a forward; anything else is an
         // escape the threading cannot follow.
-        for (&binding_id, clause) in &program.parameter_contexts {
-            let Some(variable) = program.variables.get(&binding_id) else {
-                // Parameters share the map but have no variable record.
+        //
+        // B325: over the bindings whose TYPE carries the clause, not over the
+        // ANNOTATED ones. B309 moved clause resolution before the fixpoint, so
+        // `let held = injected;` infers a type that carries the clause and the
+        // threading can follow it exactly as far as it follows the annotated
+        // spelling — but the rule had stayed keyed on the annotation, so the
+        // unannotated binding earned the value-flow refusal for a forward the
+        // pass could see was legal. The two spellings agree now, and a
+        // MISMATCHED clause is refused in both.
+        for (&binding_id, variable) in &program.variables {
+            let Some(clause) = value_contexts.get(&binding_id).cloned() else {
                 continue;
             };
             let Some(initial) = variable.initial else {
@@ -1077,16 +1206,25 @@ fn analyze(
             };
             match program.entity_map.get(&initial) {
                 Some(Expr::Closure(closure_id)) => {
-                    for &context in clause {
+                    for &context in &clause {
                         deferred.entry(context).or_default().insert(*closure_id);
                     }
                 }
-                Some(Expr::Local(source))
-                    if program.parameter_contexts.get(source) == Some(clause) =>
-                {
+                // B325: an UNANNOTATED binding's clause came FROM the
+                // initializer — there is no annotation for the value to
+                // disagree with, so the binding is a forward by construction
+                // and there is nothing to match. (Its sub-expressions are
+                // policed on their own: `let x = if c { injected } else { .. }`
+                // admits the `if`, which carries nothing, and the `injected`
+                // appearance inside the leg still answers to the value-flow
+                // restriction.)
+                _ if !variable.annotated => {
                     allowed_forwards.insert(initial);
                 }
-                Some(expr) if field_read_clause(program, expr).as_deref() == Some(clause) => {
+                Some(Expr::Local(source)) if value_contexts.get(source) == Some(&clause) => {
+                    allowed_forwards.insert(initial);
+                }
+                Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
                     allowed_forwards.insert(initial);
                 }
                 _ => {
@@ -1096,7 +1234,7 @@ fn analyze(
                     errors.push(anchored(
                         program,
                         initial,
-                        landing_refusal(program, "binding", clause, found.as_deref()),
+                        landing_refusal(program, "binding", &clause, found.as_deref()),
                     ));
                 }
             }
@@ -1290,6 +1428,69 @@ fn analyze(
                             .push((*node, call.call_id));
                     }
                 }
+            }
+        }
+
+        // --- B324: a clause written where the threading cannot follow it. ---
+        // Each of the four writing positions above has a landing rule, and a
+        // generic ARGUMENT lands through the field it binds. Everywhere else a
+        // clause parses, type-checks and means nothing: `List<(|| i32) context
+        // c>` admits a literal, the literal captures at creation, and the
+        // value-flow restriction below never learns the clause was written —
+        // it only ever sees values it recognizes as injected, and a captured
+        // literal is not one. Sound and silent, so the refusal is the fix: the
+        // positions this pass knows are each checked for an inert clause, and
+        // each refusal names the clause and where a clause IS followed. A fresh
+        // `seen` per position, since the memo is a cycle guard and not a
+        // per-program answer.
+        for (&parameter_id, parameter) in &program.parameters {
+            if let Some(clause) =
+                unfollowable_clause(program, parameter.type_id, &mut HashSet::default())
+            {
+                errors.push(anchored(
+                    program,
+                    parameter_id,
+                    unfollowable_refusal(program, "parameter", &clause),
+                ));
+            }
+        }
+        for (&binding_id, variable) in &program.variables {
+            if let Some(clause) =
+                unfollowable_clause(program, variable.type_id, &mut HashSet::default())
+            {
+                errors.push(anchored(
+                    program,
+                    binding_id,
+                    unfollowable_refusal(program, "binding", &clause),
+                ));
+            }
+        }
+        for (&struct_id, declaration) in &program.structs {
+            for field in &declaration.fields {
+                if let Some(clause) =
+                    unfollowable_clause(program, field.type_id, &mut HashSet::default())
+                {
+                    errors.push(anchored_at(
+                        program,
+                        struct_id,
+                        field.name_span,
+                        unfollowable_refusal(program, "field", &clause),
+                    ));
+                }
+            }
+        }
+        for (&function_id, function) in &program.functions {
+            let Some(return_type_id) = function.return_type_id else {
+                continue;
+            };
+            if let Some(clause) =
+                unfollowable_clause(program, return_type_id, &mut HashSet::default())
+            {
+                errors.push(anchored(
+                    program,
+                    function_id,
+                    unfollowable_refusal(program, "return type", &clause),
+                ));
             }
         }
 

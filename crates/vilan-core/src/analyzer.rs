@@ -2868,11 +2868,12 @@ const WIRE_SCALAR_NAMES: &[&str] = &[
     "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
 ];
 
-/// The scalars `Hashable` is satisfied by outright — the syntactic oracle's
-/// half of the answer (`is_hashable_type`) and the resolved one's
-/// (`resolved_type_is_hashable`) read the SAME list, because a type one accepts
-/// and the other rejects is a field the derive admits and a key the `[rpc]`
-/// return check refuses, or the reverse.
+/// The scalars `Hashable` is satisfied by outright — the fast path
+/// [`Analyzer::resolved_type_is_hashable`] answers with before it asks the impl
+/// table. B327 left that function as the single oracle: the derive's
+/// all-fields check and the `[rpc]` key check both ask it, so a type one
+/// accepts and the other rejects — a field the derive admits and a key the
+/// return check refuses, or the reverse — is no longer expressible.
 const HASHABLE_SCALAR_NAMES: &[&str] = &[
     "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "Hash",
 ];
@@ -7095,36 +7096,20 @@ impl<'src> Analyzer<'src> {
             .push((name, declaration_id, members));
     }
 
-    /// A field type is Hashable iff it is a scalar (any numeric, `str`, `bool`), a
-    /// `List`/`Option` of Hashable (recursing into the element), a bare-lowered
-    /// enum (its backing value is its key), or a named `[derive(Hashable)]` type.
-    /// A closure, `Set`/`Map`/`Shared`, or a view is not — `canonical_hash` would
-    /// mangle it. (Tuple *fields* are deferred, like `Wire`.)
-    ///
-    /// The bare-lowered enums reach this through `hashable_names`, recorded by the
-    /// enum walk off the authoritative `Enum::backing` rather than re-derived here:
-    /// this predicate is syntactic (it runs on `&Node`, pre-resolution) and the two
-    /// oracles for "is this Hashable?" — this one and `satisfies_trait_bound` over
-    /// the impl table — have to agree or a field the key check accepts is rejected.
-    fn is_hashable_type(&self, node: &Node) -> bool {
-        match node {
-            Node::Accessor(name) => {
-                HASHABLE_SCALAR_NAMES.contains(name) || self.hashable_names.contains(*name)
-            }
-            Node::AccessorWithGenerics(name, arguments) => {
-                matches!(*name, "List" | "Option")
-                    && arguments
-                        .0
-                        .iter()
-                        .all(|argument| self.is_hashable_type(&argument.0))
-            }
-            _ => false,
-        }
-    }
-
     /// Enforce the Hashable boundary (I1): every field of a `[derive(Hashable)]`
     /// type must itself be Hashable, else the derived `canonical_hash(self)` would
     /// silently produce a broken key. Runs after all modules are walked.
+    ///
+    /// B327: the question is put to [`Self::resolved_type_is_hashable`] — the
+    /// same oracle the `[rpc]` key check asks — and not to a syntactic
+    /// predicate over the written node. The syntactic one read the scalars and
+    /// `hashable_names` (the derives and the backed enums) and nothing else, so
+    /// a HAND-WRITTEN `impl Custom with Hashable` was invisible to it and
+    /// `[derive(Hashable)] struct Key { inner: Custom }` was refused for a
+    /// field that is Hashable — B289's class for `Wire`, which
+    /// `check_wire_boundary` closed the same way. One oracle, one answer: a
+    /// field this rule accepts and a key the return rule refuses (or the
+    /// reverse) was always the failure mode both were written to avoid.
     fn check_hashable_boundary(&mut self) {
         let checks = std::mem::take(&mut self.hashable_types_to_check);
         for (type_name, declaration_id, members) in &checks {
@@ -7152,7 +7137,7 @@ impl<'src> Analyzer<'src> {
                     }, *declaration_id);
                     continue;
                 }
-                if !self.is_hashable_type(type_node) {
+                if !self.resolved_type_is_hashable(*field_type_id) {
                     let rendered = render_type(type_node);
                     self.push_anchored(Error { trace: Vec::new(),
                         note: None,
@@ -7160,8 +7145,9 @@ impl<'src> Analyzer<'src> {
                         msg: format!(
                             "{label} of `[derive(Hashable)]` type `{type_name}` is `{rendered}`, \
                              which is not `Hashable`: every field must be (a scalar, `str`, \
-                             `bool`, `List`/`Option` of `Hashable`, a backed enum, or another \
-                             `[derive(Hashable)]` type)"
+                             `bool`, `List`/`Option` of `Hashable`, a backed enum, another \
+                             `[derive(Hashable)]` type, or a type with an `impl .. with \
+                             Hashable`)"
                         ),
                     }, *declaration_id);
                 }
@@ -7916,6 +7902,32 @@ impl<'src> Analyzer<'src> {
     /// and a binder bounded by two demand different things and no widening here
     /// changes that — and then each ARGUMENT position must be jointly
     /// inhabitable.
+    ///
+    /// # What this rule DOES NOT refuse (B330, Order 35 ruling R5)
+    ///
+    /// Two blankets whose argument binders are bounded DIFFERENTLY —
+    /// `impl type S: Read<type I: Debug>` beside `impl type O: Read<type J:
+    /// Tagged>`, both declaring `peek` — are ADMITTED, deliberately. Whether
+    /// some third type carries both `Debug` and `Tagged` is not a question the
+    /// DECLARATIONS answer: the binders demand different traits, and every
+    /// pair of traits in the program (and in every program that will ever
+    /// import it) is a potential witness. Refusing the pair would refuse two
+    /// blankets that no type in the estate can ever bring together;
+    /// [`Self::bound_argument_positions_overlap`]'s `(Generic, Generic)` arm is
+    /// where that answer is written down, and it says `false`.
+    ///
+    /// The consequence is real and is not hidden: a receiver that DOES satisfy
+    /// both — a `Cell<Both>` where `Both` implements both traits — has two
+    /// inherent candidates, and tier 1 of method resolution takes the first
+    /// without ranking, so DECLARATION ORDER decides which body runs. Swapping
+    /// the two `impl` blocks changes the answer. Two pins in
+    /// `inference/traits.rs` (`b330_*`) hold exactly that, so the admission is
+    /// a recorded behaviour rather than a gap nobody measured.
+    ///
+    /// The refusal belongs at the CALL, not here: the site knows the receiver,
+    /// so it knows whether the witness exists, and it is the only place that
+    /// can. B318's S4 — the per-importer namespace — is where such a check
+    /// lives and is where it is queued.
     fn generic_bounds_overlap(&self, left: TypeId, right: TypeId) -> bool {
         let left_bounds = self.generic_bound_traits(left);
         let right_bounds = self.generic_bound_traits(right);
@@ -7954,6 +7966,8 @@ impl<'src> Analyzer<'src> {
             // both is a question this rule cannot answer from the declarations
             // alone, and the duplicate family refuses only what it can see —
             // so they are left as they were before B315: not a collision.
+            // B330/R5 documents what that costs at
+            // `generic_bounds_overlap`, and pins it.
             (Type::Generic(_), Type::Generic(_)) => false,
             (Type::Generic(binder), other) | (other, Type::Generic(binder)) => self
                 .generic_bound_traits(binder)
@@ -15859,15 +15873,29 @@ impl<'src> Analyzer<'src> {
             match element {
                 Some(element) if !self.resolved_type_is_wire(element) => {
                     let element_type = element.get_type(self);
-                    let rendered = self.pretty_print_type(&element_type, &HashMap::default());
+                    let resolved_label = self.pretty_print_type(&element_type, &HashMap::default());
+                    // B329: the SENTENCE names the element as the author wrote
+                    // it. `pretty_print_type` renders a nominal type by its bare
+                    // name, so a field annotated `SignalCell<models::Note>` was
+                    // told its element `Note` is not Wire while every sibling
+                    // refusal in this family — the derive boundaries, the `[rpc]`
+                    // parameter and return, the `[expose]` field just above —
+                    // says `models::Note` (B302). One annotation, two answers.
+                    let rendered = written_source_element(type_node)
+                        .map(render_type)
+                        .unwrap_or_else(|| resolved_label.clone());
                     // B189: this field's exposure is now reported, so the
                     // generated subscription's bound failure on it is a
                     // restatement and stands down (`call_covered_by_expose_
                     // refusal`, consulted one pass later). Both keys: the
                     // FIELD, for the call handed it, and the ELEMENT this
                     // sentence names, for the mirror that only mentions it.
+                    //
+                    // The element key stays the RESOLVED spelling: the stand-down
+                    // compares it against `pretty_print_type` of the generated
+                    // mirror's own value type, which never sees a written path.
                     self.expose_refused_field_slots.insert(field_type_id);
-                    self.expose_refused_elements.insert(rendered.clone());
+                    self.expose_refused_elements.insert(resolved_label);
                     self.push_anchored(
                         Error {
                             trace: Vec::new(),
@@ -16293,7 +16321,13 @@ impl<'src> Analyzer<'src> {
                 self.enums.get(&id).map(|enum_| enum_.name)?,
                 arguments.as_slice(),
             ) {
-                ("Option", [inner]) => self.resolved_handle_return_element(*inner),
+                // R4/B326: the written twin declines to descend into a KEYED
+                // handle here, and the two have to agree — a form one reads as
+                // a handle and the other does not is the one outcome this pair
+                // exists to rule out.
+                ("Option", [inner]) if self.resolved_handle_return_key(*inner).is_none() => {
+                    self.resolved_handle_return_element(*inner)
+                }
                 _ => None,
             },
             _ => None,
@@ -28284,7 +28318,7 @@ impl<'src> Analyzer<'src> {
                 // A bare-lowered enum IS a `str`/number at runtime and carries a
                 // synthesized `impl .. with Hashable` (`backed_enum_hashable_source`),
                 // so it counts as Hashable for the derive's all-fields check too —
-                // otherwise the impl table and `is_hashable_type` would disagree and
+                // otherwise the impl table and `hashable_names` would disagree and
                 // `[derive(Hashable)] struct Key { align: Align }` would be rejected
                 // for a field the key check accepts. A resource is excluded on both
                 // sides for the same reason it is excluded there.
@@ -47849,6 +47883,20 @@ pub struct Program<'src> {
     // Maps a struct initializer expr id to the struct definition it constructs,
     // so go-to-definition on `Point { .. }` reaches the `struct` declaration.
     pub struct_initializer_to_def: HashMap<Id, Id>,
+    /// B323: the type an ANNOTATION expects of a struct LITERAL — the slice of
+    /// the analyzer's walk-time `expected_types` that lands on an initializer,
+    /// and nothing else.
+    ///
+    /// Carried out for the `context` pass alone. A closure literal is born
+    /// clause-less (that is what makes it deferrable), so `let held:
+    /// Held<(|| void) context current> = Held { body = || .. }` binds the
+    /// struct's parameter from a clause-less closure type and the literal's own
+    /// recorded type carries no clause anywhere. The annotation is then the only
+    /// place the clause is written, and the field landing has to read it there
+    /// or the literal captures its context at construction — silently, which is
+    /// what B323 measured. Unification ignores the clause (B309), so the
+    /// expectation and the literal's own type differ in nothing else.
+    pub struct_literal_expectations: HashMap<Id, TypeId>,
     // Named type references in type position: `(file, name span, definition id,
     // label)`. Type names aren't entities, so this drives go-to-definition and
     // hover on them (e.g. `Option`, `i32`, a trait bound).
@@ -49211,6 +49259,30 @@ fn sole_argument_is_list(type_node: Option<&Node<'_>>) -> bool {
 /// the annotation. A local alias for `KeyedCell` would therefore be missed
 /// here and by the expansion alike — one refusal, said once, rather than two
 /// halves disagreeing.
+/// The ELEMENT of an exposed source as the author WROTE it (B329) — the sole
+/// type argument of the field's annotation, or a `KeyedCell`'s second.
+///
+/// The element the `[expose]` rule TESTS comes off the `Source` impl and is a
+/// resolved type id, which renders through `pretty_print_type` and so by bare
+/// name; the refusal is about an annotation, and an annotation is quoted as
+/// written ([`render_type`], B302). Where the annotation names no element —
+/// a bare `Signal`, an alias, a source whose element is not a type argument at
+/// all — there is nothing written to quote and the resolved rendering stands.
+fn written_source_element<'a>(type_node: Option<&'a Node<'a>>) -> Option<&'a Node<'a>> {
+    let arguments = match type_node? {
+        Node::AccessorWithGenerics(_, arguments) => arguments,
+        Node::StaticAccessor(_, _, Some(arguments)) => arguments,
+        _ => return None,
+    };
+    match arguments.0.as_slice() {
+        [element] => Some(&element.0),
+        // A79's keyed source: the element is the second argument, the key the
+        // first — the same split `handle_return_element` reads.
+        [_key, element] if annotation_is_keyed_cell(type_node) => Some(&element.0),
+        _ => None,
+    }
+}
+
 fn annotation_is_keyed_cell(type_node: Option<&Node<'_>>) -> bool {
     matches!(
         type_node,
@@ -49317,7 +49389,16 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
         }
         Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
             match arguments.0.as_slice() {
-                [inner] => handle_return_element(&inner.0),
+                // R4/B326: `Option<KeyedCell<K, T>>` is NOT a handle return,
+                // and the rule is the macro's own read back — `handle_key(inner)
+                // == ""` guards the same descent in `rpc.vl`. Reading it as one
+                // here stood the ordinary Wire refusal down and left the author
+                // with `'Option<KeyedCell<i32, Task>>' does not implement trait
+                // 'Wire'` out of generated code, twice, about an annotation the
+                // generator had already declined to shape a mirror for.
+                // Supporting the form — a per-KEY `Absent` beside A92's
+                // per-source one — is a design item, not this rule's business.
+                [inner] if handle_return_key(&inner.0).is_none() => handle_return_element(&inner.0),
                 _ => None,
             }
         }
@@ -56400,6 +56481,23 @@ fn analyze_over_world<'src>(
     // `source_layers` resolves that comparison per SOURCE rather than per node.
     let canonical_sources: Vec<PathBuf> = sources.iter().map(crate::util::canonical_path).collect();
 
+    // B323: the expectations that landed on a struct LITERAL, taken before
+    // `expr_id_to_expr_map` moves into the program. Filtered here rather than
+    // carried whole: the context pass is the only reader and a literal is the
+    // only position whose own recorded type can lose a `context` clause the
+    // author wrote.
+    let struct_literal_expectations: HashMap<Id, TypeId> = analyzer
+        .expected_types
+        .iter()
+        .filter(|(id, _)| {
+            matches!(
+                analyzer.expr_id_to_expr_map.get(id),
+                Some(Expr::StructInitializer(..))
+            )
+        })
+        .map(|(&id, &type_id)| (id, type_id))
+        .collect();
+
     Some(Program {
         platform,
         closures: analyzer.closures,
@@ -56505,6 +56603,7 @@ fn analyze_over_world<'src>(
         arity_invalid_calls: std::mem::take(&mut analyzer.arity_invalid_calls),
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
+        struct_literal_expectations,
         type_references,
         import_aliases: std::mem::take(&mut analyzer.import_aliases),
         import_alias_spans: std::mem::take(&mut analyzer.import_alias_spans),
