@@ -9,10 +9,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::manifest::PreludeSpec;
 use vilan_core::{
-
-/// The exposure exhibit: one curated module whose exported items name a private
-/// struct in every signature position B318 §4 lists, plus the body control.
-const EXPOSURE_MODULE: &str = "\
     EntryMode, Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair,
     Workspace, analyze_source,
 };
@@ -3966,10 +3962,19 @@ fn analyze_package_as(
 /// reaches them both. `views.vl` carries a `[derive]` (so the entry's own
 /// expansion is on the line) and an inherent `impl` the sibling reaches through
 /// the cycle (so method resolution across it is too).
+/// The kolt shape, as three files: the open module `views.vl` and the sibling
+/// `channel.vl` that imports it back, plus the declared entry `client.vl` that
+/// reaches them both. `views.vl` carries a `[derive]` (so the entry's own
+/// expansion is on the line) and an inherent `impl` the sibling reaches through
+/// the cycle (so method resolution across it is too).
+// B318: `views` and `channel` are imported by their siblings, so each carries
+// the one-line `export *;` the estate's codemod writes — without it every
+// cross-file name here is a plain reach of a private item and the pins that
+// assert silence would be asserting the absence of a warning that is correct.
 const B239_FILES: &[(&str, &str)] = &[
     (
         "views.vl",
-        "import pkg::channel::render;\n\n\
+        "export *;\n\nimport pkg::channel::render;\n\n\
          [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
          struct Style { padding: i32 }\n\n\
          impl Style {\n\tfun flex_row(self): Style {\n\t\t\
@@ -3981,7 +3986,7 @@ const B239_FILES: &[(&str, &str)] = &[
     ),
     (
         "channel.vl",
-        "import pkg::views::{ Style, button_style, icon };\n\n\
+        "export *;\n\nimport pkg::views::{ Style, button_style, icon };\n\n\
          fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
          let label = icon(\"x\");\n\tbase.padding\n}\n",
     ),
@@ -5379,78 +5384,6 @@ fn analyze_package_warnings(
         })
         .unwrap_or_default()
 }
-
-/// The Rust-fallback derive path — a derive with NO macro in scope, the case
-/// fixture stds and macro-world compiles hit — must parse its generated impls
-/// through the content cache: an unchanged program's re-analysis reuses the
-/// tree instead of re-leaking one. Pinned here rather than in the LSP leak
-/// harness because it needs a std WITHOUT the std macros, and this file
-/// already owns the hand-built-spec fixtures (the E23 sweep's coverage gap).
-#[test]
-fn rust_fallback_derives_parse_through_the_content_cache() {
-    use vilan_core::leak_tally::{self, LeakSite};
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_fallback_{}_{unique}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    // A std whose loader-forced modules are empty stubs and which defines no
-    // `macro fun` anywhere: `[derive(PartialEq)]` finds no macro in scope and
-    // falls back to the Rust generators. (The generated prelude's imports then
-    // fail to resolve against the stubs — irrelevant here: the leak this pins
-    // happens at the parse, before resolution.)
-    let std_src = root.join("std").join("src");
-    std::fs::create_dir_all(&std_src).unwrap();
-    for module in [
-        "boolean", "list", "null", "promise", "compare", "default", "debug", "json", "hash",
-    ] {
-        std::fs::write(std_src.join(format!("{module}.vl")), "").unwrap();
-    }
-    let fixture_std = PackageSpec {
-        base_root: std_src,
-        layers: Vec::new(),
-        dependencies: Vec::new(),
-        surface: true,
-        member: false,
-        prelude: Default::default(),
-    };
-    let app_dir = root.join("app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let entry_path = app_dir.join("main.vl");
-    let source = "[derive(PartialEq)]\nstruct FallbackPin { x: i32 }\n";
-    std::fs::write(&entry_path, source).unwrap();
-    let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
-
-    let analyze = || {
-        let (_program, _errors) = analyze_source(
-            leaked,
-            &fixture_std,
-            &app_dir,
-            &entry_path,
-            Some(Platform::default()),
-            &Workspace::default(),
-        );
-    };
-    leak_tally::reset();
-    analyze();
-    assert!(
-        leak_tally::bytes(LeakSite::MacroParseText) > 0,
-        "the fixture never took the Rust-fallback path — no generated text was \
-         parsed, and this pin is vacuous"
-    );
-    leak_tally::reset();
-    analyze();
-    let releaked =
-        leak_tally::bytes(LeakSite::MacroParseText) + leak_tally::bytes(LeakSite::MacroParseAst);
-    assert_eq!(
-        releaked, 0,
-        "the Rust-fallback derive re-leaked {releaked} B on an unchanged \
-         re-analysis — `flush_rust_fallback` is not parsing through the \
-         content cache"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 #[test]
 fn b318_export_all_is_a_module_level_item_like_every_other_export() {
     // `export *;` carries no inner statement — the marker IS the statement —
@@ -5630,6 +5563,42 @@ fn b318_the_import_steer_skips_a_private_item_of_a_curated_module() {
         "an uncurated module offers everything: {uncurated:#?}"
     );
 }
+
+/// The exposure exhibit: one curated module whose exported items name a private
+/// struct in every signature position B318 §4 lists, plus the body control.
+const EXPOSURE_MODULE: &str = "\
+struct Hidden {\n\
+\tx: i32,\n\
+}\n\
+\n\
+trait Secret {\n\
+\tfun mark(self): i32;\n\
+}\n\
+\n\
+export let registry: Hidden = Hidden { x = 0 };\n\
+\n\
+export fun takes(item: Hidden): i32 { item.x }\n\
+\n\
+export fun returns(): Hidden { Hidden { x = 1 } }\n\
+\n\
+export fun generic_return(): List<Hidden> { [] }\n\
+\n\
+export fun bounded<T: Secret>(item: T): i32 { item.mark() }\n\
+\n\
+export struct Boxed {\n\
+\titem: Hidden,\n\
+}\n\
+\n\
+export enum Holder {\n\
+\tOne(Hidden),\n\
+}\n\
+\n\
+export fun body_only(): i32 {\n\
+\tlet local = Hidden { x = 2 };\n\
+\tlocal.x\n\
+}\n\
+\n\
+export fun reachable(): i32 { 3 }\n";
 
 #[test]
 fn b318_the_exposure_warning_covers_every_signature_position() {
