@@ -2142,6 +2142,7 @@ impl Document {
             index,
             source_texts: Default::default(),
             anchor: Default::default(),
+            scope_extents: Default::default(),
         }
     }
 
@@ -12787,6 +12788,62 @@ pub(crate) mod tests {
             "top-level: {labels:?}"
         );
         assert!(labels.contains(&"fun".to_string()), "keyword: {labels:?}");
+    }
+
+    // E165: the moment a user actually asks for completion is a BLANK LINE, and
+    // that was the one position scope completion got wrong. `scope_at` answered
+    // "the scope of the entity at, or nearest before, the offset"; on an empty
+    // line the entity CONTAINING the offset is the enclosing function, and a
+    // function's own scope is the module it is declared in — so the popup
+    // offered globals and keywords and none of the body's locals, while `st|`
+    // one character away offered `start`.
+    #[test]
+    fn scope_completion_on_a_blank_line_offers_the_enclosing_body() {
+        let labels =
+            completions_at_cursor("fun main() {\n\tlet start = 1;\n\t|\n\tlet after = 2;\n}\n");
+        assert!(
+            labels.contains(&"start".to_string()),
+            "the enclosing body's locals: {labels:?}"
+        );
+        // Still a scope position, so the globals and keywords it always offered
+        // are offered too — this widens the answer, it does not narrow it.
+        assert!(labels.contains(&"fun".to_string()), "keyword: {labels:?}");
+    }
+
+    // The innermost enclosing body wins, and a sibling block's is not offered:
+    // the extent is per scope, so two blocks side by side never cover each
+    // other's text.
+    #[test]
+    fn scope_completion_on_a_blank_line_takes_the_innermost_block() {
+        let labels = completions_at_cursor(
+            "fun main() {\n\tlet outer = 1;\n\tif outer > 0 {\n\t\tlet inner = 2;\n\t\t|\n\t}\n\tlet sibling = 3;\n}\n",
+        );
+        assert!(
+            labels.contains(&"inner".to_string()),
+            "the nested block's own local: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"outer".to_string()),
+            "the enclosing body's local, through the parent chain: {labels:?}"
+        );
+    }
+
+    // The control the fix must not break: a blank line at TOP LEVEL has no
+    // enclosing body, so nothing local is offered and the module scope answers
+    // exactly as before.
+    #[test]
+    fn scope_completion_on_a_blank_line_at_top_level_offers_the_module() {
+        let labels = completions_at_cursor(
+            "fun helper(): i32 { 42 }\n\nfun main() {\n\tlet buried = 1;\n\tlet _ = buried;\n}\n\n|\n",
+        );
+        assert!(
+            labels.contains(&"helper".to_string()),
+            "top-level items: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"buried".to_string()),
+            "a function's local is not in scope at top level: {labels:?}"
+        );
     }
 
     #[test]

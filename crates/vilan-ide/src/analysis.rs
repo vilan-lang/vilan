@@ -81,6 +81,11 @@ pub struct Analysis<'a, 'src> {
     /// live offset — which is a question only the engine's own two texts can
     /// answer.
     pub anchor: OnceCell<(usize, usize)>,
+    /// The entry file's scope EXTENTS — `(start, end, scope id)`, narrowest
+    /// first — computed at most once per query by
+    /// [`Analysis::scope_extents`], and only where something asks (E165).
+    /// Construct with `Default::default()`.
+    pub scope_extents: OnceCell<Vec<(usize, usize, Id)>>,
 }
 
 /// `(start, end, id)` for every entry-file entity with a real span, for

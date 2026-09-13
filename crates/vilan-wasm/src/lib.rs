@@ -744,6 +744,7 @@ pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<Completi
             index: &retained.completion_index,
             source_texts: Default::default(),
             anchor: Default::default(),
+            scope_extents: Default::default(),
         };
         let offset = live.offset(Position { line, character });
         analysis
