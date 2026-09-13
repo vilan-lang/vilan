@@ -152,6 +152,9 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
             // The reach marker adds no segment: the name a module must declare
             // is the one under it.
             ImportBranch::Reach(_, inner) => leaf_names(inner, into),
+            // A selector takes no NAME out of the module (B318 S3), so it is
+            // not evidence about which layer the file wants.
+            ImportBranch::Selector(_) => {}
             ImportBranch::Set(branches) => {
                 for branch in branches {
                     leaf_names(branch, into);
@@ -195,6 +198,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
             ImportBranch::Reach(_, inner) => {
                 child_is_browser_evidence(inner, browser_root, other_roots)
             }
+            ImportBranch::Selector(_) => false,
             ImportBranch::Set(branches) => branches
                 .iter()
                 .any(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
@@ -219,7 +223,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
         nodes.iter().any(|node| walk(node, matches))
     }
     let references_browser = any_node(root, &mut |node| match node {
-        Node::Import(branch) | Node::Use(branch) => imports_browser_layer(branch),
+        Node::Import(branch, _) | Node::Use(branch) => imports_browser_layer(branch),
         _ => false,
     });
     if references_browser {
@@ -810,6 +814,11 @@ pub fn post_analysis_passes(
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async
     // only by inference, so this cannot run inside `analyze`.
+    // B318 S3: the file-level impl admission — `only` and the `(impl …)`
+    // selectors, resolved against the finished program because the question is
+    // `impl_select::subject_applies`, which reads one. Returns immediately for
+    // a program whose files wrote neither.
+    analyzer::check_impl_selector_admission(program);
     let phase_async_drops_start = PhaseClock::now();
     analyzer::check_async_drops(program);
     let phase_async_drops = phase_async_drops_start.elapsed();

@@ -267,6 +267,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
 const RULE_STATEMENT_SITES: usize = 28;
+const RULE_STATEMENT_SITES: usize = 29;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -326,6 +327,36 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "crates/vilan-core/src/parsing.rs",
         "IMPORTANT_HAS_NO_PLACE",
         "`!important` has no place in a `css` block:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPL_SELECTOR_IS_A_BRACE_ELEMENT",
+        "an `impl` selector is a brace-set ELEMENT, because it selects",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPL_SELECTOR_SHAPE",
+        "an `impl` selector is `(impl TYPE)`, optionally followed by",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPL_SELECTOR_TAKES_NO_BINDER",
+        "an `impl` selector writes no binders: it filters blocks that",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "IMPL_SELECTOR_REFUSES_AS",
+        "an `impl` selector takes no `as`: a method is called by NAME on a",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "USE_TAKES_NO_IMPL_SELECTOR",
+        "an `impl` selector belongs to `import`: it says which of a",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "USE_TAKES_NO_ONLY",
+        "`only` belongs to `import`: it drops the implementations an import",
     ),
     (
         "crates/vilan-core/src/parsing.rs",

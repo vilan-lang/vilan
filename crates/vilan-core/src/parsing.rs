@@ -52,6 +52,7 @@
 //! `resource`-misplaced steer). Ugly-but-reproduced behaviours are recorded for
 //! the S4/S5 error-quality pass, not fixed. The differential is the referee.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::lexing;
@@ -59,11 +60,64 @@ use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
     CssItem, CssNested, CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
     ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
-    GenericParameters, If, ImportBranch, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList,
-    Parameter, Pattern, ServiceAttr, StructField, TupleBound,
+    GenericParameters, If, ImplSelector, ImportBranch, ImportModifier, ImportTail, MatchLeg, Node,
+    NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
+
+/// Every `(impl …)` selector element's span in an import/use tree — what the
+/// `use` refusal reports at.
+fn collect_branch_selectors(branch: &ImportBranch<'_>, into: &mut Vec<Span>) {
+    match branch {
+        ImportBranch::Path(_, _, ImportTail::Continue(child)) => {
+            collect_branch_selectors(child, into)
+        }
+        ImportBranch::Path(..) => {}
+        ImportBranch::Set(branches) => {
+            for child in branches {
+                collect_branch_selectors(child, into);
+            }
+        }
+        ImportBranch::Selector(selector) => into.push(selector.span),
+        ImportBranch::Reach(_, inner) => collect_branch_selectors(inner, into),
+    }
+}
+
+/// Every binder inside an impl selector's subject that the selector may not
+/// write (B318, RULED: "no binders are written in a selector"): a NAMED binder
+/// (`type T`) anywhere, and a bare `_` that carries a BOUND. A bound-less `_`
+/// is the placeholder and contributes nothing.
+///
+/// Walks the type grammar's own shapes; anything else (a name, a literal
+/// length) holds no binder and ends the descent.
+fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
+    match &node.0 {
+        Node::TypeBinder((name, _), bounds) => {
+            if *name != ANONYMOUS_TYPE_BINDER || !bounds.is_empty() {
+                into.push(node.1);
+            }
+            for bound in bounds {
+                collect_selector_binders(bound, into);
+            }
+        }
+        Node::AccessorWithGenerics(_, arguments) => {
+            for argument in &arguments.0 {
+                collect_selector_binders(argument, into);
+            }
+        }
+        Node::Tuple(items) => {
+            for item in items {
+                collect_selector_binders(item, into);
+            }
+        }
+        Node::ArrayType(element, _) => collect_selector_binders(element, into),
+        Node::Reference(_, inner) | Node::TypeWithContexts(inner, _) => {
+            collect_selector_binders(inner, into)
+        }
+        _ => {}
+    }
+}
 
 /// A parse error value: where it was detected, *what* went wrong (found/expected,
 /// or a curated reason), the production context, and an optional targeted hint.
@@ -351,7 +405,7 @@ fn export_takes(node: &Node<'_>) -> bool {
         | Node::Trait(..)
         | Node::Impl(..)
         | Node::Module(..)
-        | Node::Import(_)
+        | Node::Import(..)
         | Node::Use(_)
         | Node::Export(..)
         | Node::ExportAll
@@ -371,6 +425,69 @@ fn visibility_marker_rule(marker: &str) -> String {
          imported: `export import pkg::io::panic;`.)"
     )
 }
+
+/// The rule an impl selector written OUTSIDE a brace set breaks (B318 S3,
+/// `proposal/visibility.md` §2.5). Curated (diagnostics-standard.md B6): the
+/// prohibition explains itself and names the sanctioned spelling.
+///
+/// The selector is a brace-set ELEMENT and nothing else — it binds no name, so
+/// it has no leaf position to occupy, and `import a::(impl T);` would read as a
+/// statement whose whole payload is a filter. Without this the `(` falls
+/// through both halves of the path grammar and the statement reports at column
+/// one, which is the failure mode §2.5 says a build of this slice must not
+/// reproduce.
+const IMPL_SELECTOR_IS_A_BRACE_ELEMENT: &str = "an `impl` selector is a brace-set ELEMENT, because it selects \
+     implementations rather than binding a name: write `import a::{ (impl T) };`, and put any names \
+     it travels with in the same set — `import a::{ Thing, (impl Thing) };`";
+
+/// The shape an `(impl …)` selector must have (B318 S3). Curated
+/// (diagnostics-standard.md B6): stated at the token the selector stopped on,
+/// so a typo inside one reports where it is rather than at the `import`
+/// keyword (`proposal/visibility.md` §2.5's first pinned grammar fact).
+const IMPL_SELECTOR_SHAPE: &str = "an `impl` selector is `(impl TYPE)`, optionally followed by \
+     `::name` or `::{ a, b }`: `import a::{ (impl List<i32>)::{ first, last } };`. `_` stands for any \
+     type in an argument position (`(impl List<_>)`), and `(impl _)` selects every implementation the \
+     module declares";
+
+/// The rule a binder written inside a selector breaks (B318, RULED
+/// 2026-09-12: "no binders are written in a selector"). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling, which is the placeholder.
+///
+/// A selector is a FILTER over blocks that are already generic; it introduces
+/// nothing of its own, so a `type T` in one would name a parameter no body can
+/// read, and a bound on `_` would ask for the block whose bound is that one —
+/// a selection with no exhibit, which is why `_` covers the whole design.
+const IMPL_SELECTOR_TAKES_NO_BINDER: &str = "an `impl` selector writes no binders: it filters blocks that \
+     declare their own, so there is nothing for a `type T` to name. Write `_` for a position that may \
+     be any type — `(impl List<_>)` selects every `List` block, whatever its element and whatever \
+     bound it carries";
+
+/// The rule `as` on an impl selector breaks (B318, RULED: "a method selector
+/// refuses `as` — methods are called by name on a receiver"). Curated
+/// (diagnostics-standard.md B6).
+const IMPL_SELECTOR_REFUSES_AS: &str = "an `impl` selector takes no `as`: a method is called by NAME on a \
+     receiver, so renaming one would produce a name nothing can call. `import a::Length::rem` binds a \
+     self-less function as a free name and takes an alias; `import a::{ (impl Length)::rem }` puts the \
+     member in `Length`'s namespace for this file, and that name is the member's own";
+
+/// The rule an `(impl …)` selector inside a `use` breaks (B318 S3). Curated
+/// (diagnostics-standard.md B6): a selector says which of a MODULE's `impl`
+/// blocks this file admits, and a `use` reaches no module — it destructures a
+/// namespace already in scope. The two productions share a brace set, so the
+/// selector parses there and would otherwise do nothing at all, silently.
+const USE_TAKES_NO_IMPL_SELECTOR: &str = "an `impl` selector belongs to `import`: it says which of a \
+     MODULE's implementations this file admits, and a `use` reaches no module — it destructures a \
+     namespace this file already has. Write `import <module>::{ (impl T) };`";
+
+/// The rule `use … only;` breaks (B318 §2.4). Curated
+/// (diagnostics-standard.md B6): `only` subtracts the implementations an
+/// `import` brings, and a `use` never brought any — it destructures a
+/// namespace that is already in scope — so the word would subtract nothing and
+/// read as if it did.
+const USE_TAKES_NO_ONLY: &str = "`only` belongs to `import`: it drops the implementations an import \
+     brings along its path, and a `use` brings none — it destructures a namespace this file already \
+     reaches. Delete the word";
 
 /// The rule a block-like form followed by an operator or a `.` chain breaks
 /// (B248, widened by B259). Curated (diagnostics-standard.md B6): the
@@ -5849,18 +5966,42 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     // --- import / use / export -----------------------------------------------
 
-    /// `import <namespace_path>` (the node's span covers only `import <path>`; the
-    /// statement-level `;` is consumed separately).
+    /// `import <namespace_path> only?` (the node's span covers only
+    /// `import <path> only`; the statement-level `;` is consumed separately).
     fn parse_import(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Import)?;
         // B320: one statement's record, never the previous statement's.
         self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
-        Some((Node::Import(path), self.span_from(start)))
+        let modifier = self.parse_import_modifier();
+        Some((Node::Import(path, modifier), self.span_from(start)))
     }
 
-    /// `import <namespace_path> ;` — an import used as a statement.
+    /// The trailing `only` of an `import` statement (B318 §2.4), or
+    /// [`ImportModifier::None`].
+    ///
+    /// `only` is CONTEXTUAL, exactly as `as` is
+    /// ([`Parser::parse_namespace_single_path`]'s E142 note), and for the same
+    /// reason: it is recognized only HERE, where the whole path has ended and a
+    /// `;` is the only other thing that may follow. A module or an item called
+    /// `only` is unaffected — it is reached as a path SEGMENT, which this rule
+    /// never sees — and the word occurs as an identifier nowhere in vilan, kolt
+    /// or the website (`visibility.md` §2.4: zero hits outside prose).
+    ///
+    /// It qualifies the STATEMENT, not a leaf, which is why it lives here and
+    /// not in the path grammar: `only` subtracts the implementations the walk
+    /// to the leaf brought, and that walk is the statement's.
+    fn parse_import_modifier(&mut self) -> ImportModifier {
+        if self.peek() != Some(&Token::Ident("only")) {
+            return ImportModifier::None;
+        }
+        let span = self.here_span();
+        self.bump();
+        ImportModifier::Only(span)
+    }
+
+    /// `import <namespace_path> only? ;` — an import used as a statement.
     fn parse_import_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         let import = self.parse_import()?;
         if !self.eat_ctrl(';') {
@@ -5880,9 +6021,33 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((Node::Use(path), self.span_from(start)))
     }
 
-    /// `use <namespace_path> ;` — a use used as a statement.
+    /// `use <namespace_path> ;` — a use used as a statement. A trailing `only`
+    /// is refused where it is written ([`USE_TAKES_NO_ONLY`]) and then eaten,
+    /// so the statement still parses and the reader gets one message rather
+    /// than a cascade at the `;`.
     fn parse_use_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         let use_ = self.parse_use()?;
+        if let Node::Use(branch) = &use_.0 {
+            let mut selectors = Vec::new();
+            collect_branch_selectors(branch, &mut selectors);
+            for span in selectors {
+                self.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(USE_TAKES_NO_IMPL_SELECTOR),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
+        if self.peek() == Some(&Token::Ident("only")) {
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(USE_TAKES_NO_ONLY),
+                context: Vec::new(),
+                hint: None,
+            });
+            self.bump();
+        }
         if !self.eat_ctrl(';') {
             self.note_terminator();
             return None;
@@ -6022,6 +6187,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(path) = self.attempt(Self::parse_namespace_single_path) {
             return Some(path);
         }
+        // A selector OUTSIDE a set: refused where it is written rather than at
+        // column one, and then parsed anyway so the rest of the statement is
+        // still read (`visibility.md` §2.5).
+        if self.at_impl_selector() {
+            let span = self.here_span();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(IMPL_SELECTOR_IS_A_BRACE_ELEMENT),
+                context: Vec::new(),
+                hint: None,
+            });
+            return self.parse_impl_selector();
+        }
         let branch = self.parse_namespace_set();
         if branch.is_none() {
             // B320: neither alternative reads what stands here, so the path
@@ -6031,6 +6209,163 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.note_import_failure(self.position);
         }
         branch
+    }
+
+    /// Whether the cursor sits on `( impl` — the selector's two-token gate
+    /// (B318 S3). A `(` that is not followed by `impl` is not a selector and is
+    /// left to whatever else may read it.
+    fn at_impl_selector(&self) -> bool {
+        self.peek_is_ctrl('(') && self.peek_at(1) == Some(&Token::Impl)
+    }
+
+    /// `"(" "impl" type ")" ( "::" ( NAME | "{" NAME,* "}" ) )?` — an impl
+    /// SELECTOR (B318 S3, `proposal/visibility.md` §2.5).
+    ///
+    /// COMMITTED at the gate: once `( impl` has been seen there is no other
+    /// reading of the tokens, so a failure past it reports at the token the
+    /// selector stopped on with [`IMPL_SELECTOR_SHAPE`] and the branch is still
+    /// produced (empty of members). Returning `None` would fail the whole
+    /// statement and the recovery would report `found 'import' expected an
+    /// expression` at column one — P5/P5b/P5c/P10b's shared failure, the one
+    /// §2.5 says this slice must remove before it adds the grammar.
+    ///
+    /// The subject is the ordinary type grammar, which already admits `_` at
+    /// any position as B294's anonymous binder — the selector's placeholder,
+    /// with no lexer or grammar rule of its own. What the selector refuses is a
+    /// NAMED binder and a bound ([`IMPL_SELECTOR_TAKES_NO_BINDER`]).
+    fn parse_impl_selector(&mut self) -> Option<ImportBranch<'src>> {
+        let start = self.position;
+        self.expect_ctrl('(')?;
+        self.expect(&Token::Impl)?;
+        let subject = match self.parse_type() {
+            Some(subject) => subject,
+            None => return Some(self.selector_refusal(start, None, Vec::new())),
+        };
+        self.refuse_selector_binders(&subject);
+        let subject_text = self.text_of(subject.1);
+        if !self.eat_ctrl(')') {
+            return Some(self.selector_refusal(start, Some((subject, subject_text)), Vec::new()));
+        }
+        let mut members = Vec::new();
+        if self.eat_op("::") {
+            if self.eat_ctrl('{') {
+                let names =
+                    self.comma_list(Self::eat_member_name, |parser| parser.peek_is_ctrl('}'));
+                match names {
+                    Some(names) => members = names,
+                    None => {
+                        return Some(self.selector_refusal(
+                            start,
+                            Some((subject, subject_text)),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                if !self.eat_ctrl('}') {
+                    return Some(self.selector_refusal(
+                        start,
+                        Some((subject, subject_text)),
+                        members,
+                    ));
+                }
+            } else {
+                match self.eat_member_name() {
+                    Some(member) => members.push(member),
+                    None => {
+                        return Some(self.selector_refusal(
+                            start,
+                            Some((subject, subject_text)),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.refuse_selector_alias();
+        Some(ImportBranch::Selector(Box::new(ImplSelector {
+            subject: Some(Box::new(subject)),
+            subject_text: Cow::Borrowed(subject_text),
+            members,
+            span: self.span_from(start),
+        })))
+    }
+
+    /// One member name inside a selector's `::name` / `::{ a, b }` tail, with
+    /// its span. `as` on one is refused where it is written
+    /// ([`IMPL_SELECTOR_REFUSES_AS`]) and eaten, so the set still reads.
+    fn eat_member_name(&mut self) -> Option<(&'src str, Span)> {
+        let start = self.position;
+        let name = self.eat_name()?;
+        let span = self.span_from(start);
+        self.refuse_selector_alias();
+        Some((name, span))
+    }
+
+    /// Refuses a contextual `as <name>` at the cursor and consumes it (B318:
+    /// a selector takes no alias, on the block or on a member).
+    fn refuse_selector_alias(&mut self) {
+        if self.peek() != Some(&Token::Ident("as"))
+            || !matches!(self.peek_at(1), Some(Token::Ident(_)))
+        {
+            return;
+        }
+        let start = self.position;
+        self.bump();
+        self.bump();
+        self.errors.push(ParseError {
+            span: self.span_from(start),
+            reason: ParseErrorReason::Rule(IMPL_SELECTOR_REFUSES_AS),
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// Refuses every NAMED binder and every BOUND binder in a selector's
+    /// subject (B318: no binders are written in a selector). A bare `_` is the
+    /// placeholder and is the one binder node that survives.
+    fn refuse_selector_binders(&mut self, subject: &Spanned<Node<'src>>) {
+        let mut refused = Vec::new();
+        collect_selector_binders(subject, &mut refused);
+        for span in refused {
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(IMPL_SELECTOR_TAKES_NO_BINDER),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
+    }
+
+    /// The shape refusal, reported at the token the selector stopped on, plus
+    /// the branch the caller returns in its place.
+    fn selector_refusal(
+        &mut self,
+        start: usize,
+        subject: Option<(Spanned<Node<'src>>, &'src str)>,
+        members: Vec<(&'src str, Span)>,
+    ) -> ImportBranch<'src> {
+        self.errors.push(ParseError {
+            span: self.here_span(),
+            reason: ParseErrorReason::Rule(IMPL_SELECTOR_SHAPE),
+            context: Vec::new(),
+            hint: None,
+        });
+        let (subject, subject_text) = match subject {
+            Some((subject, text)) => (Some(Box::new(subject)), text),
+            None => (None, ""),
+        };
+        ImportBranch::Selector(Box::new(ImplSelector {
+            subject,
+            subject_text: Cow::Borrowed(subject_text),
+            members,
+            span: self.span_from(start),
+        }))
+    }
+
+    /// The source text a span covers — the selector's subject, reprinted
+    /// verbatim by the formatter and keyed on by the sorter.
+    fn text_of(&self, span: Span) -> &'src str {
+        self.source.get(span.into_range()).unwrap_or("")
     }
 
     /// `name ( :: branch | as name )?` — one path in a namespace path (the
@@ -6085,20 +6420,22 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(ImportBranch::Path(name, name_span, ImportTail::Leaf))
     }
 
-    /// `{ path, ... }` — a brace-delimited set of paths (allow-trailing). Each
-    /// element is a single path (chumsky's `path`, which must start with a name),
-    /// so a nested bare set is not a legal element.
+    /// `{ path | selector, ... }` — a brace-delimited set (allow-trailing).
+    /// Each element is a single path (chumsky's `path`, which must start with a
+    /// name) or, since B318 S3, an `(impl TYPE)` SELECTOR — tried first,
+    /// because its `(` begins nothing else here. A nested bare set is still not
+    /// a legal element.
     fn parse_namespace_set(&mut self) -> Option<ImportBranch<'src>> {
         self.attempt(|parser| {
             parser.expect_ctrl('{')?;
             let paths = parser.comma_list(
                 |parser| {
-                    // B320: an element that is not a path stops the set HERE,
+                    // B320: an element that is neither a path nor a selector stops the set HERE,
                     // and here is deeper than the `{` the enclosing production
                     // would otherwise record — `{ (impl T) }` reports on the
                     // `(`, which is the token that was typed.
                     let at = parser.position;
-                    let element = parser.parse_namespace_single_path();
+                    let element = parser.parse_namespace_set_element();
                     if element.is_none() {
                         parser.note_import_failure(at);
                     }
@@ -6109,6 +6446,14 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl('}')?;
             Some(ImportBranch::Set(paths))
         })
+    }
+
+    /// One element of a brace set: an `(impl …)` selector, or a single path.
+    fn parse_namespace_set_element(&mut self) -> Option<ImportBranch<'src>> {
+        if self.at_impl_selector() {
+            return self.parse_impl_selector();
+        }
+        self.parse_namespace_single_path()
     }
 
     // --- Derive / service / macro-attribute items ----------------------------
@@ -7761,7 +8106,7 @@ mod tests {
     fn import_recursive_path_and_brace_set() {
         // `std::collections::{ Map, Set }` — a `::` path ending in a set.
         match only_item("import std::collections::{ Map, Set };") {
-            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next))) => {
+            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next)), _) => {
                 match &*next {
                     ImportBranch::Path("collections", _, ImportTail::Continue(set)) => match &**set
                     {
@@ -7784,7 +8129,7 @@ mod tests {
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).
         match only_item("export import shared::config;") {
-            Node::Export(_, inner) => assert!(matches!(inner.0, Node::Import(_))),
+            Node::Export(_, inner) => assert!(matches!(inner.0, Node::Import(..))),
             other => panic!("expected Export, got {other:?}"),
         }
     }
@@ -8046,7 +8391,7 @@ mod tests {
              fun main() { print(\"hi\") }\n",
         );
         assert_eq!(statements.len(), 4);
-        assert!(matches!(statements[0].0, Node::Import(_)));
+        assert!(matches!(statements[0].0, Node::Import(..)));
         assert!(matches!(statements[1].0, Node::Struct(..)));
         assert!(matches!(statements[2].0, Node::Derive(..)));
         assert!(matches!(statements[3].0, Node::Func(_)));

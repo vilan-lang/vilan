@@ -7,12 +7,13 @@
 //! input's (ignoring spans, whitespace, and comments); on any mismatch it returns
 //! the source unchanged rather than risk corrupting the file.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
-    GenericArguments, GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList,
-    Pattern, StructInitializerField,
+    GenericArguments, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
+    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -357,6 +358,17 @@ enum BranchKey {
     SelfLeaf,
     End,
     Path(String, Box<BranchKey>),
+    /// An `(impl TYPE)` selector (B318 S3): its subject's rendered type text
+    /// with every space removed, then its member set. Declared AFTER `Path` so
+    /// a selector sorts after every NAME in a brace set
+    /// (`visibility.md` §7.2 — B318's open (e), answered), and keyed on the
+    /// text rather than on a resolved type because the key is shared with the
+    /// token path, which has no analyzer and never will.
+    ///
+    /// Spaces are stripped so the two producers cannot disagree: the AST side
+    /// slices the subject's source text and the token side concatenates the
+    /// subject's tokens, and those differ in nothing else.
+    Selector(String, Box<BranchKey>),
     Set(Vec<BranchKey>),
 }
 
@@ -383,6 +395,15 @@ enum TokenBranch<'src> {
     /// `#<branch>` — the B318 reach marker, kept in the key so `#hidden` and
     /// `hidden` never reduce to one spelling.
     Reach(Box<TokenBranch<'src>>),
+    /// An `(impl TYPE)` selector element (B318 S3): the subject's
+    /// space-stripped text, the subject's own tokens, and the members its
+    /// `::` tail names.
+    ///
+    /// The token vector is filled only by [`parse_token_branch`], which is the
+    /// only producer whose branches are ever re-emitted; [`branch_from_ast`]
+    /// leaves it empty, because an AST-derived branch exists to be KEYED and
+    /// the key reads the text.
+    Selector(String, Vec<Token<'src>>, Vec<&'src str>),
 }
 
 /// Drops the spans from an `ImportBranch`, giving the span-free [`TokenBranch`]
@@ -407,7 +428,18 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
         ImportBranch::Set(branches) => {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
+        ImportBranch::Selector(selector) => TokenBranch::Selector(
+            selector_key_text(&selector.subject_text),
+            Vec::new(),
+            selector.members.iter().map(|(name, _)| *name).collect(),
+        ),
     }
+}
+
+/// A selector subject's ORDER key: its text with every whitespace byte removed.
+/// See [`BranchKey::Selector`] for why the two producers meet here.
+fn selector_key_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// The canonical view of a branch for ordering and re-emission: a one-member
@@ -467,6 +499,21 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
             keys.sort();
             BranchKey::Set(keys)
         }
+        TokenBranch::Selector(subject, _, members) => {
+            let mut keys: Vec<BranchKey> = members
+                .iter()
+                .map(|name| BranchKey::Path((*name).to_string(), Box::new(BranchKey::End)))
+                .collect();
+            keys.sort();
+            BranchKey::Selector(
+                subject.clone(),
+                Box::new(if keys.is_empty() {
+                    BranchKey::End
+                } else {
+                    BranchKey::Set(keys)
+                }),
+            )
+        }
     }
 }
 
@@ -476,6 +523,10 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
 /// collapsed reprint `import a;` land in the same place.
 fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey {
     let (root, rest) = match unwrap_singleton_set(branch) {
+        // A bare selector has no root namespace to rank — it only reaches here
+        // through the unbraced form the parser refuses, and a refused file is
+        // never reprinted.
+        selector @ TokenBranch::Selector(..) => (RootRank::Unrooted, branch_key(selector)),
         TokenBranch::Path(name, child, _) => {
             let root = match *name {
                 "std" => RootRank::Std,
@@ -501,7 +552,7 @@ fn import_kind_and_branch<'node, 'src>(
     node: &'node Node<'src>,
 ) -> Option<(ImportKind, &'node ImportBranch<'src>)> {
     match node {
-        Node::Import(branch) => Some((ImportKind::Import, branch)),
+        Node::Import(branch, _) => Some((ImportKind::Import, branch)),
         Node::Use(branch) => Some((ImportKind::Use, branch)),
         Node::Export(_, inner) => import_kind_and_branch(&inner.0),
         _ => None,
@@ -582,7 +633,8 @@ fn parse_token_branch<'src>(
         let mut branches = Vec::new();
         let mut next = index + 1;
         // An empty set `{}` closes immediately; otherwise each element is a
-        // name-headed single path, comma-separated, allow-trailing.
+        // name-headed single path or an `(impl …)` SELECTOR (B318 S3),
+        // comma-separated, allow-trailing.
         while tokens.get(next) != Some(&Token::Ctrl('}')) {
             if tokens.get(next) == Some(&Token::Hash) {
                 let (inner, after) = parse_token_branch(tokens, next)?;
@@ -596,6 +648,16 @@ fn parse_token_branch<'src>(
                     Some(Token::Ctrl('}')) => break,
                     _ => return None,
                 }
+            }
+            if let Some((selector, past)) = parse_token_selector(tokens, next) {
+                branches.push(selector);
+                next = past;
+                match tokens.get(next) {
+                    Some(Token::Ctrl(',')) => next += 1,
+                    Some(Token::Ctrl('}')) => break,
+                    _ => return None,
+                }
+                continue;
             }
             let name = token_name(tokens, next)?;
             let mut after = next + 1;
@@ -622,6 +684,69 @@ fn parse_token_branch<'src>(
     }
 }
 
+/// Parses an `(impl TYPE)` selector element beginning at `index` — the token
+/// path's half of [`Parser::parse_impl_selector`] (B318 S3) — returning the
+/// branch and the index past it. `None` when the tokens are not a selector,
+/// which leaves the caller to read a path there instead.
+///
+/// The subject is taken as the balanced token run up to the selector's own `)`,
+/// which is all the safety net needs: it re-emits those tokens verbatim, and it
+/// keys on them with the spaces the source never had. Reading the type grammar
+/// a second time here would be a second grammar to keep in step, and the net's
+/// contract is that it cannot disagree with the parser — not that it
+/// understands types.
+fn parse_token_selector<'src>(
+    tokens: &[Token<'src>],
+    index: usize,
+) -> Option<(TokenBranch<'src>, usize)> {
+    if tokens.get(index) != Some(&Token::Ctrl('(')) || tokens.get(index + 1) != Some(&Token::Impl) {
+        return None;
+    }
+    let mut next = index + 2;
+    let mut depth = 0usize;
+    let mut subject: Vec<Token<'src>> = Vec::new();
+    loop {
+        match tokens.get(next)? {
+            Token::Ctrl(')') if depth == 0 => break,
+            token => {
+                match token {
+                    Token::Ctrl('(' | '[' | '{') => depth += 1,
+                    Token::Ctrl(')' | ']' | '}') => depth = depth.checked_sub(1)?,
+                    _ => {}
+                }
+                subject.push(token.clone());
+                next += 1;
+            }
+        }
+    }
+    if subject.is_empty() {
+        return None;
+    }
+    next += 1;
+    let mut members = Vec::new();
+    if tokens.get(next) == Some(&Token::Op("::")) {
+        next += 1;
+        if tokens.get(next) == Some(&Token::Ctrl('{')) {
+            next += 1;
+            while tokens.get(next) != Some(&Token::Ctrl('}')) {
+                members.push(token_name(tokens, next)?);
+                next += 1;
+                match tokens.get(next) {
+                    Some(Token::Ctrl(',')) => next += 1,
+                    Some(Token::Ctrl('}')) => break,
+                    _ => return None,
+                }
+            }
+            next += 1;
+        } else {
+            members.push(token_name(tokens, next)?);
+            next += 1;
+        }
+    }
+    let key = selector_key_text(&subject.iter().map(Token::to_string).collect::<String>());
+    Some((TokenBranch::Selector(key, subject, members), next))
+}
+
 /// Parses one import/use statement beginning at `index` into its kind, whether
 /// it is an `export` re-export, its path, and the index past its `;` — or `None`
 /// if the tokens do not match the import grammar (leaving the run unsorted, a
@@ -629,7 +754,7 @@ fn parse_token_branch<'src>(
 fn parse_import_statement<'src>(
     tokens: &[Token<'src>],
     index: usize,
-) -> Option<(ImportKind, bool, TokenBranch<'src>, usize)> {
+) -> Option<(ImportKind, bool, TokenBranch<'src>, bool, usize)> {
     let mut next = index;
     let export = tokens.get(next) == Some(&Token::Export);
     if export {
@@ -643,10 +768,17 @@ fn parse_import_statement<'src>(
     next += 1;
     let (branch, after) = parse_token_branch(tokens, next)?;
     next = after;
+    // B318's trailing `only`: read here and reported back, so the canonical
+    // re-emission puts it back where it was — dropping it would change what the
+    // statement MEANS, which is the one thing the safety net exists to catch.
+    let only = kind == ImportKind::Import && tokens.get(next) == Some(&Token::Ident("only"));
+    if only {
+        next += 1;
+    }
     if tokens.get(next) != Some(&Token::Ctrl(';')) {
         return None;
     }
-    Some((kind, export, branch, next + 1))
+    Some((kind, export, branch, only, next + 1))
 }
 
 /// Appends the canonical token form of an import path, brace sets sorted and a
@@ -669,6 +801,35 @@ fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src
         TokenBranch::Reach(inner) => {
             out.push(Token::Hash);
             emit_branch_tokens(inner, out);
+        }
+        TokenBranch::Selector(_, subject, members) => {
+            out.push(Token::Ctrl('('));
+            out.push(Token::Impl);
+            out.extend(subject.iter().cloned());
+            out.push(Token::Ctrl(')'));
+            let mut order: Vec<&'src str> = members.clone();
+            order.sort_unstable();
+            // One member has a canonical unbraced spelling — `(impl T)::{ m }`
+            // IS `(impl T)::m` — exactly as a one-member path set collapses
+            // ([`unwrap_singleton_set`], kolt.local 005).
+            match order.as_slice() {
+                [] => {}
+                [single] => {
+                    out.push(Token::Op("::"));
+                    out.push(Token::Ident(single));
+                }
+                many => {
+                    out.push(Token::Op("::"));
+                    out.push(Token::Ctrl('{'));
+                    for (position, member) in many.iter().enumerate() {
+                        if position > 0 {
+                            out.push(Token::Ctrl(','));
+                        }
+                        out.push(Token::Ident(member));
+                    }
+                    out.push(Token::Ctrl('}'));
+                }
+            }
         }
         TokenBranch::Set(branches) => {
             out.push(Token::Ctrl('{'));
@@ -704,15 +865,15 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
         if depth == 0 && starts_import(tokens, index) {
             // Parse the maximal run of consecutive import statements. Each
             // statement consumes its own brace set, so depth stays 0 across it.
-            let mut statements: Vec<(ImportSortKey, ImportKind, bool, TokenBranch<'src>)> =
+            let mut statements: Vec<(ImportSortKey, ImportKind, bool, bool, TokenBranch<'src>)> =
                 Vec::new();
             let mut cursor = index;
             let mut parsed_cleanly = true;
             while cursor < tokens.len() && starts_import(tokens, cursor) {
                 match parse_import_statement(tokens, cursor) {
-                    Some((kind, export, branch, next)) => {
+                    Some((kind, export, branch, only, next)) => {
                         let key = import_sort_key(kind, &branch);
-                        statements.push((key, kind, export, branch));
+                        statements.push((key, kind, export, only, branch));
                         cursor = next;
                     }
                     None => {
@@ -723,7 +884,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
             }
             if parsed_cleanly && !statements.is_empty() {
                 statements.sort_by(|left, right| left.0.cmp(&right.0));
-                for (_, kind, export, branch) in &statements {
+                for (_, kind, export, only, branch) in &statements {
                     if *export {
                         result.push(Token::Export);
                     }
@@ -732,6 +893,9 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
                         ImportKind::Use => Token::Use,
                     });
                     emit_branch_tokens(branch, &mut result);
+                    if *only {
+                        result.push(Token::Ident("only"));
+                    }
                     result.push(Token::Ctrl(';'));
                 }
                 index = cursor;
@@ -1530,6 +1694,19 @@ fn prune_import_branch<'src>(
         // decision, and stripping it would silently re-arm the §5 warning.
         ImportBranch::Reach(marker, inner) => prune_import_branch(inner, keep)
             .map(|pruned| ImportBranch::Reach(*marker, Box::new(pruned))),
+        // B318 S3: a selector is a TERMINAL kind, asked about at its own
+        // `(impl …)` span — the span the analyzer banked the selector's
+        // resolution under, so the editor's fade and the organizer's prune go
+        // on asking one question. The surviving copy drops the subject NODE: a
+        // pruned branch exists to be printed, and the text is what prints.
+        ImportBranch::Selector(selector) => keep(selector.span).then(|| {
+            ImportBranch::Selector(Box::new(ImplSelector {
+                subject: None,
+                subject_text: selector.subject_text.clone(),
+                members: selector.members.clone(),
+                span: selector.span,
+            }))
+        }),
         ImportBranch::Set(branches) => {
             let kept: Vec<ImportBranch<'src>> = branches
                 .iter()
@@ -1575,9 +1752,30 @@ fn import_module_branch<'src>(
                 (ImportBranch::Reach(*marker, Box::new(branch)), span, depth)
             })
         }
-        // A brace set with no path before it has no module to name.
-        ImportBranch::Set(_) => None,
+        // A brace set with no path before it has no module to name; neither
+        // does a bare selector.
+        ImportBranch::Set(_) | ImportBranch::Selector(_) => None,
     }
+}
+
+/// What the organizer does with an `import` statement every one of whose leaves
+/// pruned away (E168, re-pointed at B318's selectors).
+///
+/// The statement may still be the only thing carrying an `impl` the file calls
+/// a method from, and the fix is the narrowest spelling that keeps it. Before
+/// selectors that was the whole module; with them it is the selector, when the
+/// file's uses of that module's blocks all come from ONE subject
+/// (`visibility.md` §7.2) — the precise statement of what the file actually
+/// needs, and the thing E168's own item said this would become.
+#[derive(Clone)]
+pub enum ModuleRescue {
+    /// The module brings the file nothing: the statement goes.
+    No,
+    /// `import <module>;` — the file uses more of the module than one block.
+    Module,
+    /// `import <module>::{ (impl <subject>) };` — it uses exactly one block's
+    /// members. The string is the subject as it should be rendered.
+    Selector(String),
 }
 
 /// E168: the statement `branch` becomes when every one of its leaves pruned
@@ -1593,10 +1791,45 @@ fn import_module_branch<'src>(
 /// drift.
 fn module_only_import_branch<'src>(
     branch: &ImportBranch<'src>,
-    keep_module: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> ModuleRescue,
 ) -> Option<ImportBranch<'src>> {
     let (module, module_span, depth) = import_module_branch(branch)?;
-    (depth >= 2 && keep_module(module_span)).then_some(module)
+    if depth < 2 {
+        return None;
+    }
+    match keep_module(module_span) {
+        ModuleRescue::No => None,
+        ModuleRescue::Module => Some(module),
+        ModuleRescue::Selector(subject) => Some(attach_selector(module, subject)),
+    }
+}
+
+/// `<module>` rewritten as `<module>::{ (impl <subject>) }` — the module path's
+/// terminal segment given a brace set holding one synthesized selector.
+///
+/// The selector carries no subject NODE: it exists to be printed, and the text
+/// is what prints ([`ImplSelector::subject`] says so).
+fn attach_selector<'src>(module: ImportBranch<'src>, subject: String) -> ImportBranch<'src> {
+    match module {
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => ImportBranch::Path(
+            name,
+            span,
+            ImportTail::Continue(Box::new(attach_selector(*child, subject))),
+        ),
+        ImportBranch::Path(name, span, _) => ImportBranch::Path(
+            name,
+            span,
+            ImportTail::Continue(Box::new(ImportBranch::Set(vec![ImportBranch::Selector(
+                Box::new(ImplSelector {
+                    subject: None,
+                    subject_text: Cow::Owned(subject),
+                    members: Vec::new(),
+                    span: Span::default(),
+                }),
+            )]))),
+        ),
+        other => other,
+    }
 }
 
 // --- Canonical element-head order --------------------------------------------
@@ -2031,6 +2264,10 @@ fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
                 collect_import_leaf_spans(branch, out);
             }
         }
+        // A selector binds no name, but it IS a terminal the organizer prunes,
+        // so it is offered at its own span (`prune_import_branch`'s arm asks
+        // the same one).
+        ImportBranch::Selector(selector) => out.push(selector.span),
     }
 }
 
@@ -2047,13 +2284,15 @@ fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
 /// statement `keep` emptied out (E168): an `import` brings every `impl` in the
 /// module's file with it whatever leaf it names, so a statement whose leaves are
 /// all unused may still be the only thing carrying a method the file calls.
-/// Answering `true` rewrites it to `import <module>;` instead of deleting it —
-/// the fade stays on the leaf, which is genuinely unused, and the build stays
-/// green. Pass `|_| false` to prune exactly as before.
+/// Answering [`ModuleRescue::Module`] rewrites it to `import <module>;` instead
+/// of deleting it, and [`ModuleRescue::Selector`] to the narrower
+/// `import <module>::{ (impl T) };` (B318 S3) — the fade stays on the leaf,
+/// which is genuinely unused, and the build stays green. Pass
+/// `|_| ModuleRescue::No` to prune exactly as before.
 pub fn organize_import_runs(
     source: &str,
     keep: &dyn Fn(Span) -> bool,
-    keep_module: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> ModuleRescue,
 ) -> Option<Vec<ImportRunEdit>> {
     let items = parse(source)?;
     let mut printer = Printer {
@@ -2120,6 +2359,9 @@ fn decompose_import_branch<'ast, 'src>(
         ImportBranch::Path(_, _, ImportTail::Alias(..)) => (Vec::new(), ImportLeafShape::Aliased),
         ImportBranch::Path(name, _, ImportTail::Continue(child)) => match child.as_ref() {
             ImportBranch::Set(branches) => (vec![*name], ImportLeafShape::Set(branches)),
+            // A selector binds no name, so a statement that is only a selector
+            // is not one the add-import quickfix may extend.
+            ImportBranch::Selector(_) => (Vec::new(), ImportLeafShape::Aliased),
             ImportBranch::Path(..) => {
                 let (mut prefix, shape) = decompose_import_branch(child);
                 prefix.insert(0, name);
@@ -2133,6 +2375,7 @@ fn decompose_import_branch<'ast, 'src>(
         // Same, for a marked statement head.
         ImportBranch::Reach(..) => (Vec::new(), ImportLeafShape::Aliased),
         ImportBranch::Set(branches) => (Vec::new(), ImportLeafShape::Set(branches)),
+        ImportBranch::Selector(_) => (Vec::new(), ImportLeafShape::Aliased),
     }
 }
 
@@ -2220,7 +2463,7 @@ fn try_extend_import<'src>(
 /// which is not what an add-import quickfix asked for).
 fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node ImportBranch<'src>> {
     match node {
-        Node::Import(branch) => Some(branch),
+        Node::Import(branch, _) => Some(branch),
         _ => None,
     }
 }
@@ -2737,7 +2980,7 @@ impl<'src> Printer<'src> {
         &mut self,
         items: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
-        keep_module: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> ModuleRescue,
     ) -> Vec<ImportRunEdit> {
         let mut edits = Vec::new();
         let mut index = 0;
@@ -2761,7 +3004,7 @@ impl<'src> Printer<'src> {
         &mut self,
         run: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
-        keep_module: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> ModuleRescue,
     ) -> Option<ImportRunEdit> {
         let run_start = run[0].1.into_range().start;
         // Reach this run's own trailing comments; a standalone comment before the
@@ -2787,9 +3030,9 @@ impl<'src> Printer<'src> {
                 // a method from. A `use` is not rewritten: it binds a name out
                 // of a namespace into this scope, and a namespace with no name
                 // taken out of it binds nothing at all.
-                Node::Import(branch) => prune_import_branch(branch, keep)
+                Node::Import(branch, modifier) => prune_import_branch(branch, keep)
                     .or_else(|| module_only_import_branch(branch, keep_module))
-                    .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned))),
+                    .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned, *modifier))),
                 Node::Use(branch) => prune_import_branch(branch, keep)
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Use(pruned))),
                 _ => None,
@@ -2926,9 +3169,12 @@ impl<'src> Printer<'src> {
                 self.print_import_branch(branch, true);
                 self.out.push(';');
             }
-            Node::Import(branch) => {
+            Node::Import(branch, modifier) => {
                 self.out.push_str("import ");
                 self.print_import_branch(branch, true);
+                if matches!(modifier, ImportModifier::Only(_)) {
+                    self.out.push_str(" only");
+                }
                 self.out.push(';');
             }
             Node::Export(scope, inner) => {
@@ -2981,7 +3227,7 @@ impl<'src> Printer<'src> {
                 | Node::Service(_, _)
                 | Node::Export(..)
                 | Node::Use(_)
-                | Node::Import(_)
+                | Node::Import(..)
                 | Node::MacroFun(_)
                 | Node::MacroBlock(_)
                 | Node::MacroAttribute(_, _, _, _)
@@ -3106,9 +3352,12 @@ impl<'src> Printer<'src> {
                 self.print_import_branch(branch, false);
                 self.out.push(';');
             }
-            Node::Import(branch) => {
+            Node::Import(branch, modifier) => {
                 self.out.push_str("import ");
                 self.print_import_branch(branch, false);
+                if matches!(modifier, ImportModifier::Only(_)) {
+                    self.out.push_str(" only");
+                }
                 self.out.push(';');
             }
             Node::Func(func) => self.print_func(func),
@@ -3268,6 +3517,35 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
+            // B318 S3. The subject reprints VERBATIM: the selector's type is
+            // the one place `vilan fmt` does not canonicalize spacing, because
+            // the token safety net keys on the same text and re-lexing a
+            // canonical print here would be a second type renderer to hold in
+            // step with the first.
+            ImportBranch::Selector(selector) => {
+                self.out.push_str("(impl ");
+                self.out.push_str(&selector.subject_text);
+                self.out.push(')');
+                let mut members: Vec<&'src str> =
+                    selector.members.iter().map(|(name, _)| *name).collect();
+                if sort {
+                    members.sort_unstable();
+                }
+                match members.as_slice() {
+                    [] => {}
+                    // One member collapses to the unbraced spelling, exactly as
+                    // a one-member path set does (kolt.local 005).
+                    [single] => {
+                        self.out.push_str("::");
+                        self.out.push_str(single);
+                    }
+                    many => {
+                        self.out.push_str("::{ ");
+                        self.out.push_str(&many.join(", "));
+                        self.out.push_str(" }");
+                    }
+                }
+            }
             ImportBranch::Set(branches) => {
                 let mut order: Vec<&ImportBranch<'src>> = branches.iter().collect();
                 if sort {
@@ -3288,9 +3566,13 @@ impl<'src> Printer<'src> {
                 // `Option`), and a comment inside them, which is anchored to the
                 // set's split form. `emit_branch_tokens` mirrors this collapse so
                 // the safety net reduces both spellings to the same tokens.
+                // A selector has no unbraced spelling at all — the parser
+                // refuses `import a::(impl T);` — so a one-member set holding
+                // one keeps its braces, the way a lone `self` does.
                 if let [only] = order.as_slice()
                     && !inside_comment
                     && !matches!(only, ImportBranch::Path("self", ..))
+                    && !matches!(only, ImportBranch::Selector(_))
                 {
                     self.split = split;
                     self.print_import_branch(only, sort);
@@ -3336,6 +3618,9 @@ impl<'src> Printer<'src> {
             // The marker is the head of what it marks, so a comment before a
             // marked member anchors on the `#`.
             ImportBranch::Reach(marker, _) => Some(*marker),
+            // A selector's head is its `(`, and its whole element span is what
+            // a comment before it attaches to.
+            ImportBranch::Selector(selector) => Some(selector.span),
             ImportBranch::Set(_) => None,
         }
     }
@@ -10477,6 +10762,75 @@ mod import_sorting {
         );
     }
 
+    // B318 S3. A selector sorts AFTER every name in a brace set, by its
+    // subject's rendered type text (`visibility.md` §7.2, B318's open (e)) —
+    // the shared `BranchKey::Selector` variant, so `vilan fmt` and Organize
+    // Imports order it identically and the token safety net agrees with both.
+    #[test]
+    fn a_selector_sorts_after_every_name_in_a_set() {
+        assert_sorts(
+            "import pkg::a::{ (impl Thing), Zeta, Thing };\n",
+            "import pkg::a::{ Thing, Zeta, (impl Thing) };\n",
+        );
+        // Two selectors order by their type text, not by source order.
+        assert_sorts(
+            "import pkg::a::{ (impl Zebra), (impl Alpha) };\n",
+            "import pkg::a::{ (impl Alpha), (impl Zebra) };\n",
+        );
+    }
+
+    // A selector has no unbraced spelling — `import a::(impl T);` is refused —
+    // so a one-member set holding one keeps its braces where a one-member set
+    // holding a NAME collapses (kolt.local 005).
+    #[test]
+    fn a_one_member_set_holding_a_selector_keeps_its_braces() {
+        assert_sorts(
+            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::{ (impl Style) };\n",
+        );
+        assert_sorts("import pkg::a::{ Style };\n", "import pkg::a::Style;\n");
+    }
+
+    // A selector's METHOD set sorts like any other, and a lone member takes the
+    // unbraced spelling the same way `a::{ b }` does.
+    #[test]
+    fn selector_members_sort_and_a_lone_member_unbraces() {
+        assert_sorts(
+            "import pkg::a::{ (impl List<i32>)::{ last, first } };\n",
+            "import pkg::a::{ (impl List<i32>)::{ first, last } };\n",
+        );
+        assert_sorts(
+            "import pkg::a::{ (impl List<i32>)::{ first } };\n",
+            "import pkg::a::{ (impl List<i32>)::first };\n",
+        );
+    }
+
+    // B318 §2.4: `only` is part of what the statement MEANS, so the reprint
+    // carries it — and the token safety net, which reads the word on its own
+    // path, agrees rather than bailing.
+    #[test]
+    fn only_survives_the_reprint_and_sorts_by_its_path() {
+        assert_sorts(
+            "import pkg::z::y only;\nimport std::a;\n",
+            "import std::a;\nimport pkg::z::y only;\n",
+        );
+    }
+
+    // The placeholder round-trips in every position B318 gives it: an argument
+    // (`List<_>`), a nested one, an independent pair, and the whole-module
+    // `(impl _)`.
+    #[test]
+    fn the_selector_placeholder_round_trips() {
+        for source in [
+            "import pkg::a::{ (impl _) };\n",
+            "import pkg::a::{ (impl List<_>) };\n",
+            "import pkg::a::{ (impl List<Option<_>>) };\n",
+            "import pkg::a::{ (impl Map<_, _>) };\n",
+        ] {
+            assert_sorts(source, source);
+        }
+    }
+
     // A `use` always sorts after every `import`, whatever the paths — the kind
     // is the primary key.
     #[test]
@@ -10722,7 +11076,37 @@ mod organize {
     /// rewritten to `import <module>;` instead of being deleted.
     pub(super) fn organize_rescuing(source: &str, dead: &[&str], rescued: &[&str]) -> String {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let keep_module = |span: Span| rescued.contains(&&source[span.into_range()]);
+        let keep_module = |span: Span| match rescued.contains(&&source[span.into_range()]) {
+            true => super::ModuleRescue::Module,
+            false => super::ModuleRescue::No,
+        };
+        let mut edits =
+            organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
+        let mut result = source.to_string();
+        for edit in edits {
+            result.replace_range(edit.span.into_range(), &edit.replacement);
+        }
+        result
+    }
+
+    /// [`organize`] with E168's rescue answering B318's SELECTOR form: a
+    /// statement every one of whose leaves is dead, and whose MODULE segment is
+    /// named in `selected`, is rewritten to
+    /// `import <module>::{ (impl <subject>) };`.
+    pub(super) fn organize_selecting(
+        source: &str,
+        dead: &[&str],
+        selected: &[(&str, &str)],
+    ) -> String {
+        let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
+        let keep_module = |span: Span| match selected
+            .iter()
+            .find(|(module, _)| *module == &source[span.into_range()])
+        {
+            Some((_, subject)) => super::ModuleRescue::Selector((*subject).to_string()),
+            None => super::ModuleRescue::No,
+        };
         let mut edits =
             organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
@@ -10736,7 +11120,8 @@ mod organize {
     /// The organizer offers no edit at all (already organized / nothing to prune).
     fn assert_no_edit(source: &str, dead: &[&str]) {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let edits = organize_import_runs(source, &keep, &|_| false).expect("source parses cleanly");
+        let edits = organize_import_runs(source, &keep, &|_| super::ModuleRescue::No)
+            .expect("source parses cleanly");
         assert!(
             edits.is_empty(),
             "expected no edit, got {} edit(s)",
@@ -10755,6 +11140,71 @@ mod organize {
         assert_eq!(
             organize_rescuing("import pkg::a::b;\n", &["b"], &["a"]),
             "import pkg::a;\n",
+        );
+    }
+
+    // B318 S3 re-points E168's rewrite: when everything the file gets from the
+    // module is one subject's `impl` blocks, the rescue is the SELECTOR — the
+    // precise statement of what the file actually needs — and not the whole
+    // module. `visibility.md` §7.2, and E168's own item ("re-pointed at B318's
+    // selectors later").
+    #[test]
+    fn an_emptied_statement_rescued_by_one_subject_becomes_a_selector() {
+        assert_eq!(
+            organize_selecting("import pkg::a::b;\n", &["b"], &[("a", "Style")]),
+            "import pkg::a::{ (impl Style) };\n",
+        );
+        // A brace set's common prefix is the path before it, so a set whose
+        // members all died rewrites the same way.
+        assert_eq!(
+            organize_selecting("import pkg::a::{ b, c };\n", &["b", "c"], &[("a", "Style")]),
+            "import pkg::a::{ (impl Style) };\n",
+        );
+    }
+
+    // A selector is a TERMINAL the organizer prunes: `keep` is asked at its own
+    // `(impl …)` span, so a selector whose implementation the file does not use
+    // goes, and one it does use stays — beside a name in the same set, which
+    // prunes on its own answer.
+    #[test]
+    fn an_unused_selector_prunes_and_a_used_one_survives() {
+        assert_eq!(
+            organize(
+                "import pkg::a::{ Thing, (impl Thing) };\n",
+                &["(impl Thing)"],
+            ),
+            "import pkg::a::Thing;\n",
+        );
+        assert_eq!(
+            organize("import pkg::a::{ Thing, (impl Thing) };\n", &["Thing"]),
+            "import pkg::a::{ (impl Thing) };\n",
+        );
+        // Every element dead: the statement goes, and the module rescue is a
+        // second question it was not offered here.
+        assert_eq!(
+            organize(
+                "import pkg::a::{ Thing, (impl Thing) };\n",
+                &["Thing", "(impl Thing)"],
+            ),
+            "",
+        );
+    }
+
+    // fmt/organize agreement, extended to the new elements: what the organizer
+    // renders for a run carrying a selector and an `only` is byte-for-byte what
+    // `vilan fmt` renders for it, which is the property `organize_run` depends
+    // on and the one `formatter.rs:1414` says must never break.
+    #[test]
+    fn organize_and_fmt_agree_on_selectors_and_only() {
+        let source =
+            "import pkg::z::y only;\nimport pkg::a::{ (impl Zebra), Thing, (impl Alpha) };\n";
+        assert_eq!(
+            super::organize::organize(source, &[]),
+            super::format(source)
+        );
+        assert_eq!(
+            super::organize::organize(source, &[]),
+            "import pkg::a::{ Thing, (impl Alpha), (impl Zebra) };\nimport pkg::z::y only;\n",
         );
     }
 

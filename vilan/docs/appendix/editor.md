@@ -157,7 +157,11 @@ Where the cursor is decides what is offered.
   file that has never mentioned `std::random`. A brace set completes at the
   same level as its module, so `import std::json::{ Json, ` keeps going.
   (Imports are read as single-line items; a braced group's later lines are
-  not recognized.)
+  not recognized.) Inside an impl SELECTOR the answer is not a name the
+  module offers but a block it writes: after `impl ` the module's impl
+  subjects (`import std::style::{ (impl ` offers `Length`, `Color`, …), and
+  after `)::` that block's members (`(impl Length)::` offers `rem`). Both
+  come from the module's parsed text, like every other answer here.
 - **A name you have not imported** is offered too, labeled with the module
   it comes from and carrying the `import` as part of accepting it — one
   action writes both. Your own package's names rank ahead of `std`'s, so a
@@ -192,7 +196,7 @@ and two source actions:
 
 | Action | Does |
 |---|---|
-| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* to the bare module import (`import pkg::a::b;` becomes `import pkg::a;`) when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. Offered only when it would change something |
+| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* rather than deleted when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. The rewrite is the narrowest statement that keeps it: an impl SELECTOR (`import pkg::a::b;` becomes `import pkg::a::{ (impl Style) };`) when everything the file uses from that module is one subject's blocks, and the bare module import (`import pkg::a;`) when it is not. A selector is a leaf like any other: one whose implementation the file never calls a method from fades and prunes, one it does use stays. Offered only when it would change something |
 | **Add All Missing Imports** | applies every unambiguous import quickfix in the file at once, skipping the ambiguous ones |
 
 An import the **prelude** covers is stripped for the same reason an unused

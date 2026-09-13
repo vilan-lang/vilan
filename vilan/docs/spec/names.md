@@ -129,6 +129,24 @@ importing module's scope:
   reaches a set member too (`import a::{ b as x, c };`), and a re-export
   publishes the alias (`export import a::b as c;` publishes `c`).
 
+- `import std::list only;` binds the statement's names and **no
+  implementations**. A plain `import` brings every `impl` declared in the
+  files on the path to its leaf — that is how an extension impl arrives —
+  and `only` is the spelling that declines them.
+- `import std::list::{ (impl List<i32>) };` is an **impl selector**: a
+  brace-set element that binds no name and admits exactly the `impl`
+  blocks of the module whose subject unifies with the written type. A set
+  naming one means "these implementations only", so `only` is for
+  statements without a selector. `_` is the placeholder — `(impl List<_>)`
+  admits every `List` block whatever its element, and `(impl _)` admits
+  every block the module declares — and no `type X` binders are written in
+  a selector. `import std::list::{ (impl List<i32>)::first };` takes ONE
+  member into the type's namespace for this file, and
+  `::{ first, last }` takes several; a selector takes no `as`, because a
+  method is called by name on a receiver. The subject resolves in the
+  IMPORTING file's scope: `impl S` after `import item::Struct as S;`
+  reaches `S`, and `impl item::Struct` is the qualified spelling.
+
 `use path` binds names from an already-visible type's namespace without
 loading (variants, statics) — the same two kinds `import` reaches by
 path, and the difference is only that `use` loads nothing, the type being

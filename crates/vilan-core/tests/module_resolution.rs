@@ -5870,3 +5870,234 @@ fn b318_a_qualified_reach_of_a_private_item_warns_too() {
         "an exported item is silent: {exported:#?}"
     );
 }
+/// The P7 module set, with `app.vl`'s body supplied per case.
+fn p7_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a.vl",
+            "struct Thing { x: i32 }\n\nimpl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "x.vl",
+            "import pkg::a::Thing;\n\nimpl Thing {\n\tfun bump(self): i32 { self.x + 1 }\n}\n"
+                .to_string(),
+        ),
+        ("x/y.vl", "fun y_helper(): i32 { 8 }\n".to_string()),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_p7(app: &str) -> Vec<String> {
+    let owned = p7_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// P7, unchanged: an intermediate module's `impl` arrives with an import that
+/// reaches something under it, and the call compiles. The control the paper
+/// records (P7b — drop the `y_helper` import) is the "has no method" arm.
+#[test]
+fn b318_p7s_exhibit_is_admitted_by_a_plain_import() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::y::y_helper;\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "P7's exhibit should compile unchanged: {diagnostics:?}"
+    );
+}
+
+/// The same program with `only` on the statement that loaded `x.vl`: the names
+/// still arrive (`y_helper` resolves), and the implementation does not. The
+/// refusal names the module and the fix.
+#[test]
+fn b318_only_declines_the_impls_along_the_path() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::y::y_helper only;\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly the admission refusal: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics[0].contains("'bump' is provided by an `impl` in module `x`")
+            && diagnostics[0].contains("imports that module `only`"),
+        "unexpected message: {}",
+        diagnostics[0]
+    );
+}
+
+/// `only` subtracts implementations, not NAMES: the same file's own leaf still
+/// binds, which is the half that makes the modifier usable at all.
+#[test]
+fn b318_only_still_binds_the_statements_names() {
+    let diagnostics =
+        analyze_p7("import pkg::x::y::y_helper only;\n\nfun main() {\n\tlet _ = y_helper();\n}\n");
+    assert!(
+        diagnostics.is_empty(),
+        "`only` dropped a name it should have bound: {diagnostics:?}"
+    );
+}
+
+/// A selector on the statement that carries the block admits it again — the
+/// exhibit `only` refused, spelled back in.
+#[test]
+fn b318_a_selector_readmits_what_only_declined() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::{ y::y_helper, (impl Thing) };\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "the selector should admit `x.vl`'s block: {diagnostics:?}"
+    );
+}
+
+/// The generic exhibit: one module with a block per element type. A file that
+/// selects `(impl Boxed<i32>)` gets the `i32` block and NOT the `str` one —
+/// B318's open (b), answered at the receiver's type through
+/// `impl_select::subject_applies`.
+fn boxed_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "item.vl",
+            "struct Boxed<T> { value: T }\n\n\
+             impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Boxed;\n\n\
+             impl Boxed<i32> {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+             impl Boxed<str> {\n\tfun tag(self): i32 { 2 }\n\tfun other(self): i32 { 3 }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_boxed(app: &str) -> Vec<String> {
+    let owned = boxed_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// `(impl Boxed<i32>)` serves a `Boxed<i32>` receiver and refuses a
+/// `Boxed<str>` one in the SAME file.
+#[test]
+fn b318_a_concrete_selector_serves_its_own_type_only() {
+    let served = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+    );
+    assert!(served.is_empty(), "the i32 block should serve: {served:?}");
+    let refused = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(\"a\").tag();\n}\n",
+    );
+    assert!(
+        refused.iter().any(|message| message
+            .contains("'tag' is provided by an `impl` in module `ext`")
+            && message.contains("`(impl Boxed<i32>)` does not admit it")),
+        "the str block should not be admitted: {refused:?}"
+    );
+}
+
+/// `_` is the placeholder: `(impl Boxed<_>)` admits every block whatever its
+/// argument, so both receivers are served in one file. Against a CONCRETE block
+/// it is the backward unification that reaches — a constructor-headed subject
+/// does not match a hole the other way round.
+#[test]
+fn b318_the_placeholder_selector_serves_every_argument() {
+    let diagnostics = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<_>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag() + Boxed::make(\"a\").tag();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`(impl Boxed<_>)` should admit both blocks: {diagnostics:?}"
+    );
+}
+
+/// `(impl _)` is the whole-module impls-only form: every block the module
+/// declares, and no name — the file still has to import `Boxed` itself.
+#[test]
+fn b318_the_whole_module_selector_admits_every_block() {
+    let diagnostics = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag() + Boxed::make(\"a\").other();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`(impl _)` should admit every block: {diagnostics:?}"
+    );
+}
+
+/// A METHOD selector takes one member into the type's namespace for this file
+/// and leaves the block's others out.
+#[test]
+fn b318_a_method_selector_takes_only_the_member_it_names() {
+    let taken = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<str>)::tag };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(\"a\").tag();\n}\n",
+    );
+    assert!(taken.is_empty(), "`tag` was selected: {taken:?}");
+    let left = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<str>)::tag };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(\"a\").other();\n}\n",
+    );
+    assert!(
+        left.iter()
+            .any(|message| message.contains("'other' is provided by an `impl`")),
+        "`other` was not selected and should be refused: {left:?}"
+    );
+}
+
+/// RULED: `impl PATH` resolves in the IMPORTER's scope. An alias the file bound
+/// itself is a legal subject, and so is the qualified spelling — which is what
+/// makes selector resolution a SECOND pass over the file's import list
+/// (`visibility.md` §3.6).
+#[test]
+fn b318_a_selector_resolves_in_the_importers_scope() {
+    let aliased = analyze_boxed(
+        "import pkg::item::Boxed as B;\nimport pkg::ext::{ (impl B<i32>) };\n\n\
+         fun main() {\n\tlet _ = B::make(1).tag();\n}\n",
+    );
+    assert!(
+        aliased.is_empty(),
+        "`impl B<i32>` should reach the alias this file bound: {aliased:?}"
+    );
+    let qualified = analyze_boxed(
+        "import pkg::item;\nimport pkg::item::Boxed;\nimport pkg::ext::{ (impl item::Boxed<i32>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+    );
+    assert!(
+        qualified.is_empty(),
+        "the qualified subject should resolve: {qualified:?}"
+    );
+}
+
+/// The union rule: a module a file ALSO reaches through a statement that
+/// claimed nothing keeps today's meaning. `only` on a deeper path does not
+/// silently strip the blocks of a module the file imported plainly.
+#[test]
+fn b318_a_plain_import_of_the_same_module_lifts_the_restriction() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x;\nimport pkg::x::y::y_helper only;\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "the plain `import pkg::x;` should keep `x.vl`'s block: {diagnostics:?}"
+    );
+}

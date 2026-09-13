@@ -1,4 +1,5 @@
 use crate::span::{Span, Spanned};
+use std::borrow::Cow;
 
 pub type GenericParameters<'src> = Spanned<Vec<GenericParameter<'src>>>;
 
@@ -467,6 +468,51 @@ pub enum ImportBranch<'src> {
     // that does not care about the marker delegates to the inner branch in one
     // line. The span is the `#` itself.
     Reach(Span, Box<Self>),
+    /// `(impl TYPE)` — an IMPL SELECTOR element of a brace set (B318 S3,
+    /// `proposal/visibility.md` §2.5). It binds no NAME: it says which of the
+    /// module's `impl` blocks this file admits, so it is a sibling of a path
+    /// rather than a kind of one, and every walk that asks a branch for its
+    /// leaves skips it.
+    Selector(Box<ImplSelector<'src>>),
+}
+
+/// One `(impl TYPE)` / `(impl TYPE)::name` / `(impl TYPE)::{ a, b }` selector
+/// (B318, RULED 2026-09-12: the selector is PARENTHESIZED, `_` is its
+/// placeholder, and no binders are written in one).
+#[derive(Debug)]
+pub struct ImplSelector<'src> {
+    /// The subject as a TYPE node, resolved in the IMPORTER's scope — `impl S`
+    /// reaches an alias this file's own imports bound, `impl item::Struct` is
+    /// the qualified spelling. `_` at any argument position is B294's anonymous
+    /// binder, which is exactly the placeholder the selector wants: a hole that
+    /// unifies with whatever the block admits.
+    ///
+    /// `None` only on a selector the ORGANIZER synthesized for E168's rewrite,
+    /// which is printed and never walked.
+    pub subject: Option<Box<Spanned<Node<'src>>>>,
+    /// The subject's text — the source slice for a written selector, and the
+    /// rendered type for a synthesized one. The formatter reprints it verbatim
+    /// and keys the sort on it (`visibility.md` §7.2: selectors sort after
+    /// every name in a set, by their rendered type text).
+    pub subject_text: Cow<'src, str>,
+    /// `::name` / `::{ a, b }` — the members this selector takes into the
+    /// type's namespace for this file. Empty when the selector takes the whole
+    /// block.
+    pub members: Vec<(&'src str, Span)>,
+    /// The whole `(impl …)` element's span, where a refusal naming the selector
+    /// is spanned.
+    pub span: Span,
+}
+
+/// The trailing modifier on an `import` statement (B318 §2.4, RULED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportModifier {
+    /// No modifier — today's meaning: the statement binds its names, and every
+    /// `impl` declared in the files on the path to them arrives with it.
+    None,
+    /// `only` — the names and nothing else: no `impl` arrives with this
+    /// statement. The span is the word's own, where a refusal is spanned.
+    Only(Span),
 }
 
 /// What follows one segment of an `import`/`use` path. A tail is a THREE-way
@@ -692,7 +738,8 @@ pub enum Node<'src> {
         Vec<Spanned<Self>>,
         Spanned<NodeList<'src>>,
     ),
-    Import(ImportBranch<'src>),
+    // `import <path> only?;` — the path and B318's trailing modifier.
+    Import(ImportBranch<'src>, ImportModifier),
     // `export <item>` — mark an item as this module's surface, or re-export an
     // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
     Export(Option<Box<ExportScope<'src>>>, Box<Spanned<Self>>),
@@ -979,7 +1026,7 @@ impl<'src> Node<'src> {
             | Node::Bool(_)
             | Node::Error
             | Node::ExportAll
-            | Node::Import(_)
+            | Node::Import(..)
             | Node::Jump(_)
             | Node::LiftBinder
             | Node::LiftHole(_)

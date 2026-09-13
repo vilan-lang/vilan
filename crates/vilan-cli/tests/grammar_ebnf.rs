@@ -99,6 +99,10 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
         "as",
         "the contextual alias on an import/use path leaf (§3.2, E142)",
     ),
+    (
+        "only",
+        "the contextual trailing modifier on an import statement (§3.2, B318)",
+    ),
     ("_", "the wildcard pattern"),
 ];
 
