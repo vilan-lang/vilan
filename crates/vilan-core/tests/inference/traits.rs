@@ -5368,3 +5368,259 @@ fn b302_a_bare_name_and_a_generic_application_still_render_as_they_did() {
         "return type of `[rpc]` method `look` is `List<Opaque>`, which is not Wire",
     );
 }
+
+// --- B279: the structural guard behind B258's silence, and the `candidates_of`
+// consumer sweep -----------------------------------------------------------------
+// `candidates_of` is NAME-keyed and program-wide: every override of every trait
+// declaring the dispatched name, whatever the receiver. B254 and B258 were both
+// that list consumed as though it were receiver-specific, and each was closed by
+// narrowing at its own site. What was missing is the INVARIANT — nothing forbade
+// a future over-approximation from promoting a node to strict through an edge the
+// coverage walk's narrower set never sees, which would hand that node the
+// bare-value fence and no caller checked for having a value: B258's silent
+// `undefined` again, from the other direction. The `context` pass now asserts it
+// and REFUSES (a never-silent `internal:`) rather than emitting. The pins below
+// are one per consumer of the name-keyed list, plus the geometry the guard must
+// NOT fire on.
+
+/// Consumer 1, the `context` pass reading an edge as a DEMAND. Two unrelated
+/// traits declare `label`, so one name-keyed candidate list holds both — and the
+/// strict override belongs to a type this program never calls through. The site
+/// on the OTHER trait must stay safe (its default reads the context optionally),
+/// and the guard must not read the unreachable override as a node it cannot
+/// prove covered.
+#[test]
+fn b279_a_strict_override_in_an_unrelated_trait_neither_promotes_nor_trips_the_guard() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ None, Some, self };
+
+        let scope: Context<str> = Context::new();
+
+        trait Tag {
+            fun label(self): str {
+                match scope.get_safe() {
+                    Some(let value) => i"tag under {value}",
+                    None => "tag, no scope",
+                }
+            }
+        }
+
+        trait Badge {
+            fun label(self): str {
+                i"badge under {scope.get()}"
+            }
+        }
+
+        struct Cell { value: i32 }
+        impl Cell with Tag { }
+
+        struct Mirror { value: i32 }
+        impl Mirror with Badge { }
+
+        fun describe(cell: Cell): str {
+            cell.label()
+        }
+
+        fun main() {
+            print(describe(Cell { value = 1 }));
+            scope.run("here", || print(describe(Cell { value = 2 })));
+        }
+        main();
+        "#,
+        "tag, no scope\ntag under here\n",
+    );
+}
+
+/// The same geometry with the strict body REACHED: the guard must not stand in
+/// for the coverage refusal, and the coverage refusal must still fire.
+#[test]
+fn b279_the_strict_body_of_the_other_trait_still_fences_when_it_is_called() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ None, Some, self };
+
+        let scope: Context<str> = Context::new();
+
+        trait Tag {
+            fun label(self): str {
+                match scope.get_safe() {
+                    Some(let value) => i"tag under {value}",
+                    None => "tag, no scope",
+                }
+            }
+        }
+
+        trait Badge {
+            fun label(self): str {
+                i"badge under {scope.get()}"
+            }
+        }
+
+        struct Cell { value: i32 }
+        impl Cell with Tag { }
+
+        struct Mirror { value: i32 }
+        impl Mirror with Badge { }
+
+        fun main() {
+            print(Mirror { value = 1 }.label());
+        }
+        main();
+        "#,
+        "this code can be reached without an enclosing `run`",
+    );
+}
+
+/// Consumer 2, the const-only capability check reading an edge as a REFUSAL.
+/// `emit` is reached ONLY through a bounded generic's trait dispatch — the shape
+/// B143 found escaping — and the refusal fires. This is the direction that must
+/// never be narrowed: a candidate dropped here is a compile-time-only capability
+/// shipped into a runtime path in silence.
+#[test]
+fn b279_the_const_only_check_still_refuses_through_a_bounded_generics_dispatch() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+
+        trait Paint { fun paint(self); }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self) { emit("css", ".wall{}"); }
+        }
+
+        fun run_it<T: Paint>(subject: T) {
+            subject.paint();
+        }
+
+        fun main() {
+            run_it(Wall { });
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+/// The same check under the name-keyed list's own over-approximation: a SECOND
+/// trait declares `paint` too, and the candidate list therefore holds a member
+/// no `T: Paint` receiver could select. Over-asking cannot make this check miss
+/// — the refusal still fires — which is why the list is left unnarrowed here.
+#[test]
+fn b279_a_same_named_member_on_an_unrelated_trait_does_not_let_the_const_only_check_miss() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+
+        trait Paint { fun paint(self); }
+        trait Coat { fun paint(self); }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self) { emit("css", ".wall{}"); }
+        }
+
+        struct Fence { }
+        impl Fence with Coat {
+            fun paint(self) { }
+        }
+
+        fun run_it<T: Paint>(subject: T) {
+            subject.paint();
+        }
+
+        fun main() {
+            run_it(Wall { });
+            Fence { }.paint();
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+/// The other half of consumer 2's direction: a clean instantiation of the same
+/// generic stays ADMITTED. The check refuses a path, not a name.
+#[test]
+fn b279_a_clean_instantiation_of_the_same_generic_is_still_admitted() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::asset::emit;
+
+        trait Paint { fun paint(self); }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self) { emit("css", ".wall{}"); }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self) { print("board"); }
+        }
+
+        fun run_it<T: Paint>(subject: T) {
+            subject.paint();
+        }
+
+        fun prime(): i32 {
+            run_it(Wall { });
+            1
+        }
+
+        fun main() {
+            let _primed = const prime();
+            run_it(Board { });
+        }
+        main();
+        "#,
+        "board\n",
+    );
+}
+
+/// The geometry the guard must NOT fire on, and the one that made a first
+/// formulation of it wrong: an impl of the bounded trait that NOTHING
+/// instantiates, whose body reads the context strictly. It has no direct
+/// callers and no refined dispatch edge — the walk resolves `run_it`'s site to
+/// `Board` alone — so it is exempt as dead, and it IS dead. The site still
+/// contributed an edge (to `Board::paint`), which is what says the refinement
+/// resolved rather than dropped it.
+#[test]
+fn b279_an_uninstantiated_strict_impl_of_a_bounded_trait_is_dead_not_refused() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let scope: Context<str> = Context::new();
+
+        trait Paint { fun paint(self): str; }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self): str { i"wall under {scope.get()}" }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self): str { "board" }
+        }
+
+        fun run_it<T: Paint>(subject: T): str {
+            subject.paint()
+        }
+
+        fun main() {
+            print(run_it(Board { }));
+        }
+        main();
+        "#,
+        "board\n",
+    );
+}
