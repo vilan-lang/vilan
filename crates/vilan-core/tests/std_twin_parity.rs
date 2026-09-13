@@ -206,6 +206,25 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          `std::router::pending`) — it is mirrored on both sides, and its absence \
          is exactly what E34 was filed for.",
     ),
+    (
+        "ui",
+        "swap_split",
+        Side::BrowserOnly,
+        "A85: the VALUE form of `View.swap_split` above, and the same story — \
+         emitter-selected, never written. `chunks.rs` retargets a recognized \
+         `swap(route, |current| match current { .. })` VALUE to this free \
+         function, and builds that gate only when it exists. A process build \
+         never splits.",
+    ),
+    (
+        "ui",
+        "split_route",
+        Side::BrowserOnly,
+        "A85, with `swap_split`: the gate's body under a name no `View` method \
+         shadows — `View::swap_split` cannot call the free `swap_split` from \
+         inside its own `impl` block, where that name is the method. Browser-only \
+         for the same reason the gate is.",
+    ),
     // --- process-only ------------------------------------------------------
     (
         "ui",

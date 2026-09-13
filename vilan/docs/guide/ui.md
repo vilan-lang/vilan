@@ -527,6 +527,41 @@ everything inside cleans up when the content goes away. `swap` re-renders
 only when the value *changes* (`T: PartialEq`), so navigating
 to the page you're already on does nothing.
 
+### Putting one BETWEEN siblings
+
+Those are methods, so their content lands at the parent's current end. When
+the conditional or the run is one child among others, write it as a **value**
+in a child position instead. `std::ui` exports one per method —
+`when`, `swap`, `each`, `each_values`, `each_by` — and each returns something
+that fills a child slot:
+
+```vilan,fragment
+<ul>
+	{header_row()}
+	{each_values(items, |item: str| <li>{item}</li>)}
+	{when(more, || <li>"and more"</li>)}
+	{footer_row()}
+</ul>
+```
+
+The methods are one-line sugar over these values, so both forms mean exactly
+the same thing — the method's content simply lands where `child` would have put
+it anyway. The run is called `each` rather than `bind_each` because `bind_`
+means "one property kept in sync" everywhere else, and a value that *is* a
+child has no property to bind.
+
+A helper that returns one names its type, since vilan has no trait objects:
+
+```vilan,fragment
+fun account_menu(signed_in: SignalCell<bool>): Conditional<SignalCell<bool>> {
+	when(signed_in, || <nav>"Account"</nav>)
+}
+```
+
+Ownership is the same either way: the body, the subtree and every row run
+under a fresh owner established where the value is *placed*, and that owner is
+disposed with the instantiation.
+
 ## The ownership picture
 
 Here is the whole cleanup model in one picture. Owners exist at the

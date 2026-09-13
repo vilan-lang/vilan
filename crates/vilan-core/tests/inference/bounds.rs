@@ -9429,6 +9429,115 @@ fn b309_a_context_typed_field_answers_to_the_owner_ambient_at_the_call() {
     );
 }
 
+/// A85 §6, B253's spelling cost made concrete: a helper that RETURNS a
+/// positional slot names the value form's type, because a trait in return
+/// position stays refused (`trait-objects.md`) and there is no opaque-type
+/// kind. `Conditional<SignalCell<bool>>` is the cheap end of that bill and
+/// `Each<T, K, S>` the expensive one — both writable, which is the finding
+/// the census was asked for.
+#[test]
+fn a85_a_helper_returns_a_value_form_by_name() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, owner_scope };
+        import std::ui::{ Conditional, Each, View, each, mount_root, view, when };
+        fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>> {
+            when(flag, || view("nav"))
+        }
+        fun themes(
+            list: SignalCell<List<str>>,
+        ): Each<str, str, SignalCell<List<str>>> {
+            each(list, |item: str| item, |item: str| view("li").text(item))
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let list: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || {
+                view("main").child(account(flag)).child(themes(list))
+            });
+        }
+        "#,
+    );
+}
+
+/// A85's propagation, probed before the build and pinned after it: `place`
+/// calls the value's injected body, so it is a needs-context node — and
+/// `View::child<C: Slot>` inherits that requirement PER INSTANTIATION, not as
+/// a blanket. A static child is placed outside every boundary exactly as it
+/// always was; a value form outside every boundary is refused, and the refusal
+/// names the `child` call it flows through.
+///
+/// This is the shape the item could have got wrong in the cheap direction:
+/// widening `child` itself would have made `view("div").child("hello")` a
+/// compile error in every helper that builds a static tree.
+#[test]
+fn a85_child_inherits_the_owner_requirement_per_instantiation() {
+    assert_compiles_browser(
+        r#"
+        import std::ui::{ View, view };
+        fun shell(): View {
+            view("div").child("hello").child(view("span")).child([view("i")])
+        }
+        fun main() { let _built = shell(); }
+        "#,
+    );
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, view, when };
+        fun unrooted(flag: SignalCell<bool>): View {
+            view("div").child(when(flag, || view("span")))
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _built = unrooted(flag);
+        }
+        main();
+        "#,
+        "this code can be reached without an enclosing `run`",
+    );
+}
+
+/// The same requirement through a GENERIC helper over the bound — the shape
+/// that would collapse the per-instantiation answer into a per-bound one. It
+/// does not: the static use of `put` compiles in a function with no boundary
+/// anywhere, and the value-form use in the same program is refused.
+#[test]
+fn a85_a_generic_slot_helper_keeps_the_requirement_per_instantiation() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, owner_scope };
+        import std::ui::{ Slot, View, mount_root, view, when };
+        fun put<C: Slot>(parent: View, content: C): View {
+            parent.child(content)
+        }
+        fun statics(): View {
+            put(view("div"), "hello")
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let base = statics();
+            let _root = mount_root("app", || put(base, when(flag, || view("span"))));
+        }
+        "#,
+    );
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ Slot, View, view, when };
+        fun put<C: Slot>(parent: View, content: C): View {
+            parent.child(content)
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _built = put(view("div"), when(flag, || view("span")));
+        }
+        main();
+        "#,
+        "this code can be reached without an enclosing `run`",
+    );
+}
+
 /// B307's ruling: an argument the `with` clause did not write for a
 /// NON-defaulted trait parameter is an arity error, not an elision.
 ///

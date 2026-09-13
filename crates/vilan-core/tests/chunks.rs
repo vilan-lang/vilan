@@ -108,7 +108,30 @@ fn the_router_example_splits_into_its_three_routes() {
         .as_ref()
         .expect("the browser layer declares the gate");
     assert_eq!(gate.calls.len(), 1, "the one recognized `swap` call");
-    assert_ne!(gate.swap, gate.swap_split, "the gate is a different method");
+    // Two retarget entries since A85 — the `View.swap` METHOD and the free
+    // `swap` VALUE form — each to a gated twin that is a different function,
+    // and each naming the argument index its emitted call carries the route
+    // source at (1 for the method's receiver-first shape, 0 for the value's).
+    assert_eq!(
+        gate.retarget.len(),
+        2,
+        "both spellings of a route swap are recognized"
+    );
+    for (from, to, source_at) in &gate.retarget {
+        assert_ne!(from, to, "the gate is a different function");
+        assert!(
+            *source_at <= 1,
+            "the route source is the first or second argument"
+        );
+    }
+    assert_eq!(
+        gate.retarget
+            .iter()
+            .map(|(_, _, at)| *at)
+            .collect::<Vec<usize>>(),
+        vec![1, 0],
+        "the method carries its receiver first; the value form does not"
+    );
 }
 
 /// A `_` arm has no variant tag, so nothing could address its chunk at a

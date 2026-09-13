@@ -43,6 +43,12 @@ function text(self, content) {
 	self[2].v = [  ];
 	return __clone(self);
 }
+function open(parent) {
+	return [ __clone(parent) ];
+}
+function insert(self, child) {
+	self[0][2].v.push([ 0, __clone(child) ]);
+}
 function place(self, parent) {
 	parent[2].v.push([ 0, __clone(self) ]);
 }
@@ -58,38 +64,38 @@ function apply(self, parent, name2) {
 	set_attribute(parent[1], name2, self);
 }
 function is_void_element(tag) {
-	const $v = tag;
-	let $w = null;
-	if ($v === "area") {
-		$w = true;
-	} else if ($v === "base") {
-		$w = true;
-	} else if ($v === "br") {
-		$w = true;
-	} else if ($v === "col") {
-		$w = true;
-	} else if ($v === "embed") {
-		$w = true;
-	} else if ($v === "hr") {
-		$w = true;
-	} else if ($v === "img") {
-		$w = true;
-	} else if ($v === "input") {
-		$w = true;
-	} else if ($v === "link") {
-		$w = true;
-	} else if ($v === "meta") {
-		$w = true;
-	} else if ($v === "source") {
-		$w = true;
-	} else if ($v === "track") {
-		$w = true;
-	} else if ($v === "wbr") {
-		$w = true;
+	const $C = tag;
+	let $D = null;
+	if ($C === "area") {
+		$D = true;
+	} else if ($C === "base") {
+		$D = true;
+	} else if ($C === "br") {
+		$D = true;
+	} else if ($C === "col") {
+		$D = true;
+	} else if ($C === "embed") {
+		$D = true;
+	} else if ($C === "hr") {
+		$D = true;
+	} else if ($C === "img") {
+		$D = true;
+	} else if ($C === "input") {
+		$D = true;
+	} else if ($C === "link") {
+		$D = true;
+	} else if ($C === "meta") {
+		$D = true;
+	} else if ($C === "source") {
+		$D = true;
+	} else if ($C === "track") {
+		$D = true;
+	} else if ($C === "wbr") {
+		$D = true;
 	} else {
-		$w = false;
+		$D = false;
 	}
-	return $w;
+	return $D;
 }
 function escape_text(value) {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -108,18 +114,18 @@ function render(view2) {
 	}
 	out = out + escape_text(view2[3].v);
 	for (const child of view2[2].v) {
-		const $x = child;
-		let $y = null;
-		if ($x[0] === 0) {
-			const element = $x[1];
+		const $E = child;
+		let $F = null;
+		if ($E[0] === 0) {
+			const element = $E[1];
 			out = out + render(element);
-			$y = undefined;
+			$F = undefined;
 		} else {
-			const content = $x[1];
+			const content = $E[1];
 			out = out + escape_text(content);
-			$y = undefined;
+			$F = undefined;
 		}
-		$y;
+		$F;
 	}
 	return out + "</" + view2[0] + ">";
 }
@@ -130,17 +136,17 @@ function app(title2, todos2, page2) {
 	}, (todo, $i) => {
 		return text(view("li"), todo);
 	});
-	const nav = $r(view("nav"), page2, (current, $n) => {
-		const $o = current;
-		let $p = null;
-		if ($o[0] === 0) {
-			$p = text($q(view("a"), "href", "/"), "Home");
+	const nav = $v(view("nav"), page2, (current, $r) => {
+		const $s = current;
+		let $t = null;
+		if ($s[0] === 0) {
+			$t = text($u(view("a"), "href", "/"), "Home");
 		} else {
-			$p = text($q(view("a"), "href", "/about"), "About & friends");
+			$t = text($u(view("a"), "href", "/about"), "About & friends");
 		}
-		return $p;
+		return $t;
 	});
-	return $u($u($u($q(view("main"), "id", "app"), heading), list), nav);
+	return $B($B($B($u(view("main"), "id", "app"), heading), list), nav);
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -160,54 +166,77 @@ function $g(self, source) {
 	self[2].v = [  ];
 	return __clone(self);
 }
-function $m(owner, body) {
+function $k(source, key, render2) {
+	return [ __clone(source), key, render2 ];
+}
+function $q(owner, body) {
 	return body(owner);
 }
-function $j(self, source, key, build) {
+function $n(parent, source, key, render2) {
+	const region = open(parent);
 	const items = $h(source);
 	for (const item of items) {
 		const owner = new2();
-		self[2].v.push([ 0, $m(owner, ($l) => {
-			return build(item, $l);
-		}) ]);
+		insert(region, $q(owner, ($p) => {
+			return render2(item, $p);
+		}));
 	}
+}
+function $m(self, parent) {
+	$n(parent, self[0], self[1], self[2]);
+}
+function $l(self, content) {
+	$m(content, self);
 	return __clone(self);
 }
-function $q(self, name2, value) {
+function $j(self, source, key, build) {
+	return $l(self, $k(source, key, build));
+}
+function $u(self, name2, value) {
 	apply(value, self, name2);
 	return __clone(self);
 }
-function $r(self, source, build) {
+function $y(parent, source, render2) {
+	const region = open(parent);
 	const value = $h(source);
 	const owner = new2();
-	self[2].v.push([ 0, $m(owner, ($t) => {
-		return build(value, $t);
-	}) ]);
+	insert(region, $q(owner, ($A) => {
+		return render2(value, $A);
+	}));
+}
+function $x(self, parent) {
+	$y(parent, self[0], self[1]);
+}
+function $w(self, content) {
+	$x(content, self);
 	return __clone(self);
 }
-function $u(self, content) {
+function $v(self, source, build) {
+	return $w(self, [ __clone(source), build ]);
+}
+function $B(self, content) {
 	place(content, self);
 	return __clone(self);
 }
-function $A(self, parent, name2) {
+function $H(self, parent, name2) {
 	set_attribute(parent[1], name2, $h(self));
 }
-function $z(self, name2, value) {
-	$A(value, self, name2);
+function $G(self, name2, value) {
+	$H(value, self, name2);
 	return __clone(self);
 }
-function $B(self, content) {
+function $I(self, content) {
 	place2(content, self);
 	return __clone(self);
 }
-function $D(self, parent) {
+function $K(self, parent) {
 	parent[2].v.push([ 1, $h(self) ]);
 }
-function $C(self, content) {
-	$D(content, self);
+function $J(self, content) {
+	$K(content, self);
 	return __clone(self);
 }
-function $E(self, content) {
+function $L(self, content) {
 	place3(content, self);
 	return __clone(self);
 }
@@ -217,11 +246,11 @@ const todos = $c([ "alpha", "beta & gamma" ]);
 const page = $c([ 1 ]);
 console.log(render(app(title, todos, page)));
 console.log(render(text(view("p"), "<script>alert(\"&\")</script>")));
-console.log(render($q($q(view("img"), "src", "/logo.png"), "alt", "a & b")));
-console.log(render($u($q(view("svg"), "viewBox", "0 0 24 24"), $q(view("path"), "d", "M5 12h14"))));
+console.log(render($u($u(view("img"), "src", "/logo.png"), "alt", "a & b")));
+console.log(render($B($u(view("svg"), "viewBox", "0 0 24 24"), $u(view("path"), "d", "M5 12h14"))));
 const name = $a("world & <you>");
-const mixed = $C($B($u($B($z(view("p"), "data-live", $a("a \"quoted\" & value")), "Take "), text(view("code"), "vilan upgrade")), " & enjoy. "), name);
+const mixed = $J($I($B($I($G(view("p"), "data-live", $a("a \"quoted\" & value")), "Take "), text(view("code"), "vilan upgrade")), " & enjoy. "), name);
 console.log(render(mixed));
 const pair = [ text(view("i"), "a"), text(view("b"), "b") ];
-console.log(render($E(view("p"), pair)));
-console.log(render(text($B(view("p"), "gone"), "kept")));
+console.log(render($L(view("p"), pair)));
+console.log(render(text($I(view("p"), "gone"), "kept")));

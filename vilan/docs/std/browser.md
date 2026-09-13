@@ -285,6 +285,48 @@ too.
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
 
+### Positional value forms
+
+The five methods above APPEND: their content lands at the parent's current
+end. `std::ui` also exports each of them as a **value** that fills a child
+position, so a conditional or a keyed run can sit between siblings instead of
+after them:
+
+| function | signature | returns |
+|---|---|---|
+| `when` | `(condition: S, body: (sync \|\| View) context owner_scope)`; `S: Source<bool>` | `Conditional<S>` |
+| `swap` | `(source: S, render: (sync \|T\| View) context owner_scope)`; `T: PartialEq, S: Source<T>` | `Swap<T, S>` |
+| `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope)`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | `Each<T, K, S>` |
+| `each_values` | `(source: S, render: (sync \|T\| View) context owner_scope)`; `T: PartialEq, S: Source<List<T>>` | `EachValues<T, S>` |
+| `each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| View) context owner_scope)`; `K: PartialEq, S: Source<List<T>>` | `EachBy<T, K, S>` |
+
+Each returned struct implements `Slot`, so it fills any child
+position — including a `{hole}` in element syntax — and the five methods are
+one-line sugar over it (`self.child(when(..))`). Nothing about an existing
+call site changes; reach for the value where POSITION matters:
+
+```vilan,fragment
+view("ul")
+	.child(view("li").text("Header"))
+	.child(each_values(items, |item: str| view("li").text(item)))
+	.child(when(more, || view("li").text("and more")))
+	.child(view("li").text("Footer"))
+```
+
+The run named `each` rather than `bind_each`: the `bind_` prefix means "one
+property kept in sync" everywhere else in the module, and a value that IS a
+child has no property to bind.
+
+**Naming one in a return type.** vilan has no trait objects and no opaque-type
+kind, so a helper that hands one back spells its concrete type —
+`fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>>`. The
+closures are FIELDS, not type parameters, exactly so that type is nameable.
+
+**Ownership** is the methods' unchanged: the body of a `when`, the subtree of a
+`swap` and every row of an `each` run under a fresh owner established where the
+value is PLACED — not where it was built — and that owner is disposed with the
+instantiation.
+
 **`Region` — how a reactive child keeps its place.**
 
 ```vilan,fragment
