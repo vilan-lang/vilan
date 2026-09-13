@@ -2001,6 +2001,7 @@ pub fn organize_import_runs(
         bailed: false,
         split: Split::Off,
         probing: false,
+        atomic_elements: false,
     };
     Some(printer.organize_runs(&items, keep, keep_module))
 }
@@ -2346,6 +2347,7 @@ pub fn format(original: &str) -> String {
         bailed: false,
         split: Split::Off,
         probing: false,
+        atomic_elements: false,
     };
     let prev_end = printer.print_items(&items, 0, true);
     // Comments after the last item (trailing end-of-file comments).
@@ -2427,6 +2429,14 @@ struct Printer<'src> {
     /// True while a seam probe is rendering a chain link to see whether it spans
     /// lines ([`Printer::link_spans_lines`]). Probes do not nest.
     probing: bool,
+    /// True while E155's probe is rendering a chain with its ELEMENTS treated as
+    /// atomic: an element that would break only because its line is too wide
+    /// stays inline, so the probe measures the chain's own width rather than the
+    /// width an element's break left behind. An element that breaks
+    /// STRUCTURALLY — more than one child, an element child, a comment between
+    /// its items — breaks in the probe too, because that break is not a width
+    /// decision and flattening it would be a lie.
+    atomic_elements: bool,
 }
 
 impl<'src> Printer<'src> {
@@ -4592,7 +4602,9 @@ impl<'src> Printer<'src> {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
             self.print_element_inline(body, &order);
-            if !self.out[element_start..].contains('\n') && !self.current_line_over_budget() {
+            if !self.out[element_start..].contains('\n')
+                && (self.atomic_elements || !self.current_line_over_budget())
+            {
                 return;
             }
             self.out.truncate(element_start);
@@ -4986,6 +4998,73 @@ impl<'src> Printer<'src> {
         false
     }
 
+    /// Whether `expr`'s chain must break because it does not FIT — measured with
+    /// its element arguments treated as atomic (E155).
+    ///
+    /// The width rule judges a rendering by its first line, which is honest
+    /// everywhere except here: an element argument that breaks takes the rest of
+    /// the chain off the first line WITH it, so the line the rule measures is
+    /// short and the chain is left inline. On kolt's generated `src/lucide`
+    /// that turned a hand-broken four-link `.child` ladder into one 130-column
+    /// line whose THIRD `.child` then broke inside its `<path …/>` — the chain
+    /// rejoined and the element torn open, which is the wrong half to break.
+    ///
+    /// An element is atomic to this rule, so the probe renders the chain with
+    /// every width-driven element break suppressed and asks the ordinary
+    /// question of the ordinary line. Over budget means the chain breaks at its
+    /// LINKS first; each link is then measured on its own line, and an element
+    /// still too wide for one breaks there — one level further in, under a link
+    /// that fits, which is where a break reads.
+    ///
+    /// Only chains that carry an element argument are probed: nothing else can
+    /// have its measurement moved by an element, and the probe is a whole
+    /// rendering.
+    fn chain_overflows_with_atomic_elements(&mut self, expr: &Spanned<Node<'src>>) -> bool {
+        if self.probing {
+            return false;
+        }
+        let (_, spine) = Self::postfix_spine(expr);
+        if !spine
+            .iter()
+            .any(|step| Self::link_carries_an_element(&step.0))
+        {
+            return false;
+        }
+        let start = self.out.len();
+        let cursor = self.cursor;
+        let bailed = self.bailed;
+        let split = self.split;
+        let indent = self.indent;
+        self.probing = true;
+        self.atomic_elements = true;
+        self.split = Split::Off;
+        self.print_expr(expr);
+        self.probing = false;
+        self.atomic_elements = false;
+        let over = self.first_line_over_budget(start);
+        self.out.truncate(start);
+        self.cursor = cursor;
+        self.bailed = bailed;
+        self.split = split;
+        self.indent = indent;
+        over
+    }
+
+    /// Whether a spine step is a call link one of whose arguments is an ELEMENT
+    /// — the shape [`Self::chain_overflows_with_atomic_elements`] is about.
+    fn link_carries_an_element(step: &Node<'src>) -> bool {
+        let Node::MemberAccessor(_, member) = step else {
+            return false;
+        };
+        let Node::Call(_, _, arguments) = &member.0 else {
+            return false;
+        };
+        arguments
+            .0
+            .iter()
+            .any(|argument| matches!(argument.0, Node::Element(_)))
+    }
+
     /// Renders one chain link and reports whether it spans lines, then takes the
     /// rendering back out. Measured rather than predicted from the AST, for the
     /// reason the width rule measures: only the printer knows what the printer
@@ -5311,7 +5390,8 @@ impl<'src> Printer<'src> {
         if call_links >= 2
             && (split != Split::Off
                 || self.chain_has_comment_between_links(expr)
-                || self.chain_has_spanning_seam(expr))
+                || self.chain_has_spanning_seam(expr)
+                || self.chain_overflows_with_atomic_elements(expr))
         {
             self.print_split_chain(expr);
             return;
@@ -7556,6 +7636,65 @@ mod chain_splitting {
              \t.display(Display::Flex)\n\
              \t.flex_direction(FlexDirection::Column)\n\
              \t.gap(space(4));\n",
+        );
+    }
+
+    /// E155, on kolt's generated `src/lucide/lib.vl`: an ELEMENT argument is
+    /// atomic to this rule.
+    ///
+    /// The width rule judges a statement by its FIRST line, which is honest
+    /// everywhere except here. The four-link `.child` ladder below is 129
+    /// columns inline; the formatter rejoined it, the third `.child`'s
+    /// `<path …/>` then broke because the line it landed on was too wide, and
+    /// the break took the rest of the chain off the first line WITH it — so the
+    /// line the rule measured was 92 columns, under the budget, and the chain
+    /// stayed collapsed with an element torn open inside it. The chain is
+    /// measured with its elements atomic now, breaks at its links, and each
+    /// link then fits on a line of its own.
+    ///
+    /// The file is generated and kolt excludes it from its own fmt gate, which
+    /// is the only reason this was survivable rather than noticed.
+    #[test]
+    fn an_element_argument_is_atomic_to_the_chain_break_rule() {
+        let source = "fun a_arrow_down(): View {\n\t\
+                      lucide_frame().child(<path d(\"m14 12 4 4 4-4\") />)\
+                      .child(<path d(\"M18 16V7\") />)\
+                      .child(<path d(\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\") />)\
+                      .child(<path d(\"M3.304 13h6.392\") />)\n}\n";
+        assert_over_budget(source.lines().nth(1).expect("the chain's line"));
+        assert_construct(
+            source,
+            "fun a_arrow_down(): View {\n\
+             \tlucide_frame()\n\
+             \t\t.child(<path d(\"m14 12 4 4 4-4\") />)\n\
+             \t\t.child(<path d(\"M18 16V7\") />)\n\
+             \t\t.child(<path d(\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\") />)\n\
+             \t\t.child(<path d(\"M3.304 13h6.392\") />)\n\
+             }\n",
+        );
+    }
+
+    /// The other side of the same rule, and what keeps its blast radius to the
+    /// shape it was written for: a chain whose element argument fits is left
+    /// alone. The measurement is the chain's OWN width with the element inline,
+    /// so an element that never needed to break cannot make a short chain split.
+    #[test]
+    fn a_chain_whose_element_argument_fits_stays_inline() {
+        let source = "fun icon(): View {\n\tview().child(<path d(\"M1 1\") />).child(<path d(\"M2 2\") />)\n}\n";
+        assert_construct(source, source);
+    }
+
+    /// And an element that breaks STRUCTURALLY — more than one child, which is
+    /// not a width decision at all — does not drag its chain apart with it. The
+    /// probe breaks it too, so the measured first line is short and the rule
+    /// answers exactly as it did before E155.
+    #[test]
+    fn a_structurally_split_element_does_not_break_its_chain() {
+        let source = "fun panel(): View {\n\tview().class(\"p\").child(<div>\n\t\t<span>\"a\"</span>\n\t\t<span>\"b\"</span>\n\t</div>)\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.contains("view().class(\"p\").child(<div>"),
+            "the chain should stay inline around a structurally split element:\n{formatted:?}"
         );
     }
 
