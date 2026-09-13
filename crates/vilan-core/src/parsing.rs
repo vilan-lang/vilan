@@ -8682,7 +8682,8 @@ mod tests {
         // keeps go-to-definition, find-references and rename pointing at the
         // name.
         let marked = only_item("import pkg::a::#hidden;");
-        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg))) = &marked
+        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg)), _) =
+            &marked
         else {
             panic!("the path reads as written: {marked:?}");
         };
@@ -8845,12 +8846,24 @@ mod tests {
         // the path actually stopped at. The shapes are B318's new import forms
         // (a selector, `::*`, a reach marker), which is why the row is owed
         // before they are built rather than after.
+        // B318 S3 landed in the same order (visibility-b-35), so the SELECTOR
+        // shapes parse clean now — they are pinned as grammar in
+        // `inference/modules.rs`; the two forms still outside the grammar
+        // (`::*` is Order 36's, `!` is no marker) keep this rule.
+        for source in [
+            "import a::{ (impl Thing) };\n",
+            "import a::{ (impl List<i32>)::{ first, last } };\n",
+            "import a::{ (impl List<_>) };\n",
+            "import a::{ (impl _) };\n",
+        ] {
+            let (_tree, errors) = parse(source);
+            assert!(
+                errors.is_empty(),
+                "a selector is grammar now, for {source:?}: {errors:?}"
+            );
+        }
         for (source, stopped) in [
-            ("import a::{ (impl Thing) };\n", "("),
-            ("import a::{ (impl List<i32>)::{ first, last } };\n", "("),
-            ("import a::{ (impl List<_>) };\n", "("),
             ("import pkg::a::m::*;\n", "*"),
-            ("import a::{ (impl _) };\n", "("),
             ("import a::{ !hidden };\n", "!"),
         ] {
             let (_tree, errors) = parse(source);
@@ -8866,9 +8879,15 @@ mod tests {
                 "anchored on the token the path stopped at, for {source:?}"
             );
         }
-        // `use` shares the path grammar and the rule names both.
+        // `use` shares the path grammar; a selector inside a `use` is S3's own
+        // refusal (it parses, then is declined where it is written), and a form
+        // the path grammar cannot read at all still names this rule.
         assert_eq!(
             rendered_errors("use a::{ (impl T) };\n"),
+            vec![USE_TAKES_NO_IMPL_SELECTOR.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("use a::{ !hidden };\n"),
             vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
         );
     }
@@ -8881,8 +8900,11 @@ mod tests {
         // empty), an unclosed brace is still unclosed, and a statement that is
         // not import-led keeps the expression fallback.
         assert!(rendered_errors("import pkg::a::{ b, c as d };\n").is_empty());
+        // `only` is B318 S3's trailing modifier now, so it reads clean; a
+        // stray word that is not a modifier still stops at the `;` gap.
+        assert!(rendered_errors("import pkg::a only;\n").is_empty());
         assert_eq!(
-            rendered_errors("import pkg::a only;\n"),
+            rendered_errors("import pkg::a merely;\n"),
             vec!["expected `;` to end this statement".to_string()]
         );
         assert_eq!(
