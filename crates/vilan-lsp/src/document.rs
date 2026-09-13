@@ -20272,6 +20272,7 @@ mod session_growth {
         // The seam itself, `landings` times: a BACKGROUND document's analysis
         // lands, is adopted, and is released by the retention rule — which is
         // `analyze_and_publish`'s tail, with the focus held elsewhere.
+        let mut landings_seen: Vec<(usize, Duration, usize)> = Vec::new();
         for landing in 0..landings {
             let index = landing % open.len();
             let landed = Document::analyze_on_this_thread(&texts[index], &std_dir, &entries[index]);
@@ -20287,13 +20288,13 @@ mod session_growth {
                 }
             }
             let after_release = heap_split_bytes().map(|(in_use, _)| in_use).unwrap_or(-1);
+            let released_kib = (before_release - after_release) / 1024;
             let rss_before = rss_kib();
             let started = thread_cpu_now();
-            let trimmed = if released {
-                crate::memory::trim()
-            } else {
-                false
-            };
+            // The shipped decision (M68), not a bare trim: the row is what the
+            // server does at this seam, threshold and all.
+            let trimmed =
+                released && crate::memory::trim_if_released(usize::try_from(before_release).ok());
             let ended = thread_cpu_now();
             let rss_after = rss_kib();
             let cpu = started
@@ -20311,9 +20312,40 @@ mod session_growth {
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy(),
-                (before_release - after_release) / 1024,
+                released_kib,
                 cpu.as_secs_f64() * 1000.0,
                 rss_before.saturating_sub(rss_after),
+            );
+            landings_seen.push((
+                usize::try_from(released_kib).unwrap_or(0),
+                cpu,
+                rss_before.saturating_sub(rss_after),
+            ));
+        }
+
+        // What a DIFFERENT threshold would have decided over the same
+        // landings: the sweep the shipped floor is chosen from, so the choice
+        // is readable rather than asserted.
+        for candidate_mib in [4usize, 16, 32, 64] {
+            let floor = candidate_mib * 1024;
+            let (skipped, cpu_saved, rss_forgone) = landings_seen.iter().fold(
+                (0usize, Duration::ZERO, 0usize),
+                |(skipped, cpu, rss), (released_kib, trim_cpu, returned)| {
+                    if *released_kib < floor {
+                        (skipped + 1, cpu + *trim_cpu, rss + *returned)
+                    } else {
+                        (skipped, cpu, rss)
+                    }
+                },
+            );
+            println!(
+                "M68 {{\"section\":\"threshold\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"threshold_mib\":{candidate_mib},\"landings\":{},\
+                 \"skipped\":{skipped},\"cpu_saved_ms\":{:.2},\"rss_forgone_kib\":{rss_forgone}}}",
+                profile(),
+                loadavg_1m(),
+                landings_seen.len(),
+                cpu_saved.as_secs_f64() * 1000.0,
             );
         }
     }

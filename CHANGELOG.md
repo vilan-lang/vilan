@@ -26,6 +26,19 @@ written down.
 ## Unreleased
 
 <!-- family: performance -->
+**The `malloc_trim` at the analysis-landing seam is conditional on how much the release handed back, and what it costs there is measured instead of estimated.** M64 asks glibc to return the heap's retained-free arenas after every release, which is unarguable at a document CLOSE and is asked far more often than that: the dependency sweep re-analyzes every open importer of an edited file, each of those landings releases the program it just brought (the document is not one of the focused few), and each release walked the arenas. The item put that at ~100 ms per background document, from a wall-clock difference across whole opens. In CPU, over twelve background landings on kolt's nineteen open files (`trim_cost_across_a_sibling_checkout`, release, two runs at loadavg 42–68), the walk is **3.4 to 32.6 ms** — per-landing means of 10.7 and 16.9 ms — and every one of those landings released 10.7 to 81.2 MiB and got **14.0 to 135.3 MiB of resident size back** for it. So the conditional is built and its floor is deliberately LOW, which the candidate sweep over those same landings is what says:
+
+```text
+floor    landings skipped   CPU saved   resident size forgone
+ 4 MiB        0 / 12           0 ms            0 MiB
+16 MiB        5 / 12        33.6 ms          107 MiB
+32 MiB        7 / 12        67.9 ms          251 MiB
+64 MiB        7 / 12        67.9 ms          251 MiB
+```
+
+Three megabytes of resident size per millisecond of a background thread is not a trade a server whose reported footprint was 4.13 GB should take. What `TRIM_MIN_RELEASED_BYTES` (4 MiB) is for is the release that cannot pay for the walk at ALL — glibc walks its arenas in proportion to their own size, not to what was just handed back, so a few hundred kilobytes has nothing page-shaped to give and still costs the whole walk — and no landing in a kolt-sized session is that small, which is the measurement's verdict and not a disappointment. The gate reads `mallinfo2().uordblks` either side of the release (266 and 990 ns per call over two runs of a thousand, four orders of magnitude under the trim it decides), at the two seams a RELEASE happens — `analyze_and_publish`'s tail and `Backend::focus` — while `did_close`, where a whole document's analysis and tables go at once, keeps M64's unconditional ask. `worth_trimming` is the decision alone, so `a_release_below_the_threshold_does_not_earn_the_arena_walk` holds the policy without asking the allocator anything: the floor's boundary belongs to the release, a measured 68 MiB landing still trims, a heap that GREW between the readings released nothing, and a host that cannot read its heap keeps M64's unconditional trim (which on such a host is the no-op `trim` already is). Tracker M68.
+
+<!-- family: performance -->
 **The analyzer's base cache is bounded at 192 MiB of resident worlds, measured rather than assumed, and its budget never evicts a world an open focused document is analyzed from.** M24 set the bound at 512 MiB and M50 found the denomination it was compared against was 24× low; what neither could say is what a bound COSTS, so the figure was generous by construction and never bound anything: kolt's nineteen files retained twelve worlds weighing 266 MiB, and M63 — which bounded the open documents' own retention, 1,090 → 510 MiB — left a floor of 336 MiB with every document closed, 270 MiB of it this cache. The number is measured now. `base_cache_budget_walk_across_a_sibling_checkout` opens all nineteen of kolt's `src/*.vl` under the server's retention rule and then walks them twice — a scan of every file in order, and a working-set walk (the five largest round-robin, an excursion every third visit) that is the shape a session actually has — at four budgets, reporting worlds live, their weight, RSS, the heap's in-use half and the MISSES the bound causes:
 
 ```text

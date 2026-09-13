@@ -1715,8 +1715,15 @@ async fn analyze_and_publish(
     // sweep re-analyzes every open importer of an edited file), the program it
     // brought goes straight back. Published FIRST, so the groups the planner
     // reads are the program's own and the capture is taken from them.
+    // M68: the reading the trim is conditional on, taken ahead of the release —
+    // 266 ns on a path that has just paid for a whole analysis. The trim itself
+    // is 3.4–32.6 ms of CPU and the dependency sweep reaches this seam once per
+    // open importer of an edited file, so what it costs is worth knowing and
+    // what it returns (14–135 MiB of resident size per landing, measured) is
+    // worth keeping.
+    let before_release = memory::heap_in_use_bytes();
     if enforce_program_retention(&context.focus, &context.documents) {
-        memory::trim();
+        memory::trim_if_released(before_release);
     }
     AnalysisOutcome::Landed
 }
@@ -2229,10 +2236,15 @@ impl Backend {
         // sweep would take a write lock on every shard of the document map for
         // an answer of "no". A document that takes a program BACK while the set
         // stands still is covered at the other seam, where its analysis lands.
-        if moved && enforce_program_retention(&self.focus, &self.documents) {
+        if moved {
             // M64: a release hands a whole analysis back to the allocator at
-            // once — the one moment glibc has something to give the OS.
-            memory::trim();
+            // once — the one moment glibc has something to give the OS. M68:
+            // and only when that is more than a page's worth, read either side
+            // of the release.
+            let before_release = memory::heap_in_use_bytes();
+            if enforce_program_retention(&self.focus, &self.documents) {
+                memory::trim_if_released(before_release);
+            }
         }
         self.reanalyze_if_released(uri);
     }
