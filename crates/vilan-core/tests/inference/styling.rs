@@ -6463,3 +6463,223 @@ fn b227_a_printed_event_parameter_still_reads_its_key() {
         "#,
     );
 }
+
+// --- B311: a condition carrying the slot key's own delimiter cannot be WRAPPED --
+// `Style::rule` builds the slot key `media:condition:property` and every
+// condition combinator re-reads an inner style's keys by splitting on `:`.
+// `pseudo`'s name is free-form, so `pseudo("hover:not(:active)", s)` is the one
+// way a condition can hold that delimiter: the split mis-aligns, the second
+// field stops at the first `:`, the rest of the compound is read as the
+// PROPERTY, and the wrapping combinator re-mints the slot from those pieces —
+// emitting a strictly WEAKER selector and saying nothing. Measured before the
+// fence on the item's own exhibit: `.s2jb016[data-open="true"]:hover
+// {opacity:0.5}`, with the `:not(:active)` gone.
+//
+// The fence is on the WRAP, not on the name. Unwrapped the raw token is sound
+// and is in USE (kolt's `styles.vl` writes nine of them): `rule` renders the
+// condition it was handed verbatim and nothing ever re-splits it. `+` is not a
+// wrap either — it replays a slot under its own key — so such a style still
+// merges. A95 is the real fix: a condition becomes a value and no condition is
+// ever a string to split.
+
+#[test]
+fn b311_a_colon_bearing_pseudo_condition_is_refused_by_every_wrapping_combinator() {
+    // One program per combinator that re-reads an inner style's slot keys. The
+    // list IS the wrapping surface: `attribute`, `within`, `media` (through a
+    // breakpoint), `not`, the child relations (through `children`) and `pseudo`
+    // itself. A seventh combinator added without the check reds nothing here,
+    // which is why `check_wrappable_slot` is one helper called from each rather
+    // than six copies of a condition.
+    for wrapped in [
+        r#"style().attribute("data-open", Some("true"), style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().within("data-theme", Some("dark"), style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().md(style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().not(style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().children(style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().pseudo("focus", style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+    ] {
+        let program = format!(
+            r#"
+            import std::style::{{ style, Style }};
+            fun s(): Style {{
+                {wrapped}
+            }}
+            let _s = const s();
+            fun main() {{}}
+            main();
+            "#
+        );
+        let diagnostics = failure_diagnostics(&program);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains("cannot wrap a condition containing")),
+            "{wrapped}\n{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn b311_the_miscompiles_own_exhibit_is_refused_instead_of_emitting_a_weaker_selector() {
+    // The item's program, verbatim. Before the fence it compiled and put
+    // `[data-open="true"]:hover` on the sheet — the `:not(:active)` silently
+    // dropped, the rule matching a superset of what was asked for.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute(
+                "data-open",
+                Some("true"),
+                style().pseudo("hover:not(:active)", style().opacity(0.5)),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let refusal = diagnostics
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .find(|message| message.contains("cannot wrap a condition containing"))
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    // The two things the message owes an author whose program just stopped
+    // compiling: the spelling that WORKS today, and where the real fix lives.
+    assert!(
+        refusal.contains("UNWRAPPED the raw token still emits verbatim"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains("one pseudo(..) with no condition around it"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("A95"), "{refusal}");
+    // And it names the combinator that did the wrapping, so a long chain says
+    // which link to move. (The head is const evaluation's own envelope, which
+    // names `check_wrappable_slot`; the sentence is std's.)
+    assert!(
+        refusal.contains("attribute cannot wrap a condition"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn b311_an_unwrapped_raw_pseudo_token_still_emits_verbatim() {
+    // The control, and the reason the fence is on the wrap: the compound
+    // reaches the sheet exactly as written when nothing re-reads its key.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().pseudo("hover:not(:active)", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(kind, line)| {
+            kind == "css"
+                && line.starts_with(".s")
+                && line.ends_with(":hover:not(:active){opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn b311_a_style_carrying_a_raw_pseudo_token_still_merges_and_applies() {
+    // kolt's shape (`styles.vl`: four raw tokens on one chain, then
+    // `button_style(..) + selectable_button_style` at the use site). `+` reads
+    // the key too, but it REPLAYS the slot under that same key rather than
+    // re-minting it under a new condition, so nothing is re-derived from the
+    // mis-aligned split and the fence deliberately does not reach it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::{ style, Style };
+        fun main() {
+            let base = const style()
+                .pseudo("hover:not(:active)", style().opacity(0.5))
+                .pseudo("focus-visible:not(:active)", style().opacity(0.7));
+            let extra = const style().pseudo(":selection", style().opacity(1.0));
+            print(base.class_list().split(" ").len());
+            print((base + extra).class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n3\n",
+    );
+}
+
+// --- A93: `child_relation`'s token is `children`'s and `divide`'s ---------------
+// The method is reachable from outside std only because the language has no
+// visibility yet (B318), and its token went into the slot key unexamined — so
+// a token that is neither `>*` nor `>*+*` landed in the PSEUDO slot, skipped
+// the `@layer vilan` wrap and the `> *` suffix, and rendered a rule about the
+// element ITSELF from a child-relation method. A89 gave what it was reached for
+// a real spelling, so the hatch closes.
+
+#[test]
+fn a93_a_child_relation_token_outside_the_two_relations_is_refused() {
+    // kolt's `views.vl` site, which rendered `.sX:not([hidden])` — a rule about
+    // the element, from a method whose whole subject is its children.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().child_relation("not([hidden])", "display", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let refusal = diagnostics
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .find(|message| message.contains("child_relation takes one of the two shipped relations"))
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    assert!(refusal.contains("not([hidden])"), "{refusal}");
+    assert!(refusal.contains("attribute(name, value, ..)"), "{refusal}");
+    assert!(
+        refusal.contains("not(..) inside the condition it negates"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a93_the_two_shipped_relations_are_the_controls() {
+    // Non-vacuity, beside the refusal: both legitimate tokens still reach the
+    // sheet with their own rendering — `children` the bare `> *`, `divide` the
+    // `:not(:first-child)` refinement — so the fence rejects the hatch and
+    // nothing else.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style()
+                .children(style().margin_top(space(2)))
+                .divide(style().margin_top(space(4)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.") && line.ends_with(" > *{margin-top:var(--space-2)}}")
+        }),
+        "{assets:?}"
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.")
+                && line.ends_with(" > :not(:first-child){margin-top:var(--space-4)}}")
+        }),
+        "{assets:?}"
+    );
+}
