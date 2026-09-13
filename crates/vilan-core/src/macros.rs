@@ -689,10 +689,15 @@ thread_local! {
     /// Set while a macro WORLD is being analyzed. A world's own analysis must
     /// not register macros (std's prelude modules contain `macro fun`s —
     /// registering them would recursively compile their worlds, unboundedly);
-    /// expansion still runs there with an empty scope, so a std module loaded
-    /// into a world carries no derived impls (N79: there is no second
-    /// generator behind the macro, and inside a world the absence is the
-    /// design rather than a missing std module, so it is silent).
+    /// expansion still runs there, with an empty scope. Nothing a world sees
+    /// carries a `[derive(..)]` today: the entry is BLANKED to its macro
+    /// definitions, macro_std declares none, and the std modules a world force-
+    /// loads are `boolean`/`list`/`null`/`promise`/`compare`/`default`/`debug`/
+    /// `json`/`hash`/`number`/`string`, none of which derives anything. So the
+    /// derive path below is not reached from inside a world — which matters
+    /// now, because N79 deleted the Rust generators that used to serve it and
+    /// a derive written into one of those eleven modules would be refused here
+    /// as a load-ordering bug it is not.
     static IN_MACRO_WORLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
