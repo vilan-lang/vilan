@@ -936,6 +936,32 @@ fun condition_pseudo(condition: str): str {
 	}
 }
 
+/// A slot key is THREE fields — `media:condition:property` — and every
+/// condition combinator re-reads an inner style's keys by splitting on `:`.
+/// `pseudo`'s name is free-form, so a name carrying a `:`
+/// (`"hover:not(:active)"`) is the one way a condition can hold the key's own
+/// delimiter, and the split then mis-aligns: the second field stops at the
+/// first `:` and the rest of the compound is read as the PROPERTY. A wrapping
+/// combinator re-mints the slot from those pieces, so it emits a strictly
+/// WEAKER selector and says nothing — B311's miscompile,
+/// `attribute("data-open", Some("true"), pseudo("hover:not(:active)", s))`
+/// emitting `.sX[data-open="true"]:hover` with the `:not(:active)` gone.
+///
+/// The fence is on the WRAP rather than on the name, because UNWRAPPED the raw
+/// token is sound and is in use: `rule` renders the condition it was handed
+/// verbatim and nothing ever re-splits it, so `pseudo("hover:not(:active)", s)`
+/// at the top of a chain emits exactly what it says. `+` is not a wrap either —
+/// it replays a slot under its own key — so a style carrying a raw token still
+/// merges.
+///
+/// A95 is the real fix: a condition becomes a VALUE, two pseudo-classes on one
+/// rule become two values, and no condition is ever a string to split.
+fun check_wrappable_slot(key: str, outer: str) {
+	if key.split(":").len() != 3 {
+		panic(i"{outer} cannot wrap a condition containing ':' — a slot key is media:condition:property, every condition combinator re-reads the inner style's keys by splitting on ':', and a pseudo-class name that carries one (hover:not(:active)) mis-aligns the split, so the wrapped rule would silently lose everything after it. UNWRAPPED the raw token still emits verbatim — nothing re-splits a condition that is only rendered — so write the whole compound in one pseudo(..) with no condition around it; two conditions on one rule is what A95 redesigns, not this spelling.");
+	}
+}
+
 /// One atomic rule as CSS text. The four condition axes nest the way CSS
 /// nests them — media outermost, then the relation (the ancestor guard's
 /// prefix, or the child combinator's suffix), then the attribute suffix on
@@ -1441,6 +1467,11 @@ impl Style {
 	// and the enclosing condition negates ITS OWN selector. It therefore adds
 	// no nesting order of its own — it sits directly inside the condition it
 	// negates, on whichever axis that is.
+	//
+	// Every combinator here WRAPS: it re-reads the inner style's slot keys and
+	// re-mints each slot under its own condition. That re-read is a split on
+	// `:`, so a condition carrying one cannot be wrapped at all — see
+	// `check_wrappable_slot` (B311). `+` is not a wrap and is unaffected.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -1497,6 +1528,7 @@ impl Style {
 	fun not(self, inner: Style): Style {
 		mut rules = self.rules;
 		for key in inner.rules.keys() {
+			check_wrappable_slot(key, "not");
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let parts = key.split(":");
@@ -1559,6 +1591,7 @@ impl Style {
 		};
 		mut out = self;
 		for key in inner.rules.keys() {
+			check_wrappable_slot(key, "within");
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
@@ -1611,6 +1644,7 @@ impl Style {
 	fun child_relation(self, token: str, name: str, inner: Style): Style {
 		mut out = self;
 		for key in inner.rules.keys() {
+			check_wrappable_slot(key, name);
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
@@ -1666,6 +1700,7 @@ impl Style {
 		};
 		mut out = self;
 		for key in inner.rules.keys() {
+			check_wrappable_slot(key, "attribute");
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
@@ -1695,12 +1730,23 @@ impl Style {
 	/// methods above are the common set. A pseudo-class takes the INNERMOST
 	/// position: a relation, an attribute and a breakpoint may wrap it, and it
 	/// may wrap none of them (nor another pseudo-class).
+	///
+	/// The name is free-form and reaches all of CSS, including a compound
+	/// nothing else here can spell (`"hover:not(:active)"`, `":selection"`):
+	/// the condition is RENDERED verbatim, so the rule it emits says exactly
+	/// what was written. What such a name cannot survive is being WRAPPED — the
+	/// `:` is the slot key's own field separator and a wrapping combinator
+	/// re-reads the key by splitting on it — so `check_wrappable_slot` refuses
+	/// that at const time (B311) rather than emitting the weaker selector the
+	/// mis-aligned split produced. Two conditions on one rule is A95's
+	/// redesign; the raw token is the spelling until then.
 	fun pseudo(self, name: str, inner: Style): Style {
 		if name.starts_with("!") {
 			panic(i"a pseudo-class name cannot start with '!' (got \"{name}\") — a leading '!' is the condition grammar's negation marker; write not(..) inside the condition you want negated");
 		}
 		mut out = self;
 		for key in inner.rules.keys() {
+			check_wrappable_slot(key, name);
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
@@ -1752,6 +1798,7 @@ impl Style {
 	fun media(self, min_width: str, inner: Style): Style {
 		mut out = self;
 		for key in inner.rules.keys() {
+			check_wrappable_slot(key, "a breakpoint");
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
