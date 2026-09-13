@@ -5624,3 +5624,268 @@ fn b279_an_uninstantiated_strict_impl_of_a_bounded_trait_is_dead_not_refused() {
         "board\n",
     );
 }
+
+// --- B316: the trait-typed position, asked the other way round -------------------
+// `reconcile_type(Concrete, Trait)` accepts when the concrete implements the
+// trait; `reconcile_type(Trait, Concrete)` had no arm and refused. A CALL is the
+// one position that asks in that order — the bindings key on the CALLEE's
+// generics, so the parameter goes first — and every other position reconciles
+// value-first and accepts. RULED (Order 34, R5): the universal reading, the two
+// orders agree. The eighteen programs B306's backstop measured are not
+// recoverable (they were counted by an instrument that was never landed), so the
+// pin set is the exhibit the count NAMED — `Doubler`'s supertrait defaults —
+// with the representative shapes around it.
+
+#[test]
+fn b316_a_supertrait_default_hands_self_to_the_inherited_requirement() {
+    // The exhibit. Inside a default body `Self` interns as the bare trait, so
+    // `self.add(self)` passes a `Doubler` where `Add::add`'s `Self`-typed
+    // operand wants an `Add` — "Expected Add, but got Doubler" — and the
+    // supertrait clause is exactly the promise that every `Doubler` is an `Add`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self.add(self) }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+        }
+        impl Money with Doubler {}
+
+        fun main() { print(Money { cents = 3 }.twice().cents); }
+        main();
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn b316_a_two_level_supertrait_chain_still_agrees() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self.add(self) }
+        }
+
+        trait Quad with Doubler {
+            fun four(self): Self { self.twice().twice() }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+        }
+        impl Money with Doubler {}
+        impl Money with Quad {}
+
+        fun main() { print(Money { cents = 3 }.four().cents); }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn b316_a_default_forwarding_a_self_typed_parameter_agrees() {
+    // The same shape without an operator: a default body taking `other: Self`
+    // and calling a sibling default on it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Named { fun name(self): str; }
+
+        trait Greeter with Named {
+            fun greet(self): str { i"hi {self.name()}" }
+            fun both(self, other: Self): str { i"{self.greet()} {other.greet()}" }
+        }
+
+        struct Person { n: str }
+        impl Person with Named { fun name(self): str { self.n } }
+        impl Person with Greeter {}
+
+        fun main() { print(Person { n = "a" }.both(Person { n = "b" })); }
+        main();
+        "#,
+        "hi a hi b\n",
+    );
+}
+
+#[test]
+fn b316_a_trait_typed_position_takes_a_struct_that_implements_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+
+        fun show(v: A): str { v.name() }
+
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b316_a_parameterized_trait_position_binds_its_argument_from_the_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Feed<T> { fun feed(self): T; }
+        struct Nums { n: i32 }
+        impl Nums with Feed<i32> { fun feed(self): i32 { self.n } }
+
+        fun take(f: Feed<i32>): i32 { f.feed() }
+
+        fun main() { print(take(Nums { n = 4 })); }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b316_a_value_that_does_not_implement_the_trait_is_still_refused() {
+    // The control the universal reading rests on: "satisfied by a value that
+    // implements it" is a real test, not an acceptance of everything.
+    assert_fails(
+        r#"
+        import std::io::print;
+
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+
+        fun show(v: A): str { v.name() }
+
+        fun main() { print(show(Other { n = 1 })); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b316_an_unrelated_trait_pair_is_still_refused() {
+    // The supertrait arm is the supertrait relation and nothing wider: two
+    // traits with no clause between them do not reconcile.
+    assert_fails(
+        r#"
+        import std::io::print;
+
+        trait Named { fun name(self): str; }
+        trait Sized2 { fun size(self): i32; }
+
+        trait Greeter with Named {
+            fun both(self, other: Sized2): str { i"{self.name()} {other.size()}" }
+        }
+
+        struct Person { n: str }
+        impl Person with Named { fun name(self): str { self.n } }
+        impl Person with Greeter {}
+
+        fun main() { print(Person { n = "a" }.both(Person { n = "b" })); }
+        main();
+        "#,
+    );
+}
+
+/// B279's invariant, held where a guard can be held: the coverage walk's
+/// dead-code exemption is read off the REFINED dispatch edges, and it is sound
+/// only because every fallback in `refined_edges` widens to the WHOLE candidate
+/// list. Here the dispatching level is taken as a value, so its entries cannot
+/// be enumerated and the site resolves to nothing — the fallback must therefore
+/// draw an edge to every candidate, `Wall::paint` among them, and `Wall::paint`
+/// must be FENCED for coverage rather than exempted as dead. The moment a
+/// fallback narrows instead of widening, this program compiles and prints
+/// `undefined`, which is B258's silence from the other direction.
+///
+/// (The two extra diagnostics the program carries — a generic taken as a value
+/// — are what makes the level unresolvable and are not the claim.)
+#[test]
+fn b279_an_unresolvable_dispatch_site_still_fences_its_candidates() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let scope: Context<str> = Context::new();
+
+        trait Paint { fun paint(self): str; }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self): str { i"wall under {scope.get()}" }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self): str { "board" }
+        }
+
+        fun run_it<T: Paint>(subject: T): str {
+            subject.paint()
+        }
+
+        fun main() {
+            let taken = run_it;
+            print(taken(Board { }));
+        }
+        main();
+        "#,
+        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// The same shape one level deeper — the unresolvable level FORWARDS into the
+/// dispatching one — so the widening has to survive the recursion into the
+/// entry's own enclosing function.
+#[test]
+fn b279_an_unresolvable_level_above_the_dispatch_still_fences() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let scope: Context<str> = Context::new();
+
+        trait Paint { fun paint(self): str; }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self): str { i"wall under {scope.get()}" }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self): str { "board" }
+        }
+
+        fun run_it<T: Paint>(subject: T): str {
+            subject.paint()
+        }
+
+        fun forward<U: Paint>(subject: U): str { run_it(subject) }
+
+        fun main() {
+            let taken = forward;
+            print(taken(Board { }));
+        }
+        main();
+        "#,
+        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}

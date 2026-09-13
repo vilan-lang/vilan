@@ -32720,6 +32720,65 @@ impl<'src> Analyzer<'src> {
                 }
                 (a.clone(), bindings)
             }
+            // B316 (RULED: the UNIVERSAL reading). The same question asked the
+            // other way round. A CALL is the one position that reconciles
+            // PARAMETER-first — so that the bindings key on the callee's
+            // generics — which makes it the one position that ever asks
+            // `reconcile_type(Trait, Concrete)`; every other position (a `let`
+            // annotation, a return, a field, a method argument) reconciles
+            // value-first and lands on the arm above, which ACCEPTS. The two
+            // orders disagreeing is B4 / `method-resolution.md` §10, and the
+            // ruling is that they agree: a trait-typed position is satisfied by
+            // a value that implements the trait, whichever side asked.
+            //
+            // Measured at eighteen correct programs when B306's candidate-
+            // diagnostic backstop reported on the parameter-first drop — every
+            // one of them a program that runs, because a later check always
+            // accepted what this arm had refused. That silence is why the
+            // divergence was invisible and why it is fixed here rather than
+            // reported: an instrument that says "the binder gave up HERE" is
+            // unbuildable while the binder gives up on correct code.
+            //
+            // The unified type is the CONCRETE side, exactly as the arm above
+            // keeps it: reconciling proves the value fits the position, and the
+            // position is a requirement, not the value's type.
+            (
+                Type::Trait(trait_id, template_arguments),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+            ) => {
+                if !self.type_implements_trait(b, *trait_id) {
+                    return None;
+                }
+                let mut bindings = Vec::new();
+                if !template_arguments.is_empty()
+                    && let Some(concrete_arguments) = self.trait_args_for(b, *trait_id)
+                {
+                    for (template_argument, concrete_argument) in
+                        template_arguments.clone().iter().zip(concrete_arguments)
+                    {
+                        let template = template_argument.get_type(self);
+                        let concrete = concrete_argument.get_type(self);
+                        if let Some((_, mut argument_bindings)) =
+                            self.reconcile_type(&concrete, &template, substitution_context)
+                        {
+                            bindings.append(&mut argument_bindings);
+                        }
+                    }
+                }
+                (b.clone(), bindings)
+            }
+            // B316's own exhibit is this shape rather than the two above: inside
+            // a trait DEFAULT body `Self` interns as the bare trait, so
+            // `self.add(self)` in `trait Doubler with Add`'s `twice` passes a
+            // `Doubler` where `Add::add`'s `Self`-typed operand wants an `Add`
+            // — "Expected Add, but got Doubler" — and a SUPERTRAIT is exactly
+            // the promise that every `Doubler` is an `Add`. The sub-trait is the
+            // more specific side and is what the unification keeps.
+            (Type::Trait(l_id, _), Type::Trait(r_id, _))
+                if l_id != r_id && self.trait_with_supertraits(*r_id).contains(l_id) =>
+            {
+                (b.clone(), Vec::new())
+            }
             // Two tuples unify only at the SAME arity — the arity is part of the
             // type, exactly as an array's length is (the arm below) and a
             // closure's parameter count is. A mismatch falls through to the
