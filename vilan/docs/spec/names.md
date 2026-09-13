@@ -96,6 +96,15 @@ importing module's scope:
 - `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
   unqualified use.
+- `import std::style::Length::rem;` is the same path into a type, reaching
+  its **statics** — the functions its `impl` blocks declare that take no
+  `self` (§4.6). A static is reached through the module whose file writes
+  the block, which is the type's own module for a type whose impls sit
+  beside it and the extending module for an extension impl; a `self`
+  method is not importable under either form, and says so. The set and
+  `as` forms reach statics like any other leaf, which is what lets an
+  app's own prelude module re-export one bare
+  (`export import std::style::Length::rem as rem;`).
 - `import std::json::Json as Document;` binds `Document`. `as` renames the
   leaf and changes nothing else: the path resolves exactly as it would
   without one, and the imported item is the same item under a second
@@ -105,8 +114,10 @@ importing module's scope:
   publishes the alias (`export import a::b as c;` publishes `c`).
 
 `use path` binds names from an already-visible type's namespace without
-loading (variants, statics). `export statement` re-exports: importers of
-this module see the exported names as if declared here.
+loading (variants, statics) — the same two kinds `import` reaches by
+path, and the difference is only that `use` loads nothing, the type being
+in scope already. `export statement` re-exports: importers of this module
+see the exported names as if declared here.
 
 Platform gating is not checked at the import: a module outside the
 current platform's layers (e.g. `std::ui` in a Node build) still loads,
@@ -202,6 +213,12 @@ A type has **one** namespace, and receiver position is not part of a
 name. Two impls of one type declaring the same name — two statics, two
 methods, or one of each — are a compile error at the declaration, since
 nothing ranks them and one would simply never be reachable.
+
+That namespace is what `import` and `use` reach into (§4.3), and receiver
+position IS the line they draw: a static binds to a bare name, and a
+`self`-method does not — it is called on a value, so a bare binding would
+name something uncallable. The refusal says so rather than reporting the
+member as missing.
 
 `value.member` resolves against the value's type: fields first, then
 methods, by a **precedence rule** — not by the order the impl blocks

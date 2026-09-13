@@ -3002,4 +3002,112 @@ fun main(): i32 {
         assert!(checked >= 8, "expected the whole file, checked {checked}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// B317: a type's STATIC, imported under a bare name with an alias. The
+    /// free name binds the function's own entity, so every editor query that
+    /// travels an alias has to travel this one the same way.
+    const STATIC_ALIAS: &str = "\
+import pkg::helper::Length::rem as r;
+
+fun main(): i32 {
+\tlet _ = r(1);
+\tlet _ = r(2);
+\t0
+}
+";
+
+    const LENGTH_HELPER: &str = "\
+struct Length {
+\tsize: i32,
+}
+
+impl Length {
+\tfun rem(size: i32): Length {
+\t\tLength { size = size }
+\t}
+}
+";
+
+    fn static_aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[
+            ("main.vl", STATIC_ALIAS),
+            ("helper.vl", LENGTH_HELPER),
+        ])
+    }
+
+    #[test]
+    fn b317_a_rename_at_the_alias_of_a_static_moves_the_alias_and_its_uses() {
+        // E145's invariant, over B317's new binding: the alias is this file's
+        // own name, so renaming it moves the alias and both uses and leaves
+        // `rem` — which is not this file's to rename — where it is.
+        let (dir, document) = static_aliased();
+        let on_alias = STATIC_ALIAS.find("as r").expect("fixture") + 3;
+        let edits = document
+            .rename_edits(on_alias, "rr")
+            .expect("a rename at the alias of a static");
+        assert_eq!(
+            alias_texts(
+                STATIC_ALIAS,
+                edits
+                    .iter()
+                    .map(|(source, span, _)| (*source, *span))
+                    .collect(),
+            ),
+            vec!["r", "r", "r"],
+            "the alias and both uses move",
+        );
+        assert!(
+            edits.iter().all(|(_, _, text)| text == "rr"),
+            "every edit writes the new name plainly",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b317_a_rename_at_the_static_path_segment_reaches_its_declaration() {
+        // The other direction, and the claim that the free name binds the
+        // FUNCTION'S OWN entity rather than a copy of it: renaming at the
+        // `::rem` segment reaches the declaration in the other file, and the
+        // alias — a different spelling — stays.
+        let (dir, document) = static_aliased();
+        let on_segment = STATIC_ALIAS.find("::rem").expect("fixture") + 2;
+        let edits = document
+            .rename_edits(on_segment, "rems")
+            .expect("a rename at the static's path segment");
+        assert_eq!(
+            alias_texts(
+                STATIC_ALIAS,
+                edits
+                    .iter()
+                    .map(|(source, span, _)| (*source, *span))
+                    .collect(),
+            ),
+            vec!["rem"],
+            "the path segment moves; `as r` is this file's own name and stays",
+        );
+        assert!(
+            edits.iter().any(|(source, _, _)| *source != SourceId(0)),
+            "and the declaration in `helper.vl` moves with it: {edits:#?}",
+        );
+        assert!(
+            edits.iter().all(|(_, _, text)| text == "rems"),
+            "every edit writes the new name plainly",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b317_find_references_from_a_use_of_an_aliased_static_lists_the_alias() {
+        // The reference index travels the alias like any other (E145): a use
+        // spelled `r` lists the alias declaration and both uses, and not the
+        // `rem` segment, which spells another name.
+        let (dir, document) = static_aliased();
+        let offset = STATIC_ALIAS.find("= r(1)").expect("fixture") + 2;
+        assert_eq!(
+            alias_texts(STATIC_ALIAS, document.references(offset)),
+            vec!["r", "r", "r"],
+            "the alias and both uses",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

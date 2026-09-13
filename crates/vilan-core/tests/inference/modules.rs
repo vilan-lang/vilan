@@ -6672,3 +6672,153 @@ fn e142_an_aliased_import_resolves_to_the_item_it_renames() {
         "cannot find 'NotAVariant' in Json",
     );
 }
+
+// --- B317: a type's associated functions are importable under a bare name ----
+//
+// `spec/names.md` §4.3 has said `use path` binds "variants, statics" from an
+// already-visible type's namespace since it was written, and §4.6 says a type
+// has ONE namespace holding its variants, its impls' statics and its methods.
+// Only the variants ever travelled: `use Length::rem` answered "`use` requires
+// a namespace (a module or an enum)", and every import form — direct, a brace
+// set, a re-export — answered "cannot find `rem` in the imported path". Both
+// rows read a type's self-less functions now, keyed by the module whose file
+// writes the `impl` block, so the enum shape and the struct shape are one rule.
+
+#[test]
+fn b317_a_types_static_imports_under_its_bare_name() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::Length::rem;
+        fun main() {
+            print(rem(2f).text);
+        }
+        "#,
+        "2rem\n",
+    );
+}
+
+#[test]
+fn b317_a_brace_set_of_statics_imports_and_aliases() {
+    // The prelude shape's other half: several statics at once, one of them
+    // renamed. `as` renames the BINDING and nothing else — the path is walked
+    // exactly as it would be without one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::Length::{ px, auto as automatic };
+        fun main() {
+            print(px(4f).text);
+            print(automatic().text);
+        }
+        "#,
+        "4px\nauto\n",
+    );
+}
+
+#[test]
+fn b317_use_binds_a_static_out_of_a_visible_type() {
+    // `use` walks no module path and loads nothing: the type is already in
+    // scope, and the statement reaches into the namespace it has. Exactly what
+    // it does for an enum's variants, and what §4.3 promised for statics.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::Length;
+        use Length::em;
+        use Length::{ pct as percent };
+        fun main() {
+            print(em(1f).text);
+            print(percent(50f).text);
+        }
+        "#,
+        "1em\n50%\n",
+    );
+}
+
+#[test]
+fn b317_a_self_method_is_refused_by_name_under_the_import_form() {
+    // The one curated refusal. "cannot find" would be false — the type plainly
+    // has the member — so the message says what is true about it instead.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::style::Style::text_align;
+        fun main() {
+            print("x");
+        }
+        "#,
+        "`Style::text_align` takes `self` — a method is called on a value, not imported",
+    );
+}
+
+#[test]
+fn b317_a_self_method_is_refused_by_name_under_the_use_form() {
+    // The same sentence from the other form, which is why it is one row.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::style::Style;
+        use Style::text_align;
+        fun main() {
+            print("x");
+        }
+        "#,
+        "`Style::text_align` takes `self` — a method is called on a value, not imported",
+    );
+}
+
+#[test]
+fn b317_a_use_of_something_that_is_no_namespace_names_all_three() {
+    // The fence is lifted, not removed: a FUNCTION still has no namespace to
+    // reach into, and the message now names the three things that do.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun helper(): i32 {
+            1
+        }
+        fun main() {
+            use helper::inner;
+            print("x");
+        }
+        "#,
+        "`use` requires a namespace (a module, an enum or a struct)",
+    );
+}
+
+#[test]
+fn b317_an_enums_variants_are_unchanged() {
+    // The row B317 generalises, held where it was: a variant travels every one
+    // of these paths exactly as it did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<i32> = Some(1);
+            match slot {
+                Some(let n) => print(i"{n}"),
+                None => print("none"),
+            }
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b317_a_missing_static_still_says_it_cannot_be_found() {
+    // The type is a namespace now, and a name it does not hold is still the
+    // path's own miss rather than something about namespaces.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::style::Length::furlongs;
+        fun main() {
+            print("x");
+        }
+        "#,
+        "cannot find 'furlongs' in the imported path",
+    );
+}

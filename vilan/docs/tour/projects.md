@@ -52,6 +52,7 @@ export import std::io::print;
 export import std::option::Option::{ self, Some, None };
 export import std::reactive::Signal;
 export import std::style;                 // a whole MODULE, as `style::…`
+export import std::style::Length::rem as rem;   // a type's STATIC, bare
 ```
 
 Three rules make the key safe to use:

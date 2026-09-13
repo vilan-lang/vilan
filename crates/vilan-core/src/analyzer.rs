@@ -1769,6 +1769,33 @@ pub struct Implementation<'src> {
     pub trait_args: Vec<(Id, Vec<TypeId>)>,
 }
 
+/// B317: one `impl` block as an IMPORT PATH sees it — the members it declares,
+/// the subject's written head name, and the scope the block was written in.
+///
+/// A type's namespace holds its impls' self-less functions, and an import that
+/// spells `std::style::Length::rem` has to find them before types resolve: the
+/// impl's `subject` is a bare [`TypeId`] until `prepped_type_locals` drains,
+/// which is two drains AFTER the import fixpoint. So the association is kept by
+/// NAME and SCOPE, both of which the walk has in hand, and the import path
+/// resolves the name in the scope it is already standing in.
+///
+/// That the scope is the key is also the rule: an import reaches a type's
+/// statics through the module whose file the `impl` block is written in, which
+/// is the type's own module for std and for every type whose impls sit beside
+/// it, and the EXTENDING module for an extension impl. Both fall out of asking
+/// whether this block's subject name resolves, in this block's own scope, to
+/// the type the path walked to.
+#[derive(Debug, Clone)]
+struct ImplNamespace<'src> {
+    /// The subject's written head name (`impl Length<..>` -> `Length`).
+    subject_name: &'src str,
+    /// The scope the block was written in — a module's body scope at top level.
+    scope_id: Id,
+    /// Every member the block declared, in order. `self` methods are kept: the
+    /// import refusal that names one has to be able to find it.
+    members: Vec<(&'src str, Id)>,
+}
+
 /// One impl-declared candidate for `receiver.member` — a member some impl of
 /// the receiver's type declares, before precedence picks between them
 /// (`proposal/method-resolution.md` §3).
@@ -3322,6 +3349,11 @@ pub struct Analyzer<'src> {
     /// collected from, so the two agree, and where they could not the index
     /// still says what the scan said.
     implementation_by_declaration: HashMap<Id, usize>,
+    /// B317: every `impl` block as an import path sees it — see
+    /// [`ImplNamespace`]. Written where `implementations` grows, for the reason
+    /// `implementations_by_member` is, and read only by the import and `use`
+    /// walks, which run before an impl's subject has a type at all.
+    impl_namespaces: Vec<ImplNamespace<'src>>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -4155,6 +4187,13 @@ pub struct Importable<'src> {
     /// and a module's sub-modules register flat under their package, never
     /// inside it).
     pub variants: Vec<&'src str>,
+    /// B317: a struct's or enum's STATICS — the functions this module's `impl`
+    /// blocks declare for it that take no `self`, in declaration order. Empty
+    /// for every other kind, and empty for a type whose impls are written
+    /// elsewhere: an import reaches a static through the module whose file
+    /// holds the block, so a module's own row is exactly what its own file
+    /// offers.
+    pub statics: Vec<&'src str>,
 }
 
 /// What an [`Importable`] names.
@@ -4253,6 +4292,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
                     name,
                     kind: ImportableKind::Reexport,
                     variants: Vec::new(),
+                    statics: Vec::new(),
                 });
             }
             continue;
@@ -4275,7 +4315,45 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             name,
             kind,
             variants,
+            statics: Vec::new(),
         });
+    }
+    // B317, in a second pass because an `impl` block may be written above the
+    // type it extends: every self-less function this module's blocks declare is
+    // attached to the row for the block's subject, which is where an import
+    // reaches it.
+    //
+    // The subject may be a name this module RE-EXPORTS rather than declares —
+    // an extension impl beside an `export import` of the type it extends — and
+    // that row takes the statics too, because the import that reaches them
+    // reaches them through this module. A subject held only by a PLAIN import
+    // gets no row, for the reason stated above: this module offers no such name
+    // at all, so it can offer nothing under it.
+    for item in items {
+        let Node::Impl(subject, _, body) = unwrap_item(item) else {
+            continue;
+        };
+        let Some(head) = type_head(&subject.0) else {
+            continue;
+        };
+        let Some(row) = out.iter_mut().find(|row| {
+            row.name == head
+                && matches!(
+                    row.kind,
+                    ImportableKind::Struct | ImportableKind::Enum | ImportableKind::Reexport
+                )
+        }) else {
+            continue;
+        };
+        for member in &body.0 {
+            if let Node::Func(function) = unwrap_item(member)
+                && !function.parameters.0.first().is_some_and(|parameter| {
+                    matches!(&parameter.pattern, Pattern::Binding(name, _, _) if *name == "self")
+                })
+            {
+                row.statics.push(function.name.0);
+            }
+        }
     }
 }
 
@@ -4734,6 +4812,7 @@ impl<'src> Analyzer<'src> {
             implementations: Vec::new(),
             implementations_by_member: HashMap::default(),
             implementation_by_declaration: HashMap::default(),
+            impl_namespaces: Vec::new(),
             trait_by_declaration: HashMap::default(),
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
@@ -24289,6 +24368,64 @@ impl<'src> Analyzer<'src> {
         })
     }
 
+    /// B317: the member `name` of the TYPE `subject_id`'s namespace, reached
+    /// through the namespace scope the path is standing in.
+    ///
+    /// A type's namespace holds its impls' functions, exactly as an enum's
+    /// holds its variants — spec/names.md §4.6 — and `use path` has promised
+    /// "variants, statics" at §4.3 since it was written. It is found by NAME
+    /// and SCOPE rather than by subject type, because an impl's subject is a
+    /// bare `TypeId` until `prepped_type_locals` drains, two drains after the
+    /// import fixpoint that asks this.
+    ///
+    /// The scope is the rule and not just the mechanism: `std::style::Length`'s
+    /// statics are reached through `std::style`, whose file holds the block,
+    /// and an EXTENSION impl's statics through the module that writes the
+    /// extension. Both are one question — does this block's subject name
+    /// resolve, in this block's own scope, to the type the path walked to —
+    /// and an extension impl's `Length` resolves there because the extending
+    /// file's own `import` put it in that scope.
+    ///
+    /// `self` methods come back too: the refusal that names one has to find it.
+    fn type_namespace_member(&self, subject_id: Id, scope_id: Id, name: &str) -> Option<Id> {
+        self.impl_namespaces.iter().find_map(|block| {
+            if block.scope_id != scope_id
+                || self.member_in_namespace(block.subject_name, scope_id) != Some(subject_id)
+            {
+                return None;
+            }
+            block
+                .members
+                .iter()
+                .find(|(member, _)| *member == name)
+                .map(|(_, member_id)| *member_id)
+        })
+    }
+
+    /// B317: a TYPE's member as a `use` statement sees it.
+    ///
+    /// A `use` walks no module path — its root resolves lexically, in the file
+    /// that writes it — so the scopes its namespace is read from are NAMED
+    /// rather than walked to: the module that declares the type, where the
+    /// type's own impls live, and the scope the `use` is written in, where a
+    /// file's own extension impls do.
+    fn type_use_member(&self, subject_id: Id, use_scope_id: Id, name: &str) -> Option<Id> {
+        self.module_body_scope_of_id(subject_id)
+            .and_then(|scope_id| self.type_namespace_member(subject_id, scope_id, name))
+            .or_else(|| self.type_namespace_member(subject_id, use_scope_id, name))
+    }
+
+    /// The body scope of the module `id` was written in —
+    /// [`Self::module_name_of_id`]'s twin, for a lookup that needs the scope
+    /// rather than the name.
+    fn module_body_scope_of_id(&self, id: Id) -> Option<Id> {
+        let source = self.source_of_id(id)?;
+        self.modules
+            .values()
+            .find(|module| self.source_of_id(module.id) == Some(source))
+            .map(|module| module.body.1)
+    }
+
     /// A67: a module that declares an item with the same name as a module file
     /// in its own directory — `a.vl` declaring `b` beside an `a/b.vl`.
     ///
@@ -27483,6 +27620,9 @@ impl<'src> Analyzer<'src> {
                     Node::AccessorWithGenerics(name, _) => Some(*name),
                     _ => None,
                 };
+                // B317: the same head, kept past the restore below, for the
+                // import-path index written with the registration.
+                let impl_subject_head = self.current_impl_subject_name;
                 let subject = subject_type_id;
                 let was_walking_member_body = self.walking_member_body;
                 self.walking_member_body = true;
@@ -27544,6 +27684,19 @@ impl<'src> Analyzer<'src> {
                     self.implementation_by_declaration
                         .entry(member_id)
                         .or_insert(implementation_index);
+                }
+                // B317's index, written in the same breath for the same reason
+                // as the two above. `current_impl_subject_name` was restored
+                // just up there, so the head is taken from the banked copy the
+                // walk set — a subject that is not a named head (a tuple, a
+                // list, a bare `&T`) contributes no namespace, which is right:
+                // an import path can only spell a name.
+                if let Some(subject_name) = impl_subject_head {
+                    self.impl_namespaces.push(ImplNamespace {
+                        subject_name,
+                        scope_id,
+                        members: declared_members.clone(),
+                    });
                 }
                 self.implementations.push(Implementation {
                     subject,
@@ -33599,8 +33752,44 @@ impl<'src> Analyzer<'src> {
         // registers its top-level modules in its own scope and has no submodule
         // scope, so it starts as `None`.
         let mut namespace_module_id: Option<Id> = None;
+        // B317: the TYPE the previous segment named, the scope the walk was
+        // standing in when it did, and the name it was spelled with. A type's
+        // namespace is asked AFTER the scope's own members, so every path that
+        // resolves today resolves to exactly what it resolves to now and the
+        // statics are reached only where the walk used to stop.
+        let mut type_namespace: Option<(Id, Id, &str)> = None;
         for (part, part_span) in segments {
-            match self.member_or_submodule(part, namespace_scope_id, namespace_module_id) {
+            let scope_hit = self.member_or_submodule(part, namespace_scope_id, namespace_module_id);
+            let type_hit = match (scope_hit, type_namespace) {
+                (None, Some((subject_id, subject_scope_id, _))) => {
+                    self.type_namespace_member(subject_id, subject_scope_id, part)
+                }
+                _ => None,
+            };
+            // A `self` method IS in the type's namespace and is not importable
+            // out of it: it is called on a value, so binding its bare name
+            // would hand the author something they cannot call. Said by name,
+            // because "cannot find" would be false about a member the type
+            // plainly has.
+            if let Some(member_id) = type_hit
+                && let Some((_, _, subject_name)) = type_namespace
+                && self.is_self_method(member_id)
+            {
+                if report {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: part_span,
+                        msg: format!(
+                            "`{subject_name}::{part}` takes `self` — a method is called on a \
+                             value, not imported"
+                        ),
+                    });
+                }
+                return false;
+            }
+            type_namespace = None;
+            match scope_hit.or(type_hit) {
                 Some(id) => {
                     target_id = id;
                     self.record_reference(source_id, part_span, id);
@@ -33614,8 +33803,22 @@ impl<'src> Analyzer<'src> {
                             self.modules.get(sub_module_id).map(|module| module.body.1)
                         }
                         Some(Expr::Enum(enum_id)) => {
+                            // B317: an enum is BOTH — its variants scope, and
+                            // the functions its impls declare. The variants are
+                            // asked first, exactly as they always have been.
+                            type_namespace = Some((id, namespace_scope_id, part));
                             namespace_module_id = None;
                             self.enums.get(enum_id).map(|enum_| enum_.variants_scope_id)
+                        }
+                        // B317: a struct namespaces the functions of its impl
+                        // blocks — `std::style::Length::rem`, the shape
+                        // `names.md` §4.3 has promised since it was written
+                        // ("variants, statics"). It is not a SCOPE: the blocks
+                        // are found through the scope the walk is standing in,
+                        // which is what keys them to their declaring module.
+                        Some(Expr::Struct(_)) => {
+                            type_namespace = Some((id, namespace_scope_id, part));
+                            None
                         }
                         // Not a namespace: the walk keeps the scope it is in,
                         // exactly as it always has, and keeps the module that
@@ -40313,9 +40516,10 @@ impl<'src> Analyzer<'src> {
         self.seed_preludes();
 
         // --- Resolve `use` statements ---
-        // `use Namespace::{ a, b }` binds items out of a namespace — a module
-        // or an enum (whose namespace holds its variants) — into the scope the
-        // statement appears in.
+        // `use Namespace::{ a, b }` binds items out of a namespace — a module,
+        // an enum (whose namespace holds its variants) or a struct (whose
+        // namespace holds its impls' self-less functions, B317) — into the
+        // scope the statement appears in.
         for (path, name, scope_id, _span, leaf_span, source_id, alias) in
             std::mem::take(&mut self.prepped_uses)
         {
@@ -40343,6 +40547,7 @@ impl<'src> Analyzer<'src> {
             };
             self.record_reference(source_id, root_span, current);
             let mut resolved = true;
+            let mut subject_name = root;
             for (segment, segment_span) in segments {
                 let namespace_scope_id = match self.expr_id_to_expr_map.get(&current) {
                     Some(Expr::Module(module_id)) => {
@@ -40353,22 +40558,58 @@ impl<'src> Analyzer<'src> {
                     }
                     _ => None,
                 };
-                let Some(namespace_scope_id) = namespace_scope_id else {
+                // B317: a TYPE is a namespace here too, and always was on
+                // paper — names.md §4.3 says `use path` binds "variants,
+                // statics" from an already-visible type. The variants arrive
+                // through the scope above; the statics live on impl blocks,
+                // which are no scope, so they are asked for by name.
+                let is_type = matches!(
+                    self.expr_id_to_expr_map.get(&current),
+                    Some(Expr::Struct(_)) | Some(Expr::Enum(_))
+                );
+                let member = namespace_scope_id
+                    .and_then(|namespace_scope_id| {
+                        self.scopes
+                            .get(&namespace_scope_id)
+                            .and_then(|scope| scope.name_to_id_map.get(segment))
+                            .copied()
+                    })
+                    .or_else(|| {
+                        is_type
+                            .then(|| self.type_use_member(current, scope_id, segment))
+                            .flatten()
+                    });
+                if namespace_scope_id.is_none() && !is_type {
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,
                         span: segment_span,
-                        msg: "`use` requires a namespace (a module or an enum)".to_string(),
+                        msg: "`use` requires a namespace (a module, an enum or a struct)"
+                            .to_string(),
                     });
                     resolved = false;
                     break;
-                };
-                current = match self
-                    .scopes
-                    .get(&namespace_scope_id)
-                    .and_then(|scope| scope.name_to_id_map.get(segment))
-                    .copied()
+                }
+                // A `self` method is in the namespace and is not importable out
+                // of it — the import form's rule, in the form that shares its
+                // message.
+                if let Some(member_id) = member
+                    && is_type
+                    && self.is_self_method(member_id)
                 {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: segment_span,
+                        msg: format!(
+                            "`{subject_name}::{segment}` takes `self` — a method is called on a \
+                             value, not imported"
+                        ),
+                    });
+                    resolved = false;
+                    break;
+                }
+                current = match member {
                     Some(entity) => entity,
                     None => {
                         self.diagnostics.push(Error {
@@ -40381,6 +40622,7 @@ impl<'src> Analyzer<'src> {
                         break;
                     }
                 };
+                subject_name = segment;
                 self.record_reference(source_id, segment_span, current);
             }
             if resolved {

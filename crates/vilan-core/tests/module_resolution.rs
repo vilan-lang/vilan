@@ -4882,3 +4882,94 @@ fn a67_a_directory_child_with_no_colliding_declaration_still_resolves() {
         "an uncontested directory child resolves: {errors:#?}"
     );
 }
+
+// --- B317: a type's statics across files -------------------------------------
+//
+// The two shapes a single-file pin cannot hold: the app prelude that RE-EXPORTS
+// a static under a bare name, and an EXTENSION impl, whose statics are reached
+// through the module that writes the block rather than through the module that
+// declares the type. Both fall out of one question — does this block's subject
+// name resolve, in this block's own scope, to the type the path walked to — and
+// the last pin is what that question buys: a module that writes no such block
+// offers nothing, however visible the type is inside it.
+
+#[test]
+fn b317_a_reexported_static_is_consumed_by_a_second_file() {
+    // The app-prelude shape the item was filed from: one module gathers the
+    // spellings an app wants bare, and every other file imports them from it.
+    let files = &[
+        (
+            "sugar.vl",
+            "import pkg::shapes::Point;\n\nexport import pkg::shapes::Point::origin as origin;\n",
+        ),
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::sugar::origin;\n\nfun main() { let _ = origin().x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a re-exported static is importable from the relay: {errors:#?}"
+    );
+}
+
+#[test]
+fn b317_an_extension_impls_static_imports_from_the_extending_module() {
+    // The block is written in `extra.vl`, whose own import is what makes
+    // `Point` resolve there — so `pkg::extra::Point::doubled` is the path, and
+    // the fixpoint over the import queue is what lets the second import wait
+    // for the first.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "extra.vl",
+            "import pkg::shapes::Point;\n\nimpl Point {\n\tfun doubled(x: i32): Point {\n\t\tPoint { x = x * 2 }\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::extra::Point::doubled;\n\nfun main() { let _ = doubled(2).x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an extension impl's static imports from the extending module: {errors:#?}"
+    );
+}
+
+#[test]
+fn b317_a_static_is_not_importable_through_a_module_that_writes_no_block() {
+    // The keying, stated as a refusal. `bare.vl` imports `Point` and writes no
+    // impl, so `pkg::bare::Point::doubled` names nothing — the statics belong
+    // to the modules whose files declare them, not to every module the type is
+    // visible in.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "bare.vl",
+            "import pkg::shapes::Point;\n\nfun anchor(): i32 { 1 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::bare::Point::origin;\n\nfun main() { let _ = origin().x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot find 'origin' in the imported path")),
+        "a module that writes no block offers no statics: {errors:#?}"
+    );
+}
