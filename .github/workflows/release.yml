@@ -59,6 +59,23 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
+      # The TextMate grammar's SCOPE pins (tracker E163). They tokenise with
+      # `vscode-textmate` over `vscode-oniguruma` — the tokeniser and the regex
+      # engine VS Code itself loads — so they answer "which scope does this
+      # bracket end up with" rather than "which rule could match this text",
+      # which is the question the two E164 defects were invisible to. Nothing
+      # else in a checkout creates `editors/vscode/node_modules`, so without
+      # this step every scope pin would skip and the grammar would be gated on
+      # its own rules' text again. Both packages are devDependencies: the vsix
+      # bundles `dependencies` only and `.vscodeignore` drops `node_modules/`,
+      # so nothing here reaches a published extension. ~1 s warm, +2 lockfile
+      # packages, 0 advisories. `grammar_sync.rs` REFUSES to skip when `CI` is
+      # set, which is what makes a dropped step a red suite rather than a
+      # quietly thinner gate. ci.yml's `test` job carries it too, and the two
+      # must move together like every other leg here.
+      - name: The VS Code grammar's tokeniser
+        shell: bash
+        run: npm ci --prefix editors/vscode
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       # Everything below this line is ci.yml's `test` job, character for
       # character, and it must stay that way (process.md §7.2 and §8.1;

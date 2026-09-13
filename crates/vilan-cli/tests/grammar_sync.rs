@@ -7,7 +7,7 @@
 //! the lexer alone and was caught twice by eye; the D15 docs audit then found
 //! `i64`/`u64` still coloured as types a release after they became a hard
 //! error, and `platform` missing from both attribute lists. This file answers
-//! in two layers:
+//! in three layers:
 //!
 //! - GENERATION (E91): the word-list halves of both grammars — the token
 //!   tables — are emitted from the compiler's exported tables
@@ -31,6 +31,14 @@
 //!   REGISTERS is the compiler's list — a splice landing in the wrong rule
 //!   greens one and reds the other.
 //!
+//! - SCOPES (E163): the structural rules are held to their OUTCOME rather than
+//!   to their own text — `vscode-textmate` over `vscode-oniguruma`, the
+//!   tokeniser and regex engine VS Code itself loads, run over a program, and
+//!   the scope each character ends up with asserted. The E161/E162 pins were
+//!   regex-and-order pins until this layer existed, and the two defects E164
+//!   closed were invisible to them. See the E163 section for the dependency,
+//!   its cost, and why a scope pin may skip on a working copy but never in CI.
+//!
 //! Each axis is checked in both directions: everything the compiler knows is in
 //! both grammars, and nothing in either grammar is unknown to the compiler —
 //! the `i64` direction — with the contextual words the grammars colour by
@@ -45,8 +53,9 @@
 //! fragments).
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use vilan_core::lexing::{KEYWORDS, TWO_CHARACTER_OPERATORS, tokenize};
 use vilan_core::parsing::KNOWN_ATTRIBUTE_MARKERS;
@@ -1285,260 +1294,379 @@ fn generated_fragments_are_current() {
     );
 }
 
+// --- E163: the grammar's own tokeniser ---------------------------------------
+//
+// Everything from here to the book's twin runs the TextMate grammar the way VS
+// Code runs it — `vscode-textmate` over `vscode-oniguruma`, the same tokeniser
+// and the same regex engine the editor loads — and asserts the SCOPE each
+// character ends up with.
+//
+// It did not, until E163. The E161/E162 pins asserted each rule's own REGEX
+// plus the two rule ORDERS that decide which rule gets to match, which together
+// IMPLY an outcome without ever producing one, and the gap was not theoretical:
+// both defects E164 closed (a closing tag straight after text painted as a
+// generic argument list; the `>` of an attributed opening tag painted as an
+// operator) were invisible to every regex pin in this file and obvious in the
+// first line of tokeniser output.
+//
+// **The dependency, and what it costs.** `vscode-textmate` and
+// `vscode-oniguruma` are `editors/vscode` devDependencies (+2 lockfile
+// packages, 632 KB on disk, 0 advisories). Nothing ships them: the vsix bundles
+// `dependencies` only and `.vscodeignore` drops `node_modules/` whole, so
+// `editors/vscode/ThirdPartyNotices.txt` — which covers what `out/extension.js`
+// BUNDLES — gains no entry, and the root notices gate reads `Cargo.lock` alone.
+// `npm ci --prefix editors/vscode` is what puts them on disk (~0.8 s warm), and
+// it is a step of ci.yml's `test` job and release.yml's `gate` job.
+//
+// **Why a scope pin may skip.** On a working copy the directory is optional,
+// deliberately: a fresh clone builds and runs the suite with no node packages
+// at all, and a grammar pin is not worth making that false. So [`painting`]
+// returns `None` with a message naming the command when the packages are
+// absent, and the pin returns green without asserting — EXCEPT under `CI`,
+// where the step exists and its absence means a workflow stopped running it.
+// There the skip is a failure, which is what keeps the skip honest.
+
+/// The tokeniser helper, run under node with the source on stdin.
+const TOKENIZER: &str = "crates/vilan-cli/tests/support/tokenize.js";
+/// Where `npm ci --prefix editors/vscode` puts the two packages.
+const EXTENSION_MODULES: &str = "editors/vscode/node_modules";
+/// The command that makes the scope pins runnable, named in every message that
+/// has to explain why they did not run.
+const EXTENSION_INSTALL: &str = "npm ci --prefix editors/vscode";
+
+/// One token the grammar produced: where it sits, its text, and the scope
+/// stack it carries (outermost — always `source.vilan` — first).
+#[derive(Debug)]
+struct Scoped {
+    line: usize,
+    start: usize,
+    end: usize,
+    scopes: Vec<String>,
+}
+
+impl Scoped {
+    /// The scope a theme actually colours this token by: the innermost one.
+    fn innermost(&self) -> &str {
+        self.scopes
+            .last()
+            .map(String::as_str)
+            .expect("a scope stack")
+    }
+}
+
+/// A tokenised program: the source it was read from, and every token in
+/// tokenisation order. Queried by SOURCE TEXT rather than by offset, so a pin
+/// reads as the claim it is making (`painting.scopes_over("</span>")`).
+struct Painting {
+    source: String,
+    tokens: Vec<Scoped>,
+}
+
+impl Painting {
+    /// The one occurrence of `needle`, as `(line, start, end)` columns. Panics
+    /// unless it occurs EXACTLY once and on one line: a scope pin names the
+    /// character it is asking about, and a needle that drifted into matching
+    /// twice reds here rather than asserting about the wrong `>`.
+    fn locate(&self, needle: &str) -> (usize, usize, usize) {
+        assert!(
+            !needle.contains('\n'),
+            "a scope pin's needle is one line: {needle:?}"
+        );
+        let occurrences: Vec<usize> = self
+            .source
+            .match_indices(needle)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "{needle:?} occurs {} times in the exhibit — a scope pin asks about ONE place",
+            occurrences.len()
+        );
+        let at = occurrences[0];
+        let line = self.source[..at].matches('\n').count();
+        let line_start = self.source[..at].rfind('\n').map_or(0, |index| index + 1);
+        // The tokeniser counts UTF-16 code units within a line; every exhibit
+        // here is ASCII, where that is the byte count.
+        assert!(
+            self.source.is_ascii(),
+            "the column arithmetic below assumes an ASCII exhibit"
+        );
+        (at - line_start, at - line_start + needle.len(), line)
+    }
+
+    /// Every token overlapping the one occurrence of `needle`, in order.
+    fn tokens_over(&self, needle: &str) -> Vec<&Scoped> {
+        let (start, end, line) = self.locate(needle);
+        let found: Vec<&Scoped> = self
+            .tokens
+            .iter()
+            .filter(|token| token.line == line && token.start < end && token.end > start)
+            .collect();
+        assert!(!found.is_empty(), "no token covers {needle:?}");
+        found
+    }
+
+    /// The scope each of those tokens is coloured by, in order — the pin's
+    /// usual shape: `["punctuation.definition.tag.vilan", "entity.name.tag.vilan", …]`.
+    fn scopes_over(&self, needle: &str) -> Vec<String> {
+        self.tokens_over(needle)
+            .into_iter()
+            .map(|token| token.innermost().to_string())
+            .collect()
+    }
+
+    /// The token that BEGINS at `needle`, for the pins about one character.
+    fn token_at(&self, needle: &str) -> &Scoped {
+        let (start, _, line) = self.locate(needle);
+        self.tokens
+            .iter()
+            .find(|token| token.line == line && token.start == start)
+            .unwrap_or_else(|| panic!("no token begins at {needle:?}"))
+    }
+
+    /// What that token is coloured by.
+    fn scope_at(&self, needle: &str) -> &str {
+        self.token_at(needle).innermost()
+    }
+
+    /// Its whole stack — the region pins (`meta.generic.vilan` nesting) read
+    /// this, because "inside how many lists" is the claim they make.
+    fn stack_at(&self, needle: &str) -> &[String] {
+        &self.token_at(needle).scopes
+    }
+
+    /// How many generic regions that token sits inside.
+    fn generic_depth(&self, needle: &str) -> usize {
+        self.stack_at(needle)
+            .iter()
+            .filter(|scope| *scope == "meta.generic.vilan")
+            .count()
+    }
+}
+
+/// `source` tokenised by the TextMate grammar, or `None` when the extension's
+/// packages are not installed (see the section header: a skip on a working
+/// copy, a failure under `CI`).
+fn painting(source: &str) -> Option<Painting> {
+    let modules = repo_root().join(EXTENSION_MODULES);
+    if !modules.join("vscode-textmate").is_dir() || !modules.join("vscode-oniguruma").is_dir() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "`{EXTENSION_MODULES}` does not hold `vscode-textmate`/`vscode-oniguruma`, so \
+             the scope pins cannot tokenise anything — and this is CI, where \
+             `{EXTENSION_INSTALL}` is a step of ci.yml's `test` job and release.yml's \
+             `gate` job. The step was dropped or failed: these pins are allowed to skip on \
+             a working copy and never here"
+        );
+        eprintln!(
+            "grammar_sync: the scope pins are SKIPPED — `{EXTENSION_MODULES}` is not \
+             populated. `{EXTENSION_INSTALL}` makes them run (CI always does)."
+        );
+        return None;
+    }
+    let mut child = Command::new("node")
+        .arg(repo_root().join(TOKENIZER))
+        .env(
+            "VILAN_GRAMMAR",
+            repo_root().join(TEXTMATE_GRAMMAR).as_os_str(),
+        )
+        .env("VILAN_MODULES", modules.as_os_str())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the tokeniser under node");
+    child
+        .stdin
+        .take()
+        .expect("the tokeniser's stdin")
+        .write_all(source.as_bytes())
+        .expect("write the exhibit to the tokeniser");
+    let output = child.wait_with_output().expect("the tokeniser finishes");
+    assert!(
+        output.status.success(),
+        "tokenising failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tokens = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            // `<line>\t<start>\t<end>\t<JSON text>\t<scope> <scope> …`
+            let fields: Vec<&str> = line.splitn(5, '\t').collect();
+            assert_eq!(fields.len(), 5, "the tokeniser's line protocol: {line:?}");
+            let number = |field: &str| field.parse().expect("a token offset");
+            Scoped {
+                line: number(fields[0]),
+                start: number(fields[1]),
+                end: number(fields[2]),
+                scopes: fields[4].split(' ').map(str::to_string).collect(),
+            }
+        })
+        .collect();
+    Some(Painting {
+        source: source.to_string(),
+        tokens,
+    })
+}
+
 // --- E161: the nested generic head, layer by layer ---------------------------
 //
 // `impl Source<Option<type _: Source<type U>>>` was painted by three different
 // rules for one bracket kind, and by a fourth for the keyword. The vocabulary
-// the rules use is asserted here, on the REGEXES, in node — which is where the
-// editor and the book run them (both grammars use lookbehind, which Rust's
-// `regex` crate does not have).
-//
-// **What this is not.** The item asked for a scope assertion driven by
-// `vscode-textmate`, which tokenises the way VS Code does and would answer
-// "which scope does THIS bracket end up with" rather than "which rule can
-// match this text". `vscode-textmate` (and the `vscode-oniguruma` it needs) is
-// not in `editors/vscode/package-lock.json` and pulling it in is a new
-// dependency, which is a ruling and not a lane's call — so the checks below
-// assert each rule's own regex plus the ORDER the rules sit in, which together
-// decide the outcome a tokeniser would report, and the gap is named rather
-// than papered over.
+// is asserted here on the OUTCOME — the scope each bracket, each binder and
+// each tag actually carries when the editor's own tokeniser is run over a
+// program (E163). The element controls (`<div>`, `a < b`) sit in the same
+// exhibits, because "a head is a list and a tag is a tag" is one claim about
+// two rules and the order between them, and a pin that reads the order out of
+// the file cannot see a third rule reaching the text first.
 
-/// The regexes one repository key contributes under `field` (`match`, `begin`
-/// or `end`), nested patterns included, in grammar order.
-fn textmate_regexes(grammar: &Grammar, key: &str, field: &str) -> Vec<String> {
-    grammar
-        .rules(key)
-        .into_iter()
-        .filter(|rule| rule.field == field)
-        .map(|rule| rule.regex.clone())
-        .collect()
+/// A generic head, a markup tag and a spaced comparison in one program: three
+/// `<` characters, three different vocabularies, and the head is never a tag
+/// named `str` (which is what E161 was filed about).
+const GENERIC_HEADS_AND_MARKUP: &str = "\
+fun probe(cell: SignalCell<str>, list: List<i32>): View {
+\tlet flag = a < b;
+\t<my-tag>{cell}</my-tag>
 }
+";
 
-/// The one regex under `key`/`field` that contains `needle`. Reds by name when
-/// a rule is reworded out from under a check rather than matching nothing.
-fn textmate_regex_containing(grammar: &Grammar, key: &str, field: &str, needle: &str) -> String {
-    let found: Vec<String> = textmate_regexes(grammar, key, field)
-        .into_iter()
-        .filter(|regex| regex.contains(needle))
-        .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "{TEXTMATE_GRAMMAR}: expected exactly one `{field}` under `{key}` containing {needle:?}, \
-         found {found:?}"
-    );
-    found.into_iter().next().unwrap()
+/// The nested head E161 was filed over, plus the DECLARATION keyword `type` on
+/// the line above it — the contrast the binder rule exists to draw.
+const NESTED_GENERIC_HEAD: &str = "\
+type Feed = i32;
+impl Source<Option<type _: Source<type U>>> for Feed {
 }
+";
+
+/// The one shape the generic list's begin cannot tell from a head: a GLUED
+/// comparison, which the formatter never writes (it spaces every binary
+/// operator) and which appears nowhere in std, the corpus, the examples or the
+/// book. It costs the rest of its own statement, not the rest of the file.
+const GLUED_COMPARISON: &str = "\
+fun probe() {
+\tif a<b { print(\"x\"); }
+\tlet after = 1;
+}
+";
+
+/// E162's exhibit: the one `;` a type argument legitimately contains.
+const FIXED_ARRAY_ARGUMENT: &str = "\
+fun probe(cell: SignalCell<[i32; 4]>) {
+\tlet after = 1;
+}
+";
 
 #[test]
-fn e161_a_generic_head_opens_a_generic_list_and_never_a_tag() {
-    let grammar = textmate_grammar(&[]);
-    // The element rule is the one that read `<type`, `<str`, `<sync` as tags.
-    let tag = textmate_regex_containing(&grammar, "elements", "match", "a-zA-Z0-9_]+)*");
-    let heads = [
-        "Option<type _>",
-        "SignalCell<str>",
-        "Source<Option<type _: Source<type U>>>",
-        "|T| U",
-    ];
-    assert_eq!(
-        regex_matches(&tag, &heads),
-        vec![false; heads.len()],
-        "the element rule still reads a generic head as a tag: {tag}"
-    );
-    // The controls: real markup is still markup.
-    let markup = ["<div>", "</div>", "\tview <li>", "<my-tag>"];
-    assert_eq!(
-        regex_matches(&tag, &markup),
-        vec![true; markup.len()],
-        "the element rule stopped matching an element: {tag}"
-    );
-    // And the generic rule takes the heads the element rule gave up.
-    let open = textmate_regex_containing(&grammar, "generics", "begin", "(?<=[A-Za-z0-9_])<");
-    assert_eq!(
-        regex_matches(&open, &["Option<type _>", "SignalCell<str>", "List<i32>"]),
-        vec![true, true, true],
-        "the generic rule does not open on a head: {open}"
-    );
-    // A spaced comparison is nobody's generic — the formatter spaces every
-    // binary operator, so this is the shape a written comparison has.
-    assert_eq!(
-        regex_matches(&open, &["a < b", "if a < b {", "<div>"]),
-        vec![false, false, false],
-        "the generic rule opens on a comparison: {open}"
-    );
-}
-
-#[test]
-fn e161_the_generic_list_closes_on_a_bracket_and_at_a_statement_boundary() {
-    let grammar = textmate_grammar(&[]);
-    let close = textmate_regex_containing(&grammar, "generics", "end", ">");
-    // A `>` closes one list, so `>>>` closes the three the nesting opened.
-    assert_eq!(regex_matches(&close, &[">", ">>>"]), vec![true, true]);
-    // The bail-outs: characters no type argument contains. A glued comparison
-    // the formatter never writes gives the list back at its own statement
-    // instead of running to the next `>` in the file.
-    assert_eq!(
-        regex_matches(&close, &["{", "}", ";"]),
-        vec![true, true, true],
-        "the generic list has no statement-boundary bail-out: {close}"
-    );
-}
-
-#[test]
-fn e161_the_binder_keyword_is_scoped_as_a_keyword_inside_the_list() {
-    let grammar = textmate_grammar(&[]);
-    let binder = textmate_regex_containing(&grammar, "generics", "match", "(type)");
-    assert_eq!(
-        regex_matches(&binder, &["type T", "type _", "type U>"]),
-        vec![true, true, true],
-        "the binder rule does not match a binder: {binder}"
-    );
-    // A binder is a keyword followed by a NAME; nothing else in a type is.
-    assert_eq!(
-        regex_matches(&binder, &["type>", "type,"]),
-        vec![false, false],
-        "the binder rule matches a bare `type`: {binder}"
-    );
-    let wildcard = textmate_regex_containing(&grammar, "generics", "match", "_(?!");
-    assert_eq!(
-        regex_matches(&wildcard, &["_", "_: Source<type U>", "_>"]),
-        vec![true, true, true],
-        "the wildcard rule does not match `_`: {wildcard}"
-    );
-    // Not a name that merely contains one.
-    assert_eq!(
-        regex_matches(&wildcard, &["_name", "name_", "a_b"]),
-        vec![false, false, false],
-        "the wildcard rule matches part of a name: {wildcard}"
-    );
-}
-
-/// The two orders that decide the outcome, read from the grammar itself: the
-/// generic list is reached before the element rule (so a head is claimed by the
-/// list, not by a tag), and the binder rule is listed before the keyword
-/// include inside the list (so `type` there is the binder scope and not the
-/// declaration-keyword scope that names an item).
-#[test]
-fn e161_the_generic_list_outranks_the_element_rule_and_the_binder_outranks_the_keywords() {
-    const SCRIPT: &str = r#"
-        const grammar = require(process.env.VILAN_FILE);
-        console.log("top\t" + grammar.patterns.map((p) => p.include || "?").join(","));
-        const generics = grammar.repository.generics.patterns[0];
-        console.log("region\t" + generics.patterns.map((p) => p.include || p.name).join(","));
-        console.log("scope\t" + (generics.beginCaptures["0"].name || "?"));
-        console.log("scope\t" + (generics.endCaptures["0"].name || "?"));
-        console.log("scope\t" + (generics.name || "?"));
-    "#;
-    let lines = node(SCRIPT, &repo_root().join(TEXTMATE_GRAMMAR), &[]);
-    let field = |kind: &str| -> Vec<String> {
-        lines
-            .iter()
-            .filter_map(|line| line.strip_prefix(&format!("{kind}\t")))
-            .map(str::to_string)
-            .collect()
+fn e161_a_generic_head_is_a_list_a_tag_is_a_tag_and_a_comparison_is_an_operator() {
+    let Some(painting) = painting(GENERIC_HEADS_AND_MARKUP) else {
+        return;
     };
-    let top = field("top").join("");
-    let generic_at = top
-        .split(',')
-        .position(|entry| entry == "#generics")
-        .expect("the generic list is not included at the top level");
-    let element_at = top
-        .split(',')
-        .position(|entry| entry == "#elements")
-        .expect("the element rules are not included at the top level");
-    assert!(
-        generic_at < element_at,
-        "the element rule is reached before the generic list ({top}), so a head \
-         is claimed as a tag again"
-    );
-    let region = field("region").join("");
-    let binder_at = region
-        .split(',')
-        .position(|entry| entry == "keyword.other.type-binder.vilan")
-        .expect("the binder rule is not inside the generic list");
-    let keywords_at = region
-        .split(',')
-        .position(|entry| entry == "#keywords")
-        .expect("the keyword rules are not included inside the generic list");
-    assert!(
-        binder_at < keywords_at,
-        "the keyword include outranks the binder rule ({region}), so `type` in a \
-         head takes the declaration-keyword scope again"
-    );
-    // The delimiters are one vocabulary, and it is neither the tag's nor the
-    // operator's — the whole point of the item.
+    // The head: its own three scopes, and the argument inside painted as the
+    // type it is.
+    let list = vec![
+        "punctuation.definition.generic.begin.vilan".to_string(),
+        "support.type.primitive.vilan".to_string(),
+        "punctuation.definition.generic.end.vilan".to_string(),
+    ];
+    assert_eq!(painting.scopes_over("<str>"), list, "`SignalCell<str>`");
+    assert_eq!(painting.scopes_over("<i32>"), list, "`List<i32>`");
+    assert_eq!(painting.generic_depth("<str>"), 1);
+    // The markup: `<my-tag>` and its close are tags, and neither is inside a
+    // generic region.
+    let tag = vec![
+        "punctuation.definition.tag.vilan".to_string(),
+        "entity.name.tag.vilan".to_string(),
+        "punctuation.definition.tag.vilan".to_string(),
+    ];
+    assert_eq!(painting.scopes_over("<my-tag>"), tag, "an opening tag");
+    assert_eq!(painting.scopes_over("</my-tag>"), tag, "a closing tag");
+    assert_eq!(painting.generic_depth("<my-tag>"), 0);
+    assert_eq!(painting.generic_depth("</my-tag>"), 0);
+    // The comparison the formatter writes: an operator, neither a list nor a
+    // tag named `b`.
+    assert_eq!(painting.scope_at("< b"), "keyword.operator.vilan");
+}
+
+#[test]
+fn e161_a_nested_head_closes_every_list_and_the_binder_is_a_binder() {
+    let Some(painting) = painting(NESTED_GENERIC_HEAD) else {
+        return;
+    };
+    // `>>>` closes the three lists the nesting opened — three brackets, three
+    // depths, one vocabulary.
     assert_eq!(
-        field("scope"),
+        painting.scopes_over(">>>"),
+        vec!["punctuation.definition.generic.end.vilan".to_string(); 3],
+        "the three closing brackets"
+    );
+    assert_eq!(painting.generic_depth(">>>"), 3, "the innermost list");
+    assert_eq!(painting.generic_depth("<Option<"), 1, "the outermost `<`");
+    // The binder keyword inside a head, at both depths, and the anonymous
+    // binder beside it.
+    assert_eq!(
+        painting.scope_at("type _"),
+        "keyword.other.type-binder.vilan"
+    );
+    assert_eq!(
+        painting.scope_at("type U"),
+        "keyword.other.type-binder.vilan"
+    );
+    assert_eq!(
+        painting.scope_at("_: Source"),
+        "variable.language.wildcard.vilan"
+    );
+    // The contrast: `type` NAMING AN ITEM is the declaration keyword, which is
+    // the scope the binder must not take.
+    assert_eq!(painting.scope_at("type Feed"), "storage.type.vilan");
+}
+
+#[test]
+fn e161_a_glued_comparison_gives_the_list_back_at_the_statement_boundary() {
+    let Some(painting) = painting(GLUED_COMPARISON) else {
+        return;
+    };
+    // The misfire, stated rather than papered over: a glued `<` opens a list.
+    assert_eq!(
+        painting.scope_at("<b {"),
+        "punctuation.definition.generic.begin.vilan"
+    );
+    // And the bail-out, which is what keeps it to one statement: the block's
+    // `{` is outside the region, and everything after it paints normally.
+    assert_eq!(painting.generic_depth("{ print"), 0, "the bail-out");
+    assert_eq!(painting.scope_at("print"), "entity.name.function.vilan");
+    assert_eq!(painting.scope_at("1;"), "constant.numeric.vilan");
+    assert_eq!(painting.generic_depth("1;"), 0, "the next statement");
+}
+
+#[test]
+fn e162_a_fixed_array_argument_stays_inside_the_list() {
+    let Some(painting) = painting(FIXED_ARRAY_ARGUMENT) else {
+        return;
+    };
+    // THE POINT: the array's `;` is the list's own bail-out character, and the
+    // array being its own region is what stops the bail-out from ever being
+    // offered it. Every character of `[i32; 4]` is inside the list.
+    assert_eq!(
+        painting.scopes_over("[i32; 4]"),
         vec![
-            "punctuation.definition.generic.begin.vilan".to_string(),
-            "punctuation.definition.generic.end.vilan".to_string(),
+            "meta.generic.vilan".to_string(),
+            "support.type.primitive.vilan".to_string(),
+            "meta.generic.vilan".to_string(),
+            "constant.numeric.vilan".to_string(),
             "meta.generic.vilan".to_string(),
         ],
-        "the generic list's own scopes moved"
+        "the fixed-array argument"
     );
-}
-
-// --- E162: a fixed-array argument inside a generic head ----------------------
-
-/// `SignalCell<[i32; 4]>` used to end the list at the ARRAY's `;`, because the
-/// enclosing region's statement-boundary bail-out (E161) cannot tell an array's
-/// length separator from the `;` that ends a statement. The array is its own
-/// region now, so the bail-out is never offered that `;` at all — a begin/end
-/// region matches its contained rules and its end pattern at their earliest
-/// position, and the `[` comes first.
-///
-/// A REGEX pin, like E161's five and for E161's reason: a true scope assertion
-/// tokenises with `vscode-textmate`, which is still not in the extension's
-/// `package-lock.json` (E163). The behaviour was verified against the real
-/// tokeniser off-tree while this was written — `[`, `i32`, `;`, `4` and `]` all
-/// carry `meta.generic.vilan` and the closing `>` carries
-/// `punctuation.definition.generic.end.vilan` — and that verification is not
-/// what this file can run.
-#[test]
-fn e162_a_fixed_array_argument_is_its_own_region_inside_the_list() {
-    let grammar = textmate_grammar(&[]);
-    let open = textmate_regex_containing(&grammar, "generics", "begin", "\\[");
+    assert_eq!(painting.generic_depth("; 4"), 1, "the length separator");
+    // The list closes on its own bracket, and the tail is ordinary code again.
     assert_eq!(
-        regex_matches(&open, &["[i32; 4]", "[str; 2]"]),
-        vec![true, true],
-        "the array rule does not open on a fixed array: {open}"
+        painting.scope_at(">) {"),
+        "punctuation.definition.generic.end.vilan"
     );
-    assert_eq!(
-        regex_matches(&open, &["i32", "<str>", "type U"]),
-        vec![false, false, false],
-        "the array rule opens on something that is not an array: {open}"
-    );
-    let close = textmate_regex_containing(&grammar, "generics", "end", "\\]");
-    assert_eq!(
-        regex_matches(&close, &["]"]),
-        vec![true],
-        "the array region does not close on its own bracket: {close}"
-    );
-    // THE POINT: the array's own end must not treat `;` as a boundary, or the
-    // region would give the `;` straight back to the bail-out it exists to
-    // hide. It keeps the brace bail-outs, so an unclosed `[` still gives itself
-    // back at a statement rather than running to the end of the file.
-    assert_eq!(
-        regex_matches(&close, &[";"]),
-        vec![false],
-        "the array region bails out at the length separator: {close}"
-    );
-    assert_eq!(
-        regex_matches(&close, &["{", "}"]),
-        vec![true, true],
-        "the array region has no statement-boundary bail-out: {close}"
-    );
-    // And the enclosing list's own bail-out is untouched — the fix is the new
-    // region, not a weakened boundary (E161's control, restated here because
-    // deleting the `;` from the list's end would ALSO make this item's exhibit
-    // paint correctly, at the cost of the runaway E161 closed).
-    let list_close = textmate_regex_containing(&grammar, "generics", "end", ">");
-    assert_eq!(
-        regex_matches(&list_close, &[";", "{", "}"]),
-        vec![true, true, true],
-        "the generic list lost its statement-boundary bail-out: {list_close}"
-    );
+    assert_eq!(painting.generic_depth(">) {"), 1);
+    assert_eq!(painting.scope_at("1;"), "constant.numeric.vilan");
+    assert_eq!(painting.generic_depth("1;"), 0);
 }
 
 /// The book's twin (the third place). highlight.js has no operator rule, so its
