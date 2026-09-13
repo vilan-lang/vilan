@@ -9463,6 +9463,67 @@ fn b309_a_return_type_carries_the_clause_to_its_caller() {
     );
 }
 
+/// B325: an UNANNOTATED binding of an injected closure is a forward, not an
+/// escape. B309 moved clause resolution ahead of the fixpoint, so `let held =
+/// body;` infers a type that carries the clause and the threading can follow
+/// it exactly as far as it follows the annotated spelling — but the binding
+/// landing rule had stayed keyed on the ANNOTATION, so this earned the
+/// value-flow refusal for a forward the pass could already see was legal. The
+/// annotated form is the control beside it: both run, and both print the
+/// context ambient at the CALL.
+#[test]
+fn b325_an_unannotated_binding_of_an_injected_closure_is_a_forward() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun unannotated(body: (|| void) context current) {
+            let held = body;
+            held();
+        }
+
+        fun annotated(body: (|| void) context current) {
+            let held: (|| void) context current = body;
+            held();
+        }
+
+        fun main() {
+            current.run(5, || unannotated(|| print(i"saw {current.get()}")));
+            current.run(6, || annotated(|| print(i"saw {current.get()}")));
+        }
+        main();
+        "#,
+        "saw 5\nsaw 6\n",
+    );
+}
+
+/// B325 changes what an unannotated binding means, and nothing about a
+/// MISMATCHED one: a value carrying one clause bound at an annotation
+/// demanding another is still refused, naming both.
+#[test]
+fn b325_a_mismatched_clause_at_a_binding_is_still_refused_naming_both() {
+    assert_fails_with(
+        r#"
+        import std::context::Context;
+
+        let left: Context<i32> = Context::new();
+        let right: Context<i32> = Context::new();
+
+        fun forward(body: (|| void) context left) {
+            let held: (|| void) context right = body;
+            held();
+        }
+
+        fun main() {}
+        main();
+        "#,
+        "this value carries `context left` and this binding demands `context right`",
+    );
+}
+
 /// A clause is matched, not merely present: forwarding a value carrying one
 /// clause into a position demanding another is refused, and the refusal names
 /// both clauses rather than saying only what the position takes.

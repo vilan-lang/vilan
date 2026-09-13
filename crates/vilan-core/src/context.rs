@@ -1188,9 +1188,17 @@ fn analyze(
         // defers exactly like a literal in a clause parameter position; a
         // same-clause value initializer is a forward; anything else is an
         // escape the threading cannot follow.
-        for (&binding_id, clause) in &program.parameter_contexts {
-            let Some(variable) = program.variables.get(&binding_id) else {
-                // Parameters share the map but have no variable record.
+        //
+        // B325: over the bindings whose TYPE carries the clause, not over the
+        // ANNOTATED ones. B309 moved clause resolution before the fixpoint, so
+        // `let held = injected;` infers a type that carries the clause and the
+        // threading can follow it exactly as far as it follows the annotated
+        // spelling — but the rule had stayed keyed on the annotation, so the
+        // unannotated binding earned the value-flow refusal for a forward the
+        // pass could see was legal. The two spellings agree now, and a
+        // MISMATCHED clause is refused in both.
+        for (&binding_id, variable) in &program.variables {
+            let Some(clause) = value_contexts.get(&binding_id).cloned() else {
                 continue;
             };
             let Some(initial) = variable.initial else {
@@ -1198,16 +1206,25 @@ fn analyze(
             };
             match program.entity_map.get(&initial) {
                 Some(Expr::Closure(closure_id)) => {
-                    for &context in clause {
+                    for &context in &clause {
                         deferred.entry(context).or_default().insert(*closure_id);
                     }
                 }
-                Some(Expr::Local(source))
-                    if program.parameter_contexts.get(source) == Some(clause) =>
-                {
+                // B325: an UNANNOTATED binding's clause came FROM the
+                // initializer — there is no annotation for the value to
+                // disagree with, so the binding is a forward by construction
+                // and there is nothing to match. (Its sub-expressions are
+                // policed on their own: `let x = if c { injected } else { .. }`
+                // admits the `if`, which carries nothing, and the `injected`
+                // appearance inside the leg still answers to the value-flow
+                // restriction.)
+                _ if !variable.annotated => {
                     allowed_forwards.insert(initial);
                 }
-                Some(expr) if field_read_clause(program, expr).as_deref() == Some(clause) => {
+                Some(Expr::Local(source)) if value_contexts.get(source) == Some(&clause) => {
+                    allowed_forwards.insert(initial);
+                }
+                Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
                     allowed_forwards.insert(initial);
                 }
                 _ => {
@@ -1217,7 +1234,7 @@ fn analyze(
                     errors.push(anchored(
                         program,
                         initial,
-                        landing_refusal(program, "binding", clause, found.as_deref()),
+                        landing_refusal(program, "binding", &clause, found.as_deref()),
                     ));
                 }
             }
