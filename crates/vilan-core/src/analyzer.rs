@@ -1803,6 +1803,28 @@ pub struct Implementation<'src> {
 /// it, and the EXTENDING module for an extension impl. Both fall out of asking
 /// whether this block's subject name resolves, in this block's own scope, to
 /// the type the path walked to.
+///
+/// **M69: shared by reference, not copied.** Every `Analyzer` clone — and the
+/// base cache takes one per HIT, per analysis, on the keystroke path — used to
+/// deep-copy this vector's every block, each with its own `members` allocation:
+/// std's closure alone registers hundreds of them, for ~60 KB of pure copy that
+/// nothing then writes to. The blocks are append-only and immutable once
+/// registered (`declarations` is final at the point the walk pushes one), so an
+/// [`std::sync::Arc`] per block is the whole fix: a clone bumps refcounts and
+/// allocates ONE vector of pointers, and a warm analysis that registers the
+/// entry's own impls pushes beside the shared ones rather than deep-copying
+/// them first. `Arc` and not `Rc` because a stored world crosses threads (the
+/// base cache is a global `Mutex`, and M35 puts a workspace's members on their
+/// own threads).
+///
+/// Measured on the clone path, callgrind Ir over one WARM re-analysis of kolt's
+/// `client.vl` (`m58_warm_reanalysis_profile`, the `profiling` build — Ir does
+/// not move with the load average, which is why the claim is in instructions):
+/// `Analyzer::clone` 66,881,118 → 66,833,191 Ir, **−47,927**, and the whole
+/// re-analysis 4,686,308,110 → 4,686,018,804. Small, exactly as the item said
+/// it would be — about 160 blocks and the ~60 KB they hold — and the part that
+/// is not in the Ir figure is the allocation COUNT: one malloc per block per
+/// clone, per analysis of every open document, gone.
 #[derive(Debug, Clone)]
 struct ImplNamespace<'src> {
     /// The subject's written head name (`impl Length<..>` -> `Length`).
@@ -3395,7 +3417,11 @@ pub struct Analyzer<'src> {
     /// [`ImplNamespace`]. Written where `implementations` grows, for the reason
     /// `implementations_by_member` is, and read only by the import and `use`
     /// walks, which run before an impl's subject has a type at all.
-    impl_namespaces: Vec<ImplNamespace<'src>>,
+    ///
+    /// M69: one [`std::sync::Arc`] per block, so the clone this rides on (the
+    /// base cache's, per hit) copies pointers rather than every block's member
+    /// list.
+    impl_namespaces: Vec<std::sync::Arc<ImplNamespace<'src>>>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -28202,11 +28228,14 @@ impl<'src> Analyzer<'src> {
                 // list, a bare `&T`) contributes no namespace, which is right:
                 // an import path can only spell a name.
                 if let Some(subject_name) = impl_subject_head {
-                    self.impl_namespaces.push(ImplNamespace {
-                        subject_name,
-                        scope_id,
-                        members: declared_members.clone(),
-                    });
+                    // M69: shared, not copied — every `Analyzer` clone used to
+                    // deep-copy each block's member list.
+                    self.impl_namespaces
+                        .push(std::sync::Arc::new(ImplNamespace {
+                            subject_name,
+                            scope_id,
+                            members: declared_members.clone(),
+                        }));
                 }
                 self.implementations.push(Implementation {
                     subject,
@@ -51022,8 +51051,8 @@ struct BaseCacheState {
     /// editor sits — a budget one world short of the session's cycle evicts
     /// the world the next visit wants, every visit — and the document the user
     /// is LOOKING AT is the one visit that must not pay for it. Two entries on
-    /// the server's own rule ([`RETAINED_PROGRAMS`](../../vilan-lsp) is 2), so
-    /// the exemption is bounded by the retention rule rather than by this map.
+    /// the language server's own retention rule (`RETAINED_PROGRAMS` is 2), so
+    /// the exemption is bounded by that rule rather than by this map.
     ///
     /// Canonical paths, because the declaration comes from a URI and the
     /// admission from an analysis's entry path, and those two spell the same
