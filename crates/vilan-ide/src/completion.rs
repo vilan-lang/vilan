@@ -3183,6 +3183,15 @@ impl DocParagraphs {
     fn build(program: &Program) -> DocParagraphs {
         // (declaration, name-span start), grouped by declaring source, so a
         // module's text is read once however many declarations it carries.
+        //
+        // M65: `source_of` is a LINEAR scan of `source_ranges`, and this loop
+        // asks it once per declaration in the whole program — on kolt's client
+        // that is the bulk of the 14,580 calls the index build makes, against
+        // about sixty ranges. `source_lookup` is the same question answered by a
+        // binary search that verifies the ranges are ascending and disjoint and
+        // falls back to the very scan otherwise, so it is answer-identical by
+        // construction (M27, pinned since M58).
+        let source_of = program.source_lookup();
         let mut by_source: HashMap<SourceId, Vec<(Id, usize)>> = HashMap::default();
         let declarations = program
             .functions
@@ -3195,7 +3204,7 @@ impl DocParagraphs {
                     .map(|(id, external)| (*id, external.name_span)),
             );
         for (id, name_span) in declarations {
-            let Some(source) = program.source_of(id) else {
+            let Some(source) = source_of.of(id) else {
                 continue;
             };
             // The entry (and the derived sentinel, which has no file) render
@@ -3564,6 +3573,10 @@ struct CapturedImportEdit {
 
 impl AutoImportOrder {
     fn build(program: &Program, analyzed: &str) -> AutoImportOrder {
+        // M65, as in [`DocParagraphs::build`]: the declares-it test below is
+        // asked once per NAME in every module of `std` and `pkg`, and
+        // `source_of` is a linear scan.
+        let source_of = program.source_lookup();
         let mut modules: Vec<AutoImportModule> = Vec::new();
         let mut candidates: Vec<AutoImportCandidate> = Vec::new();
         for root in ["std", "pkg"] {
@@ -3584,7 +3597,7 @@ impl AutoImportOrder {
                 let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
                     continue;
                 };
-                let child_source = program.source_of(child_id);
+                let child_source = source_of.of(child_id);
                 let module = modules.len() as u32;
                 modules.push(AutoImportModule {
                     path: vec![root.to_string(), child_module.name.to_string()],
@@ -3592,7 +3605,7 @@ impl AutoImportOrder {
                 for (&name, &entity_id) in &child_scope.name_to_id_map {
                     // Only a name this module DECLARES is an add-import target;
                     // a re-export names an item that lives somewhere else.
-                    if program.source_of(entity_id) != child_source {
+                    if source_of.of(entity_id) != child_source {
                         continue;
                     }
                     let kind = kind_of(program, entity_id);

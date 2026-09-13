@@ -5410,12 +5410,12 @@ fn style_chain_links<'a, 'src>(
 /// desugar's own scope-independent spelling (B270), which a `css` block's
 /// lowering seeds its chain with.
 fn names_the_style_seed(callee: &Node<'_>) -> bool {
-    match callee {
-        Node::Accessor("style") => true,
-        Node::StaticAccessor(_, "style", None) => true,
-        Node::StdItem("style", "style") => true,
-        _ => false,
-    }
+    matches!(
+        callee,
+        Node::Accessor("style")
+            | Node::StaticAccessor(_, "style", None)
+            | Node::StdItem("style", "style")
+    )
 }
 
 /// The links of a chain written over `self` — the shape every convertible
@@ -6402,6 +6402,86 @@ pub(crate) mod tests {
             program.entity_map.len(),
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M65's half of the same promise: the ids `CompletionIndex::build` asks
+    /// about get the same answer from the hoisted lookup as from the scan.
+    ///
+    /// The index build is the residue M58's own profile named — it asked
+    /// `Program::source_of` 14,580 times for 7.5 M Ir on kolt's client, a
+    /// LINEAR scan of `source_ranges` re-run once per row — and the hoist is
+    /// the identical one, so the pin is the identical one too, narrowed to this
+    /// build's own population: every FUNCTION and EXTERNAL (`DocParagraphs`
+    /// groups its declarations by declaring source), and every name bound in a
+    /// top-level module of `std` and `pkg` (`AutoImportOrder` keeps only the
+    /// names a module DECLARES, which is `source_of(entity) == source_of(the
+    /// module)` — a comparison of two answers, so a lookup that disagreed with
+    /// the scan on either side would change which names are offered).
+    #[test]
+    fn the_hoisted_lookup_answers_the_completion_index_build_the_same_way() {
+        let _guard = base_cache_guard();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::rows::Row;\n\n\
+                 fun main() {\n\tlet row = Row { label: \"a\" };\n\tprint(row.label);\n}\n",
+            ),
+            ("rows.vl", "struct Row {\n\tlabel: str,\n}\n"),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("the fixture analyzes cleanly");
+        let lookup = program.source_lookup();
+        let mut checked = 0usize;
+        let check = |id: Id| {
+            assert_eq!(
+                lookup.of(id),
+                program.source_of(id),
+                "the hoisted lookup and the scan disagree about id {}",
+                id.0,
+            );
+        };
+        for id in program.functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.external_functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for root in ["std", "pkg"] {
+            let Some(root_module_id) = program.module_id_by_name.get(root) else {
+                continue;
+            };
+            check(*root_module_id);
+            let Some(root_module) = program.modules.get(root_module_id) else {
+                continue;
+            };
+            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
+                continue;
+            };
+            for child_id in root_scope.name_to_id_map.values() {
+                check(*child_id);
+                checked += 1;
+                let Some(child_module) = program.modules.get(child_id) else {
+                    continue;
+                };
+                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
+                    continue;
+                };
+                for entity_id in child_scope.name_to_id_map.values() {
+                    check(*entity_id);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 500,
+            "a std-using two-module program should reach more than {checked} of the index \
+             build's ids — a pin that checks a handful is not checking the hoist",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
