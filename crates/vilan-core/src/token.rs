@@ -17,6 +17,12 @@ pub enum Token<'src> {
     External,
     For,
     Fun,
+    // `#` — the import REACH marker (B318 §2.3): `import a::{ #hidden };`
+    // deliberately imports an item its module does not export. It lexes
+    // unconditionally, like every other token: a `#` inside a `css` block is
+    // refused by the block's own parser, which is the only place that knows it
+    // is a colour (`lexical.md` §2.5 — lexing is context-free).
+    Hash,
     Ident(&'src str),
     If,
     Impl,
@@ -68,6 +74,7 @@ impl std::fmt::Display for Token<'_> {
             Token::External => write!(f, "external"),
             Token::For => write!(f, "for"),
             Token::Fun => write!(f, "fun"),
+            Token::Hash => write!(f, "#"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::If => write!(f, "if"),
             Token::Impl => write!(f, "impl"),

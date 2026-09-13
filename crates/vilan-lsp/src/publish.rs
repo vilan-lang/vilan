@@ -753,7 +753,7 @@ mod tests {
                 "main.vl",
                 "import pkg::helper::{ alpha, beta };\nfun main() {\n\talpha();\n}\n",
             ),
-            ("helper.vl", "fun alpha() {}\nfun beta() {}\n"),
+            ("helper.vl", "export *;\n\nfun alpha() {}\nfun beta() {}\n"),
         ]);
         let uri = Url::from_file_path(directory.join("main.vl")).expect("a file URL");
         let published = PublishState::new()
@@ -1429,7 +1429,10 @@ mod tests {
                 "main.vl",
                 "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
-            ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
+            (
+                "broken.vl",
+                "export *;\n\nfun answer(): i32 {\n\t\"not a number\"\n}\n",
+            ),
         ]);
         let (minted_module_uri, module_document) = open(&dir, "broken.vl");
         let (main_uri, main_document) = open(&dir, "main.vl");

@@ -240,6 +240,42 @@ const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as
 pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
+/// The rule `[doc(hidden)]` breaks (B318 §7.5, RULED 2026-09-13). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling.
+///
+/// The marker's one purpose — "callable, but omitted from editor completion" —
+/// is, word for word, what a PRIVATE item now is, so the two overlap completely
+/// and one of them has to go. It is also the one that never worked: it parsed,
+/// landed on `Function::doc_hidden`, was round-tripped by the formatter, was
+/// pinned callable and was recommended by `appendix/editor.md`, and NOTHING in
+/// `vilan-ide` or `vilan-lsp` ever read it — a promise the tool did not keep,
+/// for as long as it existed.
+const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already \
+     reachable and absent from completion, which is the whole of what this marker meant — delete \
+     it, and write `export` on the names consumers are meant to find";
+
+/// The rule a `#` inside a `css` block's VALUE breaks — `HASH_IS_NOT_A_TOKEN`'s
+/// successor (B318 §2.3). Curated (diagnostics-standard.md B6: the prohibition
+/// explains itself and names the sanctioned spelling).
+///
+/// The refusal used to live in the LEXER, unconditionally, which made it a
+/// context-free rule giving context-ful advice: an author writing
+/// `import a::{ #hidden }` was told about hex colours. B318 takes `#` as the
+/// import reach marker, so the byte lexes now and the colour rule moves to the
+/// one place that knows a `#` IS a colour — the block's own value parser. A `#`
+/// there would otherwise be swallowed into a value's text run and emitted as a
+/// raw hex literal, which is the one spelling that can leave the token system
+/// silently.
+///
+/// Public because the language server's quickfix keys on it (css-block S5,
+/// §7.2 fix 1) — one constant rather than a second copy to drift from. The
+/// diagnostic is ONE character wide, exactly as the lexer's was, so the fix
+/// still reads the colour off the text starting at the `#`.
+pub const HASH_IS_NOT_A_CSS_VALUE: &str = "`#` is not a colour here: in a `css` block a colour is a hole — \
+     `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
+     own `:root` line";
+
 /// The rule `export <expression>;` breaks (B321). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spellings).
@@ -273,6 +309,13 @@ const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-sepa
      optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins \
      none of those";
 
+/// REWRITTEN for B318 (§7.4): every sentence of the old text became false on
+/// the day the marker gained meaning. It said "a module's items are importable
+/// as they stand … so the fix is to delete the word", and the fix is not to
+/// delete the word — it is to WRITE the marker vilan does have. This is the
+/// message a Rust or Swift writer meets in their first hour, which makes it the
+/// most user-visible line in the whole feature.
+///
 /// The rule a program written with a Rust/Swift visibility marker breaks.
 /// Curated (diagnostics-standard.md B6 — the prohibition explains itself and
 /// names the sanctioned spelling): `pub` is an ordinary identifier here, so
@@ -321,10 +364,11 @@ fn export_takes(node: &Node<'_>) -> bool {
 
 fn visibility_marker_rule(marker: &str) -> String {
     format!(
-        "`{marker}` is not a vilan keyword: a module's items are importable as they stand — \
-         `import pkg::util::helper;` reaches `fun helper` with nothing marking it — so the \
-         fix is to delete the word. (`export` exists, but it RE-exports something this \
-         module imported: `export import pkg::io::panic;`.)"
+        "`{marker}` is not a vilan keyword: the marker is `export`, so write \
+         `export fun helper()` — an item a module does not export is the module's own, and \
+         stays reachable to anyone who asks for it deliberately \
+         (`import pkg::util::{{ #helper }};`). (`export` also RE-exports something this module \
+         imported: `export import pkg::io::panic;`.)"
     )
 }
 
@@ -3696,6 +3740,23 @@ impl<'a, 'src> Parser<'a, 'src> {
                 end = close.end;
                 continue;
             }
+            // B318 §2.3: a `#` lexes now, and a value's loop consumes any token
+            // as TEXT — so without this the block would emit `color: #333` as a
+            // raw hex literal, silently, which is exactly what the lexer's
+            // refusal existed to stop. Reported at the `#` alone (the span the
+            // quickfix reads the colour off) and then consumed as text, so the
+            // declaration still lowers and the block raises one diagnostic.
+            if self.peek_is(&Token::Hash) {
+                self.errors.push(ParseError {
+                    span: self.here_span(),
+                    reason: ParseErrorReason::Rule(HASH_IS_NOT_A_CSS_VALUE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+                end = self.here_span().end;
+                self.bump();
+                continue;
+            }
             // `!important` is refused permanently and with its fix: merge is a
             // record update, so a `Style` that needed it would be a `Style` that
             // had lost the property the whole model is for (§10). Consumed with
@@ -5143,7 +5204,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     // --- Functions -----------------------------------------------------------
 
     /// A function declaration: the ORDERED attribute prefix (`[deprecated(..)]`,
-    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[doc(hidden)]`,
+    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`,
     /// `[platform(..)]` — each optional but IN THIS ORDER, a faithful quirk),
     /// then `async? external?
     /// fun name generics? (params) (: return)? (borrows param)? (block | ;)`.
@@ -5157,7 +5218,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let must_use = self.eat_marker_attribute("must_use");
         let rpc = self.eat_marker_attribute("rpc");
         let trait_only = self.eat_marker_attribute("trait_only");
-        let doc_hidden = self.parse_doc_hidden_attribute();
+        self.refuse_doc_hidden_attribute();
         let platform_fence = self.parse_platform_attribute().unwrap_or_default();
         let is_async = self.eat(&Token::Async);
         let external = self.eat(&Token::External);
@@ -5326,7 +5387,6 @@ impl<'a, 'src> Parser<'a, 'src> {
                 must_use,
                 rpc,
                 trait_only,
-                doc_hidden,
                 platform_fence,
                 generic_parameters,
                 parameters,
@@ -5977,6 +6037,18 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// can follow one — `a::b as c::d` does not parse, and the tail type says
     /// so. It reaches a brace element by the same production: `{ a as b, c }`.
     fn parse_namespace_single_path(&mut self) -> Option<ImportBranch<'src>> {
+        // B318 §1/§2.3: `#` before a segment is the REACH marker — "I know this
+        // is not exported and I want it anyway". It wraps whatever follows
+        // rather than becoming part of it, so it composes with a leaf
+        // (`{ #hidden }`), with a segment mid-path (`a::#m::helper`) and with
+        // S3's selector, and it adds no path segment — which is what keeps
+        // go-to-definition, find-references and RENAME pointing at the name.
+        if self.peek_is(&Token::Hash) {
+            let marker = self.here_span();
+            self.bump();
+            let inner = self.parse_namespace_single_path()?;
+            return Some(ImportBranch::Reach(marker, Box::new(inner)));
+        }
         let start = self.position;
         let name = self.eat_name()?;
         let name_span = self.span_from(start);
@@ -6383,10 +6455,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
-    /// `[doc(hidden)]` — a tooling marker (omit from completion). Returns whether it
-    /// is present.
-    fn parse_doc_hidden_attribute(&mut self) -> bool {
-        self.attempt(|parser| {
+    /// `[doc(hidden)]` — RETIRED (B318 §7.5). Recognized and REFUSED, rather
+    /// than simply deleted from the grammar: the attribute is in the wild (the
+    /// book recommended it), and "found `[` expected `fun`" would tell its
+    /// author nothing. Consumed, so the item below it parses normally and the
+    /// file raises one diagnostic rather than cascading.
+    fn refuse_doc_hidden_attribute(&mut self) {
+        let start = self.position;
+        let refused = self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("doc")) {
                 return None;
@@ -6400,8 +6476,15 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(())
-        })
-        .is_some()
+        });
+        if refused.is_some() {
+            self.errors.push(ParseError {
+                span: (self.token_span(start).start..self.token_span(self.position - 1).end).into(),
+                reason: ParseErrorReason::Rule(DOC_HIDDEN_IS_SUPERSEDED),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
     }
 
     /// `[platform("a", "b")]` — a platform fence (≥1 string patterns, allow-trailing),
@@ -7783,9 +7866,11 @@ mod tests {
     #[test]
     fn function_attributes_are_recognized_in_fixed_order() {
         // The full ordered attribute prefix (`deprecated`, `extern`, `must_use`,
-        // `rpc`, `trait_only`, `doc(hidden)`, `platform`) on one external function.
+        // `rpc`, `trait_only`, `platform`) on one external function.
+        // `[doc(hidden)]` used to sit between `trait_only` and `platform`; B318
+        // retired it, and its slot in the order is refused rather than read.
         match only_item(
-            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\")] external fun serve();",
+            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [platform(\"@process\")] external fun serve();",
         ) {
             Node::Func(function) => {
                 assert!(matches!(
@@ -7795,9 +7880,7 @@ mod tests {
                         symbol: "createServer"
                     })
                 ));
-                assert!(
-                    function.must_use && function.rpc && function.trait_only && function.doc_hidden
-                );
+                assert!(function.must_use && function.rpc && function.trait_only);
                 assert_eq!(function.deprecated, Some("use serve_all()"));
                 assert_eq!(function.platform_fence.len(), 1);
                 assert!(function.external);
@@ -8218,6 +8301,86 @@ mod tests {
         // rest still parses — one error, the skipped BEL).
         let errors = rendered_errors("fun main() { \u{0007} }\n");
         assert_eq!(errors, vec!["found '\\u{7}' expected a token".to_string()]);
+    }
+
+    #[test]
+    fn the_reach_marker_lexes_parses_and_reprints() {
+        // B318 §2.3 — the bill for `#`, paid. It marks a LEAF, a segment
+        // mid-path (§10 d: a private `mod` is reachable), and a brace-set
+        // element; `use` shares the grammar; and every one round-trips through
+        // `vilan fmt` unchanged, because the marker is a fact about the author's
+        // intent rather than a formatting decision — stripping it would silently
+        // re-arm the plain-reach warning.
+        for source in [
+            "import pkg::a::{ #hidden };\n",
+            "import pkg::a::#hidden;\n",
+            "import pkg::a::#m::helper;\n",
+            "import pkg::a::{ shown, #hidden, other };\n",
+            "use pkg::a::{ #hidden };\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        // The marker adds no path SEGMENT — it wraps the branch — which is what
+        // keeps go-to-definition, find-references and rename pointing at the
+        // name.
+        let marked = only_item("import pkg::a::#hidden;");
+        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg))) = &marked
+        else {
+            panic!("the path reads as written: {marked:?}");
+        };
+        let ImportBranch::Path("a", _, ImportTail::Continue(after_a)) = after_pkg.as_ref() else {
+            panic!("the path reads as written: {marked:?}");
+        };
+        assert!(
+            matches!(after_a.as_ref(), ImportBranch::Reach(_, _)),
+            "the marker wraps the branch it marks: {marked:?}"
+        );
+        // fmt keeps it, and collapses a marked singleton set exactly as it
+        // collapses a plain one.
+        assert_eq!(
+            crate::formatter::format("import pkg::a::{ #hidden };\n"),
+            "import pkg::a::#hidden;\n"
+        );
+        assert_eq!(
+            crate::formatter::format("import pkg::a::{ shown, #hidden, other };\n"),
+            "import pkg::a::{ #hidden, other, shown };\n"
+        );
+        assert_eq!(
+            crate::formatter::format("import pkg::a::#m::helper;\n"),
+            "import pkg::a::#m::helper;\n"
+        );
+    }
+
+    #[test]
+    fn a_hash_in_a_css_value_still_reports_the_colour_rule() {
+        // The rule the lexer used to carry, re-homed (B318 §2.3). It must stay
+        // ONE character wide — the language server reads the colour off the text
+        // starting there — and it must still fire, because a `css` value's loop
+        // consumes any token as TEXT and would otherwise emit `color: #333` as a
+        // raw hex literal, silently.
+        let (_tree, errors) = parse("fun main() { let s = css { color: #333; }; }\n");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(render(&errors[0]), HASH_IS_NOT_A_CSS_VALUE);
+        assert_eq!(
+            errors[0].span.into_range().len(),
+            1,
+            "one character wide, so the fix can read the colour off the text"
+        );
+        // The sanctioned spelling is clean.
+        assert!(
+            rendered_errors("fun main() { let s = css { color: {Color::hex(\"#333\")}; }; }\n")
+                .is_empty()
+        );
+        // And `#` outside an import and outside a `css` block still refuses —
+        // as a PARSE error now, since the byte lexes.
+        assert_eq!(
+            rendered_errors("fun main() { let x = # 3; }\n"),
+            vec!["found '#' expected an expression".to_string()]
+        );
     }
 
     #[test]

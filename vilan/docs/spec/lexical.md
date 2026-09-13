@@ -203,6 +203,10 @@ Two token classes:
   operator tokens; conversely `a+-b` lexes as `a`, `+-`, `b` and is a parse
   error.
 - **Control tokens**: the single characters `( ) [ ] { } < > ; , .`.
+- **`#`**, a token of its own: the import **reach** marker,
+  `import pkg::a::{ #hidden };` (spec §4.3). It is in neither run — it
+  never joins an operator run and never joins a name — so it is always
+  exactly one token wherever it is written.
 
 `<` and `>` are control tokens (they delimit generics), not operator
 characters. Consequently `<=`/`>=` lex as `<`/`>` followed by `=`, and the
@@ -219,18 +223,26 @@ same: a property name is that identical span-adjacent run, and a
 dimension such as `1px` or `1.5rem` was already one number token (§2.3),
 so CSS's own value shape needed nothing new.
 
-**`#` and `@` are in neither class, and lex as nothing at all.** They
-belong to no run and open no literal, so either one is a lex error
-wherever it is written — including inside a `css` block, which cannot
-change that, because lexing finishes before any parser exists (§2.5).
-The two consequences are stated rather than worked around, and each
-diagnostic names its spelling: a colour is a hole,
-`color: {Color::hex("#333")};`, which routes the value through the
-`Color` type that carries its own `:root` line; and a block has no
-at-rules, so a media query is a breakpoint condition rule
-(`.md { … }`) and a declaration block under a selector of your own is
-`std::style::declare`. `#id` selectors are unwritable for the same
-reason; `[id="x"]` is the spelling.
+**`@` is in none of these classes, and lexes as nothing at all.** It
+belongs to no run and opens no literal, so it is a lex error wherever it
+is written — including inside a `css` block, which cannot change that,
+because lexing finishes before any parser exists (§2.5). The consequence
+is stated rather than worked around and the diagnostic names the
+spelling: a block has no at-rules, so a media query is a breakpoint
+condition rule (`.md { … }`) and a declaration block under a selector of
+your own is `std::style::declare`.
+
+**`#` lexes, and a `css` block refuses it.** The byte is a token — the
+import reach marker — so the lexer has nothing to say about it, and the
+question "is this a colour or a reach?" is answered where the answer
+exists: inside a `css` block's value, a `#` is the hex-colour mistake and
+the block's own parser refuses it, naming the hole that routes the value
+through the `Color` type that carries its own `:root` line
+(`color: {Color::hex("#333")};`). That is the rule §2.5 demands, taken
+seriously in both directions: the LEXER cannot know which of the two it
+is looking at, so it does not guess, and the parser, which does know,
+decides. `#id` selectors are still unwritable inside a block;
+`[id="x"]` is the spelling.
 
 ## 2.5 Trivia and token separation
 

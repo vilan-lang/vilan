@@ -149,6 +149,9 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     fn leaf_names<'a>(branch: &'a ImportBranch, into: &mut Vec<&'a str>) {
         match branch {
             ImportBranch::Path(name, _, _) => into.push(name),
+            // The reach marker adds no segment: the name a module must declare
+            // is the one under it.
+            ImportBranch::Reach(_, inner) => leaf_names(inner, into),
             ImportBranch::Set(branches) => {
                 for branch in branches {
                     leaf_names(branch, into);
@@ -188,6 +191,9 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
                     declares(&browser_file, name)
                         && !twin_files.iter().any(|file| declares(file, name))
                 })
+            }
+            ImportBranch::Reach(_, inner) => {
+                child_is_browser_evidence(inner, browser_root, other_roots)
             }
             ImportBranch::Set(branches) => branches
                 .iter()
@@ -583,7 +589,6 @@ fn analyze_source_unfenced(
                     platform_fence: Vec::new(),
                     rpc: false,
                     trait_only: false,
-                    doc_hidden: false,
                     generic_parameters: None,
                     parameters: (Vec::new(), head),
                     return_type: Some(Box::new((Node::Accessor("Source"), head))),

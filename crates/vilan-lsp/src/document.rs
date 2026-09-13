@@ -13,7 +13,7 @@ use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
-use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, HASH_IS_NOT_A_TOKEN, tokenize};
+use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, tokenize};
 use vilan_core::node::{Convention, CssDeclaration, CssItem, CssValuePiece, Node};
 use vilan_core::parsing::IMPORTANT_HAS_NO_PLACE;
 use vilan_core::{
@@ -5277,15 +5277,19 @@ impl Document {
                     span: semicolon_span,
                     replacement: String::new(),
                 });
-            } else if diagnostic.msg.starts_with(HASH_IS_NOT_A_TOKEN)
+            } else if diagnostic
+                .msg
+                .starts_with(vilan_core::parsing::HASH_IS_NOT_A_CSS_VALUE)
                 && let Some(span) = hex_colour_span(&self.text, diagnostic.span.start)
             {
-                // css-block S5, §7.2 fix 1. The lexer is context-free, so the
-                // diagnostic is ONE character wide (`#`) — the colour it
-                // belongs to is read off the text here, and the fix is the
-                // hole spelling the diagnostic already names, so the two
-                // cannot disagree (E58c's rule, applied to a curated rule
-                // instead of a note).
+                // css-block S5, §7.2 fix 1. B318 §2.3 moved the refusal off the
+                // lexer and onto the `css` block's own value parser — `#` is the
+                // import reach marker now, and the lexer had no way to know
+                // which of the two it was looking at — so this keys on the
+                // parser's constant. The diagnostic is still ONE character wide
+                // (`#`), which is what lets the colour be read off the text
+                // here, and the fix is still the hole spelling the diagnostic
+                // names, so the two cannot disagree (E58c's rule).
                 let hole = format!("{{Color::hex(\"{}\")}}", &self.text[span.into_range()]);
                 fixes.push(QuickFix {
                     title: format!("Wrap as `{hole}`"),
@@ -5309,6 +5313,42 @@ impl Document {
                 fixes.push(QuickFix {
                     title: "Remove `!important`".to_string(),
                     span: Span::from(start..diagnostic.span.end),
+                    replacement: String::new(),
+                });
+            }
+        }
+        // B318 §5: the two reach WARNINGS carry fixes of their own, and a
+        // warning is not in `diagnostics` — deliberately, because 62 sites gate
+        // on `diagnostics.is_empty()` and a warning must not disable Organize
+        // Imports. Both edits are one character in THIS file, which is what
+        // makes them expressible: the third fix the paper names, "Export `S`",
+        // edits the declaration wherever it lives and needs a cross-file
+        // `QuickFix` the type does not have.
+        for (index, warning) in self.warnings.iter().enumerate() {
+            if self
+                .warning_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+                || !spans_overlap(warning.span, range)
+            {
+                continue;
+            }
+            if warning.msg.contains(REACH_IS_UNMARKED) {
+                let at = warning.span.start;
+                let leaf = &self.text[warning.span.into_range()];
+                fixes.push(QuickFix {
+                    title: format!("Import as `#{leaf}`"),
+                    span: Span::from(at..at),
+                    replacement: "#".to_string(),
+                });
+            } else if warning.msg.ends_with(REACH_IS_REDUNDANT)
+                && self.text[..warning.span.start].ends_with('#')
+            {
+                fixes.push(QuickFix {
+                    title: "Delete the `#`".to_string(),
+                    span: Span::from(warning.span.start - 1..warning.span.start),
                     replacement: String::new(),
                 });
             }
@@ -5578,6 +5618,14 @@ pub struct QuickFix {
     pub span: Span,
     pub replacement: String,
 }
+
+/// The sentence B318 §5's plain-reach warning carries, and the key the "mark
+/// the reach" fix reads it by — one fragment of the analyzer's own message
+/// rather than a second copy of it to drift from.
+const REACH_IS_UNMARKED: &str = "Importing it anyway is allowed — mark the reach:";
+
+/// Its twin: the marker written on an item that is exported anyway.
+const REACH_IS_REDUNDANT: &str = "the reach marker is redundant — delete the `#`";
 
 /// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
 /// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
@@ -7330,10 +7378,13 @@ pub(crate) mod tests {
         fixes
     }
 
-    // §7.2 fix 1. `#` cannot lex — lexing is context-free and finishes before
-    // the parser exists (§4.1) — so the diagnostic is ONE CHARACTER wide and
-    // the fix reads the colour off the text itself. It rewrites the whole run,
-    // into the hole spelling the diagnostic already names.
+    // §7.2 fix 1. B318 §2.3 moved the refusal off the LEXER — `#` is the import
+    // reach marker now, and a context-free lexer cannot tell a colour from a
+    // reach — and onto the `css` block's own value parser, which can. The
+    // diagnostic is still ONE CHARACTER wide, which is what lets the fix read
+    // the colour off the text itself, and it still rewrites the whole run into
+    // the hole spelling the diagnostic names; this test is what holds the
+    // re-keying to the same answer.
     #[test]
     fn quickfix_wraps_a_hex_colour_as_a_colour_hole() {
         let fixes = css_block_fixes("\tcss {\n\t\tcolor: #336699;\n\t}\n");
@@ -7364,6 +7415,75 @@ pub(crate) mod tests {
                 "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
             );
         }
+    }
+
+    // B318 §5: the two reach warnings carry one-character fixes, and a WARNING
+    // is not in `diagnostics` — deliberately, since 62 sites gate on
+    // `diagnostics.is_empty()` and a warning must not disable Organize Imports.
+    #[test]
+    fn quickfix_marks_a_plain_reach_and_deletes_a_redundant_marker() {
+        const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let mark = fixes
+            .iter()
+            .find(|fix| fix.title == "Import as `#hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no mark fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(mark.replacement, "#");
+        assert_eq!(mark.span.start, mark.span.end, "a zero-width insertion");
+        // Applied, it produces the marked spelling — and the warning goes.
+        let mut applied = text.clone();
+        applied.replace_range(mark.span.into_range(), &mark.replacement);
+        assert!(
+            applied.starts_with("import pkg::a::#hidden;"),
+            "{applied:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The twin: a marker on an item that is exported anyway.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() {\n\tlet _ = shown();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let delete = fixes
+            .iter()
+            .find(|fix| fix.title == "Delete the `#`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no delete fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(&text[delete.span.into_range()], "#");
+        assert!(delete.replacement.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // E149: hovering an operator answers with the method it dispatches to.
@@ -8390,7 +8510,10 @@ pub(crate) mod tests {
                 "main.vl",
                 "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
-            ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
+            (
+                "broken.vl",
+                "export *;\n\nfun answer(): i32 {\n\t\"not a number\"\n}\n",
+            ),
         ]);
         assert!(
             document
@@ -8400,7 +8523,11 @@ pub(crate) mod tests {
             "the broken dependency should report first"
         );
         // Fix the module on disk; re-analyze the unchanged entry.
-        std::fs::write(dir.join("broken.vl"), "fun answer(): i32 {\n\t42\n}\n").unwrap();
+        std::fs::write(
+            dir.join("broken.vl"),
+            "export *;\n\nfun answer(): i32 {\n\t42\n}\n",
+        )
+        .unwrap();
         let entry = dir.join("main.vl");
         let text = std::fs::read_to_string(&entry).unwrap();
         let reanalyzed = Document::analyze(&text, &std_root(), &entry);
@@ -8846,7 +8973,10 @@ pub(crate) mod tests {
                 "src/deep/lib.vl",
                 "import pkg::util::triple;\n\nfun twice(n: i32): i32 { triple(n) }\n",
             ),
-            ("src/util.vl", "fun triple(n: i32): i32 { n * 3 }\n"),
+            (
+                "src/util.vl",
+                "export *;\n\nfun triple(n: i32): i32 { n * 3 }\n",
+            ),
             ("vilan.toml", "[library]\nname = \"shapes\"\n"),
         ]);
         assert!(
@@ -8930,8 +9060,14 @@ pub(crate) mod tests {
                 "import pkg::paint::tint;\nimport pkg::shared::base_value;\n\n\
                  fun render(): i32 { tint() + base_value() }\n",
             ),
-            ("src/browser/paint.vl", "fun tint(): i32 { 2 }\n"),
-            ("src/shared.vl", "fun base_value(): i32 { 1 }\n"),
+            (
+                "src/browser/paint.vl",
+                "export *;\n\nfun tint(): i32 { 2 }\n",
+            ),
+            (
+                "src/shared.vl",
+                "export *;\n\nfun base_value(): i32 { 1 }\n",
+            ),
             (
                 "vilan.toml",
                 "[library]\nname = \"widgets\"\n[library.layer.browser]\n\
@@ -9066,7 +9202,7 @@ pub(crate) mod tests {
     fn multi_entry_files_analyze_under_their_entry_targets() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let store = "import std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n";
+        let store = "export *;\n\nimport std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n";
         let reach = "import std::io::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n";
         let (dir, client) = analyze_workspace(&[
             ("src/client.vl", reach),
@@ -9322,7 +9458,7 @@ pub(crate) mod tests {
         let (dir, views) = analyze_workspace(&[
             (
                 "src/views.vl",
-                "import pkg::channel::render;\n\n\
+                "export *;\n\nimport pkg::channel::render;\n\n\
                  [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
                  struct Style { padding: i32 }\n\n\
                  impl Style {\n\tfun flex_row(self): Style {\n\t\t\
@@ -9335,7 +9471,7 @@ pub(crate) mod tests {
             ("vilan.toml", &fullstack_package("server")),
             (
                 "src/channel.vl",
-                "import pkg::views::{ Style, button_style, icon };\n\n\
+                "export *;\n\nimport pkg::views::{ Style, button_style, icon };\n\n\
                  fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
                  let label = icon(\"x\");\n\tbase.padding\n}\n",
             ),
@@ -9375,7 +9511,7 @@ pub(crate) mod tests {
         let (dir, views) = analyze_workspace(&[
             (
                 "src/views.vl",
-                "import pkg::client::{ helper, other };\n\n\
+                "export *;\n\nimport pkg::client::{ helper, other };\n\n\
                  fun render(): i32 { helper() + other() }\n",
             ),
             ("vilan.toml", &fullstack_package("server")),

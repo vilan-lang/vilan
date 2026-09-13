@@ -416,6 +416,9 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::With => "with",
         Token::Ident(_)
         | Token::Ctrl(_)
+        // B318 §2.3: `#` is the import reach marker — punctuation, not a
+        // keyword, so it takes no `KEYWORD_DOCS` entry.
+        | Token::Hash
         | Token::Number(_, _, _)
         | Token::Op(_)
         | Token::String(_)

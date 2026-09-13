@@ -533,12 +533,19 @@ fn check_hermetic_block_imports(
     }
 }
 
+/// The ROOT segment of an import path — the origin a hermetic macro world
+/// checks. A reach marker adds no segment, so it delegates.
+fn import_root<'src>(branch: &ImportBranch<'src>) -> Option<&'src str> {
+    match branch {
+        ImportBranch::Path(root, _, _) => Some(*root),
+        ImportBranch::Reach(_, inner) => import_root(inner),
+        ImportBranch::Set(_) => None,
+    }
+}
+
 fn check_hermetic_imports(node: &Spanned<Node>, diagnostics: &mut Vec<Error>, hermetic: &mut bool) {
     if let Node::Import(branch) | Node::Use(branch) = &node.0 {
-        let root = match branch {
-            ImportBranch::Path(root, _, _) => Some(*root),
-            ImportBranch::Set(_) => None,
-        };
+        let root = import_root(branch);
         if root != Some("macro_std") {
             diagnostics.push(Error {
                 trace: Vec::new(),

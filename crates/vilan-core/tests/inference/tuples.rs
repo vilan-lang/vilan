@@ -1698,14 +1698,26 @@ fun main() {}
 }
 
 #[test]
-fn the_pub_steer_names_the_export_form_it_is_not() {
+fn the_pub_steer_names_the_export_marker() {
+    // RENAMED and inverted by B318 (§7.4). The rule used to say `export` is
+    // "a different thing" and the fix is to delete the word; `export` IS the
+    // visibility marker now, so the steer names it — while still keeping the
+    // re-export reading in a parenthetical, because one word does both jobs.
     assert_fails_with(
         r#"
 public fun helper(): i32 { 1 }
 
 fun main() {}
         "#,
-        "`export` exists, but it RE-exports",
+        "the marker is `export`, so write `export fun helper()`",
+    );
+    assert_fails_with(
+        r#"
+public fun helper(): i32 { 1 }
+
+fun main() {}
+        "#,
+        "(`export` also RE-exports something this module imported",
     );
 }
 

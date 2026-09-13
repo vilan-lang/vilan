@@ -70,6 +70,16 @@ const LEXICAL: &str = "vilan/docs/spec/lexical.md";
 /// Identifier-shaped terminals the EBNF quotes that are not keywords, not
 /// attribute markers and not extern form words, with what each is. Every one
 /// is a CONTEXTUAL word or a fixed argument the parser matches by text.
+/// Attribute markers the parser RECOGNIZES but no longer ACCEPTS — a retired
+/// attribute whose name is still matched so the refusal can name what replaced
+/// it, rather than reporting "found `[` expected `fun`" at a form the book used
+/// to recommend. Spec §3 must NOT spell these: the grammar says what parses.
+const REFUSED_ATTRIBUTE_MARKERS: &[(&str, &str)] = &[(
+    "doc",
+    "`[doc(hidden)]` is retired (B318 §7.5) — recognized so the refusal can \
+     steer to `export`, never accepted",
+)];
+
 const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
     ("context", "the contextual clause on a closure type (§2.2)"),
     (
@@ -77,7 +87,6 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
         "the contextual marker opening a closure type (§7.4)",
     ),
     ("on", "the element head's event form: `on:click(..)`"),
-    ("hidden", "the sole argument of `[doc(hidden)]`"),
     (
         "keyed",
         "the sole argument of `[expose(keyed)]` / `[expose(keyed = K)]` (A39, A51)",
@@ -365,6 +374,11 @@ fn every_attribute_marker_is_spelled_in_the_normative_grammar() {
         .iter()
         .copied()
         .filter(|marker| !terminals.contains(*marker))
+        .filter(|marker| {
+            !REFUSED_ATTRIBUTE_MARKERS
+                .iter()
+                .any(|(refused, _)| refused == marker)
+        })
         .collect();
     assert!(
         missing.is_empty(),
@@ -546,6 +560,39 @@ fn every_recorded_token_class_still_needs_recording() {
 // Each check below asks its table's own question — "is this still exempting
 // anything?" — with the predicate the gate it widens uses, so an entry these
 // tests call dead is an entry the gate would hold on its own.
+
+#[test]
+fn every_refused_attribute_marker_still_needs_recording() {
+    // `REFUSED_ATTRIBUTE_MARKERS` widens check 2: a marker listed here is
+    // allowed to be a name the parser matches that §3 never spells. It stops
+    // exempting anything two ways — the parser drops the name (there is nothing
+    // left to recognize), or §3 spells it again (the form is back, and the
+    // entry now hides a real grammar).
+    let quoted = terminals(&ebnf());
+    let stale: Vec<String> = REFUSED_ATTRIBUTE_MARKERS
+        .iter()
+        .filter_map(|(marker, _)| {
+            if !KNOWN_ATTRIBUTE_MARKERS.contains(marker) {
+                Some(format!(
+                    "  {marker:?}: the parser no longer matches the name at all"
+                ))
+            } else if quoted.contains(*marker) {
+                Some(format!(
+                    "  {marker:?}: spec §3 spells it again, so the form parses \
+                     and check 2 covers it"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in REFUSED_ATTRIBUTE_MARKERS record a marker as refused-but-\
+         recognized that is no longer one:\n{}",
+        stale.join("\n")
+    );
+}
 
 #[test]
 fn every_recorded_non_keyword_terminal_still_needs_recording() {

@@ -109,9 +109,6 @@ pub struct Func<'src> {
     // through a trait bound, never on a concrete type's own surface
     // (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
-    // Declared `[doc(hidden)]`: fully callable, but omitted from editor
-    // completion (a tooling marker — no resolution change).
-    pub doc_hidden: bool,
     pub generic_parameters: Option<GenericParameters<'src>>,
     pub parameters: Spanned<Vec<Parameter<'src>>>,
     pub return_type: Option<Box<Spanned<Node<'src>>>>,
@@ -461,6 +458,15 @@ pub enum ImportBranch<'src> {
     // The span drives go-to-definition / hover on imports.
     Path(&'src str, Span, ImportTail<'src>),
     Set(Vec<Self>),
+    // `#<branch>` — the REACH marker (B318 §1/§2.3): "I know this is not
+    // exported and I want it anyway". A WRAPPER rather than a field on `Path`,
+    // for three reasons: it composes with every element production (a name, a
+    // `mod` segment mid-path, and S3's `(impl T)` selector) without any of them
+    // knowing about it; it adds no segment, so `record_reference` files the
+    // leaf's own span and RENAME still rewrites `{ #hidden }`; and every reader
+    // that does not care about the marker delegates to the inner branch in one
+    // line. The span is the `#` itself.
+    Reach(Span, Box<Self>),
 }
 
 /// What follows one segment of an `import`/`use` path. A tail is a THREE-way

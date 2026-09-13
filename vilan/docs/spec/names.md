@@ -119,6 +119,22 @@ path, and the difference is only that `use` loads nothing, the type being
 in scope already. `export statement` re-exports: importers of this module
 see the exported names as if declared here.
 
+**Visibility.** `export` before a declaration marks it as this module's
+surface; an unmarked top-level item is the module's own. `export *;` at a
+module's top level marks every item of that module, and
+`export(in PATH)` narrows one — `export(in mod)` keeps an item private
+under an `export *;`, `export(in pkg)` publishes to the item's own
+package. The bit is consulted by completion, by the add-import fix and by
+the "import it first" steer, and by nothing in resolution: **visibility
+never blocks access.** A plain `import pkg::a::hidden;` of an unmarked
+item warns and names the marked spelling; `import pkg::a::{ #hidden };`
+is that spelling, and says "I know this is not exported and I want it
+anyway". Reaching a *dependency's* unmarked item is no diagnostic at all
+— whether an item should be exported is its author's judgement, and a
+consumer's need is evidence against it. An exported item whose signature
+names an unmarked type warns too: a consumer can call it and cannot name
+what it takes or returns.
+
 Platform gating is not checked at the import: a module outside the
 current platform's layers (e.g. `std::ui` in a Node build) still loads,
 so its items type-check. The error is reported where platform-colored

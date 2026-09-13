@@ -84,8 +84,12 @@ precisely, because a fade means "you may delete this."
   top-level item is surface a consumer may import — which is what keeps
   you from having to fork a library that forgot to export something. This
   holds for a library inside a workspace too, even when the only consumer
-  today is a sibling package. Use `[doc(hidden)]` to keep a name out of
-  consumers' completion without forbidding it.
+  today is a sibling package. To keep a name out of consumers' completion
+  without forbidding it, do not `export` it: a private item is offered by
+  neither completion nor the add-import fix, and an importer who needs it
+  anyway writes the reach (`import pkg::a::{ #helper };`). `[doc(hidden)]`
+  used to be the spelling for this and is retired — it meant exactly what
+  a private item means, and no tool ever read it.
 - **A declared `generated` root never fades.** `[package] generated =
   "src/icons"` already tells `vilan fmt` to leave a machine-written
   directory alone; it tells the fade the same thing.
@@ -169,7 +173,7 @@ sees it.
 
 ## Quick fixes
 
-Eight, each attached to the diagnostic that earns it:
+Ten, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -177,7 +181,9 @@ Eight, each attached to the diagnostic that earns it:
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
 | ``Remove `;` `` | ``the `;` discards this body's last value`` — it finds the right `;` from the diagnostic's own bookkeeping, and declines rather than guess when a comment sits in the gap |
-| ``Wrap as `{Color::hex("#333")}` `` | a `#` in a `css` block. The character cannot lex at all, so the diagnostic is one column wide; the fix reads the whole colour off the line and routes it through `Color`, which carries its own `:root` line. Offered only when the run really is a colour (3, 4, 6 or 8 hex digits) |
+| ``Wrap as `{Color::hex("#333")}` `` | a `#` in a `css` block's value. The `css` parser refuses it there — the character is a real token elsewhere, the import reach marker — and the diagnostic is one column wide, so the fix reads the whole colour off the line and routes it through `Color`, which carries its own `:root` line. Offered only when the run really is a colour (3, 4, 6 or 8 hex digits) |
+| ``Import as `#hidden` `` | a plain import of an item its module does not export. A zero-width insertion of the reach marker at the leaf — the whole edit — which says the reach was deliberate and silences the warning |
+| ``Delete the `#` `` | a reach marker on an item that IS exported. The marker states a belief about the module that is not true, and the fix removes the one character |
 | ``Use `.md { … }` `` | ``@media (min-width: …)`` in a `css` block. The breakpoint is chosen by the query's own min-width, and an arbitrary one becomes `.media("900px")` rather than no fix. The other at-rules have no combinator spelling, so they get the explanation alone |
 | ``Declare the inferred contexts`` | ``…'s body reads context `b`, which this `context` clause does not declare`` — a `fun`'s declared `context` clause narrower than what its body reads. The refusal spells the clause the body needs and the fix writes exactly that, over the clause's own name list |
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |

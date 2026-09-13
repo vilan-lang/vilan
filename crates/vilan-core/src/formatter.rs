@@ -380,6 +380,9 @@ enum TokenBranch<'src> {
     /// that, and this shape mirrors it flattened).
     Path(&'src str, Option<Box<TokenBranch<'src>>>, Option<&'src str>),
     Set(Vec<TokenBranch<'src>>),
+    /// `#<branch>` — the B318 reach marker, kept in the key so `#hidden` and
+    /// `hidden` never reduce to one spelling.
+    Reach(Box<TokenBranch<'src>>),
 }
 
 /// Drops the spans from an `ImportBranch`, giving the span-free [`TokenBranch`]
@@ -397,6 +400,10 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
             ImportTail::Alias(alias, _) if alias == name => TokenBranch::Path(name, None, None),
             ImportTail::Alias(alias, _) => TokenBranch::Path(name, None, Some(alias)),
         },
+        // B318: the marker is part of the key. `#hidden` and `hidden` are two
+        // different statements about the author's intent, and a key that
+        // collapsed them would let the safety net reduce one to the other.
+        ImportBranch::Reach(_, inner) => TokenBranch::Reach(Box::new(branch_from_ast(inner))),
         ImportBranch::Set(branches) => {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
@@ -417,6 +424,11 @@ fn unwrap_singleton_set<'branch, 'src>(
     while let TokenBranch::Set(branches) = current {
         match branches.as_slice() {
             [only @ TokenBranch::Path(name, ..)] if *name != "self" => current = only,
+            // B318: a marked singleton collapses too — `{ #hidden }` and
+            // `#hidden` are one import, and the printer collapses it, so the
+            // safety net has to reduce both to the same tokens or every marked
+            // brace set would make `vilan fmt` bail on its file.
+            [only @ TokenBranch::Reach(_)] => current = only,
             _ => break,
         }
     }
@@ -443,6 +455,13 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
         TokenBranch::Path(name, Some(child), _) => {
             BranchKey::Path((*name).to_string(), Box::new(branch_key(child)))
         }
+        // The marker sorts with the name it marks — `#hidden` lands beside
+        // `hidden` rather than in a block of its own — and still keys apart,
+        // because the `#` is in the rendered name.
+        TokenBranch::Reach(inner) => match branch_key(inner) {
+            BranchKey::Path(name, rest) => BranchKey::Path(format!("#{name}"), rest),
+            other => other,
+        },
         TokenBranch::Set(branches) => {
             let mut keys: Vec<BranchKey> = branches.iter().map(branch_key).collect();
             keys.sort();
@@ -469,7 +488,7 @@ fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey 
             };
             (root, rest)
         }
-        TokenBranch::Set(_) => (RootRank::Unrooted, branch_key(branch)),
+        TokenBranch::Reach(_) | TokenBranch::Set(_) => (RootRank::Unrooted, branch_key(branch)),
     };
     ImportSortKey { kind, root, rest }
 }
@@ -541,6 +560,12 @@ fn parse_token_branch<'src>(
     tokens: &[Token<'src>],
     index: usize,
 ) -> Option<(TokenBranch<'src>, usize)> {
+    // B318: the reach marker wraps whatever follows it, exactly as it does in
+    // the real grammar.
+    if tokens.get(index) == Some(&Token::Hash) {
+        let (inner, next) = parse_token_branch(tokens, index + 1)?;
+        return Some((TokenBranch::Reach(Box::new(inner)), next));
+    }
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
         let mut alias = None;
@@ -559,6 +584,19 @@ fn parse_token_branch<'src>(
         // An empty set `{}` closes immediately; otherwise each element is a
         // name-headed single path, comma-separated, allow-trailing.
         while tokens.get(next) != Some(&Token::Ctrl('}')) {
+            if tokens.get(next) == Some(&Token::Hash) {
+                let (inner, after) = parse_token_branch(tokens, next)?;
+                branches.push(inner);
+                next = after;
+                match tokens.get(next) {
+                    Some(Token::Ctrl(',')) => {
+                        next += 1;
+                        continue;
+                    }
+                    Some(Token::Ctrl('}')) => break,
+                    _ => return None,
+                }
+            }
             let name = token_name(tokens, next)?;
             let mut after = next + 1;
             let mut alias = None;
@@ -627,6 +665,10 @@ fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src
                 out.push(Token::Ident("as"));
                 out.push(Token::Ident(alias));
             }
+        }
+        TokenBranch::Reach(inner) => {
+            out.push(Token::Hash);
+            emit_branch_tokens(inner, out);
         }
         TokenBranch::Set(branches) => {
             out.push(Token::Ctrl('{'));
@@ -1474,6 +1516,11 @@ fn prune_import_branch<'src>(
                 ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(pruned)))
             })
         }
+        // B318: a marked leaf prunes on the leaf's own question and keeps its
+        // marker. `#` is a fact about the author's intent, not a formatting
+        // decision, and stripping it would silently re-arm the §5 warning.
+        ImportBranch::Reach(marker, inner) => prune_import_branch(inner, keep)
+            .map(|pruned| ImportBranch::Reach(*marker, Box::new(pruned))),
         ImportBranch::Set(branches) => {
             let kept: Vec<ImportBranch<'src>> = branches
                 .iter()
@@ -1511,6 +1558,13 @@ fn import_module_branch<'src>(
                 )),
                 None => Some((ImportBranch::Path(name, *span, ImportTail::Leaf), *span, 1)),
             }
+        }
+        // A marked segment is the segment it marks, for the purpose of naming
+        // the module reached into.
+        ImportBranch::Reach(marker, inner) => {
+            import_module_branch(inner).map(|(branch, span, depth)| {
+                (ImportBranch::Reach(*marker, Box::new(branch)), span, depth)
+            })
         }
         // A brace set with no path before it has no module to name.
         ImportBranch::Set(_) => None,
@@ -1962,6 +2016,7 @@ fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
         ImportBranch::Path(_, _, ImportTail::Continue(child)) => {
             collect_import_leaf_spans(child, out)
         }
+        ImportBranch::Reach(_, inner) => collect_import_leaf_spans(inner, out),
         ImportBranch::Set(branches) => {
             for branch in branches {
                 collect_import_leaf_spans(branch, out);
@@ -2061,7 +2116,13 @@ fn decompose_import_branch<'ast, 'src>(
                 prefix.insert(0, name);
                 (prefix, shape)
             }
+            // A marked continuation is not a shape the add-import quickfix may
+            // fold a new name into: the marker says something about the reach
+            // that a folded-in sibling does not share.
+            ImportBranch::Reach(..) => (Vec::new(), ImportLeafShape::Aliased),
         },
+        // Same, for a marked statement head.
+        ImportBranch::Reach(..) => (Vec::new(), ImportLeafShape::Aliased),
         ImportBranch::Set(branches) => (Vec::new(), ImportLeafShape::Set(branches)),
     }
 }
@@ -3168,6 +3229,15 @@ impl<'src> Printer<'src> {
         // the `::` — and the set is what consumes it.
         let split = std::mem::take(&mut self.split);
         match branch {
+            // B318: `#` is KEPT as written, on both the fmt and the organize
+            // paths. It is a fact about the author's intent rather than a
+            // formatting decision, and stripping it would silently re-arm the
+            // plain-reach warning.
+            ImportBranch::Reach(_, inner) => {
+                self.out.push('#');
+                self.split = split;
+                self.print_import_branch(inner, sort);
+            }
             ImportBranch::Path(name, _, tail) => {
                 self.out.push_str(name);
                 match tail {
@@ -3254,6 +3324,9 @@ impl<'src> Printer<'src> {
     fn branch_span(branch: &ImportBranch<'src>) -> Option<Span> {
         match branch {
             ImportBranch::Path(_, span, _) => Some(*span),
+            // The marker is the head of what it marks, so a comment before a
+            // marked member anchors on the `#`.
+            ImportBranch::Reach(marker, _) => Some(*marker),
             ImportBranch::Set(_) => None,
         }
     }
@@ -3556,10 +3629,6 @@ impl<'src> Printer<'src> {
         }
         if func.trait_only {
             self.out.push_str("[trait_only]");
-            self.line();
-        }
-        if func.doc_hidden {
-            self.out.push_str("[doc(hidden)]");
             self.line();
         }
         if !func.platform_fence.is_empty() {
@@ -6783,9 +6852,12 @@ mod idempotency {
     /// safety check, silently leaving the whole file unformatted.)
     #[test]
     fn attributes_round_trip() {
+        // B318 retired `[doc(hidden)]`, so it is no longer one of the
+        // attributes the formatter round-trips — it is a refusal, and a refused
+        // file bails here by design.
         let source = "trait Source {\n\t[must_use]\n\t[platform(\"@process\", \"browser\")]\n\tfun sub(self): i32;\n\
                       \t[trait_only]\n\tfun tag(self): str;\n\
-                      \t[doc(hidden)]\n\tfun internal(self): i32;\n}\n\
+                      \tfun internal(self): i32;\n}\n\
                       [service(Client)]\n\
                       struct Sess {\n\t[expose] status: SignalCell<str>,\n\thidden: i32,\n}\n\
                       impl Sess {\n\t[rpc]\n\tfun login(self, name: str): bool {\n\t\ttrue\n\t}\n}\n";
@@ -6810,10 +6882,6 @@ mod idempotency {
         assert!(
             formatted.contains("[trait_only]"),
             "trait_only attribute lost:\n{formatted}"
-        );
-        assert!(
-            formatted.contains("[doc(hidden)]"),
-            "doc(hidden) attribute lost:\n{formatted}"
         );
         assert_fixed_point("attributes", source);
     }

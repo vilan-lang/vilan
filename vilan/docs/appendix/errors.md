@@ -979,24 +979,31 @@ condition's operand, which reports **"`Point` is a type, not a value"**.
 Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 → [spec §3.8](../spec/grammar.md)
 
-**"`#` is not a vilan token …"** · **"`@` is not a vilan token …"**
+**"`#` is not a colour here …"** · **"`@` is not a vilan token …"**
 Both turn up almost only inside a `css` block. A colour is written as a
 hole that routes through the `Color` type — `color: {Color::hex("#333")};`
 — which is what lets the type carry its own `:root` line. And a `css`
 block has no at-rules of any kind: a media query is spelled as a
 breakpoint combinator (`.md { … }`), and a declaration block under a
-selector of your own is `std::style::declare`.
+selector of your own is `std::style::declare`. The two are refused in
+different places, for a reason worth knowing: `@` lexes as nothing at
+all, anywhere, while `#` is a real token — the import **reach** marker,
+`import pkg::a::{ #hidden };` — so only the `css` block's own parser,
+which knows a `#` there is a colour, can refuse it.
 → [Styling](../guide/styling.md)
 
 **"`pub` is not a vilan keyword …"**
 `pub` (and `public`) is an ordinary identifier here, so `pub fun helper()`
 reads as the expression statement `pub` followed by an item — which used
 to report a missing `;` three columns in, a true statement about a
-program nobody wrote. Vilan has no visibility marker to reach for: a
-module's items are importable as written, so the fix is to delete the
-word. `export` is a different thing — it *re-exports* something this
-module imported (`export import pkg::io::panic;`), so importers of this
-module see the name as if it were declared here.
+program nobody wrote. The marker vilan does have is **`export`**: write
+`export fun helper()`. An item a module does not export is the module's
+own — completion does not offer it, the add-import fix does not propose
+it, and a plain import of it from another file of the same package warns
+— but it is never *blocked*: an importer who needs it anyway writes the
+reach, `import pkg::util::{ #helper };`. `export` also *re-exports*
+something this module imported (`export import pkg::io::panic;`), so
+importers of this module see that name as if it were declared here.
 → [spec §4.3](../spec/names.md)
 
 **"a mutable binding is spelled `mut x = …` …"**
