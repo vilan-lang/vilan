@@ -107,7 +107,7 @@ function add(self, b) {
 function $a(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+		result.push(__clone(entry.slice(1, 3)));
 	}
 	return result;
 }
@@ -123,7 +123,7 @@ function $d(self, key) {
 	let $f = null;
 	if ($e[0] === 0) {
 		const entry = $e[1];
-		$f = [ 0, __clone(entry[1]) ];
+		$f = [ 0, __clone(entry.slice(1, 3)) ];
 	} else {
 		$f = [ 1 ];
 	}
@@ -133,13 +133,13 @@ function $k(self, key) {
 	self[0].delete(hash(key));
 }
 function $l(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
 }
-const block = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::flex-direction", [ "::flex-direction", [ "s1atdsbb", "flex-direction:column" ] ] ], [ "::gap", [ "::gap", [ "s8myyrk", "gap:var(--space-4)" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ "::border-radius", [ "::border-radius", [ "s94jklx", "border-radius:8px" ] ] ], [ "768px::padding", [ "768px::padding", [ "s1wyflm5", "padding:var(--space-6)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];
-const chain = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::flex-direction", [ "::flex-direction", [ "s1atdsbb", "flex-direction:column" ] ] ], [ "::gap", [ "::gap", [ "s8myyrk", "gap:var(--space-4)" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ "::border-radius", [ "::border-radius", [ "s94jklx", "border-radius:8px" ] ] ], [ "768px::padding", [ "768px::padding", [ "s1wyflm5", "padding:var(--space-6)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];
+const block = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "::flex-direction", "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "::gap", "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "::border-radius", "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "768px::padding", "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
+const chain = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "::flex-direction", "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "::gap", "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "::border-radius", "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "768px::padding", "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
 console.log(class_list(block));
 console.log(class_list(chain));
 console.log("sflnbwj sgdl28p sw0ajwn s9bu6v3 s16sw83c s1e7dqf5 s17s8g64");
 console.log("s1hbuywq s1dwvy7w s3s9k3d scur295 sxzag36 skr9oll");
-const wider = [ [ new Map([ [ "::padding", [ "::padding", [ "s1ufvsw", "padding:var(--space-6)" ] ] ] ]) ] ];
+const wider = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
 console.log(class_list(add(block, wider)));

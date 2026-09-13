@@ -32,9 +32,9 @@ function class_list(self) {
 function $a(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+		result.push(__clone(entry.slice(1, 3)));
 	}
 	return result;
 }
-const card = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ] ]) ] ];
+const card = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ] ]) ] ];
 console.log(class_list(card));

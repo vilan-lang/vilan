@@ -514,10 +514,14 @@ pub enum ExprPattern {
     // sub-patterns. The enum id lets the transformer lower `bool` patterns to a
     // native boolean comparison rather than the array discriminant form.
     Variant(Id, usize, Vec<ExprPattern>),
-    // A tuple destructure. Each element carries its flat-storage width (a nested
-    // tuple element occupies more than one slot), so the transformer reads each
-    // at its flat offset and reslices a multi-slot capture.
-    Tuple(Vec<(ExprPattern, usize)>),
+    // A tuple destructure. Each element carries its own TYPE, from which
+    // emission computes the flat-storage width (a nested tuple element occupies
+    // more than one slot) and so reads each leaf at its flat offset and
+    // reslices a multi-slot capture. The type rather than the width because a
+    // generic body is analyzed once with its parameters abstract while emission
+    // runs per instance: an element typed `V` is one slot here and as wide as
+    // its binding there (B310).
+    Tuple(Vec<(ExprPattern, TypeId)>),
     // A fixed-array destructure (`let [a, b, c] = arr`): element `i` reads
     // `subject[i]` (a value copy — the transformer clones each element read,
     // value semantics; count-vs-length was checked at resolution).
@@ -3798,6 +3802,16 @@ pub struct Analyzer<'src> {
     // element whatever it is written as. A `..e` element has no entry and needs
     // none — its splice is mark-driven (§T.5).
     tuple_element_types: HashMap<Id, TypeId>,
+    // B310: for every `Expr::TupleIndex` the field-accessor rule mints, the
+    // tuple type of the ROOT subject the access reads and the chain of element
+    // indices from it (`deep.0.1` folds to the root plus `[0, 1]`). The offset
+    // and width baked into the `Expr` are the layout THIS walk can see, which
+    // counts a still-generic element as one slot; the transformer walks a
+    // MONOMORPHIZED body, where that element's binding is known, and recomputes
+    // both from this path under the active substitution. Without it a
+    // `Map<str, (str, str)>`'s `(K, V)` was boxed inside `insert` and read flat
+    // at the caller — silent `undefined`s out of `entries()`.
+    tuple_index_paths: HashMap<Id, (TypeId, Vec<usize>)>,
     scope_id: u32,
     scopes: IndexMap<Id, Scope<'src>>,
     span_map: HashMap<Id, &'src Span>,
@@ -4832,6 +4846,7 @@ impl<'src> Analyzer<'src> {
             elided_shared_reads: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
+            tuple_index_paths: HashMap::default(),
             scope_id: 0,
             scopes: IndexMap::default(),
             span_map: HashMap::default(),
@@ -28366,12 +28381,12 @@ impl<'src> Analyzer<'src> {
                 let _ = span;
                 let mut resolved = Vec::new();
                 for (sub_pattern, element_type_id) in patterns.iter().zip(element_type_ids) {
-                    // The element's flat width (a nested tuple spans several slots),
-                    // resolved here while the matched type is known.
-                    let width = self.tuple_flat_width(element_type_id);
+                    // The element's TYPE, not its width: the width a nested
+                    // tuple element spans is emission's to compute, under the
+                    // substitution in force there (B310).
                     resolved.push((
                         self.resolve_pattern(sub_pattern, element_type_id, lookup_scope_id)?,
-                        width,
+                        element_type_id,
                     ));
                 }
                 Some(ExprPattern::Tuple(resolved))
@@ -39609,6 +39624,33 @@ impl<'src> Analyzer<'src> {
                             Some(Expr::TupleIndex(root, root_offset, _)) => (*root, *root_offset),
                             _ => (subject_id, 0),
                         };
+                        // B310: the same fold in LAYOUT-FREE terms — the root's
+                        // tuple type and the index chain that reaches this
+                        // element from it. The offset and width above are this
+                        // walk's answer, and this walk sees a generic body's
+                        // parameters abstract (`tuple_flat_width` counts one
+                        // slot for each); emission recomputes both from the
+                        // path under the instance's substitution, where a `V`
+                        // bound to a tuple is as wide as it really is.
+                        let folded_path = self.tuple_index_paths.get(&subject_id).cloned();
+                        let rooted = match (folded_path, root_subject == subject_id) {
+                            (Some((root_type_id, path)), _) => Some((root_type_id, path)),
+                            // The subject is not itself an access, so IT is the
+                            // root and its own tuple type is the path's base.
+                            (None, true) => {
+                                let subject_type_id =
+                                    Type::Tuple(element_type_ids.clone()).get_type_id(self);
+                                Some((subject_type_id, Vec::new()))
+                            }
+                            // An access the one minting site above did not
+                            // record cannot be rooted; leave the entry absent
+                            // and emission keeps this walk's offsets.
+                            (None, false) => None,
+                        };
+                        if let Some((root_type_id, mut path)) = rooted {
+                            path.push(index);
+                            self.tuple_index_paths.insert(id, (root_type_id, path));
+                        }
                         self.expr_id_to_expr_map.insert(
                             id,
                             Expr::TupleIndex(root_subject, base_offset + offset, width),
@@ -45924,6 +45966,19 @@ pub struct Program<'src> {
     /// consults it to decide the flat-storage splice; silence there nested the
     /// element and made every read past it `undefined`.
     pub tuple_element_types: HashMap<Id, TypeId>,
+    /// B310: the layout coordinates of every positional tuple access
+    /// (`Expr::TupleIndex`), keyed by the ACCESS's own id — the tuple type of
+    /// the root subject it folded onto, and the chain of element indices from
+    /// that root (`deep.0.1` is the root plus `[0, 1]`).
+    ///
+    /// The `Expr`'s own offset and width are the layout the ANALYZER saw, and a
+    /// generic body is analyzed once with its parameters abstract, so an
+    /// element typed `V` counts one slot there however wide the instantiation
+    /// makes it. Emission runs per monomorphized instance, where `V`'s binding
+    /// is in force, and recomputes offset and width from this path under it —
+    /// which is what puts a generic body's tuple on the same flat layout its
+    /// concrete caller builds and reads.
+    pub tuple_index_paths: HashMap<Id, (TypeId, Vec<usize>)>,
     /// Element expressions written as a tuple-value spread `..e`
     /// (variadic-generics.md §T). Such an element splices because it was
     /// WRITTEN as one — the type rule already proved its operand a tuple — so
@@ -54847,6 +54902,7 @@ fn analyze_over_world<'src>(
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
+        tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::default(),

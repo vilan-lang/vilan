@@ -6504,3 +6504,232 @@ fn b247_a_plain_string_never_interpolates() {
         "{1 + 2}\n",
     );
 }
+
+// --- B310: the instantiated tuple layout inside a generic body ------------------
+// Tuples store FLAT, and which slots a tuple occupies is decided by its element
+// types. The analyzer walks a generic body ONCE with its parameters abstract, so
+// an element typed `V` looked one slot wide there however wide the instantiation
+// made it — while the concrete caller, which knows `V = (A, B)`, built and read
+// the flat form. `Map<str, (str, str)>` boxed its `(K, V)` inside `insert` and
+// resliced it flat at `entries()`: `let (class, declaration) = slot` read
+// `class = "class,decl"` and `declaration = undefined`, silently.
+//
+// Emission runs per MONOMORPHIZED instance, where the binding is known, so the
+// layout is recomputed there: the splice decision resolves through the
+// substitution, and a positional read's offset and width come from the
+// layout-free path the analyzer records (`tuple_index_paths`) rather than from
+// the offsets it baked. Both halves of every crossing then read one layout.
+
+#[test]
+fn b310_a_map_of_tuple_values_round_trips_through_entries() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+
+        fun main() {
+            mut m: Map<str, (str, str)> = Map::new();
+            m.insert("a", ("class", "decl"));
+            for entry in m.entries() {
+                let (key, slot) = entry;
+                let (class, declaration) = slot;
+                print(key);
+                print(class);
+                print(declaration);
+                print(entry.1.0);
+                print(entry.1.1);
+            }
+        }
+        "#,
+        "a\nclass\ndecl\nclass\ndecl\n",
+    );
+}
+
+#[test]
+fn b310_the_other_map_readers_still_agree_with_entries() {
+    // `keys`, `values` and `get` were RIGHT before the fix — each reads `V` as
+    // one slot and hands the caller the value itself, never the pair — so the
+    // pin that matters is that they still are, on the layout that moved.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::option::Option::{ Some, None };
+
+        fun main() {
+            mut m: Map<str, (str, str)> = Map::new();
+            m.insert("a", ("one", "two"));
+            for key in m.keys() { print(key); }
+            for value in m.values() { let (x, y) = value; print(x); print(y); }
+            match m.get("a") {
+                Some(let got) => { let (x, y) = got; print(x); print(y); }
+                None => print("missing"),
+            }
+        }
+        "#,
+        "a\none\ntwo\none\ntwo\n",
+    );
+}
+
+#[test]
+fn b310_a_generic_function_returns_a_tuple_of_its_parameters_flat() {
+    // The item's second exhibit: nothing to do with `Map`. The tuple is built
+    // in generic land and read at a concrete call.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pair<T>(a: T, b: T): (T, T) {
+            (a, b)
+        }
+
+        fun main() {
+            let p = pair((1, 2), (3, 4));
+            let (x, y) = p;
+            let (x0, x1) = x;
+            let (y0, y1) = y;
+            print(x0);
+            print(x1);
+            print(y0);
+            print(y1);
+        }
+        "#,
+        "1\n2\n3\n4\n",
+    );
+}
+
+#[test]
+fn b310_a_tuple_of_parameters_passed_into_a_generic_body_reads_flat() {
+    // The crossing in the OTHER direction: the caller builds the tuple flat and
+    // the generic body reads it. `p.0` used to read slot 0 — half of the first
+    // element — and everything past it was `undefined`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun first<T>(p: (T, T)): T {
+            p.0
+        }
+
+        fun main() {
+            let got = first(((1, 2), (3, 4)));
+            let (a, b) = got;
+            print(a);
+            print(b);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b310_a_generic_struct_field_of_tuple_parameters_reads_flat() {
+    // A struct literal written at a concrete site stores the flat form; the
+    // generic method that reads it must use the same layout.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder<T> {
+            p: (T, T),
+        }
+
+        impl Holder<type T> {
+            fun first(self): T {
+                self.p.0
+            }
+
+            fun second(self): T {
+                self.p.1
+            }
+        }
+
+        fun main() {
+            let h = Holder { p = ((1, 2), (3, 4)) };
+            let (a, b) = h.first();
+            let (c, d) = h.second();
+            print(a);
+            print(b);
+            print(c);
+            print(d);
+        }
+        "#,
+        "1\n2\n3\n4\n",
+    );
+}
+
+#[test]
+fn b310_a_nested_tuple_through_a_generic_keeps_every_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun wrap<T>(v: T): (i32, T) {
+            (0, v)
+        }
+
+        fun main() {
+            let w = wrap((1, (2, 3)));
+            let (n, inner) = w;
+            let (a, rest) = inner;
+            let (b, c) = rest;
+            print(n);
+            print(a);
+            print(b);
+            print(c);
+        }
+        "#,
+        "0\n1\n2\n3\n",
+    );
+}
+
+#[test]
+fn b310_a_tuple_of_a_parameter_and_a_concrete_reads_flat() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun tag<T>(v: T): (str, T) {
+            ("t", v)
+        }
+
+        fun main() {
+            let t = tag((1, 2));
+            let (name, inner) = t;
+            let (a, b) = inner;
+            print(name);
+            print(a);
+            print(b);
+            print(t.1.0);
+            print(t.1.1);
+        }
+        "#,
+        "t\n1\n2\n1\n2\n",
+    );
+}
+
+#[test]
+fn b310_a_generic_body_whose_parameter_stays_abstract_is_unchanged() {
+    // The control: a `T` no instantiation binds to a tuple keeps the one-slot
+    // layout the analyzer saw, so the fix is a no-op wherever the two layouts
+    // already agreed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pair<T>(a: T, b: T): (T, T) {
+            (a, b)
+        }
+
+        fun main() {
+            let p = pair(1, 2);
+            let (x, y) = p;
+            print(x);
+            print(y);
+            print(p.0);
+            print(p.1);
+        }
+        "#,
+        "1\n2\n1\n2\n",
+    );
+}
