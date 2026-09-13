@@ -23,6 +23,23 @@ dashmap = "6"
 # Already in the tree via tower-lsp — this only makes the edge direct.
 serde_json = "1"
 
+# M64, and the one dependency edge this crate's memory work needed: glibc's
+# `malloc_trim(0)` has no `std` spelling, and the server calls it after a
+# document closes and after an analysis is dropped so the arenas a closed file
+# gives back reach the OS rather than sitting on the allocator's free list (418
+# MB of it after closing kolt's eighteen files, M64's measurement). `src/memory.rs`
+# reads `/proc/self/statm` and `mallinfo2` through the same edge for the status
+# page (E166).
+#
+# Linux only, because that is where all three symbols are: the two glibc ones
+# are gated a second time in the source on `target_env = "gnu"`, so a musl build
+# links neither. The package was already in `Cargo.lock` — and therefore already
+# covered by `THIRD-PARTY-NOTICES.txt` — as this crate's own dev-dependency and
+# several others' dependency, so promoting it adds no third-party surface;
+# what changes is that the shipped binary may now call two of its functions.
+[target."cfg(target_os = \"linux\")".dependencies]
+libc = "0.2"
+
 # Test-only, and only for the clock: E121's keystroke-path gate
 # (`src/keystroke.rs`'s `gate` module) and E122's range-scaling gate
 # (`main.rs`'s `semantic_token_range_cost_tests`) both assert THREAD CPU time so
@@ -33,6 +50,10 @@ serde_json = "1"
 # the shipped binary, which is why they are dev-dependencies and not
 # dependencies. The identical pair on `vilan-cli` carries the same note for the
 # same reason.
+#
+# `libc` is ALSO a normal dependency on Linux since M64 (above); this entry is
+# what keeps the thread clock available on the other unixes, where it is still
+# test-only.
 [target."cfg(unix)".dev-dependencies]
 libc = "0.2"
 

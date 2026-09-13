@@ -9,6 +9,7 @@ mod document;
 mod keystroke;
 mod line_index;
 mod manifest_completion;
+mod memory;
 mod publish;
 mod references;
 mod schedule;
@@ -28,7 +29,9 @@ use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result};
 use vilan_core::Span;
 use vilan_core::analyzer::SourceId;
 
-use crate::document::{Document, Symbol, SymbolKind as VilanSymbolKind, hash_text};
+use crate::document::{
+    Document, RETAINED_PROGRAMS, Symbol, SymbolKind as VilanSymbolKind, hash_text,
+};
 use crate::line_index::LineIndex;
 use crate::publish::PublishState;
 use crate::schedule::Schedule;
@@ -582,6 +585,15 @@ struct Backend {
     package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
     package_revision: Arc<DashMap<PathBuf, u64>>,
     union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
+    /// M63: the documents the editor has most recently worked IN, newest
+    /// first, at most [`RETAINED_PROGRAMS`] of them — and therefore the
+    /// documents that keep their `Program`. Every other open document holds
+    /// its editor tables and re-analyzes when it is focused again.
+    ///
+    /// A `Vec` under a plain mutex rather than a map: it is two entries, the
+    /// operation on it is "move this one to the front", and the order IS the
+    /// state. Poison-recovering like every other synchronous lock here (E97).
+    focus: Arc<std::sync::Mutex<Vec<Url>>>,
 }
 
 /// What a cached read of a file is only valid for: the file's length and its
@@ -1424,6 +1436,10 @@ struct AnalysisContext {
     package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
     package_revision: Arc<DashMap<PathBuf, u64>>,
     union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
+    /// M63's retained set, so the seam where an analysis LANDS can apply the
+    /// retention rule: the dependency sweep re-analyzes background documents,
+    /// and a program that lands on one of them has to go straight back.
+    focus: Arc<std::sync::Mutex<Vec<Url>>>,
 }
 
 /// What one scheduled analysis did (M26).
@@ -1693,7 +1709,55 @@ async fn analyze_and_publish(
         &uri,
     )
     .await;
+    // M63, and the seam that makes the policy hold: this analysis has been
+    // adopted and published, so its editor tables are current — and if the
+    // document it landed on is not one of the focused few (the dependency
+    // sweep re-analyzes every open importer of an edited file), the program it
+    // brought goes straight back. Published FIRST, so the groups the planner
+    // reads are the program's own and the capture is taken from them.
+    if enforce_program_retention(&context.focus, &context.documents) {
+        memory::trim();
+    }
     AnalysisOutcome::Landed
+}
+
+/// M63: hold a `Program` only for the [`RETAINED_PROGRAMS`] most recently
+/// focused documents; every other open document drops to its editor tables.
+/// Answers whether anything was released, which is M64's cue to trim.
+///
+/// A sweep of the open documents rather than a list of evictions, for one
+/// reason: it is the POLICY stated directly, and a policy stated directly
+/// cannot drift from its bookkeeping. Releasing a document that already
+/// released is free (`Document::release_analysis` answers `false` at once),
+/// and the map is one entry per open file — a dozen probes, on a path that
+/// runs when focus moves or an analysis lands, never per keystroke and never
+/// per request.
+///
+/// Called at exactly two seams, which between them cover every way a program
+/// can come into existence: [`Backend::focus`], where the retained SET moves,
+/// and [`analyze_and_publish`], where an analysis lands — the dependency sweep
+/// re-analyzes background documents on every save, and without the second seam
+/// each of those would silently take its program back.
+///
+/// Takes no document guard of its own beyond the one it releases through, so
+/// no caller may hold one: `iter_mut` walks the map's shards, and a guard held
+/// across it would deadlock the shard it belongs to.
+fn enforce_program_retention(
+    focus: &std::sync::Mutex<Vec<Url>>,
+    documents: &DashMap<Url, Document>,
+) -> bool {
+    let retained = focus
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut released = false;
+    for mut document in documents.iter_mut() {
+        if retained.contains(document.key()) {
+            continue;
+        }
+        released |= document.value_mut().release_analysis();
+    }
+    released
 }
 
 /// Land a completed analysis on the open document at `uri`
@@ -2071,12 +2135,23 @@ impl Backend {
             session_trace::TraceEvent::Summarize => session_trace::summary(
                 session_trace::StateSizes {
                     documents: self.documents.len(),
+                    // M63: of those documents, how many still hold a program —
+                    // the retention rule's own number, on the page beside the
+                    // memory it is there to bound.
+                    programs: self
+                        .documents
+                        .iter()
+                        .filter(|document| document.value().holds_program())
+                        .count(),
                     semantic_token_cache: self.semantic_token_cache.len(),
                     manifests: self.manifests.len(),
                     pending: self.schedule.len(),
                     line_indices: self.line_indices.len(),
                 },
                 self.analyses.counts(),
+                // E166: the numbers E106 and M63 were found with, on the page
+                // the owner reads when a session starts feeling slow.
+                memory::Memory::sample(),
             ),
         };
         if tokio::runtime::Handle::try_current().is_err() {
@@ -2085,6 +2160,98 @@ impl Backend {
         let client = self.client.clone();
         tokio::spawn(async move {
             client.log_message(MessageType::INFO, text).await;
+        });
+    }
+
+    /// M63: record that the editor is working in `uri`, apply the retention
+    /// rule, and re-analyze this document if it had been released.
+    ///
+    /// **What counts as focus.** LSP has no "the user switched tabs"
+    /// notification, so focus is read off the traffic — but not off all of it.
+    /// The requests an editor sends for every VISIBLE document, and re-sends on
+    /// every refresh — semantic tokens, inlay hints, the outline, folding — are
+    /// exactly the ones a released document answers from its tables, and
+    /// letting them move the retained set would make three visible editors
+    /// evict each other in a burst that nobody asked for. What moves it is the
+    /// traffic that follows the CARET: the notifications (`didOpen`,
+    /// `didChange`) and the requests that need the program under a cursor
+    /// (hover, completion, definition, references, rename, code actions). Those
+    /// arrive for the document the user is actually in.
+    ///
+    /// **The re-analysis.** A released document is re-analyzed at the front
+    /// door rather than lazily at the first query that misses, so that the
+    /// second after a tab switch has the program back (M58's warm path,
+    /// sub-second on kolt's `client.vl`). It runs under the document's CURRENT
+    /// generation, not a superseded one: this is not an edit, and cancelling a
+    /// debounced analysis that is already computing the same answer would be a
+    /// step backwards. One at a time — [`Schedule::is_analyzing`] is what stops
+    /// the five requests an editor sends on a tab switch from starting five
+    /// analyses of one file.
+    fn focus(&self, uri: &Url) {
+        let moved = {
+            let mut focus = self
+                .focus
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if focus.first() == Some(uri) {
+                false
+            } else {
+                focus.retain(|held| held != uri);
+                focus.insert(0, uri.clone());
+                focus.truncate(RETAINED_PROGRAMS);
+                true
+            }
+        };
+        // Only when the retained SET moved. Focus is asked on every caret
+        // request, and the common case is the same document twice — where
+        // nothing fell out of the set, so nothing can need releasing, and a
+        // sweep would take a write lock on every shard of the document map for
+        // an answer of "no". A document that takes a program BACK while the set
+        // stands still is covered at the other seam, where its analysis lands.
+        if moved && enforce_program_retention(&self.focus, &self.documents) {
+            // M64: a release hands a whole analysis back to the allocator at
+            // once — the one moment glibc has something to give the OS.
+            memory::trim();
+        }
+        self.reanalyze_if_released(uri);
+    }
+
+    /// M63's other half: schedule the re-analysis a refocused document needs.
+    ///
+    /// Only for a RELEASED document — one that HAD an analysis and gave it back
+    /// — never for a document that simply has not analyzed yet, whose own open
+    /// or edit already scheduled one.
+    fn reanalyze_if_released(&self, uri: &Url) {
+        let Some(text) = self
+            .documents
+            .get(uri)
+            .and_then(|document| document.is_released().then(|| document.text.clone()))
+        else {
+            return;
+        };
+        if self.schedule.is_analyzing(uri) {
+            return;
+        }
+        let Some(generation) = self.schedule.generation(uri) else {
+            return;
+        };
+        // The tally and the fence are usable from a plain synchronous caller;
+        // spawning is not. A test that drives a handler off-runtime keeps the
+        // released tables and answers from them, which is the degraded state
+        // this path exists to leave.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let context = self.analysis_context();
+        let uri = uri.clone();
+        tokio::spawn(async move {
+            let landed = analyze_and_publish(&context, uri.clone(), text, generation)
+                .await
+                .landed();
+            // The analyzed snapshot moved under whatever the client asked for
+            // while this document was released — its tokens and hints were
+            // served from the capture, and the capture is new now (S5).
+            send_refreshes(&context.client, refresh_plan(landed)).await;
         });
     }
 
@@ -2102,6 +2269,7 @@ impl Backend {
             package_unions: Arc::clone(&self.package_unions),
             package_revision: Arc::clone(&self.package_revision),
             union_tokens: Arc::clone(&self.union_tokens),
+            focus: Arc::clone(&self.focus),
         }
     }
 
@@ -2664,6 +2832,11 @@ impl LanguageServer for Backend {
                 uri.clone(),
                 Document::unanalyzed(&params.text_document.text),
             );
+            // M63: an open IS a focus — the editor opened this file because the
+            // user is about to be in it — and it is registered before the
+            // analysis below is scheduled, so the result is kept rather than
+            // released the moment it lands.
+            self.focus(&uri);
             // M26: register the open's generation, exactly as an edit registers
             // its own. E123 routed the open through the same SCHEDULING but it
             // registered nothing, so an edit arriving before the open's
@@ -2729,6 +2902,10 @@ impl LanguageServer for Backend {
                 self.manifests.insert(uri, ManifestDocument::new(text));
                 return;
             }
+            // M63: typing in a file is the strongest focus signal there is.
+            // Before the edit, so the analysis this change schedules lands on a
+            // document the retention rule keeps.
+            self.focus(&uri);
             // Apply the edits to the open document immediately — in order,
             // each against the text as already edited (the incremental-sync
             // contract) — so a completion request arriving before the
@@ -2895,6 +3072,14 @@ impl LanguageServer for Backend {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.documents.remove(&uri);
         self.semantic_token_cache.remove(&uri);
+        // M63: give the retained slot back. A closed document holds nothing,
+        // and leaving its URI in the focus list would spend one of the two
+        // slots on a file that is gone — the next document to be focused would
+        // evict a live one instead of it.
+        self.focus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|held| held != &uri);
         // Drop the edit generation so any in-flight debounced analysis bails,
         // and CANCEL whatever is already past its pause (M26): a closed
         // document's analysis is dropped by `land` in any case, so finishing it
@@ -2916,6 +3101,15 @@ impl LanguageServer for Backend {
         }
         // A document that never analyzed (open failed) still clears.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        // M64: the close above dropped this document's whole analysis — its
+        // program, its entry text and tree, its editor tables — and glibc does
+        // not hand that back to the OS on its own: closing kolt's eighteen
+        // files returned 418 MB to the allocator's free list and 62 MB to the
+        // system, so resident size ratcheted up across a session of opening and
+        // closing files and never came down. This is the ask. Linux/glibc only,
+        // a no-op everywhere else, and it is here rather than on a timer
+        // because a close is exactly the moment there is something to give.
+        memory::trim();
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
@@ -3153,6 +3347,9 @@ impl LanguageServer for Backend {
         self.fenced("hover", Ok(None), || {
             let uri = params.text_document_position_params.text_document.uri;
             let position = params.text_document_position_params.position;
+            // M63: hover is a caret request and needs the program — focus this
+            // document, which re-analyzes it if it had been released.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -3181,6 +3378,8 @@ impl LanguageServer for Backend {
                     .collect();
                 return Ok(Some(CompletionResponse::Array(items)));
             }
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -3224,6 +3423,8 @@ impl LanguageServer for Backend {
         self.fenced("goto_definition", Ok(None), || {
             let uri = params.text_document_position_params.text_document.uri;
             let position = params.text_document_position_params.position;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -3241,6 +3442,8 @@ impl LanguageServer for Backend {
         self.fenced("references", Ok(None), || {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             // Every open document at once (kolt.local 034): the union below
             // re-resolves the definition in each neighbor's program, which is
             // what lets a query IN the defining file see the files that import
@@ -3271,6 +3474,8 @@ impl LanguageServer for Backend {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
             let new_name = params.new_name;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             // The same one-pass guard collection the references handler uses
             // (kolt.local 034): rename reads the same cross-document union, so
             // a rename issued at a definition rewrites the files that import it.
@@ -3339,6 +3544,8 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         self.fenced("prepare_rename", Ok(None), || {
             let uri = params.text_document.uri;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let open: Vec<_> = self.documents.iter().collect();
             let Some(origin) = open.iter().find(|entry| *entry.key() == uri) else {
                 return Ok(None);
@@ -3436,6 +3643,8 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
             let uri = params.text_document.uri;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -3739,6 +3948,7 @@ mod snapshot_consistency_tests {
             package_unions: Arc::new(DashMap::new()),
             package_revision: Arc::new(DashMap::new()),
             union_tokens: Arc::new(DashMap::new()),
+            focus: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -5399,6 +5609,7 @@ async fn main() {
         package_unions: Arc::new(DashMap::new()),
         package_revision: Arc::new(DashMap::new()),
         union_tokens: Arc::new(DashMap::new()),
+        focus: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -6178,6 +6389,11 @@ mod session_leak_tests {
     fn sizes(backend: &Backend) -> session_trace::StateSizes {
         session_trace::StateSizes {
             documents: backend.documents.len(),
+            programs: backend
+                .documents
+                .iter()
+                .filter(|document| document.value().holds_program())
+                .count(),
             semantic_token_cache: backend.semantic_token_cache.len(),
             manifests: backend.manifests.len(),
             pending: backend.schedule.len(),

@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
 use vilan_core::cancel::CancelToken;
 use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
-use vilan_core::fx::FxHashMap as HashMap;
+use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, HASH_IS_NOT_A_TOKEN, tokenize};
@@ -579,6 +579,7 @@ pub fn is_identifier(name: &str) -> bool {
 }
 
 /// A kind of declaration, for the document outline.
+#[derive(Clone, Copy)]
 pub enum SymbolKind {
     Function,
     Struct,
@@ -588,6 +589,10 @@ pub enum SymbolKind {
 }
 
 /// One node in the document outline.
+///
+/// `Clone` since M63: a released document answers the outline from the copy it
+/// captured before dropping its program ([`ReleasedTables`]).
+#[derive(Clone)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -671,6 +676,89 @@ pub struct EditDelta {
     pub start: usize,
     pub old_len: usize,
     pub new_len: usize,
+}
+
+/// M63: how many open documents keep their `Program` — the focused one and
+/// the most recently focused before it.
+///
+/// RULED 2026-09-13 (Order 34, R4). Two, and the reason is what a person does
+/// with an editor: a working session is a file and the file it is being
+/// written against, and the pair alternates. One would re-analyze on every
+/// alternation; two hold both ends of it, and every further document is one
+/// the user is not in. The bound this buys is flat — at most this many
+/// programs are live however many files the session has opened, where before
+/// it every open file held one for as long as the tab existed (1.06 GB
+/// resident with kolt's nineteen open; the owner's own server at 4.13 GB).
+pub const RETAINED_PROGRAMS: usize = 2;
+
+/// M63: the editor tables one open document goes on answering from once its
+/// `Program` has been dropped.
+///
+/// The server holds a whole analysis per OPEN document, for as long as the
+/// editor holds the file — and a whole analysis of a real application is tens
+/// of megabytes: kolt's nineteen `src/*.vl` files stood at 1.06 GB resident
+/// with all of them open (dx-33's `open_documents` instrument, release), and
+/// the owner's own server read 4.13 GB eight hours into a working day. Nothing
+/// there is a leak; it is the design, and M63 is the ruling that bounds it:
+/// the FOCUSED document and the [`RETAINED_PROGRAMS`] most recently focused
+/// keep their `Program`, and every other open document drops to this — its
+/// editor tables, which are what the editor actually reads between visits.
+///
+/// What a released document goes on answering, unchanged: its diagnostics
+/// (already resolved to paths here), its outline, its semantic tokens and
+/// inlay hints (the keystroke path serves both off [`LandedSnapshot`], which
+/// is captured at analysis time and never touched the program again), and its
+/// references — the [`ReferenceIndex`] is a table already, and the two program
+/// questions the cross-document union asks it (which file is a source id, what
+/// is a definition's declared name) are answered from the two maps here.
+///
+/// What it cannot answer until it is focused again: hover, go-to-definition,
+/// type-aware completion, rename, and the dead-item paint — every one of them
+/// a walk of the program itself. Focus re-analyses (M58's warm path, ~3.6 G Ir
+/// on kolt's `client.vl`, sub-second), and the answers come back.
+///
+/// Kept in a `Box` so an unreleased document — the common case, the one the
+/// user is typing in — carries one null pointer for all of this.
+pub struct ReleasedTables {
+    /// [`publish`]'s answer over the program that was dropped: this document's
+    /// diagnostics and warnings with every `SourceId` already resolved to the
+    /// file it names. Taken here rather than recomputed because the resolution
+    /// is exactly what needs the program, and a `PublishedDiagnostic` is
+    /// already the program-free shape the planner publishes (`diagnostics_under`
+    /// relies on the same fact for E113's further legs).
+    diagnostics: Vec<PublishedDiagnostic>,
+    /// [`Document::document_symbols`]'s answer — the outline, in the analyzed
+    /// text's coordinates, which is the space every span this document holds
+    /// is in.
+    symbols: Vec<Symbol>,
+    /// `Program::canonical_sources`: the entry first, then every file the
+    /// analysis loaded. One `PathBuf` per source file — the smallest of these
+    /// tables, and the one the most answers hang off: which file a span
+    /// belongs to (the reference union's path space), whether this document
+    /// loaded an edited file ([`Document::depends_on`], the sweep's gate), and
+    /// what this document's entry IS.
+    canonical_sources: Vec<PathBuf>,
+    /// The declared name and kind of every definition the reference index
+    /// holds a DECLARATION row for — `references::name_of` and
+    /// `references::kind_of`, captured for the rows that can be asked about.
+    ///
+    /// This is the cross-document union's other program question
+    /// (`ReferenceIndex::key_of` and `definition_of_key` both ask the name; a
+    /// rename's E143 expansion asks the kind), and without it a released
+    /// neighbor would contribute nothing to a find-references and would REFUSE
+    /// a rename: the union would go quiet exactly for the files the user is not
+    /// looking at, which is the silent-incomplete-edit class kolt.local 034
+    /// exists to prevent. Declaration rows only — a use site is never resolved
+    /// by name — which is what keeps it a fraction of the index it sits beside.
+    declarations: HashMap<Definition, (Box<str>, Option<DefinitionKind>)>,
+    /// `Program::std_sources` and `Program::dependency_sources`: the files a
+    /// rename may not rewrite, whoever reached them. Two small sets of source
+    /// ids, and the refusal they carry ("the standard library", "a dependency")
+    /// is the one a released neighbor must go on producing — a rename that
+    /// silently skipped a library file it could no longer recognize would emit
+    /// a partial edit set, which is the one thing rename may never do.
+    std_sources: FxHashSet<SourceId>,
+    dependency_sources: FxHashSet<SourceId>,
 }
 
 pub struct Document {
@@ -815,6 +903,11 @@ pub struct Document {
     /// ANALYSIS side — `adopt_analysis` takes it wholesale with the program it
     /// describes. See [`crate::keystroke`].
     landed: LandedSnapshot,
+    /// M63: this document's editor tables, captured when its `Program` was
+    /// released — `None` while it holds one, which is the state of the
+    /// focused document and the [`RETAINED_PROGRAMS`] most recently focused.
+    /// See [`ReleasedTables`] and [`Document::release_analysis`].
+    released: Option<Box<ReleasedTables>>,
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -1341,6 +1434,9 @@ impl Document {
             package_reach: None,
             // Nothing landed, so the keystroke path answers from syntax alone.
             landed: LandedSnapshot::default(),
+            // Nothing was analyzed, so nothing was released: this document has
+            // no tables to fall back to and never claims otherwise (M63).
+            released: None,
         }
     }
 
@@ -1570,6 +1666,9 @@ impl Document {
             // none, which is the withdrawn state and the safe one.
             package_reach: None,
             landed: LandedSnapshot::default(),
+            // A fresh analysis holds its program (M63); the server releases it
+            // later, if this document is not one of the focused few.
+            released: None,
         };
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
@@ -1862,13 +1961,22 @@ impl Document {
     /// compiles agree about most of a shared module, and one mistake reported
     /// twice is one squiggle.
     pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
-        let mut published = publish(
-            self.program.as_ref(),
-            &self.diagnostics,
-            &self.diagnostic_sources,
-            &self.warnings,
-            &self.warning_sources,
-        );
+        // M63: a released document publishes the groups it published while it
+        // held its program. `publish` needs the program to turn a `SourceId`
+        // into the file it names, and that resolution is exactly what was
+        // captured — so the alternative is not a cheaper answer, it is the
+        // document's squiggles disappearing from a background tab the moment
+        // anything republishes.
+        let mut published = match self.released.as_ref() {
+            Some(released) => released.diagnostics.clone(),
+            None => publish(
+                self.program.as_ref(),
+                &self.diagnostics,
+                &self.diagnostic_sources,
+                &self.warnings,
+                &self.warning_sources,
+            ),
+        };
         for shared in &self.shared_diagnostics {
             if !published
                 .iter()
@@ -2261,13 +2369,16 @@ impl Document {
     /// conservative direction — the old always-sweep behavior, kept exactly
     /// where its reason still holds.
     pub fn depends_on(&self, path: &Path) -> bool {
-        let Some(program) = self.program.as_ref() else {
+        // M63: a RELEASED document kept its source list, so the edge stays
+        // exact for it. Without that it would answer `true` here — the
+        // conservative arm below — and every save would re-analyze every
+        // released document in the package, which is the retention the release
+        // exists to avoid, paid back one sweep later.
+        let sources = self.canonical_sources();
+        if sources.is_empty() {
             return true;
-        };
-        program
-            .canonical_sources
-            .iter()
-            .any(|source| same_file(source, path))
+        }
+        sources.iter().any(|source| same_file(source, path))
     }
 
     /// Land a completed analysis of this document (`analysis` is a fresh
@@ -2317,6 +2428,10 @@ impl Document {
             // carry the analysis's (always absent) copy over the document's.
             package_reach: _,
             landed,
+            // M63: an analysis is born holding its program, so its own
+            // released tables are always absent — and THIS document's are
+            // cleared below, by the program arriving.
+            released: _,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
@@ -2325,6 +2440,11 @@ impl Document {
         // session leak M7 measured (leak-soak.md §4.1) stops at.
         self.analyzed_index = analyzed_index;
         self.program = program;
+        // M63: the tables the released state answered from describe the program
+        // that just went away. The incoming one answers every question itself,
+        // so the fallback is dropped rather than left to shadow it — and a
+        // document that is released again captures the new program's tables.
+        self.released = None;
         self.index_time = index_time;
         self.diagnostics = diagnostics;
         self.diagnostic_sources = diagnostic_sources;
@@ -2372,6 +2492,143 @@ impl Document {
         // The entry module's export list follows the LIVE buffer, not the
         // analyzed one — a `fun` typed during the analysis must complete.
         self.landed.index.refresh_entry_from_syntax(&self.text);
+    }
+
+    /// M63: drop this document's `Program` and go on answering from its editor
+    /// tables. Answers whether there was one to drop.
+    ///
+    /// This is the reclaim [`AnalyzedProgram`]'s `Drop` already knew how to do
+    /// — the program first, then the entry text, the entry tree and the
+    /// overlay-served module copies it borrowed — reached deliberately rather
+    /// than as a side effect of a newer analysis landing. Everything the
+    /// program can still be asked for AFTER it is gone is captured first, in
+    /// one place, so a released document's answers are the answers it had and
+    /// not degraded copies of them: its published diagnostics, its outline,
+    /// its source list and its declaration names. See [`ReleasedTables`] for
+    /// what that does and does not cover.
+    ///
+    /// Idempotent, and a no-op on a document that never analyzed: both answer
+    /// `false`, which is what the server's retention pass reads as "nothing to
+    /// hand back here".
+    ///
+    /// The capture is paid on the thread that releases — the server's runtime
+    /// thread — and it is a walk of the entry file's declarations plus a clone
+    /// of the diagnostics, not of the program: the reference index it reads is
+    /// already built, and the document's own tables are already in hand.
+    pub fn release_analysis(&mut self) -> bool {
+        if !self.program.is_some() {
+            return false;
+        }
+        // The outline first, and through the ordinary path: a released
+        // document's `document_symbols` must be byte-for-byte what it answered
+        // a moment ago, and the way to guarantee that is to ask the same
+        // function rather than to re-implement it here.
+        let symbols = self.document_symbols();
+        let Some(program) = self.program.as_ref() else {
+            return false;
+        };
+        let diagnostics = publish(
+            Some(program),
+            &self.diagnostics,
+            &self.diagnostic_sources,
+            &self.warnings,
+            &self.warning_sources,
+        );
+        let canonical_sources = program.canonical_sources.clone();
+        let mut declarations: HashMap<Definition, (Box<str>, Option<DefinitionKind>)> =
+            HashMap::default();
+        for row in self.reference_index.declarations() {
+            if let Some(name) = crate::references::name_of(program, row.definition) {
+                declarations.insert(
+                    row.definition,
+                    (
+                        name.into(),
+                        crate::references::kind_of(program, row.definition),
+                    ),
+                );
+            }
+        }
+        self.released = Some(Box::new(ReleasedTables {
+            diagnostics,
+            symbols,
+            canonical_sources,
+            declarations,
+            std_sources: program.std_sources.clone(),
+            dependency_sources: program.dependency_sources.clone(),
+        }));
+        // The line M63 is: the pair goes, and with it the program, the leaked
+        // entry text, the leaked entry tree and this document's claims on the
+        // overlay-served module copies (`AnalyzedProgram`'s `Drop`, the same
+        // reclaim `adopt_analysis` takes for a superseded analysis).
+        self.program = AnalyzedProgram::none();
+        true
+    }
+
+    /// Whether this document holds a `Program` — the retention pass's question
+    /// (M63), and the refocus trigger's: a focused document that answers
+    /// `false` here is one to re-analyze.
+    pub fn holds_program(&self) -> bool {
+        self.program.is_some()
+    }
+
+    /// Whether this document is answering from [`ReleasedTables`] — it held a
+    /// program, and [`release_analysis`](Document::release_analysis) took it.
+    ///
+    /// Distinct from `!holds_program()`, which is also true of a document that
+    /// never analyzed at all (the entry `did_open` inserts, the degraded
+    /// internal-error document): those have no tables and answer emptily,
+    /// where a released one answers.
+    pub fn is_released(&self) -> bool {
+        self.released.is_some()
+    }
+
+    /// What a definition is CALLED, from the program or — for a released
+    /// document — from its captured declaration rows (M63).
+    ///
+    /// Answers for a definition the reference index holds a declaration row
+    /// for, which is every definition a cross-program key can name.
+    fn name_of_definition(&self, definition: Definition) -> Option<&str> {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => crate::references::name_of(program, definition),
+            (None, Some(released)) => released
+                .declarations
+                .get(&definition)
+                .map(|(name, _)| &**name),
+            (None, None) => None,
+        }
+    }
+
+    /// What KIND of thing a definition is, from the program or from a released
+    /// document's captured rows (M63).
+    fn kind_of_definition(&self, definition: Definition) -> Option<DefinitionKind> {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => crate::references::kind_of(program, definition),
+            (None, Some(released)) => released
+                .declarations
+                .get(&definition)
+                .and_then(|(_, kind)| *kind),
+            (None, None) => None,
+        }
+    }
+
+    /// The source ids a rename may not rewrite: `(std, dependency)`, from the
+    /// program or from a released document's capture (M63).
+    fn foreign_sources(&self) -> Option<(&FxHashSet<SourceId>, &FxHashSet<SourceId>)> {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => Some((&program.std_sources, &program.dependency_sources)),
+            (None, Some(released)) => Some((&released.std_sources, &released.dependency_sources)),
+            (None, None) => None,
+        }
+    }
+
+    /// The files this document's analysis loaded — the entry first — from the
+    /// program, or from the tables of a released one (M63).
+    fn canonical_sources(&self) -> &[PathBuf] {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => &program.canonical_sources,
+            (None, Some(released)) => &released.canonical_sources,
+            (None, None) => &[],
+        }
     }
 
     /// Computes B38's retained tail: the longest byte-identical common
@@ -3802,15 +4059,73 @@ impl Document {
         &self,
         definition: Definition,
     ) -> Option<crate::references::DefinitionKey> {
+        if let Some(released) = self.released.as_ref() {
+            return self.released_key_of(released, definition);
+        }
         let program = self.program.as_ref()?;
         self.reference_index.key_of(program, definition)
+    }
+
+    /// [`definition_key`](Document::definition_key) for a released document
+    /// (M63) — `ReferenceIndex::key_of`'s two program questions answered from
+    /// [`ReleasedTables`]: which file the declaration row's source id names,
+    /// and what the definition is called.
+    fn released_key_of(
+        &self,
+        released: &ReleasedTables,
+        definition: Definition,
+    ) -> Option<crate::references::DefinitionKey> {
+        let declaration = self
+            .reference_index
+            .occurrences_of(definition)
+            .find(|occurrence| occurrence.is_declaration_of(definition))?;
+        let path = released
+            .canonical_sources
+            .get(declaration.source.0 as usize)?
+            .clone();
+        let (name, _) = released.declarations.get(&definition)?;
+        Some(crate::references::DefinitionKey::new(
+            path,
+            declaration.span,
+            name.to_string(),
+        ))
     }
 
     /// The definition `key` names in THIS document's program —
     /// [`ReferenceIndex::definition_of_key`]'s document form.
     pub fn definition_of_key(&self, key: &crate::references::DefinitionKey) -> Option<Definition> {
+        if let Some(released) = self.released.as_ref() {
+            return self.released_definition_of_key(released, key);
+        }
         let program = self.program.as_ref()?;
         self.reference_index.definition_of_key(program, key)
+    }
+
+    /// [`definition_of_key`](Document::definition_of_key) for a released
+    /// document (M63): `ReferenceIndex::definition_of_key`'s scan, filtered
+    /// span-first exactly as there, with the path and the name read from
+    /// [`ReleasedTables`] instead of from the program.
+    fn released_definition_of_key(
+        &self,
+        released: &ReleasedTables,
+        key: &crate::references::DefinitionKey,
+    ) -> Option<Definition> {
+        self.reference_index
+            .declarations()
+            .filter(|row| row.span == key.span())
+            .find(|row| {
+                released
+                    .declarations
+                    .get(&row.definition)
+                    .map(|(name, _)| &**name)
+                    == Some(key.name())
+                    && released
+                        .canonical_sources
+                        .get(row.source.0 as usize)
+                        .map(PathBuf::as_path)
+                        == Some(key.path())
+            })
+            .map(|row| row.definition)
     }
 
     /// `(source, span)` rows from this document's program in `(canonical file
@@ -3818,14 +4133,11 @@ impl Document {
     /// cross-document union merges in. A row whose source has no path
     /// (generated code) is dropped.
     fn spans_by_path(&self, spans: Vec<(SourceId, Span)>) -> Vec<(PathBuf, Span)> {
-        let Some(program) = self.program.as_ref() else {
-            return Vec::new();
-        };
+        let sources = self.canonical_sources();
         spans
             .into_iter()
             .filter_map(|(source, span)| {
-                program
-                    .canonical_sources
+                sources
                     .get(source.0 as usize)
                     .map(|path| (path.clone(), span))
             })
@@ -3835,14 +4147,11 @@ impl Document {
     /// [`Self::spans_by_path`] for a rename's edits, which carry their own
     /// replacement text (E143).
     fn edits_by_path(&self, edits: Vec<(SourceId, Span, String)>) -> Vec<(PathBuf, Span, String)> {
-        let Some(program) = self.program.as_ref() else {
-            return Vec::new();
-        };
+        let sources = self.canonical_sources();
         edits
             .into_iter()
             .filter_map(|(source, span, text)| {
-                program
-                    .canonical_sources
+                sources
                     .get(source.0 as usize)
                     .map(|path| (path.clone(), span, text))
             })
@@ -3853,11 +4162,7 @@ impl Document {
     /// entry (`None` when nothing was analyzed) — how the location conversion
     /// recognizes a path-space span as belonging to an open document.
     pub fn entry_path(&self) -> Option<&Path> {
-        self.program
-            .as_ref()?
-            .canonical_sources
-            .first()
-            .map(PathBuf::as_path)
+        self.canonical_sources().first().map(PathBuf::as_path)
     }
 
     /// The definition the identifier under `offset` names, with its kind — the
@@ -3984,7 +4289,13 @@ impl Document {
         what: &str,
         new_name: &str,
     ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
-        let Some(program) = self.program.as_ref() else {
+        // M63: from the program, or from a released document's capture — the
+        // two source sets and the per-definition name and kind are exactly what
+        // this needs of a program, and a neighbor that could not answer would
+        // refuse the whole rename (`rename_edits_across` propagates), which is
+        // a rename that stops working for every file the user is not looking
+        // at.
+        let Some((std_sources, dependency_sources)) = self.foreign_sources() else {
             return Err(RenameRefusal::NotAnIdentifier);
         };
         let missing = self.unindexed_references(definition);
@@ -4007,7 +4318,7 @@ impl Document {
                 (
                     occurrence.source,
                     occurrence.span,
-                    self.replacement_for(program, definition, occurrence, new_name),
+                    self.replacement_for(definition, occurrence, new_name),
                 )
             })
             .collect();
@@ -4027,13 +4338,13 @@ impl Document {
             // A rename reached through an import must not rewrite the library it
             // reached into. The old code would happily hand the client edits for
             // files under `$VILAN_STD`.
-            if program.std_sources.contains(source) {
+            if std_sources.contains(source) {
                 return Err(RenameRefusal::NotOwned {
                     what: what.to_string(),
                     origin: "the standard library",
                 });
             }
-            if program.dependency_sources.contains(source) {
+            if dependency_sources.contains(source) {
                 return Err(RenameRefusal::NotOwned {
                     what: what.to_string(),
                     origin: "a dependency",
@@ -4063,7 +4374,6 @@ impl Document {
     /// changed is that the module can now express a site where it is not.
     fn replacement_for(
         &self,
-        program: &Program,
         definition: Definition,
         occurrence: &crate::references::Occurrence,
         new_name: &str,
@@ -4074,8 +4384,8 @@ impl Document {
         // Both halves of a shorthand spell one name — that is what makes it a
         // shorthand — so the surviving side keeps the name the site already
         // has, and only the renamed side moves.
-        let existing = crate::references::name_of(program, definition).unwrap_or(new_name);
-        match crate::references::kind_of(program, definition) {
+        let existing = self.name_of_definition(definition).unwrap_or(new_name);
+        match self.kind_of_definition(definition) {
             // The field key is on the LEFT of a struct initializer entry.
             Some(crate::references::DefinitionKind::Field) => format!("{new_name} = {existing}"),
             // Anything else reaching here is the value side: E134's
@@ -4083,7 +4393,7 @@ impl Document {
             // and there is no third shape.
             _ => {
                 debug_assert!(matches!(
-                    crate::references::kind_of(program, other),
+                    self.kind_of_definition(other),
                     Some(crate::references::DefinitionKind::Field)
                 ));
                 format!("{existing} = {new_name}")
@@ -4333,6 +4643,14 @@ impl Document {
     /// Gated as E114's producers are, and it needs the gate more: a salvaged
     /// parse can lose a whole block or the file's entire tail, and **a smaller
     /// program reads to a reachability walk as a deader one** (§3.3).
+    ///
+    /// Empty for a RELEASED document too (M63), and deliberately not captured
+    /// the way the outline and the diagnostics are: a gray is a claim the user
+    /// acts on by DELETING, the union it is computed against is withdrawn and
+    /// recomputed under this document's feet while it is released, and
+    /// determination 8 says a gray may be arbitrarily stale toward FEWER grays
+    /// and never toward more. So a released file simply does not paint, and
+    /// refocusing — which re-analyzes — paints it again.
     pub fn dead_item_spans(&self) -> Vec<Span> {
         if self.generated {
             return Vec::new();
@@ -5135,6 +5453,10 @@ impl Document {
     /// The outline of the entry file: functions, structs (with their fields),
     /// enums, and traits, each with its declaration and name spans.
     pub fn document_symbols(&self) -> Vec<Symbol> {
+        // M63: the outline as it stood, for a document serving from its tables.
+        if let Some(released) = self.released.as_ref() {
+            return released.symbols.clone();
+        }
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
@@ -16835,6 +17157,251 @@ mod m24_budget_eviction {
     }
 }
 
+/// M63: what an open document goes on answering once the server has taken its
+/// `Program` back.
+///
+/// The retention rule is only as good as this module. Dropping an analysis is
+/// easy; dropping it without the editor noticing is the item — the file is
+/// still OPEN, its tab is still there, its squiggles are still on the screen
+/// and a find-references in another file must still see through it. So each pin
+/// here asks the same question twice, once with the program and once without,
+/// and requires the same answer.
+///
+/// The two-document shape is the one kolt.local 034 was filed on: `library.vl`
+/// declares, `application.vl` imports and uses, and the query runs in the
+/// DEFINER — the direction a single program cannot answer, because a program
+/// reaches its own import closure and never its importers.
+#[cfg(test)]
+mod released_documents {
+    use super::*;
+    use crate::document::tests::{analyze_workspace, base_cache_guard, std_root};
+
+    const LIBRARY: &str = "struct Point {\n\tx: i32,\n}\n";
+    const APPLICATION: &str =
+        "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n";
+
+    /// The definer as the open document, its importer open beside it.
+    fn library_and_application() -> (PathBuf, Document, Document) {
+        let (dir, library) =
+            analyze_workspace(&[("library.vl", LIBRARY), ("application.vl", APPLICATION)]);
+        let application = Document::analyze(APPLICATION, &std_root(), &dir.join("application.vl"));
+        (dir, library, application)
+    }
+
+    /// `(path tail, span, message)` per published diagnostic — the shape the
+    /// planner publishes, compared as text so a released document's answer can
+    /// be held to the one it gave a moment earlier.
+    fn published(document: &Document) -> Vec<(String, std::ops::Range<usize>, String)> {
+        document
+            .published_diagnostics()
+            .into_iter()
+            .map(|item| {
+                (
+                    item.path
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    item.span.into_range(),
+                    item.message,
+                )
+            })
+            .collect()
+    }
+
+    fn outline(document: &Document) -> Vec<String> {
+        document
+            .document_symbols()
+            .into_iter()
+            .map(|symbol| format!("{}:{:?}", symbol.name, symbol.full.into_range()))
+            .collect()
+    }
+
+    /// THE PIN (M63): the three answers a released document owes the editor —
+    /// its diagnostics, its outline, and its half of a cross-document
+    /// find-references — are the answers it gave while it held its program.
+    #[test]
+    fn a_released_document_answers_diagnostics_symbols_and_references_from_its_tables() {
+        let _guard = base_cache_guard();
+        let (dir, library, mut application) = library_and_application();
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+
+        let diagnostics_before = published(&application);
+        let outline_before = outline(&application);
+        let references_before = library.references_across(offset, [&application]);
+        assert!(
+            references_before
+                .iter()
+                .any(|(path, _)| path.ends_with("application.vl")),
+            "the union must reach the importer BEFORE the release, or this pin \
+             is measuring nothing: {references_before:?}",
+        );
+
+        assert!(
+            application.release_analysis(),
+            "a document holding a program releases it",
+        );
+        assert!(!application.holds_program());
+        assert!(application.is_released());
+        assert!(
+            !application.release_analysis(),
+            "releasing twice is a no-op, not a second capture",
+        );
+
+        assert_eq!(
+            published(&application),
+            diagnostics_before,
+            "a released document publishes what it published — its `SourceId`s \
+             were resolved to paths before the program went away",
+        );
+        assert_eq!(
+            outline(&application),
+            outline_before,
+            "the outline is served from the capture",
+        );
+        assert_eq!(
+            library.references_across(offset, [&application]),
+            references_before,
+            "the cross-document union must still see through a released \
+             neighbor: its reference index is a table, and the two program \
+             questions it asks (which file a source id is, what a definition is \
+             called) are answered from the released tables. A union that goes \
+             quiet for the files the user is not looking at is the silent \
+             incomplete edit set kolt.local 034 exists to prevent",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE OTHER PIN (M63): a rename at a definition still rewrites a released
+    /// importer.
+    ///
+    /// The sharpest edge of the whole item. Find-references going quiet for a
+    /// background file is a visible failure; a RENAME going quiet for one is an
+    /// invisible corruption — the edit set comes back, the client applies it,
+    /// and the file the user was not looking at still says the old name. The
+    /// rule is that rename is complete or it refuses, so a released neighbor
+    /// has to produce its edits from its tables: its occurrence spans (the
+    /// index), the declaration's name and kind (E143's expansion), and the
+    /// source sets a rename may not rewrite.
+    #[test]
+    fn a_rename_at_a_definition_still_rewrites_a_released_importer() {
+        let _guard = base_cache_guard();
+        let (dir, library, mut application) = library_and_application();
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+        let before = library
+            .rename_edits_across(offset, "Spot", [&application])
+            .expect("the rename answers while the importer holds its program");
+        assert_eq!(
+            before
+                .iter()
+                .filter(|(path, _, _)| path.ends_with("application.vl"))
+                .count(),
+            2,
+            "the import leaf and the constructor: {before:?}",
+        );
+
+        assert!(
+            application.release_analysis(),
+            "the release has to happen, or this pin is a pin on a document that \
+             still holds its program",
+        );
+
+        let after = library
+            .rename_edits_across(offset, "Spot", [&application])
+            .expect(
+                "a released importer must still answer with its edits — a rename \
+                 that refuses because a background file gave its program back is \
+                 a rename that stops working as soon as the retention rule runs",
+            );
+        assert_eq!(after, before, "and the same edits, span for span");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dependency edge survives the release — which is what stops the
+    /// retention rule from paying itself back one sweep later: a released
+    /// document that answered "I might depend on anything" would be
+    /// re-analyzed by every save in the workspace.
+    #[test]
+    fn a_released_document_still_knows_which_files_it_loaded() {
+        let _guard = base_cache_guard();
+        let (dir, _library, mut application) = library_and_application();
+        let library_path = dir.join("library.vl");
+        let unrelated = dir.join("nothing.vl");
+        assert!(application.depends_on(&library_path));
+        assert!(!application.depends_on(&unrelated));
+        let entry_before = application.entry_path().map(Path::to_path_buf);
+        assert!(entry_before.is_some(), "an analyzed document has an entry");
+
+        assert!(
+            application.release_analysis(),
+            "the release has to happen, or this pin is a pin on a document that \
+             still holds its program",
+        );
+
+        assert!(
+            application.depends_on(&library_path),
+            "the source list is captured, so the edge stays exact",
+        );
+        assert!(
+            !application.depends_on(&unrelated),
+            "and stays exact in the negative direction, which is the half that \
+             saves the work",
+        );
+        assert_eq!(
+            application.entry_path().map(Path::to_path_buf),
+            entry_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a released document CANNOT answer, stated as a pin rather than
+    /// left to be discovered: the program walks. Each of them is a caret
+    /// request, each of them focuses the document, and focus re-analyzes.
+    #[test]
+    fn a_released_document_answers_the_program_walks_emptily_until_it_is_analyzed_again() {
+        let _guard = base_cache_guard();
+        let (dir, _library, mut application) = library_and_application();
+        let caret = APPLICATION
+            .find("Point { x = 1 }")
+            .expect("the constructor")
+            + 2;
+        assert!(application.hover(caret).is_some(), "the control");
+
+        assert!(application.release_analysis());
+        assert!(application.hover(caret).is_none());
+        assert!(application.definition(caret).is_none());
+        assert!(
+            application.dead_item_spans().is_empty(),
+            "a released document paints no top-level gray: a gray is a claim \
+             the user acts on by deleting, and determination 8 allows staleness \
+             only toward FEWER of them",
+        );
+
+        // Refocus: the server re-analyzes, `adopt_analysis` lands the program,
+        // and the tables that stood in for it are dropped with the fallback.
+        let fresh = Document::analyze(APPLICATION, &std_root(), &dir.join("application.vl"));
+        application.adopt_analysis(fresh);
+        assert!(application.holds_program());
+        assert!(
+            !application.is_released(),
+            "the fallback is cleared by the program's arrival, not left to \
+             shadow it",
+        );
+        assert!(application.hover(caret).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A document that never analyzed is not a released one: it has no tables
+    /// and says so, which is what keeps the server's refocus trigger off the
+    /// entry `did_open` inserts before the first analysis is even scheduled.
+    #[test]
+    fn a_document_that_never_analyzed_is_not_released() {
+        let mut document = Document::unanalyzed("fun main() {}\n");
+        assert!(!document.holds_program());
+        assert!(!document.is_released());
+        assert!(!document.release_analysis());
+        assert!(!document.is_released());
+    }
+}
+
 // Linux-only, and specifically Linux rather than unix: the harness reads
 // resident-set size from `/proc/self/statm`, which Windows does not have (the
 // CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1
@@ -18709,6 +19276,396 @@ mod session_growth {
             .collect();
         entries.sort();
         on_big_stack(move || open_documents("kolt_src", &entries));
+    }
+
+    /// M63/M64: the same session, under the retention rule the server now
+    /// applies — and with M64's trim at every release.
+    ///
+    /// [`open_documents`] is the BEFORE: every open document holds its whole
+    /// analysis, for as long as the editor holds the file. This is the after.
+    /// After each open, every document but the `retained` most recently opened
+    /// drops to its editor tables ([`Document::release_analysis`]) and the
+    /// allocator is asked to hand back what that freed
+    /// ([`crate::memory::trim`]) — which is exactly what `Backend::focus` and
+    /// `analyze_and_publish` do in the shipped server, with "most recently
+    /// opened" standing in for "most recently focused".
+    ///
+    /// Reports the same row as its sibling plus the number of documents that
+    /// still hold a program, so the two logs diff line for line, and answers
+    /// the readings the pins are stated on.
+    fn open_documents_under_retention(
+        label: &str,
+        entries: &[PathBuf],
+        retained: usize,
+    ) -> RetentionReading {
+        let std_dir = std_root();
+        let baseline = rss_kib();
+        let mut open: Vec<Document> = Vec::with_capacity(entries.len());
+        let mut first = None;
+        let mut at_capacity = None;
+        for (index, entry) in entries.iter().enumerate() {
+            let Ok(text) = std::fs::read_to_string(entry) else {
+                println!("M63-SKIP {label}: {} is not readable", entry.display());
+                continue;
+            };
+            let before = thread_cpu_now();
+            open.push(Document::analyze_on_this_thread(&text, &std_dir, entry));
+            let after = thread_cpu_now();
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            // The rule, applied where the server applies it.
+            let count = open.len();
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                if position + retained < count {
+                    released |= document.release_analysis();
+                }
+            }
+            if released {
+                crate::memory::trim();
+            }
+            let programs = open
+                .iter()
+                .filter(|document| document.holds_program())
+                .count();
+            let resident = rss_kib();
+            let (in_use, retained_free) = heap_split_bytes().unwrap_or((-1, -1));
+            println!(
+                "M63 {{\"section\":\"open_documents_retained\",\"corpus\":\"{label}\",\
+                 \"profile\":\"{}\",\"load\":\"{}\",\"open\":{},\"programs\":{},\
+                 \"file\":\"{}\",\"analyze_cpu_ms\":{:.2},\"rss_kib\":{},\
+                 \"rss_kib_since_baseline\":{},\"heap_in_use_kib\":{},\
+                 \"heap_free_retained_kib\":{}}}",
+                profile(),
+                loadavg_1m(),
+                index + 1,
+                programs,
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                cpu.as_secs_f64() * 1000.0,
+                resident,
+                resident.saturating_sub(baseline),
+                in_use / 1024,
+                retained_free / 1024,
+            );
+            // The two readings the bound is stated against: the FIRST open,
+            // whose cost is one whole cold analysis plus everything the process
+            // resolves once (std, the base cache, the interned names), and the
+            // session at capacity — exactly as many documents open as it
+            // retains programs for. Everything opened after that one costs its
+            // editor tables and nothing else, which is the claim.
+            if open.len() == 1 {
+                first = Some((resident, in_use));
+            }
+            if open.len() == retained {
+                at_capacity = Some((resident, in_use));
+            }
+        }
+        // THE REFOCUS, measured: the first document opened was released long
+        // ago, and this is what the server pays when the user comes back to its
+        // tab — M58's warm path, in a process whose base world, parse caches
+        // and interned names are all full. Reported beside the COLD cost of the
+        // same file (the first row above) because the two together are the
+        // trade the rule makes.
+        if let Some(entry) = entries.first()
+            && let Ok(text) = std::fs::read_to_string(entry)
+        {
+            let before = thread_cpu_now();
+            let landed = Document::analyze_on_this_thread(&text, &std_dir, entry);
+            let after = thread_cpu_now();
+            if let Some(document) = open.first_mut() {
+                document.adopt_analysis(landed);
+            }
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            println!(
+                "M63 {{\"section\":\"refocus\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"analyze_cpu_ms\":{:.2},\
+                 \"holds_program\":{}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                cpu.as_secs_f64() * 1000.0,
+                open.first().is_some_and(Document::holds_program),
+            );
+            // And then the visit is over: the rule runs again, exactly as the
+            // server runs it when the next analysis lands, so the readings
+            // below are the session's steady state and not a session with one
+            // extra program in it.
+            let count = open.len();
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                if position + retained < count {
+                    released |= document.release_analysis();
+                }
+            }
+            if released {
+                crate::memory::trim();
+            }
+        }
+        let held = rss_kib();
+        let (held_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        let programs = open
+            .iter()
+            .filter(|document| document.holds_program())
+            .count();
+        drop(open);
+        // M64: the close, and the trim that is the item. The pair of readings
+        // on either side of it is the whole question — how much a session gets
+        // back when every file is closed, and how much of that reaches the OS.
+        let (closed_in_use, closed_retained) = heap_split_bytes().unwrap_or((-1, -1));
+        let closed_rss = rss_kib();
+        crate::memory::trim();
+        let (trimmed_in_use, trimmed_retained) = heap_split_bytes().unwrap_or((-1, -1));
+        let trimmed_rss = rss_kib();
+        println!(
+            "M63 {{\"section\":\"open_documents_retained_released\",\"corpus\":\"{label}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"programs_held\":{},\
+             \"base_cache_worlds\":{},\"base_cache_weight_kib\":{},\"rss_kib_baseline\":{},\
+             \"rss_kib_held\":{},\"rss_kib_after_close\":{},\"rss_kib_after_trim\":{},\
+             \"heap_in_use_kib_held\":{},\"heap_in_use_kib_after_close\":{},\
+             \"heap_in_use_kib_after_trim\":{},\"heap_free_retained_kib_after_close\":{},\
+             \"heap_free_retained_kib_after_trim\":{}}}",
+            profile(),
+            loadavg_1m(),
+            programs,
+            // What is left when every document is gone is not the documents':
+            // the base cache retains a resolved world per key (M21/M23/M24),
+            // and it is the floor every reading here sits on.
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            baseline,
+            held,
+            closed_rss,
+            trimmed_rss,
+            held_in_use / 1024,
+            closed_in_use / 1024,
+            trimmed_in_use / 1024,
+            closed_retained / 1024,
+            trimmed_retained / 1024,
+        );
+        RetentionReading {
+            baseline_rss_kib: baseline,
+            opened: entries.len(),
+            retained,
+            first_in_use_kib: first.map(|(_, in_use)| in_use).unwrap_or(0) / 1024,
+            at_capacity_rss_kib: at_capacity.map(|(rss, _)| rss).unwrap_or(baseline),
+            at_capacity_in_use_kib: at_capacity.map(|(_, in_use)| in_use).unwrap_or(0) / 1024,
+            held_rss_kib: held,
+            held_in_use_kib: held_in_use / 1024,
+            programs_held: programs,
+            closed_rss_kib: closed_rss,
+            trimmed_rss_kib: trimmed_rss,
+            closed_in_use_kib: closed_in_use / 1024,
+        }
+    }
+
+    /// What [`open_documents_under_retention`] answers: the readings its two
+    /// pins are stated on, in the units they are stated in.
+    #[derive(Clone, Copy, Debug)]
+    struct RetentionReading {
+        /// Resident KiB before the first document was opened.
+        baseline_rss_kib: usize,
+        /// How many documents the session opened, and how many programs it was
+        /// allowed to keep.
+        opened: usize,
+        retained: usize,
+        /// Heap KiB in use with ONE document open: one whole analysis, plus
+        /// everything a process resolves exactly once.
+        first_in_use_kib: isize,
+        /// Resident KiB with exactly as many documents open as programs are
+        /// retained — the "N × the largest document" figure, measured rather
+        /// than estimated.
+        at_capacity_rss_kib: usize,
+        at_capacity_in_use_kib: isize,
+        /// Resident KiB with every document open.
+        held_rss_kib: usize,
+        held_in_use_kib: isize,
+        /// How many programs were live at the end. The rule's own number.
+        programs_held: usize,
+        /// Resident KiB after every document was dropped, before and after the
+        /// trim M64 adds.
+        closed_rss_kib: usize,
+        trimmed_rss_kib: usize,
+        /// Heap KiB in use with every document open, and once they are all
+        /// dropped: the difference is what the close handed BACK to the
+        /// allocator, which is what the trim is asked to pass on to the OS.
+        closed_in_use_kib: isize,
+    }
+
+    /// THE PIN (M63): opening documents past the retained few does not grow the
+    /// process by a program each.
+    ///
+    /// Stated on the heap's IN-USE bytes rather than on resident size, and the
+    /// reason is the same one `leak-soak.md` §7.7 gives: RSS confounds what the
+    /// server holds with what the allocator has not handed back, and the claim
+    /// here is about the first. Resident size is asserted too, with the slack
+    /// that confound deserves, because it is the number the owner reads.
+    ///
+    /// Six documents of the generated exhibit, two retained. The bound is the
+    /// reading at capacity — the session with exactly two documents open — plus
+    /// a fifth: every document past the second costs its editor tables, which
+    /// are real and are not nothing, and the pin's subject is that it does NOT
+    /// cost another analysis.
+    #[test]
+    fn open_documents_retain_at_most_the_ruled_number_of_programs() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("retention", 24);
+        // Six copies of one generated module, each its own entry: the same
+        // shape as six open files of an application, small enough for the
+        // suite.
+        let entries: Vec<PathBuf> = (0..6)
+            .map(|index| {
+                let path = directory.join(format!("open{index}.vl"));
+                std::fs::write(&path, EXHIBIT_ENTRY).expect("write an exhibit entry");
+                path
+            })
+            .collect();
+        let _ = entry;
+        let reading = on_big_stack(move || {
+            open_documents_under_retention("exhibit_24", &entries, RETAINED_PROGRAMS)
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert_eq!(
+            reading.programs_held, RETAINED_PROGRAMS,
+            "six open documents, and the rule says {RETAINED_PROGRAMS} programs",
+        );
+        assert!(
+            reading.at_capacity_in_use_kib > reading.first_in_use_kib,
+            "the calibration readings must exist and must differ — without \
+             them this pin has no bound to compare against ({reading:?})",
+        );
+        // What one document costs WITH a program, measured on this box in this
+        // run: the second open, which pays an analysis and its tables against a
+        // process that has already resolved everything a process resolves once.
+        let with_a_program = reading.at_capacity_in_use_kib - reading.first_in_use_kib;
+        // What one costs WITHOUT one: the average over every document opened
+        // past capacity, each of which keeps its editor tables and gave its
+        // program back.
+        let past_capacity = (reading.opened - reading.retained) as isize;
+        let without_a_program =
+            (reading.held_in_use_kib - reading.at_capacity_in_use_kib) / past_capacity;
+        assert!(
+            without_a_program * 4 <= with_a_program * 3,
+            "a document opened past the retained few cost {without_a_program} \
+             KiB of heap against the {with_a_program} KiB one that keeps its \
+             program costs — the tables are real and are not nothing, but a \
+             released document must cost materially less than an analysis, or \
+             the rule is not releasing (M63). {reading:?}",
+        );
+        let resident_bound =
+            (reading.at_capacity_rss_kib as f64 * 1.5).max(reading.baseline_rss_kib as f64);
+        assert!(
+            (reading.held_rss_kib as f64) <= resident_bound,
+            "six open documents held {} KiB resident against the two-document \
+             reading's {} KiB — RSS carries the allocator's retention as well \
+             as the server's, which is what the slack is for, and 1.5× of it \
+             is another analysis (M63)",
+            reading.held_rss_kib,
+            reading.at_capacity_rss_kib,
+        );
+    }
+
+    /// THE PIN (M64): closing every document returns the session to where it
+    /// started — resident size within 1.2× of the figure before the first open.
+    ///
+    /// This is the number that did not hold before the trim: closing kolt's
+    /// files returned 418 MB to the allocator's free list and 62 MB to the OS,
+    /// so a session of opening and closing files ratcheted resident size up and
+    /// never brought it down. `malloc_trim(0)` is the whole difference, and the
+    /// pin is stated on RSS deliberately — the allocator's free list is exactly
+    /// what is being asserted about.
+    #[test]
+    fn closing_every_document_returns_the_process_to_its_opening_size() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("close", 24);
+        let entries: Vec<PathBuf> = (0..4)
+            .map(|index| {
+                let path = directory.join(format!("close{index}.vl"));
+                std::fs::write(&path, EXHIBIT_ENTRY).expect("write an exhibit entry");
+                path
+            })
+            .collect();
+        let _ = entry;
+        let reading = on_big_stack(move || {
+            open_documents_under_retention("exhibit_24_close", &entries, RETAINED_PROGRAMS)
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+
+        // THE ASSERTION THAT IS ABOUT THE TRIM. Closing every document handed
+        // a heap's worth of bytes back to the allocator; this is how much of
+        // that reached the OS. Without `malloc_trim` it is zero — which is
+        // exactly the defect M64 names, and is what makes this pin non-vacuous
+        // where the ratio below is not: the ratio passes on this exhibit with
+        // the trim removed, because four small documents do not push resident
+        // size far enough past the floor for 1.2× to catch it.
+        let given_back_to_the_allocator = reading.held_in_use_kib - reading.closed_in_use_kib;
+        let returned_to_the_os = (reading.closed_rss_kib - reading.trimmed_rss_kib) as isize;
+        assert!(
+            returned_to_the_os * 2 >= given_back_to_the_allocator,
+            "closing every document handed {given_back_to_the_allocator} KiB \
+             back to the allocator and only {returned_to_the_os} KiB of it \
+             reached the OS: glibc does not trim on its own, which is why the \
+             server asks it to (M64). {reading:?}",
+        );
+        // And the ratio the item states, against the AT-CAPACITY reading rather
+        // than the baseline: the process keeps what the first analysis resolved
+        // — std's parsed world, the interned names, the base cache's retained
+        // worlds — and none of that belongs to a document or comes back when
+        // one closes. What must come back is every analysis the session opened
+        // after that.
+        let bound = (reading.at_capacity_rss_kib as f64 * 1.2) as usize;
+        assert!(
+            reading.trimmed_rss_kib <= bound,
+            "after closing every document the process holds {} KiB resident \
+             against the two-document reading's {} KiB (bound {bound} KiB, and \
+             {} KiB before the trim) (M64)",
+            reading.trimmed_rss_kib,
+            reading.at_capacity_rss_kib,
+            reading.closed_rss_kib,
+        );
+    }
+
+    /// M63/M64's measurement on the owner's own application: kolt's `src/*.vl`,
+    /// opened under the retention rule.
+    ///
+    /// `#[ignore]`d for its cost and because its subject is a sibling checkout,
+    /// exactly like [`session_growth_across_open_documents`] — which is the
+    /// BEFORE of the same reading. Run the two back to back:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(open_documents)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M63's per-open-document measurement under the retention rule: needs VILAN_PERF_KOLT, run deliberately"]
+    fn open_documents_under_retention_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M63-SKIP open_documents_retained: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        // `VILAN_M63_RETAINED` overrides the ruled figure, which is how the
+        // measurement ATTRIBUTES what is left: at 0 no document keeps a
+        // program, so what the session holds is its editor tables plus the
+        // process-global caches, and the difference between that run and this
+        // one is what the retained programs themselves cost.
+        let retained = std::env::var("VILAN_M63_RETAINED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(RETAINED_PROGRAMS);
+        on_big_stack(move || open_documents_under_retention("kolt_src", &entries, retained));
     }
 
     /// The item's own session: 2,000 keystrokes, twenty windows, on the

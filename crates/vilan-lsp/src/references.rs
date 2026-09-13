@@ -148,10 +148,38 @@ pub struct DefinitionKey {
 }
 
 impl DefinitionKey {
+    /// The key of a declaration named directly: the declaring file, the
+    /// declaration name's span in it, and the name.
+    ///
+    /// M63's seam. A document whose `Program` was released still holds its
+    /// reference index and, beside it, the two facts [`key_of`] reads off a
+    /// program — the source list and the declaration names — so it can mint
+    /// the same key; this is the constructor it mints it with
+    /// (`Document::released_key_of`). Every other caller goes through
+    /// [`key_of`], which is the only one that can DERIVE the three parts.
+    ///
+    /// [`key_of`]: ReferenceIndex::key_of
+    pub fn new(path: PathBuf, span: Span, name: String) -> DefinitionKey {
+        DefinitionKey { path, span, name }
+    }
+
     /// The canonical path of the declaring file — what
     /// [`crate::document::Document::depends_on`] scopes the union by.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The declaration name's span in [`path`](DefinitionKey::path) — the
+    /// address half of the key, and what a resolution filters on first.
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
+    /// The declared name — the consistency half: a program that read a
+    /// different text of [`path`](DefinitionKey::path) fails this and refuses
+    /// to match rather than linking two symbols that share an address.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -858,6 +886,17 @@ impl ReferenceIndex {
         let previous = self.occurrences.get(start.checked_sub(1)?)?;
         (previous.source == source && previous.span.end == offset && previous.span.start < offset)
             .then_some(previous)
+    }
+
+    /// Every DECLARATION row in the index, in `(source, span)` order.
+    ///
+    /// M63: the rows a cross-program [`DefinitionKey`] can address. A document
+    /// whose program was released resolves a key by scanning these — the same
+    /// scan [`definition_of_key`](ReferenceIndex::definition_of_key) does, with
+    /// the name and path read from the released document's own tables — and
+    /// captures their names when it releases.
+    pub fn declarations(&self) -> impl Iterator<Item = &Occurrence> {
+        self.occurrences.iter().filter(|row| row.is_declaration)
     }
 
     /// Every occurrence of `definition`, declaration included, in source order.

@@ -108,6 +108,19 @@ impl Schedule {
         generation
     }
 
+    /// Whether an analysis is in flight for `uri` (M63).
+    ///
+    /// The refocus path's guard: an editor sends several requests the instant a
+    /// tab is switched to, and each of them focuses the same document. Without
+    /// this, each would start its own analysis of one file — and with a
+    /// `supersede` in front of it, each would cancel the last, so a busy tab
+    /// switch could analyze forever and land nothing.
+    pub fn is_analyzing(&self, uri: &Url) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|entry| !entry.running.is_empty())
+    }
+
     /// The document's current edit generation, for the debounced pause's
     /// [`crate::pause_action`]. `None` when the document has no schedule —
     /// closed, or never opened — which supersedes any pause waiting on it.
