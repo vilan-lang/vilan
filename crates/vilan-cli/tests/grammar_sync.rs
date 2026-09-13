@@ -1865,6 +1865,101 @@ fn e164_a_head_that_is_really_a_comparison_gives_itself_back_at_the_statement() 
     assert_eq!(painting.region_depth("1;", "meta.tag.vilan"), 0);
 }
 
+// --- E170: a head item's NAME is an attribute, not a call or a keyword ------
+//
+// `<div class("row")>` painted `class` `entity.name.function.vilan` and
+// `<input type("checkbox")>` painted `type` `storage.type.vilan` — the call
+// rule and the declaration-keyword rule reaching text inside a head, because
+// the head region had only `$self` to offer its items and the attribute
+// vocabulary lived in two rules that never asked to be in a head at all (the
+// `on:` form and a hyphenated name, both guarded by their own spelling). So
+// the head form's names were coloured by what they happen to look like
+// elsewhere: `class` like a call, `type` and `for` like the keywords they
+// spell. E164's head REGION is what makes the fix one rule — the vocabulary
+// can be asked for inside a head and nowhere else.
+//
+// Measured over the tree at the fix: of every token in all 257 tracked `.vl`
+// files and all 456 `vilan` fences under `vilan/docs`, 7 tokens change scope
+// (22 characters in `vilan/test/element-syntax.vl` — `class`, `title`, `type`,
+// `viewBox`, `d`; 16 in two doc fences — `class`, `placeholder`), and every
+// one is a head item's own name. The builder spelling is untouched, which is
+// the control that matters: `view("p").class("summary")` is a CALL and stays
+// `entity.name.function.vilan` in all six `.vl` files that write it.
+
+/// Every shape the rule has to tell apart, in one program: a plain attribute
+/// name, two keyword-named ones, the `on:` form and a hyphenated name (the two
+/// that already worked), a chained call inside a head item, a call outside any
+/// head, and a postfix chain hanging off the element.
+const E170_HEAD_ITEM_NAMES: &str = "\
+fun probe(flag: bool): View {
+\tlet widget = compute(\"x\");
+\t<label class(\"row\") for(\"name\") hidden.show(flag)>
+\t\t<input type(\"checkbox\") on:click(|_| { bump(); }) aria-label(\"y\") />
+\t\t{widget}
+\t</label>.child(<span>\"tail\"</span>)
+}
+";
+
+#[test]
+fn e170_a_head_items_name_is_an_attribute_name_whatever_it_spells() {
+    let Some(painting) = painting(E170_HEAD_ITEM_NAMES) else {
+        return;
+    };
+    let attribute = "entity.other.attribute-name.vilan";
+    // THE DEFECT: a plain name went to the call rule, and a name that spells a
+    // keyword went to the keyword list — `for` to `keyword.control.vilan` and
+    // `type` to `storage.type.vilan`, the scope the declaration keyword takes.
+    assert_eq!(painting.scope_at("class"), attribute, "a plain name");
+    assert_eq!(painting.scope_at("for("), attribute, "a control keyword");
+    assert_eq!(
+        painting.scope_at("type("),
+        attribute,
+        "a declaration keyword"
+    );
+    // The two that already carried it, from rules of their own, unchanged.
+    assert_eq!(painting.scope_at("click"), attribute, "the `on:` form");
+    assert_eq!(
+        painting.scope_at("aria-label"),
+        attribute,
+        "a hyphenated name"
+    );
+    // And every one of them is inside the head, which is the only place this
+    // vocabulary is offered.
+    for name in ["class", "for(", "type(", "click", "aria-label"] {
+        assert_eq!(painting.region_depth(name, "meta.tag.vilan"), 1, "{name}");
+    }
+}
+
+#[test]
+fn e170_a_call_is_still_a_call_inside_a_head_item_and_outside_one() {
+    let Some(painting) = painting(E170_HEAD_ITEM_NAMES) else {
+        return;
+    };
+    let call = "entity.name.function.vilan";
+    // Inside a head, but not a head item's own name: the rule's lookbehind
+    // declines a name glued to a `.`, so a chained call keeps the call scope.
+    assert_eq!(painting.scope_at("show"), call, "`hidden.show(flag)`");
+    assert_eq!(painting.region_depth("show", "meta.tag.vilan"), 1);
+    // Inside a head item's VALUE — `#element-head-value`'s region, which this
+    // rule is not part of, so an argument paints as it would anywhere.
+    assert_eq!(painting.scope_at("bump"), call, "a call in a closure value");
+    assert_eq!(painting.region_depth("bump", "meta.tag.vilan"), 1);
+    // Outside any head: an ordinary call, and the postfix chain the element
+    // itself hangs — the head has ended at its `>` before the `.child(` runs.
+    assert_eq!(
+        painting.scope_at("compute"),
+        call,
+        "a call before the element"
+    );
+    assert_eq!(painting.region_depth("compute", "meta.tag.vilan"), 0);
+    assert_eq!(
+        painting.scope_at("child"),
+        call,
+        "the element's postfix chain"
+    );
+    assert_eq!(painting.region_depth("child", "meta.tag.vilan"), 0);
+}
+
 /// The book's twin (the third place). highlight.js has no operator rule, so its
 /// brackets were never mis-scoped — but its element-tag rule made the very same
 /// `<type` mistake, and takes the very same guard.
