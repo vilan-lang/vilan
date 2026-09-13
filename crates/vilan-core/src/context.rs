@@ -312,14 +312,39 @@ fn field_type_at(
         .generic_parameter_constraint_ids
         .iter()
         .position(|id| id == parameter)?;
-    let arguments = match instance
-        .and_then(|instance| value_type_of(program, instance))
-        .and_then(|type_id| program.type_id_to_type_map.get(&type_id))
-    {
-        Some(Type::Struct(id, arguments)) if *id == struct_id => arguments,
-        _ => return Some(field.type_id),
-    };
-    Some(arguments.get(position).copied().unwrap_or(field.type_id))
+    let argument = instance
+        .into_iter()
+        .flat_map(|instance| instance_types_of(program, instance))
+        .find_map(|type_id| match program.type_id_to_type_map.get(&type_id) {
+            Some(Type::Struct(id, arguments)) if *id == struct_id => {
+                arguments.get(position).copied()
+            }
+            _ => None,
+        });
+    Some(argument.unwrap_or(field.type_id))
+}
+
+/// The types this pass will read an INSTANCE's generic arguments out of, in
+/// preference order: the ANNOTATION that expected a struct literal (B323)
+/// first, the value's own type second.
+///
+/// The annotation wins because a closure LITERAL is born clause-less — that is
+/// what makes it deferrable — so `Held { body = || .. }` binds the struct's
+/// parameter from a clause-less closure type and the literal's own record
+/// carries no `context` clause at all. Under `let held: Held<(|| void) context
+/// current> = Held { body = || .. }` the annotation is the only place the
+/// clause is written; reading past it left the field landing silent, the
+/// literal capturing the context of its construction site, and the program
+/// printing it (B323's `saw 9`). Unification ignores the clause, so the two
+/// answers differ in nothing else, and a non-struct or wrong-struct
+/// expectation simply falls through to the value's own type.
+fn instance_types_of(program: &Program, entity: Id) -> impl Iterator<Item = TypeId> {
+    program
+        .struct_literal_expectations
+        .get(&entity)
+        .copied()
+        .into_iter()
+        .chain(value_type_of(program, entity))
 }
 
 /// The type an expression has, as this pass can see it: a reference to a

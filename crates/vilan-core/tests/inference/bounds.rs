@@ -9291,6 +9291,43 @@ fn b309_a_generic_argument_carries_the_clause_into_the_field_it_binds() {
     );
 }
 
+/// B323: the same generic argument written as an ANNOTATION rather than
+/// carried in by a constructor's parameter. `Held<(|| void) context current>`
+/// binds `T` from the VALUE's type, and a closure literal is born clause-less
+/// — that is what makes it deferrable — so the literal bound a clause-less `T`
+/// and the annotation reached nothing: the field landing never fired, the
+/// literal captured at construction, and the program printed the context of
+/// its CONSTRUCTION site (`saw 9`) rather than of its call (`saw 3`).
+///
+/// The landing now reads the annotated EXPECTED type of the literal, so the
+/// two spellings agree. `hold` above is the control: the constructor shape has
+/// always worked and still does.
+#[test]
+fn b323_an_annotated_generic_argument_carries_the_clause_into_the_literal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        fun main() {
+            current.run(9, || {
+                let held: Held<(|| void) context current> =
+                    Held { body = || print(i"saw {current.get()}") };
+                current.run(3, || (held.body)());
+            });
+        }
+        main();
+        "#,
+        "saw 3\n",
+    );
+}
+
 /// A RETURN carries the clause: the closure a function hands back is injected,
 /// so its caller supplies the context at the call THROUGH it rather than the
 /// producing function capturing one it may not have.

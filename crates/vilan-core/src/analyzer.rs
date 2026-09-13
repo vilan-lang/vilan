@@ -46883,6 +46883,20 @@ pub struct Program<'src> {
     // Maps a struct initializer expr id to the struct definition it constructs,
     // so go-to-definition on `Point { .. }` reaches the `struct` declaration.
     pub struct_initializer_to_def: HashMap<Id, Id>,
+    /// B323: the type an ANNOTATION expects of a struct LITERAL — the slice of
+    /// the analyzer's walk-time `expected_types` that lands on an initializer,
+    /// and nothing else.
+    ///
+    /// Carried out for the `context` pass alone. A closure literal is born
+    /// clause-less (that is what makes it deferrable), so `let held:
+    /// Held<(|| void) context current> = Held { body = || .. }` binds the
+    /// struct's parameter from a clause-less closure type and the literal's own
+    /// recorded type carries no clause anywhere. The annotation is then the only
+    /// place the clause is written, and the field landing has to read it there
+    /// or the literal captures its context at construction — silently, which is
+    /// what B323 measured. Unification ignores the clause (B309), so the
+    /// expectation and the literal's own type differ in nothing else.
+    pub struct_literal_expectations: HashMap<Id, TypeId>,
     // Named type references in type position: `(file, name span, definition id,
     // label)`. Type names aren't entities, so this drives go-to-definition and
     // hover on them (e.g. `Option`, `i32`, a trait bound).
@@ -55932,6 +55946,23 @@ fn analyze_over_world<'src>(
     // `source_layers` resolves that comparison per SOURCE rather than per node.
     let canonical_sources: Vec<PathBuf> = sources.iter().map(crate::util::canonical_path).collect();
 
+    // B323: the expectations that landed on a struct LITERAL, taken before
+    // `expr_id_to_expr_map` moves into the program. Filtered here rather than
+    // carried whole: the context pass is the only reader and a literal is the
+    // only position whose own recorded type can lose a `context` clause the
+    // author wrote.
+    let struct_literal_expectations: HashMap<Id, TypeId> = analyzer
+        .expected_types
+        .iter()
+        .filter(|(id, _)| {
+            matches!(
+                analyzer.expr_id_to_expr_map.get(id),
+                Some(Expr::StructInitializer(..))
+            )
+        })
+        .map(|(&id, &type_id)| (id, type_id))
+        .collect();
+
     Some(Program {
         platform,
         closures: analyzer.closures,
@@ -56037,6 +56068,7 @@ fn analyze_over_world<'src>(
         arity_invalid_calls: std::mem::take(&mut analyzer.arity_invalid_calls),
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
+        struct_literal_expectations,
         type_references,
         import_aliases: std::mem::take(&mut analyzer.import_aliases),
         import_alias_spans: std::mem::take(&mut analyzer.import_alias_spans),
