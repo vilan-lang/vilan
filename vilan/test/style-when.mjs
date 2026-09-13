@@ -138,7 +138,7 @@ function $b(self, key) {
 	let $d = null;
 	if ($c[0] === 0) {
 		const entry = $c[1];
-		$d = [ 0, __clone(entry[1]) ];
+		$d = [ 0, __clone(entry.slice(1, 3)) ];
 	} else {
 		$d = [ 1 ];
 	}
@@ -148,18 +148,18 @@ function $i(self, key) {
 	self[0].delete(hash(key));
 }
 function $j(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
 }
 function $l(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+		result.push(__clone(entry.slice(1, 3)));
 	}
 	return result;
 }
-const base = [ [ new Map([ [ "::padding", [ "::padding", [ "s1ufvp8", "padding:var(--space-2)" ] ] ], [ "::color", [ "::color", [ "s1hbuywq", "color:var(--gray-900)" ] ] ], [ "::background-color", [ "::background-color", [ "sdoeicu", "background-color:#ffffff" ] ] ] ]) ] ];
-const chosen = [ [ new Map([ [ "::color", [ "::color", [ "s1ip1dgv", "color:var(--blue-900)" ] ] ], [ "::background-color", [ "::background-color", [ "s1do7ev5", "background-color:var(--blue-100)" ] ] ] ]) ] ];
-const muted = [ [ new Map([ [ "::color", [ "::color", [ "s1hbr49h", "color:var(--gray-400)" ] ] ] ]) ] ];
+const base = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvp8", "padding:var(--space-2)" ] ], [ "::color", [ "::color", "s1hbuywq", "color:var(--gray-900)" ] ], [ "::background-color", [ "::background-color", "sdoeicu", "background-color:#ffffff" ] ] ]) ] ];
+const chosen = [ [ new Map([ [ "::color", [ "::color", "s1ip1dgv", "color:var(--blue-900)" ] ], [ "::background-color", [ "::background-color", "s1do7ev5", "background-color:var(--blue-100)" ] ] ]) ] ];
+const muted = [ [ new Map([ [ "::color", [ "::color", "s1hbr49h", "color:var(--gray-400)" ] ] ]) ] ];
 let cell = 0;
 while (cell < 4) {
 	const is_chosen = cell % 2 === 1;

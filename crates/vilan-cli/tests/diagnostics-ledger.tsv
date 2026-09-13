@@ -461,3 +461,4 @@ row	flagship	key
 427	-	child_relation takes one of the two shipped relations — >* (children) or >*+* (divide) — and got {...}: it is those two methods' shared chokepoint, not a raw-selector hatch. A condition on the element ITSELF is attribute(name, value, ..) or within(name, value, ..), and a negated one is not(..) inside the condition it negates.
 428	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
 429	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
+430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait

@@ -503,6 +503,20 @@ pub struct ExprMatchLeg {
     pub body: Id,
 }
 
+/// How two INHERENT impl subjects claim the same receivers — what
+/// [`Analyzer::subjects_collide`] answers and what the duplicate-member message
+/// says (B315).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubjectCollision {
+    /// One subject written twice: the same type, or two binders bound the same
+    /// way. The duplicate the rule has refused since B57.
+    Same,
+    /// Two BLANKETS whose bound clauses differ but OVERLAP — some type
+    /// satisfies both, so both impls claim it and tier 1 takes whichever came
+    /// first, unranked.
+    OverlappingBounds,
+}
+
 // A fully resolved match pattern, ready for code generation.
 #[derive(Clone, Debug)]
 pub enum ExprPattern {
@@ -514,10 +528,14 @@ pub enum ExprPattern {
     // sub-patterns. The enum id lets the transformer lower `bool` patterns to a
     // native boolean comparison rather than the array discriminant form.
     Variant(Id, usize, Vec<ExprPattern>),
-    // A tuple destructure. Each element carries its flat-storage width (a nested
-    // tuple element occupies more than one slot), so the transformer reads each
-    // at its flat offset and reslices a multi-slot capture.
-    Tuple(Vec<(ExprPattern, usize)>),
+    // A tuple destructure. Each element carries its own TYPE, from which
+    // emission computes the flat-storage width (a nested tuple element occupies
+    // more than one slot) and so reads each leaf at its flat offset and
+    // reslices a multi-slot capture. The type rather than the width because a
+    // generic body is analyzed once with its parameters abstract while emission
+    // runs per instance: an element typed `V` is one slot here and as wide as
+    // its binding there (B310).
+    Tuple(Vec<(ExprPattern, TypeId)>),
     // A fixed-array destructure (`let [a, b, c] = arr`): element `i` reads
     // `subject[i]` (a value copy — the transformer clones each element read,
     // value semantics; count-vs-length was checked at resolution).
@@ -3822,6 +3840,16 @@ pub struct Analyzer<'src> {
     // element whatever it is written as. A `..e` element has no entry and needs
     // none — its splice is mark-driven (§T.5).
     tuple_element_types: HashMap<Id, TypeId>,
+    // B310: for every `Expr::TupleIndex` the field-accessor rule mints, the
+    // tuple type of the ROOT subject the access reads and the chain of element
+    // indices from it (`deep.0.1` folds to the root plus `[0, 1]`). The offset
+    // and width baked into the `Expr` are the layout THIS walk can see, which
+    // counts a still-generic element as one slot; the transformer walks a
+    // MONOMORPHIZED body, where that element's binding is known, and recomputes
+    // both from this path under the active substitution. Without it a
+    // `Map<str, (str, str)>`'s `(K, V)` was boxed inside `insert` and read flat
+    // at the caller — silent `undefined`s out of `entries()`.
+    tuple_index_paths: HashMap<Id, (TypeId, Vec<usize>)>,
     scope_id: u32,
     scopes: IndexMap<Id, Scope<'src>>,
     span_map: HashMap<Id, &'src Span>,
@@ -4870,6 +4898,7 @@ impl<'src> Analyzer<'src> {
             elided_shared_reads: HashSet::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
+            tuple_index_paths: HashMap::default(),
             scope_id: 0,
             scopes: IndexMap::default(),
             span_map: HashMap::default(),
@@ -6993,8 +7022,8 @@ impl<'src> Analyzer<'src> {
                 by_name.entry(name).or_default().push((index, *member_id));
             }
         }
-        // (member name, first declaration, second declaration, subject).
-        let mut duplicates: Vec<(&'src str, Id, Id, TypeId)> = Vec::new();
+        // (member name, first declaration, second declaration, subject, kind).
+        let mut duplicates: Vec<(&'src str, Id, Id, TypeId, SubjectCollision)> = Vec::new();
         for (member_name, declarations) in &by_name {
             if declarations.len() < 2 {
                 continue;
@@ -7040,20 +7069,21 @@ impl<'src> Analyzer<'src> {
                 let earlier = inherent[..position]
                     .iter()
                     .filter(|(earlier_index, _, _)| earlier_index != index)
-                    .find(|(_, _, earlier_subject)| {
+                    .find_map(|(_, earlier_id, earlier_subject)| {
                         self.subjects_collide(&subject_type, *earlier_subject)
+                            .map(|collision| (*earlier_id, collision))
                     });
-                if let Some((_, earlier_id, _)) = earlier {
-                    duplicates.push((member_name, *earlier_id, *member_id, *subject));
+                if let Some((earlier_id, collision)) = earlier {
+                    duplicates.push((member_name, earlier_id, *member_id, *subject, collision));
                 }
             }
         }
         let duplicates = duplicates
             .into_iter()
-            .map(|(member_name, first_id, second_id, subject)| {
+            .map(|(member_name, first_id, second_id, subject, collision)| {
                 let subject_label =
                     self.pretty_print_type(&subject.get_type(self), &HashMap::default());
-                (member_name, first_id, second_id, subject_label)
+                (member_name, first_id, second_id, subject_label, collision)
             })
             .collect();
         self.report_duplicate_declarations(duplicates);
@@ -7162,7 +7192,7 @@ impl<'src> Analyzer<'src> {
     /// the inherent check skips a same-block pair rather than reporting it a
     /// second time.
     fn check_duplicate_block_members(&mut self) {
-        let mut duplicates: Vec<(&'src str, Id, Id, String)> = Vec::new();
+        let mut duplicates: Vec<(&'src str, Id, Id, String, SubjectCollision)> = Vec::new();
         let blocks = self
             .implementations
             .iter()
@@ -7188,9 +7218,13 @@ impl<'src> Analyzer<'src> {
             let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::default();
             for (member_name, member_id) in declared_members {
                 match first_by_name.get(member_name) {
-                    Some(first_id) => {
-                        duplicates.push((member_name, *first_id, member_id, subject_label.clone()))
-                    }
+                    Some(first_id) => duplicates.push((
+                        member_name,
+                        *first_id,
+                        member_id,
+                        subject_label.clone(),
+                        SubjectCollision::Same,
+                    )),
                     None => {
                         first_by_name.insert(member_name, member_id);
                     }
@@ -7434,7 +7468,7 @@ impl<'src> Analyzer<'src> {
 
     /// Whether two INHERENT impl subjects claim the same receivers for the
     /// purposes of the duplicate-member rule: compatible by the ordinary
-    /// comparison, and — when both are BARE BINDERS — bound the same way.
+    /// comparison, and — when both are BARE BINDERS — bound compatibly.
     ///
     /// The bounds clause is the coherence rule's own reading, one tier down
     /// (`same_impl_type_shape`: "two impl parameters are the same position when
@@ -7449,16 +7483,90 @@ impl<'src> Analyzer<'src> {
     /// declaring one name is still the overlap the rule exists to refuse,
     /// because tier 1 of method resolution takes the first inherent candidate
     /// without ranking.
-    fn subjects_collide(&self, subject_type: &Type, earlier_subject: TypeId) -> bool {
+    ///
+    /// B315: two blankets whose bound clauses are NOT identical but OVERLAP —
+    /// some type satisfies both — collide too, as [`SubjectCollision::
+    /// OverlappingBounds`]. Tier 1 of method resolution takes the first
+    /// inherent candidate UNRANKED (the trait tiers rank, tier 1 does not), so
+    /// admitting both made the winner declaration order: `impl type S:
+    /// Source<type I>` and `impl type S: Source<Option<type I>>` each declaring
+    /// `f` both claim an `S: Source<Option<i32>>` and the rule the doc comment
+    /// above wants — "no silent pick" — was not being kept.
+    fn subjects_collide(
+        &self,
+        subject_type: &Type,
+        earlier_subject: TypeId,
+    ) -> Option<SubjectCollision> {
         let earlier_type = earlier_subject.get_type(self);
         if !self.compare_type(subject_type, &earlier_type, &HashMap::default()) {
-            return false;
+            return None;
         }
         match (subject_type, &earlier_type) {
             (Type::Generic(left_id), Type::Generic(right_id)) => {
-                self.same_generic_bounds(*left_id, *right_id, &mut Vec::new())
+                if self.same_generic_bounds(*left_id, *right_id, &mut Vec::new()) {
+                    Some(SubjectCollision::Same)
+                } else {
+                    self.generic_bounds_overlap(*left_id, *right_id)
+                        .then_some(SubjectCollision::OverlappingBounds)
+                }
             }
-            _ => true,
+            _ => Some(SubjectCollision::Same),
+        }
+    }
+
+    /// Whether two binders' bound clauses OVERLAP: one type could satisfy both,
+    /// so two blankets written over them both claim it (B315). Asked only once
+    /// [`Self::same_generic_bounds`] has said the clauses are not the same.
+    ///
+    /// The clauses must line up trait for trait — a binder bounded by one trait
+    /// and a binder bounded by two demand different things and no widening here
+    /// changes that — and then each ARGUMENT position must be jointly
+    /// inhabitable.
+    fn generic_bounds_overlap(&self, left: TypeId, right: TypeId) -> bool {
+        let left_bounds = self.generic_bound_traits(left);
+        let right_bounds = self.generic_bound_traits(right);
+        if left_bounds.is_empty() || left_bounds.len() != right_bounds.len() {
+            return false;
+        }
+        left_bounds.iter().zip(right_bounds.iter()).all(
+            |((left_trait, left_arguments), (right_trait, right_arguments))| {
+                left_trait == right_trait
+                    && left_arguments.len() == right_arguments.len()
+                    && left_arguments.iter().zip(right_arguments.iter()).all(
+                        |(left_id, right_id)| {
+                            self.bound_argument_positions_overlap(*left_id, *right_id)
+                        },
+                    )
+            },
+        )
+    }
+
+    /// Whether one ARGUMENT position of two bound clauses can be filled by one
+    /// and the same type (B315).
+    ///
+    /// The clause A86 needed is the binder-against-a-written-type one: a binder
+    /// admits a written type exactly when that type carries every trait the
+    /// binder demands, so `type I: Source<type U>` does NOT admit
+    /// `Option<type I: Source<type U>>` — no `Option` is a `Source` — and std's
+    /// two joins stay the disjoint pair A86 made them. An UNBOUNDED binder
+    /// demands nothing and admits everything, which is B315's own pair: `type
+    /// I` beside `Option<type I>` overlaps at every `Option`.
+    fn bound_argument_positions_overlap(&self, left: TypeId, right: TypeId) -> bool {
+        if self.same_impl_type(left, right, &mut Vec::new()) {
+            return true;
+        }
+        match (left.get_type(self), right.get_type(self)) {
+            // Two binders bounded differently. Whether a third type satisfies
+            // both is a question this rule cannot answer from the declarations
+            // alone, and the duplicate family refuses only what it can see —
+            // so they are left as they were before B315: not a collision.
+            (Type::Generic(_), Type::Generic(_)) => false,
+            (Type::Generic(binder), other) | (other, Type::Generic(binder)) => self
+                .generic_bound_traits(binder)
+                .iter()
+                .all(|(trait_id, _)| self.type_implements_trait(&other, *trait_id)),
+            // Two written types that are not the same type name disjoint sets.
+            _ => false,
         }
     }
 
@@ -7571,9 +7679,13 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The shared reporting half of the two duplicate-declaration rules:
-    /// `(member name, first declaration, second declaration, subject label)`.
-    fn report_duplicate_declarations(&mut self, duplicates: Vec<(&'src str, Id, Id, String)>) {
-        for (member_name, first_id, second_id, subject_label) in duplicates {
+    /// `(member name, first declaration, second declaration, subject label,
+    /// collision kind)`.
+    fn report_duplicate_declarations(
+        &mut self,
+        duplicates: Vec<(&'src str, Id, Id, String, SubjectCollision)>,
+    ) {
+        for (member_name, first_id, second_id, subject_label, collision) in duplicates {
             if self.frozen_entity(second_id) {
                 continue;
             }
@@ -7607,15 +7719,28 @@ impl<'src> Analyzer<'src> {
             // fixes — and which one is right is the author's call, not ours.
             let elsewhere = self.other_module_clause(first_id, second_id);
             let span = self.declaration_name_span(second_id);
+            let msg = match collision {
+                SubjectCollision::Same => format!(
+                    "'{member_name}' is already defined for '{subject_label}'{elsewhere}; \
+                     remove or rename this one"
+                ),
+                // B315: the two bound clauses are different, so "already
+                // defined" would be read as a mistake about what the compiler
+                // saw. What is wrong is that they are not disjoint.
+                SubjectCollision::OverlappingBounds => format!(
+                    "'{member_name}' is declared by two blanket impls whose bounds \
+                     OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, \
+                     and an inherent member is taken from the first matching impl without \
+                     ranking. Narrow one bound so the two are disjoint, or declare \
+                     '{member_name}' on a trait"
+                ),
+            };
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
                     note,
                     span,
-                    msg: format!(
-                        "'{member_name}' is already defined for '{subject_label}'{elsewhere}; \
-                         remove or rename this one"
-                    ),
+                    msg,
                 },
                 second_id,
             );
@@ -28541,12 +28666,12 @@ impl<'src> Analyzer<'src> {
                 let _ = span;
                 let mut resolved = Vec::new();
                 for (sub_pattern, element_type_id) in patterns.iter().zip(element_type_ids) {
-                    // The element's flat width (a nested tuple spans several slots),
-                    // resolved here while the matched type is known.
-                    let width = self.tuple_flat_width(element_type_id);
+                    // The element's TYPE, not its width: the width a nested
+                    // tuple element spans is emission's to compute, under the
+                    // substitution in force there (B310).
                     resolved.push((
                         self.resolve_pattern(sub_pattern, element_type_id, lookup_scope_id)?,
-                        width,
+                        element_type_id,
                     ));
                 }
                 Some(ExprPattern::Tuple(resolved))
@@ -32769,6 +32894,65 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 (a.clone(), bindings)
+            }
+            // B316 (RULED: the UNIVERSAL reading). The same question asked the
+            // other way round. A CALL is the one position that reconciles
+            // PARAMETER-first — so that the bindings key on the callee's
+            // generics — which makes it the one position that ever asks
+            // `reconcile_type(Trait, Concrete)`; every other position (a `let`
+            // annotation, a return, a field, a method argument) reconciles
+            // value-first and lands on the arm above, which ACCEPTS. The two
+            // orders disagreeing is B4 / `method-resolution.md` §10, and the
+            // ruling is that they agree: a trait-typed position is satisfied by
+            // a value that implements the trait, whichever side asked.
+            //
+            // Measured at eighteen correct programs when B306's candidate-
+            // diagnostic backstop reported on the parameter-first drop — every
+            // one of them a program that runs, because a later check always
+            // accepted what this arm had refused. That silence is why the
+            // divergence was invisible and why it is fixed here rather than
+            // reported: an instrument that says "the binder gave up HERE" is
+            // unbuildable while the binder gives up on correct code.
+            //
+            // The unified type is the CONCRETE side, exactly as the arm above
+            // keeps it: reconciling proves the value fits the position, and the
+            // position is a requirement, not the value's type.
+            (
+                Type::Trait(trait_id, template_arguments),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+            ) => {
+                if !self.type_implements_trait(b, *trait_id) {
+                    return None;
+                }
+                let mut bindings = Vec::new();
+                if !template_arguments.is_empty()
+                    && let Some(concrete_arguments) = self.trait_args_for(b, *trait_id)
+                {
+                    for (template_argument, concrete_argument) in
+                        template_arguments.clone().iter().zip(concrete_arguments)
+                    {
+                        let template = template_argument.get_type(self);
+                        let concrete = concrete_argument.get_type(self);
+                        if let Some((_, mut argument_bindings)) =
+                            self.reconcile_type(&concrete, &template, substitution_context)
+                        {
+                            bindings.append(&mut argument_bindings);
+                        }
+                    }
+                }
+                (b.clone(), bindings)
+            }
+            // B316's own exhibit is this shape rather than the two above: inside
+            // a trait DEFAULT body `Self` interns as the bare trait, so
+            // `self.add(self)` in `trait Doubler with Add`'s `twice` passes a
+            // `Doubler` where `Add::add`'s `Self`-typed operand wants an `Add`
+            // — "Expected Add, but got Doubler" — and a SUPERTRAIT is exactly
+            // the promise that every `Doubler` is an `Add`. The sub-trait is the
+            // more specific side and is what the unification keeps.
+            (Type::Trait(l_id, _), Type::Trait(r_id, _))
+                if l_id != r_id && self.trait_with_supertraits(*r_id).contains(l_id) =>
+            {
+                (b.clone(), Vec::new())
             }
             // Two tuples unify only at the SAME arity — the arity is part of the
             // type, exactly as an array's length is (the arm below) and a
@@ -39798,6 +39982,33 @@ impl<'src> Analyzer<'src> {
                             Some(Expr::TupleIndex(root, root_offset, _)) => (*root, *root_offset),
                             _ => (subject_id, 0),
                         };
+                        // B310: the same fold in LAYOUT-FREE terms — the root's
+                        // tuple type and the index chain that reaches this
+                        // element from it. The offset and width above are this
+                        // walk's answer, and this walk sees a generic body's
+                        // parameters abstract (`tuple_flat_width` counts one
+                        // slot for each); emission recomputes both from the
+                        // path under the instance's substitution, where a `V`
+                        // bound to a tuple is as wide as it really is.
+                        let folded_path = self.tuple_index_paths.get(&subject_id).cloned();
+                        let rooted = match (folded_path, root_subject == subject_id) {
+                            (Some((root_type_id, path)), _) => Some((root_type_id, path)),
+                            // The subject is not itself an access, so IT is the
+                            // root and its own tuple type is the path's base.
+                            (None, true) => {
+                                let subject_type_id =
+                                    Type::Tuple(element_type_ids.clone()).get_type_id(self);
+                                Some((subject_type_id, Vec::new()))
+                            }
+                            // An access the one minting site above did not
+                            // record cannot be rooted; leave the entry absent
+                            // and emission keeps this walk's offsets.
+                            (None, false) => None,
+                        };
+                        if let Some((root_type_id, mut path)) = rooted {
+                            path.push(index);
+                            self.tuple_index_paths.insert(id, (root_type_id, path));
+                        }
                         self.expr_id_to_expr_map.insert(
                             id,
                             Expr::TupleIndex(root_subject, base_offset + offset, width),
@@ -46127,6 +46338,19 @@ pub struct Program<'src> {
     /// consults it to decide the flat-storage splice; silence there nested the
     /// element and made every read past it `undefined`.
     pub tuple_element_types: HashMap<Id, TypeId>,
+    /// B310: the layout coordinates of every positional tuple access
+    /// (`Expr::TupleIndex`), keyed by the ACCESS's own id — the tuple type of
+    /// the root subject it folded onto, and the chain of element indices from
+    /// that root (`deep.0.1` is the root plus `[0, 1]`).
+    ///
+    /// The `Expr`'s own offset and width are the layout the ANALYZER saw, and a
+    /// generic body is analyzed once with its parameters abstract, so an
+    /// element typed `V` counts one slot there however wide the instantiation
+    /// makes it. Emission runs per monomorphized instance, where `V`'s binding
+    /// is in force, and recomputes offset and width from this path under it —
+    /// which is what puts a generic body's tuple on the same flat layout its
+    /// concrete caller builds and reads.
+    pub tuple_index_paths: HashMap<Id, (TypeId, Vec<usize>)>,
     /// Element expressions written as a tuple-value spread `..e`
     /// (variadic-generics.md §T). Such an element splices because it was
     /// WRITTEN as one — the type rule already proved its operand a tuple — so
@@ -47331,9 +47555,20 @@ fn lift_target_of(node: &Spanned<Node<'_>>) -> bool {
     }
 }
 
-/// Renders a (field) type node back to source for use in generated code — a
-/// name (`i32`/`Point`) or a generic application (`List<i32>`). Other forms fall
+/// Renders a (field) type node back to source — for generated code, and for
+/// every diagnostic that quotes a type AS WRITTEN. A name (`i32`/`Point`), a
+/// generic application (`List<i32>`) and a `::` path (`models::Note`,
+/// `std::reactive::SignalCell<i32>`) render as their source; other forms fall
 /// back to `_`, which surfaces a clear error at the generated use site.
+///
+/// The path arm is B302: a path annotation used to render `_`, so `[rpc] fun
+/// note(self, id: i32): models::Note` was refused as "return type … is `_`,
+/// which is not Wire" — a message naming nothing the author had written. Every
+/// caller here quotes the author's own spelling back, so the arm is one fix for
+/// all of them (the Wire/Hashable/PartialEq/Json field messages, the four
+/// `[rpc]` ones, the macro signature, and the derive codegen, where a path
+/// annotation is generated back into the module that wrote it and resolves
+/// there exactly as it did).
 fn render_type(node: &Node<'_>) -> String {
     match node {
         Node::Accessor(name) => name.to_string(),
@@ -47345,6 +47580,23 @@ fn render_type(node: &Node<'_>) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{name}<{arguments}>")
+        }
+        // `a::b::C` nests to the LEFT (`StaticAccessor(StaticAccessor(a, "b"),
+        // "C")`), and only the last segment can carry generic arguments.
+        Node::StaticAccessor(subject, name, arguments) => {
+            let subject = render_type(&subject.0);
+            let arguments = arguments.as_ref().map(|arguments| {
+                arguments
+                    .0
+                    .iter()
+                    .map(|argument| render_type(&argument.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            match arguments {
+                Some(arguments) => format!("{subject}::{name}<{arguments}>"),
+                None => format!("{subject}::{name}"),
+            }
         }
         _ => "_".to_string(),
     }
@@ -55191,6 +55443,7 @@ fn analyze_over_world<'src>(
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
+        tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::default(),

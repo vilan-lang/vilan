@@ -1753,6 +1753,18 @@ impl<'p, 'src> State<'p, 'src> {
                 CallTarget::Indirect(IndirectReason::TraitDispatch | IndirectReason::GenericMember)
             )
         };
+        // The candidate lists below are NAME-KEYED and program-wide
+        // (`candidates_of`, B279's sweep): every override of every trait
+        // declaring the dispatched name, whatever the receiver. They are
+        // deliberately NOT narrowed here, and the reason is the DIRECTION this
+        // check reads an edge in. An edge is a REFUSAL — a runtime path that
+        // reaches a `[const_only]` capability is rejected — so a candidate
+        // this site could never select can only make the check refuse MORE.
+        // Over-refusing costs an author a diagnostic they can see and argue
+        // with; under-refusing ships the capability into a runtime path in
+        // silence, which is the whole failure this check exists to prevent.
+        // The context pass narrows the same lists because it reads an edge as
+        // a property of the site (B258); nothing here does.
         let mut refinement_sites: Vec<DispatchSite> = Vec::new();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {

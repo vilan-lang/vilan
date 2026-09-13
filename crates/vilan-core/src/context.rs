@@ -637,6 +637,14 @@ fn analyze(
     // the const-only capability check since B143).
     let dispatch_member_name =
         |call_id: Id| -> Option<&str> { crate::dispatch_refine::member_name_at(program, call_id) };
+    // NAME-KEYED, program-wide (B279): every override of every trait declaring
+    // the name. This pass reads an edge as a DEMAND — the callee may need the
+    // hidden value, so the caller threads it — and a demand may be over-asked,
+    // so the wide list is what `needs` and the threading plan want. The two
+    // consumers that may NOT over-ask narrow first: the site's FLAVOR by
+    // `known_receiver_candidates` below (B258), and COVERAGE by
+    // `refined_edges` further down. B279's guard after the coverage fixpoint
+    // holds those two narrowings honest against this list.
     let dispatch_candidates =
         |name: &str| -> Vec<Id> { crate::dispatch_refine::candidates_of(program, name) };
     // (caller node, call id, candidate callees) per dispatch site.
@@ -1309,6 +1317,41 @@ fn analyze(
                 break;
             }
         }
+
+        // --- B279: why the dead-code exemption above is sound. ---
+        //
+        // Two edge sets meet here and they are not the same set. STRICTNESS
+        // propagates over the WIDE one (`dispatch_callers`, whose candidate
+        // lists come from `candidates_of` and are NAME-keyed — every override
+        // of every trait declaring the name, whatever the receiver); COVERAGE
+        // reads the REFINED one, which resolves each site to the callees its
+        // recorded instantiation actually selects. The exemption — "no caller
+        // edges, so it cannot run" — is read off the refined set, and losing
+        // its soundness is B258's silence from the other direction: a strict
+        // node exempted as dead keeps the bare-value fence, no caller of it is
+        // ever checked for having a value to hand, and a call that does reach
+        // it reads `undefined` from a compile that reported nothing.
+        //
+        // What makes it sound is ONE property of `refined_edges`, stated in its
+        // own documentation and load-bearing here: **every fallback widens to
+        // the whole candidate list**. A site the refinement cannot resolve —
+        // an opaque binding, a value-taken or dispatch-reachable level whose
+        // entries cannot be enumerated, a receiver-less `OnType` — draws an
+        // edge to EVERY candidate, so no candidate of an unresolved site is
+        // ever mistaken for dead. A node with no refined edge was therefore
+        // excluded by a RESOLUTION at every site that lists it, which is a real
+        // answer about what can run.
+        //
+        // That property is held by a pin rather than asserted here, and the
+        // difference is deliberate (B279's own finding): "strict, and no
+        // refined edge" is an ORDINARY state — an impl of a bounded trait that
+        // nothing instantiates has none, and neither does any candidate of a
+        // dispatch site sitting in code nothing calls — so a refusal built on
+        // it fires on correct programs by the hundred. The pin is
+        // `b279_an_unresolvable_dispatch_site_still_fences_its_candidates`
+        // (`inference/traits.rs`): a strict candidate reachable only through a
+        // site the refinement CANNOT resolve is still refused for coverage, and
+        // it goes red the moment a fallback stops widening.
 
         // The A2 walk-back (E74, widened to any dependency package by
         // C3a/E84): a refused site whose own span sits in library code

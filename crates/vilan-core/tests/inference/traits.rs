@@ -5138,3 +5138,904 @@ fn b297_the_subject_arguments_still_type_selfs_variant_patterns() {
         "7\n1\n",
     );
 }
+
+// --- B315: two blankets whose bounds OVERLAP ------------------------------------
+// A86 taught the duplicate-inherent-member rule to read a bound's ARGUMENTS, so
+// two blankets over one parameterized trait stopped colliding wholesale. What it
+// asked for was SAMENESS, and sameness is narrower than the thing the rule
+// exists to prevent: a pair whose clauses differ but overlap — some type
+// satisfies both — was admitted, and tier 1 of method resolution takes the first
+// inherent candidate UNRANKED, so the winner was declaration order. The rule
+// refuses overlap now, and the clause that keeps A86's own pair legal is the one
+// that says a BOUNDED binder admits only types carrying the traits it demands.
+
+#[test]
+fn b315_two_blankets_whose_bounds_overlap_are_refused() {
+    // `S: Read<type I>` accepts every `S` that reads anything at all, so an `S`
+    // reading an `Option` satisfies both clauses and both impls claim `peek`.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I> {
+            fun peek(self): I { self.get() }
+        }
+        impl type O: Read<Option<type V>> {
+            fun peek(self): Option<V> { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is declared by two blanket impls whose bounds OVERLAP",
+    );
+}
+
+#[test]
+fn b315_the_overlap_refusal_names_the_two_fixes_and_points_at_the_first_impl() {
+    // C3: the message says what to do, and the note says where the other one is.
+    assert_fails_noting(
+        r#"
+        import std::option::Option;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I> {
+            fun peek(self): I { self.get() }
+        }
+        impl type O: Read<Option<type V>> {
+            fun peek(self): Option<V> { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "Narrow one bound so the two are disjoint, or declare 'peek' on a trait",
+        "peek",
+        "'peek' is already defined here",
+    );
+}
+
+#[test]
+fn b315_two_blankets_bounded_at_disjoint_concrete_arguments_may_share_a_name() {
+    // The non-overlapping control: two WRITTEN types that are not the same type
+    // name disjoint sets, so nothing satisfies both clauses.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<i32> {
+            fun peek(self): i32 { self.get() + 1 }
+        }
+        impl type O: Read<str> {
+            fun peek(self): str { self.get() }
+        }
+
+        fun main() {
+            let numbers = Cell { value = 41 };
+            print(numbers.peek());
+            let words = Cell { value = "hi" };
+            print(words.peek());
+        }
+
+        main();
+        "#,
+        "42\nhi\n",
+    );
+}
+
+#[test]
+fn b315_a_bounded_binder_does_not_admit_a_type_that_misses_its_bound() {
+    // A86's pair, stated as the overlap question it now is: the first clause's
+    // `type I` demands `Read`, no `Option` is a `Read`, so an `S` cannot satisfy
+    // both — and the two impls stay two impls. (The behaviour is A86's own pin
+    // `a86_two_blankets_bounded_at_different_arguments_may_share_a_member_name`;
+    // this one holds the CLAUSE that keeps it, by putting a bound on the binder
+    // that the overlapping pair above leaves off.)
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun peek(self): U { self.get().get() }
+        }
+        impl type O: Read<Option<type V: Read<type W>>> {
+            fun peek(self): Option<W> {
+                match self.get() {
+                    Some(let inner) => Some(inner.get()),
+                    None => None,
+                }
+            }
+        }
+
+        fun main() {
+            let nested = Cell { value = Cell { value = 7 } };
+            print(nested.peek());
+            let optional: Cell<Option<Cell<i32>>> = Cell { value = Some(Cell { value = 3 }) };
+            print(optional.peek().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "7\n3\n",
+    );
+}
+
+#[test]
+fn b315_a_binder_bounded_by_a_trait_the_written_type_does_implement_overlaps() {
+    // The other side of the same clause: make the written type carry the trait
+    // the binder demands and the two clauses DO overlap, so the pair is refused.
+    // This is the item's own framing — the hypothetical `Option: Source`.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl Option<type T> with Read<T> {
+            fun get(self): T {
+                match self {
+                    Some(let value) => value,
+                    None => panic("empty"),
+                }
+            }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun peek(self): U { self.get().get() }
+        }
+        impl type O: Read<Option<type V: Read<type W>>> {
+            fun peek(self): Option<W> { None }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is declared by two blanket impls whose bounds OVERLAP",
+    );
+}
+
+#[test]
+fn b315_two_blankets_bounded_the_same_way_keep_the_already_defined_message() {
+    // The families stay apart: an identical pair is still "already defined",
+    // because what is wrong there is that one thing was written twice.
+    assert_fails_with(
+        r#"
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type T> {
+            fun peek(self): T { self.get() }
+        }
+        impl type O: Read<type V> {
+            fun peek(self): V { self.get() }
+        }
+
+        fun main() { }
+        "#,
+        "'peek' is already defined for",
+    );
+}
+
+// --- B302: a written PATH renders as written ------------------------------------
+// `render_type` turns a written type annotation back into source — for the code
+// a `[derive(..)]` generates, and for every message that quotes a type AS THE
+// AUTHOR WROTE IT. It knew a name (`i32`) and a generic application
+// (`List<i32>`) and fell back to `_` for everything else, and a `::` path is
+// everything else: `[rpc] fun note(self, id: i32): models::Note` was refused as
+// "return type … is `_`, which is not Wire", naming nothing the author had
+// typed. The arm is one fix for every caller, because every caller is quoting
+// the same spelling back.
+
+#[test]
+fn b302_the_rpc_return_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun note(self, id: i32): models::Note { models::Note { body = || {} } }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `note` is `models::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_the_rpc_parameter_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun keep(self, note: models::Note): i53 { 1i53 }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "of `[rpc]` method `keep` is `models::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_a_path_with_generic_arguments_renders_both_halves() {
+    // The last segment is the only one that can carry arguments, and it does.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Holder<T> { body: || void, value: T }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun hold(self): models::Holder<i32> {
+                models::Holder { body = || {}, value = 1 }
+            }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `hold` is `models::Holder<i32>`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_a_path_of_three_segments_renders_whole() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            mod deep {
+                struct Note { body: || void }
+            }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun note(self): models::deep::Note { models::deep::Note { body = || {} } }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `note` is `models::deep::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_the_derive_wire_field_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [derive(Wire)]
+        struct Row { note: models::Note }
+        fun main() { print("row"); }
+        main();
+        "#,
+        "field `note` of `[derive(Wire)]` type `Row` is `models::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_the_derive_hashable_field_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [derive(Hashable)]
+        struct Row { note: models::Note }
+        fun main() { print("row"); }
+        main();
+        "#,
+        "field `note` of `[derive(Hashable)]` type `Row` is `models::Note`, which is not `Hashable`",
+    );
+}
+
+#[test]
+fn b302_the_client_service_notification_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            [derive(Wire)]
+            struct Note { title: str }
+        }
+        [client_service]
+        struct Watcher { name: str }
+        impl Watcher {
+            [rpc]
+            fun ping(self): models::Note { models::Note { title = "x" } }
+        }
+        fun main() { print("w"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `ping` is `models::Note`, but a `[client_service]` method \
+         is a NOTIFICATION",
+    );
+}
+
+#[test]
+fn b302_a_bare_name_and_a_generic_application_still_render_as_they_did() {
+    // The control: the two forms the renderer already knew are untouched.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Opaque { body: || void }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun look(self): List<Opaque> { [] }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `look` is `List<Opaque>`, which is not Wire",
+    );
+}
+
+// --- B279: the structural guard behind B258's silence, and the `candidates_of`
+// consumer sweep -----------------------------------------------------------------
+// `candidates_of` is NAME-keyed and program-wide: every override of every trait
+// declaring the dispatched name, whatever the receiver. B254 and B258 were both
+// that list consumed as though it were receiver-specific, and each was closed by
+// narrowing at its own site. What was missing is the INVARIANT — nothing forbade
+// a future over-approximation from promoting a node to strict through an edge the
+// coverage walk's narrower set never sees, which would hand that node the
+// bare-value fence and no caller checked for having a value: B258's silent
+// `undefined` again, from the other direction. The `context` pass now asserts it
+// and REFUSES (a never-silent `internal:`) rather than emitting. The pins below
+// are one per consumer of the name-keyed list, plus the geometry the guard must
+// NOT fire on.
+
+/// Consumer 1, the `context` pass reading an edge as a DEMAND. Two unrelated
+/// traits declare `label`, so one name-keyed candidate list holds both — and the
+/// strict override belongs to a type this program never calls through. The site
+/// on the OTHER trait must stay safe (its default reads the context optionally),
+/// and the guard must not read the unreachable override as a node it cannot
+/// prove covered.
+#[test]
+fn b279_a_strict_override_in_an_unrelated_trait_neither_promotes_nor_trips_the_guard() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ None, Some, self };
+
+        let scope: Context<str> = Context::new();
+
+        trait Tag {
+            fun label(self): str {
+                match scope.get_safe() {
+                    Some(let value) => i"tag under {value}",
+                    None => "tag, no scope",
+                }
+            }
+        }
+
+        trait Badge {
+            fun label(self): str {
+                i"badge under {scope.get()}"
+            }
+        }
+
+        struct Cell { value: i32 }
+        impl Cell with Tag { }
+
+        struct Mirror { value: i32 }
+        impl Mirror with Badge { }
+
+        fun describe(cell: Cell): str {
+            cell.label()
+        }
+
+        fun main() {
+            print(describe(Cell { value = 1 }));
+            scope.run("here", || print(describe(Cell { value = 2 })));
+        }
+        main();
+        "#,
+        "tag, no scope\ntag under here\n",
+    );
+}
+
+/// The same geometry with the strict body REACHED: the guard must not stand in
+/// for the coverage refusal, and the coverage refusal must still fire.
+#[test]
+fn b279_the_strict_body_of_the_other_trait_still_fences_when_it_is_called() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ None, Some, self };
+
+        let scope: Context<str> = Context::new();
+
+        trait Tag {
+            fun label(self): str {
+                match scope.get_safe() {
+                    Some(let value) => i"tag under {value}",
+                    None => "tag, no scope",
+                }
+            }
+        }
+
+        trait Badge {
+            fun label(self): str {
+                i"badge under {scope.get()}"
+            }
+        }
+
+        struct Cell { value: i32 }
+        impl Cell with Tag { }
+
+        struct Mirror { value: i32 }
+        impl Mirror with Badge { }
+
+        fun main() {
+            print(Mirror { value = 1 }.label());
+        }
+        main();
+        "#,
+        "this code can be reached without an enclosing `run`",
+    );
+}
+
+/// Consumer 2, the const-only capability check reading an edge as a REFUSAL.
+/// `emit` is reached ONLY through a bounded generic's trait dispatch — the shape
+/// B143 found escaping — and the refusal fires. This is the direction that must
+/// never be narrowed: a candidate dropped here is a compile-time-only capability
+/// shipped into a runtime path in silence.
+#[test]
+fn b279_the_const_only_check_still_refuses_through_a_bounded_generics_dispatch() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+
+        trait Paint { fun paint(self); }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self) { emit("css", ".wall{}"); }
+        }
+
+        fun run_it<T: Paint>(subject: T) {
+            subject.paint();
+        }
+
+        fun main() {
+            run_it(Wall { });
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+/// The same check under the name-keyed list's own over-approximation: a SECOND
+/// trait declares `paint` too, and the candidate list therefore holds a member
+/// no `T: Paint` receiver could select. Over-asking cannot make this check miss
+/// — the refusal still fires — which is why the list is left unnarrowed here.
+#[test]
+fn b279_a_same_named_member_on_an_unrelated_trait_does_not_let_the_const_only_check_miss() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+
+        trait Paint { fun paint(self); }
+        trait Coat { fun paint(self); }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self) { emit("css", ".wall{}"); }
+        }
+
+        struct Fence { }
+        impl Fence with Coat {
+            fun paint(self) { }
+        }
+
+        fun run_it<T: Paint>(subject: T) {
+            subject.paint();
+        }
+
+        fun main() {
+            run_it(Wall { });
+            Fence { }.paint();
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+/// The other half of consumer 2's direction: a clean instantiation of the same
+/// generic stays ADMITTED. The check refuses a path, not a name.
+#[test]
+fn b279_a_clean_instantiation_of_the_same_generic_is_still_admitted() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::asset::emit;
+
+        trait Paint { fun paint(self); }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self) { emit("css", ".wall{}"); }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self) { print("board"); }
+        }
+
+        fun run_it<T: Paint>(subject: T) {
+            subject.paint();
+        }
+
+        fun prime(): i32 {
+            run_it(Wall { });
+            1
+        }
+
+        fun main() {
+            let _primed = const prime();
+            run_it(Board { });
+        }
+        main();
+        "#,
+        "board\n",
+    );
+}
+
+/// The geometry the guard must NOT fire on, and the one that made a first
+/// formulation of it wrong: an impl of the bounded trait that NOTHING
+/// instantiates, whose body reads the context strictly. It has no direct
+/// callers and no refined dispatch edge — the walk resolves `run_it`'s site to
+/// `Board` alone — so it is exempt as dead, and it IS dead. The site still
+/// contributed an edge (to `Board::paint`), which is what says the refinement
+/// resolved rather than dropped it.
+#[test]
+fn b279_an_uninstantiated_strict_impl_of_a_bounded_trait_is_dead_not_refused() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let scope: Context<str> = Context::new();
+
+        trait Paint { fun paint(self): str; }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self): str { i"wall under {scope.get()}" }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self): str { "board" }
+        }
+
+        fun run_it<T: Paint>(subject: T): str {
+            subject.paint()
+        }
+
+        fun main() {
+            print(run_it(Board { }));
+        }
+        main();
+        "#,
+        "board\n",
+    );
+}
+
+// --- B316: the trait-typed position, asked the other way round -------------------
+// `reconcile_type(Concrete, Trait)` accepts when the concrete implements the
+// trait; `reconcile_type(Trait, Concrete)` had no arm and refused. A CALL is the
+// one position that asks in that order — the bindings key on the CALLEE's
+// generics, so the parameter goes first — and every other position reconciles
+// value-first and accepts. RULED (Order 34, R5): the universal reading, the two
+// orders agree. The eighteen programs B306's backstop measured are not
+// recoverable (they were counted by an instrument that was never landed), so the
+// pin set is the exhibit the count NAMED — `Doubler`'s supertrait defaults —
+// with the representative shapes around it.
+
+#[test]
+fn b316_a_supertrait_default_hands_self_to_the_inherited_requirement() {
+    // The exhibit. Inside a default body `Self` interns as the bare trait, so
+    // `self.add(self)` passes a `Doubler` where `Add::add`'s `Self`-typed
+    // operand wants an `Add` — "Expected Add, but got Doubler" — and the
+    // supertrait clause is exactly the promise that every `Doubler` is an `Add`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self.add(self) }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+        }
+        impl Money with Doubler {}
+
+        fun main() { print(Money { cents = 3 }.twice().cents); }
+        main();
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn b316_a_two_level_supertrait_chain_still_agrees() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self.add(self) }
+        }
+
+        trait Quad with Doubler {
+            fun four(self): Self { self.twice().twice() }
+        }
+
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }
+        }
+        impl Money with Doubler {}
+        impl Money with Quad {}
+
+        fun main() { print(Money { cents = 3 }.four().cents); }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn b316_a_default_forwarding_a_self_typed_parameter_agrees() {
+    // The same shape without an operator: a default body taking `other: Self`
+    // and calling a sibling default on it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Named { fun name(self): str; }
+
+        trait Greeter with Named {
+            fun greet(self): str { i"hi {self.name()}" }
+            fun both(self, other: Self): str { i"{self.greet()} {other.greet()}" }
+        }
+
+        struct Person { n: str }
+        impl Person with Named { fun name(self): str { self.n } }
+        impl Person with Greeter {}
+
+        fun main() { print(Person { n = "a" }.both(Person { n = "b" })); }
+        main();
+        "#,
+        "hi a hi b\n",
+    );
+}
+
+#[test]
+fn b316_a_trait_typed_position_takes_a_struct_that_implements_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+
+        fun show(v: A): str { v.name() }
+
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b316_a_parameterized_trait_position_binds_its_argument_from_the_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Feed<T> { fun feed(self): T; }
+        struct Nums { n: i32 }
+        impl Nums with Feed<i32> { fun feed(self): i32 { self.n } }
+
+        fun take(f: Feed<i32>): i32 { f.feed() }
+
+        fun main() { print(take(Nums { n = 4 })); }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b316_a_value_that_does_not_implement_the_trait_is_still_refused() {
+    // The control the universal reading rests on: "satisfied by a value that
+    // implements it" is a real test, not an acceptance of everything.
+    assert_fails(
+        r#"
+        import std::io::print;
+
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+
+        fun show(v: A): str { v.name() }
+
+        fun main() { print(show(Other { n = 1 })); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b316_an_unrelated_trait_pair_is_still_refused() {
+    // The supertrait arm is the supertrait relation and nothing wider: two
+    // traits with no clause between them do not reconcile.
+    assert_fails(
+        r#"
+        import std::io::print;
+
+        trait Named { fun name(self): str; }
+        trait Sized2 { fun size(self): i32; }
+
+        trait Greeter with Named {
+            fun both(self, other: Sized2): str { i"{self.name()} {other.size()}" }
+        }
+
+        struct Person { n: str }
+        impl Person with Named { fun name(self): str { self.n } }
+        impl Person with Greeter {}
+
+        fun main() { print(Person { n = "a" }.both(Person { n = "b" })); }
+        main();
+        "#,
+    );
+}
+
+/// B279's invariant, held where a guard can be held: the coverage walk's
+/// dead-code exemption is read off the REFINED dispatch edges, and it is sound
+/// only because every fallback in `refined_edges` widens to the WHOLE candidate
+/// list. Here the dispatching level is taken as a value, so its entries cannot
+/// be enumerated and the site resolves to nothing — the fallback must therefore
+/// draw an edge to every candidate, `Wall::paint` among them, and `Wall::paint`
+/// must be FENCED for coverage rather than exempted as dead. The moment a
+/// fallback narrows instead of widening, this program compiles and prints
+/// `undefined`, which is B258's silence from the other direction.
+///
+/// (The two extra diagnostics the program carries — a generic taken as a value
+/// — are what makes the level unresolvable and are not the claim.)
+#[test]
+fn b279_an_unresolvable_dispatch_site_still_fences_its_candidates() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let scope: Context<str> = Context::new();
+
+        trait Paint { fun paint(self): str; }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self): str { i"wall under {scope.get()}" }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self): str { "board" }
+        }
+
+        fun run_it<T: Paint>(subject: T): str {
+            subject.paint()
+        }
+
+        fun main() {
+            let taken = run_it;
+            print(taken(Board { }));
+        }
+        main();
+        "#,
+        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// The same shape one level deeper — the unresolvable level FORWARDS into the
+/// dispatching one — so the widening has to survive the recursion into the
+/// entry's own enclosing function.
+#[test]
+fn b279_an_unresolvable_level_above_the_dispatch_still_fences() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let scope: Context<str> = Context::new();
+
+        trait Paint { fun paint(self): str; }
+
+        struct Wall { }
+        impl Wall with Paint {
+            fun paint(self): str { i"wall under {scope.get()}" }
+        }
+
+        struct Board { }
+        impl Board with Paint {
+            fun paint(self): str { "board" }
+        }
+
+        fun run_it<T: Paint>(subject: T): str {
+            subject.paint()
+        }
+
+        fun forward<U: Paint>(subject: U): str { run_it(subject) }
+
+        fun main() {
+            let taken = forward;
+            print(taken(Board { }));
+        }
+        main();
+        "#,
+        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}

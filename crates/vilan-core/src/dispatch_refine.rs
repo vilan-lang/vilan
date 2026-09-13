@@ -146,6 +146,36 @@ pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'sr
 /// Every candidate a dispatch of `name` selects among: for each trait
 /// declaring `name`, the trait's own default body (when it has one) plus
 /// every implementation's override, across the traits declaring that name.
+///
+/// **KEYED BY THE MEMBER NAME, and by nothing else.** Not by the receiver,
+/// not by the bound, not by the trait: two unrelated traits that both declare
+/// `label` contribute to one list, and every implementation of either is in
+/// it. The list is therefore an OVER-APPROXIMATION of what any one site can
+/// select, and it is the source of the B254/B258 class — a name-keyed list
+/// consumed as though it were receiver-specific. B279 is the sweep of its
+/// consumers; each is named here with the DIRECTION it reads an edge in,
+/// because that direction is what decides whether widening is safe:
+///
+/// - `context::analyze`'s dispatch sites — an edge is a DEMAND (the callee
+///   may need the hidden value, so the caller must thread it). Widening adds
+///   threading a callee ignores, which is sound. It is NOT sound for the
+///   site's FLAVOR (`settle_strict` promotes a whole site off one strict
+///   candidate) nor for COVERAGE, and both are narrowed: the flavor by
+///   [`known_receiver_candidates`] at the site (B258), coverage by
+///   [`refined_edges`] over the recorded instantiations. B279's structural
+///   guard in that pass is what holds the two narrowings apart from the wide
+///   list they came from.
+/// - the const-only capability check (`const_eval`'s three site scans) — an
+///   edge is a REFUSAL (a runtime path that reaches a const-only capability
+///   is rejected). Widening REFUSES MORE, never less, so the name-keyed list
+///   is safe there BY DIRECTION and is deliberately left unnarrowed: a
+///   narrowing that dropped a real edge would let a `[const_only]` capability
+///   ship in a runtime path, which is the failure this check exists to
+///   prevent. The cost of the over-approximation is a refusal an author can
+///   see and argue with; the cost of the under-approximation is silence.
+///
+/// A consumer that reads the candidate SET as a property of the site — "these
+/// and no others" — must narrow first. There is no third direction.
 pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
     let mut candidates = Vec::new();
     for trait_ in program.traits.values() {
@@ -177,6 +207,10 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
 /// (the `dispatch_candidates_for` shape, widened to primitive subjects —
 /// `impl str with Slot` is real here).
 ///
+/// KEYED BY (subject type, member name) — the narrowing twin of
+/// [`candidates_of`]'s name-only key, and what a consumer that reads the set
+/// as a property of the SITE has to go through (B279).
+///
 /// Matching is deliberately LOOSER than emission's
 /// ([`crate::impl_select::select_member`]): the nominal head alone, plus every
 /// impl whose subject pattern applies — which is what brings a blanket
@@ -188,6 +222,8 @@ pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str
 }
 
 /// [`impl_members_for`], narrowed to the impls that provide one of `traits`.
+///
+/// KEYED BY (subject type, member name, bound traits).
 ///
 /// A call through a BOUND can only reach an impl of the bound's own trait:
 /// `v.bind(..)` under `V: MaybeSignal<str>` is answered by an impl of
@@ -266,8 +302,8 @@ pub fn impl_members_for_bound(
 }
 
 /// The candidates an `OnType` site with a KNOWN receiver can actually select
-/// among — the members the receiver's HEAD selects — or `None` when nothing
-/// narrows the site: an `OnConstraint` or unrecorded dispatch, a receiver-less
+/// among — the members the receiver's HEAD selects — KEYED BY (receiver type,
+/// member name) — or `None` when nothing narrows the site: an `OnConstraint` or unrecorded dispatch, a receiver-less
 /// `OnType` (a `self` call inside a shared trait default body), a receiver
 /// that resolves to a generic or opaque type, or an empty selection. Every
 /// `None` means "keep the union", so this only ever narrows where the

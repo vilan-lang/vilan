@@ -4187,11 +4187,15 @@ impl<'src> Transformer<'src> {
             }
             // `pair.0` — tuples store flat: a width-1 element reads its slot,
             // a tuple-typed element reslices its region (like destructuring).
+            // Offset and width come from the recorded path under this
+            // instance's substitution (B310), not from the analyzer's
+            // generic-body answer.
             Expr::TupleIndex(subject_id, offset, width) => {
+                let (offset, width) = self.tuple_index_slot(id, (*offset, *width));
                 let subject = self
                     .walk_entity(*subject_id, block)
                     .unwrap_or(js::Node::Void);
-                if *width == 1 {
+                if width == 1 {
                     js::Node::PropertyIndex(
                         Box::new(subject),
                         Box::new(js::Node::Number(offset.to_string(), None)),
@@ -5416,8 +5420,10 @@ impl<'src> Transformer<'src> {
                 // each slot of the region from the value (evaluated once).
                 // Statically-known width keeps this plain slot assignments —
                 // the const-eval interpreter runs them like any other write.
-                if let Some(&Expr::TupleIndex(subject_id, offset, width)) =
+                if let Some(&Expr::TupleIndex(subject_id, baked_offset, baked_width)) =
                     self.program.entity_map.get(target_id)
+                    && let (offset, width) =
+                        self.tuple_index_slot(*target_id, (baked_offset, baked_width))
                     && width > 1
                 {
                     let subject = self
@@ -6352,7 +6358,7 @@ impl<'src> Transformer<'src> {
             }
             ExprPattern::Tuple(elements) => {
                 let mut leaves = Vec::new();
-                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                self.flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
                 for (sub_pattern, element) in leaves {
                     self.backed_pattern_tests(sub_pattern, element, out);
                 }
@@ -6844,7 +6850,7 @@ impl<'src> Transformer<'src> {
             }
             ExprPattern::Tuple(elements) => {
                 let mut leaves = Vec::new();
-                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                self.flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
                 for (sub_pattern, element) in leaves {
                     self.compile_is_pattern(sub_pattern, element, conditions);
                 }
@@ -6871,19 +6877,26 @@ impl<'src> Transformer<'src> {
     /// for flat storage: a nested tuple pattern recurses (accumulating the flat
     /// offset), a width-1 element reads `subject[offset]`, and a multi-slot capture
     /// (a binding/wildcard of tuple type) reslices `subject.slice(offset, end)`.
+    ///
+    /// Each element carries its TYPE and the width is computed here, under the
+    /// instance's substitution (B310) — the pattern was resolved once for a
+    /// generic body, where an element typed `V` looks one slot wide however wide
+    /// the binding makes it.
     fn flatten_tuple_pattern<'a>(
-        elements: &'a [(ExprPattern, usize)],
+        &self,
+        elements: &'a [(ExprPattern, TypeId)],
         subject: &js::Node<'src>,
         base: usize,
         out: &mut Vec<(&'a ExprPattern, js::Node<'src>)>,
     ) {
         let mut offset = base;
-        for (sub_pattern, width) in elements {
+        for (sub_pattern, element_type_id) in elements {
+            let width = self.flat_width(*element_type_id);
             match sub_pattern {
                 ExprPattern::Tuple(inner) => {
-                    Self::flatten_tuple_pattern(inner, subject, offset, out);
+                    self.flatten_tuple_pattern(inner, subject, offset, out);
                 }
-                _ if *width == 1 => out.push((
+                _ if width == 1 => out.push((
                     sub_pattern,
                     js::Node::PropertyIndex(
                         Box::new(subject.clone()),
@@ -6906,6 +6919,61 @@ impl<'src> Transformer<'src> {
             }
             offset += width;
         }
+    }
+
+    /// The number of flat slots a value of `type_id` occupies once tuples are
+    /// flattened, under the substitution in force: a tuple is the sum of its
+    /// elements', anything else (including a generic this instance does not
+    /// bind) is one. The emission-side twin of the analyzer's
+    /// `tuple_flat_width`, which answers the same question for the walk that
+    /// sees a generic body's parameters abstract.
+    fn flat_width(&self, type_id: TypeId) -> usize {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return 1;
+        };
+        match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))
+        {
+            Some(Type::Tuple(elements)) => {
+                elements.clone().iter().map(|id| self.flat_width(*id)).sum()
+            }
+            _ => 1,
+        }
+    }
+
+    /// The flat offset and width of one positional tuple access
+    /// (`Expr::TupleIndex`), recomputed from the layout-free path the analyzer
+    /// recorded — the root subject's tuple type and the chain of element
+    /// indices — under the substitution this instance was emitted with (B310).
+    ///
+    /// The `Expr`'s own offset and width are the analyzer's answer, and the
+    /// analyzer walks a generic body ONCE with its parameters abstract: a
+    /// `(K, V)` whose `V` instantiates to `(str, str)` is two slots there and
+    /// three here, so `entry.1` has to reslice rather than read a slot. They
+    /// stay as the fallback for an access with no recorded path.
+    fn tuple_index_slot(&self, expr_id: Id, baked: (usize, usize)) -> (usize, usize) {
+        let Some((root_type_id, path)) = self.program.tuple_index_paths.get(&expr_id) else {
+            return baked;
+        };
+        let mut type_id = self.resolve_type_id(*root_type_id);
+        let mut offset = 0;
+        for index in path {
+            let Some(Type::Tuple(elements)) = self.program.type_id_to_type_map.get(&type_id) else {
+                return baked;
+            };
+            let elements = elements.clone();
+            let Some(element_type_id) = elements.get(*index) else {
+                return baked;
+            };
+            offset += elements[..*index]
+                .iter()
+                .map(|id| self.flat_width(*id))
+                .sum::<usize>();
+            type_id = self.resolve_type_id(*element_type_id);
+        }
+        (offset, self.flat_width(type_id))
     }
 
     /// Lowers an `[extern]`-bound call to its host (JS) form. The first argument
@@ -7403,7 +7471,7 @@ impl<'src> Transformer<'src> {
                 // Tuples store flat: read each leaf at its flat offset, reslicing a
                 // multi-slot (sub-tuple) capture.
                 let mut leaves = Vec::new();
-                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                self.flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
                 for (sub_pattern, element) in leaves {
                     self.compile_pattern(sub_pattern, element, conditions, bindings);
                 }
@@ -9232,12 +9300,15 @@ impl<'src> Transformer<'src> {
     /// for that very element and it covers every form; it is consulted second so
     /// an expression that already answered keeps its answer byte for byte.
     ///
-    /// The element entry is read UNRESOLVED, unlike the general one. The
-    /// analyzer bakes a `.n` read's flat offset into the AST from
-    /// `tuple_flat_width`, which counts a still-generic element as one slot
-    /// because a generic body is walked once for every instantiation — so
-    /// splicing one would move every offset past it. Reading the entry as
-    /// written keeps emission and those offsets on the same layout.
+    /// The element entry is RESOLVED, like the general one (B310). It used to be
+    /// read as written, because the analyzer baked a `.n` read's flat offset
+    /// into the AST from `tuple_flat_width`, which counts a still-generic
+    /// element as one slot — so splicing one here moved every offset past it.
+    /// Emission now recomputes those offsets from the analyzer's recorded path
+    /// under the instance's substitution (`tuple_index_slot`), so both halves
+    /// read the SAME layout: the instantiated one, which is also the layout the
+    /// concrete caller builds and reads. Boxing a `(K, V)` inside `Map::insert`
+    /// and reslicing it flat at `entries()` was the miscompile.
     fn is_tuple_typed(&self, expr_id: Id) -> bool {
         if matches!(self.program.entity_map.get(&expr_id), Some(Expr::Tuple(_))) {
             return true;
@@ -9252,7 +9323,11 @@ impl<'src> Transformer<'src> {
         self.program
             .tuple_element_types
             .get(&expr_id)
-            .and_then(|type_id| self.program.type_id_to_type_map.get(type_id))
+            .and_then(|type_id| {
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(*type_id))
+            })
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
