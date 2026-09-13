@@ -149,6 +149,58 @@ struct ProjectReader {
     site: Cell<(SourceId, Span)>,
     /// What the channel did, with the site that did it — see [`ConstFact`].
     facts: RefCell<Vec<ConstFact>>,
+    /// `asset::stage`'s REGISTRY (B308): every staged contribution of the
+    /// pass, in call order, which is the one order the read-back must not use
+    /// — [`ProjectReader::staged`] orders by `(token, line)` and deduplicates
+    /// on that pair, exactly as the keyed flush does, so the answer is a
+    /// function of the SET of contributions and never of the sequence
+    /// (build-hooks.md §5.1's rule, which the registry is no exception to).
+    ///
+    /// It lives on the reader rather than in the program because the const
+    /// pass gives every site its own interpreter scopes: there is no vilan
+    /// global that can span two `const` expressions, so a module accumulating
+    /// across the build has to accumulate HERE.
+    staged: RefCell<Vec<StagedContribution>>,
+    /// The tokens the build still NAMES — the liveness set, computed once
+    /// after the last const evaluation and `None` until then. A staged
+    /// contribution survives when its token is in here, or when its token is
+    /// empty (an unconditional contribution, which nothing references because
+    /// it names nothing).
+    ///
+    /// `None` is not "nothing is live": it is "the question cannot be answered
+    /// yet", and `staged` says so rather than guessing, because until the last
+    /// site has run a token may still be about to be named.
+    live_tokens: RefCell<Option<Liveness>>,
+}
+
+/// The tokens a build still NAMES, in the two shapes a name reaches a const
+/// result in — see [`live_tokens_of`].
+#[derive(Default)]
+struct Liveness {
+    /// Every result string, and every whitespace-separated word of one. The
+    /// second is what a joined class list is: `Style::class_list` renders
+    /// `"s1ufvr2 s8myyrk"`, and a `const` whose result is that string names
+    /// two tokens, not one.
+    words: HashSet<String>,
+    /// Every result string, concatenated with a separator no token can span.
+    /// The fallback for a token a split did not isolate — a class glued into
+    /// a larger word by interpolation or `+`. Scanned only for a token the set
+    /// misses, which in practice is none.
+    text: String,
+}
+
+impl Liveness {
+    fn names(&self, token: &str) -> bool {
+        self.words.contains(token) || self.text.contains(token)
+    }
+}
+
+/// One `asset::stage` contribution: the kind it belongs to, the LIVENESS TOKEN
+/// that decides whether it survives, and the line itself.
+struct StagedContribution {
+    kind: String,
+    token: String,
+    line: String,
 }
 
 /// One thing the compile-time asset channel did, and the `const` site that did
@@ -655,6 +707,35 @@ impl interpreter::AssetReader for ProjectReader {
             }
         }
     }
+
+    fn stage(&self, kind: &str, token: &str, line: &str) {
+        self.staged.borrow_mut().push(StagedContribution {
+            kind: kind.to_string(),
+            token: token.to_string(),
+            line: line.to_string(),
+        });
+    }
+
+    fn staged(&self, kind: &str) -> Result<Vec<String>, String> {
+        let live = self.live_tokens.borrow();
+        let Some(live) = live.as_ref() else {
+            return Err(
+                "`asset::staged` reads the registry AFTER evaluation has finished, and this                  build is still evaluating — until the last `const` expression has run, a                  token it stages may still be about to be named. Read it from a function                  passed to `asset::schedule_at_end`, which is where the build runs it."
+                    .to_string(),
+            );
+        };
+        let mut surviving: Vec<(String, String)> = self
+            .staged
+            .borrow()
+            .iter()
+            .filter(|contribution| contribution.kind == kind)
+            .filter(|contribution| contribution.token.is_empty() || live.names(&contribution.token))
+            .map(|contribution| (contribution.token.clone(), contribution.line.clone()))
+            .collect();
+        surviving.sort_unstable();
+        surviving.dedup();
+        Ok(surviving.into_iter().map(|(_, line)| line).collect())
+    }
 }
 
 impl ProjectReader {
@@ -778,6 +859,8 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
         // against it: every channel call happens inside an explicit `const`.
         site: Cell::new((SourceId(0), Span::default())),
         facts: RefCell::new(Vec::new()),
+        staged: RefCell::new(Vec::new()),
+        live_tokens: RefCell::new(None),
     };
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));
@@ -785,6 +868,15 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     for &expr_id in &program.const_exprs {
         state.evaluate_one(&mut world, expr_id);
     }
+    // B308: the LIVENESS SET, computed the moment before the finalisers run
+    // and not a moment earlier — every token the build still names. See
+    // [`live_tokens_of`] for what "names" means and why this is the answer
+    // `asset::staged` gives.
+    *reader.live_tokens.borrow_mut() = Some(live_tokens_of(&state.results));
+    // G23: the END of evaluation. Every finaliser the pass was asked for runs
+    // here, once, in registration order — after the last `const` expression
+    // above and before anything reads what the pass produced.
+    state.run_finalisers(&mut world);
     // Destructure first: `state` holds the borrow of `reader`, and the borrow
     // must end before the recorded inputs move out of it.
     let State {
@@ -815,6 +907,72 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
             .map(|row| (row.source, row.name))
             .collect(),
     }
+}
+
+/// Every token the build still NAMES — `asset::staged`'s liveness predicate
+/// (B308), and the whole of what makes late emission a DROP rather than a
+/// delay.
+///
+/// A token is live when some `const` expression's result NAMES it: the token is
+/// one of that result's strings, one of the whitespace-separated words of one
+/// (`Style::class_list` renders a joined list, so a `const` ending in it names
+/// every class at once), or — the fallback, for a token glued into a larger
+/// word by interpolation or `+` — a substring of one. That is the right
+/// question for the styling case it was built for, and the argument is short:
+/// every class name is minted by
+/// `Style::rule` at const time, every `Style` that dresses an element reaches
+/// the program through a const RESULT (`class_list` and `+` are runtime code
+/// that can only read classes already in a const-built map), and a condition
+/// combinator that re-mints an inner style's rules under a composed condition
+/// DROPS the inner — so the inner's class is in no surviving value, and its
+/// rule is dead. The rules that survive are the rules of the styles the
+/// program kept.
+///
+/// It is deliberately an OVER-approximation in the safe direction. A const
+/// result later removed by dead-code elimination still names its tokens, so
+/// its rules still ship; a string that merely looks like a token keeps a rule
+/// alive. Both leave a live sheet correct and only a dead line behind, where
+/// the opposite error would delete a rule an element still wears.
+///
+/// The scan is over every result of the pass, which is also the only place it
+/// could be: a site's value is plain data by the time it lands here, so there
+/// is nothing type-shaped to consult, and nothing in the host knows what a
+/// `Style` is — which is exactly the wall lane styles-33 hit when it priced a
+/// Rust-side flush that "learns `Style` by type".
+fn live_tokens_of(results: &HashMap<Id, interpreter::ConstValue>) -> Liveness {
+    fn collect(value: &interpreter::ConstValue, into: &mut Liveness) {
+        match value {
+            interpreter::ConstValue::Str(text) => {
+                for word in text.split_whitespace() {
+                    if !into.words.contains(word) {
+                        into.words.insert(word.to_string());
+                    }
+                }
+                into.words.insert(text.clone());
+                into.text.push_str(text);
+                // A separator no token can span, so a token is never found
+                // straddling two unrelated results.
+                into.text.push('\u{1}');
+            }
+            interpreter::ConstValue::Array(items) | interpreter::ConstValue::Set(items) => {
+                for item in items {
+                    collect(item, into);
+                }
+            }
+            interpreter::ConstValue::Map(entries) => {
+                for (key, item) in entries {
+                    collect(key, into);
+                    collect(item, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut liveness = Liveness::default();
+    for value in results.values() {
+        collect(value, &mut liveness);
+    }
+    liveness
 }
 
 /// The INFERENCE sweep (const-eval.md §9): fold every `let`/`mut` initializer
@@ -1433,6 +1591,16 @@ struct State<'p, 'src> {
     /// `asset::read`'s host — present in [`Mode::Explicit`], `None` in
     /// [`Mode::Inferred`] (the inferred form's channels are closed, §9.2).
     reader: Option<&'p ProjectReader>,
+    /// The END-OF-EVALUATION finalisers the pass has been asked for (G23), as
+    /// `(emitted name, the site that asked)`, in REGISTRATION order and
+    /// deduplicated on the name — the item's set, so three requests for one
+    /// function are one finaliser. The site is kept because a finaliser is
+    /// re-entered from a program of its own and that program's reach and
+    /// prelude are the scheduling site's ([`transformer::ConstWorld::
+    /// stage_finaliser`]); the FIRST site to ask is the one recorded, so which
+    /// program a finaliser runs against is a function of registration order
+    /// and not of how many times it was asked for.
+    scheduled: Vec<(String, Id)>,
 }
 
 /// How a const expression's free variable is (or isn't) compile-time-known.
@@ -1466,6 +1634,7 @@ impl<'p, 'src> State<'p, 'src> {
             in_progress: HashSet::default(),
             errors: Vec::new(),
             reader,
+            scheduled: Vec::new(),
         }
     }
 
@@ -1628,6 +1797,15 @@ impl<'p, 'src> State<'p, 'src> {
                                 }
                             }
                             self.assets.extend(outcome.assets);
+                            // G23: the site's finaliser requests join the
+                            // pass's list here, deduplicated on the emitted
+                            // name — one name generator serves the whole pass,
+                            // so the name IS the function's identity.
+                            for name in outcome.scheduled {
+                                if !self.scheduled.iter().any(|(already, _)| already == &name) {
+                                    self.scheduled.push((name, expr_id));
+                                }
+                            }
                             true
                         }
                         Err(failure) => {
@@ -1655,6 +1833,121 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
             };
+        }
+    }
+
+    /// **G23 — the end of evaluation.** Every finaliser
+    /// `asset::schedule_at_end` was asked for, run ONCE, in REGISTRATION
+    /// order, after the last `const` expression of the build has been
+    /// evaluated and in a const context of its own (so `emit` and the rest of
+    /// the channel are live, which is the whole point: a module accumulates
+    /// during evaluation and processes + emits the result in one go here).
+    ///
+    /// **What "the end" is.** The end of ONE COMPILE's const pass — this
+    /// function's caller is [`evaluate`], and `evaluate` runs once per
+    /// compile, per leg (`const-eval.md` §3's "a two-target build evaluates
+    /// consts per compile"). Under `run --watch`'s HMR rounds that is the end
+    /// of the ROUND: a round recompiles the entry it invalidated, the modules
+    /// it re-evaluates re-schedule and re-emit, and a module the round did not
+    /// touch neither re-schedules nor re-emits — its asset is retained by the
+    /// round's artifact record, which is the machinery B276/M59 already built
+    /// for every other asset. A finaliser therefore never has to ask whether
+    /// it is in a first build or a rebuild; it is handed one complete pass
+    /// either way.
+    ///
+    /// **A finaliser sees every contribution made after its scheduling**,
+    /// because it runs after every const expression rather than at the
+    /// scheduling site: a style module schedules on its FIRST rule and still
+    /// flushes the last one.
+    ///
+    /// **A finaliser that schedules** joins the same list and runs in the same
+    /// pass (the walk is by index over a list that may grow), and one that
+    /// re-schedules ITSELF is a no-op — the set is deduplicated on the
+    /// function's identity, which is what makes "runs once" true whoever asks
+    /// and however often.
+    ///
+    /// **A finaliser that panics fails the build naming it**, at the site that
+    /// scheduled it — the only span the pass has, since the interpreted tree
+    /// carries none (§8.2) — with the function's own declaration as the note.
+    fn run_finalisers<'w>(&mut self, world: &mut transformer::ConstWorld<'w>) {
+        let mut index = 0;
+        while index < self.scheduled.len() {
+            let (name, scheduler) = self.scheduled[index].clone();
+            index += 1;
+            self.run_finaliser(world, &name, scheduler);
+        }
+    }
+
+    /// One finaliser, against a program of its own: the scheduling site's
+    /// reach and prelude with a synthetic body that calls the function
+    /// ([`transformer::ConstWorld::stage_finaliser`] says why that reach is
+    /// the right one).
+    fn run_finaliser<'w>(
+        &mut self,
+        world: &mut transformer::ConstWorld<'w>,
+        name: &str,
+        scheduler: Id,
+    ) {
+        let free = self.free_locals(scheduler);
+        let external: HashSet<Id> = free.iter().map(|(_, binding)| *binding).collect();
+        let lower_started = crate::PhaseClock::now();
+        // The scheduling site was evaluated, so its bindings resolved; a
+        // straggler here would have been reported at that site and is not
+        // reported twice.
+        let (reach, prelude, _unresolved) = world.prepare(scheduler, &external, &self.results);
+        world.stage_finaliser(name, scheduler);
+        let site = world.finaliser_site(name, &reach, prelude);
+        phase_add(&PHASE_LOWER, lower_started);
+        if let Some(recorder) = self.reader {
+            recorder.enter_site(self.source_of(scheduler), self.span_of(scheduler));
+        }
+        let reader = self
+            .reader
+            .map(|reader| reader as &dyn interpreter::AssetReader);
+        let interp_started = crate::PhaseClock::now();
+        let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, reader);
+        phase_add(&PHASE_INTERP, interp_started);
+        match evaluated {
+            Ok(outcome) => {
+                FUEL_MAX.with(|cell| cell.set(cell.get().max(outcome.fuel_used)));
+                if let Some(recorder) = self.reader {
+                    let mut seen: BTreeSet<&str> = BTreeSet::new();
+                    for asset in &outcome.assets {
+                        if seen.insert(&asset.kind) {
+                            recorder.record(ConstFactKind::Emitted {
+                                kind: asset.kind.clone(),
+                            });
+                        }
+                    }
+                }
+                self.assets.extend(outcome.assets);
+                for scheduled in outcome.scheduled {
+                    if !self
+                        .scheduled
+                        .iter()
+                        .any(|(already, _)| already == &scheduled)
+                    {
+                        self.scheduled.push((scheduled, scheduler));
+                    }
+                }
+            }
+            Err(failure) => {
+                let trace = [name.to_string()];
+                let source_name = world
+                    .resolve_trace(&trace)
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map(|function_id| self.program.functions[&function_id].name);
+                let frames = world.resolve_trace(&failure.trace);
+                let mut error = self.failure_error(scheduler, failure, &frames);
+                let finaliser = source_name.unwrap_or(name);
+                error.msg = format!(
+                    "the end-of-evaluation finaliser `{finaliser}` failed: {}",
+                    error.msg
+                );
+                self.report(scheduler, error);
+            }
         }
     }
 
@@ -1715,6 +2008,21 @@ impl<'p, 'src> State<'p, 'src> {
         let mut worklist: Vec<Id> = Vec::new();
         let mut boundary_errors: Vec<(Id, Id)> = Vec::new(); // (call site, callee)
         let mut owned_calls: HashSet<Id> = HashSet::default();
+        // G23's one carve-out from the value-escape rule below, collected here
+        // because this is the loop that already resolves a call to a channel
+        // verb: the ARGUMENT of `asset::schedule_at_end` is a const-only
+        // function NAMED as a value, which is what §2's escape rule refuses —
+        // and it is also the entire point of the hook. The value never becomes
+        // a runtime one: it is handed to the const pass, which re-enters it at
+        // the end of evaluation and nowhere else. Narrow on purpose — the
+        // argument expression of a call to this one verb, nothing wider.
+        let schedule_at_end = self
+            .program
+            .asset_channel_fns
+            .iter()
+            .find(|(_, path)| *path == "asset::schedule_at_end")
+            .map(|(id, _)| *id);
+        let mut scheduled_arguments: HashSet<Id> = HashSet::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
                 owned_calls.insert(call.call_id);
@@ -1722,6 +2030,11 @@ impl<'p, 'src> State<'p, 'src> {
                     CallTarget::External(target) if const_only.contains(&target) => target,
                     _ => continue,
                 };
+                if Some(target) == schedule_at_end
+                    && let Some(scheduled) = self.program.function_calls.get(&call.call_id)
+                {
+                    scheduled_arguments.extend(scheduled.argument_ids.iter().copied());
+                }
                 if self.in_const_subtree(call.call_id) {
                     continue;
                 }
@@ -1922,7 +2235,7 @@ impl<'p, 'src> State<'p, 'src> {
             ));
         }
 
-        self.check_value_escapes(graph, &in_r, &reaches);
+        self.check_value_escapes(graph, &in_r, &reaches, &scheduled_arguments);
     }
 
     /// The value-escape half of §2's rule. Two shapes make a runtime function
@@ -1938,11 +2251,17 @@ impl<'p, 'src> State<'p, 'src> {
     /// narrowest span that identifies the problem (diagnostics-standard A1).
     /// A reference inside a `const` subtree is untouched: there the interpreter
     /// makes the call, which is the whole styling shape.
+    ///
+    /// `scheduled_arguments` is G23's carve-out: the argument of an
+    /// `asset::schedule_at_end` call names a const-only function on purpose,
+    /// and the name never leaves the const pass — it is the identity the pass
+    /// re-enters the function by at the end of evaluation.
     fn check_value_escapes(
         &mut self,
         graph: &CallGraph,
         in_r: &HashSet<Id>,
         reaches: &HashMap<Id, Id>,
+        scheduled_arguments: &HashSet<Id>,
     ) {
         let mut escapes: Vec<(Id, Option<Id>)> = Vec::new(); // (site, named function)
 
@@ -1957,7 +2276,10 @@ impl<'p, 'src> State<'p, 'src> {
             .chain(self.program.module_level_bindings());
         for owner in reference_owners {
             for &(reference_id, function_id) in graph.function_references_of(owner) {
-                if !in_r.contains(&function_id) || self.in_const_subtree(reference_id) {
+                if !in_r.contains(&function_id)
+                    || self.in_const_subtree(reference_id)
+                    || scheduled_arguments.contains(&reference_id)
+                {
                     continue;
                 }
                 escapes.push((reference_id, Some(function_id)));

@@ -2391,7 +2391,7 @@ fn canonical_instance_body(node: &js::Node, name: &str) -> String {
 /// function once would lose all three for every site after the first — so each
 /// emission records them, together with what it directly required, and a site
 /// recovers its exact set by closing over `requires` from its own walk.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EmissionRecord {
     globals: HashSet<Id>,
     helpers: BTreeSet<&'static str>,
@@ -10213,6 +10213,14 @@ pub struct ConstWorld<'src> {
     transformer: Transformer<'src>,
     seed: ConstProgramSeed,
     sites: HashMap<Id, SiteWalk<'src>>,
+    /// The END-OF-EVALUATION finalisers (G23), by the emitted name of the
+    /// function each one calls. A finaliser is not an expression in the
+    /// program — nothing in the source spells `flush()` — so it gets a
+    /// SYNTHETIC body of its own (`const __const_result = flush();`), seeded
+    /// with the emission record of the site that scheduled it, which is the
+    /// site that reached the function and therefore already carries its whole
+    /// transitive requirement set.
+    finalisers: HashMap<String, SiteWalk<'src>>,
 }
 
 /// One site's own lowering, cached: the statements its expression emitted (the
@@ -10264,6 +10272,7 @@ impl<'src> ConstWorld<'src> {
             transformer,
             seed,
             sites: HashMap::default(),
+            finalisers: HashMap::default(),
         }
     }
 
@@ -10383,6 +10392,24 @@ impl<'src> ConstWorld<'src> {
         reach: &SiteReach,
         prelude: Vec<js::Node<'src>>,
     ) -> ConstSite<'world> {
+        let mut site = self.site_shell(reach, prelude);
+        site.body = self
+            .sites
+            .get(&expr_id)
+            .map(|site| site.body.as_slice())
+            .unwrap_or_default();
+        site
+    }
+
+    /// Everything a site's program is except its BODY — the reached world
+    /// declarations, this site's own imports and helpers, its prelude. Shared
+    /// by the expression sites and by G23's finaliser sites, which differ from
+    /// them in the body and in nothing else.
+    fn site_shell<'world>(
+        &'world self,
+        reach: &SiteReach,
+        prelude: Vec<js::Node<'src>>,
+    ) -> ConstSite<'world> {
         let mut world: Vec<&'world js::Node<'world>> =
             Vec::with_capacity(reach.functions.len() + reach.slots.len());
         for function_id in &reach.functions {
@@ -10400,12 +10427,56 @@ impl<'src> ConstWorld<'src> {
             imports: reach.imports.clone(),
             helpers: reach.helpers.clone(),
             prelude,
-            body: self
-                .sites
-                .get(&expr_id)
-                .map(|site| site.body.as_slice())
-                .unwrap_or_default(),
+            body: &[],
         }
+    }
+
+    /// Registers an end-of-evaluation finaliser's synthetic body (G23), once
+    /// per finaliser: `const __const_result = <name>();`, where `<name>` is
+    /// the EMITTED name of the scheduled function.
+    ///
+    /// `scheduler` is the const site whose evaluation asked for the finaliser.
+    /// Its emission record is the seed, and that is the whole trick: the site
+    /// referenced the function (it passed it to `schedule_at_end`), so the
+    /// record already requires it, and [`ConstWorld::reach_from`] closes over
+    /// `requires` to reach everything the function itself calls. No second
+    /// walk, and no way for a finaliser to reach code its scheduling site
+    /// could not.
+    pub fn stage_finaliser(&mut self, name: &str, scheduler: Id) {
+        if self.finalisers.contains_key(name) {
+            return;
+        }
+        let record = self
+            .sites
+            .get(&scheduler)
+            .map(|site| site.record.clone())
+            .unwrap_or_default();
+        let body = vec![js::Node::ConstVariable(js::Variable {
+            name: "__const_result".to_string(),
+            value: Box::new(js::Node::Call(
+                Box::new(js::Node::Local(name.to_string())),
+                Vec::new(),
+            )),
+        })];
+        self.finalisers
+            .insert(name.to_string(), SiteWalk { body, record });
+    }
+
+    /// A staged finaliser's program: [`ConstWorld::site`]'s body swapped for
+    /// the synthetic call [`ConstWorld::stage_finaliser`] registered.
+    pub fn finaliser_site<'world>(
+        &'world self,
+        name: &str,
+        reach: &SiteReach,
+        prelude: Vec<js::Node<'src>>,
+    ) -> ConstSite<'world> {
+        let mut site = self.site_shell(reach, prelude);
+        site.body = self
+            .finalisers
+            .get(name)
+            .map(|staged| staged.body.as_slice())
+            .unwrap_or_default();
+        site
     }
 
     /// Lowers one site's expression into the world, once per pass. The three

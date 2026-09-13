@@ -164,8 +164,9 @@ is a condition rule, a `;` is a link. `vilan fmt` treats a link as a
 across it and its position is preserved.
 
 **A block is `const` on its own.** A style is a compile-time asset — the
-chain writes its rules into the stylesheet as it is built — so the chain
-spelling needs `const` in front of it, and the block does not: it writes
+chain records its rules as it is built, and the build writes the ones
+the program kept onto the stylesheet when evaluation ends — so the
+chain spelling needs `const` in front of it, and the block does not: it writes
 the word for you. `let card = css { … };` is the whole declaration. What
 that does *not* buy you is reading a runtime value: a hole that reads a
 function parameter or a signal is refused at the hole, because there is
@@ -211,6 +212,18 @@ let button = css {
 	display: flex;
 };
 ```
+
+## What reaches the stylesheet
+
+The sheet holds the rules your program **kept**, not every rule it ever
+built. A condition combinator re-mints its inner style's rules under the
+composed condition and drops the inner — `attribute("data-open",
+Some("true"), hover(inner))` mints three classes and can only ever put
+the third on an element — and a shorthand set after a longhand it covers
+drops that longhand's slot. Rules are recorded as they are built and the
+build writes the surviving ones when const evaluation ends, so the
+scaffolding never ships: only classes the program can still name reach
+the file.
 
 ## Getting the stylesheet onto the page
 

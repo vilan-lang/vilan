@@ -38,6 +38,72 @@ external fun emit_keyed(kind: str, key: str, line: str): void;
 // build input: a change to it invalidates the compile that read it.
 // Compile-time-only, exactly like `emit`.
 
+// The END-OF-EVALUATION HOOK (G23): `schedule_at_end(f)` asks the build to
+// call `f` once, after EVERY const evaluation of this compile has finished,
+// in a const context of its own — so a module can accumulate into a registry
+// while the program evaluates and process + emit the result in one go at the
+// end, instead of emitting each piece at the moment it is minted and being
+// unable to take any of it back. `std::style` is the first consumer: a style
+// rule is recorded when it is built and the sheet is written here, once, from
+// the rules that survived.
+//
+// `f` must be a NAMED function, and its name is its IDENTITY: scheduling the
+// same function three times schedules it once (the set is deduplicated, so
+// every contributor can ask without coordinating), and the order the
+// finalisers run in is the order they were first asked for. An anonymous
+// closure is refused — a closure's captured scope belongs to the evaluation
+// that made it and does not survive to the end of the pass, so there would be
+// nothing to call.
+//
+// A finaliser sees every contribution made AFTER its scheduling, which is the
+// point of the hook: it runs after the last const expression, not after the
+// one that asked for it. A finaliser may schedule another (it runs in the same
+// pass); one that re-schedules itself does nothing. A finaliser that panics
+// fails the build, naming the function.
+//
+// "The end" is the end of ONE COMPILE's const pass — per leg, like every other
+// const fact. Under `run --watch` that is the end of the ROUND: what the round
+// re-evaluated re-schedules and re-emits, and what it did not touch keeps the
+// asset the previous round wrote.
+//
+// Compile-time-only, exactly like `emit`.
+
+[extern("__schedule_at_end")]
+external fun schedule_at_end(finaliser: || void): void;
+
+// The channel's REGISTRY (B308), and what the hook above is for. `stage(kind,
+// token, line)` records a contribution WITHOUT writing it: the build holds it
+// until evaluation ends, and it reaches the kind's file only if a finaliser
+// puts it there. `token` is the contribution's LIVENESS TOKEN — the name the
+// rest of the build has to still be using for the line to be worth keeping.
+//
+// `staged(kind)` is the read-back: the staged lines of `kind` whose token the
+// build still NAMES — a token appears in a value some `const` expression
+// evaluated to — in `(token, line)` order and deduplicated on that pair, the
+// same order and the same dedup the keyed flush uses, so the answer is a
+// function of the SET of contributions and never of the order they were made
+// in. A contribution staged with an empty token is unconditional: it names
+// nothing, so nothing can stop naming it.
+//
+// It answers only AFTER evaluation has finished — until the last `const`
+// expression has run, a token may still be about to be named — so it is read
+// from a function passed to `schedule_at_end` and reading it anywhere else is
+// a compile error saying so. That pairing is the mechanism: a module stages
+// while the program evaluates, and its finaliser emits what survived.
+//
+// This is how `std::style` writes a stylesheet. Every rule is staged under
+// its class; a condition combinator that re-mints an inner style's rules under
+// a composed condition drops the inner, so the inner's class is in no
+// surviving style and its rule never reaches the sheet.
+//
+// Compile-time-only, exactly like `emit`.
+
+[extern("__stage_asset")]
+external fun stage(kind: str, token: str, line: str): void;
+
+[extern("__staged_assets")]
+external fun staged(kind: str): List<str>;
+
 [extern("__read_asset")]
 external fun read(path: str): str;
 
