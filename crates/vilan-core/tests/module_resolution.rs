@@ -1821,24 +1821,33 @@ fn dependency_display_names_intern_across_analyses() {
     );
 }
 
-/// The Rust-fallback derive path — a derive with NO macro in scope, the case
-/// fixture stds and macro-world compiles hit — must parse its generated impls
-/// through the content cache: an unchanged program's re-analysis reuses the
-/// tree instead of re-leaking one. Pinned here rather than in the LSP leak
-/// harness because it needs a std WITHOUT the std macros, and this file
-/// already owns the hand-built-spec fixtures (the E23 sweep's coverage gap).
+/// The SYNTHESIZED-MEMBER path — a backed enum's `value()`/`parse()` and a
+/// bare-lowered enum's `Hashable` impl, the members the language gives an enum
+/// with no macro anywhere in it — must parse its generated text through the
+/// content cache: an unchanged program's re-analysis reuses the tree instead of
+/// re-leaking one. Pinned here rather than in the LSP leak harness because it
+/// needs a hand-built std spec, and this file already owns those fixtures (the
+/// E23 sweep's coverage gap).
+///
+/// The subject was `[derive(PartialEq)]` with no macro in scope until N79,
+/// which deleted the Rust derive generators that path ran on. The MECHANISM is
+/// unchanged — the same per-scope bucket, the same `flush_synthesized_members`,
+/// the same `parse_cached` — so the pin moves to the one generator still
+/// filling that bucket rather than going with the generators.
 #[test]
-fn rust_fallback_derives_parse_through_the_content_cache() {
+fn synthesized_enum_members_parse_through_the_content_cache() {
     use vilan_core::leak_tally::{self, LeakSite};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_fallback_{}_{unique}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("vilan_synthesized_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    // A std whose loader-forced modules are empty stubs and which defines no
-    // `macro fun` anywhere: `[derive(PartialEq)]` finds no macro in scope and
-    // falls back to the Rust generators. (The generated prelude's imports then
-    // fail to resolve against the stubs — irrelevant here: the leak this pins
+    // A std whose loader-forced modules are empty stubs: a backed enum's
+    // `value()`/`parse()` and its `Hashable` impl are synthesized regardless —
+    // no macro is consulted for them, which is what makes this path the one
+    // that still fills the bucket. (The generated prelude's imports then fail
+    // to resolve against the stubs — irrelevant here: the leak this pins
     // happens at the parse, before resolution.)
     let std_src = root.join("std").join("src");
     std::fs::create_dir_all(&std_src).unwrap();
@@ -1858,7 +1867,7 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let entry_path = app_dir.join("main.vl");
-    let source = "[derive(PartialEq)]\nstruct FallbackPin { x: i32 }\n";
+    let source = "enum SynthesizedPin { Low = 0, Mid, High }\n";
     std::fs::write(&entry_path, source).unwrap();
     let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
 
@@ -1876,8 +1885,8 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
     analyze();
     assert!(
         leak_tally::bytes(LeakSite::MacroParseText) > 0,
-        "the fixture never took the Rust-fallback path — no generated text was \
-         parsed, and this pin is vacuous"
+        "the fixture never synthesized anything — no generated text was parsed, \
+         and this pin is vacuous"
     );
     leak_tally::reset();
     analyze();
@@ -1885,8 +1894,8 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
         leak_tally::bytes(LeakSite::MacroParseText) + leak_tally::bytes(LeakSite::MacroParseAst);
     assert_eq!(
         releaked, 0,
-        "the Rust-fallback derive re-leaked {releaked} B on an unchanged \
-         re-analysis — `flush_rust_fallback` is not parsing through the \
+        "the synthesized enum members re-leaked {releaked} B on an unchanged \
+         re-analysis — `flush_synthesized_members` is not parsing through the \
          content cache"
     );
     let _ = std::fs::remove_dir_all(&root);

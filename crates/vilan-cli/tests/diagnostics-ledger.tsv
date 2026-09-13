@@ -195,7 +195,7 @@ row	flagship	key
 160	-	a macro body may import only from `macro_std`: the macro wor
 161	-	`[service]` expanded before std::rpc's `service` macro was 
 162	-	this `macro { .. }` block was not registered; see the file'
-163	-	the built-in derive generators produced invalid Vilan ({mess
+163	-	the built-in enum member generators produced invalid Vilan ({message})
 164	-	no macro named `{name}` is in scope
 165	-	`{name}` is a macro HELPER (its signature is not a macro sha
 166	-	macro `{name}` is invocation-shaped (it takes no `Item`); ca
@@ -464,3 +464,4 @@ row	flagship	key
 431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{name}.vl` that is the module `{module_name}::{name}` — the declaration wins, so the file cannot be reached by any import; rename one of them
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
 433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
+NEW	-	`[derive({derive})]` needs std's `{module}`, and the std this package resolves to does not carry one
