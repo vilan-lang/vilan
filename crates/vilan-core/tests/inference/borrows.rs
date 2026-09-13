@@ -2189,6 +2189,99 @@ fn a_mut_array_binder_in_an_is_test_stamps_its_elements() {
     );
 }
 
+// --- A80: a mutable binder in a VARIANT payload ------------------------------
+//
+// B53 finding 5 carried `mut` through the tuple and array binders of a match;
+// the variant payload is the same keyword in the same grammar, and the pins
+// below are the ones the item was filed for. A binder is a BINDING, so `mut`
+// buys a mutable binding of a COPY — exactly what `mut x = value` buys one
+// statement away — and the value the arm matched is untouched. Writing the
+// mutated copy back through a `&mut` subject is what reaches the original.
+
+#[test]
+fn a80_a_mut_binder_in_a_variant_payload_is_mutable_in_the_arm() {
+    // The item's own exhibit. `Some(let list) => list.push(9)` is refused with
+    // "cannot mutate immutable 'list'" (the pin below), and the workaround was
+    // `Option::take`/`replace`, which is not obvious. The arm's own push lands,
+    // and the assignment through `held` — the `&mut` subject the closure was
+    // handed — is what carries it into the cell.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+        fun main() {
+            let cell = SignalCell::new(Some([1]));
+            cell.update(|&mut held| {
+                match held {
+                    Some(mut list) => {
+                        list.push(9);
+                        print(list.len());
+                        held = Some(list);
+                    }
+                    None => void,
+                }
+            });
+            match cell.get() {
+                Some(let list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn a80_a_mut_binder_in_a_variant_payload_binds_a_copy() {
+    // The half that is not the sugar: rule 1 copies at a binding, and a pattern
+    // binder is a binding — `mut [a, b]`'s pin two screens up says the same
+    // thing for the array form. So the arm's push does NOT reach the matched
+    // value, and a reader who wants it to has to write it back.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut slot = Some([1]);
+            match slot {
+                Some(mut list) => {
+                    list.push(9);
+                    print(list.len());
+                }
+                None => void,
+            }
+            match slot {
+                Some(let list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "2\n1\n",
+    );
+}
+
+#[test]
+fn a80_a_let_binder_in_a_variant_payload_is_still_immutable() {
+    // The control that says `mut` is what changed: `let` binds immutably in a
+    // pattern exactly as it does in a declaration, and the refusal an author
+    // meets when they reach for the mutation is the one that sent them here.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let list) => {
+                    list.push(9);
+                    print(list.len());
+                }
+                None => void,
+            }
+        }
+        "#,
+        "cannot mutate immutable 'list'",
+    );
+}
+
 #[test]
 fn a_guard_that_needs_a_temporary_emits_it() {
     // B59: a guard whose expression needs hoisted statements (an `is` test, a

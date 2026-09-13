@@ -42,6 +42,26 @@ fun main() {
 If you forget a variant, the compiler tells you. That's most of the
 reason enums plus `match` replace flag fields and `null` checks.
 
+A payload binds with `let` or with `mut`, the same two words that
+declare a variable — `let` immutably, `mut` mutably:
+
+```vilan,fragment
+match slot {
+	Some(mut items) => {
+		items.push(9);         // `let items` here is "cannot mutate immutable"
+		slot = Some(items);    // the binder is a copy: write it back
+	}
+	None => void,
+}
+```
+
+A binder is a binding, so it holds a **copy** of what it matched, like
+every other binding (see [the memory model](memory-model.md)). `mut`
+makes that copy writable; it does not reach the value you matched on.
+An arm that means to change the subject assigns back through it, as
+above. Writing both words (`Some(let mut items)`) is neither form, and
+the compiler says so.
+
 Completeness is judged over the whole pattern, not just its outermost
 name, so a payload you narrow has to be handled too:
 

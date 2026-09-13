@@ -300,6 +300,17 @@ const LET_MUT_IS_ONE_WORD: &str = "a mutable binding is spelled `mut x = …`: `
      not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and \
      writing both is neither";
 
+/// The rule `Some(let mut x)` and `Some(mut let x)` break — [`LET_MUT_IS_ONE_WORD`]'s
+/// twin inside a PATTERN (A80). Curated (diagnostics-standard.md B6): a pattern
+/// binder follows the declaration syntax exactly, so `let` and `mut` are the two
+/// forms there too and the steer is the pattern spelling the author wanted. Its own
+/// constant rather than a second use of the declaration's, because that one's steer
+/// (`mut x = …`, with an initializer) is not a thing you can write in a pattern.
+const PATTERN_BINDER_IS_ONE_WORD: &str = "a pattern binds mutably with `mut x`: `let` and `mut` are the two binding forms \
+     inside a pattern exactly as they are in a declaration, not a keyword and a \
+     modifier — `Some(let list)` binds immutably, `Some(mut list)` binds mutably, and \
+     writing both is neither";
+
 /// The did-you-mean note for a failure INSIDE an interpolation hole. A `{` in an
 /// `i"…"` opens a hole, so a literal brace has to be escaped — and code that
 /// GENERATES braces (a CSS rule, a JS body, a JSON object) hits this constantly,
@@ -4410,9 +4421,28 @@ impl<'a, 'src> Parser<'a, 'src> {
         let start = self.position;
         // `let x` / `mut x` — a binder, stamped mutable per the keyword.
         if self.peek_is(&Token::Let) || self.peek_is(&Token::Mut) {
-            let mutable = self.eat(&Token::Mut);
+            let mut mutable = self.eat(&Token::Mut);
             if !mutable {
                 self.bump(); // `let`
+            }
+            // `Some(let mut x)` / `Some(mut let x)`: the two binding forms
+            // written as one, exactly as `let mut x = …` writes them at a
+            // declaration (A80). Refused by name, and CONSUMED — the binder is
+            // taken as MUTABLE, which is what either spelling was reaching for,
+            // so the arm still parses and the author reads one diagnostic
+            // naming `Some(mut x)` instead of a "found '(' expected '=>'" about
+            // the payload's own paren, thrown when the pattern backtracked out
+            // from under it (diagnostics-standard B5).
+            let paired = if mutable { Token::Let } else { Token::Mut };
+            if self.peek_is(&paired) {
+                self.bump();
+                mutable = true;
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(PATTERN_BINDER_IS_ONE_WORD),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
             }
             let (binder, _) = self.parse_binder()?;
             let pattern = apply_binding_mutability(binder, mutable);
