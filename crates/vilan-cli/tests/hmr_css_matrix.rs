@@ -57,6 +57,37 @@ fn wait_for_file(path: &Path, deadline: Duration) -> bool {
     false
 }
 
+/// Waits (bounded) for a line containing `needle` in the watcher's own trace
+/// (`VILAN_WATCH_LOG`, B208) — the loop narrates every round there, so "round 1
+/// has finished" is an EVENT this test can wait ON rather than a state it has
+/// to infer from the files the round was in the middle of writing (N35).
+fn wait_for_trace_line(trace: &Path, needle: &str, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if std::fs::read_to_string(trace).is_ok_and(|text| text.contains(needle)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Whether `path` is a whole ES module — node's own parser, which is the reader
+/// that matters, since the harness loads this file with `await import(..)`.
+///
+/// N35: a truncated bundle is what the harness reported as `SyntaxError:
+/// Unexpected end of input`, and asking node to PARSE the file is the only
+/// check that cannot be satisfied by half of one. Substring tests cannot: the
+/// shim is prepended, so `window.__VILAN_HMR__` is present in the first
+/// kilobyte of a file that may be a hundred times that.
+fn parses_as_a_module(path: &Path) -> bool {
+    Command::new("node")
+        .arg("--check")
+        .arg(path)
+        .output()
+        .is_ok_and(|check| check.status.success())
+}
+
 /// The number of matrix cells each column drives — asserted, so a harness that
 /// dies before its assertions (or loses some to a refactor) cannot report a
 /// matrix it never drove.
@@ -344,6 +375,45 @@ fn run_harness(dir: &Path, name: &str, body: &str, cells: usize) {
     );
 }
 
+#[test]
+fn n35_a_truncated_bundle_is_not_mistaken_for_a_whole_one() {
+    // The race the read below closes, asked of the two readers directly. The
+    // watcher writes `dist/client.js` while this suite reads it, and what the
+    // old loop asked of what it read was two SUBSTRING tests — both of which a
+    // prefix satisfies, because the shim is prepended and carries both needles
+    // in its first kilobyte. A prefix is what the harness then imported, and
+    // `SyntaxError: Unexpected end of input` is what it reported (green in
+    // isolation, green on the rerun, failing only under load). node's parser is
+    // the reader that can tell a prefix from a file.
+    let dir = temp_project("truncation");
+    std::fs::create_dir_all(&dir).unwrap();
+    let whole = "var HMR = {};\nwindow.__VILAN_HMR__ = HMR;\n\
+                 export function boot(page) {\n    return page;\n}\n";
+    let cut = &whole[..whole.find("export function").unwrap() + 30];
+
+    for text in [whole, cut] {
+        assert!(
+            text.contains("window.__VILAN_HMR__") && !text.contains("__VILAN_HMR_BUNDLE__"),
+            "both readings satisfy the substring tests — that is the whole \
+             problem: {text:?}"
+        );
+    }
+
+    let module = dir.join("whole.mjs");
+    std::fs::write(&module, whole).unwrap();
+    assert!(
+        parses_as_a_module(&module),
+        "the whole module parses, so the check costs a healthy read nothing"
+    );
+    let partial = dir.join("cut.mjs");
+    std::fs::write(&partial, cut).unwrap();
+    assert!(
+        !parses_as_a_module(&partial),
+        "a bundle cut mid-function must not pass for a whole one"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// kolt.local 007's apply matrix. One `run --watch` produces the instrumented
 /// bundle; each column then drives the real shim's real `handleEvent` through
 /// its cells.
@@ -358,8 +428,12 @@ fn the_css_apply_matrix_holds_in_every_cell() {
     write(&dir, "src/client.vl", CLIENT);
     write(&dir, "src/server.vl", SERVER);
 
+    // The watcher narrates its rounds into this file (B208), which is what
+    // turns "round 1 has finished" into something to wait on (N35).
+    let trace = dir.join("watch-trace.log");
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .env("VILAN_WATCH_LOG", &trace)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -375,6 +449,19 @@ fn the_css_apply_matrix_holds_in_every_cell() {
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let bundle_path = dir.join("dist/client.js");
+        // N35 — the round's own completion signal, ahead of every read of what
+        // the round wrote. `dist/client.js` appearing means the round has
+        // STARTED writing it, and this test then read the file while the
+        // watcher was still writing it: under suite load it once took away a
+        // truncated bundle that satisfied both substring tests below and threw
+        // `SyntaxError: Unexpected end of input` inside the node harness, green
+        // in isolation and green on the rerun. The verdict line is written
+        // after the round's action returns, so everything the round writes is
+        // on disk by the time it appears.
+        assert!(
+            wait_for_trace_line(&trace, "round 1 end verdict=", support::WATCH_LIVENESS),
+            "round 1 should have finished and said so in the watch trace"
+        );
         assert!(
             wait_for_file(&bundle_path, support::WATCH_LIVENESS),
             "round 1 should have written dist/client.js"
@@ -382,14 +469,36 @@ fn the_css_apply_matrix_holds_in_every_cell() {
         // The bundle is read back rather than fetched: what this matrix needs
         // from the channel is the SHIM's bytes, and `dist/client.js` is the very
         // copy the channel serves (`serve_asset` reads it from the same file).
-        let bundle = loop {
+        //
+        // Read until it PARSES, and bounded. The substring tests say the shim is
+        // there and its bundle placeholder was substituted, which is a claim
+        // about the CONTENT and is exactly what half a file can satisfy; node's
+        // parser is what says the file is whole. The old loop asked only the two
+        // substrings and had no deadline at all, so a round that never produced
+        // an instrumented bundle hung here instead of failing.
+        let module = dir.join("bundle.mjs");
+        let started = Instant::now();
+        loop {
             let text = std::fs::read_to_string(&bundle_path).expect("read the instrumented bundle");
-            if text.contains("window.__VILAN_HMR__") && !text.contains("__VILAN_HMR_BUNDLE__") {
-                break text;
+            // Written before it is judged, because the judgement is node's and
+            // node reads a file: what the harness imports is the copy that
+            // passed, byte for byte.
+            std::fs::write(&module, &text).unwrap();
+            if text.contains("window.__VILAN_HMR__")
+                && !text.contains("__VILAN_HMR_BUNDLE__")
+                && parses_as_a_module(&module)
+            {
+                break;
             }
+            assert!(
+                started.elapsed() < support::WATCH_LIVENESS,
+                "dist/client.js should have settled into a whole instrumented \
+                 bundle within {:?} (read {} bytes last)",
+                support::WATCH_LIVENESS,
+                text.len()
+            );
             std::thread::sleep(Duration::from_millis(50));
-        };
-        std::fs::write(dir.join("bundle.mjs"), &bundle).unwrap();
+        }
 
         run_harness(&dir, "linked.mjs", LINKED_HARNESS, LINKED_CELLS);
         run_harness(&dir, "linkless.mjs", LINKLESS_HARNESS, LINKLESS_CELLS);
