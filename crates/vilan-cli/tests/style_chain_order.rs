@@ -666,6 +666,93 @@ fn an_order_sensitive_css_block_resolves_the_same_slots() {
     );
 }
 
+/// E167's claim, in the only currency that settles it: the `css` block the
+/// editor's "Convert to a `css` block" refactor produces for a TYPED chain
+/// renders the same style the chain does.
+///
+/// The refactor reads a typed link's declarations out of std's own `style.vl`
+/// (`Document::style_link_declarations` inlines the method's body), so
+/// `.padding_x(space(4))` becomes two declarations and `.radius(…)` becomes
+/// `border-radius`. Nothing about that is checkable by reading the block: it is
+/// right exactly when the two programs emit the same stylesheet and resolve the
+/// same slots, which is what this builds and compares — the same two assertions
+/// the sort's own twins make, for the same reason (a class name is a content
+/// hash of the slot key and the declaration, so any drift moves a hash).
+///
+/// The block below is the refactor's OWN OUTPUT, byte for byte: it is pinned as
+/// the replacement text in `vilan-lsp`'s
+/// `refactor_converts_a_typed_property_link_by_inlining_its_std_body` and
+/// `refactor_splits_a_chain_at_a_link_with_no_block_spelling`, so if the
+/// converter's rendering changes, that pin reds and this fixture is the place
+/// the new text has to be proved equivalent.
+const E167_TYPED_CHAIN: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ Color, Length, Style, space, style };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const style()\n",
+    "\t\t.padding_x(space(4))\n",
+    "\t\t.color(Color::gray(900))\n",
+    "\t\t.radius(Length::px(4))\n",
+    "\t\t.raw(\"outline\", \"none\")\n",
+    "\t\t.hover(style().background(Color::gray(100)));\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+const E167_CONVERTED_BLOCK: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ Color, Length, Style, space, style };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const css {\n",
+    "\t\tpadding-left: {space(4)};\n",
+    "\t\tpadding-right: {space(4)};\n",
+    "\t\tcolor: {Color::gray(900)};\n",
+    "\t\tborder-radius: {Length::px(4)};\n",
+    "\t\toutline: none;\n",
+    "\t\t.hover {\n",
+    "\t\t\tbackground-color: {Color::gray(100)};\n",
+    "\t\t}\n",
+    "\t};\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+#[test]
+fn the_css_block_refactor_renders_the_typed_chain_it_converted() {
+    let temporary = scratch_directory("vilan-style-e167");
+    let chain_dir = temporary.join("chain");
+    let block_dir = temporary.join("block");
+    std::fs::create_dir_all(&chain_dir).expect("create the chain directory");
+    std::fs::create_dir_all(&block_dir).expect("create the block directory");
+    let chain_source = chain_dir.join("converted.vl");
+    let block_source = block_dir.join("converted.vl");
+    std::fs::write(&chain_source, E167_TYPED_CHAIN).expect("write the chain");
+    std::fs::write(&block_source, E167_CONVERTED_BLOCK).expect("write the block");
+
+    let chain = build(&chain_source, &chain_dir, false)
+        .unwrap_or_else(|error| panic!("the typed chain did not build:\n{error}"));
+    let block = build(&block_source, &block_dir, false)
+        .unwrap_or_else(|error| panic!("the converted block did not build:\n{error}"));
+    let _ = std::fs::remove_dir_all(&temporary);
+
+    assert_eq!(
+        chain.1, block.1,
+        "the converted `css` block emits a different stylesheet than the typed chain it was \
+         converted from - a class name is a content hash of the slot and the declaration, so one \
+         inlined body is writing something the method does not"
+    );
+    assert_eq!(
+        sort_map_entries(&chain.0),
+        sort_map_entries(&block.0),
+        "the converted `css` block resolves different slots than the typed chain it was converted \
+         from"
+    );
+}
+
 /// The `.mjs` canonicalization must not be able to hide a real difference: a
 /// changed class name, declaration or slot key survives it.
 #[test]

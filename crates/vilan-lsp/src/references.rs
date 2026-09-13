@@ -43,18 +43,21 @@
 //!    definition of its own now (`Program::import_aliases`), and the invariant
 //!    has no LICENSED exception left.
 //!
-//!    It has two known BREACHES, which is a different thing and is E158's
-//!    find. The invariant's pin used to check only the entry file's rows,
-//!    because the entry's text was the only one it had in hand; it reads every
-//!    loaded module now, and over std's closure it turns up two texts that are
+//!    It had two BREACHES, E158's find, and they are closed (B314). The
+//!    invariant's pin used to check only the entry file's rows, because the
+//!    entry's text was the only one it had in hand; it reads every loaded
+//!    module now, and over std's closure that turned up two texts that were
 //!    not their definition's name — `pkg` recorded against the package root
 //!    module, and `Self` recorded against its trait. Both are KEYWORDS, both
-//!    survive `narrow`'s exact check by being the same LENGTH as the name they
-//!    are attributed to (`pkg`/`std`, `Self`/`Wire`), and both would be
-//!    rewritten by a rename. They are enumerated at `KEYWORD_SPELLED_ROWS` so
-//!    a third reds, and the fix is at the analyzer's recording site rather
-//!    than here: this index has no source text at build time and deliberately
-//!    pays for none, so it cannot tell a keyword from an identifier.
+//!    survived `narrow`'s exact check by being the same LENGTH as the name
+//!    they were attributed to (`pkg`/`std`, `Self`/`Wire`), and both would
+//!    have been rewritten by a rename. The fix is at the analyzer's recording
+//!    sites rather than here — this index has no source text at build time and
+//!    deliberately pays for none, so it cannot tell a keyword from an
+//!    identifier: `resolve_import` records nothing for a `pkg` origin segment,
+//!    and the written-type drain files a `Self` mention under no definition at
+//!    all (its type LABEL survives, so hover is unchanged). The invariant now
+//!    holds with NO exception and no enumeration beside it.
 //! 2. **No two rows share a span IN A FILE.** The analyzer records some
 //!    references more than once (a struct's constructor name lands in both
 //!    `type_references` and `struct_initializer_to_def`; a match pattern's
@@ -1122,38 +1125,6 @@ fun main(): i32 {
         found.into_iter().map(|(_, text)| text).collect()
     }
 
-    /// The two texts a row is allowed to cover that are NOT its definition's
-    /// name, and they are a DEFECT this sweep found rather than a licence
-    /// (E158, from B264's ask).
-    ///
-    /// Both are the same mistake: a KEYWORD recorded as a reference to the
-    /// entity it denotes, surviving [`narrow`]'s exact check because it happens
-    /// to be the same LENGTH as that entity's name. E145 named this hazard
-    /// exactly — "an alias whose name happened to be the same length survived,
-    /// spelling its target's name back at INVARIANT 1" — and these two are it,
-    /// in the analyzer's recording rather than in the alias table:
-    ///
-    /// - **`pkg`**, the origin segment of an import inside a package's own
-    ///   sources, recorded against the package ROOT module, whose name is the
-    ///   package's (`std`, 3 bytes, exactly `pkg`'s). Forty-odd rows across
-    ///   `vilan/std/src`.
-    /// - **`Self`**, recorded against the trait it stands for — `Wire`, 4
-    ///   bytes, exactly `Self`'s. One row in `wire.vl`.
-    ///
-    /// Neither is an identifier anybody declared, so neither may ever be
-    /// rewritten: a rename of a 3-letter package or a 4-letter trait would
-    /// rewrite `pkg` and `Self` into the new name and break the build — B264's
-    /// class, reached by a different road. A package or trait of any other
-    /// length is merely INCOMPLETE instead: the length check drops the row, the
-    /// drop is counted, and rename refuses.
-    ///
-    /// The fix is at the RECORDING site (`analyzer.rs`), not here — the index
-    /// has no source text at build time and by design pays for none, so it
-    /// cannot tell a keyword from an identifier. Listed rather than skipped
-    /// silently so that a THIRD such text reds this pin, which is the whole
-    /// point of a sweep.
-    const KEYWORD_SPELLED_ROWS: &[&str] = &["pkg", "Self"];
-
     // --- The invariants ------------------------------------------------
 
     // INVARIANT 1. Every row covers exactly an identifier — its text is the
@@ -1169,7 +1140,6 @@ fun main(): i32 {
         let index = document.reference_index();
         assert!(!index.rows().is_empty(), "the pin needs a populated index");
         let mut checked = 0;
-        let mut keyword_spelled = 0;
         // EVERY source, not only the entry (E158). The entry's text was the
         // only one "on hand" while this read `MATRIX` directly — but every
         // other module the program loaded is a file on disk, `source_path`
@@ -1206,10 +1176,6 @@ fun main(): i32 {
                     program.source_path(row.source)
                 )
             });
-            if text != name && KEYWORD_SPELLED_ROWS.contains(&text) {
-                keyword_spelled += 1;
-                continue;
-            }
             assert_eq!(
                 text, name,
                 "row {row:?} covers {text:?}, which is not the identifier {name:?}",
@@ -1220,12 +1186,108 @@ fun main(): i32 {
             checked > 1000,
             "expected the whole loaded closure, checked {checked}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B314, the first of INVARIANT 1's two closed breaches: a `pkg` ORIGIN
+    /// SEGMENT is not a reference to the package root module.
+    ///
+    /// `resolve_import_root` maps `pkg` to the importing package's own
+    /// namespace, whose name is the PACKAGE's, so the row filed three bytes
+    /// spelling `pkg` against a definition spelled something else. A rename of
+    /// a three-letter package would have rewritten every one of them (the row
+    /// clears `narrow`'s exact length check by coincidence); a package of any
+    /// other length dropped the row instead and made rename refuse. Recording
+    /// nothing is the whole fix, and the segments AFTER the origin are
+    /// untouched — `library` and `Point` still index, so go-to-definition on an
+    /// import path is what it was.
+    #[test]
+    fn a_pkg_origin_segment_is_not_indexed_as_a_reference() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n",
+            ),
+            ("library.vl", "struct Point {\n\tx: i32,\n}\n"),
+        ]);
+        let text = std::fs::read_to_string(dir.join("main.vl")).expect("the entry");
+        let index = document.reference_index();
+        let entry_texts: Vec<&str> = index
+            .rows()
+            .iter()
+            .filter(|row| row.source == SourceId(0))
+            .filter_map(|row| text.get(row.span.into_range()))
+            .collect();
         assert!(
-            keyword_spelled > 0,
-            "no keyword-spelled row was found at all — either the defect below \
-             was fixed (delete KEYWORD_SPELLED_ROWS and this assertion with it) \
-             or the sweep stopped reaching std's import heads"
+            !entry_texts.contains(&"pkg"),
+            "the origin keyword is indexed as a reference: {entry_texts:?}"
         );
+        assert!(
+            entry_texts.contains(&"library"),
+            "the module segment after the origin must still index: {entry_texts:?}"
+        );
+        assert!(
+            entry_texts.contains(&"Point"),
+            "the leaf must still index: {entry_texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B314, the second breach: `Self` is not a reference to the impl subject.
+    ///
+    /// A four-letter trait (`Wire` is std's own, and the row E158 found) shares
+    /// `Self`'s length exactly, so the keyword survived `narrow` and a rename
+    /// of the trait rewrote it into the new name — a broken build from a
+    /// refactor that was supposed to be mechanical. The written-type drain
+    /// files a `Self` mention under NO definition now: find-references over the
+    /// trait omits it, and rename rewrites only the spellings of the name.
+    #[test]
+    fn a_self_keyword_is_not_a_reference_to_the_impl_subject() {
+        const SOURCE: &str = "\
+trait Copy {
+\tfun duplicate(self): Self;
+}
+
+struct Cell {
+\tvalue: i32,
+}
+
+impl Cell with Copy {
+\tfun duplicate(self): Self {
+\t\tCell { value = self.value }
+\t}
+}
+
+fun main(): i32 {
+\tlet cell = Cell { value = 1 };
+\tcell.duplicate().value
+}
+";
+        let (dir, document) = analyze_workspace(&[("main.vl", SOURCE)]);
+        let trait_offset = SOURCE.find("trait Copy").expect("the trait") + "trait ".len();
+        let covered: Vec<&str> = document
+            .references(trait_offset)
+            .into_iter()
+            .filter_map(|(_, span)| SOURCE.get(span.into_range()))
+            .collect();
+        assert!(
+            !covered.is_empty(),
+            "the trait must still have references at all"
+        );
+        assert!(
+            covered.iter().all(|text| *text == "Copy"),
+            "find-references over the trait covers a keyword: {covered:?}"
+        );
+        let edits = document
+            .rename_edits(trait_offset, "Duplicable")
+            .expect("a four-letter trait renames");
+        for (_, span, _) in &edits {
+            assert_eq!(
+                SOURCE.get(span.into_range()),
+                Some("Copy"),
+                "rename rewrites something that is not the trait's name"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

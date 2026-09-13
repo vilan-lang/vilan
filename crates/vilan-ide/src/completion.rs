@@ -2544,11 +2544,42 @@ impl<'a, 'src> Analysis<'a, 'src> {
         items
     }
 
-    /// The scope of the entity at — or nearest before — `analyzed_offset`
-    /// (ANALYZED space), so the current function's locals are in scope even
-    /// when the cursor sits in fresh text.
+    /// How far up a scope's parent chain [`Self::scope_extents`] folds one
+    /// entity's span. Deep enough for any body a human writes, and a bound
+    /// rather than a `while` so a malformed parent cycle cannot hang a
+    /// keystroke.
+    const SCOPE_NESTING_BOUND: usize = 256;
+
+    /// The scope at `analyzed_offset` (ANALYZED space): the innermost scope the
+    /// offset sits INSIDE, so the enclosing function's locals are offered
+    /// wherever the cursor is in its body.
+    ///
+    /// E165: it used to be "the scope of the entity at — or nearest before —
+    /// the offset", and on a BLANK LINE that is the wrong question. `entity_at`
+    /// answers with the innermost entity whose span CONTAINS the offset, which
+    /// on an empty line inside a body is the enclosing FUNCTION; and
+    /// `entity_scope_map` holds the scope an entity is DECLARED IN, so a
+    /// function answered the module scope. `fun main() { let start = 1; ▮ }`
+    /// therefore offered only globals, while `st▮` one character away offered
+    /// `start` — the accessor being typed is its own entity, and it lives in
+    /// the body scope. A blank line is the moment a user actually asks for
+    /// completion, so the fallback was firing exactly where it was least
+    /// wanted.
+    ///
+    /// The extent test answers what the fallback was reaching for and is the
+    /// question the language actually asks (see [`Self::scope_extents`]). The
+    /// nearest-entity path stays as the fallback for an offset no scope
+    /// contains — fresh text past the last top-level item, where there is no
+    /// enclosing body at all.
     fn scope_at(&self, analyzed_offset: usize) -> Option<Id> {
         let program = self.program;
+        if let Some((_, _, scope_id)) = self
+            .scope_extents()
+            .iter()
+            .find(|(start, end, _)| *start <= analyzed_offset && analyzed_offset <= *end)
+        {
+            return Some(*scope_id);
+        }
         let entity = self.entity_at(analyzed_offset).or_else(|| {
             self.entity_spans
                 .iter()
@@ -2557,6 +2588,80 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 .map(|(_, _, id)| *id)
         })?;
         program.entity_scope_map.get(&entity).copied()
+    }
+
+    /// The byte extent of every scope the ENTRY FILE writes, narrowest first —
+    /// so the first row containing an offset is the innermost scope around it
+    /// (E165).
+    ///
+    /// A scope has no span of its own: `Scope` is a name map with a parent, and
+    /// the braces that open it belong to the `Block`/`Func` node. Its extent is
+    /// read off its MEMBERS instead — the union of the spans of the entry
+    /// entities `entity_scope_map` files under it, folded up the parent chain
+    /// because a scope's text contains its children's.
+    ///
+    /// The union reaches the closing brace because the parser's filler for a
+    /// block with no trailing expression is an `Expr::Void` SPANNING that brace
+    /// (S3, editing-dx.md §3.9). `entity_spans` excludes it — it is not
+    /// something the user wrote and has no hover — and this walk deliberately
+    /// keeps it: it is the one entity that says where the body ENDS, and
+    /// without it a blank line after the last statement would fall outside the
+    /// body it is written in.
+    ///
+    /// Entry entities only, by the entry's own id ranges (M27's rule): a scope
+    /// shared with a loaded module would otherwise union spans from two
+    /// different coordinate spaces.
+    fn scope_extents(&self) -> &[(usize, usize, Id)] {
+        self.scope_extents.get_or_init(|| {
+            let program = self.program;
+            let mut extents: HashMap<Id, (usize, usize)> = HashMap::default();
+            let widen = |extents: &mut HashMap<Id, (usize, usize)>,
+                         scope_id: Id,
+                         start: usize,
+                         end: usize| {
+                let slot = extents.entry(scope_id).or_insert((start, end));
+                slot.0 = slot.0.min(start);
+                slot.1 = slot.1.max(end);
+            };
+            for id in program
+                .id_ranges_of(SourceId(0))
+                .into_iter()
+                .flatten()
+                .map(Id)
+            {
+                let (Some(scope_id), Some(span)) = (
+                    program.entity_scope_map.get(&id).copied(),
+                    program.span_map.get(&id),
+                ) else {
+                    continue;
+                };
+                let range = span.into_range();
+                if range.start >= range.end {
+                    continue;
+                }
+                widen(&mut extents, scope_id, range.start, range.end);
+                // Up the parent chain: a block whose only statement is another
+                // block declares nothing of its own, and its extent is its
+                // child's. Bounded so a malformed parent cycle costs nothing.
+                let mut parent = program
+                    .scopes
+                    .get(&scope_id)
+                    .and_then(|scope| scope.parent_id);
+                for _ in 0..Self::SCOPE_NESTING_BOUND {
+                    let Some(id) = parent else { break };
+                    widen(&mut extents, id, range.start, range.end);
+                    parent = program.scopes.get(&id).and_then(|scope| scope.parent_id);
+                }
+            }
+            let mut rows: Vec<(usize, usize, Id)> = extents
+                .into_iter()
+                .map(|(scope_id, (start, end))| (start, end, scope_id))
+                .collect();
+            // Narrowest first, and every tie broken, so the answer is a
+            // function of the program and not of a hash map's iteration order.
+            rows.sort_by_key(|(start, end, scope_id)| (end - start, *start, scope_id.0));
+            rows
+        })
     }
 
     /// The binding `name` resolves to in the scope at `analyzed_offset`
@@ -3078,6 +3183,15 @@ impl DocParagraphs {
     fn build(program: &Program) -> DocParagraphs {
         // (declaration, name-span start), grouped by declaring source, so a
         // module's text is read once however many declarations it carries.
+        //
+        // M65: `source_of` is a LINEAR scan of `source_ranges`, and this loop
+        // asks it once per declaration in the whole program — on kolt's client
+        // that is the bulk of the 14,580 calls the index build makes, against
+        // about sixty ranges. `source_lookup` is the same question answered by a
+        // binary search that verifies the ranges are ascending and disjoint and
+        // falls back to the very scan otherwise, so it is answer-identical by
+        // construction (M27, pinned since M58).
+        let source_of = program.source_lookup();
         let mut by_source: HashMap<SourceId, Vec<(Id, usize)>> = HashMap::default();
         let declarations = program
             .functions
@@ -3090,7 +3204,7 @@ impl DocParagraphs {
                     .map(|(id, external)| (*id, external.name_span)),
             );
         for (id, name_span) in declarations {
-            let Some(source) = program.source_of(id) else {
+            let Some(source) = source_of.of(id) else {
                 continue;
             };
             // The entry (and the derived sentinel, which has no file) render
@@ -3459,6 +3573,10 @@ struct CapturedImportEdit {
 
 impl AutoImportOrder {
     fn build(program: &Program, analyzed: &str) -> AutoImportOrder {
+        // M65, as in [`DocParagraphs::build`]: the declares-it test below is
+        // asked once per NAME in every module of `std` and `pkg`, and
+        // `source_of` is a linear scan.
+        let source_of = program.source_lookup();
         let mut modules: Vec<AutoImportModule> = Vec::new();
         let mut candidates: Vec<AutoImportCandidate> = Vec::new();
         for root in ["std", "pkg"] {
@@ -3479,7 +3597,7 @@ impl AutoImportOrder {
                 let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
                     continue;
                 };
-                let child_source = program.source_of(child_id);
+                let child_source = source_of.of(child_id);
                 let module = modules.len() as u32;
                 modules.push(AutoImportModule {
                     path: vec![root.to_string(), child_module.name.to_string()],
@@ -3487,7 +3605,7 @@ impl AutoImportOrder {
                 for (&name, &entity_id) in &child_scope.name_to_id_map {
                     // Only a name this module DECLARES is an add-import target;
                     // a re-export names an item that lives somewhere else.
-                    if program.source_of(entity_id) != child_source {
+                    if source_of.of(entity_id) != child_source {
                         continue;
                     }
                     let kind = kind_of(program, entity_id);

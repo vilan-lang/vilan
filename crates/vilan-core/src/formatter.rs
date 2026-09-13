@@ -1484,6 +1484,58 @@ fn prune_import_branch<'src>(
     }
 }
 
+/// The MODULE an import statement reaches into: its path with the leaves
+/// removed, the span of that module's own segment, and how many segments the
+/// truncation left (E168).
+///
+/// `import pkg::a::b;` reaches into `pkg::a`; so does `import pkg::a::{ b, c };`
+/// — a brace set's common prefix IS the path before it, which is why one
+/// truncation answers both. A statement whose leaf is its second segment
+/// (`import pkg::a;`, `import std::json;`) truncates to the ORIGIN alone, and an
+/// origin is not a module whose file declares anything: the count is returned so
+/// the caller can refuse that case rather than rewrite `import pkg::a;` into
+/// `import pkg;`.
+fn import_module_branch<'src>(
+    branch: &ImportBranch<'src>,
+) -> Option<(ImportBranch<'src>, Span, usize)> {
+    match branch {
+        // This segment IS the leaf: there is no module path below it, and the
+        // parent turns itself into the terminal segment on the `None`.
+        ImportBranch::Path(_, _, ImportTail::Leaf | ImportTail::Alias(..)) => None,
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => {
+            match import_module_branch(child) {
+                Some((inner, module_span, depth)) => Some((
+                    ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(inner))),
+                    module_span,
+                    depth + 1,
+                )),
+                None => Some((ImportBranch::Path(name, *span, ImportTail::Leaf), *span, 1)),
+            }
+        }
+        // A brace set with no path before it has no module to name.
+        ImportBranch::Set(_) => None,
+    }
+}
+
+/// E168: the statement `branch` becomes when every one of its leaves pruned
+/// away but `keep_module` says the module it reaches into is still needed —
+/// `import pkg::a;`, rendered through the canonical printer like any other
+/// surviving statement. `None` when the module is not wanted, or when the
+/// truncation would leave an ORIGIN rather than a module (see
+/// [`import_module_branch`]).
+///
+/// The predicate is asked at the module SEGMENT's span, which is the span the
+/// analyzer recorded the module's own reference at — so the editor answers it
+/// from the same table it answers the leaf question from, and the two cannot
+/// drift.
+fn module_only_import_branch<'src>(
+    branch: &ImportBranch<'src>,
+    keep_module: &dyn Fn(Span) -> bool,
+) -> Option<ImportBranch<'src>> {
+    let (module, module_span, depth) = import_module_branch(branch)?;
+    (depth >= 2 && keep_module(module_span)).then_some(module)
+}
+
 // --- Canonical element-head order --------------------------------------------
 //
 // `vilan fmt` canonicalizes the order of the items in an element HEAD (E151) —
@@ -1926,9 +1978,18 @@ fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
 /// `name_span` survives; pass `|_| true` for sort-only. `None` when the source
 /// doesn't parse cleanly (no edit would be safe). Block-scoped imports live
 /// inside item bodies, not the top-level list, so they are never considered.
+///
+/// `keep_module(module_span)` is the SECOND question, and it is asked only of a
+/// statement `keep` emptied out (E168): an `import` brings every `impl` in the
+/// module's file with it whatever leaf it names, so a statement whose leaves are
+/// all unused may still be the only thing carrying a method the file calls.
+/// Answering `true` rewrites it to `import <module>;` instead of deleting it —
+/// the fade stays on the leaf, which is genuinely unused, and the build stays
+/// green. Pass `|_| false` to prune exactly as before.
 pub fn organize_import_runs(
     source: &str,
     keep: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> bool,
 ) -> Option<Vec<ImportRunEdit>> {
     let items = parse(source)?;
     let mut printer = Printer {
@@ -1940,8 +2001,9 @@ pub fn organize_import_runs(
         bailed: false,
         split: Split::Off,
         probing: false,
+        atomic_elements: false,
     };
-    Some(printer.organize_runs(&items, keep))
+    Some(printer.organize_runs(&items, keep, keep_module))
 }
 
 // --- Insert an import (the add-import quickfix and auto-import completion) --
@@ -2285,6 +2347,7 @@ pub fn format(original: &str) -> String {
         bailed: false,
         split: Split::Off,
         probing: false,
+        atomic_elements: false,
     };
     let prev_end = printer.print_items(&items, 0, true);
     // Comments after the last item (trailing end-of-file comments).
@@ -2366,6 +2429,14 @@ struct Printer<'src> {
     /// True while a seam probe is rendering a chain link to see whether it spans
     /// lines ([`Printer::link_spans_lines`]). Probes do not nest.
     probing: bool,
+    /// True while E155's probe is rendering a chain with its ELEMENTS treated as
+    /// atomic: an element that would break only because its line is too wide
+    /// stays inline, so the probe measures the chain's own width rather than the
+    /// width an element's break left behind. An element that breaks
+    /// STRUCTURALLY — more than one child, an element child, a comment between
+    /// its items — breaks in the probe too, because that break is not a width
+    /// decision and flattening it would be a lie.
+    atomic_elements: bool,
 }
 
 impl<'src> Printer<'src> {
@@ -2596,13 +2667,14 @@ impl<'src> Printer<'src> {
         &mut self,
         items: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> bool,
     ) -> Vec<ImportRunEdit> {
         let mut edits = Vec::new();
         let mut index = 0;
         while index < items.len() {
             if import_kind_and_branch(&items[index].0).is_some() {
                 let run_end = self.import_run_end(items, index);
-                if let Some(edit) = self.organize_run(&items[index..run_end], keep) {
+                if let Some(edit) = self.organize_run(&items[index..run_end], keep, keep_module) {
                     edits.push(edit);
                 }
                 index = run_end;
@@ -2619,6 +2691,7 @@ impl<'src> Printer<'src> {
         &mut self,
         run: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> bool,
     ) -> Option<ImportRunEdit> {
         let run_start = run[0].1.into_range().start;
         // Reach this run's own trailing comments; a standalone comment before the
@@ -2638,7 +2711,14 @@ impl<'src> Printer<'src> {
             let statement = match &item.0 {
                 // A re-export is surface, not usage — never pruned.
                 Node::Export(_) => Some(PrunedStatement::ReExport(&item.0)),
+                // E168: an `import` emptied of its leaves is offered to
+                // `keep_module` before it is dropped — the module it reaches
+                // into may be the only thing bringing an `impl` the file calls
+                // a method from. A `use` is not rewritten: it binds a name out
+                // of a namespace into this scope, and a namespace with no name
+                // taken out of it binds nothing at all.
                 Node::Import(branch) => prune_import_branch(branch, keep)
+                    .or_else(|| module_only_import_branch(branch, keep_module))
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned))),
                 Node::Use(branch) => prune_import_branch(branch, keep)
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Use(pruned))),
@@ -4522,7 +4602,9 @@ impl<'src> Printer<'src> {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
             self.print_element_inline(body, &order);
-            if !self.out[element_start..].contains('\n') && !self.current_line_over_budget() {
+            if !self.out[element_start..].contains('\n')
+                && (self.atomic_elements || !self.current_line_over_budget())
+            {
                 return;
             }
             self.out.truncate(element_start);
@@ -4916,6 +4998,73 @@ impl<'src> Printer<'src> {
         false
     }
 
+    /// Whether `expr`'s chain must break because it does not FIT — measured with
+    /// its element arguments treated as atomic (E155).
+    ///
+    /// The width rule judges a rendering by its first line, which is honest
+    /// everywhere except here: an element argument that breaks takes the rest of
+    /// the chain off the first line WITH it, so the line the rule measures is
+    /// short and the chain is left inline. On kolt's generated `src/lucide`
+    /// that turned a hand-broken four-link `.child` ladder into one 130-column
+    /// line whose THIRD `.child` then broke inside its `<path …/>` — the chain
+    /// rejoined and the element torn open, which is the wrong half to break.
+    ///
+    /// An element is atomic to this rule, so the probe renders the chain with
+    /// every width-driven element break suppressed and asks the ordinary
+    /// question of the ordinary line. Over budget means the chain breaks at its
+    /// LINKS first; each link is then measured on its own line, and an element
+    /// still too wide for one breaks there — one level further in, under a link
+    /// that fits, which is where a break reads.
+    ///
+    /// Only chains that carry an element argument are probed: nothing else can
+    /// have its measurement moved by an element, and the probe is a whole
+    /// rendering.
+    fn chain_overflows_with_atomic_elements(&mut self, expr: &Spanned<Node<'src>>) -> bool {
+        if self.probing {
+            return false;
+        }
+        let (_, spine) = Self::postfix_spine(expr);
+        if !spine
+            .iter()
+            .any(|step| Self::link_carries_an_element(&step.0))
+        {
+            return false;
+        }
+        let start = self.out.len();
+        let cursor = self.cursor;
+        let bailed = self.bailed;
+        let split = self.split;
+        let indent = self.indent;
+        self.probing = true;
+        self.atomic_elements = true;
+        self.split = Split::Off;
+        self.print_expr(expr);
+        self.probing = false;
+        self.atomic_elements = false;
+        let over = self.first_line_over_budget(start);
+        self.out.truncate(start);
+        self.cursor = cursor;
+        self.bailed = bailed;
+        self.split = split;
+        self.indent = indent;
+        over
+    }
+
+    /// Whether a spine step is a call link one of whose arguments is an ELEMENT
+    /// — the shape [`Self::chain_overflows_with_atomic_elements`] is about.
+    fn link_carries_an_element(step: &Node<'src>) -> bool {
+        let Node::MemberAccessor(_, member) = step else {
+            return false;
+        };
+        let Node::Call(_, _, arguments) = &member.0 else {
+            return false;
+        };
+        arguments
+            .0
+            .iter()
+            .any(|argument| matches!(argument.0, Node::Element(_)))
+    }
+
     /// Renders one chain link and reports whether it spans lines, then takes the
     /// rendering back out. Measured rather than predicted from the AST, for the
     /// reason the width rule measures: only the printer knows what the printer
@@ -5241,7 +5390,8 @@ impl<'src> Printer<'src> {
         if call_links >= 2
             && (split != Split::Off
                 || self.chain_has_comment_between_links(expr)
-                || self.chain_has_spanning_seam(expr))
+                || self.chain_has_spanning_seam(expr)
+                || self.chain_overflows_with_atomic_elements(expr))
         {
             self.print_split_chain(expr);
             return;
@@ -7489,6 +7639,65 @@ mod chain_splitting {
         );
     }
 
+    /// E155, on kolt's generated `src/lucide/lib.vl`: an ELEMENT argument is
+    /// atomic to this rule.
+    ///
+    /// The width rule judges a statement by its FIRST line, which is honest
+    /// everywhere except here. The four-link `.child` ladder below is 129
+    /// columns inline; the formatter rejoined it, the third `.child`'s
+    /// `<path …/>` then broke because the line it landed on was too wide, and
+    /// the break took the rest of the chain off the first line WITH it — so the
+    /// line the rule measured was 92 columns, under the budget, and the chain
+    /// stayed collapsed with an element torn open inside it. The chain is
+    /// measured with its elements atomic now, breaks at its links, and each
+    /// link then fits on a line of its own.
+    ///
+    /// The file is generated and kolt excludes it from its own fmt gate, which
+    /// is the only reason this was survivable rather than noticed.
+    #[test]
+    fn an_element_argument_is_atomic_to_the_chain_break_rule() {
+        let source = "fun a_arrow_down(): View {\n\t\
+                      lucide_frame().child(<path d(\"m14 12 4 4 4-4\") />)\
+                      .child(<path d(\"M18 16V7\") />)\
+                      .child(<path d(\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\") />)\
+                      .child(<path d(\"M3.304 13h6.392\") />)\n}\n";
+        assert_over_budget(source.lines().nth(1).expect("the chain's line"));
+        assert_construct(
+            source,
+            "fun a_arrow_down(): View {\n\
+             \tlucide_frame()\n\
+             \t\t.child(<path d(\"m14 12 4 4 4-4\") />)\n\
+             \t\t.child(<path d(\"M18 16V7\") />)\n\
+             \t\t.child(<path d(\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\") />)\n\
+             \t\t.child(<path d(\"M3.304 13h6.392\") />)\n\
+             }\n",
+        );
+    }
+
+    /// The other side of the same rule, and what keeps its blast radius to the
+    /// shape it was written for: a chain whose element argument fits is left
+    /// alone. The measurement is the chain's OWN width with the element inline,
+    /// so an element that never needed to break cannot make a short chain split.
+    #[test]
+    fn a_chain_whose_element_argument_fits_stays_inline() {
+        let source = "fun icon(): View {\n\tview().child(<path d(\"M1 1\") />).child(<path d(\"M2 2\") />)\n}\n";
+        assert_construct(source, source);
+    }
+
+    /// And an element that breaks STRUCTURALLY — more than one child, which is
+    /// not a width decision at all — does not drag its chain apart with it. The
+    /// probe breaks it too, so the measured first line is short and the rule
+    /// answers exactly as it did before E155.
+    #[test]
+    fn a_structurally_split_element_does_not_break_its_chain() {
+        let source = "fun panel(): View {\n\tview().class(\"p\").child(<div>\n\t\t<span>\"a\"</span>\n\t\t<span>\"b\"</span>\n\t</div>)\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.contains("view().class(\"p\").child(<div>"),
+            "the chain should stay inline around a structurally split element:\n{formatted:?}"
+        );
+    }
+
     /// The boundary, arithmetically: `let padded = s.aa("…").bb(2);` is 28
     /// columns of code around the padding string (13 for `let padded = `, 6 for
     /// `s.aa("`, 9 for `").bb(2);`), so 72 padding characters make exactly the
@@ -8743,7 +8952,7 @@ mod import_set_layout {
     //! every save.
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::{assert_over_budget, columns};
-    use super::organize::organize;
+    use super::organize::{organize, organize_rescuing};
     use super::{LINE_BUDGET, format};
 
     /// The motivating line, from `std/src/rpc.vl`: an import at 184 columns.
@@ -8937,6 +9146,20 @@ mod import_set_layout {
                 ]
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
+        );
+        // E168's rewrite rides the same printer: the module-only statement the
+        // rescue produces is what `fmt` would print for a hand-written
+        // `import std::rpc;`, and it sorts into the run at the place `fmt` puts
+        // it — before the deeper path, because `BranchKey` orders by segment.
+        // An action that rendered it any other way would be undone by the next
+        // format-on-save.
+        let run = "import std::rpc::{ Dispatcher, call };\nimport std::task::Task;\n";
+        let rewritten = organize_rescuing(run, &["Dispatcher", "call"], &["rpc"]);
+        assert_eq!(rewritten, "import std::rpc;\nimport std::task::Task;\n");
+        assert_eq!(
+            rewritten,
+            format(&rewritten),
+            "fmt leaves the rewrite alone"
         );
     }
 }
@@ -10378,8 +10601,17 @@ mod organize {
     /// Applies the organizer's edits to `source`, treating every leaf named in
     /// `dead` as unused. Edits apply back-to-front so earlier offsets stay valid.
     pub(super) fn organize(source: &str, dead: &[&str]) -> String {
+        organize_rescuing(source, dead, &[])
+    }
+
+    /// [`organize`] with E168's second predicate wired: a statement every one of
+    /// whose leaves is dead, and whose MODULE segment is named in `rescued`, is
+    /// rewritten to `import <module>;` instead of being deleted.
+    pub(super) fn organize_rescuing(source: &str, dead: &[&str], rescued: &[&str]) -> String {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let mut edits = organize_import_runs(source, &keep).expect("source parses cleanly");
+        let keep_module = |span: Span| rescued.contains(&&source[span.into_range()]);
+        let mut edits =
+            organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
         let mut result = source.to_string();
         for edit in edits {
@@ -10391,12 +10623,70 @@ mod organize {
     /// The organizer offers no edit at all (already organized / nothing to prune).
     fn assert_no_edit(source: &str, dead: &[&str]) {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let edits = organize_import_runs(source, &keep).expect("source parses cleanly");
+        let edits = organize_import_runs(source, &keep, &|_| false).expect("source parses cleanly");
         assert!(
             edits.is_empty(),
             "expected no edit, got {} edit(s)",
             edits.len()
         );
+    }
+
+    // E168: a statement whose every leaf is dead but whose MODULE is still
+    // wanted is REWRITTEN, not deleted — `import pkg::a::b;` becomes
+    // `import pkg::a;`, rendered through the canonical printer and sorted into
+    // place like any other surviving statement. The `impl`s in `a.vl` travel
+    // with any import that reaches the module, so deleting the statement is what
+    // broke the build; the leaf `b` is unused either way.
+    #[test]
+    fn an_emptied_statement_whose_module_is_wanted_is_rewritten() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::b;\n", &["b"], &["a"]),
+            "import pkg::a;\n",
+        );
+    }
+
+    // The rewrite fires only when NOTHING survives: a brace set with a live
+    // member prunes to that member, exactly as before, and never widens back to
+    // the module.
+    #[test]
+    fn a_partly_live_brace_set_prunes_rather_than_widening_to_the_module() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::{ b, c };\n", &["b"], &["a"]),
+            "import pkg::a::c;\n",
+        );
+    }
+
+    // A module nobody wants still deletes — the rescue is a second question,
+    // not a second chance.
+    #[test]
+    fn an_emptied_statement_whose_module_is_unwanted_is_deleted() {
+        assert_eq!(organize_rescuing("import pkg::a::b;\n", &["b"], &[]), "");
+    }
+
+    // The truncation refuses to leave an ORIGIN: `import pkg::a;` reaches into
+    // `pkg`, which is not a module whose file declares anything, so a dead leaf
+    // there deletes rather than becoming `import pkg;`.
+    #[test]
+    fn an_emptied_statement_one_segment_deep_is_never_rewritten_to_its_origin() {
+        assert_eq!(organize_rescuing("import pkg::a;\n", &["a"], &["pkg"]), "");
+    }
+
+    // A brace set's common prefix IS the path before it, so a set whose members
+    // all died rewrites to that prefix.
+    #[test]
+    fn an_emptied_brace_set_rewrites_to_its_common_prefix() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::{ b, c };\n", &["b", "c"], &["a"]),
+            "import pkg::a;\n",
+        );
+    }
+
+    // A `use` is NOT rewritten. It binds a name out of a namespace into this
+    // scope; a namespace with no name taken out of it binds nothing, so there
+    // is no module-only spelling to fall back to.
+    #[test]
+    fn an_emptied_use_is_deleted_rather_than_widened() {
+        assert_eq!(organize_rescuing("use pkg::a::b;\n", &["b"], &["a"]), "");
     }
 
     // Sort-only (nothing dead): a shuffled run reorders exactly as `vilan fmt`.

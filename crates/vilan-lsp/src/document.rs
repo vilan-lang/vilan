@@ -2142,6 +2142,7 @@ impl Document {
             index,
             source_texts: Default::default(),
             anchor: Default::default(),
+            scope_extents: Default::default(),
         }
     }
 
@@ -4133,11 +4134,22 @@ impl Document {
                 // the file's import list, so a reference written there is not
                 // mistaken for the file using the import.
                 let import_spans = vilan_core::formatter::import_statement_spans(source);
-                let keep =
-                    |leaf_span: Span| self.import_leaf_is_used(program, leaf_span, &import_spans);
-                vilan_core::formatter::organize_import_runs(source, &keep)
+                // E169: what this file's OTHER import leaves already bind, so a
+                // whole-module leaf is judged on what the module import ALONE
+                // brings. Computed once for the pass — it is a walk of every
+                // leaf, and asking it per leaf would be that walk squared.
+                let bound = self.definitions_bound_by_import_leaves(program, source);
+                let keep = |leaf_span: Span| {
+                    self.import_leaf_is_used(program, leaf_span, &import_spans, &bound)
+                };
+                // E168: the second question, asked only of a statement the
+                // first emptied out.
+                let keep_module = |module_span: Span| {
+                    self.import_module_is_used(program, module_span, &import_spans, &bound)
+                };
+                vilan_core::formatter::organize_import_runs(source, &keep, &keep_module)
             }
-            None => vilan_core::formatter::organize_import_runs(source, &|_| true),
+            None => vilan_core::formatter::organize_import_runs(source, &|_| true, &|_| false),
         };
         edits
             .map(|edits| {
@@ -4182,9 +4194,10 @@ impl Document {
         // since a stale document decides nothing above.
         let source = self.analyzed_text();
         let import_spans = vilan_core::formatter::import_statement_spans(source);
+        let bound = self.definitions_bound_by_import_leaves(program, source);
         vilan_core::formatter::import_leaf_name_spans(source)
             .into_iter()
-            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans))
+            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans, &bound))
             .collect()
     }
 
@@ -4496,16 +4509,10 @@ impl Document {
         program: &Program,
         leaf_span: Span,
         import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
     ) -> bool {
         let entry = SourceId(0);
-        let Some(definition_id) = program
-            .type_references
-            .iter()
-            .find_map(|(source, span, definition, _)| {
-                (*source == entry && *span == leaf_span).then_some(*definition)
-            })
-            .flatten()
-        else {
+        let Some(definition_id) = self.import_path_definition(program, leaf_span) else {
             // The leaf binds nothing this analysis recorded — keep it, since
             // pruning on no evidence is how a green build gets broken.
             return true;
@@ -4566,22 +4573,132 @@ impl Document {
         if matches!(
             crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
-        ) && let Some(home) = program.source_of(definition_id)
-        {
-            // A module whose file is this one brings nothing new, and would
-            // otherwise match every local declaration and never prune.
-            if home != entry {
-                return self
-                    .reference_index
-                    .occurrences_in(entry)
-                    .any(|occurrence| {
-                        !written_in_an_import(occurrence.span)
-                            && crate::references::declaration_source(program, occurrence.definition)
-                                == Some(home)
-                    });
-            }
+        ) {
+            return self.module_import_brings_a_use(
+                program,
+                definition_id,
+                import_spans,
+                bound_by_leaves,
+            );
         }
         false
+    }
+
+    /// The definition an import PATH SEGMENT at `span` binds — a leaf's own, or
+    /// an intermediate module's. `resolve_import` records every segment as a
+    /// reference at its own span (`flatten_namespace_branch`/`record_reference`),
+    /// so one lookup answers for both, and a segment this analysis did not
+    /// record answers `None`.
+    fn import_path_definition(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .type_references
+            .iter()
+            .find_map(|(source, at, definition, _)| {
+                (*source == SourceId(0) && *at == span).then_some(*definition)
+            })
+            .flatten()
+    }
+
+    /// Every definition this file's top-level import LEAVES bind, aliases
+    /// included — E169's exclusion set.
+    ///
+    /// A whole-module import is kept by rule (2) when the file resolves
+    /// something declared in the module's file. That test counted EVERYTHING
+    /// declared there, including the names the file imported by their own
+    /// leaves — so `import pkg::a;` sitting beside `import pkg::a::b;` was kept
+    /// forever by `b`'s uses, although it is `b`'s own leaf that provides them
+    /// and the module import brings nothing the file spells. Subtracting what
+    /// the other leaves bind leaves exactly what the module import ALONE
+    /// carries: the methods of the `impl`s declared in that file, and anything
+    /// reached by `a::` qualification (which references the module leaf itself
+    /// and is rule (1)'s).
+    ///
+    /// Keyed on the DEFINITION, alias-aware, so the set is the same address
+    /// space [`Self::import_leaf_is_used`] tests occurrences in.
+    fn definitions_bound_by_import_leaves(
+        &self,
+        program: &Program,
+        source: &str,
+    ) -> HashSet<Definition> {
+        let entry = SourceId(0);
+        vilan_core::formatter::import_leaf_name_spans(source)
+            .into_iter()
+            .filter_map(|leaf_span| {
+                let definition_id = self.import_path_definition(program, leaf_span)?;
+                let alias = program.import_alias_spans.get(&(entry, leaf_span)).copied();
+                Some(Definition::Entity(alias.unwrap_or(definition_id)))
+            })
+            .collect()
+    }
+
+    /// Rule (2), asked of a MODULE — the one question E168 and E169 share.
+    ///
+    /// A whole-module import brings more than its own name: every `impl` in that
+    /// module's file arrives with it, and with ANY import that reaches the
+    /// module, not only a whole-module one. So a method call whose
+    /// implementation lives there IS a use of the import even though the module
+    /// name is never written, and pruning it breaks the build — the over-pruning
+    /// half of kolt.local 004, and E168's whole subject.
+    ///
+    /// The accounting is the analyzer's own provenance: did this file resolve
+    /// anything DECLARED in the file this import reaches into, that it is not
+    /// already getting from another import leaf of its own (E169)? A module
+    /// whose file is this one brings nothing new and would otherwise match every
+    /// local declaration and never prune.
+    fn module_import_brings_a_use(
+        &self,
+        program: &Program,
+        module_id: Id,
+        import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
+    ) -> bool {
+        let entry = SourceId(0);
+        let Some(home) = program.source_of(module_id) else {
+            return false;
+        };
+        if home == entry {
+            return false;
+        }
+        self.reference_index
+            .occurrences_in(entry)
+            .any(|occurrence| {
+                !import_spans.iter().any(|statement| {
+                    statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
+                }) && !bound_by_leaves.contains(&occurrence.definition)
+                    && crate::references::declaration_source(program, occurrence.definition)
+                        == Some(home)
+            })
+    }
+
+    /// E168's rescue: whether the MODULE an emptied-out import statement reaches
+    /// into is still needed, asked at that module segment's own span.
+    ///
+    /// `import pkg::a::b;` with `b` unused used to be DELETED, and `a.vl`'s
+    /// `impl Style { fun select_off(self) … }` went with it — the next analysis
+    /// said "Style has no method 'select_off'" and the organizer had broken a
+    /// green build. `b` is genuinely unused and goes on fading; what changes is
+    /// the EDIT, which rewrites the statement to `import pkg::a;` rather than
+    /// removing it. The test is [`Self::module_import_brings_a_use`]'s, applied
+    /// to the statement's module instead of to a module LEAF — one predicate,
+    /// two callers, so the two halves cannot disagree about what a module
+    /// import is worth.
+    fn import_module_is_used(
+        &self,
+        program: &Program,
+        module_span: Span,
+        import_spans: &[Span],
+        bound_by_leaves: &HashSet<Definition>,
+    ) -> bool {
+        let Some(module_id) = self.import_path_definition(program, module_span) else {
+            return false;
+        };
+        if !matches!(
+            crate::references::kind_of(program, Definition::Entity(module_id)),
+            Some(crate::references::DefinitionKind::Module)
+        ) {
+            return false;
+        }
+        self.module_import_brings_a_use(program, module_id, import_spans, bound_by_leaves)
     }
 
     // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
@@ -4921,11 +5038,55 @@ impl Document {
         if commented(node.1) {
             return None;
         }
+        // std's own `style.vl`, parsed, is what gives a TYPED link its
+        // declarations (E167). Read here rather than at analysis time because
+        // it is wanted by one code action and by nothing else — and only after
+        // the block direction has declined, so a cursor in a block never pays
+        // for it.
+        let style_text = self.std_style_text();
+        let style_tree = style_text
+            .as_deref()
+            .and_then(|text| vilan_core::parsing::parse(text).0);
+        let surface = match (style_text.as_deref(), style_tree.as_ref()) {
+            (Some(text), Some(tree)) => StyleSurface::build(text, &tree.0),
+            _ => StyleSurface::default(),
+        };
         Some(CssConversion {
             to_chain: false,
             span: node.1,
-            replacement: render_css_block(node, source, &line_indent(source, node.1.start))?,
+            replacement: render_css_block(
+                node,
+                source,
+                &line_indent(source, node.1.start),
+                &surface,
+            )?,
         })
+    }
+
+    /// std's `style.vl` as text, located through the analyzed program's own
+    /// source table: the file that declares `with_length`, std's `Style` slot
+    /// writer, and is called `style.vl`. Both halves matter — the name alone
+    /// would match an app's own `style.vl`, and the function alone an app's own
+    /// `with_length`.
+    ///
+    /// `None` when nothing analyzed, when style.vl is not among the loaded
+    /// modules (then there is no `style()` chain to convert either), or when the
+    /// file cannot be read; the conversion degrades to the chokepoint links and
+    /// the combinators rather than to a wrong answer.
+    fn std_style_text(&self) -> Option<String> {
+        let program = self.program.as_ref()?;
+        let source = program.functions.iter().find_map(|(id, function)| {
+            (function.name == "with_length")
+                .then(|| program.source_of(*id))
+                .flatten()
+                .filter(|source| {
+                    program
+                        .source_path(*source)
+                        .and_then(|path| path.file_name())
+                        .is_some_and(|name| name == "style.vl")
+                })
+        })?;
+        std::fs::read_to_string(program.source_path(source)?).ok()
     }
 
     /// Every unambiguous missing-import fix in the file, folded into ONE edit
@@ -5218,8 +5379,7 @@ fn outermost_style_chain<'a, 'src>(
 }
 
 /// The links of a `style()`-seeded chain, in written order, or `None` when
-/// `node` is some other expression. The seed is a bare `style()` call — a
-/// receiver of any other shape is not a chain this refactor can read.
+/// `node` is some other expression.
 fn style_chain_links<'a, 'src>(
     node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
 ) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
@@ -5230,10 +5390,46 @@ fn style_chain_links<'a, 'src>(
             Some(links)
         }
         Node::Call(callee, None, arguments)
-            if matches!(callee.0, Node::Accessor("style")) && arguments.0.is_empty() =>
+            if arguments.0.is_empty() && names_the_style_seed(&callee.0) =>
         {
             Some(Vec::new())
         }
+        _ => None,
+    }
+}
+
+/// Whether `callee` names std's `style()` seed (E167).
+///
+/// A BARE `style` was the only spelling this refactor read, and it is the one
+/// spelling the estate does not write: the web prelude publishes the MODULE, so
+/// the templates, the docs and kolt all write `style::style()`, and every chain
+/// in real code was refused at its first token. The test is syntactic — the last
+/// segment is `style` and the call takes no arguments — which matches
+/// `style::style()`, an aliased `s::style()` and a bare `style()` alike, and is
+/// the rule a raw parse can apply without resolving anything. `StdItem` is the
+/// desugar's own scope-independent spelling (B270), which a `css` block's
+/// lowering seeds its chain with.
+fn names_the_style_seed(callee: &Node<'_>) -> bool {
+    matches!(
+        callee,
+        Node::Accessor("style")
+            | Node::StaticAccessor(_, "style", None)
+            | Node::StdItem("style", "style")
+    )
+}
+
+/// The links of a chain written over `self` — the shape every convertible
+/// `impl Style` body in std's `style.vl` has (E167's inliner).
+fn self_chain_links<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
+    match &node.0 {
+        Node::MemberAccessor(subject, member) => {
+            let mut links = self_chain_links(subject)?;
+            links.push(member);
+            Some(links)
+        }
+        Node::Accessor("self") => Some(Vec::new()),
         _ => None,
     }
 }
@@ -5355,65 +5551,396 @@ fn escape_value(text: &str) -> Option<String> {
     (!text.contains('\\')).then(|| text.replace('"', "\\\""))
 }
 
-/// A `style()` chain as the `css` block it is the lowering of.
+/// A `style()` chain as the `css` block it is the lowering of, with the links
+/// that have no block spelling written back onto it as a POSTFIX CHAIN (E167).
+///
+/// One unconvertible link used to refuse the whole conversion, which on real
+/// code meant always: every chain an app writes ends in `.class_list()`, and
+/// most carry a user extension or a `Style`-valued combinator argument
+/// somewhere. The chain SPLITS at the first such link instead — everything
+/// before it becomes the block, the rest is written on the block, which parses
+/// and types today (`css { … }.select_off()`). The split is at the FIRST one
+/// because chain order is merge order: the tail keeps its order relative to
+/// everything the block now holds, so the two spellings mean the same style.
+///
+/// `None` when NOTHING converts — a chain of only unconvertible links is not a
+/// conversion, it is a `css { }` with the whole chain hung off it.
 fn render_css_block(
     chain: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
     source: &str,
     indent: &str,
+    surface: &StyleSurface<'_>,
 ) -> Option<String> {
-    let items = render_css_items(&style_chain_links(chain)?, source, indent)?;
-    Some(format!("css {{\n{items}{indent}}}"))
+    let links = style_chain_links(chain)?;
+    let (items, converted) = render_css_prefix(&links, source, indent, surface);
+    if converted == 0 {
+        return None;
+    }
+    let mut out = format!("css {{\n{items}{indent}}}");
+    for link in &links[converted..] {
+        out.push('.');
+        out.push_str(&source[link.1.into_range()]);
+    }
+    Some(out)
 }
 
+/// Every link of `links` as block items, or `None` when even one has no block
+/// spelling — the ALL-OR-NOTHING face, which is what a nested rule needs: a
+/// rule's body is a block, and a block has nowhere to hang a postfix chain.
 fn render_css_items(
     links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
     source: &str,
     indent: &str,
+    surface: &StyleSurface<'_>,
+) -> Option<String> {
+    let (items, converted) = render_css_prefix(links, source, indent, surface);
+    (converted == links.len()).then_some(items)
+}
+
+/// The longest PREFIX of `links` with a block spelling, rendered, and how many
+/// links that was.
+fn render_css_prefix(
+    links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
+    source: &str,
+    indent: &str,
+    surface: &StyleSurface<'_>,
+) -> (String, usize) {
+    let mut out = String::new();
+    for (index, link) in links.iter().enumerate() {
+        let Some(rendered) = render_css_link(link, source, indent, surface) else {
+            return (out, index);
+        };
+        out.push_str(&rendered);
+    }
+    (out, links.len())
+}
+
+/// One chain link as the block item(s) it writes, or `None` when it has no
+/// block spelling.
+///
+/// Three kinds, and the third is E167's whole subject. A `raw`/`with_length`/
+/// `with_color` link IS a declaration (the lowering's own chokepoint). A
+/// CONDITION combinator is a nested rule, and converts recursively. Everything
+/// else is a method whose body writes declarations, and the body is read out of
+/// std's own `style.vl` rather than restated in a table beside it — see
+/// [`StyleSurface`].
+fn render_css_link(
+    link: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    source: &str,
+    indent: &str,
+    surface: &StyleSurface<'_>,
 ) -> Option<String> {
     let inner = format!("{indent}\t");
-    let mut out = String::new();
-    for link in links {
-        let Node::Call(callee, None, arguments) = &link.0 else {
-            return None;
-        };
-        let Node::Accessor(name) = callee.0 else {
-            return None;
-        };
-        if name == "raw" {
-            let [property, value] = arguments.0.as_slice() else {
-                return None;
-            };
-            let Node::String(property) = property.0 else {
-                return None;
-            };
-            if !is_css_property(property) {
-                return None;
-            }
-            let value = render_block_value(value, source);
-            out.push_str(&format!("{inner}{property}: {value};\n"));
-        } else if STYLE_CONDITION_METHODS
-            .iter()
-            .any(|(condition, _)| *condition == name)
-        {
-            let (nested, head) = arguments.0.split_last()?;
-            let body = render_css_items(&style_chain_links(nested)?, source, &inner)?;
-            let head = if head.is_empty() {
-                String::new()
-            } else {
-                let written: Vec<String> = head
-                    .iter()
-                    .map(|argument| source[argument.1.into_range()].to_string())
-                    .collect();
-                format!("({})", written.join(", "))
-            };
-            out.push_str(&format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
+    let Node::Call(callee, None, arguments) = &link.0 else {
+        return None;
+    };
+    let Node::Accessor(name) = callee.0 else {
+        return None;
+    };
+    if STYLE_CONDITION_METHODS
+        .iter()
+        .any(|(condition, _)| *condition == name)
+    {
+        let (nested, head) = arguments.0.split_last()?;
+        let body = render_css_items(&style_chain_links(nested)?, source, &inner, surface)?;
+        let head = if head.is_empty() {
+            String::new()
         } else {
-            // Not a row of the lowering table: no block spelling exists, and
-            // one is not this refactor's to invent.
-            return None;
-        }
+            let written: Vec<String> = head
+                .iter()
+                .map(|argument| source[argument.1.into_range()].to_string())
+                .collect();
+            format!("({})", written.join(", "))
+        };
+        return Some(format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
+    }
+    let written: Vec<InlineValue<'_>> = arguments
+        .0
+        .iter()
+        .map(|argument| InlineValue::written(argument, source))
+        .collect();
+    let declarations = style_link_declarations(surface, name, &written, 0)?;
+    let mut out = String::new();
+    for (property, value) in declarations {
+        out.push_str(&format!("{inner}{property}: {value};\n"));
     }
     Some(out)
+}
+
+/// std's `impl Style` surface, read out of the parsed `style.vl` (E167).
+///
+/// The alternative was a hand table beside `STYLE_PROPERTY_METHODS` giving each
+/// method's declarations with holes for its arguments, gated against `style.vl`
+/// exactly as the `family` column is. The inliner is preferred because it cannot
+/// DRIFT: a shorthand's body is a chain of `with_length`/`with_color`/`raw` links
+/// over `self`, so substituting the call's arguments into it yields the
+/// declarations the method actually writes, and a method whose body is not such a
+/// chain (`raw` itself, `rule`, `with_border`, `background_gradient` — anything
+/// with a statement in it) simply HAS no block spelling and splits the chain
+/// rather than being converted wrong.
+///
+/// Empty when `style.vl` cannot be read or parsed, which degrades to the
+/// pre-E167 behaviour (the chokepoint links and the combinators) rather than to
+/// a wrong answer.
+#[derive(Default)]
+struct StyleSurface<'a> {
+    source: &'a str,
+    methods: HashMap<&'a str, StyleMethodBody<'a>>,
+}
+
+/// One `impl Style` method's inlinable shape: the names it binds its arguments
+/// to, and the single expression its body is.
+struct StyleMethodBody<'a> {
+    parameters: Vec<&'a str>,
+    tail: &'a vilan_core::Spanned<Node<'a>>,
+}
+
+impl<'a> StyleSurface<'a> {
+    /// The `impl Style` methods of a parsed `style.vl`. A method with a
+    /// STATEMENT in its body is skipped outright: a `let`, an `if` or a loop is
+    /// a barrier, and nothing about it has a declaration spelling.
+    fn build(source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) -> StyleSurface<'a> {
+        let mut methods = HashMap::default();
+        for item in items {
+            let Node::Impl(subject, _traits, body) = &item.0 else {
+                continue;
+            };
+            let names_style = matches!(subject.0, Node::Accessor("Style"))
+                || matches!(subject.0, Node::StaticAccessor(_, "Style", None));
+            if !names_style {
+                continue;
+            }
+            for member in &body.0 {
+                let Node::Func(function) = &member.0 else {
+                    continue;
+                };
+                let Some(body) = function.body.as_ref() else {
+                    continue;
+                };
+                if !body.0.0.is_empty() {
+                    continue;
+                }
+                let mut parameters = Vec::new();
+                let mut spellable = true;
+                for parameter in &function.parameters.0 {
+                    match parameter.pattern {
+                        vilan_core::node::Pattern::Binding("self", ..) => {}
+                        vilan_core::node::Pattern::Binding(name, ..) => parameters.push(name),
+                        // A destructuring binder has no single name to
+                        // substitute, so the method is not inlinable.
+                        _ => spellable = false,
+                    }
+                }
+                if spellable {
+                    methods.insert(
+                        function.name.0,
+                        StyleMethodBody {
+                            parameters,
+                            tail: body.0.1.as_ref(),
+                        },
+                    );
+                }
+            }
+        }
+        StyleSurface { source, methods }
+    }
+}
+
+/// One argument as the converter carries it through an inlining: its TEXT, and
+/// — when the argument is exactly one node of one source, with no substitution
+/// done to it — that node, so `render_block_value`'s plain-token-run rule and
+/// the property literal can still be read off the tree rather than off a string.
+#[derive(Clone)]
+struct InlineValue<'a> {
+    text: String,
+    written: Option<(&'a vilan_core::Spanned<Node<'a>>, &'a str)>,
+}
+
+impl<'a> InlineValue<'a> {
+    /// An argument exactly as the user wrote it.
+    fn written(node: &'a vilan_core::Spanned<Node<'a>>, source: &'a str) -> InlineValue<'a> {
+        InlineValue {
+            text: source[node.1.into_range()].to_string(),
+            written: Some((node, source)),
+        }
+    }
+
+    /// The value as a `css` declaration writes it: a plain token run as itself,
+    /// everything else through a HOLE, which is exact.
+    fn declaration_value(&self) -> String {
+        match self.written {
+            Some((node, source)) => render_block_value(node, source),
+            None => format!("{{{}}}", self.text),
+        }
+    }
+
+    /// The value as a declaration's PROPERTY — a string literal that is
+    /// spellable as a css property, and nothing else.
+    fn declaration_property(&self) -> Option<&'a str> {
+        let (node, _) = self.written?;
+        let Node::String(literal) = node.0 else {
+            return None;
+        };
+        is_css_property(literal).then_some(literal)
+    }
+}
+
+/// How deep the inliner will follow one shorthand into another. std's own depth
+/// is three (`padding_x` → `with_length` → `raw`); the bound is here so a cycle
+/// introduced in `style.vl` costs a refused conversion rather than a hung
+/// language server.
+const STYLE_INLINE_DEPTH: usize = 8;
+
+/// The declarations a chain link writes, as `(property, value)` pairs — E167's
+/// inliner (see [`StyleSurface`]).
+///
+/// `raw`, `with_length` and `with_color` are the BASE CASE rather than bodies to
+/// inline: they are the lowering's chokepoint, `with_length`/`with_color` are
+/// exactly `raw` at an instantiation, and `raw`'s own body carries the theme
+/// token's `:root` emission and is not a chain at all.
+fn style_link_declarations<'a>(
+    surface: &StyleSurface<'a>,
+    name: &str,
+    arguments: &[InlineValue<'a>],
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    if matches!(name, "raw" | "with_length" | "with_color") {
+        let [property, value] = arguments else {
+            return None;
+        };
+        return Some(vec![(
+            property.declaration_property()?.to_string(),
+            value.declaration_value(),
+        )]);
+    }
+    if depth >= STYLE_INLINE_DEPTH {
+        return None;
+    }
+    let method = surface.methods.get(name)?;
+    if method.parameters.len() != arguments.len() {
+        return None;
+    }
+    let bindings: Vec<(&str, &InlineValue<'a>)> = method
+        .parameters
+        .iter()
+        .copied()
+        .zip(arguments.iter())
+        .collect();
+    let mut declarations = Vec::new();
+    for link in self_chain_links(method.tail)? {
+        let Node::Call(callee, None, written) = &link.0 else {
+            return None;
+        };
+        let Node::Accessor(inner_name) = callee.0 else {
+            return None;
+        };
+        let mut inner_arguments = Vec::with_capacity(written.0.len());
+        for argument in &written.0 {
+            inner_arguments.push(inline_argument(argument, surface.source, &bindings)?);
+        }
+        declarations.extend(style_link_declarations(
+            surface,
+            inner_name,
+            &inner_arguments,
+            depth + 1,
+        )?);
+    }
+    Some(declarations)
+}
+
+/// One argument of a `style.vl` body, with the caller's arguments substituted
+/// for the parameters it names — or `None` when the expression is not one this
+/// substitution can do exactly.
+///
+/// Three shapes carry a meaning, and everything else is refused rather than
+/// guessed at:
+///  - the expression IS a parameter (`self.with_length("gap", value)`), so the
+///    caller's own node passes straight through and its plain-token-run reading
+///    survives;
+///  - the expression NAMES no parameter (`"padding-left"`), so it is its own
+///    text and its own node;
+///  - the expression is a path or call rooted at a parameter (`value.value()`),
+///    so the caller's text is spliced at the parameter's own span.
+///
+/// A `Binary` is refused, with one exception: `i"{x}"` lexes to `("" + (x))`
+/// (the lexer desugars an interpolation in place), and an i-string that is
+/// exactly one hole MEANS that hole — `flex_grow(3)` writes `flex-grow: {3};`
+/// rather than a nested i-string. Every other `Binary` carries wrapper tokens
+/// spanning the whole construct, which is exactly what a span splice cannot read.
+fn inline_argument<'a>(
+    node: &'a vilan_core::Spanned<Node<'a>>,
+    style_source: &'a str,
+    bindings: &[(&str, &InlineValue<'a>)],
+) -> Option<InlineValue<'a>> {
+    if let Node::Accessor(name) = node.0
+        && let Some((_, value)) = bindings.iter().find(|(parameter, _)| *parameter == name)
+    {
+        return Some((*value).clone());
+    }
+    if let Node::Binary(vilan_core::node::BinaryOp::Add, left, right) = &node.0 {
+        if matches!(left.0, Node::String("")) {
+            return inline_argument(right, style_source, bindings);
+        }
+        return None;
+    }
+    let mut holes: Vec<(vilan_core::span::Span, usize)> = Vec::new();
+    collect_parameter_spans(node, bindings, &mut holes);
+    let range = node.1.into_range();
+    if holes.is_empty() {
+        return Some(InlineValue {
+            text: style_source.get(range)?.to_string(),
+            written: Some((node, style_source)),
+        });
+    }
+    holes.sort_by_key(|(span, _)| span.start);
+    let mut text = String::new();
+    let mut cursor = range.start;
+    for (span, index) in holes {
+        if span.start < cursor || span.end > range.end {
+            return None;
+        }
+        text.push_str(style_source.get(cursor..span.start)?);
+        text.push_str(&bindings[index].1.text);
+        cursor = span.end;
+    }
+    text.push_str(style_source.get(cursor..range.end)?);
+    Some(InlineValue {
+        text,
+        written: None,
+    })
+}
+
+/// Every span inside `node` at which one of `bindings`' parameters is READ.
+///
+/// The walk is deliberately not `for_each_child`'s: a member name is not a
+/// scope name, so `value.value()` reads the parameter once (its subject) and
+/// names a method the second time, and substituting both would write
+/// `Display::Flex.Display::Flex()`.
+fn collect_parameter_spans<'a>(
+    node: &'a vilan_core::Spanned<Node<'a>>,
+    bindings: &[(&str, &InlineValue<'a>)],
+    out: &mut Vec<(vilan_core::span::Span, usize)>,
+) {
+    match &node.0 {
+        Node::Accessor(name) => {
+            if let Some(index) = bindings.iter().position(|(parameter, _)| parameter == name) {
+                out.push((node.1, index));
+            }
+        }
+        Node::MemberAccessor(subject, member) => {
+            collect_parameter_spans(subject, bindings, out);
+            // `x.f(a)` — `f` is the method's name, `a` is an expression.
+            if let Node::Call(_, _, arguments) = &member.0 {
+                for argument in &arguments.0 {
+                    collect_parameter_spans(argument, bindings, out);
+                }
+            }
+        }
+        Node::StaticAccessor(subject, _, _) => collect_parameter_spans(subject, bindings, out),
+        _ => node
+            .0
+            .for_each_child(&mut |child| collect_parameter_spans(child, bindings, out)),
+    }
 }
 
 /// A `raw` argument as a declaration's value. A plain token run is written as
@@ -5875,6 +6402,86 @@ pub(crate) mod tests {
             program.entity_map.len(),
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M65's half of the same promise: the ids `CompletionIndex::build` asks
+    /// about get the same answer from the hoisted lookup as from the scan.
+    ///
+    /// The index build is the residue M58's own profile named — it asked
+    /// `Program::source_of` 14,580 times for 7.5 M Ir on kolt's client, a
+    /// LINEAR scan of `source_ranges` re-run once per row — and the hoist is
+    /// the identical one, so the pin is the identical one too, narrowed to this
+    /// build's own population: every FUNCTION and EXTERNAL (`DocParagraphs`
+    /// groups its declarations by declaring source), and every name bound in a
+    /// top-level module of `std` and `pkg` (`AutoImportOrder` keeps only the
+    /// names a module DECLARES, which is `source_of(entity) == source_of(the
+    /// module)` — a comparison of two answers, so a lookup that disagreed with
+    /// the scan on either side would change which names are offered).
+    #[test]
+    fn the_hoisted_lookup_answers_the_completion_index_build_the_same_way() {
+        let _guard = base_cache_guard();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::rows::Row;\n\n\
+                 fun main() {\n\tlet row = Row { label: \"a\" };\n\tprint(row.label);\n}\n",
+            ),
+            ("rows.vl", "struct Row {\n\tlabel: str,\n}\n"),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("the fixture analyzes cleanly");
+        let lookup = program.source_lookup();
+        let mut checked = 0usize;
+        let check = |id: Id| {
+            assert_eq!(
+                lookup.of(id),
+                program.source_of(id),
+                "the hoisted lookup and the scan disagree about id {}",
+                id.0,
+            );
+        };
+        for id in program.functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.external_functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for root in ["std", "pkg"] {
+            let Some(root_module_id) = program.module_id_by_name.get(root) else {
+                continue;
+            };
+            check(*root_module_id);
+            let Some(root_module) = program.modules.get(root_module_id) else {
+                continue;
+            };
+            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
+                continue;
+            };
+            for child_id in root_scope.name_to_id_map.values() {
+                check(*child_id);
+                checked += 1;
+                let Some(child_module) = program.modules.get(child_id) else {
+                    continue;
+                };
+                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
+                    continue;
+                };
+                for entity_id in child_scope.name_to_id_map.values() {
+                    check(*entity_id);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 500,
+            "a std-using two-module program should reach more than {checked} of the index \
+             build's ids — a pin that checks a handful is not checking the hoist",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6692,9 +7299,15 @@ pub(crate) mod tests {
     /// The conversion offered at the `~` cursor in a `css`-block fixture, as
     /// `(to_chain, replaced text, replacement)`.
     fn css_conversion(body: &str) -> Option<(bool, String, String)> {
-        let source = format!(
+        css_conversion_of(&format!(
             "import std::style::{{ Color, Length, Style, space, style }};\n\nfun card(): Style {{\n{body}}}\n"
-        );
+        ))
+    }
+
+    /// [`css_conversion`] over a whole FILE rather than one function body — the
+    /// shapes that need their own imports or an `impl Style` of their own.
+    fn css_conversion_of(source: &str) -> Option<(bool, String, String)> {
+        let source = source.to_string();
         let offset = source.find('~').expect("fixture needs a `~` cursor");
         let text = source.replace('~', "");
         let (directory, document) = analyze_workspace(&[("main.vl", &text)]);
@@ -6762,20 +7375,94 @@ pub(crate) mod tests {
         );
     }
 
-    // The inverse is PARTIAL, and says so by not being offered. A typed
-    // property method is `with_length("padding", …)`, which is not the node
-    // `padding: {space(4)};` lowers to — so a chain carrying one has no block
-    // spelling this refactor is entitled to invent.
+    // E167: a TYPED property link converts, because the declarations it writes
+    // are read out of std's own `style.vl` rather than restated in a table
+    // beside it. `padding_x`'s body is
+    // `self.with_length("padding-left", value).with_length("padding-right", value)`,
+    // so the conversion is two declarations and the argument lands in both holes
+    // — which is exactly what the method does, and cannot drift from it.
     #[test]
-    fn refactor_declines_a_chain_with_a_typed_property_link() {
+    fn refactor_converts_a_typed_property_link_by_inlining_its_std_body() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.padding_x(space(4))\n\t\t.color(Color::gray(900))\n\t\t.gap(space(2))\n",
+        )
+        .expect("a typed chain converts");
+        assert!(!conversion.0, "chain -> block");
         assert_eq!(
-            css_conversion("\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"display\", \"flex\")\n"),
-            None
+            conversion.2,
+            "css {\n\t\tpadding-left: {space(4)};\n\t\tpadding-right: {space(4)};\n\t\tcolor: {Color::gray(900)};\n\t\tgap: {space(2)};\n\t}",
+            "{conversion:?}"
         );
-        // `class_list` ends the chain in something that is not a `Style` at
-        // all — likewise not convertible.
+    }
+
+    // The seed. `style_chain_links` matched a BARE `style` only, which is the one
+    // spelling the estate does not write — the web prelude publishes the MODULE,
+    // so the templates, the docs and kolt all write `style::style()` and every
+    // chain in real code was refused at its first token. The rule is syntactic:
+    // the last segment is `style`, the call takes no arguments.
+    #[test]
+    fn refactor_reads_a_path_spelled_style_seed() {
+        let conversion = css_conversion_of(
+            "import std::style;\n\nfun card(): style::Style {\n\tsty~le::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))\n}\n",
+        )
+        .expect("a `style::style()` chain converts");
         assert_eq!(
-            css_conversion("\tsty~le()\n\t\t.raw(\"display\", \"flex\")\n\t\t.class_list()\n"),
+            conversion.1,
+            "style::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))",
+            "the whole chain is replaced"
+        );
+        assert_eq!(
+            conversion.2, "css {\n\t\tdisplay: flex;\n\t\tpadding: {style::space(4)};\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // The SPLIT, on the shape kolt actually writes (`styles.vl`'s button
+    // styles): std shorthands and a `raw`, a condition combinator, and a user
+    // extension declared in the file's own `impl Style`. One unconvertible link
+    // used to refuse the whole chain; the chain splits at the FIRST of them now,
+    // and the rest is written as a postfix chain on the block — which parses and
+    // types, and keeps its order relative to everything the block holds, so the
+    // two spellings mean the same style.
+    #[test]
+    fn refactor_splits_a_chain_at_a_link_with_no_block_spelling() {
+        let conversion = css_conversion_of(
+            "import std::style::{ Color, Length, Style, space, style };\n\n             impl Style {\n\tfun select_off(self): Style {\n\t\tself.raw(\"user-select\", \"none\")\n\t}\n}\n\n             fun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
+        )
+        .expect("a kolt-shaped chain converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpadding: {space(4)};\n\t\toutline: none;\n\t\tborder-radius: {Length::px(4)};\n\t\t.attribute(\"disabled\", None) {\n\t\t\tcolor: {Color::gray(300)};\n\t\t}\n\t}.select_off().hover(style().background(Color::gray(100)))",
+            "{conversion:?}"
+        );
+    }
+
+    // A std method whose body is not a chain at all is a BARRIER, not a guess:
+    // `border` delegates to `with_border`, whose body carries two `if`s and the
+    // `rule` chokepoint, so it has no declaration spelling and the chain splits
+    // there. This is the inliner refusing rather than inventing.
+    #[test]
+    fn refactor_splits_at_a_std_method_whose_body_is_not_a_chain() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.padding(space(4))\n\t\t.border(Length::px(1), Color::gray(300))\n",
+        )
+        .expect("the convertible prefix converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpadding: {space(4)};\n\t}.border(Length::px(1), Color::gray(300))",
+            "{conversion:?}"
+        );
+    }
+
+    // And a chain with NO convertible link offers nothing at all: a `css { }`
+    // with the whole chain hung off it is not a conversion.
+    #[test]
+    fn refactor_offers_nothing_when_no_link_has_a_block_spelling() {
+        assert_eq!(css_conversion("\tsty~le()\n\t\t.class_list()\n"), None);
+        assert_eq!(
+            css_conversion_of(
+                "import std::style::{ Style, style };\n\n                 impl Style {\n\tfun select_off(self): Style {\n\t\tself.raw(\"user-select\", \"none\")\n\t}\n}\n\n                 fun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
+            ),
             None
         );
     }
@@ -12183,6 +12870,62 @@ pub(crate) mod tests {
         assert!(labels.contains(&"fun".to_string()), "keyword: {labels:?}");
     }
 
+    // E165: the moment a user actually asks for completion is a BLANK LINE, and
+    // that was the one position scope completion got wrong. `scope_at` answered
+    // "the scope of the entity at, or nearest before, the offset"; on an empty
+    // line the entity CONTAINING the offset is the enclosing function, and a
+    // function's own scope is the module it is declared in — so the popup
+    // offered globals and keywords and none of the body's locals, while `st|`
+    // one character away offered `start`.
+    #[test]
+    fn scope_completion_on_a_blank_line_offers_the_enclosing_body() {
+        let labels =
+            completions_at_cursor("fun main() {\n\tlet start = 1;\n\t|\n\tlet after = 2;\n}\n");
+        assert!(
+            labels.contains(&"start".to_string()),
+            "the enclosing body's locals: {labels:?}"
+        );
+        // Still a scope position, so the globals and keywords it always offered
+        // are offered too — this widens the answer, it does not narrow it.
+        assert!(labels.contains(&"fun".to_string()), "keyword: {labels:?}");
+    }
+
+    // The innermost enclosing body wins, and a sibling block's is not offered:
+    // the extent is per scope, so two blocks side by side never cover each
+    // other's text.
+    #[test]
+    fn scope_completion_on_a_blank_line_takes_the_innermost_block() {
+        let labels = completions_at_cursor(
+            "fun main() {\n\tlet outer = 1;\n\tif outer > 0 {\n\t\tlet inner = 2;\n\t\t|\n\t}\n\tlet sibling = 3;\n}\n",
+        );
+        assert!(
+            labels.contains(&"inner".to_string()),
+            "the nested block's own local: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"outer".to_string()),
+            "the enclosing body's local, through the parent chain: {labels:?}"
+        );
+    }
+
+    // The control the fix must not break: a blank line at TOP LEVEL has no
+    // enclosing body, so nothing local is offered and the module scope answers
+    // exactly as before.
+    #[test]
+    fn scope_completion_on_a_blank_line_at_top_level_offers_the_module() {
+        let labels = completions_at_cursor(
+            "fun helper(): i32 { 42 }\n\nfun main() {\n\tlet buried = 1;\n\tlet _ = buried;\n}\n\n|\n",
+        );
+        assert!(
+            labels.contains(&"helper".to_string()),
+            "top-level items: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"buried".to_string()),
+            "a function's local is not in scope at top level: {labels:?}"
+        );
+    }
+
     #[test]
     fn path_completion_lists_enum_variants() {
         let labels = completions_at_cursor(
@@ -12690,6 +13433,170 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// E168/E169's helper module: a free function the entry can import by name,
+    /// and an `impl` that travels with ANY import reaching the module. The two
+    /// together are what the leaf question and the module question disagree
+    /// about — `b` is provided by its own leaf, `doubled` only by the import
+    /// reaching `a.vl`.
+    const LEAF_AND_IMPL: &str =
+        "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n";
+
+    // E168 (the s1c shape): `import pkg::a::b;` with `b` unused is NOT deleted
+    // when `a.vl`'s `impl` is what the file calls a method from — impls travel
+    // with any import that reaches the module, not only with a whole-module one,
+    // so deleting the statement took `doubled` with it and the next analysis
+    // said "i32 has no method 'doubled'". The organizer had broken a green
+    // build. The statement is REWRITTEN to the module import instead; the leaf
+    // goes on fading, because it is genuinely unused.
+    #[test]
+    fn organize_rewrites_an_emptied_import_whose_module_still_carries_an_impl() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement offers an edit"),
+            "import pkg::a;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+        );
+        // The fade is unchanged: `b` IS unused, and E114's contract is that the
+        // mark and the fix describe the same statement.
+        assert_eq!(faded(&document), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The rewrite fires only when nothing survives the leaf question: a brace
+    // set with one live member prunes to that member exactly as before.
+    #[test]
+    fn organize_prunes_rather_than_rewrites_while_a_leaf_still_survives() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ b, c };\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+            ),
+            (
+                "a.vl",
+                "fun b(): i32 {\n\t1\n}\n\nfun c(): i32 {\n\t2\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document).expect("the dead leaf offers an edit"),
+            "import pkg::a::c;\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // And when the module brings nothing either, the statement still DELETES —
+    // the rescue is a second question, not a second chance.
+    #[test]
+    fn organize_deletes_an_emptied_import_whose_module_brings_nothing() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\t1\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document).expect("the unused import offers an edit"),
+            "\nfun main(): i32 {\n\t1\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E169 (the s2 shape), the OVER-keeping half: a whole-module import beside a
+    // named import of the same module, with only the NAME used. Rule (2) kept
+    // the module leaf because the file resolved something declared in `a.vl` —
+    // but `b`'s uses come from `b`'s own leaf, and the module import brings
+    // nothing the file spells. Counted against what the module import ALONE
+    // provides, it is unused: it fades, and it prunes.
+    #[test]
+    fn organize_prunes_a_module_import_whose_only_evidence_is_another_leaf() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(faded(&document), vec!["a".to_string()]);
+        assert_eq!(
+            organized(&document).expect("the module import is unused"),
+            "import pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E169's EDGE, and why the refinement is not simply "a module import beside
+    // a named one dies": a definition reached BOTH ways keeps the module import,
+    // because the qualified use writes the module's own name and that is rule
+    // (1)'s question, not rule (2)'s.
+    #[test]
+    fn organize_keeps_a_module_import_a_qualified_path_names() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb() + a::b()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        assert_eq!(organized(&document), None, "both imports are used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The s4 control, which E169 must not disturb: a whole-module import whose
+    // only contribution is an `impl` method survives the refinement, because
+    // nothing binds `doubled` by a leaf of its own.
+    #[test]
+    fn organize_keeps_a_module_import_beside_a_leaf_when_an_impl_is_the_use() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tlet n = b();\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        assert_eq!(
+            organized(&document),
+            None,
+            "the module import brings `doubled`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// One build-preservation case: a workspace whose entry file has imports
     /// organize must act on. `entry` is the first file.
     struct OrganizeCase {
@@ -12750,6 +13657,29 @@ pub(crate) mod tests {
                     "main.vl",
                     "import std::result::Result::{ self, Err, Ok };\n\nfun main(): Result<i32, str> {\n\tOk(1)\n}\n",
                 )],
+            },
+            OrganizeCase {
+                label: "E168: a named import whose module carries the impl in use",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+                    ),
+                    (
+                        "a.vl",
+                        "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+                    ),
+                ],
+            },
+            OrganizeCase {
+                label: "E169: a module import beside a named import of the same module",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+                    ),
+                    ("a.vl", "fun b(): i32 {\n\t1\n}\n"),
+                ],
             },
             OrganizeCase {
                 label: "a shuffled run where every leaf is used",
