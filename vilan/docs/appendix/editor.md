@@ -215,7 +215,7 @@ diagnostic or on the file:
 | Action | Does |
 |---|---|
 | **Convert to a `style()` chain** | rewrites the `css { … }` block the cursor is in as the builder chain it lowers to — a declaration becomes a `.raw` link, a nested rule becomes a combinator link carrying the inner chain |
-| **Convert to a `css` block** | the inverse, on a `style()` chain. Only the two rows of that lowering have a block spelling, so a chain carrying a typed property method (`.padding(space(4))`, which writes its slot through `with_length`) is not offered the conversion at all |
+| **Convert to a `css` block** | the inverse, on a `style()` chain — seeded by any path ending in `style()`, so `style::style()` (what the web prelude publishes) reads as one. A typed property method is converted by *inlining its std body*: `.padding_x(space(4))` is `with_length("padding-left", value).with_length("padding-right", value)`, so it writes both declarations with the argument in each hole. A link with no block spelling — a user extension, a method whose body is not a chain (`.border(…)`), `.class_list()` — *splits* the chain instead of refusing it: everything before it becomes the block and the rest is written as a postfix chain on it (`css { … }.select_off()`). Not offered when no link converts |
 
 Both directions decline rather than guess. A **comment** inside the
 construct stops the conversion, because its attachment is not recoverable

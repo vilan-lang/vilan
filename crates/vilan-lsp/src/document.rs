@@ -5037,11 +5037,55 @@ impl Document {
         if commented(node.1) {
             return None;
         }
+        // std's own `style.vl`, parsed, is what gives a TYPED link its
+        // declarations (E167). Read here rather than at analysis time because
+        // it is wanted by one code action and by nothing else — and only after
+        // the block direction has declined, so a cursor in a block never pays
+        // for it.
+        let style_text = self.std_style_text();
+        let style_tree = style_text
+            .as_deref()
+            .and_then(|text| vilan_core::parsing::parse(text).0);
+        let surface = match (style_text.as_deref(), style_tree.as_ref()) {
+            (Some(text), Some(tree)) => StyleSurface::build(text, &tree.0),
+            _ => StyleSurface::default(),
+        };
         Some(CssConversion {
             to_chain: false,
             span: node.1,
-            replacement: render_css_block(node, source, &line_indent(source, node.1.start))?,
+            replacement: render_css_block(
+                node,
+                source,
+                &line_indent(source, node.1.start),
+                &surface,
+            )?,
         })
+    }
+
+    /// std's `style.vl` as text, located through the analyzed program's own
+    /// source table: the file that declares `with_length`, std's `Style` slot
+    /// writer, and is called `style.vl`. Both halves matter — the name alone
+    /// would match an app's own `style.vl`, and the function alone an app's own
+    /// `with_length`.
+    ///
+    /// `None` when nothing analyzed, when style.vl is not among the loaded
+    /// modules (then there is no `style()` chain to convert either), or when the
+    /// file cannot be read; the conversion degrades to the chokepoint links and
+    /// the combinators rather than to a wrong answer.
+    fn std_style_text(&self) -> Option<String> {
+        let program = self.program.as_ref()?;
+        let source = program.functions.iter().find_map(|(id, function)| {
+            (function.name == "with_length")
+                .then(|| program.source_of(*id))
+                .flatten()
+                .filter(|source| {
+                    program
+                        .source_path(*source)
+                        .and_then(|path| path.file_name())
+                        .is_some_and(|name| name == "style.vl")
+                })
+        })?;
+        std::fs::read_to_string(program.source_path(source)?).ok()
     }
 
     /// Every unambiguous missing-import fix in the file, folded into ONE edit
@@ -5334,8 +5378,7 @@ fn outermost_style_chain<'a, 'src>(
 }
 
 /// The links of a `style()`-seeded chain, in written order, or `None` when
-/// `node` is some other expression. The seed is a bare `style()` call — a
-/// receiver of any other shape is not a chain this refactor can read.
+/// `node` is some other expression.
 fn style_chain_links<'a, 'src>(
     node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
 ) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
@@ -5346,10 +5389,46 @@ fn style_chain_links<'a, 'src>(
             Some(links)
         }
         Node::Call(callee, None, arguments)
-            if matches!(callee.0, Node::Accessor("style")) && arguments.0.is_empty() =>
+            if arguments.0.is_empty() && names_the_style_seed(&callee.0) =>
         {
             Some(Vec::new())
         }
+        _ => None,
+    }
+}
+
+/// Whether `callee` names std's `style()` seed (E167).
+///
+/// A BARE `style` was the only spelling this refactor read, and it is the one
+/// spelling the estate does not write: the web prelude publishes the MODULE, so
+/// the templates, the docs and kolt all write `style::style()`, and every chain
+/// in real code was refused at its first token. The test is syntactic — the last
+/// segment is `style` and the call takes no arguments — which matches
+/// `style::style()`, an aliased `s::style()` and a bare `style()` alike, and is
+/// the rule a raw parse can apply without resolving anything. `StdItem` is the
+/// desugar's own scope-independent spelling (B270), which a `css` block's
+/// lowering seeds its chain with.
+fn names_the_style_seed(callee: &Node<'_>) -> bool {
+    match callee {
+        Node::Accessor("style") => true,
+        Node::StaticAccessor(_, "style", None) => true,
+        Node::StdItem("style", "style") => true,
+        _ => false,
+    }
+}
+
+/// The links of a chain written over `self` — the shape every convertible
+/// `impl Style` body in std's `style.vl` has (E167's inliner).
+fn self_chain_links<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
+    match &node.0 {
+        Node::MemberAccessor(subject, member) => {
+            let mut links = self_chain_links(subject)?;
+            links.push(member);
+            Some(links)
+        }
+        Node::Accessor("self") => Some(Vec::new()),
         _ => None,
     }
 }
@@ -5471,65 +5550,396 @@ fn escape_value(text: &str) -> Option<String> {
     (!text.contains('\\')).then(|| text.replace('"', "\\\""))
 }
 
-/// A `style()` chain as the `css` block it is the lowering of.
+/// A `style()` chain as the `css` block it is the lowering of, with the links
+/// that have no block spelling written back onto it as a POSTFIX CHAIN (E167).
+///
+/// One unconvertible link used to refuse the whole conversion, which on real
+/// code meant always: every chain an app writes ends in `.class_list()`, and
+/// most carry a user extension or a `Style`-valued combinator argument
+/// somewhere. The chain SPLITS at the first such link instead — everything
+/// before it becomes the block, the rest is written on the block, which parses
+/// and types today (`css { … }.select_off()`). The split is at the FIRST one
+/// because chain order is merge order: the tail keeps its order relative to
+/// everything the block now holds, so the two spellings mean the same style.
+///
+/// `None` when NOTHING converts — a chain of only unconvertible links is not a
+/// conversion, it is a `css { }` with the whole chain hung off it.
 fn render_css_block(
     chain: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
     source: &str,
     indent: &str,
+    surface: &StyleSurface<'_>,
 ) -> Option<String> {
-    let items = render_css_items(&style_chain_links(chain)?, source, indent)?;
-    Some(format!("css {{\n{items}{indent}}}"))
+    let links = style_chain_links(chain)?;
+    let (items, converted) = render_css_prefix(&links, source, indent, surface);
+    if converted == 0 {
+        return None;
+    }
+    let mut out = format!("css {{\n{items}{indent}}}");
+    for link in &links[converted..] {
+        out.push('.');
+        out.push_str(&source[link.1.into_range()]);
+    }
+    Some(out)
 }
 
+/// Every link of `links` as block items, or `None` when even one has no block
+/// spelling — the ALL-OR-NOTHING face, which is what a nested rule needs: a
+/// rule's body is a block, and a block has nowhere to hang a postfix chain.
 fn render_css_items(
     links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
     source: &str,
     indent: &str,
+    surface: &StyleSurface<'_>,
+) -> Option<String> {
+    let (items, converted) = render_css_prefix(links, source, indent, surface);
+    (converted == links.len()).then_some(items)
+}
+
+/// The longest PREFIX of `links` with a block spelling, rendered, and how many
+/// links that was.
+fn render_css_prefix(
+    links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
+    source: &str,
+    indent: &str,
+    surface: &StyleSurface<'_>,
+) -> (String, usize) {
+    let mut out = String::new();
+    for (index, link) in links.iter().enumerate() {
+        let Some(rendered) = render_css_link(link, source, indent, surface) else {
+            return (out, index);
+        };
+        out.push_str(&rendered);
+    }
+    (out, links.len())
+}
+
+/// One chain link as the block item(s) it writes, or `None` when it has no
+/// block spelling.
+///
+/// Three kinds, and the third is E167's whole subject. A `raw`/`with_length`/
+/// `with_color` link IS a declaration (the lowering's own chokepoint). A
+/// CONDITION combinator is a nested rule, and converts recursively. Everything
+/// else is a method whose body writes declarations, and the body is read out of
+/// std's own `style.vl` rather than restated in a table beside it — see
+/// [`StyleSurface`].
+fn render_css_link(
+    link: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    source: &str,
+    indent: &str,
+    surface: &StyleSurface<'_>,
 ) -> Option<String> {
     let inner = format!("{indent}\t");
-    let mut out = String::new();
-    for link in links {
-        let Node::Call(callee, None, arguments) = &link.0 else {
-            return None;
-        };
-        let Node::Accessor(name) = callee.0 else {
-            return None;
-        };
-        if name == "raw" {
-            let [property, value] = arguments.0.as_slice() else {
-                return None;
-            };
-            let Node::String(property) = property.0 else {
-                return None;
-            };
-            if !is_css_property(property) {
-                return None;
-            }
-            let value = render_block_value(value, source);
-            out.push_str(&format!("{inner}{property}: {value};\n"));
-        } else if STYLE_CONDITION_METHODS
-            .iter()
-            .any(|(condition, _)| *condition == name)
-        {
-            let (nested, head) = arguments.0.split_last()?;
-            let body = render_css_items(&style_chain_links(nested)?, source, &inner)?;
-            let head = if head.is_empty() {
-                String::new()
-            } else {
-                let written: Vec<String> = head
-                    .iter()
-                    .map(|argument| source[argument.1.into_range()].to_string())
-                    .collect();
-                format!("({})", written.join(", "))
-            };
-            out.push_str(&format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
+    let Node::Call(callee, None, arguments) = &link.0 else {
+        return None;
+    };
+    let Node::Accessor(name) = callee.0 else {
+        return None;
+    };
+    if STYLE_CONDITION_METHODS
+        .iter()
+        .any(|(condition, _)| *condition == name)
+    {
+        let (nested, head) = arguments.0.split_last()?;
+        let body = render_css_items(&style_chain_links(nested)?, source, &inner, surface)?;
+        let head = if head.is_empty() {
+            String::new()
         } else {
-            // Not a row of the lowering table: no block spelling exists, and
-            // one is not this refactor's to invent.
-            return None;
-        }
+            let written: Vec<String> = head
+                .iter()
+                .map(|argument| source[argument.1.into_range()].to_string())
+                .collect();
+            format!("({})", written.join(", "))
+        };
+        return Some(format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
+    }
+    let written: Vec<InlineValue<'_>> = arguments
+        .0
+        .iter()
+        .map(|argument| InlineValue::written(argument, source))
+        .collect();
+    let declarations = style_link_declarations(surface, name, &written, 0)?;
+    let mut out = String::new();
+    for (property, value) in declarations {
+        out.push_str(&format!("{inner}{property}: {value};\n"));
     }
     Some(out)
+}
+
+/// std's `impl Style` surface, read out of the parsed `style.vl` (E167).
+///
+/// The alternative was a hand table beside `STYLE_PROPERTY_METHODS` giving each
+/// method's declarations with holes for its arguments, gated against `style.vl`
+/// exactly as the `family` column is. The inliner is preferred because it cannot
+/// DRIFT: a shorthand's body is a chain of `with_length`/`with_color`/`raw` links
+/// over `self`, so substituting the call's arguments into it yields the
+/// declarations the method actually writes, and a method whose body is not such a
+/// chain (`raw` itself, `rule`, `with_border`, `background_gradient` — anything
+/// with a statement in it) simply HAS no block spelling and splits the chain
+/// rather than being converted wrong.
+///
+/// Empty when `style.vl` cannot be read or parsed, which degrades to the
+/// pre-E167 behaviour (the chokepoint links and the combinators) rather than to
+/// a wrong answer.
+#[derive(Default)]
+struct StyleSurface<'a> {
+    source: &'a str,
+    methods: HashMap<&'a str, StyleMethodBody<'a>>,
+}
+
+/// One `impl Style` method's inlinable shape: the names it binds its arguments
+/// to, and the single expression its body is.
+struct StyleMethodBody<'a> {
+    parameters: Vec<&'a str>,
+    tail: &'a vilan_core::Spanned<Node<'a>>,
+}
+
+impl<'a> StyleSurface<'a> {
+    /// The `impl Style` methods of a parsed `style.vl`. A method with a
+    /// STATEMENT in its body is skipped outright: a `let`, an `if` or a loop is
+    /// a barrier, and nothing about it has a declaration spelling.
+    fn build(source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) -> StyleSurface<'a> {
+        let mut methods = HashMap::default();
+        for item in items {
+            let Node::Impl(subject, _traits, body) = &item.0 else {
+                continue;
+            };
+            let names_style = matches!(subject.0, Node::Accessor("Style"))
+                || matches!(subject.0, Node::StaticAccessor(_, "Style", None));
+            if !names_style {
+                continue;
+            }
+            for member in &body.0 {
+                let Node::Func(function) = &member.0 else {
+                    continue;
+                };
+                let Some(body) = function.body.as_ref() else {
+                    continue;
+                };
+                if !body.0.0.is_empty() {
+                    continue;
+                }
+                let mut parameters = Vec::new();
+                let mut spellable = true;
+                for parameter in &function.parameters.0 {
+                    match parameter.pattern {
+                        vilan_core::node::Pattern::Binding("self", ..) => {}
+                        vilan_core::node::Pattern::Binding(name, ..) => parameters.push(name),
+                        // A destructuring binder has no single name to
+                        // substitute, so the method is not inlinable.
+                        _ => spellable = false,
+                    }
+                }
+                if spellable {
+                    methods.insert(
+                        function.name.0,
+                        StyleMethodBody {
+                            parameters,
+                            tail: body.0.1.as_ref(),
+                        },
+                    );
+                }
+            }
+        }
+        StyleSurface { source, methods }
+    }
+}
+
+/// One argument as the converter carries it through an inlining: its TEXT, and
+/// — when the argument is exactly one node of one source, with no substitution
+/// done to it — that node, so `render_block_value`'s plain-token-run rule and
+/// the property literal can still be read off the tree rather than off a string.
+#[derive(Clone)]
+struct InlineValue<'a> {
+    text: String,
+    written: Option<(&'a vilan_core::Spanned<Node<'a>>, &'a str)>,
+}
+
+impl<'a> InlineValue<'a> {
+    /// An argument exactly as the user wrote it.
+    fn written(node: &'a vilan_core::Spanned<Node<'a>>, source: &'a str) -> InlineValue<'a> {
+        InlineValue {
+            text: source[node.1.into_range()].to_string(),
+            written: Some((node, source)),
+        }
+    }
+
+    /// The value as a `css` declaration writes it: a plain token run as itself,
+    /// everything else through a HOLE, which is exact.
+    fn declaration_value(&self) -> String {
+        match self.written {
+            Some((node, source)) => render_block_value(node, source),
+            None => format!("{{{}}}", self.text),
+        }
+    }
+
+    /// The value as a declaration's PROPERTY — a string literal that is
+    /// spellable as a css property, and nothing else.
+    fn declaration_property(&self) -> Option<&'a str> {
+        let (node, _) = self.written?;
+        let Node::String(literal) = node.0 else {
+            return None;
+        };
+        is_css_property(literal).then_some(literal)
+    }
+}
+
+/// How deep the inliner will follow one shorthand into another. std's own depth
+/// is three (`padding_x` → `with_length` → `raw`); the bound is here so a cycle
+/// introduced in `style.vl` costs a refused conversion rather than a hung
+/// language server.
+const STYLE_INLINE_DEPTH: usize = 8;
+
+/// The declarations a chain link writes, as `(property, value)` pairs — E167's
+/// inliner (see [`StyleSurface`]).
+///
+/// `raw`, `with_length` and `with_color` are the BASE CASE rather than bodies to
+/// inline: they are the lowering's chokepoint, `with_length`/`with_color` are
+/// exactly `raw` at an instantiation, and `raw`'s own body carries the theme
+/// token's `:root` emission and is not a chain at all.
+fn style_link_declarations<'a>(
+    surface: &StyleSurface<'a>,
+    name: &str,
+    arguments: &[InlineValue<'a>],
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    if matches!(name, "raw" | "with_length" | "with_color") {
+        let [property, value] = arguments else {
+            return None;
+        };
+        return Some(vec![(
+            property.declaration_property()?.to_string(),
+            value.declaration_value(),
+        )]);
+    }
+    if depth >= STYLE_INLINE_DEPTH {
+        return None;
+    }
+    let method = surface.methods.get(name)?;
+    if method.parameters.len() != arguments.len() {
+        return None;
+    }
+    let bindings: Vec<(&str, &InlineValue<'a>)> = method
+        .parameters
+        .iter()
+        .copied()
+        .zip(arguments.iter())
+        .collect();
+    let mut declarations = Vec::new();
+    for link in self_chain_links(method.tail)? {
+        let Node::Call(callee, None, written) = &link.0 else {
+            return None;
+        };
+        let Node::Accessor(inner_name) = callee.0 else {
+            return None;
+        };
+        let mut inner_arguments = Vec::with_capacity(written.0.len());
+        for argument in &written.0 {
+            inner_arguments.push(inline_argument(argument, surface.source, &bindings)?);
+        }
+        declarations.extend(style_link_declarations(
+            surface,
+            inner_name,
+            &inner_arguments,
+            depth + 1,
+        )?);
+    }
+    Some(declarations)
+}
+
+/// One argument of a `style.vl` body, with the caller's arguments substituted
+/// for the parameters it names — or `None` when the expression is not one this
+/// substitution can do exactly.
+///
+/// Three shapes carry a meaning, and everything else is refused rather than
+/// guessed at:
+///  - the expression IS a parameter (`self.with_length("gap", value)`), so the
+///    caller's own node passes straight through and its plain-token-run reading
+///    survives;
+///  - the expression NAMES no parameter (`"padding-left"`), so it is its own
+///    text and its own node;
+///  - the expression is a path or call rooted at a parameter (`value.value()`),
+///    so the caller's text is spliced at the parameter's own span.
+///
+/// A `Binary` is refused, with one exception: `i"{x}"` lexes to `("" + (x))`
+/// (the lexer desugars an interpolation in place), and an i-string that is
+/// exactly one hole MEANS that hole — `flex_grow(3)` writes `flex-grow: {3};`
+/// rather than a nested i-string. Every other `Binary` carries wrapper tokens
+/// spanning the whole construct, which is exactly what a span splice cannot read.
+fn inline_argument<'a>(
+    node: &'a vilan_core::Spanned<Node<'a>>,
+    style_source: &'a str,
+    bindings: &[(&str, &InlineValue<'a>)],
+) -> Option<InlineValue<'a>> {
+    if let Node::Accessor(name) = node.0
+        && let Some((_, value)) = bindings.iter().find(|(parameter, _)| *parameter == name)
+    {
+        return Some((*value).clone());
+    }
+    if let Node::Binary(vilan_core::node::BinaryOp::Add, left, right) = &node.0 {
+        if matches!(left.0, Node::String("")) {
+            return inline_argument(right, style_source, bindings);
+        }
+        return None;
+    }
+    let mut holes: Vec<(vilan_core::span::Span, usize)> = Vec::new();
+    collect_parameter_spans(node, bindings, &mut holes);
+    let range = node.1.into_range();
+    if holes.is_empty() {
+        return Some(InlineValue {
+            text: style_source.get(range)?.to_string(),
+            written: Some((node, style_source)),
+        });
+    }
+    holes.sort_by_key(|(span, _)| span.start);
+    let mut text = String::new();
+    let mut cursor = range.start;
+    for (span, index) in holes {
+        if span.start < cursor || span.end > range.end {
+            return None;
+        }
+        text.push_str(style_source.get(cursor..span.start)?);
+        text.push_str(&bindings[index].1.text);
+        cursor = span.end;
+    }
+    text.push_str(style_source.get(cursor..range.end)?);
+    Some(InlineValue {
+        text,
+        written: None,
+    })
+}
+
+/// Every span inside `node` at which one of `bindings`' parameters is READ.
+///
+/// The walk is deliberately not `for_each_child`'s: a member name is not a
+/// scope name, so `value.value()` reads the parameter once (its subject) and
+/// names a method the second time, and substituting both would write
+/// `Display::Flex.Display::Flex()`.
+fn collect_parameter_spans<'a>(
+    node: &'a vilan_core::Spanned<Node<'a>>,
+    bindings: &[(&str, &InlineValue<'a>)],
+    out: &mut Vec<(vilan_core::span::Span, usize)>,
+) {
+    match &node.0 {
+        Node::Accessor(name) => {
+            if let Some(index) = bindings.iter().position(|(parameter, _)| parameter == name) {
+                out.push((node.1, index));
+            }
+        }
+        Node::MemberAccessor(subject, member) => {
+            collect_parameter_spans(subject, bindings, out);
+            // `x.f(a)` — `f` is the method's name, `a` is an expression.
+            if let Node::Call(_, _, arguments) = &member.0 {
+                for argument in &arguments.0 {
+                    collect_parameter_spans(argument, bindings, out);
+                }
+            }
+        }
+        Node::StaticAccessor(subject, _, _) => collect_parameter_spans(subject, bindings, out),
+        _ => node
+            .0
+            .for_each_child(&mut |child| collect_parameter_spans(child, bindings, out)),
+    }
 }
 
 /// A `raw` argument as a declaration's value. A plain token run is written as
@@ -6808,9 +7218,15 @@ pub(crate) mod tests {
     /// The conversion offered at the `~` cursor in a `css`-block fixture, as
     /// `(to_chain, replaced text, replacement)`.
     fn css_conversion(body: &str) -> Option<(bool, String, String)> {
-        let source = format!(
+        css_conversion_of(&format!(
             "import std::style::{{ Color, Length, Style, space, style }};\n\nfun card(): Style {{\n{body}}}\n"
-        );
+        ))
+    }
+
+    /// [`css_conversion`] over a whole FILE rather than one function body — the
+    /// shapes that need their own imports or an `impl Style` of their own.
+    fn css_conversion_of(source: &str) -> Option<(bool, String, String)> {
+        let source = source.to_string();
         let offset = source.find('~').expect("fixture needs a `~` cursor");
         let text = source.replace('~', "");
         let (directory, document) = analyze_workspace(&[("main.vl", &text)]);
@@ -6878,20 +7294,94 @@ pub(crate) mod tests {
         );
     }
 
-    // The inverse is PARTIAL, and says so by not being offered. A typed
-    // property method is `with_length("padding", …)`, which is not the node
-    // `padding: {space(4)};` lowers to — so a chain carrying one has no block
-    // spelling this refactor is entitled to invent.
+    // E167: a TYPED property link converts, because the declarations it writes
+    // are read out of std's own `style.vl` rather than restated in a table
+    // beside it. `padding_x`'s body is
+    // `self.with_length("padding-left", value).with_length("padding-right", value)`,
+    // so the conversion is two declarations and the argument lands in both holes
+    // — which is exactly what the method does, and cannot drift from it.
     #[test]
-    fn refactor_declines_a_chain_with_a_typed_property_link() {
+    fn refactor_converts_a_typed_property_link_by_inlining_its_std_body() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.padding_x(space(4))\n\t\t.color(Color::gray(900))\n\t\t.gap(space(2))\n",
+        )
+        .expect("a typed chain converts");
+        assert!(!conversion.0, "chain -> block");
         assert_eq!(
-            css_conversion("\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"display\", \"flex\")\n"),
-            None
+            conversion.2,
+            "css {\n\t\tpadding-left: {space(4)};\n\t\tpadding-right: {space(4)};\n\t\tcolor: {Color::gray(900)};\n\t\tgap: {space(2)};\n\t}",
+            "{conversion:?}"
         );
-        // `class_list` ends the chain in something that is not a `Style` at
-        // all — likewise not convertible.
+    }
+
+    // The seed. `style_chain_links` matched a BARE `style` only, which is the one
+    // spelling the estate does not write — the web prelude publishes the MODULE,
+    // so the templates, the docs and kolt all write `style::style()` and every
+    // chain in real code was refused at its first token. The rule is syntactic:
+    // the last segment is `style`, the call takes no arguments.
+    #[test]
+    fn refactor_reads_a_path_spelled_style_seed() {
+        let conversion = css_conversion_of(
+            "import std::style;\n\nfun card(): style::Style {\n\tsty~le::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))\n}\n",
+        )
+        .expect("a `style::style()` chain converts");
         assert_eq!(
-            css_conversion("\tsty~le()\n\t\t.raw(\"display\", \"flex\")\n\t\t.class_list()\n"),
+            conversion.1,
+            "style::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))",
+            "the whole chain is replaced"
+        );
+        assert_eq!(
+            conversion.2, "css {\n\t\tdisplay: flex;\n\t\tpadding: {style::space(4)};\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // The SPLIT, on the shape kolt actually writes (`styles.vl`'s button
+    // styles): std shorthands and a `raw`, a condition combinator, and a user
+    // extension declared in the file's own `impl Style`. One unconvertible link
+    // used to refuse the whole chain; the chain splits at the FIRST of them now,
+    // and the rest is written as a postfix chain on the block — which parses and
+    // types, and keeps its order relative to everything the block holds, so the
+    // two spellings mean the same style.
+    #[test]
+    fn refactor_splits_a_chain_at_a_link_with_no_block_spelling() {
+        let conversion = css_conversion_of(
+            "import std::style::{ Color, Length, Style, space, style };\n\n             impl Style {\n\tfun select_off(self): Style {\n\t\tself.raw(\"user-select\", \"none\")\n\t}\n}\n\n             fun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
+        )
+        .expect("a kolt-shaped chain converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpadding: {space(4)};\n\t\toutline: none;\n\t\tborder-radius: {Length::px(4)};\n\t\t.attribute(\"disabled\", None) {\n\t\t\tcolor: {Color::gray(300)};\n\t\t}\n\t}.select_off().hover(style().background(Color::gray(100)))",
+            "{conversion:?}"
+        );
+    }
+
+    // A std method whose body is not a chain at all is a BARRIER, not a guess:
+    // `border` delegates to `with_border`, whose body carries two `if`s and the
+    // `rule` chokepoint, so it has no declaration spelling and the chain splits
+    // there. This is the inliner refusing rather than inventing.
+    #[test]
+    fn refactor_splits_at_a_std_method_whose_body_is_not_a_chain() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.padding(space(4))\n\t\t.border(Length::px(1), Color::gray(300))\n",
+        )
+        .expect("the convertible prefix converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpadding: {space(4)};\n\t}.border(Length::px(1), Color::gray(300))",
+            "{conversion:?}"
+        );
+    }
+
+    // And a chain with NO convertible link offers nothing at all: a `css { }`
+    // with the whole chain hung off it is not a conversion.
+    #[test]
+    fn refactor_offers_nothing_when_no_link_has_a_block_spelling() {
+        assert_eq!(css_conversion("\tsty~le()\n\t\t.class_list()\n"), None);
+        assert_eq!(
+            css_conversion_of(
+                "import std::style::{ Style, style };\n\n                 impl Style {\n\tfun select_off(self): Style {\n\t\tself.raw(\"user-select\", \"none\")\n\t}\n}\n\n                 fun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
+            ),
             None
         );
     }
