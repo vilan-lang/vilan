@@ -240,6 +240,18 @@ const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as
 pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
+/// The rule `export <expression>;` breaks (B321). Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spellings).
+///
+/// [`Parser::parse_export`] takes any STATEMENT, and an expression statement is
+/// one, so `export (helper);` and `export * helper;` (which is `export` of the
+/// deref `*helper`) both compiled clean and published nothing — a form with no
+/// reading, accepted silently. Zero occurrences in the estate.
+const EXPORT_TAKES_AN_ITEM: &str = "`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level \
+     `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — and an \
+     expression is none of those: it publishes nothing, checks nothing and emits nothing";
+
 /// The rule a MALFORMED import path breaks (B320). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spelling).
@@ -272,6 +284,39 @@ const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-sepa
 /// `public` is the same reflex one synonym over, and it was being refused in a
 /// word its author never wrote (E109's F21). That is the only reason this is a
 /// function where every other curated rule is a constant.
+/// Whether `export` can take this statement (B321): an ITEM, an `import`/`use`,
+/// or another `export`. The attribute wrappers are transparent — they annotate
+/// the item under them and `export [derive(Wire)] struct S { .. }` is the same
+/// declaration — so they are asked about their inner node rather than admitted
+/// blindly.
+///
+/// [`Node::Error`] is admitted: it is the nesting bound's stand-in, already
+/// refused once, and a second message about the same input is the double-report
+/// diagnostics-standard B5 forbids.
+fn export_takes(node: &Node<'_>) -> bool {
+    match node {
+        Node::Derive(_, inner) | Node::Service(_, inner) | Node::MacroAttribute(_, _, _, inner) => {
+            export_takes(&inner.0)
+        }
+        Node::Func(_)
+        | Node::MacroFun(_)
+        | Node::MacroInvocation(..)
+        | Node::MacroBlock(_)
+        | Node::Struct(..)
+        | Node::Enum(..)
+        | Node::Trait(..)
+        | Node::Impl(..)
+        | Node::Module(..)
+        | Node::Import(_)
+        | Node::Use(_)
+        | Node::Export(_)
+        | Node::Let(..)
+        | Node::LetDestructure(..)
+        | Node::Error => true,
+        _ => false,
+    }
+}
+
 fn visibility_marker_rule(marker: &str) -> String {
     format!(
         "`{marker}` is not a vilan keyword: a module's items are importable as they stand — \
@@ -5781,6 +5826,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         let start = self.position;
         self.expect(&Token::Export)?;
         let inner = self.parse_statement()?;
+        // B321: `parse_statement` reads an EXPRESSION statement too, so
+        // `export (helper);` and `export * helper;` parsed and meant nothing.
+        // Reported and KEPT — the inner statement is whatever the author wrote
+        // and dropping it would unbind a name the rest of the file uses, which
+        // is `recover_missing_terminator`'s argument applied to a wrapper.
+        if !export_takes(&inner.0) {
+            self.errors.push(ParseError {
+                span: inner.1,
+                reason: ParseErrorReason::Rule(EXPORT_TAKES_AN_ITEM),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         Some((Node::Export(Box::new(inner)), self.span_from(start)))
     }
 
@@ -8070,6 +8128,52 @@ mod tests {
         // rest still parses — one error, the skipped BEL).
         let errors = rendered_errors("fun main() { \u{0007} }\n");
         assert_eq!(errors, vec!["found '\\u{7}' expected a token".to_string()]);
+    }
+
+    #[test]
+    fn export_refuses_an_expression_and_keeps_every_item() {
+        // B321: `parse_export` took any STATEMENT, so an `export` of a
+        // parenthesised expression — and of `*` followed by a name, which is
+        // `export` of a deref — compiled clean and published nothing. The two
+        // nonsense forms, then every form `export` really takes.
+        for nonsense in ["export (helper);\n", "export * helper;\n"] {
+            assert_eq!(
+                rendered_errors(nonsense),
+                vec![EXPORT_TAKES_AN_ITEM.to_string()],
+                "for {nonsense:?}"
+            );
+        }
+        for item in [
+            "export fun helper(): i32 { 1 }\n",
+            "export struct S { x: i32 }\n",
+            "export enum E { A }\n",
+            "export trait T { fun f(); }\n",
+            "export impl S { fun make(): i32 { 1 } }\n",
+            "export mod m { fun f() {} }\n",
+            "export let answer = 42;\n",
+            "export import pkg::io::print;\n",
+            "export use pkg::a::b;\n",
+            // The attribute wrappers are transparent: the rule asks about the
+            // declaration under them, not about the wrapper.
+            "export [derive(Wire)] struct S { x: i32 }\n",
+            "export external fun serve();\n",
+        ] {
+            assert!(
+                rendered_errors(item).is_empty(),
+                "`export` takes {item:?}: {:?}",
+                rendered_errors(item)
+            );
+        }
+        // The refusal is about the SHAPE, not about the parentheses: a call and
+        // an operator tower are refused with the same rule.
+        assert_eq!(
+            rendered_errors("export helper();\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("export 1 + 1;\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
     }
 
     #[test]
