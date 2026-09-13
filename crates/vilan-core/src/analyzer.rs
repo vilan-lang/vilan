@@ -2776,6 +2776,15 @@ const WIRE_SCALAR_NAMES: &[&str] = &[
     "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
 ];
 
+/// The scalars `Hashable` is satisfied by outright — the syntactic oracle's
+/// half of the answer (`is_hashable_type`) and the resolved one's
+/// (`resolved_type_is_hashable`) read the SAME list, because a type one accepts
+/// and the other rejects is a field the derive admits and a key the `[rpc]`
+/// return check refuses, or the reverse.
+const HASHABLE_SCALAR_NAMES: &[&str] = &[
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "Hash",
+];
+
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
 /// DECLARATION's entity id — the file every member span indexes into, which the
 /// check cannot ask for later because it runs after `build()` (B112) — plus each
@@ -3965,6 +3974,12 @@ pub struct Analyzer<'src> {
     // the bound check computes is the ELEMENT's and the label the refusal
     // reported is the collection's.
     rpc_refused_wire_types: HashSet<String>,
+    /// B319's half of the set above: the KEY types a keyed-handle return
+    /// refusal has already named, whose generated bound failures are `Wire`
+    /// AND `Hashable` (`reply_source_keyed<K: Wire + Hashable, ..>`). Kept
+    /// apart from `rpc_refused_wire_types` because the trait it stands down is
+    /// the wider pair, and only a key earns it.
+    rpc_refused_key_types: HashSet<String>,
     // The refusals above that actually SILENCED a follow-on. Ordering asks only
     // about these (`normalize_diagnostic_order`): a refusal that caused
     // stand-downs is the ROOT of everything still printed around it, and a root
@@ -4078,6 +4093,12 @@ pub struct Analyzer<'src> {
     // struct, and the syntactic allowlist could not see it. `resolved_type_is_wire`
     // asks `satisfies_trait_bound` about this trait once its fast paths miss.
     wire_trait_id: Option<Id>,
+    // The `std::hash` `Hashable` TRAIT, if loaded — `wire_trait_id`'s twin, and
+    // read for the same reason (B319): what is Hashable is what an
+    // `impl .. with Hashable` applies to, and the name set above it cannot see
+    // a hand-written one. `resolved_type_is_hashable` asks
+    // `satisfies_trait_bound` about this trait once its fast paths miss.
+    hashable_trait_id: Option<Id>,
     print_fn_id: Option<Id>,
     // `std::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
@@ -4873,6 +4894,7 @@ impl<'src> Analyzer<'src> {
             expose_refused_elements: HashSet::default(),
             expose_refused_key_bounds: HashSet::default(),
             rpc_refused_wire_types: HashSet::default(),
+            rpc_refused_key_types: HashSet::default(),
             stood_down_refusals: HashSet::default(),
             parameter_annotation_type_ids: HashMap::default(),
             field_annotation_type_ids: HashMap::default(),
@@ -4890,6 +4912,7 @@ impl<'src> Analyzer<'src> {
             guard_continuations: Vec::new(),
             source_trait_id: None,
             wire_trait_id: None,
+            hashable_trait_id: None,
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
@@ -5584,6 +5607,22 @@ impl<'src> Analyzer<'src> {
                         && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
                         && self
                             .rpc_refused_wire_types
+                            .contains(&without_spaces(&type_label))
+                    {
+                        continue;
+                    }
+                    // B319's half of the same stand-down: a keyed handle's KEY
+                    // is held to `Wire + Hashable` (the generated
+                    // `reply_source_keyed`/`expose_keyed_cell` bounds), so a
+                    // key the return refusal has already named fails BOTH in
+                    // generated code — four reports for one annotation. The
+                    // Wire half is covered above; this is the other trait, and
+                    // only for a type a KEY refusal named.
+                    if !self.rpc_refused_key_types.is_empty()
+                        && trait_label == "Hashable"
+                        && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
+                        && self
+                            .rpc_refused_key_types
                             .contains(&without_spaces(&type_label))
                     {
                         continue;
@@ -6645,13 +6684,9 @@ impl<'src> Analyzer<'src> {
     /// oracles for "is this Hashable?" — this one and `satisfies_trait_bound` over
     /// the impl table — have to agree or a field the key check accepts is rejected.
     fn is_hashable_type(&self, node: &Node) -> bool {
-        const HASHABLE_SCALARS: &[&str] = &[
-            "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
-            "Hash",
-        ];
         match node {
             Node::Accessor(name) => {
-                HASHABLE_SCALARS.contains(name) || self.hashable_names.contains(*name)
+                HASHABLE_SCALAR_NAMES.contains(name) || self.hashable_names.contains(*name)
             }
             Node::AccessorWithGenerics(name, arguments) => {
                 matches!(*name, "List" | "Option")
@@ -15118,6 +15153,65 @@ impl<'src> Analyzer<'src> {
                             method_id,
                         );
                     }
+                    // B319: a KEYED handle's key crosses the wire too, and the
+                    // rule reached only the element — so `KeyedCell<NotWire,
+                    // T>` passed here and failed inside the generated
+                    // `reply_source_keyed`, whose bound is `K: Wire +
+                    // Hashable`, naming a function the author never wrote. Said
+                    // here in the method's own vocabulary instead, on the
+                    // annotation the author did write, and both halves of the
+                    // bound at once because a key that is neither fails both.
+                    if let Some(key) = type_node.and_then(handle_return_key) {
+                        let key_type_id = member_type_id
+                            .and_then(|type_id| self.resolved_handle_return_key(type_id));
+                        // A key whose own annotation never grounded has a
+                        // diagnostic of its own; this one stands down rather
+                        // than adding a second (the element half's rule).
+                        let (key_is_wire, key_is_hashable) = match key_type_id {
+                            Some(key_type_id) => (
+                                self.resolved_type_is_wire(key_type_id),
+                                self.resolved_type_is_hashable(key_type_id),
+                            ),
+                            None => (true, true),
+                        };
+                        if !key_is_wire || !key_is_hashable {
+                            if let Some(key_type_id) = key_type_id {
+                                if !key_is_wire {
+                                    self.record_refused_rpc_wire_type(key_type_id);
+                                }
+                                let label = self.pretty_print_type(
+                                    &key_type_id.get_type(self),
+                                    &HashMap::default(),
+                                );
+                                self.rpc_refused_key_types.insert(without_spaces(&label));
+                            }
+                            let rendered = render_type(key);
+                            let missing = match (key_is_wire, key_is_hashable) {
+                                (false, false) => "neither Wire nor Hashable",
+                                (false, true) => "not Wire",
+                                _ => "not Hashable",
+                            };
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: format!(
+                                        "`[rpc]` method `{method_name}` returns a keyed handle \
+                                         whose key `{rendered}` is {missing}: the client names \
+                                         the key in every keyed `Subscribe`, each `Delta` the \
+                                         channel forwards carries it, and the mirror indexes by \
+                                         it — so a keyed channel's key must be both (a scalar, \
+                                         `str`, `bool`, a backed enum, a `[derive(Wire, \
+                                         Hashable)]` type, or a type with an `impl .. with \
+                                         Wire` and an `impl .. with Hashable`). The ELEMENT's \
+                                         own requirement is unchanged"
+                                    ),
+                                },
+                                method_id,
+                            );
+                        }
+                    }
                     continue;
                 }
                 let member_is_wire =
@@ -15614,6 +15708,39 @@ impl<'src> Analyzer<'src> {
         self.satisfies_trait_bound(&type_, wire_trait_id, &[], 0)
     }
 
+    /// `resolved_type_is_wire`'s twin for `Hashable` (B319): the same shape —
+    /// the syntactic fast paths `is_hashable_type` answers with, then the impl
+    /// table for everything else, so a hand-written `impl .. with Hashable`
+    /// counts exactly as a derived one does.
+    fn resolved_type_is_hashable(&mut self, type_id: TypeId) -> bool {
+        let type_ = type_id.get_type(self);
+        let (name, arguments) = match &type_ {
+            Type::Struct(id, arguments) => (self.structs.get(id).map(|s| s.name), arguments),
+            Type::Enum(id, arguments) => (self.enums.get(id).map(|e| e.name), arguments),
+            _ => return false,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        if HASHABLE_SCALAR_NAMES.contains(&name) {
+            return true;
+        }
+        if self.hashable_names.contains(name) {
+            return true;
+        }
+        if matches!(name, "List" | "Option")
+            && arguments
+                .iter()
+                .all(|argument| self.resolved_type_is_hashable(*argument))
+        {
+            return true;
+        }
+        let Some(hashable_trait_id) = self.hashable_trait_id else {
+            return false;
+        };
+        self.satisfies_trait_bound(&type_, hashable_trait_id, &[], 0)
+    }
+
     /// [`handle_return_element`]'s descent, read off a RESOLVED type: the
     /// `SignalCell<T>` element behind an `[rpc]` handle return, through an
     /// optional `Option`.
@@ -15630,9 +15757,8 @@ impl<'src> Analyzer<'src> {
                 arguments.as_slice(),
             ) {
                 ("SignalCell", [element]) => Some(*element),
-                // A79's keyed handle: the ELEMENT is the second argument, and
-                // it is the one whose Wire-ness this rule tests — the key's is
-                // not reached here (see the written twin).
+                // A79's keyed handle: the ELEMENT is the second argument.
+                // Its KEY is `resolved_handle_return_key`'s answer (B319).
                 ("KeyedCell", [_key, element]) => Some(*element),
                 _ => None,
             },
@@ -15641,6 +15767,29 @@ impl<'src> Analyzer<'src> {
                 arguments.as_slice(),
             ) {
                 ("Option", [inner]) => self.resolved_handle_return_element(*inner),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// [`handle_return_key`]'s descent, read off a RESOLVED type (B319) — the
+    /// element descent's twin, one argument to the left, and `None` for a
+    /// handle that is not keyed.
+    fn resolved_handle_return_key(&self, type_id: TypeId) -> Option<TypeId> {
+        match type_id.get_type(self) {
+            Type::Struct(id, arguments) => match (
+                self.structs.get(&id).map(|struct_| struct_.name)?,
+                arguments.as_slice(),
+            ) {
+                ("KeyedCell", [key, _element]) => Some(*key),
+                _ => None,
+            },
+            Type::Enum(id, arguments) => match (
+                self.enums.get(&id).map(|enum_| enum_.name)?,
+                arguments.as_slice(),
+            ) {
+                ("Option", [inner]) => self.resolved_handle_return_key(*inner),
                 _ => None,
             },
             _ => None,
@@ -47595,11 +47744,9 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
             }
         }
         // A79: `KeyedCell<K, T>` is a handle return too, and its element is
-        // `T`. The KEY also crosses the wire — it rides every `Delta` and
-        // every keyed `Subscribe` — and is NOT tested here: this rule answers
-        // one element, and a non-Wire key still fails, in the generated
-        // `reply_source_keyed`'s `K: Wire` bound rather than in the method's
-        // own vocabulary. Tracked rather than papered over.
+        // `T`. Its KEY crosses the wire as well — it rides every `Delta` and
+        // every keyed `Subscribe` — and is `handle_return_key`'s answer (B319),
+        // checked beside this one.
         Node::AccessorWithGenerics(name, arguments) if *name == "KeyedCell" => {
             match arguments.0.as_slice() {
                 [_key, element] => Some(&element.0),
@@ -47609,6 +47756,34 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
         Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
             match arguments.0.as_slice() {
                 [inner] => handle_return_element(&inner.0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The KEY of a keyed handle return, as WRITTEN (B319) —
+/// [`handle_return_element`]'s twin one argument to the left, and `None` for
+/// every return that is not a keyed handle.
+///
+/// A keyed channel's key is as much a wire value as its element: the client
+/// names it in every keyed `Subscribe`, each `Delta` carries it, and the
+/// mirror indexes by it — which is why the generated code's bound is `K: Wire +
+/// Hashable` (`reply_source_keyed`, `expose_keyed_cell`). Before this, a key
+/// that was neither failed four times inside that generated code, naming
+/// functions the author never wrote.
+fn handle_return_key<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
+    match node {
+        Node::AccessorWithGenerics(name, arguments) if *name == "KeyedCell" => {
+            match arguments.0.as_slice() {
+                [key, _element] => Some(&key.0),
+                _ => None,
+            }
+        }
+        Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
+            match arguments.0.as_slice() {
+                [inner] => handle_return_key(&inner.0),
                 _ => None,
             }
         }
@@ -53468,6 +53643,15 @@ fn analyze_inner<'src>(
         .get("wire")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
         .and_then(|scope| scope.name_to_id_map.get("Wire").copied());
+
+    // The `std::hash` `Hashable` TRAIT, if `hash.vl` loaded — captured exactly
+    // as `Wire` is, and read for the same reason (B319): a keyed channel's key
+    // must be Hashable, and a hand-written `impl .. with Hashable` is as good
+    // as a derived one.
+    analyzer.hashable_trait_id = module_scopes
+        .get("hash")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("Hashable").copied());
 
     // The `std::json` `JsonValue` struct, if `json.vl` loaded — same treatment.
     // Its `field` method id is captured after `build()` to lower to `self[name]`.

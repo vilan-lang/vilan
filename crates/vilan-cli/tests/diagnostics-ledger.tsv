@@ -458,3 +458,4 @@ row	flagship	key
 424	-	a custom property name cannot contain {...} — the name is one token, like --button-color
 425	-	cannot find type '{name}'; this `impl`'s subject is the trait `{trait_name}` itself, so it is written for EVERY type that implements it — and that type has no name here. Say `Self`, or name it in the head: `impl type {name}: {trait_name}<..>`
 NEW	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
+NEW	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
