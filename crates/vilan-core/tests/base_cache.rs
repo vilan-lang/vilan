@@ -1398,6 +1398,189 @@ fn the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// THE PIN (M67): the budget never evicts a world a LIVE entry is analyzed
+/// from — and does evict it the moment the entry stops being live.
+///
+/// M24's budget is least-recently-used, which is the right policy for a cache
+/// and the wrong one for the document the user is looking at: a session whose
+/// working set is one world larger than its budget evicts exactly what the next
+/// visit wants (measured on kolt, `base_cache_budget_walk`: 7 → 17 misses over
+/// a nineteen-file scan for a budget one world short of the cycle). The ruling
+/// carves out the front end's own retained set, and this holds the carve-out to
+/// both of its halves: exempt while live, ordinary the moment it is not.
+///
+/// Four entries, each importing a different sibling so each mints its own key
+/// (M21), and every world the same size by construction — so the budget
+/// arithmetic below is exact rather than approximate, exactly as
+/// [`the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget`]'s is.
+#[test]
+fn a_live_entrys_world_is_never_the_budgets_victim() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    const ENTRIES: usize = 3;
+    let root = std::env::temp_dir().join(format!("vilan_m67_live_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch dir");
+    let mut entry_paths = Vec::new();
+    let mut entry_sources: Vec<&'static str> = Vec::new();
+    for index in 0..ENTRIES {
+        std::fs::write(
+            root.join(format!("live_mod_{index}.vl")),
+            format!(
+                "fun live_value_{index}(): i32 {{\n\t{:04}\n}}\n",
+                2000 + index
+            ),
+        )
+        .expect("write module");
+        let entry_path = root.join(format!("live_entry_{index}.vl"));
+        let source = format!(
+            "import pkg::live_mod_{index}::live_value_{index};\n\nfun main() {{\n\tlet _v = live_value_{index}();\n}}\n"
+        );
+        std::fs::write(&entry_path, &source).expect("write entry");
+        entry_sources.push(Box::leak(source.into_boxed_str()));
+        entry_paths.push(entry_path);
+    }
+
+    let analyze = |index: usize| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_paths[index].clone();
+        let source = entry_sources[index];
+        let diagnostics = on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            drop(program);
+            diagnostics
+        });
+        assert_eq!(diagnostics, "[]", "entry {index} must analyze clean");
+    };
+
+    let fill = || {
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+        vilan_core::analyzer::base_cache_clear();
+        for index in 0..ENTRIES {
+            analyze(index);
+        }
+        assert_eq!(
+            vilan_core::analyzer::base_cache_retained(),
+            ENTRIES,
+            "three distinct sibling sets retain three worlds under the default \
+             budget — the vacuity guard this pin's arithmetic rests on",
+        );
+    };
+
+    // THE CONTROL, and it comes first: with nothing declared live, the budget
+    // takes the least recently used world, which is entry 0's. A pin that
+    // asserted only the exemption would pass over a policy that evicts nothing
+    // at all.
+    vilan_core::analyzer::set_base_cache_live_entries(&[]);
+    fill();
+    let one_world = vilan_core::analyzer::base_cache_retained_bytes() / ENTRIES;
+    assert!(one_world > 0, "a stored world must weigh something");
+    let budget = 2 * one_world;
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        2,
+        "the budget must evict down to what fits",
+    );
+    let (hits_before, misses_before) = stats();
+    analyze(0);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before, misses_before + 1),
+        "without the exemption the least-recently-used world is the victim — \
+         M24's policy, and the control for the one below",
+    );
+
+    // THE PIN. Same three worlds, same budget, and entry 0 declared live: it is
+    // still the least recently used, and it is the one world that stays.
+    fill();
+    vilan_core::analyzer::set_base_cache_live_entries(&[entry_paths[0].clone()]);
+    // Declaring a path does not tell the cache which key it names — an
+    // admission does. Entry 0's next analysis is where it is learned (the
+    // refocus M63 schedules), and the two analyses after it put entry 0 back at
+    // the tail of the LRU, which is what makes the assertion below a claim
+    // about the exemption rather than about recency.
+    analyze(0);
+    analyze(1);
+    analyze(2);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_live_entries(),
+        (1, 1),
+        "one entry declared live, and its key learned at its next admission",
+    );
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    assert_eq!(vilan_core::analyzer::base_cache_retained(), 2);
+    let (hits_before, misses_before) = stats();
+    analyze(0);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before + 1, misses_before),
+        "the live entry's world must survive a budget that evicted the world \
+         next to it — the eviction the control just watched happen",
+    );
+
+    // THE BOUND. Every entry live and a one-byte budget: the cache keeps the
+    // exempt worlds and nothing else, and that is the stated bound — the
+    // budget, or the exempt set (the live entries plus the world just stored),
+    // whichever is more. Not a bound that can be exceeded quietly: it is
+    // exactly what the exemption promises to hold.
+    fill();
+    vilan_core::analyzer::set_base_cache_live_entries(&entry_paths);
+    for index in 0..ENTRIES {
+        analyze(index);
+    }
+    assert_eq!(
+        vilan_core::analyzer::base_cache_live_entries(),
+        (ENTRIES, ENTRIES),
+        "every entry declared live, every key learned",
+    );
+    vilan_core::analyzer::set_base_cache_budget(1);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        ENTRIES,
+        "a one-byte budget may not take a world a live entry names",
+    );
+    assert!(
+        vilan_core::analyzer::base_cache_retained_bytes() <= 1 + ENTRIES * one_world,
+        "retained {} B against the bound the exemption states: the budget (1 B) \
+         plus the exempt worlds",
+        vilan_core::analyzer::base_cache_retained_bytes(),
+    );
+
+    // And the other half of the carve-out: an entry that stops being live stops
+    // being exempt. The same one-byte budget, applied again with nothing
+    // declared, takes everything — so what held those worlds was the
+    // declaration and not some other reluctance to evict.
+    vilan_core::analyzer::set_base_cache_live_entries(&[]);
+    vilan_core::analyzer::set_base_cache_budget(1);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        0,
+        "with the declaration withdrawn the budget evicts what it could not \
+         touch a moment ago",
+    );
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---------------------------------------------------------------------------
 // M19 T1 — module reuse over a cached world
 // (`per-module-analysis-reuse.md` §4.1). The base cache decides WHICH world an
