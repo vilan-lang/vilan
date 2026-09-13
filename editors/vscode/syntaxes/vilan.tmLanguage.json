@@ -387,9 +387,9 @@
   "generics": {
    "patterns": [
     {
-     "comment": "A generic argument list (E161). Structured as begin/end rather than matched, for two reasons a `match` cannot serve: a TextMate `match` sees ONE LINE, so a head wrapped across lines lost its closing `>` to the operator fallback (and, at the start of a line, to E115's element terminator); and the list NESTS, so one rule including itself is what makes `Source<Option<_: Source<type U>>>` close three lists with `>>>` instead of reading them as a shift. The begin is a `<` glued to a type-name character \u2014 element syntax's own atom-position rule (S2) read from the other side: a tag `<` opens an atom, so a `<` that does NOT is an argument list. The end is `>`, plus three bail-outs (`{`, `}`, `;`) that give the list back at a statement boundary, so the one shape that could run away \u2014 a glued comparison, which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book \u2014 costs the rest of its own statement rather than the rest of the file. The `;` bail-out cost one honest form until E162: a FIXED-ARRAY argument (`SignalCell<[i32; 4]>`) ended the list at the array's LENGTH separator and the tail fell back to the top-level rules. The `[`…`]` sub-rule below is what gives it back — the array is consumed as its own region, so the bail-out never sees that `;` at all.",
+     "comment": "A generic argument list (E161). Structured as begin/end rather than matched, for two reasons a `match` cannot serve: a TextMate `match` sees ONE LINE, so a head wrapped across lines lost its closing `>` to the operator fallback (and, at the start of a line, to E115's element terminator); and the list NESTS, so one rule including itself is what makes `Source<Option<_: Source<type U>>>` close three lists with `>>>` instead of reading them as a shift. The begin is a `<` glued to a type-name character \u2014 element syntax's own atom-position rule (S2) read from the other side: a tag `<` opens an atom, so a `<` that does NOT is an argument list. The end is `>`, plus three bail-outs (`{`, `}`, `;`) that give the list back at a statement boundary, so the one shape that could run away \u2014 a glued comparison, which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book \u2014 costs the rest of its own statement rather than the rest of the file. The `;` bail-out cost one honest form until E162: a FIXED-ARRAY argument (`SignalCell<[i32; 4]>`) ended the list at the array's LENGTH separator and the tail fell back to the top-level rules. The `[`…`]` sub-rule below is what gives it back — the array is consumed as its own region, so the bail-out never sees that `;` at all. The begin declines a `<` followed by `/` (E164): a `</` is a CLOSING TAG and never an argument list, and without that guard `<span>hello</span>` offered this rule a `<` glued to the `o` of `hello` and had `</span>` painted as a generic — the commonest markup shape in the language, mis-coloured, and invisible to a pin that reads this regex instead of running it.",
      "name": "meta.generic.vilan",
-     "begin": "(?<=[A-Za-z0-9_])<",
+     "begin": "(?<=[A-Za-z0-9_])<(?!/)",
      "end": ">|(?=[{};])",
      "beginCaptures": {
       "0": {
@@ -447,8 +447,8 @@
   "elements": {
    "patterns": [
     {
-     "comment": "Element syntax (element-syntax S2): a tag name glued to `<` or `</` \u2014 the grammar's own atom-position rule; a spaced comparison never matches. The `<` may NOT follow an identifier character (E161): S2 says a tag `<` starts an ATOM, so `Option<type _>` and `SignalCell<str>` open a generic argument list and never a tag named `type` or `str` \u2014 this is the grammar catching up with the spec, not a new rule.",
-     "match": "(?<![A-Za-z0-9_])(</?)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(/?>)?",
+     "comment": "A CLOSING tag (E164), its own rule and deliberately WITHOUT the `(?<![A-Za-z0-9_])` guard the opening form carries. That guard is element syntax's atom-position rule (S2): a tag `<` OPENS an atom, so a `<` glued to the name before it is a generic argument list rather than a tag. A `</` is never an argument list, whatever precedes it — and with the guard here, `</span>` straight after text was refused by this rule and taken by the generic list instead, whose begin is a `<` glued to an identifier character, which is exactly what text ending in a letter offers it. The generic list declines a `</` now and this rule takes it wherever it sits. The `>` stays optional so a close being typed still reads as one.",
+     "match": "(</)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(>)?",
      "captures": {
       "1": {
        "name": "punctuation.definition.tag.vilan"
@@ -462,13 +462,31 @@
      }
     },
     {
-     "comment": "A multi-line element head's terminator (E115). The rule above is a `match`, and a TextMate `match` sees one line at a time \u2014 so when a head's attributes are written one per line and the `>` lands on a line of its own, that rule cannot reach it and the operator list painted it as a comparison. A `>` or `/>` alone on its line is that terminator: the formatter breaks AFTER a binary operator and never before one, so no formatted line begins with a bare `>`. A `>` that closes a GENERIC list never reaches this rule (E161): the generic rule is a begin/end and a begin/end spans lines, so the list it opened consumes its own closing bracket wherever that lands \u2014 which is what leaves this rule to the element heads it was written for. The language server paints the same bracket from the parse, which is the authority whenever it is running; this is what the file looks like without it.",
-     "match": "^\\s*(/?>)",
-     "captures": {
+     "comment": "An element HEAD, from `<tag` to the `>` or `/>` that closes it (element-syntax S2). A begin/end REGION since E164, and that is the whole fix: the head was a `match`, a TextMate `match` sees ONE LINE, and its optional `(/?>)` could only reach a `>` that no head item stood between — so `<div class(\"row\")>` had its `>` painted by the operator list, and a head written one item per line had E115's line-start rule for a `>` alone on its own line and nothing at all for any other position. A region ends where the head ends, wherever that is, and E115's rule is gone with the shape that needed it. The begin keeps the atom-position guard (E161), so `Option<type _>` is still an argument list and never a tag named `type`. The end carries the generic list's own three bail-outs (`{`, `}`, `;`) for the generic list's reason: the one shape this begin cannot tell from a head is a GLUED comparison (`a<b`), which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book, and the bail-out costs it the rest of its own statement rather than the rest of the file. A head item's VALUE is consumed by `#element-head-value` before the bail-out is ever offered the `{` or the `;` inside `on:click(|_| { bump(); })`.",
+     "name": "meta.tag.vilan",
+     "begin": "(?<![A-Za-z0-9_])(<)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)",
+     "end": "(/?>)|(?=[{};])",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.definition.tag.vilan"
+      },
+      "2": {
+       "name": "entity.name.tag.vilan"
+      }
+     },
+     "endCaptures": {
       "1": {
        "name": "punctuation.definition.tag.vilan"
       }
-     }
+     },
+     "patterns": [
+      {
+       "include": "#element-head-value"
+      },
+      {
+       "include": "$self"
+      }
+     ]
     },
     {
      "comment": "The event form `on:click(\u2026)`.",
@@ -483,6 +501,23 @@
      "comment": "A hyphenated attribute name in a head (`aria-label(`, `data-id(`).",
      "match": "\\b([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)+)(?=\\()",
      "name": "entity.other.attribute-name.vilan"
+    }
+   ]
+  },
+  "element-head-value": {
+   "patterns": [
+    {
+     "comment": "A head item's VALUE: the parenthesised expression in `class(\"row\")`, `on:click(|_| { bump(); })`, `hidden.show(a > b)`. Its own region for the reason E162's fixed-array sub-rule is one — the element head bails out at `{`, `}` and `;` so a glued comparison cannot run away, and those three characters are exactly what a closure-valued head item legitimately contains. Consuming the parens here means the bail-out is never offered them: a region's contained rules and its end pattern are matched at their earliest position, and the `(` comes first. It includes ITSELF for a nested call (`on:click(|| go())`) and `$self` for everything else an expression can be, so a value paints exactly as the same text would anywhere else.",
+     "begin": "\\(",
+     "end": "\\)",
+     "patterns": [
+      {
+       "include": "#element-head-value"
+      },
+      {
+       "include": "$self"
+      }
+     ]
     }
    ]
   },
