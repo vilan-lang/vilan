@@ -9,6 +9,7 @@ mod document;
 mod keystroke;
 mod line_index;
 mod manifest_completion;
+mod memory;
 mod publish;
 mod references;
 mod schedule;
@@ -2916,6 +2917,15 @@ impl LanguageServer for Backend {
         }
         // A document that never analyzed (open failed) still clears.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        // M64: the close above dropped this document's whole analysis — its
+        // program, its entry text and tree, its editor tables — and glibc does
+        // not hand that back to the OS on its own: closing kolt's eighteen
+        // files returned 418 MB to the allocator's free list and 62 MB to the
+        // system, so resident size ratcheted up across a session of opening and
+        // closing files and never came down. This is the ask. Linux/glibc only,
+        // a no-op everywhere else, and it is here rather than on a timer
+        // because a close is exactly the moment there is something to give.
+        memory::trim();
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
