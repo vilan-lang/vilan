@@ -109,6 +109,26 @@ const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[(
 /// Rows the enumeration cannot reach, ROWED BY HAND, with why the walk does
 /// not get to each (N41).
 ///
+/// **Keyed by the row's KEY, not by its number** (N76). A row number is the
+/// LEDGER's to assign at integration, so a lane that ships a message the walk
+/// cannot read had nowhere to record it: its row is `NEW` until the merge, and
+/// a second lane's `NEW` row in the same order would make an entry spelled
+/// `"NEW"` name the wrong one. The key is the row's own text and is written in
+/// the same commit as the message, so an entry here lands with the row it
+/// exempts and survives the renumbering untouched — the integrator's
+/// `apply_row_mapping.py` has nothing to rewrite in this block.
+///
+/// An entry's first field is a PREFIX of the key as `diagnostics-ledger.tsv`
+/// spells it, long enough to name exactly one row;
+/// [`every_hand_rowed_row_is_in_the_index`] resolves it and reds on a prefix
+/// that matches no row or several. Long enough is not 60 characters, which is
+/// what the batch-7 generation cut heads at and what this list was first
+/// imagined carrying: three of the `+` ladder's arms share their first 64
+/// characters and two more share 60, so the prefixes below run to whatever it
+/// takes to separate them. A prefix that goes ambiguous later reds rather than
+/// silently exempting the wrong row, which is the direction this list has to
+/// fail in.
+///
 /// `anchored_messages` reads the literal written AT its anchor. The `+`
 /// operator's refusal ladder writes none: it builds its six arms into a
 /// `let msg = if … { format!(…) } else if …`, then hands the binding over by
@@ -127,14 +147,34 @@ const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[(
 /// keeps the naming honest.
 const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     (
-        "352",
+        "`+` on `str` concatenates, and `{rhs_label}` has no string form: a \
+         parameter promises only what its bounds promise, and this",
         "the `+` ladder's unbounded-parameter concatenation arm (`analyzer.rs`)",
     ),
-    ("353", "its B179 arm — a parameter right of a number's `+`"),
-    ("354", "its B176 arm — bounded, but to the wrong promise"),
-    ("355", "its plain no-string-form arm"),
-    ("356", "its `str`-on-the-right arm"),
-    ("357", "its same-type arm, the ladder's fallthrough"),
+    (
+        "`+` adds two values of the same type, but the operands are \
+         `{lhs_label}` and `{rhs_label}`: `{rhs_label}`",
+        "its B179 arm — a parameter right of a number's `+`",
+    ),
+    (
+        "`+` on `str` concatenates, and `{rhs_label}` has no string form: a \
+         parameter promises only what its bounds promise, and no",
+        "its B176 arm — bounded, but to the wrong promise",
+    ),
+    (
+        "`+` on `str` concatenates, and `{rhs_label}` has no string form: \
+         concatenating",
+        "its plain no-string-form arm",
+    ),
+    (
+        "`+` on `{lhs_label}` adds, and `str` is not a number: only a",
+        "its `str`-on-the-right arm",
+    ),
+    (
+        "`+` adds two values of the same type, but the operands are \
+         `{lhs_label}` and `{rhs_label}`: there",
+        "its same-type arm, the ladder's fallthrough",
+    ),
     // B200's unary ladders, built the same way and handed over by the same
     // field shorthand — one `let msg = if … else if …` per operator. Their
     // arms differ in HEAD, not just in a slot (`-` on a native non-numeric
@@ -143,30 +183,58 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     // bound can prove membership), so folding them into one templated
     // `msg:` literal the enumeration could read would cost the sentences
     // their accuracy. Rowed by hand instead, as the `+` ladder above is.
-    ("368", "`!`'s parameter arm (`analyzer.rs`)"),
-    ("369", "`!`'s `void` arm"),
     (
-        "370",
+        "`!` negates a `bool`, and `{label}` is a type parameter: `bool`'s",
+        "`!`'s parameter arm (`analyzer.rs`)",
+    ),
+    (
+        "`!` negates a `bool`, and this operand is `void`: the expression",
+        "`!`'s `void` arm",
+    ),
+    (
+        "`!` negates a `bool`, and this operand is `{label}`: the host's",
         "`!`'s truthiness arm — every other non-`bool` operand",
     ),
-    ("371", "`-`'s parameter arm"),
-    ("372", "`-`'s `bool` arm"),
-    ("373", "`-`'s `str` arm"),
-    ("374", "`-`'s backed-enum arm"),
-    ("375", "`-`'s `void` arm"),
     (
-        "376",
+        "`-` negates a number, and `{label}` is a type parameter: the",
+        "`-`'s parameter arm",
+    ),
+    (
+        "`-` on `bool` has no meaning: `bool`'s admitted unary operator",
+        "`-`'s `bool` arm",
+    ),
+    (
+        "`-` on `str` has no meaning: `str`'s admitted operators are `+",
+        "`-`'s `str` arm",
+    ),
+    (
+        "`-` on `{label}` has no meaning: `{label}`'s admitted operators",
+        "`-`'s backed-enum arm",
+    ),
+    (
+        "`-` negates a number, and this operand is `void`: the expression",
+        "`-`'s `void` arm",
+    ),
+    (
+        "`-` negates a number, and `{label}` is not one: vilan has no",
         "`-`'s no-`Neg`-trait arm — every other non-numeric operand",
     ),
     // B197's operator-conformance refusal shares the missing-member push with
     // the ordinary one, choosing between them in a `let msg = if …` the walk
     // cannot read for the same reason.
     (
-        "378",
+        "`impl {subject_name} with {trait}`{inherited} provides no \
+         `{member_name}`:",
         "the operator arm of the trait-conformance refusal (`analyzer.rs`)",
     ),
-    ("379", "`!`'s trait-typed arm"),
-    ("380", "`-`'s trait-typed arm"),
+    (
+        "`!` negates a `bool`, and `{label}` is a trait: no trait names",
+        "`!`'s trait-typed arm",
+    ),
+    (
+        "`-` negates a number, and `{label}` is a trait: no trait names",
+        "`-`'s trait-typed arm",
+    ),
 ];
 
 /// Ledger rows with no key at all, and so absent from the index, with the
@@ -1087,22 +1155,97 @@ fn every_appendix_entry_carries_a_quoted_head() {
     );
 }
 
+/// The row an exemption's key prefix names, or why it names none (N76). Exactly
+/// one match is the contract: zero means the row is gone (or the key moved),
+/// several mean the prefix stopped separating the rows it has to separate, and
+/// both are a reason to red rather than to guess.
+fn hand_rowed_row<'rows>(rows: &'rows [Row], prefix: &str) -> Result<&'rows Row, String> {
+    let matched: Vec<&Row> = rows
+        .iter()
+        .filter(|row| row.key.starts_with(prefix))
+        .collect();
+    match matched.as_slice() {
+        [row] => Ok(row),
+        [] => Err(format!("  no row's key starts with {prefix:?}")),
+        several => Err(format!(
+            "  {prefix:?} names {} rows ({}) — lengthen it",
+            several.len(),
+            several
+                .iter()
+                .map(|row| row.number.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[test]
 fn every_hand_rowed_row_is_in_the_index() {
     // The exemption above is only worth its ink while the rows it names are
     // real: a hand-rowed message that loses its row loses ALL coverage, since
-    // the enumeration never reached it to begin with.
+    // the enumeration never reached it to begin with. N76: the entry names its
+    // row by KEY, so this check is also what holds the prefixes to their one
+    // job — naming exactly one row, whatever the ledger has numbered it.
     let rows = index();
-    let missing: Vec<&str> = ROWS_THE_ENUMERATION_CANNOT_REACH
+    let unresolved: Vec<String> = ROWS_THE_ENUMERATION_CANNOT_REACH
         .iter()
-        .map(|(number, _)| *number)
-        .filter(|number| !rows.iter().any(|row| row.number == *number))
+        .filter_map(|(prefix, _)| hand_rowed_row(&rows, prefix).err())
         .collect();
     assert!(
-        missing.is_empty(),
-        "row(s) {missing:?} are recorded in ROWS_THE_ENUMERATION_CANNOT_REACH but \
-         are not in `{INDEX}`. A message the enumeration cannot see is held by \
-         its row and nothing else, so dropping the row drops the message."
+        unresolved.is_empty(),
+        "key(s) recorded in ROWS_THE_ENUMERATION_CANNOT_REACH do not name exactly \
+         one row of `{INDEX}`. A message the enumeration cannot see is held by \
+         its row and nothing else, so dropping the row drops the message — and an \
+         AMBIGUOUS key exempts whichever row the list happens to find \
+         first:\n{}",
+        unresolved.join("\n")
+    );
+}
+
+#[test]
+fn n76_a_hand_rowed_exemption_resolves_by_key_not_by_number() {
+    // N76's whole point, asked of the resolver rather than of the live index:
+    // a lane that ships a message the walk cannot read writes its row as `NEW`
+    // (the ledger numbers it at integration), so an exemption that named rows
+    // by NUMBER had nothing to write — and two lanes each writing `"NEW"` in
+    // one order would have exempted each other's row. A key is written in the
+    // same commit as the message and does not move at the renumbering.
+    let rows = vec![
+        Row {
+            number: NEW_ROW.to_string(),
+            ordinal: None,
+            flagship: false,
+            key: "`~` inverts a number, and `{label}` is a type parameter: nothing".to_string(),
+        },
+        Row {
+            number: "1".to_string(),
+            ordinal: Some(1),
+            flagship: false,
+            key: "`~` inverts a number, and `{label}` is a trait: nothing".to_string(),
+        },
+    ];
+    let Ok(resolved) = hand_rowed_row(&rows, "`~` inverts a number, and `{label}` is a type")
+    else {
+        panic!("the prefix names the unnumbered row");
+    };
+    assert_eq!(
+        resolved.number, NEW_ROW,
+        "a row with no number yet is still nameable — that is what keying on the \
+         key buys"
+    );
+
+    // And the two ways a key stops naming exactly one row both red, which is
+    // what keeps the list from exempting a row nobody meant.
+    let Err(absent) = hand_rowed_row(&rows, "`^` xors") else {
+        panic!("no row starts with `^`");
+    };
+    assert!(absent.contains("no row's key starts with"), "{absent}");
+    let Err(ambiguous) = hand_rowed_row(&rows, "`~` inverts a number,") else {
+        panic!("both rows start with that prefix");
+    };
+    assert!(
+        ambiguous.contains("names 2 rows") && ambiguous.contains("lengthen it"),
+        "{ambiguous}"
     );
 }
 
@@ -1123,16 +1266,18 @@ fn every_hand_rowed_row_is_still_out_of_the_enumerations_reach() {
     let sites = enumerated_sites();
     let reached: Vec<String> = ROWS_THE_ENUMERATION_CANNOT_REACH
         .iter()
-        .filter_map(|(number, _)| {
-            let row = rows.iter().find(|row| row.number == *number)?;
+        .filter_map(|(prefix, _)| {
+            // An entry whose key names no row, or several, is the OTHER check's
+            // to report; this one asks its question of the rows it can resolve.
+            let row = hand_rowed_row(&rows, prefix).ok()?;
             sites
                 .iter()
                 .filter(|site| !site.is_note)
                 .find(|site| key_describes(&row.key, &site.message))
                 .map(|site| {
                     format!(
-                        "  row {number}: now enumerated at {}:{}",
-                        site.file, site.line
+                        "  row {}: now enumerated at {}:{}",
+                        row.number, site.file, site.line
                     )
                 })
         })

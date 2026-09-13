@@ -6346,8 +6346,7 @@ fn a_runtime_hole_is_refused_at_the_hole() {
 //
 // This replaces `a_block_without_style_in_scope_fails_at_the_css_keyword`,
 // which pinned the behaviour B270 reverses. The note it also pinned
-// (`css_style_import_note`) survives for the one state that can still miss —
-// a std with no `style` item — and is unreachable from a well-formed std.
+// (`css_style_import_note`) is deleted rather than narrowed — N74, below.
 
 #[test]
 fn a_block_needs_no_style_import_at_all() {
@@ -6400,10 +6399,28 @@ fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
 }
 
 #[test]
-fn a_hand_written_style_accessor_gets_no_css_note() {
-    // The note's gate is the SPAN reading `css`, so it cannot fire on an
-    // ordinary unresolved `style` — which would be a note about a construct
-    // the author never wrote.
+fn n74_an_unresolved_style_is_reported_without_an_import_steer() {
+    // N74, N69's twin. `css_style_import_note` attached "a `css { … }` block
+    // lowers to a std::style::style chain; add `import std::style::style;`" to
+    // an unresolved `style` whose span read `css`, and after B270 the block's
+    // seed is a scope-independent reference to `std::style::style` — so the
+    // note could only fire for a std with no `style` item at all, where the
+    // import it steers at would miss exactly the same way. A note that can
+    // only fire where its own advice is false is worse than no note; the
+    // reachability half is held by `a_block_needs_no_style_import_at_all`
+    // above, which goes red the moment a block needs the import again.
+    //
+    // What is left is the ordinary miss, for the author who wrote the lowered
+    // chain by hand: the plain message, and nothing about a `css` block they
+    // did not write.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _s = const style().raw("display", "flex");
+        }
+        "#,
+        "cannot find 'style' in this scope",
+    );
     assert_fails_without(
         r#"
         fun main() {

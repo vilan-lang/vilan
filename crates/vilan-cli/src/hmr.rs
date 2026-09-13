@@ -716,11 +716,25 @@ pub struct LegArtifact {
     pub css: Option<String>,
     /// The files `const asset::bundle` registered for this leg: (resolved
     /// source, the name it takes in `dist/`). Carried on the artifact so a
-    /// SKIPPED round — which reuses the previous artifact verbatim — still
-    /// re-copies them, and so a round that recompiled because a resource
-    /// changed copies the new bytes. Not part of the classifier: the browser is
-    /// told nothing, because `asset_body` re-reads under a watch and every
-    /// request is already fresh (`dev-refresh.md` §5, item 1).
+    /// SKIPPED leg — whose entry in the round's `next` is the previous
+    /// artifact, cloned — still lists what it bundles when the round writes
+    /// `dist/`, and so a round that fired BECAUSE a resource changed copies the
+    /// new bytes even though no leg recompiled. The copy reads the source every
+    /// round, which is what makes that second sentence true; the trigger is
+    /// `record_const_inputs`'s build-input record (B276), and before it no
+    /// round fired for a resource at all, so the behaviour was unreachable
+    /// rather than merely unnoticed.
+    ///
+    /// The `build --watch` loop keeps the same list for a DIFFERENT reason and
+    /// repeats no copy — see `BuildWatchLeg::bundled` in `main.rs`, where a
+    /// skipped leg's names occupy the cross-leg collision map and nothing else.
+    /// The two loops are deliberately not the same here: this one rewrites a
+    /// skipped leg's bundle anyway (the shim carries the round's version), so
+    /// the copy rides a write that is happening regardless.
+    ///
+    /// Not part of the classifier: the browser is told nothing, because
+    /// `asset_body` re-reads under a watch and every request is already fresh
+    /// (`dev-refresh.md` §5, item 1).
     pub bundled: Vec<(PathBuf, String)>,
     /// The sources this artifact was compiled from — each loaded file's path
     /// mapped to the `content_hash` of the text the compiler actually consumed

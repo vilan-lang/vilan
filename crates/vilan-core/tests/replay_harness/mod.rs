@@ -12,13 +12,28 @@
 //! one planted diagnostic, the disable switch) and `replay_differential` (the
 //! corpus sweep, which is the long one and the reason the two are separate
 //! binaries at all — tracker N57).
+//!
+//! # Driving a REAL package with it (N66)
+//!
+//! The fixtures below are bare directories — a `module.vl` and an entry, no
+//! manifest — so `pkg_root` is simply the directory they are in, and nothing
+//! about that generalizes. A real package's `pkg_root` is the directory its
+//! manifest's `root` names, **not** the directory the manifest is in: for a
+//! package that declares no `root` (kolt, for one) that is `<repo>/src`, the
+//! default. Handing the repository root instead does not fail; it analyzes a
+//! DIFFERENT, smaller program and says nothing about it — kolt measured that
+//! way loaded 39 sources instead of 69 and reported 22 spurious "cannot find …
+//! in the imported path" errors, which is a trap for anyone reading the census
+//! as a statement about the real package. [`package_root`] resolves the right
+//! directory from the manifest, and [`observe_in_package`] refuses the wrong
+//! one rather than measuring it.
 
 // Two binaries read this harness — `replay_differential` (the corpus sweep) and
 // `check_scope_differential` (the fast T1/T1b pins, which keep their own five-field
 // observation helpers) — each a different subset; `support/mod.rs`'s precedent.
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
@@ -58,11 +73,77 @@ pub fn module_entry(revision: u32) -> String {
 /// because nothing was reused would be vacuous).
 pub type ReuseObservation = (String, String, Option<String>, (usize, usize, usize));
 
+/// The source root a package's manifest declares, resolved against the
+/// manifest's own directory — what `pkg_root` has to be for a real package
+/// (N66). `None` when `directory` holds no readable `vilan.toml`, which is the
+/// fixtures' state and the reason the guard below is silent for them.
+///
+/// Lexical: the manifest's `root` as written (`src` by default for both
+/// `[package]` and `[library]`), joined to the directory. Nothing here looks at
+/// the filesystem, so a root that does not exist yet resolves the same way the
+/// compiler's own reader resolves it.
+pub fn package_root(directory: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(directory.join("vilan.toml")).ok()?;
+    let (manifest, _) = vilan_core::manifest::Manifest::parse(&text).ok()?;
+    let declared = manifest
+        .package
+        .as_ref()
+        .map(|package| package.root().to_path_buf())
+        .or_else(|| {
+            manifest.library.as_ref().map(|library| {
+                // `[library]`'s `root` has the same default as `[package]`'s
+                // and no accessor of its own.
+                library.root.clone().unwrap_or_else(|| PathBuf::from("src"))
+            })
+        })?;
+    Some(directory.join(declared))
+}
+
+/// Refuses a `pkg_root` that is a package's MANIFEST directory rather than its
+/// source root (N66). Called by [`observe_in_package`] and by
+/// `check_scope_differential`'s own five-field twin of it, so both entry points
+/// that take a `pkg_root` refuse the same argument.
+///
+/// The wrong one is not an error the analyzer reports — it is a smaller program
+/// analyzed quietly — so the harness has to be what says so. The test is
+/// lexical and cheap: a `vilan.toml` here whose `root` names a subdirectory
+/// means this directory is the manifest's home, and the root it declares is
+/// where the sources are. A `root = "."` package names no subdirectory and
+/// passes; a directory with no manifest (every fixture below) passes.
+pub fn refuse_a_manifest_directory(pkg_root: &Path) {
+    let Some(declared) = package_root(pkg_root) else {
+        return;
+    };
+    let names_a_subdirectory = declared
+        .strip_prefix(pkg_root)
+        .map(|relative| {
+            relative
+                .components()
+                .any(|component| matches!(component, Component::Normal(_)))
+        })
+        .unwrap_or(false);
+    assert!(
+        !names_a_subdirectory,
+        "{} holds a `vilan.toml` whose `root` is `{}`: analysis wants the SOURCE \
+         root, so pass `{}` instead. The manifest directory is not an error the \
+         analyzer reports — it loads whatever resolves from there and reports the \
+         rest as `cannot find … in the imported path`, which reads as a finding \
+         about the package and is a finding about the argument (N66).",
+        pkg_root.display(),
+        declared
+            .strip_prefix(pkg_root)
+            .unwrap_or(&declared)
+            .display(),
+        declared.display()
+    );
+}
+
 pub fn observe_in_package(
     pkg_root: &Path,
     entry_path: &Path,
     entry_source: String,
 ) -> ReuseObservation {
+    refuse_a_manifest_directory(pkg_root);
     let pkg_root = pkg_root.to_path_buf();
     let entry_path = entry_path.to_path_buf();
     std::thread::Builder::new()

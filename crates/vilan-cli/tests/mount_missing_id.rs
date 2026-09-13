@@ -4,12 +4,11 @@
 //! nowhere in the message. `mount_target` now checks `get_element_by_id`'s
 //! result before touching it, so the failure names the id instead.
 //!
-//! Runs the compiled client under the A10 DOM stub (the same hand-rolled
-//! `document`/`window` shim `ssr_differential.rs`/`ssr_fullstack.rs` use) —
-//! real `node`, not a compile-only pin — with `getElementById` returning
-//! `null` for the missing-id case and a real stub element for the happy
-//! path, so both the failing AND the unaffected path are proven against
-//! actual execution, not assumed from reading the source.
+//! Runs the compiled client under the shared DOM stub (`support/dom/stub.js`,
+//! N73) — real `node`, not a compile-only pin — with `getElementById` missing
+//! for the missing-id case and answering for the happy path, so both the
+//! failing AND the unaffected path are proven against actual execution, not
+//! assumed from reading the source.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,34 +36,23 @@ fun main() {
 main();
 "#;
 
-/// A minimal DOM/owner stub — just enough for `mount_root`'s build (`comp`,
-/// `turn`) and `mount` (`get_element_by_id`, `element.clear()`,
-/// `element.appendChild`) to run. `getElementById` is the one knob: the
-/// missing-id test never returns an element for ANY id, and the happy-path
-/// test returns a real stub element for `"app"`.
-fn harness(get_element_by_id_body: &str) -> String {
-    format!(
-        r#"class StubElement {{
-    constructor(tag) {{ this.tagName = tag; this.children = []; }}
-    appendChild(child) {{ this.children.push(child); }}
-    replaceChildren() {{ this.children = []; }}
-    clear() {{ this.replaceChildren(); }}
-    setAttribute() {{}}
-    set textContent(text) {{ this._text = text; }}
-    get textContent() {{ return this._text; }}
-}}
-global.document = {{
-    createElement: (tag) => new StubElement(tag),
-    createElementNS: (ns, tag) => new StubElement(tag),
-    getElementById: (id) => {{ {get_element_by_id_body} }},
-    querySelector: () => null,
-    querySelectorAll: () => [],
-}};
-global.window = {{ addEventListener: () => {{}} }};
+/// The DOM the suite runs against (N73/N75): the shared stub, and nothing
+/// layered on it. Every other browser-bundle suite concatenates a
+/// `support/dom/<suite>.js` of its own, and this one has no extras to put
+/// there — its only knob is `installStubDocument`'s `rootId`, which differs
+/// between the two legs and therefore belongs at the install call below rather
+/// than in a file shared by both.
+const DOM_STUB: &str = include_str!("support/dom/stub.js");
 
-require("./client.js");
-console.log("mounted-ok");
-"#
+/// One leg's harness. `root_id` is the id `getElementById` answers with the
+/// document root, written as a JSON string: `"app"` is the happy path, and any
+/// other id is the missing one — `mount_root`'s missing-id path is the reason
+/// the shared stub's `rootId` knob exists at all, because every other suite is
+/// content for every id to answer.
+fn harness(root_id: &str) -> String {
+    format!(
+        "{DOM_STUB}\ninstallStubDocument({{ rootTag: \"div\", rootId: {root_id} }});\n\
+         require(\"./client.js\");\nconsole.log(\"mounted-ok\");\n"
     )
 }
 
@@ -82,7 +70,7 @@ fn build(dir: &Path) {
     );
 }
 
-fn project(tag: &str, get_element_by_id_body: &str) -> PathBuf {
+fn project(tag: &str, root_id: &str) -> PathBuf {
     let dir = temp_project(tag);
     write(&dir, "client.vl", CLIENT);
     write(
@@ -90,17 +78,17 @@ fn project(tag: &str, get_element_by_id_body: &str) -> PathBuf {
         "vilan.toml",
         "[package]\nname = \"client\"\nroot = \".\"\nentry = \"client.vl\"\ntarget = \"browser\"\n",
     );
-    write(&dir, "harness.js", &harness(get_element_by_id_body));
+    write(&dir, "harness.js", &harness(root_id));
     build(&dir);
     dir
 }
 
 #[test]
 fn mount_root_on_a_missing_id_panics_naming_the_id() {
-    // `getElementById` always misses — the id the app asked for is never on
-    // the (stub) page, exactly `get_element_by_id`'s real `null`-for-missing
-    // contract.
-    let dir = project("missing", "return null;");
+    // `getElementById` answers for one id and the app asks for another, so the
+    // miss is the stub's real `null`-for-missing contract rather than a
+    // special case: the root is on the page, under a different id.
+    let dir = project("missing", "\"not-the-apps-id\"");
     let output = Command::new("node")
         .arg("harness.js")
         .current_dir(&dir)
@@ -134,10 +122,7 @@ fn mount_root_on_an_existing_id_is_unaffected() {
     // The happy path: `getElementById("app")` returns a real element, exactly
     // as it always has — the guard adds nothing to this path but the check
     // itself.
-    let dir = project(
-        "present",
-        r#"if (id === "app") return new StubElement("div"); return null;"#,
-    );
+    let dir = project("present", "\"app\"");
     let output = Command::new("node")
         .arg("harness.js")
         .current_dir(&dir)

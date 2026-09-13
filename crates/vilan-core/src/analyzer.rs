@@ -22628,35 +22628,6 @@ impl<'src> Analyzer<'src> {
         })
     }
 
-    /// A `css { … }` block lowers to `std::style::style` (css-block.md §5.1,
-    /// S4): an unresolved `style` whose span is the `css` KEYWORD — the one
-    /// span the block's desugar gives a generated accessor on purpose, so the
-    /// squiggle lands on the word that asked for a `Style` — gets the
-    /// explanation as a note.
-    ///
-    /// Without it the report is honest but disjointed: `css` is underlined and
-    /// the message talks about `style`, with nothing drawing the line between
-    /// them. Every other generated accessor in the desugar is zero-width, so
-    /// this test cannot fire on one of them; a hand-written `style` accessor's
-    /// span is its own ident, which does not read `css`.
-    fn css_style_import_note(&self, id: Id, name: &str) -> Option<Note> {
-        if name != "style" {
-            return None;
-        }
-        let span = **self.span_map.get(&id)?;
-        let source = self.source_of_id(id).unwrap_or(SourceId(0));
-        let text = self.source_text(source)?;
-        if text.get(span.into_range())? != "css" {
-            return None;
-        }
-        Some(Note::here(
-            span,
-            "a `css { … }` block lowers to a std::style::style chain; add \
-             `import std::style::style;`"
-                .to_string(),
-        ))
-    }
-
     /// Element-syntax S4: `<div text("hi")>` — an undotted `text(…)` head item
     /// is an ATTRIBUTE (it lowers to `.attr("text", …)` and sets a `text`
     /// attribute), while the author almost certainly meant the `.text(…)`
@@ -40096,17 +40067,20 @@ impl<'src> Analyzer<'src> {
                         }
                     },
                 );
-                // N69: the element's twin of this steer is gone. B270 made the
-                // desugar's callee a scope-independent `std::ui::view`, so an
-                // element's `view` cannot be unresolved while std has the item
-                // — and in the one state that could still miss it, a std with
-                // no `ui::view` at all, "add `import std::ui::{ view, View };`"
-                // steered at an import that would miss the same way. A note
-                // that can only fire where its own advice is wrong is worse
-                // than no note (`an_element_needs_no_view_import_at_all` is
-                // what holds the reachability claim). The `css` twin below is
-                // in the same state and is its own item.
-                let note = note.or_else(|| self.css_style_import_note(id, name));
+                // N69/N74: the two desugars' import steers are both gone, for
+                // one reason. B270 made an element's callee a scope-independent
+                // `std::ui::view` and a `css` block's seed a scope-independent
+                // `std::style::style`, so neither name can be unresolved while
+                // std has the item — and in the one state that could still miss
+                // it, a std lacking the item altogether, "add `import
+                // std::ui::{ view, View };`" / "add `import std::style::style;`"
+                // steered at an import that would miss exactly the same way. A
+                // note that can only fire where its own advice is wrong is worse
+                // than no note. The reachability claims stay where they belong,
+                // on `an_element_needs_no_view_import_at_all` and
+                // `a_block_needs_no_style_import_at_all`, which go red the
+                // moment either desugar needs an import again.
+                //
                 // B236: the name is not missing — the import that would have
                 // brought it in was refused, and that refusal is already filed
                 // at the import. The expression still becomes an `Expr::Error`,
