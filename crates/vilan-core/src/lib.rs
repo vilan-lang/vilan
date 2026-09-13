@@ -809,6 +809,11 @@ pub fn post_analysis_passes(
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async
     // only by inference, so this cannot run inside `analyze`.
+    // B318 S3: the file-level impl admission — `only` and the `(impl …)`
+    // selectors, resolved against the finished program because the question is
+    // `impl_select::subject_applies`, which reads one. Returns immediately for
+    // a program whose files wrote neither.
+    analyzer::check_impl_selector_admission(program);
     let phase_async_drops_start = PhaseClock::now();
     analyzer::check_async_drops(program);
     let phase_async_drops = phase_async_drops_start.elapsed();
