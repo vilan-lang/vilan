@@ -15989,7 +15989,13 @@ impl<'src> Analyzer<'src> {
                 self.enums.get(&id).map(|enum_| enum_.name)?,
                 arguments.as_slice(),
             ) {
-                ("Option", [inner]) => self.resolved_handle_return_element(*inner),
+                // R4/B326: the written twin declines to descend into a KEYED
+                // handle here, and the two have to agree — a form one reads as
+                // a handle and the other does not is the one outcome this pair
+                // exists to rule out.
+                ("Option", [inner]) if self.resolved_handle_return_key(*inner).is_none() => {
+                    self.resolved_handle_return_element(*inner)
+                }
                 _ => None,
             },
             _ => None,
@@ -48618,7 +48624,16 @@ fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
         }
         Node::AccessorWithGenerics(name, arguments) if *name == "Option" => {
             match arguments.0.as_slice() {
-                [inner] => handle_return_element(&inner.0),
+                // R4/B326: `Option<KeyedCell<K, T>>` is NOT a handle return,
+                // and the rule is the macro's own read back — `handle_key(inner)
+                // == ""` guards the same descent in `rpc.vl`. Reading it as one
+                // here stood the ordinary Wire refusal down and left the author
+                // with `'Option<KeyedCell<i32, Task>>' does not implement trait
+                // 'Wire'` out of generated code, twice, about an annotation the
+                // generator had already declined to shape a mirror for.
+                // Supporting the form — a per-KEY `Absent` beside A92's
+                // per-source one — is a design item, not this rule's business.
+                [inner] if handle_return_key(&inner.0).is_none() => handle_return_element(&inner.0),
                 _ => None,
             }
         }
