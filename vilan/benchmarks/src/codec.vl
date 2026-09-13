@@ -1,3 +1,5 @@
+export *;
+
 // Codec throughput: encode/decode of a realistic value, in-process — the
 // number that decides how much the serializer call mechanism (closure records
 // vs monomorphized traits, §6.1) matters. Uses the payload module's sample.

@@ -1,3 +1,5 @@
+export *;
+
 // RPC round-trip throughput: sequential calls (each awaited — honest latency,
 // no pipelining) over the in-process transport and over real HTTP on
 // localhost, with the JSON and binary codecs side by side. Timings vary by
