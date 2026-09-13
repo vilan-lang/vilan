@@ -1715,8 +1715,15 @@ async fn analyze_and_publish(
     // sweep re-analyzes every open importer of an edited file), the program it
     // brought goes straight back. Published FIRST, so the groups the planner
     // reads are the program's own and the capture is taken from them.
+    // M68: the reading the trim is conditional on, taken ahead of the release —
+    // 266 ns on a path that has just paid for a whole analysis. The trim itself
+    // is 3.4–32.6 ms of CPU and the dependency sweep reaches this seam once per
+    // open importer of an edited file, so what it costs is worth knowing and
+    // what it returns (14–135 MiB of resident size per landing, measured) is
+    // worth keeping.
+    let before_release = memory::heap_in_use_bytes();
     if enforce_program_retention(&context.focus, &context.documents) {
-        memory::trim();
+        memory::trim_if_released(before_release);
     }
     AnalysisOutcome::Landed
 }
@@ -1750,6 +1757,12 @@ fn enforce_program_retention(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    // M67: the same set, told to the analyzer's base cache — the worlds these
+    // documents' analyses are served from are the ones its byte budget may not
+    // evict. Here rather than beside each caller because the set is this
+    // function's subject: one policy, one place, and a declaration that cannot
+    // drift from the releases it is stated against.
+    declare_live_entries(&retained);
     let mut released = false;
     for mut document in documents.iter_mut() {
         if retained.contains(document.key()) {
@@ -1758,6 +1771,21 @@ fn enforce_program_retention(
         released |= document.value_mut().release_analysis();
     }
     released
+}
+
+/// M67: tell the base cache which documents are LIVE, so its byte budget never
+/// evicts a world one of them is analyzed from.
+///
+/// The retained set, rendered as entry paths. A URI with no file path (an
+/// untitled buffer) contributes none: it is not an entry the analyzer can key
+/// a world by, and dropping it silently is right — the declaration is an
+/// exemption, and an exemption nothing can match is simply not one.
+fn declare_live_entries(retained: &[Url]) {
+    let entries: Vec<std::path::PathBuf> = retained
+        .iter()
+        .filter_map(|uri| uri.to_file_path().ok())
+        .collect();
+    vilan_core::analyzer::set_base_cache_live_entries(&entries);
 }
 
 /// Land a completed analysis on the open document at `uri`
@@ -2240,10 +2268,15 @@ impl Backend {
         // sweep would take a write lock on every shard of the document map for
         // an answer of "no". A document that takes a program BACK while the set
         // stands still is covered at the other seam, where its analysis lands.
-        if moved && enforce_program_retention(&self.focus, &self.documents) {
+        if moved {
             // M64: a release hands a whole analysis back to the allocator at
-            // once — the one moment glibc has something to give the OS.
-            memory::trim();
+            // once — the one moment glibc has something to give the OS. M68:
+            // and only when that is more than a page's worth, read either side
+            // of the release.
+            let before_release = memory::heap_in_use_bytes();
+            if enforce_program_retention(&self.focus, &self.documents) {
+                memory::trim_if_released(before_release);
+            }
         }
         self.reanalyze_if_released(uri);
     }
@@ -3153,10 +3186,20 @@ impl LanguageServer for Backend {
         // and leaving its URI in the focus list would spend one of the two
         // slots on a file that is gone — the next document to be focused would
         // evict a live one instead of it.
-        self.focus
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|held| held != &uri);
+        let retained = {
+            let mut focus = self
+                .focus
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            focus.retain(|held| held != &uri);
+            focus.clone()
+        };
+        // M67: and the base cache's exemption goes with it. A closed
+        // document's world must become evictable in the same breath its slot
+        // is given back, or a session of opening and closing files would pin a
+        // world per file it ever focused — the one growth the budget exists to
+        // stop.
+        declare_live_entries(&retained);
         // Drop the edit generation so any in-flight debounced analysis bails,
         // and CANCEL whatever is already past its pause (M26): a closed
         // document's analysis is dropped by `land` in any case, so finishing it

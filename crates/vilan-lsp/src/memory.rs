@@ -145,6 +145,98 @@ pub fn heap_split_bytes() -> Option<(usize, usize)> {
     None
 }
 
+/// The heap's IN-USE half alone (`mallinfo2().uordblks`), the reading a release
+/// is measured against (M68).
+///
+/// Cheap enough to take on the landing path: 266 and 990 ns per call over two
+/// runs of a thousand calls, in a server-shaped process with kolt's nineteen
+/// files open (`mallinfo2_cost`, release, loadavg 42–58) — four orders of
+/// magnitude under the trim it decides, and five under the landing it rides
+/// on.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn heap_in_use_bytes() -> Option<usize> {
+    heap_split_bytes().map(|(in_use, _)| in_use)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn heap_in_use_bytes() -> Option<usize> {
+    None
+}
+
+/// The least a release must hand back before the server asks glibc to walk its
+/// arenas (M68).
+///
+/// 4 MiB, and the measurement is why this is a FLOOR rather than a policy.
+/// `trim_cost_across_a_sibling_checkout` drives twelve BACKGROUND landings
+/// over kolt's nineteen open files — a document's analysis lands, is adopted,
+/// and is released by the retention rule because the focus is elsewhere, which
+/// is `analyze_and_publish`'s tail — and every one of them released between
+/// 10.7 and 81.2 MiB and got 14.0 to 135.3 MiB of RESIDENT SIZE back for 3.4
+/// to 32.6 ms of CPU (release, two runs, loadavg 42–68, per-landing mean 10.7
+/// and 16.9 ms). The candidate floors, over those same landings:
+///
+/// ```text
+/// floor    landings skipped   CPU saved   resident size forgone
+///  4 MiB        0 / 12           0 ms            0 MiB
+/// 16 MiB        5 / 12        33.6 ms          107 MiB
+/// 32 MiB        7 / 12        67.9 ms          251 MiB
+/// 64 MiB        7 / 12        67.9 ms          251 MiB
+/// ```
+///
+/// Three megabytes of resident size per millisecond of a background thread is
+/// not a trade this server should take, and that is the whole argument for a
+/// LOW floor: what the threshold is for is the release that cannot pay for the
+/// walk at all. glibc walks its arenas in proportion to THEIR size, not to what
+/// was just handed back, so a release of a few hundred kilobytes has nothing
+/// page-shaped to give and still costs the whole walk. No landing in a
+/// kolt-sized session is that small — the floor does not fire there, and that
+/// is the measurement's verdict rather than a disappointment.
+pub const TRIM_MIN_RELEASED_BYTES: usize = 4 * 1024 * 1024;
+
+/// [`trim`], but only if the heap's in-use bytes have fallen by more than
+/// [`TRIM_MIN_RELEASED_BYTES`] since `before` — the reading
+/// [`heap_in_use_bytes`] took ahead of the release. Answers whether it trimmed.
+///
+/// M64 asked for the trim after EVERY release, which is right at a close and
+/// too eager at the analysis-landing seam: the dependency sweep re-analyzes
+/// every open importer of an edited file, each of those landings releases the
+/// program it just brought (the document is not one of the focused few), and
+/// each release walked the arenas. Measured in CPU rather than wall, that walk
+/// is 3.4–32.6 ms per landing — the item's estimate of ~100 ms per background
+/// document was a wall-clock difference across whole opens — and the reading
+/// that gates it is under a microsecond. So the conditional is cheap enough to
+/// ask at every landing, and it is set where a release stops being able to
+/// return a page's worth, not where the trim stops being worth its CPU.
+///
+/// A host that cannot read its heap gets M64's unconditional trim, which on
+/// that host is the no-op [`trim`] already is.
+pub fn trim_if_released(before: Option<usize>) -> bool {
+    if !worth_trimming(before, heap_in_use_bytes()) {
+        return false;
+    }
+    trim()
+}
+
+/// The decision [`trim_if_released`] makes, alone: did the heap's in-use half
+/// fall by at least [`TRIM_MIN_RELEASED_BYTES`] between the two readings?
+///
+/// Separated from the call so a pin can hold the POLICY without asking the
+/// allocator anything — `malloc_trim` answers whether it found something to
+/// give back, which is a fact about the host's arenas at that instant and not
+/// about this rule.
+///
+/// A missing reading answers `true`: a host that cannot say what it released
+/// gets M64's unconditional trim, which on such a host is the no-op [`trim`]
+/// already is. A heap that GREW between the readings answers `false` — the
+/// subtraction saturates, and a landing that allocated more than the release
+/// handed back has nothing to trim by definition.
+pub fn worth_trimming(before: Option<usize>, now: Option<usize>) -> bool {
+    match (before, now) {
+        (Some(before), Some(now)) => before.saturating_sub(now) >= TRIM_MIN_RELEASED_BYTES,
+        _ => true,
+    }
+}
+
 /// Ask glibc to return the heap's retained-free arenas to the OS
 /// (`malloc_trim(0)`), answering whether it says it gave anything back.
 ///
@@ -204,6 +296,42 @@ mod tests {
     fn a_fractional_mebibyte_renders_to_one_decimal() {
         assert_eq!(mib(Some(1024 * 1024 * 3 / 2)), "1.5 MiB");
         assert_eq!(mib(Some(0)), "0.0 MiB");
+    }
+
+    /// THE PIN (M68): the trim at the release seam is conditional on how much
+    /// the release handed back, and the rule is stated on the READINGS rather
+    /// than on what glibc then says it found.
+    ///
+    /// The threshold is a floor, not a policy — every background landing in a
+    /// kolt-sized session releases 10.7 to 81.2 MiB and gets 14.0 to 135.2 MiB
+    /// of resident size back for 3.4 to 18.6 ms of CPU — so what this holds is
+    /// that a release too small to return a page's worth does not pay for the
+    /// arena walk, and that everything a real session releases still does.
+    #[test]
+    fn a_release_below_the_threshold_does_not_earn_the_arena_walk() {
+        let after = 400 * 1024 * 1024;
+        assert!(
+            !worth_trimming(Some(after + TRIM_MIN_RELEASED_BYTES - 1), Some(after)),
+            "a release one byte short of the floor buys nothing page-shaped",
+        );
+        assert!(
+            worth_trimming(Some(after + TRIM_MIN_RELEASED_BYTES), Some(after)),
+            "the floor itself trims — the boundary belongs to the release",
+        );
+        assert!(
+            worth_trimming(Some(after + 68 * 1024 * 1024), Some(after)),
+            "a background landing's own release (68 MiB, measured) trims: the \
+             threshold must not turn M64 off",
+        );
+        assert!(
+            !worth_trimming(Some(after), Some(after + 1024 * 1024)),
+            "a heap that grew between the readings released nothing",
+        );
+        assert!(
+            worth_trimming(None, Some(after)),
+            "a host that cannot read its heap keeps M64's unconditional trim",
+        );
+        assert!(worth_trimming(Some(after), None));
     }
 
     /// The platform readers, on the platform this suite runs on: whatever the

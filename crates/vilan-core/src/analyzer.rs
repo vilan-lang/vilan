@@ -1803,6 +1803,28 @@ pub struct Implementation<'src> {
 /// it, and the EXTENDING module for an extension impl. Both fall out of asking
 /// whether this block's subject name resolves, in this block's own scope, to
 /// the type the path walked to.
+///
+/// **M69: shared by reference, not copied.** Every `Analyzer` clone — and the
+/// base cache takes one per HIT, per analysis, on the keystroke path — used to
+/// deep-copy this vector's every block, each with its own `members` allocation:
+/// std's closure alone registers hundreds of them, for ~60 KB of pure copy that
+/// nothing then writes to. The blocks are append-only and immutable once
+/// registered (`declarations` is final at the point the walk pushes one), so an
+/// [`std::sync::Arc`] per block is the whole fix: a clone bumps refcounts and
+/// allocates ONE vector of pointers, and a warm analysis that registers the
+/// entry's own impls pushes beside the shared ones rather than deep-copying
+/// them first. `Arc` and not `Rc` because a stored world crosses threads (the
+/// base cache is a global `Mutex`, and M35 puts a workspace's members on their
+/// own threads).
+///
+/// Measured on the clone path, callgrind Ir over one WARM re-analysis of kolt's
+/// `client.vl` (`m58_warm_reanalysis_profile`, the `profiling` build — Ir does
+/// not move with the load average, which is why the claim is in instructions):
+/// `Analyzer::clone` 66,881,118 → 66,833,191 Ir, **−47,927**, and the whole
+/// re-analysis 4,686,308,110 → 4,686,018,804. Small, exactly as the item said
+/// it would be — about 160 blocks and the ~60 KB they hold — and the part that
+/// is not in the Ir figure is the allocation COUNT: one malloc per block per
+/// clone, per analysis of every open document, gone.
 #[derive(Debug, Clone)]
 struct ImplNamespace<'src> {
     /// The subject's written head name (`impl Length<..>` -> `Length`).
@@ -3423,7 +3445,11 @@ pub struct Analyzer<'src> {
     /// [`ImplNamespace`]. Written where `implementations` grows, for the reason
     /// `implementations_by_member` is, and read only by the import and `use`
     /// walks, which run before an impl's subject has a type at all.
-    impl_namespaces: Vec<ImplNamespace<'src>>,
+    ///
+    /// M69: one [`std::sync::Arc`] per block, so the clone this rides on (the
+    /// base cache's, per hit) copies pointers rather than every block's member
+    /// list.
+    impl_namespaces: Vec<std::sync::Arc<ImplNamespace<'src>>>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -28238,11 +28264,14 @@ impl<'src> Analyzer<'src> {
                 // list, a bare `&T`) contributes no namespace, which is right:
                 // an import path can only spell a name.
                 if let Some(subject_name) = impl_subject_head {
-                    self.impl_namespaces.push(ImplNamespace {
-                        subject_name,
-                        scope_id,
-                        members: declared_members.clone(),
-                    });
+                    // M69: shared, not copied — every `Analyzer` clone used to
+                    // deep-copy each block's member list.
+                    self.impl_namespaces
+                        .push(std::sync::Arc::new(ImplNamespace {
+                            subject_name,
+                            scope_id,
+                            members: declared_members.clone(),
+                        }));
                 }
                 self.implementations.push(Implementation {
                     subject,
@@ -50378,10 +50407,41 @@ thread_local! {
 pub const BASE_CACHE_WEIGHT_FACTOR: usize = 24;
 
 /// The retained-world budget in the currency a session actually has: RESIDENT
-/// bytes (M24's number, M50's unit). Generous, because the point is a BOUND,
-/// not a diet — a session that meets a handful of key shapes must never notice
-/// it, and one that walks a large workspace must not grow without end.
-pub const BASE_CACHE_RESIDENT_BUDGET: usize = 512 * 1024 * 1024;
+/// bytes (M24's number, M50's unit).
+///
+/// **M67, and the reason this is 192 MiB and not M24's 512.** M63 bounded what
+/// the open DOCUMENTS retain (kolt's nineteen files: 1,090 → 510 MiB) and left
+/// a floor of 336 MiB with every document closed, of which 270 MiB was this
+/// cache: twelve worlds keyed by import set, none of them evictable under a
+/// budget nothing in a real session could reach. A bound that binds is a
+/// MEASURED bound, and the measurement is
+/// `base_cache_budget_walk_across_a_sibling_checkout` (`vilan-lsp`'s
+/// `perf_baseline`, release, kolt's `src/*.vl`, loadavg 14–30) — the whole
+/// session at four budgets, reading what each one keeps and what each one
+/// costs in MISSES:
+///
+/// ```text
+/// budget     worlds  weight  RSS held  RSS floor  heap floor  scan miss  walk miss
+/// unbounded    12    266 MiB  559 MiB   374 MiB    342 MiB     7 / 19     15 / 30
+/// 256 MiB      11    254 MiB  560 MiB   415 MiB    331 MiB    17 / 19     17 / 30
+/// 192 MiB       7    160 MiB  443 MiB   305 MiB    235 MiB    17 / 19     21 / 30
+/// 128 MiB       5    125 MiB  414 MiB   256 MiB    206 MiB    18 / 19     26 / 30
+/// ```
+///
+/// 192 MiB is where the floor meets M63's 300 MB target (305 MiB resident and
+/// 235 MiB of heap in use with every document closed, against 374 and 342
+/// unbounded) for six extra misses in a thirty-visit focus walk. 256 MiB buys 12 MiB of that and still cliffs on the
+/// scan — an LRU whose budget sits one world below the cycle evicts exactly
+/// what the next visit wants — and 128 MiB pays five more misses for 50 MiB.
+///
+/// What a miss COSTS is the other half, and it is NOT M36's 3.5–5 s: that is a
+/// per-PROCESS floor which includes parsing std, and every miss here is in a
+/// process whose parse cache, interner and checks record are warm. Measured
+/// paired, the same file both ways inside one process
+/// (`base_cache_miss_cost_across_a_sibling_checkout`, loadavg 4.9): `drag.vl`
+/// 42 → 63 ms, `views.vl` 473 → 768 ms. A miss is the pre-entry RESOLVE, and
+/// it is worth between 21 and 295 ms on this application.
+pub const BASE_CACHE_RESIDENT_BUDGET: usize = 192 * 1024 * 1024;
 
 /// The same bound, expressed in the currency [`BaseCacheState::retained_bytes`]
 /// counts in (M50) — which is what [`BaseCacheState::evict_to_budget`] compares
@@ -50412,6 +50472,26 @@ struct BaseCacheState {
     /// lets a nested analysis on the CLAIMING thread recognise its own claim
     /// and build unclaimed rather than wait on itself.
     building: HashMap<BaseCacheKey, std::thread::ThreadId>,
+    /// M67: the entry paths a front end has declared LIVE — the focused
+    /// document and the few whose programs the server retains — each mapped to
+    /// the key its last analysis used, once one has been observed.
+    ///
+    /// The ruling's second half: the budget evicts least-recently-used, NEVER
+    /// a key a live entry names. An LRU alone has a cliff exactly where an
+    /// editor sits — a budget one world short of the session's cycle evicts
+    /// the world the next visit wants, every visit — and the document the user
+    /// is LOOKING AT is the one visit that must not pay for it. Two entries on
+    /// the language server's own retention rule (`RETAINED_PROGRAMS` is 2), so
+    /// the exemption is bounded by that rule rather than by this map.
+    ///
+    /// Canonical paths, because the declaration comes from a URI and the
+    /// admission from an analysis's entry path, and those two spell the same
+    /// file differently often enough (`windows-support.md` §5).
+    ///
+    /// EMPTY is the ordinary state: the CLI, the wasm front end and every test
+    /// declare nothing, so the whole mechanism is one `is_empty` check on the
+    /// admission path and the eviction behaves exactly as M24 wrote it.
+    live_entries: HashMap<PathBuf, Option<BaseCacheKey>>,
 }
 
 impl BaseCacheState {
@@ -50424,15 +50504,36 @@ impl BaseCacheState {
     /// budget (M24). `keep` — the world just stored — is never evicted: a
     /// single world larger than the budget would otherwise be thrown away the
     /// instant it was stored, turning the cache off rather than bounding it.
-    /// The bound is therefore "the budget, or one world, whichever is more",
-    /// and that is what the pins assert.
+    ///
+    /// **M67: nor is a key a LIVE ENTRY names** — an open document that is
+    /// focused, or whose program the server still retains. The rest of the
+    /// policy is what it was; this is the one world a budget must not be
+    /// allowed to take, because the next analysis of it is the keystroke the
+    /// user is waiting on. Two of them at the server's retention rule, so the
+    /// exemption cannot swallow the budget.
+    ///
+    /// The bound is therefore "the budget, or the exempt worlds, whichever is
+    /// more" — the world just stored plus the live entries' — and that is what
+    /// the pins assert. An exempt set that alone exceeds the budget stops the
+    /// loop rather than spinning it: there is no victim, and a cache that
+    /// cannot evict is a cache that stays where it is.
     fn evict_to_budget(&mut self, keep: Option<&BaseCacheKey>) {
         let budget = BASE_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        // At most one key per live entry, so this is two clones on a path that
+        // runs on a store — and none at all in every front end that declares
+        // no live entry.
+        let live: Vec<BaseCacheKey> = self
+            .live_entries
+            .values()
+            .flatten()
+            .filter(|key| self.worlds.contains_key(*key))
+            .cloned()
+            .collect();
         while self.retained_bytes > budget {
             let victim = self
                 .worlds
                 .iter()
-                .filter(|(key, _)| Some(*key) != keep)
+                .filter(|(key, _)| Some(*key) != keep && !live.contains(key))
                 .min_by_key(|(_, stored)| stored.last_hit)
                 .map(|(key, _)| key.clone());
             let Some(victim) = victim else { return };
@@ -50465,6 +50566,61 @@ pub fn set_base_cache_budget(bytes: usize) {
     // No world is exempt here: this is not a store, so there is nothing to
     // keep.
     state.evict_to_budget(None);
+}
+
+/// Declares which entry paths are LIVE — the documents a front end is holding
+/// open and would re-analyze on the next keystroke (M67).
+///
+/// The budget never evicts a world one of these names. A front end calls this
+/// wherever its retained set moves (the language server: `Backend::focus`, a
+/// landed analysis, a close) and hands the whole set each time, because a set
+/// is what it is: the previous declaration is REPLACED, so a document that
+/// left the set stops being exempt in the same breath the one that joined it
+/// starts.
+///
+/// A path whose key this cache has never seen is remembered anyway, with no
+/// key: the document is live from the moment it is declared, and the key is
+/// learned at its next analysis (a focused document that was released is about
+/// to have one — M63's refocus). A path declared live and already known keeps
+/// the key it had, so a refocus does not forget what a focus learned.
+///
+/// Declaring an empty set turns the exemption off, which is the state every
+/// other front end is in.
+pub fn set_base_cache_live_entries(entries: &[PathBuf]) {
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(BaseCacheState::default()));
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if entries.is_empty() {
+        state.live_entries.clear();
+        return;
+    }
+    let mut live: HashMap<PathBuf, Option<BaseCacheKey>> = HashMap::default();
+    for entry in entries {
+        let canonical = crate::util::canonical_path(entry);
+        let known = state.live_entries.get(&canonical).cloned().flatten();
+        live.insert(canonical, known);
+    }
+    state.live_entries = live;
+}
+
+/// How many entries are declared live, and how many of them have had a key
+/// observed (M67) — the test surface for the exemption, and the pair a
+/// `[vilan phase]` reader would want beside `base_cache_retained`.
+#[doc(hidden)]
+pub fn base_cache_live_entries() -> (usize, usize) {
+    BASE_CACHE
+        .get()
+        .map(|cache| {
+            let state = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.live_entries.len(),
+                state.live_entries.values().flatten().count(),
+            )
+        })
+        .unwrap_or((0, 0))
 }
 
 /// The budget in force (M24) — the test surface, and what a `[vilan phase]`
@@ -51063,7 +51219,18 @@ const CHECKED_CACHE_KEYS: usize = 256;
 /// figure in the same units a machine has — so it needs no re-denomination,
 /// while the base cache's does; deriving this from the re-denominated constant
 /// would have silently divided this budget by 24 as well.
-pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = BASE_CACHE_RESIDENT_BUDGET / 8;
+///
+/// **M67 cut the derivation.** The figure was `BASE_CACHE_RESIDENT_BUDGET / 8`
+/// while that constant was 512 MiB; M67 measured the world budget down to
+/// 192 MiB, and an eighth of THAT is 24 MiB — a 62% cut to a different cache,
+/// arriving as a side effect of a decision about worlds, with no measurement
+/// behind it and nothing in the tree saying it had happened. 64 MiB is written
+/// here now. The sizing ARGUMENT is unchanged and still worth keeping: a
+/// record is a fraction of the world it describes, and the two caches are
+/// bounded by the same argument — but a constant that moves when its neighbour
+/// moves is not a constant, it is a coupling, and this one had already been
+/// warned about once (the note above).
+pub const CHECKED_CACHE_DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 
 static CHECKED_CACHE_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(CHECKED_CACHE_DEFAULT_BUDGET);
@@ -51449,6 +51616,19 @@ fn base_cache_admit(
     let mut state = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // M67: if this entry is one the front end declared LIVE, this is the key
+    // its world is under — learned here because this is the one place that
+    // has both, and recorded whether the lookup below hits or misses (a miss
+    // stores under exactly this key a moment later). Skipped entirely where
+    // nothing is declared live, which is every front end but the server.
+    if !state.live_entries.is_empty() {
+        let canonical = crate::util::canonical_path(entry_path);
+        if let Some(slot) = state.live_entries.get_mut(&canonical)
+            && slot.as_ref() != Some(key)
+        {
+            *slot = Some(key.clone());
+        }
+    }
     let deadline = std::time::Instant::now() + BASE_CACHE_BUILD_WAIT;
     let mut waited = false;
     loop {

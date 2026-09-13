@@ -20032,6 +20032,668 @@ mod session_growth {
         on_big_stack(move || open_documents_under_retention("kolt_src", &entries, retained));
     }
 
+    /// M67's measurement, and the one the ruled default is set FROM: what a
+    /// session pays for a base cache bounded at `budget_mib` RESIDENT MiB.
+    ///
+    /// [`open_documents_under_retention`] answers what the open documents cost.
+    /// This answers what is left when they are gone: the base cache's own
+    /// worlds — thirteen of them for kolt's nineteen files, 270 MiB of the
+    /// 336 MiB floor — and what BOUNDING them costs the session that meets
+    /// them. The trade has exactly two sides and this measures both:
+    ///
+    /// - the FOOTPRINT, read after the walk (worlds live, their weight, RSS,
+    ///   the heap's in-use half), and
+    /// - the MISSES the bound causes, and what a miss COSTS in CPU — a miss is
+    ///   a whole pre-entry resolve of the file's std closure, which is M36's
+    ///   3.5–5 s floor in a cold process and rather less in a warm one, and the
+    ///   difference between the two is the number the default turns on.
+    ///
+    /// Two walks, because a bound behaves differently under each and a default
+    /// chosen against one alone would be chosen against half the question:
+    ///
+    /// - **`scan`** — every file once, in order. The worst case for an LRU of
+    ///   any size below the key count: a full cycle evicts exactly what the
+    ///   next visit wants.
+    /// - **`working_set`** — the shape a session actually has: a handful of
+    ///   files the author moves between (the five largest, round-robin) with an
+    ///   excursion to some other file every third visit. This is what the
+    ///   ruling's "never a focused document's key" is stated about.
+    ///
+    /// The process is warmed first (one analysis, before the cache is cleared)
+    /// so the parse cache, the interner and the allocator's arenas are not
+    /// charged to the first budget measured; the base cache itself IS cleared,
+    /// so every run starts from the same empty map.
+    fn base_cache_budget_walk(
+        label: &str,
+        entries: &[PathBuf],
+        budget_mib: usize,
+        retained: usize,
+    ) {
+        let std_dir = std_root();
+        let Some(warm) = entries.first() else {
+            println!("M67-SKIP {label}: no entries");
+            return;
+        };
+        if let Ok(text) = std::fs::read_to_string(warm) {
+            drop(Document::analyze_on_this_thread(&text, &std_dir, warm));
+        }
+        // `0` is UNBOUNDED here, not "retain nothing": this harness measures
+        // what a bound costs, and the run it is all compared against is the run
+        // with no bound at all. (`set_base_cache_budget`'s own `0` keeps its
+        // meaning; this is the harness's spelling, and it is why the row
+        // carries `budget_mib` verbatim.)
+        let budget = if budget_mib == 0 {
+            usize::MAX
+        } else {
+            vilan_core::analyzer::base_cache_budget_for_resident(budget_mib * 1024 * 1024)
+        };
+        vilan_core::analyzer::base_cache_clear();
+        vilan_core::analyzer::set_base_cache_budget(budget);
+        let baseline = rss_kib();
+        let texts: Vec<String> = entries
+            .iter()
+            .map(|entry| std::fs::read_to_string(entry).unwrap_or_default())
+            .collect();
+
+        // Phase one: open every file, under the server's own retention rule.
+        let mut open: Vec<Document> = Vec::with_capacity(entries.len());
+        let mut order: Vec<usize> = Vec::new();
+        let mut opened = WalkTally::default();
+        for (index, entry) in entries.iter().enumerate() {
+            if texts[index].is_empty() {
+                println!("M67-SKIP {label}: {} is not readable", entry.display());
+                continue;
+            }
+            let (hits_before, misses_before) = vilan_core::analyzer::base_cache_stats();
+            let before = thread_cpu_now();
+            open.push(Document::analyze_on_this_thread(
+                &texts[index],
+                &std_dir,
+                entry,
+            ));
+            let after = thread_cpu_now();
+            let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            let served = hits_after > hits_before;
+            order.retain(|held| *held != index);
+            order.insert(0, index);
+            let keep: Vec<usize> = order.iter().copied().take(retained).collect();
+            // M67: the server tells the base cache its retained set at this
+            // very seam (`enforce_program_retention`), so the walk tells it
+            // too — the exemption is part of what a budget costs, and a
+            // measurement that left it out would be measuring a policy the
+            // server does not run.
+            let live: Vec<PathBuf> = keep.iter().map(|index| entries[*index].clone()).collect();
+            vilan_core::analyzer::set_base_cache_live_entries(&live);
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                if !keep.contains(&position) {
+                    released |= document.release_analysis();
+                }
+            }
+            if released {
+                crate::memory::trim();
+            }
+            let _ = misses_before;
+            opened.record(cpu, served);
+            visit_row(label, budget_mib, "open", index + 1, entry, cpu, served);
+        }
+        summary_row(label, budget_mib, retained, "open", &opened, baseline);
+
+        // Phase two: the scan — every file once, in order.
+        let mut scan = WalkTally::default();
+        for index in 0..open.len() {
+            let (cpu, served) = revisit(
+                &mut open, entries, &texts, &std_dir, &mut order, retained, index,
+            );
+            scan.record(cpu, served);
+            visit_row(
+                label,
+                budget_mib,
+                "scan",
+                index + 1,
+                &entries[index],
+                cpu,
+                served,
+            );
+        }
+        summary_row(label, budget_mib, retained, "scan", &scan, baseline);
+
+        // Phase three: the working set — the five largest files, round-robin,
+        // with an excursion to one of the others every third visit.
+        let mut by_size: Vec<usize> = (0..open.len()).collect();
+        by_size.sort_by_key(|index| std::cmp::Reverse(texts[*index].len()));
+        let core: Vec<usize> = by_size.iter().copied().take(5).collect();
+        let excursions: Vec<usize> = by_size.iter().copied().skip(5).collect();
+        let mut working = WalkTally::default();
+        if !core.is_empty() {
+            for step in 0..WORKING_SET_VISITS {
+                let index = if step % 3 == 2 && !excursions.is_empty() {
+                    excursions[(step / 3) % excursions.len()]
+                } else {
+                    core[step % core.len()]
+                };
+                let (cpu, served) = revisit(
+                    &mut open, entries, &texts, &std_dir, &mut order, retained, index,
+                );
+                working.record(cpu, served);
+                visit_row(
+                    label,
+                    budget_mib,
+                    "working_set",
+                    step + 1,
+                    &entries[index],
+                    cpu,
+                    served,
+                );
+            }
+        }
+        summary_row(
+            label,
+            budget_mib,
+            retained,
+            "working_set",
+            &working,
+            baseline,
+        );
+
+        // What the session is holding at the end, and what is left when every
+        // document is gone: the floor M67 is about.
+        let held = rss_kib();
+        let (held_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        drop(open);
+        crate::memory::trim();
+        let (closed_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        println!(
+            "M67 {{\"section\":\"budget_floor\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"budget_mib\":{budget_mib},\"retained\":{retained},\
+             \"worlds\":{},\"weight_kib\":{},\"rss_kib_baseline\":{baseline},\
+             \"rss_kib_held\":{held},\"rss_kib_after_close\":{},\
+             \"heap_in_use_kib_held\":{},\"heap_in_use_kib_after_close\":{}}}",
+            profile(),
+            loadavg_1m(),
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            rss_kib(),
+            held_in_use / 1024,
+            closed_in_use / 1024,
+        );
+        vilan_core::analyzer::set_base_cache_live_entries(&[]);
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// How many visits the working-set walk takes. Six laps of a five-file
+    /// working set, which is long enough for an LRU to have evicted and
+    /// re-admitted every key a bound below the key count cannot hold.
+    const WORKING_SET_VISITS: usize = 30;
+
+    /// One walk's answer: how many visits, how many the cache served, and what
+    /// each kind cost in CPU.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct WalkTally {
+        visits: usize,
+        hits: usize,
+        hit_cpu: Duration,
+        miss_cpu: Duration,
+    }
+
+    impl WalkTally {
+        fn record(&mut self, cpu: Duration, served: bool) {
+            self.visits += 1;
+            if served {
+                self.hits += 1;
+                self.hit_cpu += cpu;
+            } else {
+                self.miss_cpu += cpu;
+            }
+        }
+
+        fn misses(&self) -> usize {
+            self.visits - self.hits
+        }
+
+        fn mean_ms(total: Duration, count: usize) -> f64 {
+            if count == 0 {
+                0.0
+            } else {
+                total.as_secs_f64() * 1000.0 / count as f64
+            }
+        }
+    }
+
+    /// Re-analyze `index` and land it on the open document, then apply the
+    /// retention rule with that document most recently focused — one visit of a
+    /// focus walk, exactly as `Backend::focus` and `analyze_and_publish`
+    /// sequence it. Answers the CPU the analysis cost and whether the base
+    /// cache served it.
+    fn revisit(
+        open: &mut [Document],
+        entries: &[PathBuf],
+        texts: &[String],
+        std_dir: &Path,
+        order: &mut Vec<usize>,
+        retained: usize,
+        index: usize,
+    ) -> (Duration, bool) {
+        let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+        let before = thread_cpu_now();
+        let landed = Document::analyze_on_this_thread(&texts[index], std_dir, &entries[index]);
+        let after = thread_cpu_now();
+        let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+        open[index].adopt_analysis(landed);
+        let cpu = before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default();
+        order.retain(|held| *held != index);
+        order.insert(0, index);
+        let keep: Vec<usize> = order.iter().copied().take(retained).collect();
+        // M67's exemption, declared where the server declares it.
+        let live: Vec<PathBuf> = keep.iter().map(|index| entries[*index].clone()).collect();
+        vilan_core::analyzer::set_base_cache_live_entries(&live);
+        let mut released = false;
+        for (position, document) in open.iter_mut().enumerate() {
+            if !keep.contains(&position) {
+                released |= document.release_analysis();
+            }
+        }
+        if released {
+            crate::memory::trim();
+        }
+        (cpu, hits_after > hits_before)
+    }
+
+    /// One visit's row.
+    fn visit_row(
+        label: &str,
+        budget_mib: usize,
+        phase: &str,
+        visit: usize,
+        entry: &Path,
+        cpu: Duration,
+        served: bool,
+    ) {
+        println!(
+            "M67 {{\"section\":\"budget_visit\",\"corpus\":\"{label}\",\
+             \"budget_mib\":{budget_mib},\"phase\":\"{phase}\",\"visit\":{visit},\
+             \"file\":\"{}\",\"served\":\"{}\",\"analyze_cpu_ms\":{:.2},\
+             \"worlds\":{},\"weight_kib\":{},\"rss_kib\":{}}}",
+            entry.file_name().unwrap_or_default().to_string_lossy(),
+            if served { "hit" } else { "miss" },
+            cpu.as_secs_f64() * 1000.0,
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            rss_kib(),
+        );
+    }
+
+    /// One walk's row — the table M67's ruling is set from.
+    fn summary_row(
+        label: &str,
+        budget_mib: usize,
+        retained: usize,
+        phase: &str,
+        tally: &WalkTally,
+        baseline: usize,
+    ) {
+        let (in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        println!(
+            "M67 {{\"section\":\"budget_walk\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"budget_mib\":{budget_mib},\"retained\":{retained},\
+             \"phase\":\"{phase}\",\"visits\":{},\"hits\":{},\"misses\":{},\
+             \"cpu_total_ms\":{:.2},\"cpu_hit_mean_ms\":{:.2},\"cpu_miss_mean_ms\":{:.2},\
+             \"worlds\":{},\"weight_kib\":{},\"rss_kib\":{},\"rss_kib_since_baseline\":{},\
+             \"heap_in_use_kib\":{}}}",
+            profile(),
+            loadavg_1m(),
+            tally.visits,
+            tally.hits,
+            tally.misses(),
+            (tally.hit_cpu + tally.miss_cpu).as_secs_f64() * 1000.0,
+            WalkTally::mean_ms(tally.hit_cpu, tally.hits),
+            WalkTally::mean_ms(tally.miss_cpu, tally.misses()),
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            rss_kib(),
+            rss_kib().saturating_sub(baseline),
+            in_use / 1024,
+        );
+    }
+
+    /// M67's budget sweep over the owner's own application, one budget per run:
+    ///
+    /// ```text
+    /// for mib in 0 128 192 256; do
+    ///   VILAN_PERF_KOLT=<checkout> VILAN_M67_BUDGET_MIB=$mib \
+    ///     cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+    ///     -E 'test(base_cache_budget_walk)' --no-capture
+    /// done
+    /// ```
+    ///
+    /// `0` is the unbounded run every other one is read against.
+    #[test]
+    #[ignore = "M67's base-cache budget sweep: needs VILAN_PERF_KOLT, run deliberately"]
+    fn base_cache_budget_walk_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M67-SKIP budget_walk: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        let budget_mib = std::env::var("VILAN_M67_BUDGET_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let retained = std::env::var("VILAN_M63_RETAINED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(RETAINED_PROGRAMS);
+        on_big_stack(move || base_cache_budget_walk("kolt_src", &entries, budget_mib, retained));
+    }
+
+    /// What a base-cache MISS costs over a hit, paired — the other half of the
+    /// budget decision, and the half a walk cannot answer honestly.
+    ///
+    /// A walk's mean-miss and mean-hit figures are means over DIFFERENT FILES:
+    /// kolt's `views.vl` costs ten times `routes.vl` whether it hits or misses,
+    /// so the two means differ by the file mix as much as by the cache. And CPU
+    /// time on this box moves with the load average (E121's standing note),
+    /// which a sweep spread over twenty minutes of somebody else's build cannot
+    /// hold still.
+    ///
+    /// So this measures the SAME file both ways, alternately, inside one
+    /// process: analyze it with its world stored (a hit), then evict every
+    /// world with a zero budget and analyze it again (a miss), `pairs` times,
+    /// and report the median of each half. A zero budget rather than
+    /// [`vilan_core::analyzer::base_cache_clear`] deliberately — an eviction is
+    /// what a budget does, and it leaves M19's checks record standing, which a
+    /// clear does not; clearing would price the miss as something no budget can
+    /// cause.
+    fn base_cache_miss_cost(label: &str, entries: &[PathBuf], pairs: usize) {
+        let std_dir = std_root();
+        let unbounded = usize::MAX;
+        let mut texts: Vec<(PathBuf, String)> = entries
+            .iter()
+            .filter_map(|entry| {
+                std::fs::read_to_string(entry)
+                    .ok()
+                    .map(|text| (entry.clone(), text))
+            })
+            .collect();
+        texts.sort_by_key(|(_, text)| text.len());
+        if texts.is_empty() {
+            println!("M67-SKIP {label}: no readable entries");
+            return;
+        }
+        // Four files across the size range this application actually has: the
+        // smallest, the two quartiles and the largest. A miss's cost is the
+        // file's own pre-entry closure, so one file's number is one file's.
+        let picks = [0, texts.len() / 4, texts.len() / 2, texts.len() - 1];
+        vilan_core::analyzer::set_base_cache_budget(unbounded);
+        for pick in picks {
+            let (entry, text) = &texts[pick];
+            let mut hits: Vec<Duration> = Vec::new();
+            let mut misses: Vec<Duration> = Vec::new();
+            // The warm-up analysis stores the world this file's hits are served
+            // from — and is itself neither.
+            drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+            for _ in 0..pairs {
+                let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+                let cpu = started
+                    .zip(ended)
+                    .map(|(started, ended)| ended.saturating_sub(started))
+                    .unwrap_or_default();
+                if hits_after > hits_before {
+                    hits.push(cpu);
+                }
+                // The eviction, in the currency the budget evicts in.
+                vilan_core::analyzer::set_base_cache_budget(0);
+                vilan_core::analyzer::set_base_cache_budget(unbounded);
+                let (_, misses_before) = vilan_core::analyzer::base_cache_stats();
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                let (_, misses_after) = vilan_core::analyzer::base_cache_stats();
+                let cpu = started
+                    .zip(ended)
+                    .map(|(started, ended)| ended.saturating_sub(started))
+                    .unwrap_or_default();
+                if misses_after > misses_before {
+                    misses.push(cpu);
+                }
+            }
+            hits.sort();
+            misses.sort();
+            let median = |samples: &[Duration]| {
+                samples
+                    .get(samples.len() / 2)
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "M67 {{\"section\":\"miss_cost\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"bytes\":{},\"pairs\":{pairs},\
+                 \"hit_samples\":{},\"miss_samples\":{},\"hit_median_ms\":{:.2},\
+                 \"miss_median_ms\":{:.2}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                text.len(),
+                hits.len(),
+                misses.len(),
+                median(&hits),
+                median(&misses),
+            );
+        }
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// M67's paired miss-cost probe over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(base_cache_miss_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M67's paired miss-cost probe: needs VILAN_PERF_KOLT, run deliberately"]
+    fn base_cache_miss_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M67-SKIP miss_cost: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        on_big_stack(move || base_cache_miss_cost("kolt_src", &entries, 3));
+    }
+
+    /// M68's measurement: what the trim at the analysis-landing seam COSTS, and
+    /// what each landing actually hands back for it.
+    ///
+    /// M64 put `malloc_trim(0)` after every release, which is right at a CLOSE
+    /// — a whole document's analysis goes back at once and glibc hands the
+    /// arenas to the OS — and is asked far more often than that: the dependency
+    /// sweep re-analyzes every open importer of an edited file, each of those
+    /// landings releases the program it just brought (the document is not one
+    /// of the focused few), and each release trims. The item's estimate was
+    /// ~100 ms per background document at kolt scale, from a wall-clock
+    /// difference; this measures it in CPU, per landing, beside the two numbers
+    /// that decide the threshold — how much the landing released, and how much
+    /// of it reached the OS.
+    ///
+    /// Also the cost of ASKING: `mallinfo2` is what the conditional reads, and
+    /// a conditional that costs what it saves is not one. Reported first, as a
+    /// mean over a thousand calls.
+    fn trim_cost(label: &str, entries: &[PathBuf], landings: usize) {
+        let std_dir = std_root();
+        // What the reading itself costs.
+        let started = thread_cpu_now();
+        let mut sink = 0usize;
+        for _ in 0..1000 {
+            sink += heap_split_bytes()
+                .map(|(in_use, _)| in_use as usize)
+                .unwrap_or(0);
+        }
+        let ended = thread_cpu_now();
+        let read_ns = started
+            .zip(ended)
+            .map(|(started, ended)| ended.saturating_sub(started).as_nanos() / 1000)
+            .unwrap_or(0);
+        println!(
+            "M68 {{\"section\":\"mallinfo2_cost\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"calls\":1000,\"mean_ns\":{read_ns},\"sink\":{}}}",
+            profile(),
+            loadavg_1m(),
+            sink % 7,
+        );
+
+        // A session in its steady state: every file open, the focused few
+        // holding programs.
+        let mut open: Vec<Document> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        for entry in entries {
+            let Ok(text) = std::fs::read_to_string(entry) else {
+                continue;
+            };
+            open.push(Document::analyze_on_this_thread(&text, &std_dir, entry));
+            texts.push(text);
+            let count = open.len();
+            for (position, document) in open.iter_mut().enumerate() {
+                if position + RETAINED_PROGRAMS < count {
+                    document.release_analysis();
+                }
+            }
+        }
+        crate::memory::trim();
+
+        // The seam itself, `landings` times: a BACKGROUND document's analysis
+        // lands, is adopted, and is released by the retention rule — which is
+        // `analyze_and_publish`'s tail, with the focus held elsewhere.
+        let mut landings_seen: Vec<(usize, Duration, usize)> = Vec::new();
+        for landing in 0..landings {
+            let index = landing % open.len();
+            let landed = Document::analyze_on_this_thread(&texts[index], &std_dir, &entries[index]);
+            open[index].adopt_analysis(landed);
+            let before_release = heap_split_bytes().map(|(in_use, _)| in_use).unwrap_or(-1);
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                // Index 0 stands in for the focused tab. Every other document
+                // gives its program back, which is what makes this landing a
+                // BACKGROUND one — the shape the dependency sweep produces.
+                if position != 0 {
+                    released |= document.release_analysis();
+                }
+            }
+            let after_release = heap_split_bytes().map(|(in_use, _)| in_use).unwrap_or(-1);
+            let released_kib = (before_release - after_release) / 1024;
+            let rss_before = rss_kib();
+            let started = thread_cpu_now();
+            // The shipped decision (M68), not a bare trim: the row is what the
+            // server does at this seam, threshold and all.
+            let trimmed =
+                released && crate::memory::trim_if_released(usize::try_from(before_release).ok());
+            let ended = thread_cpu_now();
+            let rss_after = rss_kib();
+            let cpu = started
+                .zip(ended)
+                .map(|(started, ended)| ended.saturating_sub(started))
+                .unwrap_or_default();
+            println!(
+                "M68 {{\"section\":\"landing\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"landing\":{landing},\"file\":\"{}\",\"released\":{released},\
+                 \"released_kib\":{},\"trimmed\":{trimmed},\"trim_cpu_ms\":{:.2},\
+                 \"rss_returned_kib\":{},\"rss_kib\":{rss_after}}}",
+                profile(),
+                loadavg_1m(),
+                entries[index]
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                released_kib,
+                cpu.as_secs_f64() * 1000.0,
+                rss_before.saturating_sub(rss_after),
+            );
+            landings_seen.push((
+                usize::try_from(released_kib).unwrap_or(0),
+                cpu,
+                rss_before.saturating_sub(rss_after),
+            ));
+        }
+
+        // What a DIFFERENT threshold would have decided over the same
+        // landings: the sweep the shipped floor is chosen from, so the choice
+        // is readable rather than asserted.
+        for candidate_mib in [4usize, 16, 32, 64] {
+            let floor = candidate_mib * 1024;
+            let (skipped, cpu_saved, rss_forgone) = landings_seen.iter().fold(
+                (0usize, Duration::ZERO, 0usize),
+                |(skipped, cpu, rss), (released_kib, trim_cpu, returned)| {
+                    if *released_kib < floor {
+                        (skipped + 1, cpu + *trim_cpu, rss + *returned)
+                    } else {
+                        (skipped, cpu, rss)
+                    }
+                },
+            );
+            println!(
+                "M68 {{\"section\":\"threshold\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"threshold_mib\":{candidate_mib},\"landings\":{},\
+                 \"skipped\":{skipped},\"cpu_saved_ms\":{:.2},\"rss_forgone_kib\":{rss_forgone}}}",
+                profile(),
+                loadavg_1m(),
+                landings_seen.len(),
+                cpu_saved.as_secs_f64() * 1000.0,
+            );
+        }
+    }
+
+    /// M68's per-landing trim cost over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(trim_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M68's per-landing trim cost: needs VILAN_PERF_KOLT, run deliberately"]
+    fn trim_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M68-SKIP trim_cost: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        on_big_stack(move || trim_cost("kolt_src", &entries, 12));
+    }
     /// The item's own session: 2,000 keystrokes, twenty windows, on the
     /// kolt-sized generated exhibit — and on a sibling checkout's `views.vl`
     /// when `VILAN_PERF_KOLT` points at one.
