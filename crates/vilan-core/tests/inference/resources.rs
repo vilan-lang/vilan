@@ -4464,6 +4464,40 @@ fn drop_of_a_resource_tears_down_immediately() {
     );
 }
 
+/// B328: the sink resolves a PARAMETER's type through `expr_type_id`'s general
+/// answer rather than through a private copy of the arm.
+///
+/// A reference to a parameter is spelled `Expr::Local(parameter_id)` —
+/// `Expr::Parameter` is the DECLARATION — and `expr_type_id` looked the binding
+/// up in `variables` alone, so it read `None` for every one of them.
+/// `drop_argument_type_id` carried its own parameter arm to cover the gap; that
+/// copy is gone, so this program is the consumer reading a parameter's type
+/// with no fallback under it. Remove the arm and it does not silently leak: the
+/// sink's own internal-error guard fires, which is the shape that made the gap
+/// latent rather than dangerous — and is exactly why the general answer had to
+/// be right for the next consumer, which will not have a guard.
+#[test]
+fn b328_drop_of_an_own_parameter_tears_down_at_its_site() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::drop::{ Drop, drop };
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        fun consume(own guard: Guard) {
+            print("before");
+            drop(guard);
+            print("after");
+        }
+        fun main() {
+            consume(Guard { label = "one" });
+            print("done");
+        }
+        "#,
+        "before\ndropped one\nafter\ndone\n",
+    );
+}
+
 #[test]
 fn drop_of_data_is_a_no_op() {
     // On data `drop` is a no-op that still evaluates its argument for effects (no
