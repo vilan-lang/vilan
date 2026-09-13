@@ -57295,16 +57295,20 @@ fn module_source_by_name(
     // The longest prefix that names a loaded file: `a::b::item` is the module
     // `a::b` reaching a name, and `a::b::c` may be a module in its own right.
     for length in (1..=segments.len()).rev() {
-        let joined = segments[..length].join("/");
-        let candidates = [format!("/{joined}.vl"), format!("/{joined}/lib.vl")];
+        // Matched by PATH COMPONENTS, not by string suffix: a canonical path on
+        // Windows is `\\`-separated, and `Path::ends_with` compares components
+        // (both separators read as one there), so the same candidate matches
+        // on every host — the string form never matched a `\\` path.
+        let mut tail = std::path::PathBuf::new();
+        for segment in &segments[..length] {
+            tail.push(segment);
+        }
+        let candidates = [tail.with_extension("vl"), tail.join("lib.vl")];
         let mut best: Option<(usize, SourceId)> = None;
         for (index, loaded) in program.canonical_sources.iter().enumerate() {
-            let Some(text) = loaded.to_str() else {
-                continue;
-            };
             if !candidates
                 .iter()
-                .any(|candidate| text.ends_with(candidate.as_str()))
+                .any(|candidate| loaded.ends_with(candidate))
             {
                 continue;
             }
