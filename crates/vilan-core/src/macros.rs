@@ -344,7 +344,7 @@ fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<(&'a Func<'src>, Span)
         .iter()
         .filter_map(|(node, span)| match node {
             Node::MacroFun(function) => Some((&**function, *span)),
-            Node::Export(inner) => match &inner.0 {
+            Node::Export(_, inner) => match &inner.0 {
                 Node::MacroFun(function) => Some((&**function, inner.1)),
                 _ => None,
             },
@@ -1567,7 +1567,7 @@ impl Expander<'_, '_> {
     /// question, not this pass's to answer.)
     fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>, derived_hashable: bool) {
         match &node.0 {
-            Node::Export(inner)
+            Node::Export(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner) => {
                 self.collect_backed_enum_impls_in(inner, derived_hashable)
@@ -1620,7 +1620,7 @@ impl Expander<'_, '_> {
         depth: u32,
     ) {
         match &node.0 {
-            Node::Export(inner) => self.expand_item_position(inner, siblings, text, depth),
+            Node::Export(_, inner) => self.expand_item_position(inner, siblings, text, depth),
             // `mod` bodies are item position too (a service there gathers its
             // rpc surface from the mod's own items). What a derive there
             // generates belongs to the `mod`'s scope, so the path is tracked

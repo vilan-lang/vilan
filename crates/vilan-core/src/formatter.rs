@@ -10,9 +10,9 @@
 use std::cell::Cell;
 
 use crate::node::{
-    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, Exposure, ExternBinding, Func, GenericArguments,
-    GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList, Pattern,
-    StructInitializerField,
+    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
+    GenericArguments, GenericParameters, ImportBranch, ImportTail, Node, NodeIfBranch, NodeList,
+    Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -484,7 +484,7 @@ fn import_kind_and_branch<'node, 'src>(
     match node {
         Node::Import(branch) => Some((ImportKind::Import, branch)),
         Node::Use(branch) => Some((ImportKind::Use, branch)),
-        Node::Export(inner) => import_kind_and_branch(&inner.0),
+        Node::Export(_, inner) => import_kind_and_branch(&inner.0),
         _ => None,
     }
 }
@@ -1941,7 +1941,7 @@ pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
     };
     let mut spans = Vec::new();
     for item in items.iter() {
-        if matches!(item.0, Node::Export(_)) {
+        if matches!(item.0, Node::Export(..)) {
             continue;
         }
         let Some((_, branch)) = import_kind_and_branch(&item.0) else {
@@ -2710,7 +2710,7 @@ impl<'src> Printer<'src> {
             let end = item.1.into_range().end;
             let statement = match &item.0 {
                 // A re-export is surface, not usage — never pruned.
-                Node::Export(_) => Some(PrunedStatement::ReExport(&item.0)),
+                Node::Export(..) => Some(PrunedStatement::ReExport(&item.0)),
                 // E168: an `import` emptied of its leaves is offered to
                 // `keep_module` before it is dropped — the module it reaches
                 // into may be the only thing bringing an `impl` the file calls
@@ -2861,12 +2861,31 @@ impl<'src> Printer<'src> {
                 self.print_import_branch(branch, true);
                 self.out.push(';');
             }
-            Node::Export(inner) => {
-                self.out.push_str("export ");
+            Node::Export(scope, inner) => {
+                self.out.push_str("export");
+                self.print_export_scope(scope.as_deref());
+                self.out.push(' ');
                 self.print_import_like(&inner.0);
             }
             _ => {}
         }
+    }
+
+    /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
+    /// space before the `(` (`export(in pkg) fun f()`). Nothing when the marker
+    /// carries no narrowing.
+    fn print_export_scope(&mut self, scope: Option<&ExportScope<'src>>) {
+        let Some(scope) = scope else {
+            return;
+        };
+        self.out.push_str("(in ");
+        for (index, (segment, _)) in scope.path.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str("::");
+            }
+            self.out.push_str(segment);
+        }
+        self.out.push(')');
     }
 
     /// Whether `node`, printed as a statement, takes a terminating `;`. Expression
@@ -2890,7 +2909,7 @@ impl<'src> Printer<'src> {
                 | Node::Module(_, _)
                 | Node::Derive(_, _)
                 | Node::Service(_, _)
-                | Node::Export(_)
+                | Node::Export(..)
                 | Node::Use(_)
                 | Node::Import(_)
                 | Node::MacroFun(_)
@@ -3079,10 +3098,16 @@ impl<'src> Printer<'src> {
                 }
                 self.print_item(item);
             }
-            Node::Export(exported) => {
-                self.out.push_str("export ");
+            Node::Export(scope, exported) => {
+                self.out.push_str("export");
+                self.print_export_scope(scope.as_deref());
+                self.out.push(' ');
                 self.print_item(exported);
             }
+            // `export *;` — the module-wide marker. It carries no inner item, so
+            // `needs_semicolon` leaves it out of its exclusion list and the
+            // statement printer supplies the `;`.
+            Node::ExportAll => self.out.push_str("export *"),
             // `mod name { items }`.
             Node::Module(name, body) => {
                 self.out.push_str("mod ");

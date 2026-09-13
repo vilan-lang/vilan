@@ -465,4 +465,4 @@ row	flagship	key
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
 433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
 NEW	-	an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
-NEW	-	`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — and an expression is none of those: it publishes nothing, checks nothing and emits nothing
+NEW	-	`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an expression is none of those, and publishes nothing, checks nothing and emits nothing

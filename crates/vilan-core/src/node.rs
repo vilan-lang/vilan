@@ -439,6 +439,22 @@ pub enum NodeIfBranch<'src> {
     Else(Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>),
 }
 
+/// The `(in PATH)` narrowing on an `export` (B318 §2.2, §10 c): the scope the
+/// marker publishes into.
+///
+/// GENERAL rather than the two useful spellings, because the grammar is
+/// `"(" "in" path ")"` either way: `mod` and `pkg` are RESERVED heads — "this
+/// module and its inline `mod` blocks" and "the item's own package" — matching
+/// `names.md` §4.2's existing roots, and any other path names the module
+/// subtree it roots (`export(in pkg::a)`).
+#[derive(Debug)]
+pub struct ExportScope<'src> {
+    /// The path's segments with their spans, the reserved head included.
+    pub path: Vec<(&'src str, Span)>,
+    /// The whole `(in …)` group — what a diagnostic about the narrowing spans.
+    pub span: Span,
+}
+
 #[derive(Debug)]
 pub enum ImportBranch<'src> {
     // A path segment: its name, the span of that name, and what follows it.
@@ -671,8 +687,12 @@ pub enum Node<'src> {
         Spanned<NodeList<'src>>,
     ),
     Import(ImportBranch<'src>),
-    // `export <item>` — re-export an import or expose a local declaration.
-    Export(Box<Spanned<Self>>),
+    // `export <item>` — mark an item as this module's surface, or re-export an
+    // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
+    Export(Option<Box<ExportScope<'src>>>, Box<Spanned<Self>>),
+    // `export *;` — every item of this module is exported (B318 §2.1). A
+    // module-level item with no inner statement: the marker IS the statement.
+    ExportAll,
     // `macro fun name(..) { .. }` — a macro definition (macro-engine.md §3).
     // Its body is HERMETIC: never walked in the program world, compiled in the
     // per-file macro world instead (its imports resolve against `macro_std`
@@ -952,6 +972,7 @@ impl<'src> Node<'src> {
             | Node::StdItem(..)
             | Node::Bool(_)
             | Node::Error
+            | Node::ExportAll
             | Node::Import(_)
             | Node::Jump(_)
             | Node::LiftBinder
@@ -985,11 +1006,11 @@ impl<'src> Node<'src> {
                     visit(child.node());
                 }
             }
+            Node::Export(_, inner) => visit(inner),
             Node::Async(inner)
             | Node::Await(inner)
             | Node::Dereference(inner)
             | Node::Derive(_, inner)
-            | Node::Export(inner)
             | Node::Reference(_, inner)
             | Node::Service(_, inner)
             | Node::TryAssert(inner)

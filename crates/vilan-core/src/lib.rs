@@ -123,7 +123,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     fn declares(path: &Path, name: &str) -> bool {
         fn node_declares(node: &Node, name: &str) -> bool {
             match node {
-                Node::Export(inner) | Node::Derive(_, inner) | Node::Service(_, inner) => {
+                Node::Export(_, inner) | Node::Derive(_, inner) | Node::Service(_, inner) => {
                     node_declares(&inner.0, name)
                 }
                 Node::Func(function) => function.name.0 == name,
@@ -598,7 +598,7 @@ fn analyze_source_unfenced(
         for (node, _span) in root.0.iter() {
             let function = match node {
                 Node::Func(function) => Some(function),
-                Node::Export(inner) => match &inner.0 {
+                Node::Export(_, inner) => match &inner.0 {
                     Node::Func(function) => Some(function),
                     _ => None,
                 },

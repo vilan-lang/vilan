@@ -4340,7 +4340,7 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
 
 fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
     for item in items {
-        if let Node::Export(inner) = &item.0
+        if let Node::Export(_, inner) = &item.0
             && let Node::Import(branch) | Node::Use(branch) = &inner.0
         {
             let mut entries = Vec::new();
@@ -4458,7 +4458,7 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
 /// attribute) down to the item itself.
 fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
     let mut node = &item.0;
-    while let Node::Export(inner)
+    while let Node::Export(_, inner)
     | Node::Derive(_, inner)
     | Node::Service(_, inner)
     | Node::MacroAttribute(_, _, _, inner) = node
@@ -18820,7 +18820,7 @@ impl<'src> Analyzer<'src> {
             analyzer.declare_scope_item(module_scope_id, name, id);
         };
         match node {
-            Node::Export(inner)
+            Node::Export(_, inner)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner) => {
@@ -26706,7 +26706,23 @@ impl<'src> Analyzer<'src> {
                     Some(Expr::Error)
                 }
             }
-            Node::Export(inner) => {
+            // `export *;` (B318 §2.1) — every item of this module is exported.
+            // The marker IS the statement, so there is nothing under it to walk;
+            // it takes the same module-level refusal `export` takes, for the same
+            // reason.
+            Node::ExportAll => {
+                if !self.module_scope_ids.contains(&scope_id) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: node.1,
+                        msg: "`export` is a module-level item and cannot appear inside a body"
+                            .to_string(),
+                    });
+                }
+                Some(Expr::Void)
+            }
+            Node::Export(_, inner) => {
                 // Exports shape a module's public surface, so they only mean
                 // something at a module's top level. A block-scoped `import`
                 // (H2) is deliberately not exportable — and any other `export`

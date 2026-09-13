@@ -58,9 +58,9 @@ use crate::lexing;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
     CssItem, CssNested, CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
-    Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
-    ImportBranch, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern,
-    ServiceAttr, StructField, TupleBound,
+    ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
+    GenericParameters, If, ImportBranch, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList,
+    Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -249,8 +249,9 @@ pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` b
 /// deref `*helper`) both compiled clean and published nothing — a form with no
 /// reading, accepted silently. Zero occurrences in the estate.
 const EXPORT_TAKES_AN_ITEM: &str = "`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level \
-     `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — and an \
-     expression is none of those: it publishes nothing, checks nothing and emits nothing";
+     `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for \
+     the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an \
+     expression is none of those, and publishes nothing, checks nothing and emits nothing";
 
 /// The rule a MALFORMED import path breaks (B320). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
@@ -309,7 +310,8 @@ fn export_takes(node: &Node<'_>) -> bool {
         | Node::Module(..)
         | Node::Import(_)
         | Node::Use(_)
-        | Node::Export(_)
+        | Node::Export(..)
+        | Node::ExportAll
         | Node::Let(..)
         | Node::LetDestructure(..)
         | Node::Error => true,
@@ -5825,6 +5827,18 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_export(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Export)?;
+        // B318 §2.1: `export *;` is the module-wide marker. The lookahead takes
+        // the `;` as well as the `*`, because a following NAME is a real
+        // expression — `export * helper;` is `export` of the deref `*helper`
+        // (probe P1b) — and reading that as a mistyped `export *;` would take
+        // a shape the language already has. Nothing else in the language has
+        // this one: `*` starts a prefix deref and finds no operand at the `;`.
+        if self.peek_is_op("*") && matches!(self.peek_at(1), Some(Token::Ctrl(';'))) {
+            self.bump();
+            self.bump();
+            return Some((Node::ExportAll, self.span_from(start)));
+        }
+        let scope = self.parse_export_scope();
         let inner = self.parse_statement()?;
         // B321: `parse_statement` reads an EXPRESSION statement too, so
         // `export (helper);` and `export * helper;` parsed and meant nothing.
@@ -5839,7 +5853,83 @@ impl<'a, 'src> Parser<'a, 'src> {
                 hint: None,
             });
         }
-        Some((Node::Export(Box::new(inner)), self.span_from(start)))
+        Some((Node::Export(scope, Box::new(inner)), self.span_from(start)))
+    }
+
+    /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
+    /// marker carries none.
+    ///
+    /// `in` is already [`Token::In`] (`for … in`), so the inner grammar needs no
+    /// contextual-keyword dance; `mod` is [`Token::Mod`] and is admitted as a
+    /// path segment by name, which is what makes `export(in mod)` spellable
+    /// without reserving a second word. A `(` that is NOT followed by `in`
+    /// declines here and falls to the statement reader, where [`export_takes`]
+    /// refuses it and names this form — which is how `export(pkg)`, the spelling
+    /// that reads as a CALL, gets a steer rather than a silent acceptance.
+    fn parse_export_scope(&mut self) -> Option<Box<ExportScope<'src>>> {
+        self.attempt(|parser| {
+            let start = parser.position;
+            parser.expect_ctrl('(')?;
+            // §2.2: `export(pkg)` — the spelling P2c shows reads as a CALL — is
+            // the scope form with `in` left out. Taken and REPORTED rather than
+            // declined, so the author gets the steer instead of the missing-`;`
+            // three tokens later that the fall-through produced. The `;`
+            // lookahead is what keeps it off `export (helper);`, which is an
+            // expression STATEMENT and B321's case: a scope is followed by the
+            // item it narrows, never by a terminator.
+            let missing_in = !parser.eat(&Token::In);
+            if missing_in && parser.terminates_an_export_group() {
+                return None;
+            }
+            let mut path = Vec::new();
+            loop {
+                let at = parser.position;
+                let segment = if parser.eat(&Token::Mod) {
+                    "mod"
+                } else {
+                    parser.eat_name()?
+                };
+                path.push((segment, parser.span_from(at)));
+                if !parser.eat_op("::") {
+                    break;
+                }
+            }
+            parser.expect_ctrl(')')?;
+            let span = parser.span_from(start);
+            if missing_in {
+                parser.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(EXPORT_TAKES_AN_ITEM),
+                    context: parser.context_stack.clone(),
+                    hint: None,
+                });
+            }
+            Some(Box::new(ExportScope { path, span }))
+        })
+    }
+
+    /// Whether the parenthesised group opening at the current position is
+    /// closed by a `;` — an expression STATEMENT after `export`, not a
+    /// visibility scope. Scans forward at paren depth, stopping at anything a
+    /// balanced group cannot contain.
+    fn terminates_an_export_group(&self) -> bool {
+        let mut depth = 1usize;
+        let mut at = self.position;
+        while let Some((token, _)) = self.tokens.get(at) {
+            match token {
+                Token::Ctrl('(') => depth += 1,
+                Token::Ctrl(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.tokens.get(at + 1), Some((Token::Ctrl(';'), _)));
+                    }
+                }
+                Token::Ctrl('{') | Token::Ctrl('}') | Token::Ctrl(';') => return false,
+                _ => {}
+            }
+            at += 1;
+        }
+        false
     }
 
     /// A `::`-separated namespace path ending in a name or a `{ a, b }` set (H2) —
@@ -7602,7 +7692,7 @@ mod tests {
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).
         match only_item("export import shared::config;") {
-            Node::Export(inner) => assert!(matches!(inner.0, Node::Import(_))),
+            Node::Export(_, inner) => assert!(matches!(inner.0, Node::Import(_))),
             other => panic!("expected Export, got {other:?}"),
         }
     }
@@ -8128,6 +8218,59 @@ mod tests {
         // rest still parses — one error, the skipped BEL).
         let errors = rendered_errors("fun main() { \u{0007} }\n");
         assert_eq!(errors, vec!["found '\\u{7}' expected a token".to_string()]);
+    }
+
+    #[test]
+    fn export_all_and_the_scope_narrowing_parse_and_reprint() {
+        // B318 §2.1/§2.2. `export *;` is a `*` + `;` LOOKAHEAD, not "`*` after
+        // `export`": `export * helper;` is a real expression (the deref
+        // `*helper`, probe P1b) and reading it as a mistyped `export *;` would
+        // take a shape the language already has — it stays B321's refusal.
+        assert!(rendered_errors("export *;\n").is_empty());
+        assert!(matches!(only_item("export *;"), Node::ExportAll));
+        assert_eq!(
+            rendered_errors("export * helper;\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        // `(in PATH)` is GENERAL (§10 c): `mod` and `pkg` are reserved heads and
+        // any other path names the module subtree it roots. `mod` is a KEYWORD
+        // token and is admitted as a segment by name, which is what makes
+        // `export(in mod)` spellable without reserving a second word.
+        for source in [
+            "export(in mod) fun helper(): i32 { 1 }\n",
+            "export(in pkg) fun helper(): i32 { 1 }\n",
+            "export(in pkg::a) struct S { x: i32 }\n",
+            "export(in mod) import pkg::io::print;\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        let Node::Export(Some(scope), _) = only_item("export(in pkg::a) struct S { x: i32 }")
+        else {
+            panic!("the narrowing rides the export node");
+        };
+        assert_eq!(
+            scope.path.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["pkg", "a"]
+        );
+        // `export(pkg)` — the spelling that reads as a CALL (probe P2c) — is the
+        // scope with `in` left out, and is REPORTED rather than declined, so the
+        // author gets the steer instead of a missing-`;` three tokens later. The
+        // `;` lookahead keeps that off `export (helper);`, which is B321's.
+        assert_eq!(
+            rendered_errors("export(pkg) fun helper(): i32 { 1 }\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        // fmt reprints both new shapes as written, `::`-joined, no space before
+        // the `(`.
+        assert_eq!(crate::formatter::format("export *;\n"), "export *;\n");
+        assert_eq!(
+            crate::formatter::format("export(in pkg::a) import pkg::io::print;\n"),
+            "export(in pkg::a) import pkg::io::print;\n"
+        );
     }
 
     #[test]

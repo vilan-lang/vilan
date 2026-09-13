@@ -4973,3 +4973,27 @@ fn b317_a_static_is_not_importable_through_a_module_that_writes_no_block() {
         "a module that writes no block offers no statics: {errors:#?}"
     );
 }
+
+// --- B318 S1: visibility, the bit and the two warnings ----------------------
+
+#[test]
+fn b318_export_all_is_a_module_level_item_like_every_other_export() {
+    // `export *;` carries no inner statement — the marker IS the statement —
+    // so it takes the same refusal `export <item>` takes inside a body, for
+    // the same reason: an export shapes a MODULE's surface and a body has no
+    // surface to shape.
+    let files = &[("main.vl", "fun main() {\n\texport *;\n}\n")];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`export` is a module-level item")),
+        "`export *;` inside a body is refused: {errors:#?}"
+    );
+    // At a module's top level it is clean.
+    let files = &[("main.vl", "export *;\n\nfun main() {}\n")];
+    assert!(
+        analyze_package(files, "main.vl", Platform::default()).is_empty(),
+        "`export *;` at the top level is an item"
+    );
+}

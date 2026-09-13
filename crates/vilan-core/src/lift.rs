@@ -323,7 +323,7 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         Node::Await(inner) => Node::Await(seal_boxed(inner)),
         Node::Async(inner) => Node::Async(seal_boxed(inner)),
         Node::FuncReturn(value) => Node::FuncReturn(seal_opt(value)),
-        Node::Export(inner) => Node::Export(seal_boxed(inner)),
+        Node::Export(scope, inner) => Node::Export(scope, seal_boxed(inner)),
         Node::Const(inner) => Node::Const(seal_boxed(inner)),
         Node::Derive(names, inner) => Node::Derive(names, seal_boxed(inner)),
         Node::Service(attribute, inner) => Node::Service(attribute, seal_boxed(inner)),
