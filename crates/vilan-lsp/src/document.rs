@@ -4471,6 +4471,24 @@ impl Document {
             .unwrap_or_default()
     }
 
+    /// The fade text of an unused import leaf: what the editor writes beside
+    /// the gray, and what the user reads before running the action.
+    ///
+    /// Two of them since E173, because the action does two things. A leaf whose
+    /// statement will be DELETED says the plain thing. A leaf whose statement
+    /// the organizer will REWRITE instead (E168: every leaf unused, but the
+    /// file resolves something declared in the module's file, so the import is
+    /// the only thing carrying an `impl` the file calls a method from) said the
+    /// same plain thing and was misleading in the one place it most mattered —
+    /// the fade and the edit disagreed, and the user reading "unused import"
+    /// over a statement the action KEEPS has been told the wrong thing about
+    /// their own file. The second text names the rewrite, and the rewritten
+    /// statement is appended to it in backticks.
+    const UNUSED_IMPORT: &str = "unused import";
+    /// See [`Document::UNUSED_IMPORT`]. The rewritten statement follows.
+    const UNUSED_BUT_THE_MODULE_IS_USED: &str =
+        "unused; the module's impls are in use — Organize Imports rewrites this to";
+
     /// The top-level import leaves nothing in this file uses (E114) — the spans
     /// the editor FADES, in the analyzed text's coordinates.
     ///
@@ -4491,7 +4509,7 @@ impl Document {
     /// the analysis, and nothing fades in a file that carries a diagnostic — a
     /// half-typed name might be about to use the very import in question.
     /// Re-exports are not leaves here at all.
-    pub fn unused_import_spans(&self) -> Vec<Span> {
+    pub fn unused_import_spans(&self) -> Vec<(Span, String)> {
         let Some(program) = self
             .program
             .as_ref()
@@ -4505,9 +4523,107 @@ impl Document {
         let source = self.analyzed_text();
         let import_spans = vilan_core::formatter::import_statement_spans(source);
         let bound = self.definitions_bound_by_import_leaves(program, source);
-        vilan_core::formatter::import_leaf_name_spans(source)
+        let leaves: Vec<(Span, bool)> = vilan_core::formatter::import_leaf_name_spans(source)
             .into_iter()
-            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans, &bound))
+            .map(|leaf| {
+                let used = self.import_leaf_is_used(program, leaf, &import_spans, &bound);
+                (leaf, used)
+            })
+            .collect();
+        if leaves.iter().all(|(_, used)| *used) {
+            return Vec::new();
+        }
+        let rewrites =
+            self.rewritten_import_statements(program, source, &import_spans, &bound, &leaves);
+        leaves
+            .into_iter()
+            .filter(|(_, used)| !used)
+            .map(|(leaf, _)| {
+                let message = rewrites
+                    .iter()
+                    .find(|(statement, _)| spans_contain(*statement, leaf))
+                    .map(|(_, rewrite)| {
+                        format!("{} `{rewrite}`", Self::UNUSED_BUT_THE_MODULE_IS_USED)
+                    })
+                    .unwrap_or_else(|| Self::UNUSED_IMPORT.to_string());
+                (leaf, message)
+            })
+            .collect()
+    }
+
+    /// E173: the import statements Organize Imports will REWRITE to
+    /// `import <module>;` rather than delete, as `(statement span, the
+    /// statement it becomes)`.
+    ///
+    /// Asked OF the organizer rather than recomputed beside it. `keep_module`
+    /// is E168's second question and it is put only to a statement the leaf
+    /// question emptied — which is exactly the statement whose fade text has to
+    /// change — and the module SEGMENT's span, which the rewritten text is
+    /// built from, exists nowhere outside that callback. Recording the callback
+    /// is therefore both the cheapest way to learn it and the only way the fade
+    /// and the action cannot drift, which is E114's whole contract.
+    ///
+    /// Skipped unless some statement's leaves are ALL unused: nothing else can
+    /// reach `keep_module`, so the organizer run would be pure cost on the
+    /// common shape (one unused leaf beside a used one).
+    fn rewritten_import_statements(
+        &self,
+        program: &Program,
+        source: &str,
+        import_spans: &[Span],
+        bound: &HashSet<Definition>,
+        leaves: &[(Span, bool)],
+    ) -> Vec<(Span, String)> {
+        let emptied = |statement: Span| {
+            let mut saw_one = false;
+            for (leaf, used) in leaves {
+                if spans_contain(statement, *leaf) {
+                    if *used {
+                        return false;
+                    }
+                    saw_one = true;
+                }
+            }
+            saw_one
+        };
+        if !import_spans.iter().any(|statement| emptied(*statement)) {
+            return Vec::new();
+        }
+        // The leaf question, answered from the tally above rather than asked
+        // again: this run exists to learn where `keep_module` is reached, and
+        // re-deciding every leaf to get there would be that walk twice.
+        let keep = |leaf_span: Span| {
+            leaves
+                .iter()
+                .find(|(leaf, _)| *leaf == leaf_span)
+                .is_none_or(|(_, used)| *used)
+        };
+        let widened = std::cell::RefCell::new(Vec::new());
+        let keep_module = |module_span: Span| {
+            let used = self.import_module_is_used(program, module_span, import_spans, bound);
+            if used {
+                widened.borrow_mut().push(module_span);
+            }
+            used
+        };
+        let _ = vilan_core::formatter::organize_import_runs(source, &keep, &keep_module);
+        widened
+            .into_inner()
+            .into_iter()
+            .filter_map(|module_span| {
+                let statement = *import_spans
+                    .iter()
+                    .find(|statement| spans_contain(**statement, module_span))?;
+                // The statement's own head, up to and including the module
+                // segment the organizer kept — which is what it prints. A
+                // statement's span ends at its path (the `;` is outside it), so
+                // the terminator is put back here; the whitespace collapse is
+                // for the one shape a hand-written import can take that the
+                // formatter never writes, a path broken across lines.
+                let head = source.get(statement.start..module_span.end)?;
+                let head: Vec<&str> = head.split_whitespace().collect();
+                Some((statement, format!("{};", head.join(" "))))
+            })
             .collect()
     }
 
@@ -6466,6 +6582,12 @@ fn trailing_semicolon_to_remove(
 /// overlaps it.
 fn spans_overlap(a: Span, b: Span) -> bool {
     a.start <= b.end && b.start <= a.end
+}
+
+/// Whether `outer` covers `inner` — an import statement's span against one of
+/// its own leaf or module spans (E173).
+fn spans_contain(outer: Span, inner: Span) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
 }
 
 /// Replaces the byte range `span` in `source` with `replacement`. The
@@ -13955,9 +14077,88 @@ pub(crate) mod tests {
             organized(&document).expect("the emptied statement offers an edit"),
             "import pkg::a;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
         );
-        // The fade is unchanged: `b` IS unused, and E114's contract is that the
-        // mark and the fix describe the same statement.
+        // The fade stays where it was: `b` IS unused, and E114's contract is
+        // that the mark and the fix describe the same statement. Its TEXT is
+        // E173's subject and is pinned below.
         assert_eq!(faded(&document), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fade TEXT beside each faded leaf (E173), paired with the leaf it is
+    /// written over — [`faded`] asks where, this asks what it says there.
+    fn faded_messages(document: &Document) -> Vec<(String, String)> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unused_import_spans()
+            .into_iter()
+            .map(|(span, message)| (text[span.into_range()].to_string(), message))
+            .collect()
+    }
+
+    // E173: the one place the fade and the action it names disagreed. E168's
+    // rewrite KEEPS the statement — the leaf is unused but the module's impls
+    // are not — and the leaf went on saying "unused import", so a user reading
+    // the gray was told their import would be deleted and then watched Organize
+    // Imports widen it instead. The text names the rewrite, and the statement it
+    // becomes, which is the same statement `organized` produces above.
+    #[test]
+    fn a_faded_leaf_whose_module_is_kept_says_what_the_action_will_do() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![(
+                "b".to_string(),
+                "unused; the module's impls are in use — Organize Imports rewrites this \
+                 to `import pkg::a;`"
+                    .to_string()
+            )],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The two controls, both of which keep the plain text because the action
+    // really does delete. The module brings nothing either, so the statement
+    // goes; and a brace set with a live member never reaches the module
+    // question at all — the common shape, and the one the widened return is
+    // careful not to make pay for the rewrite case.
+    #[test]
+    fn a_faded_leaf_whose_statement_is_deleted_keeps_the_plain_text() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\t2\n}\n",
+            ),
+            ("a.vl", "fun b(): i32 {\n\t1\n}\n"),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![("b".to_string(), "unused import".to_string())],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_faded_leaf_beside_a_live_one_keeps_the_plain_text() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ b, c };\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+            ),
+            (
+                "a.vl",
+                "fun b(): i32 {\n\t1\n}\n\nfun c(): i32 {\n\t2\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![("b".to_string(), "unused import".to_string())],
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14252,7 +14453,7 @@ pub(crate) mod tests {
         document
             .unused_import_spans()
             .into_iter()
-            .map(|span| text[span.into_range()].to_string())
+            .map(|(span, _)| text[span.into_range()].to_string())
             .collect()
     }
 
