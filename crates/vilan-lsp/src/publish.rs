@@ -813,7 +813,7 @@ mod tests {
             ),
             (
                 "a.vl",
-                "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+                "export *;\n\nfun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
             ),
         ]);
         let uri = Url::from_file_path(directory.join("main.vl")).expect("a file URL");
