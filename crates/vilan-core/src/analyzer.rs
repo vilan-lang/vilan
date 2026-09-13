@@ -47293,9 +47293,20 @@ fn lift_target_of(node: &Spanned<Node<'_>>) -> bool {
     }
 }
 
-/// Renders a (field) type node back to source for use in generated code — a
-/// name (`i32`/`Point`) or a generic application (`List<i32>`). Other forms fall
+/// Renders a (field) type node back to source — for generated code, and for
+/// every diagnostic that quotes a type AS WRITTEN. A name (`i32`/`Point`), a
+/// generic application (`List<i32>`) and a `::` path (`models::Note`,
+/// `std::reactive::SignalCell<i32>`) render as their source; other forms fall
 /// back to `_`, which surfaces a clear error at the generated use site.
+///
+/// The path arm is B302: a path annotation used to render `_`, so `[rpc] fun
+/// note(self, id: i32): models::Note` was refused as "return type … is `_`,
+/// which is not Wire" — a message naming nothing the author had written. Every
+/// caller here quotes the author's own spelling back, so the arm is one fix for
+/// all of them (the Wire/Hashable/PartialEq/Json field messages, the four
+/// `[rpc]` ones, the macro signature, and the derive codegen, where a path
+/// annotation is generated back into the module that wrote it and resolves
+/// there exactly as it did).
 fn render_type(node: &Node<'_>) -> String {
     match node {
         Node::Accessor(name) => name.to_string(),
@@ -47307,6 +47318,23 @@ fn render_type(node: &Node<'_>) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{name}<{arguments}>")
+        }
+        // `a::b::C` nests to the LEFT (`StaticAccessor(StaticAccessor(a, "b"),
+        // "C")`), and only the last segment can carry generic arguments.
+        Node::StaticAccessor(subject, name, arguments) => {
+            let subject = render_type(&subject.0);
+            let arguments = arguments.as_ref().map(|arguments| {
+                arguments
+                    .0
+                    .iter()
+                    .map(|argument| render_type(&argument.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            match arguments {
+                Some(arguments) => format!("{subject}::{name}<{arguments}>"),
+                None => format!("{subject}::{name}"),
+            }
         }
         _ => "_".to_string(),
     }

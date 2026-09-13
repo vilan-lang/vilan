@@ -5192,3 +5192,179 @@ fn b315_two_blankets_bounded_the_same_way_keep_the_already_defined_message() {
         "'peek' is already defined for",
     );
 }
+
+// --- B302: a written PATH renders as written ------------------------------------
+// `render_type` turns a written type annotation back into source — for the code
+// a `[derive(..)]` generates, and for every message that quotes a type AS THE
+// AUTHOR WROTE IT. It knew a name (`i32`) and a generic application
+// (`List<i32>`) and fell back to `_` for everything else, and a `::` path is
+// everything else: `[rpc] fun note(self, id: i32): models::Note` was refused as
+// "return type … is `_`, which is not Wire", naming nothing the author had
+// typed. The arm is one fix for every caller, because every caller is quoting
+// the same spelling back.
+
+#[test]
+fn b302_the_rpc_return_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun note(self, id: i32): models::Note { models::Note { body = || {} } }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `note` is `models::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_the_rpc_parameter_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun keep(self, note: models::Note): i53 { 1i53 }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "of `[rpc]` method `keep` is `models::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_a_path_with_generic_arguments_renders_both_halves() {
+    // The last segment is the only one that can carry arguments, and it does.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Holder<T> { body: || void, value: T }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun hold(self): models::Holder<i32> {
+                models::Holder { body = || {}, value = 1 }
+            }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `hold` is `models::Holder<i32>`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_a_path_of_three_segments_renders_whole() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            mod deep {
+                struct Note { body: || void }
+            }
+        }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun note(self): models::deep::Note { models::deep::Note { body = || {} } }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `note` is `models::deep::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_the_derive_wire_field_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [derive(Wire)]
+        struct Row { note: models::Note }
+        fun main() { print("row"); }
+        main();
+        "#,
+        "field `note` of `[derive(Wire)]` type `Row` is `models::Note`, which is not Wire",
+    );
+}
+
+#[test]
+fn b302_the_derive_hashable_field_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            struct Note { body: || void }
+        }
+        [derive(Hashable)]
+        struct Row { note: models::Note }
+        fun main() { print("row"); }
+        main();
+        "#,
+        "field `note` of `[derive(Hashable)]` type `Row` is `models::Note`, which is not `Hashable`",
+    );
+}
+
+#[test]
+fn b302_the_client_service_notification_refusal_names_the_path_as_written() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        mod models {
+            [derive(Wire)]
+            struct Note { title: str }
+        }
+        [client_service]
+        struct Watcher { name: str }
+        impl Watcher {
+            [rpc]
+            fun ping(self): models::Note { models::Note { title = "x" } }
+        }
+        fun main() { print("w"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `ping` is `models::Note`, but a `[client_service]` method \
+         is a NOTIFICATION",
+    );
+}
+
+#[test]
+fn b302_a_bare_name_and_a_generic_application_still_render_as_they_did() {
+    // The control: the two forms the renderer already knew are untouched.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Opaque { body: || void }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun look(self): List<Opaque> { [] }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "return type of `[rpc]` method `look` is `List<Opaque>`, which is not Wire",
+    );
+}
