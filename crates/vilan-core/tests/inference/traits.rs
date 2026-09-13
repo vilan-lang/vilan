@@ -5442,6 +5442,101 @@ fn b315_a_binder_bounded_by_a_trait_the_written_type_does_implement_overlaps() {
     );
 }
 
+// --- B330: two blankets bounded DIFFERENTLY (Order 35 ruling R5) ---------------
+// B315 refuses two blankets whose bound clauses OVERLAP, and it answers that
+// question from the declarations. When both argument binders are BOUNDED, and
+// bounded by different traits, the declarations do not contain the answer:
+// whether some third type carries both is a fact about every type in this
+// program and in every program that will import it. The pair is admitted —
+// deliberately, and these two pins are what makes it a recorded behaviour
+// rather than a gap nobody measured. The refusal belongs at the CALL, where the
+// receiver is known; B318's S4 (the per-importer namespace) is where it is
+// queued.
+
+#[test]
+fn b330_two_blankets_bounded_differently_may_share_a_name() {
+    // Neither clause is a subset of the other and neither names a written type,
+    // so `bound_argument_positions_overlap` has nothing to compare and the
+    // duplicate family stands down.
+    assert_compiles(
+        r#"
+        import std::debug::Debug;
+
+        trait Read<T> { fun get(self): T; }
+        trait Tagged { fun tag(self): str; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Debug> {
+            fun peek(self): str { "debug side" }
+        }
+        impl type O: Read<type J: Tagged> {
+            fun peek(self): str { "tagged side" }
+        }
+
+        fun main() { }
+        "#,
+    );
+}
+
+/// The cost of the admission, stated: a receiver satisfying BOTH bounds has two
+/// inherent candidates and tier 1 takes the first without ranking, so
+/// DECLARATION ORDER picks the body. The same program with the two `impl`
+/// blocks swapped prints the other answer — which is why the refusal has to
+/// live at the call site (B318 S4) and cannot be written here.
+#[test]
+fn b330_a_receiver_satisfying_both_bounds_takes_the_first_impl_declared() {
+    let program = r#"
+        import std::io::print;
+        import std::debug::Debug;
+
+        trait Read<T> { fun get(self): T; }
+        trait Tagged { fun tag(self): str; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        struct Both { n: i32 }
+        impl Both with Debug {
+            fun debug(self): str { i"Both({self.n})" }
+        }
+        impl Both with Tagged {
+            fun tag(self): str { "both" }
+        }
+
+        IMPLS
+
+        fun main() {
+            let cell: Cell<Both> = Cell { value = Both { n = 1 } };
+            print(cell.peek());
+        }
+        main();
+        "#;
+    let debug_first = r#"
+        impl type S: Read<type I: Debug> {
+            fun peek(self): str { "debug side" }
+        }
+        impl type O: Read<type J: Tagged> {
+            fun peek(self): str { "tagged side" }
+        }
+        "#;
+    let tagged_first = r#"
+        impl type O: Read<type J: Tagged> {
+            fun peek(self): str { "tagged side" }
+        }
+        impl type S: Read<type I: Debug> {
+            fun peek(self): str { "debug side" }
+        }
+        "#;
+    assert_compiles_and_runs(&program.replace("IMPLS", debug_first), "debug side\n");
+    assert_compiles_and_runs(&program.replace("IMPLS", tagged_first), "tagged side\n");
+}
+
 #[test]
 fn b315_two_blankets_bounded_the_same_way_keep_the_already_defined_message() {
     // The families stay apart: an identical pair is still "already defined",

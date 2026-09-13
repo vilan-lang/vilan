@@ -7594,6 +7594,32 @@ impl<'src> Analyzer<'src> {
     /// and a binder bounded by two demand different things and no widening here
     /// changes that — and then each ARGUMENT position must be jointly
     /// inhabitable.
+    ///
+    /// # What this rule DOES NOT refuse (B330, Order 35 ruling R5)
+    ///
+    /// Two blankets whose argument binders are bounded DIFFERENTLY —
+    /// `impl type S: Read<type I: Debug>` beside `impl type O: Read<type J:
+    /// Tagged>`, both declaring `peek` — are ADMITTED, deliberately. Whether
+    /// some third type carries both `Debug` and `Tagged` is not a question the
+    /// DECLARATIONS answer: the binders demand different traits, and every
+    /// pair of traits in the program (and in every program that will ever
+    /// import it) is a potential witness. Refusing the pair would refuse two
+    /// blankets that no type in the estate can ever bring together;
+    /// [`Self::bound_argument_positions_overlap`]'s `(Generic, Generic)` arm is
+    /// where that answer is written down, and it says `false`.
+    ///
+    /// The consequence is real and is not hidden: a receiver that DOES satisfy
+    /// both — a `Cell<Both>` where `Both` implements both traits — has two
+    /// inherent candidates, and tier 1 of method resolution takes the first
+    /// without ranking, so DECLARATION ORDER decides which body runs. Swapping
+    /// the two `impl` blocks changes the answer. Two pins in
+    /// `inference/traits.rs` (`b330_*`) hold exactly that, so the admission is
+    /// a recorded behaviour rather than a gap nobody measured.
+    ///
+    /// The refusal belongs at the CALL, not here: the site knows the receiver,
+    /// so it knows whether the witness exists, and it is the only place that
+    /// can. B318's S4 — the per-importer namespace — is where such a check
+    /// lives and is where it is queued.
     fn generic_bounds_overlap(&self, left: TypeId, right: TypeId) -> bool {
         let left_bounds = self.generic_bound_traits(left);
         let right_bounds = self.generic_bound_traits(right);
@@ -7632,6 +7658,8 @@ impl<'src> Analyzer<'src> {
             // both is a question this rule cannot answer from the declarations
             // alone, and the duplicate family refuses only what it can see —
             // so they are left as they were before B315: not a collision.
+            // B330/R5 documents what that costs at
+            // `generic_bounds_overlap`, and pins it.
             (Type::Generic(_), Type::Generic(_)) => false,
             (Type::Generic(binder), other) | (other, Type::Generic(binder)) => self
                 .generic_bound_traits(binder)
