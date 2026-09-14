@@ -76,6 +76,47 @@ pub struct StateSizes {
     pub line_indices: usize,
 }
 
+/// E179: what the ANALYZER's base cache is holding, for the retained-state
+/// line — the worlds it is keeping, what they weigh, and the budget that bounds
+/// them (M67).
+///
+/// Its own struct rather than three more [`StateSizes`] fields, and the
+/// distinction is not cosmetic: `StateSizes` is the SERVER's own maps, one
+/// entry per open document, and the open-edit-close pins compare two of them
+/// for equality to prove a session returns to baseline. The base cache is
+/// process-global and analyzer-owned — shared with every other analysis in the
+/// process, and deliberately NOT emptied by closing a document — so folding it
+/// into that tuple would make those comparisons depend on something no
+/// document owns.
+///
+/// Both byte figures are RESIDENT bytes, which is the unit the reader means by
+/// "how much memory is this holding": the budget is denominated in the M11
+/// tally's recorded bytes internally, and is converted here through the one
+/// public factor so the two numbers on the line can be compared by eye
+/// (`base_cache_weight` at or just under `base_cache_budget` is the bound
+/// working; well over it is M67's eviction not running).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BaseCacheSizes {
+    /// How many worlds the cache retains right now (M11).
+    pub worlds: usize,
+    /// What those worlds weigh, in resident bytes (M50's re-denomination).
+    pub weight_bytes: usize,
+    /// The bound in force, in the same unit (M24/M67).
+    pub budget_bytes: usize,
+}
+
+impl BaseCacheSizes {
+    /// The cache's own numbers, read at this instant.
+    pub fn sample() -> BaseCacheSizes {
+        BaseCacheSizes {
+            worlds: vilan_core::analyzer::base_cache_retained(),
+            weight_bytes: vilan_core::analyzer::base_cache_retained_weight(),
+            budget_bytes: vilan_core::analyzer::base_cache_budget()
+                .saturating_mul(vilan_core::analyzer::BASE_CACHE_WEIGHT_FACTOR),
+        }
+    }
+}
+
 /// M26: what the analysis scheduler did this session.
 ///
 /// `started` counts every analysis the server began; `landed` those that
@@ -243,6 +284,7 @@ impl RequestTally {
     pub fn summary(
         &self,
         state: StateSizes,
+        base_cache: BaseCacheSizes,
         analyses: AnalysisCounts,
         memory: crate::memory::Memory,
     ) -> String {
@@ -260,7 +302,8 @@ impl RequestTally {
         let mut out = format!(
             "session trace after {} requests\n  \
              retained state: documents={} programs={} semantic_token_cache={} manifests={} \
-             pending={} line_indices={}\n  \
+             pending={} line_indices={} base_cache_worlds={} base_cache_weight={} \
+             base_cache_budget={}\n  \
              {}\n  \
              analyses: started={} landed={} cancelled={}\n  \
              lsp-index (M27, editor tables per landed analysis): total={}ms max={}ms\n  \
@@ -272,6 +315,15 @@ impl RequestTally {
             state.manifests,
             state.pending,
             state.line_indices,
+            // E179: the base cache beside the maps it is NOT one of. `programs=`
+            // and `memory:` were already here and said nothing about the
+            // analyzer's own retained worlds — which on kolt's nineteen files
+            // weighed 266 MiB, the single largest thing the server holds, and
+            // were invisible on the one page the owner reads when a session
+            // starts feeling slow.
+            base_cache.worlds,
+            crate::memory::mib(Some(base_cache.weight_bytes)),
+            crate::memory::mib(Some(base_cache.budget_bytes)),
             memory.line(),
             analyses.started,
             analyses.landed,
@@ -318,6 +370,7 @@ pub fn record(request: &'static str, elapsed_ms: u128) -> TraceEvent {
 /// analysis counts.
 pub fn summary(
     state: StateSizes,
+    base_cache: BaseCacheSizes,
     analyses: AnalysisCounts,
     memory: crate::memory::Memory,
 ) -> String {
@@ -326,7 +379,7 @@ pub fn summary(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .get_or_insert_with(RequestTally::new)
-        .summary(state, analyses, memory)
+        .summary(state, base_cache, analyses, memory)
 }
 
 #[cfg(test)]
@@ -429,6 +482,7 @@ mod tests {
                 pending: 0,
                 line_indices: 37,
             },
+            BaseCacheSizes::default(),
             AnalysisCounts {
                 started: 9,
                 landed: 3,
@@ -453,7 +507,8 @@ mod tests {
         assert!(
             summary.contains(
                 "documents=4 programs=2 semantic_token_cache=4 manifests=1 pending=0 \
-                 line_indices=37"
+                 line_indices=37 base_cache_worlds=0 base_cache_weight=0.0 MiB \
+                 base_cache_budget=0.0 MiB"
             ),
             "the retained-state cardinalities are the growth evidence: {summary}",
         );
@@ -487,6 +542,16 @@ mod tests {
                 pending: 0,
                 line_indices: 61,
             },
+            // E179: the base cache's own numbers, from the budget walk this
+            // page exists to make readable — twelve worlds at 266 MiB under
+            // M67's 192 MiB bound is the state that says the bound is not
+            // holding, and it is the state the owner reported with nothing on
+            // the page to name it.
+            BaseCacheSizes {
+                worlds: 12,
+                weight_bytes: 278_921_216,
+                budget_bytes: 201_326_592,
+            },
             AnalysisCounts::default(),
             crate::memory::Memory {
                 resident_bytes: Some(532_824_064),
@@ -497,9 +562,12 @@ mod tests {
         assert!(
             summary.contains(
                 "retained state: documents=18 programs=2 semantic_token_cache=18 \
-                 manifests=1 pending=0 line_indices=61"
+                 manifests=1 pending=0 line_indices=61 base_cache_worlds=12 \
+                 base_cache_weight=266.0 MiB base_cache_budget=192.0 MiB"
             ),
-            "M63's own number belongs beside the documents it bounds: {summary}",
+            "M63's own number belongs beside the documents it bounds, and E179's \
+             three beside them — the base cache is the largest thing the server \
+             retains and the page did not name it: {summary}",
         );
         assert!(
             summary.contains(
@@ -516,6 +584,7 @@ mod tests {
         tally.record("hover", 2);
         let summary = tally.summary(
             StateSizes::default(),
+            BaseCacheSizes::default(),
             AnalysisCounts::default(),
             crate::memory::Memory::default(),
         );
@@ -532,6 +601,7 @@ mod tests {
         let tally = RequestTally::new();
         let summary = tally.summary(
             StateSizes::default(),
+            BaseCacheSizes::default(),
             AnalysisCounts::default(),
             crate::memory::Memory::default(),
         );
@@ -566,6 +636,7 @@ mod tests {
 
         let summary = RequestTally::new().summary(
             StateSizes::default(),
+            BaseCacheSizes::default(),
             counts,
             crate::memory::Memory::default(),
         );

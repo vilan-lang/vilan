@@ -2166,6 +2166,10 @@ impl Backend {
                 pending: self.schedule.len(),
                 line_indices: self.line_indices.len(),
             },
+            // E179: the analyzer's base cache, which is not one of the maps
+            // above — it is process-global and outlives every document — and
+            // was the one large retained thing this page did not name.
+            session_trace::BaseCacheSizes::sample(),
             self.analyses.counts(),
             // E166: the numbers E106 and M63 were found with, on the page
             // the owner reads when a session starts feeling slow.
@@ -8791,6 +8795,31 @@ mod execute_command_tests {
         assert!(
             text.contains("\n  memory: rss="),
             "E166's memory line is the payload: {text}"
+        );
+        // E179: the ANALYZER's base cache, sampled live by the server rather
+        // than passed in by a test — the numbers are the process's own and
+        // cannot be asserted (the cache is process-global and this runner is
+        // parallel), so what is pinned is that the page NAMES all three, in
+        // this order, on the retained-state line. The analysis above is what
+        // makes them non-vacuous: a world was stored to reach this point.
+        let retained = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("retained state: "))
+            .unwrap_or_else(|| panic!("no retained-state line: {text}"));
+        for field in [
+            "base_cache_worlds=",
+            "base_cache_weight=",
+            "base_cache_budget=",
+        ] {
+            assert!(
+                retained.contains(field),
+                "the base cache is the largest thing the server retains and \
+                 `{field}` is not on its line: {retained}"
+            );
+        }
+        assert!(
+            retained.contains(" MiB"),
+            "the two byte figures are rendered in the memory line's own unit: {retained}"
         );
         assert!(
             text.contains("analyses: started="),
