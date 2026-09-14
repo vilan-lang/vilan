@@ -2041,15 +2041,15 @@ fn e170_a_call_is_still_a_call_inside_a_head_item_and_outside_one() {
 /// Every shape the parenless rule has to tell apart: the two it must paint, the
 /// tag names and the `on:` form it must not steal, a chain link's method, a
 /// hyphenated name, a hole child and a call outside the markup.
-const E176_PARENLESS_HEAD_ITEMS: &str = "\
-fun probe(flag: bool): View {
-\tlet widget = compute(\"x\");
-\t<label class(\"row\") hidden.show(flag)>
-\t\t<input type(\"checkbox\") on:click(|_| { bump(); }) aria-label(\"y\") disabled />
-\t\t{widget}
-\t</label>
-}
-";
+const E176_PARENLESS_HEAD_ITEMS: &str = concat!(
+    "fun probe(flag: bool): View {\n",
+    "\tlet widget = compute(\"x\");\n",
+    "\t<label class(\"row\") hidden.show(flag)>\n",
+    "\t\t<input type(\"checkbox\") on:click(|_| { bump(); }) aria-label(\"y\") disabled />\n",
+    "\t\t{widget}\n",
+    "\t</label>\n",
+    "}\n",
+);
 
 #[test]
 fn e176_a_parenless_head_item_carries_the_attribute_vocabulary() {

@@ -12667,13 +12667,19 @@ pub(crate) mod tests {
 
     /// A CURATED module — one `export` marker is what makes it one — beside its
     /// own private machinery.
-    const CURATED_MODULE: &str = "export fun shown(): i32 {\n\t1\n}\n\n\
-         export fun also_shown(): i32 {\n\t3\n}\n\nfun hidden(): i32 {\n\t2\n}\n";
+    const CURATED_MODULE: &str = concat!(
+        "export fun shown(): i32 {\n\t1\n}\n\n",
+        "export fun also_shown(): i32 {\n\t3\n}\n\n",
+        "fun hidden(): i32 {\n\t2\n}\n",
+    );
 
     /// The same module with no marker anywhere: it offers everything, exactly
     /// as it did before the bit existed.
-    const UNCURATED_MODULE: &str = "fun shown(): i32 {\n\t1\n}\n\n\
-         fun also_shown(): i32 {\n\t3\n}\n\nfun hidden(): i32 {\n\t2\n}\n";
+    const UNCURATED_MODULE: &str = concat!(
+        "fun shown(): i32 {\n\t1\n}\n\n",
+        "fun also_shown(): i32 {\n\t3\n}\n\n",
+        "fun hidden(): i32 {\n\t2\n}\n",
+    );
 
     #[test]
     fn an_import_path_offers_a_curated_modules_exports_and_not_its_machinery() {
@@ -12727,10 +12733,12 @@ pub(crate) mod tests {
 
     /// B318 S3's selector surface with a PRIVATE subject beside an exported
     /// one — the module writes an `impl` block for each.
-    const CURATED_IMPL_MODULE: &str = "export struct Shown {\n\tn: i32,\n}\n\n\
-         struct Hidden {\n\tn: i32,\n}\n\n\
-         impl Shown {\n\tfun widen(self): i32 {\n\t\tself.n\n\t}\n}\n\n\
-         impl Hidden {\n\tfun narrow(self): i32 {\n\t\tself.n\n\t}\n}\n";
+    const CURATED_IMPL_MODULE: &str = concat!(
+        "export struct Shown {\n\tn: i32,\n}\n\n",
+        "struct Hidden {\n\tn: i32,\n}\n\n",
+        "impl Shown {\n\tfun widen(self): i32 {\n\t\tself.n\n\t}\n}\n\n",
+        "impl Hidden {\n\tfun narrow(self): i32 {\n\t\tself.n\n\t}\n}\n",
+    );
 
     #[test]
     fn an_impl_selector_never_offers_a_private_subject_or_its_members() {
@@ -16735,9 +16743,11 @@ pub(crate) mod tests {
     /// form only when the file's uses span more than one `impl` block
     /// (`visibility.md` §7.2), and the collision guard is about the wide form —
     /// a SELECTOR binds no name and needs no guard at all.
-    const LEAF_AND_TWO_IMPLS: &str = "fun b(): i32 {\n\t1\n}\n\n\
-         impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n\n\
-         impl bool {\n\tfun flipped(self): bool {\n\t\tself\n\t}\n}\n";
+    const LEAF_AND_TWO_IMPLS: &str = concat!(
+        "fun b(): i32 {\n\t1\n}\n\n",
+        "impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n\n",
+        "impl bool {\n\tfun flipped(self): bool {\n\t\tself\n\t}\n}\n",
+    );
 
     // E180's collision guard where the rescue is genuinely WANTED: `a.vl`'s two
     // `impl` blocks are the only thing bringing `doubled` and `flipped`, so
