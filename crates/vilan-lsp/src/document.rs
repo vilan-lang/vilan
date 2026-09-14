@@ -12648,6 +12648,114 @@ pub(crate) mod tests {
         labels
     }
 
+    // --- E178: completion consults the visibility bit ----------------------
+    //
+    // B318 §1 gates three tooling consumers on the bit, and S1 wired two of
+    // them (the add-import quickfix, the steers) and left the third because
+    // `vilan-ide` was another lane's file: an import-path popup went on listing
+    // every name a module declares, its private machinery included. One rule
+    // in every place it is asked, under the uncurated-module exemption.
+    //
+    // The AUTO-IMPORT candidate table is the one consumer this does not reach,
+    // and its reason is measured rather than assumed: it is built once per
+    // ANALYSIS, outside the scope that owns overlay loads, so reading each
+    // module's rows there parses an open buffer's content into the
+    // process-global cache once per keystroke — §7.5's session leak, and four
+    // `overlay_module_reclaim` pins go red on it (see the comment in
+    // `AutoImportOrder::build`). It needs the analyzer's own
+    // `exported_entities`/`curated_modules` on `Program`, which is filed.
+
+    /// A CURATED module — one `export` marker is what makes it one — beside its
+    /// own private machinery.
+    const CURATED_MODULE: &str = "export fun shown(): i32 {\n\t1\n}\n\n\
+         export fun also_shown(): i32 {\n\t3\n}\n\nfun hidden(): i32 {\n\t2\n}\n";
+
+    /// The same module with no marker anywhere: it offers everything, exactly
+    /// as it did before the bit existed.
+    const UNCURATED_MODULE: &str = "fun shown(): i32 {\n\t1\n}\n\n\
+         fun also_shown(): i32 {\n\t3\n}\n\nfun hidden(): i32 {\n\t2\n}\n";
+
+    #[test]
+    fn an_import_path_offers_a_curated_modules_exports_and_not_its_machinery() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::|\n"),
+            ("a.vl", CURATED_MODULE),
+        ]);
+        assert!(labels.contains(&"shown".to_string()), "{labels:?}");
+        assert!(
+            !labels.contains(&"hidden".to_string()),
+            "a private item is not offered to an import path: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_origin_offers_its_surfaces_exports_and_not_its_machinery() {
+        // The ORIGIN arm (`OriginListing::completions`): a package's `lib.vl`
+        // surface, read through the captured listing. Its MODULES are not
+        // filtered and are not a leak — a module is a file, `export` marks
+        // items inside one — so `a` is offered beside the surface's names.
+        let labels = workspace_completions_at_cursor(&[
+            ("app/src/main.vl", "import common::|\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n\n[package.dependencies]\n\
+                 common = { path = \"../common\" }\n",
+            ),
+            ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+            ("common/src/lib.vl", CURATED_MODULE),
+            ("common/src/a.vl", "fun anything() {}\n"),
+        ]);
+        assert!(labels.contains(&"shown".to_string()), "{labels:?}");
+        assert!(labels.contains(&"a".to_string()), "a module: {labels:?}");
+        assert!(
+            !labels.contains(&"hidden".to_string()),
+            "the surface's private machinery is not offered: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_path_into_an_uncurated_module_offers_everything() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::|\n"),
+            ("a.vl", UNCURATED_MODULE),
+        ]);
+        assert!(
+            labels.contains(&"shown".to_string()) && labels.contains(&"hidden".to_string()),
+            "an uncurated module offers everything: {labels:?}"
+        );
+    }
+
+    /// B318 S3's selector surface with a PRIVATE subject beside an exported
+    /// one — the module writes an `impl` block for each.
+    const CURATED_IMPL_MODULE: &str = "export struct Shown {\n\tn: i32,\n}\n\n\
+         struct Hidden {\n\tn: i32,\n}\n\n\
+         impl Shown {\n\tfun widen(self): i32 {\n\t\tself.n\n\t}\n}\n\n\
+         impl Hidden {\n\tfun narrow(self): i32 {\n\t\tself.n\n\t}\n}\n";
+
+    #[test]
+    fn an_impl_selector_never_offers_a_private_subject_or_its_members() {
+        let subjects = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl |\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(subjects.contains(&"Shown".to_string()), "{subjects:?}");
+        assert!(
+            !subjects.contains(&"Hidden".to_string()),
+            "a private subject is not a block an importer may admit: {subjects:?}"
+        );
+        // And its members are not reachable by naming it anyway.
+        let members = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl Hidden)::|\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(!members.contains(&"narrow".to_string()), "{members:?}");
+        let members = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl Shown)::|\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(members.contains(&"widen".to_string()), "{members:?}");
+    }
+
     #[test]
     fn lifted_member_completion_offers_the_element() {
         let labels = completions_at_cursor(
