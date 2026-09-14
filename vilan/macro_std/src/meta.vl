@@ -19,7 +19,7 @@ export struct TypeExpr {
 	arguments: List<TypeExpr>,
 }
 
-impl TypeExpr {
+export impl TypeExpr {
 	fun render(self): str {
 		if self.arguments.len() == 0 {
 			self.name
@@ -189,7 +189,7 @@ export struct StructItem {
 	generics: List<GenericParameter>,
 }
 
-impl StructItem {
+export impl StructItem {
 	// `Handle<T>` — this struct spelled as an application of its own
 	// parameters, for every role in a derived impl that takes a type.
 	fun subject(self): str {
@@ -236,7 +236,7 @@ export struct EnumItem {
 	generics: List<GenericParameter>,
 }
 
-impl EnumItem {
+export impl EnumItem {
 	// `Either<L, R>` — this enum spelled as an application of its own
 	// parameters, for every role in a derived impl that takes a type.
 	fun subject(self): str {
@@ -301,7 +301,7 @@ export enum Item {
 	Service(ServiceItem),
 }
 
-impl Item {
+export impl Item {
 	fun as_struct(self): Option<StructItem> {
 		match self {
 			Item::Struct(let item) => Option::Some(item),
@@ -339,7 +339,7 @@ export struct Arguments {
 	values: List<str>,
 }
 
-impl Arguments {
+export impl Arguments {
 	fun len(self): i32 {
 		self.values.len()
 	}

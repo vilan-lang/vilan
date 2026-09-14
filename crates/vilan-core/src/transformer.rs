@@ -2243,6 +2243,31 @@ struct BackedTest<'src> {
     value: js::Node<'src>,
 }
 
+/// B318 S4 — one member lookup the per-importer namespace turned down, kept so
+/// the never-silent check can report the author's imports instead of an
+/// internal error. See [`Transformer::admission_miss`].
+struct AdmissionMiss {
+    /// The member the body asked for.
+    member: String,
+    /// The file the emitting body was DECLARED in — the file whose imports
+    /// decided this (`visibility.md` §3.5), which is NOT necessarily the file
+    /// that instantiated the body.
+    importer: crate::analyzer::SourceId,
+    /// The file declaring the `impl` the lookup would otherwise have taken.
+    declared_in: crate::analyzer::SourceId,
+}
+
+/// What [`Transformer::enter_instance`] displaces while a body is emitted, and
+/// [`Transformer::restore_instance`] puts back. A named record rather than a
+/// tuple since B318 S4 made it a fourth field: three positional `saved.2`s were
+/// already at the limit of what a reader can hold.
+struct SavedInstance<'src> {
+    adapted: Vec<Id>,
+    instance: Option<crate::analyzer::AdaptedInstance>,
+    origin: Option<&'src str>,
+    admitting_file: Option<crate::analyzer::SourceId>,
+}
+
 struct Transformer<'src> {
     formatter: Formatter,
     ng: NameGenerator,
@@ -2273,6 +2298,43 @@ struct Transformer<'src> {
     // ORIGIN stamped into `__task` calls, so an unobserved task failure can
     // name where it was spawned. `None` at module level ("top level").
     current_origin: Option<&'src str>,
+    // B318 S4 (`visibility.md` §3.5) — the FILE whose admitted-impl set this
+    // body's member lookups run under: the file the body was DECLARED in, not
+    // the file that instantiated it.
+    //
+    // A generic function in `a.vl` means what `a.vl`'s imports say it means, at
+    // every instantiation. That is `prelude.md` §7's rule ("a consumer cannot
+    // change what a dependency's source means") and it is the only rule under
+    // which a library is analysable at all — the alternative, resolving a
+    // monomorphized body under the INSTANTIATING file's set, makes one source
+    // text mean different things in different callers.
+    //
+    // It matters here and nowhere else in emission because `select_member`
+    // takes `maxima(..).first()`: with two equally specific inherent impls both
+    // declaring the name it picks one arbitrarily, which is exactly the silent
+    // pick B57 exists to prevent. Until S4 that pair was impossible (the
+    // declaration-site rule refused it program-wide); now it is a per-FILE
+    // fact, so the file has to travel with the lookup.
+    //
+    // `None` while nothing in the program restricts anything — the estate's
+    // path, and `admitting_file`'s own short-circuit.
+    current_admitting_file: Option<crate::analyzer::SourceId>,
+    // B318 S4 — the FIRST member lookup this emission lost to the per-importer
+    // namespace: a member `select_member` would have found with no file scope
+    // and did not find under the emitting body's own file.
+    //
+    // A body-less call target is the never-silent check's business (B55), and
+    // its message says "internal … please report this program" because until
+    // S4 every way of reaching it WAS a compiler bug. It is now also a legal
+    // program's honest outcome: a file whose selector admits no `tag` and whose
+    // generic body calls `.tag()` has written something the compiler must
+    // refuse, and refuse in the author's own terms. So the losing lookup leaves
+    // its evidence here and the check reads it.
+    //
+    // A `RefCell` because the lookup sites are `&self` — they resolve, they do
+    // not emit — and threading `&mut` through them to carry a diagnostic would
+    // put the sink in four signatures to serve one message.
+    admission_miss: std::cell::RefCell<Option<AdmissionMiss>>,
     // Every entity emitted as a VALUE reference (the `Expr::Local` arm) —
     // consulted at assembly to tree-shake module-level bindings (F6): a
     // binding emits only if something reachable referenced it.
@@ -2695,6 +2757,8 @@ impl<'src> Transformer<'src> {
             current_adapted: Vec::new(),
             current_instance: None,
             current_origin: None,
+            current_admitting_file: None,
+            admission_miss: std::cell::RefCell::new(None),
             referenced_globals: HashSet::default(),
             instances: HashMap::default(),
             current_self_type: None,
@@ -3098,6 +3162,41 @@ impl<'src> Transformer<'src> {
                     ],
                 ));
             }
+        }
+
+        // B318 S4 (`visibility.md` §3.5): the body-less target below is USUALLY
+        // a compiler bug, and since the per-importer namespace it can also be a
+        // legal program's honest outcome — a generic body whose DECLARING file
+        // admits no implementation of the member it calls. That is the author's
+        // to fix and the message has to say so, in the author's own terms,
+        // rather than asking them to report a program that is working exactly
+        // as ruled. Checked FIRST because it is the specific diagnosis of the
+        // general symptom below.
+        if let Some(miss) = self.admission_miss.borrow_mut().take() {
+            let module = |source: crate::analyzer::SourceId| -> String {
+                self.program
+                    .canonical_sources
+                    .get(source.0 as usize)
+                    .and_then(|path: &std::path::PathBuf| path.file_stem())
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("that module")
+                    .to_string()
+            };
+            let member = miss.member;
+            let declaring = module(miss.declared_in);
+            let here = module(miss.importer);
+            return Err(Error {
+                trace: Vec::new(),
+                note: None,
+                span: Span::default(),
+                msg: format!(
+                    "'{member}' is provided by an `impl` in module `{declaring}`, and module \
+                     `{here}` does not admit it: a generic body resolves under the file it was \
+                     DECLARED in, not the file that instantiated it, so widening the import at \
+                     the CALLER does not reach it. Widen `{here}`'s own import of \
+                     `{declaring}` — `(impl _)` admits every implementation it declares"
+                ),
+            });
         }
 
         // Never-silent (B55): refuse to ship a program that emitted a body-less
@@ -8453,8 +8552,7 @@ impl<'src> Transformer<'src> {
         member: &str,
     ) -> Option<(Id, TypeId)> {
         let arguments = self.wanted_trait_arguments(trait_arguments);
-        let selected = impl_select::select_member(
-            self.program,
+        let selected = self.select_member_here(
             type_id,
             member,
             Some(impl_select::WantedTrait {
@@ -8582,9 +8680,12 @@ impl<'src> Transformer<'src> {
         // the receiver in concrete ones) — so the arguments this default
         // specializes under are the ones the WINNING impl writes, not the
         // first-declared one's.
-        let Some(implementation) =
-            impl_select::select_implementation(self.program, type_id, *trait_id)
-        else {
+        let Some(implementation) = impl_select::select_implementation(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            *trait_id,
+        ) else {
             return substitution;
         };
         self.bind_generics(implementation.subject, type_id, &mut substitution);
@@ -9283,7 +9384,7 @@ impl<'src> Transformer<'src> {
         // dropping inherited defaults on generic types (the emitted call then
         // bound to the trait's abstract member), and a nominal head match
         // never saw a blanket impl at all (B158).
-        impl_select::applying_trait_ids(self.program, type_id)
+        impl_select::applying_trait_ids(self.program, self.current_admitting_file, type_id)
             .into_iter()
             .find_map(|trait_id| self.trait_default_member(trait_id, member))
     }
@@ -9497,15 +9598,7 @@ impl<'src> Transformer<'src> {
     /// Swap in the adapted-instance context for a body about to be emitted;
     /// returns the previous context for `restore_instance`. Also tracks the
     /// function's source name as the spawn origin for `__task` calls.
-    fn enter_instance(
-        &mut self,
-        function_id: Id,
-        bits: Vec<Id>,
-    ) -> (
-        Vec<Id>,
-        Option<crate::analyzer::AdaptedInstance>,
-        Option<&'src str>,
-    ) {
+    fn enter_instance(&mut self, function_id: Id, bits: Vec<Id>) -> SavedInstance<'src> {
         let info = self
             .program
             .adapted_instances
@@ -9516,24 +9609,23 @@ impl<'src> Transformer<'src> {
             .functions
             .get(&function_id)
             .map(|function| function.name);
-        (
-            std::mem::replace(&mut self.current_adapted, bits),
-            std::mem::replace(&mut self.current_instance, info),
-            std::mem::replace(&mut self.current_origin, origin),
-        )
+        // B318 S4 §3.5: the DECLARING file, taken from the function entity
+        // itself, so an instantiation reached from anywhere resolves under the
+        // set the body was written against.
+        let file = self.program.admitting_file(function_id);
+        SavedInstance {
+            adapted: std::mem::replace(&mut self.current_adapted, bits),
+            instance: std::mem::replace(&mut self.current_instance, info),
+            origin: std::mem::replace(&mut self.current_origin, origin),
+            admitting_file: std::mem::replace(&mut self.current_admitting_file, file),
+        }
     }
 
-    fn restore_instance(
-        &mut self,
-        saved: (
-            Vec<Id>,
-            Option<crate::analyzer::AdaptedInstance>,
-            Option<&'src str>,
-        ),
-    ) {
-        self.current_adapted = saved.0;
-        self.current_instance = saved.1;
-        self.current_origin = saved.2;
+    fn restore_instance(&mut self, saved: SavedInstance<'src>) {
+        self.current_adapted = saved.adapted;
+        self.current_instance = saved.instance;
+        self.current_origin = saved.origin;
+        self.current_admitting_file = saved.admitting_file;
     }
 
     /// The bindings the active substitution provides for the generics a callee's
@@ -10018,8 +10110,58 @@ impl<'src> Transformer<'src> {
         ) {
             return None;
         }
-        let selected = impl_select::select_member(self.program, type_id, member, None)?;
+        let selected = self.select_member_here(type_id, member, None)?;
         Some((selected.member_id, selected.impl_subject))
+    }
+
+    /// [`impl_select::select_member`] under the file the emitting body was
+    /// DECLARED in (B318 S4, `visibility.md` §3.5), recording an ADMISSION MISS
+    /// when the same lookup succeeds with no file scope.
+    ///
+    /// The re-ask costs a second selection ONLY on the failing path, and only
+    /// while some file in the program restricts something — a lookup that found
+    /// its member never asks, and a program with no `only` and no selector has
+    /// `current_admitting_file` at `None` and never reaches the branch. What it
+    /// buys is the difference between "internal: … please report this program"
+    /// and a refusal naming the import that caused it.
+    fn select_member_here(
+        &self,
+        type_id: TypeId,
+        member: &str,
+        wanted: Option<impl_select::WantedTrait>,
+    ) -> Option<impl_select::SelectedMember> {
+        let selected = impl_select::select_member(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            member,
+            wanted,
+        );
+        if selected.is_some() {
+            return selected;
+        }
+        let importer = self.current_admitting_file?;
+        if self.admission_miss.borrow().is_some() {
+            return None;
+        }
+        let unscoped = impl_select::select_member(self.program, None, type_id, member, wanted)?;
+        let declared_in = self
+            .program
+            .implementations
+            .iter()
+            .find(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|id| *id == unscoped.member_id)
+            })
+            .map(|implementation| implementation.source)?;
+        *self.admission_miss.borrow_mut() = Some(AdmissionMiss {
+            member: member.to_string(),
+            importer,
+            declared_in,
+        });
+        None
     }
 
     /// Binds the generic parameters in `pattern` (an impl subject in its own

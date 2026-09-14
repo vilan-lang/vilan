@@ -80,7 +80,7 @@ export fun fun_of(name: str): FunBuilder {
 	}
 }
 
-impl FunBuilder {
+export impl FunBuilder {
 	// The written generic parameter list, brackets included: `"<S: Serialize>"`.
 	fun generics(self, generic_parameters: str): FunBuilder {
 		FunBuilder {
@@ -174,7 +174,7 @@ export fun impl_of(name: str): ImplBuilder {
 	ImplBuilder { name, generic_parameters = "", trait_name = "", members = [] }
 }
 
-impl ImplBuilder {
+export impl ImplBuilder {
 	// The written generic parameter list, brackets included: `"<type T>"`.
 	fun generics(self, generic_parameters: str): ImplBuilder {
 		ImplBuilder {
@@ -235,7 +235,7 @@ export fun match_of(subject: str): MatchBuilder {
 	MatchBuilder { subject, arms = [] }
 }
 
-impl MatchBuilder {
+export impl MatchBuilder {
 	// `pattern => value,`
 	fun arm(self, pattern: str, value: str): MatchBuilder {
 		mut arms = self.arms;
@@ -275,7 +275,7 @@ export fun struct_of(name: str): StructBuilder {
 	StructBuilder { name, generic_parameters = "", fields = [] }
 }
 
-impl StructBuilder {
+export impl StructBuilder {
 	// The written generic parameter list, brackets included: `"<T: Transport>"`.
 	fun generics(self, generic_parameters: str): StructBuilder {
 		StructBuilder { name = self.name, generic_parameters, fields = self.fields }
@@ -308,7 +308,7 @@ export fun init_of(name: str): InitBuilder {
 	InitBuilder { name, fields = [] }
 }
 
-impl InitBuilder {
+export impl InitBuilder {
 	// One initializer: `.field("x", "0")` renders `x = 0`.
 	fun field(self, field_name: str, value: str): InitBuilder {
 		mut fields = self.fields;

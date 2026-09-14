@@ -775,6 +775,18 @@ pub fn post_analysis_passes(
     // both. Zero the accumulator here — the top of the only region that calls
     // it — so the `dispatch-refine` bucket is this analysis's total.
     dispatch_refine::reset_refine_time();
+    // B318 S4: the per-importer method namespace, resolved against the FINISHED
+    // program because the question a selector asks is
+    // `impl_select::subject_applies`, which reads one — and resolved HERE,
+    // ahead of every pass below, because `context::thread_contexts`'
+    // candidate lists and emission's `impl_select` both read the map. Returns
+    // immediately for a program whose files wrote neither `only` nor a
+    // selector, which is the whole estate.
+    analyzer::build_impl_admission(program);
+    // B336: `export(in <general PATH>)`, decided where the source paths are —
+    // the subtree test the analyzer's own walk cannot make. Returns immediately
+    // for a program that wrote no general narrowing, which is the whole estate.
+    analyzer::check_scoped_exports(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are
@@ -814,11 +826,10 @@ pub fn post_analysis_passes(
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async
     // only by inference, so this cannot run inside `analyze`.
-    // B318 S3: the file-level impl admission — `only` and the `(impl …)`
-    // selectors, resolved against the finished program because the question is
-    // `impl_select::subject_applies`, which reads one. Returns immediately for
-    // a program whose files wrote neither.
-    analyzer::check_impl_selector_admission(program);
+    // B318 S3: the file-level impl admission refusal — a call answered by an
+    // `impl` this file's `only` or selector declined. The MAP it reads was
+    // built at the top of this function, before the passes that consult it.
+    analyzer::check_call_site_admission(program);
     let phase_async_drops_start = PhaseClock::now();
     analyzer::check_async_drops(program);
     let phase_async_drops = phase_async_drops_start.elapsed();

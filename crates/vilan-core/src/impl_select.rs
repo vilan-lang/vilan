@@ -40,7 +40,7 @@
 //! an unranked pair that reached emission answers exactly as it did before
 //! rather than turning a reported program into a second failure.
 
-use crate::analyzer::{Implementation, Program};
+use crate::analyzer::{Implementation, Program, SourceId};
 use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
@@ -587,9 +587,21 @@ fn ground_id(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, Type
 }
 
 /// Every implementation that applies to `concrete`, in declaration order,
-/// filtered by the caller's `wanted` trait instantiation when it has one.
+/// filtered by the caller's `wanted` trait instantiation when it has one and by
+/// the FILE the question is asked on behalf of.
+///
+/// **`file` is the per-importer namespace (B318 S4, `visibility.md` §3.3).** An
+/// impl the file's imports did not admit is not a candidate here at all — not
+/// merely a candidate that loses — because the whole point of the rule is that
+/// two independent packages may declare one method name for one type and a
+/// file that took only one of them must not be answered by the other. `None`
+/// means "no file to scope by", which is the honest answer for a caller that
+/// has none and is also what the estate always gets: nothing in it writes
+/// `only` or a selector, so [`crate::analyzer::ImplAdmission::admits_impl`]
+/// returns `true` without a lookup.
 pub fn applying_implementations<'a, 'src>(
     program: &'a Program<'src>,
+    file: Option<SourceId>,
     concrete: TypeId,
     wanted: Option<WantedTrait>,
 ) -> Vec<&'a Implementation<'src>> {
@@ -599,9 +611,16 @@ pub fn applying_implementations<'a, 'src>(
     if !is_resolvable(concrete_type) {
         return Vec::new();
     }
+    // B318 S4: the per-importer namespace. Asked once for the FILE here rather
+    // than once per registered block below — a file that restricts nothing has
+    // today's meaning and there is nothing to filter.
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let by_instantiation: Vec<&Implementation> = program
         .implementations
         .iter()
+        .filter(|implementation| {
+            scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
+        })
         .filter(|implementation| match wanted {
             Some(wanted) => {
                 provides_wanted_instantiation(program, implementation, concrete, wanted)
@@ -693,19 +712,65 @@ fn inherits_a_default(program: &Program, implementation: &Implementation, member
 /// declares nothing still outranks a blanket that does. Such a winner returns
 /// `None` — it has no member of its own, and the caller reaches its answer
 /// through the trait default, which is the same verdict by the same order.
+/// The maxima of the specificity order among the impls that DECLARE `member`
+/// for `concrete`, under `file`'s admitted set — what [`select_member`] picks
+/// its answer out of.
+///
+/// One maximum is the winner. TWO OR MORE is the unranked residue: nothing in
+/// the order separates them, so `select_member` takes the first in declaration
+/// order and the program's meaning becomes a function of which block was
+/// written first. That is precisely what B57 exists to prevent, and B330's
+/// call-site refusal is what reports it — the question it asks is this
+/// function's length, because only the SITE, which knows the receiver, can ask
+/// it at all.
+pub fn declaring_maxima<'a, 'src>(
+    program: &'a Program<'src>,
+    file: Option<SourceId>,
+    concrete: TypeId,
+    member: &str,
+) -> Vec<&'a Implementation<'src>> {
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
+    let contenders: Vec<&Implementation> = applying_implementations(program, file, concrete, None)
+        .into_iter()
+        .filter(
+            |implementation| match implementation.declarations.get(member) {
+                Some(member_id) => scope.is_none_or(|file| {
+                    program
+                        .impl_admission
+                        .admits_member(file, implementation, *member_id)
+                }),
+                None => false,
+            },
+        )
+        .collect();
+    maxima(program, &contenders)
+}
+
 pub fn select_member(
     program: &Program,
+    file: Option<SourceId>,
     concrete: TypeId,
     member: &str,
     wanted: Option<WantedTrait>,
 ) -> Option<SelectedMember> {
-    let contenders: Vec<&Implementation> = applying_implementations(program, concrete, wanted)
-        .into_iter()
-        .filter(|implementation| {
-            implementation.declarations.contains_key(member)
-                || inherits_a_default(program, implementation, member)
-        })
-        .collect();
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
+    let contenders: Vec<&Implementation> =
+        applying_implementations(program, file, concrete, wanted)
+            .into_iter()
+            .filter(|implementation| {
+                // B318 S4, one step finer than the block filter above: a
+                // `(impl T)::{ m }` selector takes ONE member out of a block,
+                // so a block this file admits may still not offer `member`.
+                match implementation.declarations.get(member) {
+                    Some(member_id) => scope.is_none_or(|file| {
+                        program
+                            .impl_admission
+                            .admits_member(file, implementation, *member_id)
+                    }),
+                    None => inherits_a_default(program, implementation, member),
+                }
+            })
+            .collect();
     let winner = *maxima(program, &contenders).first()?;
     Some(SelectedMember {
         member_id: *winner.declarations.get(member)?,
@@ -718,11 +783,13 @@ pub fn select_member(
 /// (which arguments it implements the trait at, say).
 pub fn select_implementation<'a, 'src>(
     program: &'a Program<'src>,
+    file: Option<SourceId>,
     concrete: TypeId,
     trait_id: Id,
 ) -> Option<&'a Implementation<'src>> {
     let applying = applying_implementations(
         program,
+        file,
         concrete,
         Some(WantedTrait {
             trait_id,
@@ -735,8 +802,8 @@ pub fn select_implementation<'a, 'src>(
 /// The traits a concrete type's applying implementations provide, most
 /// specific first — the search order for an INHERITED trait default, which no
 /// impl declares and which therefore cannot be found by [`select_member`].
-pub fn applying_trait_ids(program: &Program, concrete: TypeId) -> Vec<Id> {
-    let applying = applying_implementations(program, concrete, None);
+pub fn applying_trait_ids(program: &Program, file: Option<SourceId>, concrete: TypeId) -> Vec<Id> {
+    let applying = applying_implementations(program, file, concrete, None);
     let winners = maxima(program, &applying);
     winners
         .iter()

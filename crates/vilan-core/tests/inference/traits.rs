@@ -5482,13 +5482,19 @@ fn b330_two_blankets_bounded_differently_may_share_a_name() {
     );
 }
 
-/// The cost of the admission, stated: a receiver satisfying BOTH bounds has two
-/// inherent candidates and tier 1 takes the first without ranking, so
-/// DECLARATION ORDER picks the body. The same program with the two `impl`
-/// blocks swapped prints the other answer — which is why the refusal has to
-/// live at the call site (B318 S4) and cannot be written here.
+/// B318 S4 — the admission's cost is now REFUSED, at the call, where the
+/// witness is.
+///
+/// A receiver satisfying BOTH bounds had two inherent candidates and tier 1
+/// took the first without ranking, so DECLARATION ORDER picked the body and the
+/// same program with the two `impl` blocks swapped printed the other answer.
+/// The declarations cannot see that — whether a third type carries both
+/// `Debug` and `Tagged` is not a question they answer — so the pair stays
+/// admitted (the pin above) and the SITE, which knows its receiver, refuses.
+/// Both orders refuse identically, which is the whole point: the answer is no
+/// longer a function of which block was written first.
 #[test]
-fn b330_a_receiver_satisfying_both_bounds_takes_the_first_impl_declared() {
+fn b330_a_receiver_satisfying_both_bounds_is_refused_at_the_call() {
     let program = r#"
         import std::io::print;
         import std::debug::Debug;
@@ -5533,8 +5539,21 @@ fn b330_a_receiver_satisfying_both_bounds_takes_the_first_impl_declared() {
             fun peek(self): str { "debug side" }
         }
         "#;
-    assert_compiles_and_runs(&program.replace("IMPLS", debug_first), "debug side\n");
-    assert_compiles_and_runs(&program.replace("IMPLS", tagged_first), "tagged side\n");
+    for implementations in [debug_first, tagged_first] {
+        assert_fails_with(
+            &program.replace("IMPLS", implementations),
+            "this receiver satisfies the bounds of TWO blanket `impl` blocks that both declare \
+             'peek'",
+        );
+    }
+    // The fix the message names, taken: narrowing one bound so the two are
+    // disjoint leaves one candidate, and the program runs again.
+    let narrowed = r#"
+        impl type S: Read<type I: Debug> {
+            fun peek(self): str { "debug side" }
+        }
+        "#;
+    assert_compiles_and_runs(&program.replace("IMPLS", narrowed), "debug side\n");
 }
 
 #[test]

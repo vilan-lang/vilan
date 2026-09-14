@@ -507,7 +507,7 @@ pub struct ExprMatchLeg {
 /// [`Analyzer::subjects_collide`] answers and what the duplicate-member message
 /// says (B315).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubjectCollision {
+pub enum SubjectCollision {
     /// One subject written twice: the same type, or two binders bound the same
     /// way. The duplicate the rule has refused since B57.
     Same,
@@ -515,6 +515,84 @@ enum SubjectCollision {
     /// satisfies both, so both impls claim it and tier 1 takes whichever came
     /// first, unranked.
     OverlappingBounds,
+}
+
+/// B336 — one reach past an `export(in <general PATH>)` narrowing, banked by
+/// the plain-reach walk and decided by [`check_scoped_exports`].
+///
+/// `mod` and `pkg` are answered where they are asked: one is "the declaring
+/// file", the other "the item's own package", and the analyzer holds both. A
+/// GENERAL path names a module SUBTREE, and a subtree is a question about file
+/// paths — `Program::canonical_sources` — so the row travels to where the paths
+/// are.
+#[derive(Clone, Debug)]
+pub struct ScopedReachCheck {
+    /// The `(in PATH)` segments: `["pkg", "a"]`.
+    pub scope: Vec<String>,
+    /// The file the exported item is DECLARED in — where the subtree is
+    /// resolved from, since the declaring file is inside its own narrowing by
+    /// definition.
+    pub declared_in: SourceId,
+    /// The file doing the reaching, and the leaf it reached.
+    pub importer: SourceId,
+    pub leaf_span: Span,
+    /// The module path as the import spelled it, and the leaf name — the two
+    /// halves of the warning's own sentence.
+    pub module: String,
+    pub leaf: String,
+    /// Whether the reach was a qualified PATH rather than an import leaf, which
+    /// picks the second of the warning's two wordings.
+    pub qualified: bool,
+}
+
+/// B330 — two BLANKET impls, bounded differently, declaring one inherent member
+/// name: the pair `generic_bounds_overlap` deliberately admits, banked at the
+/// declaration and decided at the CALL.
+///
+/// The declarations cannot answer whether a third type satisfies both clauses —
+/// every pair of traits in the program, and in every program that will ever
+/// import it, is a potential witness — so refusing the pair would refuse two
+/// blankets no type in the estate can bring together. A CALL knows its
+/// receiver, so it knows whether the witness exists, and it is the only place
+/// that can. What is wrong when it does exist is not the declarations: it is
+/// that tier 1 of method resolution takes the first inherent candidate WITHOUT
+/// ranking, so declaration order decides which body runs and swapping the two
+/// blocks changes the answer.
+#[derive(Clone, Debug)]
+pub struct BlanketResidue {
+    /// The member name both blankets declare.
+    pub member: String,
+    /// The earlier declaration and its impl's subject (a bound binder).
+    pub first: Id,
+    pub first_subject: TypeId,
+    /// The later declaration and its subject.
+    pub second: Id,
+    pub second_subject: TypeId,
+}
+
+/// B318 S4 — one INHERENT member name declared for one subject by two impls in
+/// DIFFERENT files, banked at the declaration and decided at the IMPORT.
+///
+/// The pair is not a defect of either module: two independent packages may each
+/// write `impl Style { fun helper(self) }` and both stay installable, which is
+/// the property `names.md` §4.6 forbade and the whole reason the per-importer
+/// namespace is worth its cost (`visibility.md` §3.7). It becomes a problem
+/// only in a FILE that admits both, so that is where it is reported —
+/// [`refuse_imported_member_collisions`].
+#[derive(Clone, Debug)]
+pub struct MemberCollision {
+    /// The member name both blocks declare.
+    pub member: String,
+    /// The earlier declaration, and the file it is written in.
+    pub first: Id,
+    pub first_source: SourceId,
+    /// The later declaration, and its file.
+    pub second: Id,
+    pub second_source: SourceId,
+    /// The subject as the message prints it.
+    pub subject: String,
+    /// Which way the two subjects claim the same receivers (B315/B330).
+    pub collision: SubjectCollision,
 }
 
 // A fully resolved match pattern, ready for code generation.
@@ -1818,6 +1896,15 @@ struct PreppedIs<'src> {
 #[derive(Debug, Clone)]
 pub struct Implementation<'src> {
     pub subject: TypeId,
+    /// The block's own entity id — what `export impl …` marks, and therefore
+    /// the key the visibility bit is read by (B318 S4). Minted by the walk that
+    /// registers the block, so it is the same id `Expr::Impl(id)` carries.
+    pub impl_id: Id,
+    /// The SCOPE the block was written in — a module's body scope at a file's
+    /// top level, which is what `curated_modules` and `export_all_modules` are
+    /// keyed on. Carried rather than looked up because the visibility question
+    /// is asked once per block and the answer is fixed at registration.
+    pub module_scope: Id,
     /// The file whose text declares this block (B318 §3.3). Stored directly
     /// rather than recovered through `source_of(impl_id)`, which is a linear
     /// scan of `source_ranges` that M27 already flagged as a
@@ -3523,6 +3610,17 @@ pub struct Analyzer<'src> {
     /// that writes neither `only` nor a selector, which is every file in the
     /// estate today.
     import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B318 S4: the cross-module inherent collisions the declaration-site rule
+    /// banks for the IMPORT pass ([`MemberCollision`]). Empty for every program
+    /// in which no two files declare one inherent name for one subject — the
+    /// whole estate, which is what keeps the import pass free.
+    cross_module_collisions: Vec<MemberCollision>,
+    /// B330: the differently-bounded blanket pairs the duplicate family admits,
+    /// for the CALL-site refusal ([`BlanketResidue`]).
+    blanket_residues: Vec<BlanketResidue>,
+    /// B336: reaches past an `export(in <general PATH>)` narrowing, for the
+    /// post-build pass that has the source paths ([`ScopedReachCheck`]).
+    scoped_reach_checks: Vec<ScopedReachCheck>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -4010,7 +4108,7 @@ pub struct Analyzer<'src> {
     // NAME the impl wrote, after the queue itself is consumed. Accumulates
     // across builds, matching the drain-once contract.
     written_type_spellings: Vec<(TypeId, &'src str)>,
-    prepped_uses: PreppedImports<'src>,
+    prepped_uses: PreppedUses<'src>,
     // Deferred module-qualified type references (`style::Style`), drained after
     // `prepped_type_locals` so a path's namespace head has resolved by the time
     // its member is looked up in it.
@@ -5144,7 +5242,32 @@ pub struct ImportAlias<'src> {
 /// The queue an `import`/`use` statement's leaves wait in until the world can
 /// resolve them: the namespace path, the leaf name the path RESOLVES to, the
 /// scope the statement binds into, the statement's span, the leaf's span, the
-/// file, and the `as` alias the leaf BINDS under when it has one (E142).
+/// file, the `as` alias the leaf BINDS under when it has one (E142), and
+/// whether the walk BINDS at all.
+///
+/// B318 S4: the last flag is `false` for a statement whose whole payload is an
+/// `(impl …)` selector. Such a statement names no leaf, so the flattening walk
+/// produced no entry for it and `resolve_import` never saw its path — which
+/// left the admission pass looking its module up by FILE NAME
+/// (`module_source_by_name`, retired here), a string match against
+/// `canonical_sources` that read a `\`-separated Windows path as a miss and
+/// took the seal fix 9b22ec36 to make host-independent at all. A walk that
+/// binds nothing still walks: it resolves the path, records each segment's
+/// reference (so go-to-definition and rename reach a selector's module) and
+/// stops one line short of writing the leaf into the scope.
+/// [`PreppedImports`] without the bind flag: a `use` statement always binds —
+/// it names items out of a namespace already in scope, and there is no
+/// selector form of it.
+type PreppedUses<'src> = Vec<(
+    Vec<(&'src str, Span)>,
+    &'src str,
+    Id,
+    Span,
+    Span,
+    SourceId,
+    Option<(&'src str, Span)>,
+)>;
+
 type PreppedImports<'src> = Vec<(
     Vec<(&'src str, Span)>,
     &'src str,
@@ -5153,6 +5276,7 @@ type PreppedImports<'src> = Vec<(
     Span,
     SourceId,
     Option<(&'src str, Span)>,
+    bool,
 )>;
 
 /// One flattened `import`/`use` leaf: the namespace segments leading to it
@@ -5164,6 +5288,130 @@ pub(crate) type NamespaceEntry<'src> = (
     Span,
     Option<(&'src str, Span)>,
 );
+
+/// B318 S4 — the per-importer method namespace, resolved once after `build()`
+/// and read by everything that asks what a type PROVIDES.
+///
+/// `visibility.md` §3.2's rule, stated as a table: *a file's method namespace
+/// for a type is the union of the impls that file's import statements admit.*
+/// A plain `import a::b;` admits every impl on the path (today's meaning, and
+/// the reason absence means "unrestricted" rather than "nothing"); `only`
+/// admits none; `(impl T)` admits the blocks whose subject unifies with `T`,
+/// and `(impl T)::{ m, n }` narrows that to two members.
+///
+/// **Inverted from §3.3's `file_impls`, deliberately.** The paper wrote
+/// `HashMap<SourceId, Vec<usize>>` — per importing file, the impls it admits —
+/// which every lookup would have to SEARCH. The question every consumer
+/// actually asks is "may THIS file take THIS member", and the map that answers
+/// it in one probe is keyed by the pair. An entry exists only for a
+/// (file, module) pair the file restricted, so the estate — which writes
+/// neither `only` nor a selector anywhere — stores nothing and every lookup
+/// short-circuits on [`ImplAdmission::is_empty`] before it even asks which
+/// file a call is in.
+#[derive(Debug, Clone, Default)]
+pub struct ImplAdmission {
+    /// The importing files whose own statements restrict anything at all.
+    /// Everything about this map is gated on membership here, so a file that
+    /// wrote no `only` and no selector keeps today's meaning EXACTLY.
+    restricting: HashSet<SourceId>,
+    /// (importing file, declaring file) -> the member ids the importer's
+    /// selectors admitted out of that file. An entry's absence is
+    /// "unrestricted"; an entry that is EMPTY is `only`.
+    admitted: HashMap<(SourceId, SourceId), HashSet<Id>>,
+    /// (importing file, declaring file) -> the selector's subject as written,
+    /// for the refusal that names it. Absent where the restriction is `only`.
+    selector_of: HashMap<(SourceId, SourceId), String>,
+    /// The `impl` BLOCKS a curated module does not export
+    /// ([`Program::hidden_impls`]), keyed by the block's own entity id. These
+    /// reach their own file and nothing else unless a file wrote `#(impl T)`.
+    hidden: HashSet<Id>,
+    /// (importing file, impl block) — a `#(impl T)` selector's reach into a
+    /// hidden block. The ONLY way past the export gate.
+    reached: HashSet<(SourceId, Id)>,
+}
+
+impl ImplAdmission {
+    /// Whether NO file in the program restricts anything and no module hides an
+    /// `impl` — the estate's answer, and the guard every consumer asks before
+    /// it pays for a file lookup.
+    pub fn is_empty(&self) -> bool {
+        self.restricting.is_empty() && self.hidden.is_empty()
+    }
+
+    /// Whether THIS file's method namespace differs from today's at all — it
+    /// wrote `only` or a selector, or some module in the program hides an
+    /// `impl` from it.
+    ///
+    /// The per-IMPLEMENTATION predicates below are asked once per registered
+    /// block per lookup (std registers hundreds), and every one of those asks
+    /// begins by answering this same question about the same file. Hoisted so a
+    /// caller asks it ONCE per lookup: in a program where one file writes a
+    /// selector — kolt's `views.vl`, the estate's first — every other file then
+    /// pays nothing per block rather than a hash probe per block.
+    pub fn restricts(&self, importer: SourceId) -> bool {
+        self.restricting.contains(&importer) || !self.hidden.is_empty()
+    }
+
+    /// The EXPORT gate (B318 S4, RULED 2026-09-13): `export` on an `impl` means
+    /// what it means on every other declaration, so a block a consumer cannot
+    /// SEE contributes nothing to that consumer — no methods, and no ambient
+    /// impls either. Its own file always sees it; a file that wrote
+    /// `#(impl T)` for it sees it; nobody else does.
+    fn export_gate_admits(&self, importer: SourceId, implementation: &Implementation) -> bool {
+        !self.hidden.contains(&implementation.impl_id)
+            || self.reached.contains(&(importer, implementation.impl_id))
+    }
+
+    /// Whether `importer` admits `member_id`, declared by `implementation`.
+    ///
+    /// Two gates in order. The block must be VISIBLE to the file (its module
+    /// exports it, or the file reached it with `#`), and the file's own
+    /// statements must not have declined it — the block is this file's own, the
+    /// file restricts nothing, or the file restricted that module and this
+    /// member is in what it took.
+    pub fn admits_member(
+        &self,
+        importer: SourceId,
+        implementation: &Implementation,
+        member_id: Id,
+    ) -> bool {
+        if implementation.source == importer {
+            return true;
+        }
+        if !self.export_gate_admits(importer, implementation) {
+            return false;
+        }
+        if !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, implementation.source)) {
+            Some(members) => members.contains(&member_id),
+            None => true,
+        }
+    }
+
+    /// Whether `importer` admits ANY member of `implementation` — the
+    /// whole-block question [`crate::impl_select::applying_implementations`]
+    /// asks, which does not know which member is being looked up.
+    pub fn admits_impl(&self, importer: SourceId, implementation: &Implementation) -> bool {
+        if implementation.source == importer {
+            return true;
+        }
+        if !self.export_gate_admits(importer, implementation) {
+            return false;
+        }
+        if !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, implementation.source)) {
+            Some(admitted) => implementation
+                .declarations
+                .values()
+                .any(|member| admitted.contains(member)),
+            None => true,
+        }
+    }
+}
 
 /// B318 S3 — one `import` statement's claim on the implementations its walk
 /// carries, banked by the import walk and resolved after `build()` by
@@ -5208,15 +5456,10 @@ pub struct ImportImplSelector {
     /// The members the `::` tail named, empty when the selector takes the whole
     /// block.
     pub members: Vec<(String, Span)>,
-    /// The module path the selector was written under, past the origin
-    /// (`["ext"]` for `import pkg::ext::{ (impl T) };`).
-    ///
-    /// A statement whose whole payload is a selector binds no name, so
-    /// `resolve_import` never walked it and `type_references` holds no row for
-    /// its spans. The module still LOADED — the module collectors take a
-    /// selector's path too — so its file is in `canonical_sources`, and these
-    /// segments are what finds it (see [`module_source_by_name`]).
-    pub path: Vec<String>,
+    /// `#(impl T)` — the REACH marker on this selector (B318 S4). An `impl`
+    /// block its module does not `export` contributes nothing to a file that
+    /// did not write one; this is that file saying it knows.
+    pub reached: bool,
 }
 
 /// Flattens an `import`/`use` tree into (path, leaf-name, leaf-span, alias)
@@ -5319,9 +5562,14 @@ pub(crate) fn collect_reach_marked_spans(
             }
         },
         ImportBranch::Reach(_, inner) => collect_reach_marked_spans(inner, true, out),
-        // A selector binds no leaf, so a marker on it marks nothing here (S2's
-        // `#(impl T)` seam).
-        ImportBranch::Selector(_) => {}
+        // B318 S4: a selector binds no leaf, but `#(impl T)` is a real reach —
+        // the ONE way into an `impl` block its module does not `export` — and
+        // the selector's own span is what records it.
+        ImportBranch::Selector(selector) => {
+            if marked {
+                out.push(selector.span);
+            }
+        }
         ImportBranch::Set(branches) => {
             for child in branches {
                 collect_reach_marked_spans(child, marked, out);
@@ -5433,6 +5681,9 @@ impl<'src> Analyzer<'src> {
             implementation_by_declaration: HashMap::default(),
             impl_namespaces: Vec::new(),
             import_impl_restrictions: Vec::new(),
+            cross_module_collisions: Vec::new(),
+            blanket_residues: Vec::new(),
+            scoped_reach_checks: Vec::new(),
             trait_by_declaration: HashMap::default(),
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
@@ -7781,18 +8032,119 @@ impl<'src> Analyzer<'src> {
                     });
                 if let Some((earlier_id, collision)) = earlier {
                     duplicates.push((member_name, earlier_id, *member_id, *subject, collision));
+                    continue;
+                }
+                // B330 (Order 35 R5, documented admission; Order 36's refusal):
+                // two BLANKETS whose bound clauses are neither the same nor
+                // provably overlapping are ADMITTED here, deliberately —
+                // whether some third type carries both `Debug` and `Tagged` is
+                // not a question the DECLARATIONS answer. The consequence is
+                // that a receiver which DOES satisfy both has two inherent
+                // candidates and tier 1 takes the first UNRANKED, so swapping
+                // the two blocks changes which body runs. The site knows the
+                // receiver, so the site is the only place that can tell whether
+                // the witness exists; the pairs are banked here and decided at
+                // the call ([`check_call_site_admission`]).
+                for (_, earlier_id, earlier_subject) in &inherent[..position] {
+                    if !matches!(subject_type, Type::Generic(_))
+                        || !matches!(earlier_subject.get_type(self), Type::Generic(_))
+                    {
+                        continue;
+                    }
+                    // ONLY the pair `bound_argument_positions_overlap`'s
+                    // `(Generic, Generic)` arm admits. Two blankets separated
+                    // at a WRITTEN argument — A86's `Read<type I>` beside
+                    // `Read<Option<type I>>`, std's own `flatten` pair — are
+                    // ranked by tier 1 and are not this; banking them would put
+                    // every `flatten` call through the residue test for
+                    // nothing.
+                    let (Type::Generic(left), Type::Generic(right)) =
+                        (earlier_subject.get_type(self), subject.get_type(self))
+                    else {
+                        continue;
+                    };
+                    if !self.bounds_differ_only_at_binder_bounds(left, right) {
+                        continue;
+                    }
+                    self.blanket_residues.push(BlanketResidue {
+                        member: member_name.to_string(),
+                        first: *earlier_id,
+                        first_subject: *earlier_subject,
+                        second: *member_id,
+                        second_subject: *subject,
+                    });
                 }
             }
         }
-        let duplicates = duplicates
-            .into_iter()
-            .map(|(member_name, first_id, second_id, subject, collision)| {
-                let subject_label =
-                    self.pretty_print_type(&subject.get_type(self), &HashMap::default());
-                (member_name, first_id, second_id, subject_label, collision)
-            })
-            .collect();
-        self.report_duplicate_declarations(duplicates);
+        // B318 S4 — the CROSS-MODULE half leaves here.
+        //
+        // `names.md` §4.6's "a type has ONE namespace" was, in the shipped
+        // compiler, one namespace per PROGRAM: an impl registers when its file
+        // LOADS, so this check saw every block any file happened to pull in and
+        // refused a pair two independent packages could each legitimately
+        // declare. The per-importer namespace moves that question to the file
+        // that actually takes both — `visibility.md` §3.2, refused at the
+        // IMPORT, where the fix (a selector) lives and where the answer is a
+        // DEFINITION-ORDER-INDEPENDENT fact about one file. What stays here is
+        // the SAME-MODULE case (§10 (i)): a module that declares one name twice
+        // for one subject is refused at the declaration, as it always was,
+        // because no import can separate two blocks of one file.
+        //
+        // A COMPILER-SYNTHESIZED member (`DERIVED_SOURCE`) belongs to the file
+        // its attribute was written in, which is what
+        // `declaring_module_source` resolves — a backed enum's `value`/`parse`
+        // colliding with a hand-written one is a same-module pair and must not
+        // be deferred to an import that does not exist.
+        let mut same_module = Vec::new();
+        for (member_name, first_id, second_id, subject, collision) in duplicates {
+            let subject_label =
+                self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+            if self.declaring_module_source(first_id) == self.declaring_module_source(second_id) {
+                same_module.push((member_name, first_id, second_id, subject_label, collision));
+                continue;
+            }
+            // The same frozen-std skip the reporting half keeps (S1), applied
+            // where the row is BANKED so the scoped and full-scan checks agree
+            // about what the import pass will see.
+            if self.frozen_entity(second_id) {
+                continue;
+            }
+            let (Some(first_source), Some(second_source)) = (
+                self.declaring_module_source(first_id),
+                self.declaring_module_source(second_id),
+            ) else {
+                continue;
+            };
+            self.cross_module_collisions.push(MemberCollision {
+                member: member_name.to_string(),
+                first: first_id,
+                first_source,
+                second: second_id,
+                second_source,
+                subject: subject_label,
+                collision,
+            });
+        }
+        self.report_duplicate_declarations(same_module);
+    }
+
+    /// The file a declaration BELONGS TO for the duplicate rules — its own
+    /// file, or, for a compiler-synthesized member, the file whose attribute
+    /// generated it.
+    ///
+    /// [`Self::source_of_id`] answers [`DERIVED_SOURCE`] for generated code,
+    /// which is not a file any import can reach: a synthesized `value` and a
+    /// hand-written one are two declarations of ONE module and have to be
+    /// refused where they are written.
+    fn declaring_module_source(&self, id: Id) -> Option<SourceId> {
+        match self.source_of_id(id) {
+            Some(DERIVED_SOURCE) => self
+                .derived_origins
+                .iter()
+                .find(|(range, _, _)| range.contains(&id.0))
+                .map(|(_, _, source)| *source),
+            other => other,
+        }
     }
 
     /// **One module may declare a name once (B212).** Two `struct N`, two
@@ -8271,6 +8623,46 @@ impl<'src> Analyzer<'src> {
                     )
             },
         )
+    }
+
+    /// B330 — whether two binders' clauses are the pair
+    /// [`Self::generic_bounds_overlap`] admits for the ONE reason it cannot
+    /// answer: every argument position is either the same type or two BINDERS
+    /// bounded differently, and at least one is the latter.
+    ///
+    /// The distinction matters because it is the whole of the difference
+    /// between B330 and A86. `Read<type I: Debug>` beside `Read<type J:
+    /// Tagged>` leaves the compiler nothing to rank — whether some type carries
+    /// both traits is a question about the future, not about the declarations —
+    /// so the pair is admitted and a receiver that DOES carry both is decided
+    /// by declaration order. `Read<type I>` beside `Read<Option<type I>>` is
+    /// nothing of the sort: one argument is a written constructor, tier 1 ranks
+    /// them, and std's two `flatten` bodies are the exhibit.
+    fn bounds_differ_only_at_binder_bounds(&self, left: TypeId, right: TypeId) -> bool {
+        let left_bounds = self.generic_bound_traits(left);
+        let right_bounds = self.generic_bound_traits(right);
+        if left_bounds.is_empty() || left_bounds.len() != right_bounds.len() {
+            return false;
+        }
+        let mut differs_at_a_binder = false;
+        for ((left_trait, left_arguments), (right_trait, right_arguments)) in
+            left_bounds.iter().zip(right_bounds.iter())
+        {
+            if left_trait != right_trait || left_arguments.len() != right_arguments.len() {
+                return false;
+            }
+            for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments.iter())
+            {
+                if self.same_impl_type(*left_argument, *right_argument, &mut Vec::new()) {
+                    continue;
+                }
+                match (left_argument.get_type(self), right_argument.get_type(self)) {
+                    (Type::Generic(_), Type::Generic(_)) => differs_at_a_binder = true,
+                    _ => return false,
+                }
+            }
+        }
+        differs_at_a_binder
     }
 
     /// Whether one ARGUMENT position of two bound clauses can be filled by one
@@ -27607,8 +27999,15 @@ impl<'src> Analyzer<'src> {
                         leaf_span,
                         self.current_source_id,
                         alias,
+                        true,
                     ));
                 }
+                // B318 S4: a selector's own path is walked too, BINDING
+                // nothing. The walk is what puts the module's segments in
+                // `type_references`, which is where the admission pass reads
+                // the files a statement carried — the one channel that works
+                // the same on every host.
+                self.queue_selector_paths(root_branch, scope_id, node.1, &mut path_spans);
                 self.bank_import_restriction(root_branch, *modifier, scope_id, node.1, path_spans);
                 Some(Expr::Void)
             }
@@ -29449,6 +29848,8 @@ impl<'src> Analyzer<'src> {
                 }
                 self.implementations.push(Implementation {
                     subject,
+                    impl_id: id,
+                    module_scope: scope_id,
                     source: self.current_source_id,
                     declarations,
                     declared_members,
@@ -35587,6 +35988,55 @@ impl<'src> Analyzer<'src> {
     /// the import fixpoint, so the name is read AFTER the file's plain leaves
     /// have bound, which is §3.6's "plain leaves bind first, selectors resolve
     /// second" with no second walk to write.
+    /// B318 S4 — queues the path of every `(impl …)` selector in an `import`
+    /// tree for a WALK that binds nothing.
+    ///
+    /// A statement whose brace set holds only selectors binds no leaf, so
+    /// [`flatten_namespace_branch`] produced no entry for it and the path was
+    /// never resolved: nothing recorded a reference for `pkg::ext` in
+    /// `import pkg::ext::{ (impl T) };`, and the admission pass had to find the
+    /// module by matching the segments against `canonical_sources` as a file
+    /// path ([`module_source_by_name`], retired with this). That lookup is a
+    /// host-dependent string match — a canonical path is `\`-separated on
+    /// Windows and `/`-separated everywhere else, which is what the Order 35
+    /// seal fix (vilan 9b22ec36) had to repair — and it is guesswork even where
+    /// it works: two packages with the same directory shape both match, and it
+    /// picked whichever shared the longer prefix with the importer.
+    ///
+    /// The walk answers exactly, by the same route every other import takes.
+    /// It is queued only when the statement's segments are not already in the
+    /// queue from a real leaf, so `import pkg::x::{ y::helper, (impl T) };`
+    /// costs nothing extra.
+    fn queue_selector_paths(
+        &mut self,
+        branch: &'src ImportBranch<'src>,
+        scope_id: Id,
+        span: Span,
+        path_spans: &mut Vec<Span>,
+    ) {
+        let mut written = Vec::new();
+        collect_impl_selectors(branch, Vec::new(), &mut written);
+        for (path, _) in written {
+            let Some(((leaf, leaf_span), segments)) = path.split_last() else {
+                continue;
+            };
+            if path_spans.contains(leaf_span) {
+                continue;
+            }
+            path_spans.push(*leaf_span);
+            self.prepped_imports.push((
+                segments.to_vec(),
+                leaf,
+                scope_id,
+                span,
+                *leaf_span,
+                self.current_source_id,
+                None,
+                false,
+            ));
+        }
+    }
+
     fn bank_import_restriction(
         &mut self,
         branch: &'src ImportBranch<'src>,
@@ -35616,6 +36066,9 @@ impl<'src> Analyzer<'src> {
                     path_spans.push(*segment_span);
                 }
             }
+            let reached = self
+                .reach_marked_spans
+                .contains(&(self.current_source_id, selector.span));
             selectors.push(ImportImplSelector {
                 span: selector.span,
                 text: selector.subject_text.to_string(),
@@ -35625,13 +36078,7 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .map(|(name, span)| ((*name).to_string(), *span))
                     .collect(),
-                // Past the ORIGIN segment (`pkg`, `std`, a dependency name),
-                // which names a package rather than a file.
-                path: path
-                    .iter()
-                    .skip(1)
-                    .map(|(name, _)| (*name).to_string())
-                    .collect(),
+                reached,
             });
         }
         let only = match modifier {
@@ -35814,6 +36261,7 @@ impl<'src> Analyzer<'src> {
         leaf_span: Span,
         source_id: SourceId,
         alias: Option<(&'src str, Span)>,
+        bind: bool,
     ) -> bool {
         // The segments to walk, each with its source span. A `self` leaf re-binds
         // the namespace it sits in (e.g. `Option::{ self }` binds `Option`);
@@ -36103,6 +36551,15 @@ impl<'src> Analyzer<'src> {
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
+        }
+        // B318 S4: a selector-only statement's walk stops here. It has resolved
+        // the path and recorded every segment's reference — which is all it was
+        // for — and it binds no name, records no alias and makes no reach: a
+        // module FILE is not a module's own top-level declaration, so the
+        // plain-reach warning had nothing to say about this leaf anyway
+        // (§5's third exemption).
+        if !bind {
+            return true;
         }
         // E142: an `as` alias renames the binding and nothing else — the path
         // resolved exactly as it would have without one. The alias's own span
@@ -40814,12 +41271,17 @@ impl<'src> Analyzer<'src> {
         // A narrowing beats `export *;` — which is what makes `export(in mod)`
         // the way to hold one item back under a module-wide export.
         if let Some(scope) = self.export_scopes.get(&target) {
-            return match scope.first() {
+            // The two reserved heads are reserved as WHOLE paths: `export(in
+            // pkg)` is the package and `export(in pkg::a)` is a module subtree
+            // under it, which is a different question and a different answer
+            // (B336). Matching on the first segment alone read the second as
+            // the first.
+            return match scope.as_slice() {
                 // "this module and its inline `mod` blocks" — the declaring
                 // FILE, which is the only reader of a file-private item.
-                Some(&"mod") => self.source_of_id(target) == Some(importer),
+                ["mod"] => self.source_of_id(target) == Some(importer),
                 // "the item's own package".
-                Some(&"pkg") => {
+                ["pkg"] => {
                     let declared_in = self.source_of_id(target);
                     declared_in.is_some_and(|declared_in| {
                         self.package_of_source.get(&declared_in)
@@ -40827,12 +41289,14 @@ impl<'src> Analyzer<'src> {
                     })
                 }
                 // A general path (`export(in pkg::a)`) names a module SUBTREE,
-                // and a subtree is a question about file paths, which the
-                // analyzer does not hold (`sources` lives on `Program`). S1
-                // parses, stores, formats and reprints the form and admits it
-                // here — the conservative direction, since being wrong the other
-                // way is a warning about a program that is correct. Zero
-                // occurrences in the estate; the subtree test is a follow-up.
+                // and a subtree is a question about FILE PATHS, which the
+                // analyzer does not hold — `sources` is a parameter of the
+                // commit, not a field of the walk. B336: admitted here and
+                // decided by [`check_scoped_exports`] in the post-build family,
+                // where `Program::canonical_sources` is in hand. Admitted
+                // rather than refused because being wrong this way is silence
+                // about a program that is wrong, and being wrong the other way
+                // is a warning about one that is right.
                 _ => true,
             };
         }
@@ -40894,6 +41358,19 @@ impl<'src> Analyzer<'src> {
                 .reach_marked_spans
                 .contains(&(reach.source, reach.leaf_span));
             let visible = self.export_reaches_file(reach.target, module_scope, reach.source);
+            // B336: `export(in pkg::a)` names a module SUBTREE, and a subtree
+            // is a question about FILE PATHS, which this walk does not hold —
+            // `sources` is a parameter of the commit, not a field of the
+            // analyzer. `export_reaches_file` admits the form; the decision is
+            // banked here and made by [`check_scoped_exports`] after the build.
+            // Only the general form: `mod` and `pkg` are enforced exactly,
+            // right where they are asked.
+            let general_scope: Option<Vec<&'src str>> = self
+                .export_scopes
+                .get(&reach.target)
+                .filter(|scope| !matches!(scope.as_slice(), ["mod"] | ["pkg"]))
+                .cloned();
+            let visible = visible && general_scope.is_none();
             let module = reach.path.join("::");
             // A qualified path carries no marker (there is no leaf to write one
             // on), so the redundancy question does not arise for it.
@@ -40929,6 +41406,21 @@ impl<'src> Analyzer<'src> {
             }
             if self.package_of_source.get(&declared_in) != self.package_of_source.get(&reach.source)
             {
+                continue;
+            }
+            // B336: the banked row carries everything the message needs, so the
+            // post-build pass composes the SAME two sentences rather than a
+            // third wording for one form.
+            if let Some(scope) = general_scope {
+                self.scoped_reach_checks.push(ScopedReachCheck {
+                    scope: scope.iter().map(|segment| (*segment).to_string()).collect(),
+                    declared_in,
+                    importer: reach.source,
+                    leaf_span: reach.leaf_span,
+                    module: module.clone(),
+                    leaf: reach.leaf.to_string(),
+                    qualified: reach.qualified,
+                });
                 continue;
             }
             sites.push((
@@ -43368,10 +43860,10 @@ impl<'src> Analyzer<'src> {
         loop {
             let before = remaining.len();
             remaining.retain(
-                |(path, name, scope_id, span, leaf_span, source_id, alias)| {
+                |(path, name, scope_id, span, leaf_span, source_id, alias, bind)| {
                     let diagnostics_before = self.diagnostics.len();
                     let resolved = self.resolve_import(
-                        path, name, *scope_id, *span, false, *leaf_span, *source_id, *alias,
+                        path, name, *scope_id, *span, false, *leaf_span, *source_id, *alias, *bind,
                     );
                     self.attribute_new_diagnostics(diagnostics_before, *source_id);
                     !resolved
@@ -43381,10 +43873,10 @@ impl<'src> Analyzer<'src> {
                 break;
             }
         }
-        for (path, name, scope_id, span, leaf_span, source_id, alias) in remaining {
+        for (path, name, scope_id, span, leaf_span, source_id, alias, bind) in remaining {
             let diagnostics_before = self.diagnostics.len();
             self.resolve_import(
-                &path, name, scope_id, span, true, leaf_span, source_id, alias,
+                &path, name, scope_id, span, true, leaf_span, source_id, alias, bind,
             );
             self.attribute_new_diagnostics(diagnostics_before, source_id);
         }
@@ -48848,14 +49340,53 @@ pub struct Program<'src> {
     pub global_scope_id: Id,
     pub implementations: Vec<Implementation<'src>>,
     /// B318 S3: the `only` modifiers and `(impl …)` selectors the program's
-    /// files wrote, resolved by [`check_impl_selector_admission`] after the
-    /// program is built. Empty for a program that writes neither.
+    /// files wrote, DRAINED by [`build_impl_admission`] after the program is
+    /// built. Empty for a program that writes neither.
     pub import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B318 S4: the cross-module inherent collisions, banked at the declaration
+    /// and refused at the IMPORT of whichever file admits both
+    /// ([`refuse_imported_member_collisions`]).
+    pub cross_module_collisions: Vec<MemberCollision>,
+    /// B330: the differently-bounded blanket pairs the duplicate family admits,
+    /// refused at a CALL whose receiver satisfies both ([`BlanketResidue`]).
+    pub blanket_residues: Vec<BlanketResidue>,
+    /// B336: reaches past an `export(in <general PATH>)` narrowing, decided by
+    /// [`check_scoped_exports`] where the source paths are in hand.
+    pub scoped_reach_checks: Vec<ScopedReachCheck>,
     /// B318 S3: per `(importing file, selector span)`, the impl MEMBERS that
     /// selector admitted — the answer Organize Imports asks for when it decides
     /// whether a selector is used (`visibility.md` §7.2). Filled by
-    /// [`check_impl_selector_admission`].
+    /// [`build_impl_admission`].
     pub impl_selector_members: HashMap<(SourceId, Span), Vec<Id>>,
+    /// B318 S4: the per-importer method namespace — which `impl` blocks each
+    /// file admits. Built by [`build_impl_admission`] BEFORE the post-build
+    /// passes that read it, because `dispatch_refine`'s candidate lists and
+    /// emission's `impl_select` are two of its consumers.
+    pub impl_admission: ImplAdmission,
+    /// B318 S4: the `impl` BLOCKS a curated module does not export — the ones
+    /// that reach only their own file and whatever file wrote `#(impl T)` for
+    /// them. Keyed by the block's own entity id. Empty for an uncurated module
+    /// and therefore for the whole estate.
+    pub hidden_impls: HashSet<Id>,
+    /// B318 (E178) — every top-level declaration a CURATED module publishes:
+    /// marked `export`, `export(in PATH)`, or covered by its module's
+    /// `export *;`.
+    ///
+    /// Here for vilan-ide's completion filters. Their other route,
+    /// [`module_importables`], parses the module's file into the process-global
+    /// cache, which is free inside `owned_modules::collecting()` and a
+    /// per-keystroke leak outside it — `auto_import_completions` runs outside.
+    /// The analyzer has already answered this while walking; the answer travels
+    /// rather than being recomputed from source.
+    pub exported_entities: HashSet<Id>,
+    /// B318 (E178) — the module BODY SCOPES that carry any `export` marker at
+    /// all: the uncurated-module exemption's complement, and the other half of
+    /// the predicate [`exported_entities`](Self::exported_entities) serves.
+    ///
+    /// Read together: a name is offered when `exported_entities` holds it OR
+    /// its module's scope is absent here, which is `Analyzer::is_exported_in`
+    /// exactly — a module that has curated nothing offers everything.
+    pub curated_modules: HashSet<Id>,
     /// Every generic parameter's bound list, by constraint type id — a
     /// multi-bound's entries, where a single bound is the constraint id
     /// itself. Carried out of the analyzer because the specificity order
@@ -49472,6 +50003,21 @@ impl<'src> Program<'src> {
     /// The source file an entity originated from, by locating the walk range
     /// that produced its id. `None` for synthetic entities minted outside any
     /// file walk (e.g. during post-analysis passes).
+    /// B318 S4 — the file an impl lookup anchored at `id` runs under, or `None`
+    /// when NO file in the program restricts anything.
+    ///
+    /// The `None` is not a fallback: it is the estate's answer, and it is what
+    /// keeps the per-importer namespace free for every program that writes
+    /// neither `only` nor a selector. `source_of` is a linear scan of
+    /// `source_ranges` (M27's whole-program-loop hazard) and the dispatch
+    /// consumers ask it once per SITE, so the guard has to come first.
+    pub fn admitting_file(&self, id: Id) -> Option<SourceId> {
+        if self.impl_admission.is_empty() {
+            return None;
+        }
+        self.source_of(id)
+    }
+
     pub fn source_of(&self, id: Id) -> Option<SourceId> {
         self.source_ranges
             .iter()
@@ -55741,12 +56287,32 @@ fn analyze_inner<'src>(
             // Give the module entity a location (its file, at the top) so a path
             // segment naming it can go-to-definition. A one-id range maps it to its
             // source; the span is the file start.
+            //
+            // B335: an ADOPTED node already HAS a one-id range — the namespace
+            // placeholder `ensure_module_node` attributed to the entry, because
+            // a namespace has no file of its own. Pushing a second range for
+            // the same id left `source_of` (which takes the FIRST range that
+            // contains an id) answering the ENTRY for every module that owns
+            // both `x.vl` and `x/`, so `program.source_of(segment)` named the
+            // importing file — and `import_module_is_used` (E168/E169) asks
+            // exactly that, so Organize Imports was reading the wrong file. It
+            // also made `source_ranges` non-disjoint, which silently demoted
+            // `source_lookup` to the linear scan M27 exists to avoid. Corrected
+            // IN PLACE: the module has a file now, and the placeholder is the
+            // row that should say so.
             analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-            analyzer.source_ranges.push(SourceRange {
-                start: module_id.0,
-                end: module_id.0 + 1,
-                source: module_source_id,
-            });
+            match analyzer
+                .source_ranges
+                .iter_mut()
+                .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
+            {
+                Some(placeholder) => placeholder.source = module_source_id,
+                None => analyzer.source_ranges.push(SourceRange {
+                    start: module_id.0,
+                    end: module_id.0 + 1,
+                    source: module_source_id,
+                }),
+            }
             analyzer
                 .expr_id_to_expr_map
                 .insert(module_id, Expr::Module(module_id));
@@ -58032,7 +58598,56 @@ fn analyze_over_world<'src>(
         .map(|(&id, &type_id)| (id, type_id))
         .collect();
 
+    // B318 S4, the `export impl` ruling (owner, 2026-09-13): `export` on an
+    // `impl` means what it means on every other declaration, so an impl block a
+    // consumer cannot SEE contributes nothing to that consumer — no methods, no
+    // ambient impls — and `#(impl T)` is the only reach.
+    //
+    // Computed here, at the commit, because the three sets it reads are the
+    // analyzer's own and the question is asked per BLOCK rather than per
+    // lookup. The uncurated-module exemption is the first clause and carries
+    // the whole estate: a module with NO marker offers everything, exactly as
+    // it did before B318 (`visibility.md` §14), so a package that has not
+    // curated loses nothing.
+    let hidden_impls: HashSet<Id> = analyzer
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            analyzer
+                .curated_modules
+                .contains(&implementation.module_scope)
+                && !analyzer
+                    .export_all_modules
+                    .contains(&implementation.module_scope)
+                && !analyzer
+                    .exported_entities
+                    .contains_key(&implementation.impl_id)
+        })
+        .map(|implementation| implementation.impl_id)
+        .collect();
+
+    // B318 (E178): the visibility answers the walk already has, for vilan-ide's
+    // completion filters. `export *;` marks the MODULE rather than each of its
+    // names, so the module-wide form is resolved onto its own declarations here
+    // — the consumer asks about a name, and the name is what has to answer.
+    let declaring_scopes = analyzer.module_declaration_scopes();
+    let exported_entities: HashSet<Id> = analyzer
+        .exported_entities
+        .keys()
+        .copied()
+        .chain(
+            declaring_scopes
+                .iter()
+                .filter(|(_, (scope, _))| analyzer.export_all_modules.contains(scope))
+                .map(|(id, _)| *id),
+        )
+        .collect();
+    let curated_modules = analyzer.curated_modules.clone();
+
     Some(Program {
+        hidden_impls,
+        exported_entities,
+        curated_modules,
         platform,
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,
@@ -58072,7 +58687,11 @@ fn analyze_over_world<'src>(
         global_scope_id,
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
+        cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
+        blanket_residues: std::mem::take(&mut analyzer.blanket_residues),
+        scoped_reach_checks: std::mem::take(&mut analyzer.scoped_reach_checks),
         impl_selector_members: HashMap::default(),
+        impl_admission: ImplAdmission::default(),
         generic_bounds: analyzer.generic_bounds,
         backed_value_members,
         list_new_fn_id,
@@ -58355,17 +58974,31 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
 /// `impl List<i32>` that the forward test refuses (a constructor-headed subject
 /// does not match a hole), and `(impl _)` reaches every block there is. One
 /// predicate, both readings, and no new type machinery.
-pub fn check_impl_selector_admission(program: &mut Program) {
+pub fn build_impl_admission(program: &mut Program) {
     let statements = std::mem::take(&mut program.import_impl_restrictions);
-    // The estate's path: nothing wrote `only` and nothing wrote a selector, so
-    // there is no file whose method surface differs from today's.
+    // The estate's path: nothing wrote `only`, nothing wrote a selector, and no
+    // two files declare one inherent name for one subject — so there is no file
+    // whose method surface differs from today's and nothing to decide.
     let restricting: HashSet<SourceId> = statements
         .iter()
         .filter(|row| row.only.is_some() || !row.selectors.is_empty())
         .map(|row| row.source)
         .collect();
-    if restricting.is_empty() {
+    if restricting.is_empty()
+        && program.cross_module_collisions.is_empty()
+        && program.hidden_impls.is_empty()
+    {
         return;
+    }
+    // `statement_sources` reads a span's definition out of `type_references`,
+    // which is a flat `Vec` of every reference the program recorded: asked once
+    // per path segment of every import statement, that product is the pass. One
+    // index, built once, answers each of them in a probe.
+    let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
+    for (source, span, definition, _) in &program.type_references {
+        if let Some(definition) = definition {
+            references.entry((*source, *span)).or_insert(*definition);
+        }
     }
     // Per (importing file, restricted file): the member ids the file's
     // selectors admitted out of that file. An entry's absence is "unrestricted".
@@ -58373,11 +59006,44 @@ pub fn check_impl_selector_admission(program: &mut Program) {
     let mut selector_of: HashMap<(SourceId, SourceId), String> = HashMap::default();
     let mut selector_members: HashMap<(SourceId, Span), Vec<Id>> = HashMap::default();
     let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
+    // B338: selectors that admitted nothing, reported once the walk is done so
+    // the diagnostics come back in source order.
+    let mut selector_misses: Vec<(SourceId, Span, String)> = Vec::new();
+    // Per statement, the files its walk carried — the input the collision
+    // refusal reads, and the same answer the admission loop below computes.
+    // Built for EVERY statement only when a collision is banked; otherwise only
+    // the restricting files' statements are walked, as before.
+    let mut carried: Vec<(SourceId, Span, Vec<SourceId>)> = Vec::new();
+    // B318 S4's export gate: which hidden blocks each file reached with
+    // `#(impl T)`. A marked selector is read against the WHOLE program's
+    // implementations rather than against the statement's own files — the
+    // marker's job is to name a block, and the block's module is the one the
+    // statement walked to, which the subject test already decides.
+    let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
+    let collisions = std::mem::take(&mut program.cross_module_collisions);
+    let hidden = std::mem::take(&mut program.hidden_impls);
     for row in &statements {
+        if !hidden.is_empty() {
+            for selector in row.selectors.iter().filter(|selector| selector.reached) {
+                for implementation in &program.implementations {
+                    if hidden.contains(&implementation.impl_id)
+                        && selector_admits(program, implementation.subject, selector.subject)
+                    {
+                        reached.insert((row.source, implementation.impl_id));
+                    }
+                }
+            }
+        }
+        if !restricting.contains(&row.source) && collisions.is_empty() {
+            continue;
+        }
+        let sources = statement_sources(program, &references, row);
+        if !collisions.is_empty() {
+            carried.push((row.source, row.span, sources.clone()));
+        }
         if !restricting.contains(&row.source) {
             continue;
         }
-        let sources = statement_sources(program, row);
         if row.only.is_none() && row.selectors.is_empty() {
             for module in sources {
                 unrestricted.insert((row.source, module));
@@ -58387,12 +59053,14 @@ pub fn check_impl_selector_admission(program: &mut Program) {
         let mut admitted: HashSet<Id> = HashSet::default();
         for selector in &row.selectors {
             let mut members: Vec<Id> = Vec::new();
+            let mut subject_reached = false;
             for implementation in &program.implementations {
                 if !sources.contains(&implementation.source)
                     || !selector_admits(program, implementation.subject, selector.subject)
                 {
                     continue;
                 }
+                subject_reached = true;
                 for (name, member_id) in &implementation.declarations {
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| taken == name)
@@ -58400,6 +59068,40 @@ pub fn check_impl_selector_admission(program: &mut Program) {
                         members.push(*member_id);
                     }
                 }
+            }
+            // B338: a selector that admits NOTHING is almost certainly a typo,
+            // and it used to be silent — the mistake surfaced later, as the
+            // admission refusal at the first call that wanted the block, in a
+            // message about a member rather than about the selector that
+            // dropped it. Said HERE, at the selector, where the fix is. Two
+            // shapes: a subject no block in the module has, and a subject that
+            // reaches a block whose members the `::` tail then misses.
+            if !subject_reached || members.is_empty() {
+                let subject = &selector.text;
+                let modules = sources
+                    .iter()
+                    .map(|source| format!("`{}`", module_stem(program, *source)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let claim = if subject_reached {
+                    let named = selector
+                        .members
+                        .iter()
+                        .map(|(name, _)| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "no `impl {subject}` this statement carries declares {named}: the \
+                         selector admits nothing"
+                    )
+                } else {
+                    format!(
+                        "no `impl` this statement carries has a subject `{subject}` admits, so \
+                         the selector admits nothing. The modules it walks are {modules}; \
+                         `(impl _)` admits every block they declare"
+                    )
+                };
+                selector_misses.push((row.source, selector.span, claim));
             }
             admitted.extend(members.iter().copied());
             selector_members.insert((row.source, selector.span), members);
@@ -58418,11 +59120,376 @@ pub fn check_impl_selector_admission(program: &mut Program) {
     }
     for key in unrestricted {
         restricted.remove(&key);
+        selector_of.remove(&key);
     }
     program.impl_selector_members = selector_members;
-    if restricted.is_empty() {
+    selector_misses.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
+    for (source, span, msg) in selector_misses {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
+    program.impl_admission = ImplAdmission {
+        restricting,
+        admitted: restricted,
+        selector_of,
+        hidden,
+        reached,
+    };
+    if !collisions.is_empty() {
+        refuse_imported_member_collisions(program, &collisions, &carried);
+    }
+}
+
+/// B318 S4, `visibility.md` §3.2 — **two admitted impls declaring one inherent
+/// name for one subject are a refusal at the IMPORT**, spanned on the second
+/// import statement, naming both blocks and the selector that resolves them.
+///
+/// Refused at the import and not at the call, for the paper's three reasons.
+/// (1) The import list is where the file expresses its intent, and it is the
+/// only place the fix lives: the fix IS a selector, and a selector is written
+/// in an import. (2) A call-site refusal fires N times for one mistake and
+/// fires only on the paths a file happens to exercise, so a file can be
+/// half-broken. (3) It keeps the refusal a DEFINITION-ORDER-INDEPENDENT fact
+/// about one file, which is the whole reason B57 exists — "which one dies is
+/// decided by the order the modules happened to load in" is the thing being
+/// removed, not relocated.
+///
+/// A file admits a block when one of its import statements CARRIED the block's
+/// file (today's meaning: the leaf's file and every file on the path to it,
+/// `names.md` §4.1) and its own selectors did not decline the member. So the
+/// same two modules are clean in every file that takes one of them, and in
+/// every file that takes neither — which is the property that lets two
+/// independent packages each extend one type and both stay installable.
+fn refuse_imported_member_collisions(
+    program: &mut Program,
+    collisions: &[MemberCollision],
+    carried: &[(SourceId, Span, Vec<SourceId>)],
+) {
+    let mut violations: Vec<(Error, SourceId, Option<crate::error::Note>)> = Vec::new();
+    for collision in collisions {
+        for importer in program
+            .source_ranges
+            .iter()
+            .map(|range| range.source)
+            .collect::<Vec<_>>()
+        {
+            // The statement that brought each block in. A file DECLARING one of
+            // them needs no import for it: its own blocks are always its own.
+            let statement_for = |source: SourceId| -> Option<Option<Span>> {
+                if source == importer {
+                    return Some(None);
+                }
+                carried
+                    .iter()
+                    .filter(|(file, _, sources)| *file == importer && sources.contains(&source))
+                    .map(|(_, span, _)| Some(*span))
+                    .next()
+            };
+            let (Some(first_at), Some(second_at)) = (
+                statement_for(collision.first_source),
+                statement_for(collision.second_source),
+            ) else {
+                continue;
+            };
+            // Both blocks must be in this file's namespace for the pair to be
+            // its problem: the export gate and the file's own selectors are
+            // asked exactly as a call would ask them.
+            let admits = |member_id: Id| -> bool {
+                program
+                    .implementations
+                    .iter()
+                    .find(|implementation| {
+                        implementation
+                            .declarations
+                            .values()
+                            .any(|id| *id == member_id)
+                    })
+                    .is_some_and(|implementation| {
+                        program
+                            .impl_admission
+                            .admits_member(importer, implementation, member_id)
+                    })
+            };
+            if !admits(collision.first) || !admits(collision.second) {
+                continue;
+            }
+            let member = &collision.member;
+            // Where the refusal sits, and what the C3 note points at. Two
+            // geometries, and they want different notes.
+            //
+            // BOTH BLOCKS IMPORTED: the LATER statement carries the refusal and
+            // the earlier one carries the note, which is the duplicate family's
+            // own shape one construct over — the second occurrence is reported,
+            // naming the first.
+            //
+            // ONE BLOCK THIS FILE'S OWN: there is only one import, so it is
+            // where the message goes, and the note points at the DECLARATION —
+            // the file wrote that block, it can read it, and "already defined
+            // here" is the sentence it has always been shown.
+            let own_declaration = |member_id: Id| -> Option<crate::error::Note> {
+                Some(crate::error::Note {
+                    span: program
+                        .functions
+                        .get(&member_id)
+                        .map(|function| function.name_span)
+                        .or_else(|| program.span_map.get(&member_id).map(|span| **span))?,
+                    msg: format!("'{member}' is already defined here"),
+                    source: Some(importer),
+                })
+            };
+            let arrives_here = |span: Span| -> Option<crate::error::Note> {
+                Some(crate::error::Note {
+                    span,
+                    msg: format!("'{member}' arrives with this import too"),
+                    source: Some(importer),
+                })
+            };
+            // (the refusal's span, the module the SELECTOR fix names, the
+            // module the claim names, the note).
+            let (here, here_source, other_source, note) = match (first_at, second_at) {
+                (Some(first), Some(second)) if first.start > second.start => (
+                    first,
+                    collision.first_source,
+                    collision.second_source,
+                    arrives_here(second),
+                ),
+                (Some(first), Some(second)) => (
+                    second,
+                    collision.second_source,
+                    collision.first_source,
+                    arrives_here(first),
+                ),
+                (Some(first), None) => (
+                    first,
+                    collision.first_source,
+                    collision.first_source,
+                    own_declaration(collision.second),
+                ),
+                (None, Some(second)) => (
+                    second,
+                    collision.second_source,
+                    collision.second_source,
+                    own_declaration(collision.first),
+                ),
+                (None, None) => continue,
+            };
+            let subject = &collision.subject;
+            let other = module_stem(program, other_source);
+            let selected = module_stem(program, here_source);
+            let fix = format!("`import {selected}::{{ (impl {subject})::{member} }};`");
+            let claim = match collision.collision {
+                SubjectCollision::Same => format!(
+                    "'{member}' is already defined for '{subject}' by module '{other}', which \
+                     this file also imports; a file may take only one. Select one — {fix} — or \
+                     drop an import"
+                ),
+                // B315/B330: the two bound clauses differ, so "already defined"
+                // would read as a mistake about what the compiler saw.
+                SubjectCollision::OverlappingBounds => format!(
+                    "'{member}' is declared for '{subject}' by two blanket impls whose bounds \
+                     OVERLAP, one of them module '{other}''s, and this file imports both: a type \
+                     satisfying both clauses matches both impls, and an inherent member is taken \
+                     from the first without ranking. Select one — {fix} — or drop an import"
+                ),
+            };
+            violations.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: here,
+                    msg: claim,
+                },
+                importer,
+                note,
+            ));
+        }
+    }
+    violations.sort_by_key(|(error, source, _)| (source.0, error.span.start, error.span.end));
+    violations.dedup_by_key(|(error, source, _)| (source.0, error.span, error.msg.clone()));
+    for (mut error, source, note) in violations {
+        error.note = note;
+        program.push_diagnostic(error, source);
+    }
+}
+
+/// B336 — `export(in <general PATH>)`, ENFORCED.
+///
+/// S1 shipped the form parsing, storing, formatting and reprinting, and
+/// ADMITTING: `mod` and `pkg` were enforced exactly (the declaring file, and
+/// the item's own package — both answerable from the walk), while a general
+/// path was let through because the subtree test needs source PATHS and those
+/// live on [`Program`]. This is that test, in the post-build family, over the
+/// rows the plain-reach walk banked.
+///
+/// **A module subtree IS a directory.** `names.md`'s layout gives every module
+/// exactly two spellings — `<dir>/<name>.vl` and `<dir>/<name>/lib.vl` — so a
+/// file is inside the subtree `pkg::a` when it IS `a.vl` or sits under `a/`.
+/// A path this file is not under at all is admitted, deliberately: the
+/// narrowing may name a module elsewhere in the package, and a warning about a
+/// subtree the compiler cannot locate would be unactionable.
+pub fn check_scoped_exports(program: &mut Program) {
+    let checks = std::mem::take(&mut program.scoped_reach_checks);
+    if checks.is_empty() {
         return;
     }
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    for check in &checks {
+        let Some(root) = subtree_root(program, check) else {
+            continue;
+        };
+        let Some(importer) = program.canonical_sources.get(check.importer.0 as usize) else {
+            continue;
+        };
+        // Inside the subtree: the module's own body file, or anything under the
+        // directory that holds it.
+        if importer == &root.with_extension("vl") || importer.starts_with(&root) {
+            continue;
+        }
+        let module = &check.module;
+        let leaf = &check.leaf;
+        let scope = check.scope.join("::");
+        sites.push((
+            check.leaf_span,
+            check.importer,
+            if check.qualified {
+                format!(
+                    "`{module}::{leaf}` is exported only into `{scope}`, and this path reaches \
+                     it from outside. The spelling that says so is a marked import: \
+                     `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own"
+                )
+            } else {
+                format!(
+                    "`{module}::{leaf}` is exported only into `{scope}`, and this file is \
+                     outside it. Importing it anyway is allowed — mark the reach: \
+                     `import {module}::{{ #{leaf} }};`"
+                )
+            },
+        ));
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    sites.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+    for (span, source, msg) in sites {
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(source);
+    }
+}
+
+/// The path an `export(in PATH)` subtree roots at — `<dir>/a` for a narrowing
+/// whose last segment is `a`, such that the module's own body file is
+/// `<dir>/a.vl` and everything below it is `<dir>/a/…`.
+///
+/// Resolved from the DECLARING file rather than from a package root, because
+/// the declaring file is inside its own narrowing by definition and its path is
+/// the one piece of layout this pass can be sure of: an item written in
+/// `a/thing.vl` under `export(in pkg::a)` has `a` as a directory above it, and
+/// one written in `a.vl` itself has `a` as its own stem. `None` when neither
+/// holds — the narrowing names a module this file is not under, which is a
+/// program the compiler has nothing useful to say about and admits.
+fn subtree_root(program: &Program, check: &ScopedReachCheck) -> Option<std::path::PathBuf> {
+    let declared = program
+        .canonical_sources
+        .get(check.declared_in.0 as usize)?;
+    let last = check.scope.last()?;
+    if declared.file_stem().and_then(|stem| stem.to_str()) == Some(last.as_str()) {
+        return Some(declared.with_extension(""));
+    }
+    let mut current = declared.parent()?;
+    loop {
+        if current.file_name().and_then(|name| name.to_str()) == Some(last.as_str()) {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// The type a method call's RECEIVER has, as a post-build pass can see it.
+///
+/// `expr_type_ids` holds a type only where one is PRODUCED, and a plain
+/// `Expr::Local` read of a binding produces nothing — so a receiver written as
+/// a variable has to be answered through its DECLARATION. The same three lines
+/// `context::value_type_of` keeps, for the same reason.
+fn receiver_type_id(program: &Program, receiver: Id) -> Option<TypeId> {
+    if let Some(Expr::Local(target)) = program.entity_map.get(&receiver) {
+        if let Some(parameter) = program.parameters.get(target) {
+            return Some(parameter.type_id);
+        }
+        if let Some(variable) = program.variables.get(target) {
+            return Some(variable.type_id);
+        }
+    }
+    program.expr_type_ids.get(&receiver).copied()
+}
+
+/// The HEAD name of an `impl` block's subject, as a selector spells it —
+/// `Thing` for `impl Thing`, `Boxed` for `impl Boxed<i32>`, and `_` for a
+/// subject with no nominal head (a blanket, a tuple, an array), which is
+/// exactly the placeholder a selector writes for it.
+fn subject_head_name(program: &Program, subject: TypeId) -> String {
+    match program.type_id_to_type_map.get(&subject) {
+        Some(Type::Struct(id, _)) => program.structs.get(id).map(|struct_| struct_.name),
+        Some(Type::Enum(id, _)) => program.enums.get(id).map(|enum_| enum_.name),
+        Some(Type::Trait(id, _)) => program.traits.get(id).map(|trait_| trait_.name),
+        _ => None,
+    }
+    .unwrap_or("_")
+    .to_string()
+}
+
+/// A source's module NAME as a diagnostic spells it — its file stem, which is
+/// what `names.md` makes the module's name for every layout the loader admits
+/// (`<name>.vl`, and `<name>/lib.vl`'s parent directory).
+fn module_stem(program: &Program, source: SourceId) -> String {
+    program
+        .canonical_sources
+        .get(source.0 as usize)
+        .and_then(|path: &std::path::PathBuf| {
+            match path.file_stem().and_then(|stem| stem.to_str()) {
+                Some("lib") => path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str()),
+                stem => stem,
+            }
+        })
+        .unwrap_or("that module")
+        .to_string()
+}
+
+/// B318 S3/S4 — the refusal a CALL earns when the method it resolved to comes
+/// from an `impl` the calling file did not admit.
+///
+/// The analyzer's own method lookup ([`Analyzer::impl_member_candidates`]) runs
+/// during the walk, where the admission map does not exist yet: the question a
+/// selector asks is `impl_select::subject_applies`, which reads a FINISHED
+/// program. So the lookup stays program-wide and the call is corrected here —
+/// which is also where the message can name the selector that would fix it.
+/// The per-importer namespace proper ([`ImplAdmission`], read by
+/// `dispatch_refine` and by emission's `impl_select`) is the same map asked by
+/// the consumers that DO run after the build.
+pub fn check_call_site_admission(program: &mut Program) {
+    if program.impl_admission.is_empty() && program.blanket_residues.is_empty() {
+        return;
+    }
+    let residues = std::mem::take(&mut program.blanket_residues);
+    let ImplAdmission {
+        restricting,
+        admitted: restricted,
+        selector_of,
+        hidden,
+        reached,
+    } = program.impl_admission.clone();
     // Which implementation declares a member — `declarations` read backwards,
     // built once for the pass rather than scanned per call.
     let mut declaring: HashMap<Id, usize> = HashMap::default();
@@ -58436,9 +59503,6 @@ pub fn check_impl_selector_admission(program: &mut Program) {
         let Some(source) = program.source_of(*call_id) else {
             continue;
         };
-        if !restricting.contains(&source) {
-            continue;
-        }
         // A method call's callee is a fresh local bound to the member the
         // lookup found (`wire_method_call`), which is the one place a call
         // records WHICH implementation answered it.
@@ -58449,10 +59513,85 @@ pub fn check_impl_selector_admission(program: &mut Program) {
             continue;
         };
         let implementation = &program.implementations[index];
-        let Some(admitted) = restricted.get(&(source, implementation.source)) else {
+        // B330's refusal, decided HERE because only the site knows the
+        // receiver. The pair was admitted at the declaration precisely because
+        // the declarations could not say whether a witness exists; this call's
+        // receiver either is one or is not.
+        if let Some(residue) = residues
+            .iter()
+            .find(|residue| residue.first == *member_id || residue.second == *member_id)
+            && let Some(receiver) = function_call
+                .argument_ids
+                .first()
+                .and_then(|receiver| receiver_type_id(program, *receiver))
+            && crate::impl_select::is_resolvable(
+                program.type_id_to_type_map.get(&receiver).unwrap_or(&Type::Unknown),
+            )
+            // The question, asked of the SELECTION ORDER rather than of the
+            // subjects alone: how many maxima declare this member for this
+            // receiver, under THIS FILE's admitted set (B318 S4's filter — a
+            // file that took one of the two with a selector has already
+            // chosen, and choosing is the fix). One is a winner; two is the
+            // unranked residue, and the residue is what declaration order was
+            // silently deciding. Asking the order rather than the bounds is
+            // what keeps two blankets separated at their trait ARGUMENTS
+            // (B268/A86 — std's own `flatten` pair) out of this: tier 1 ranks
+            // them, so there is one maximum and nothing to report.
+            && crate::impl_select::declaring_maxima(
+                program,
+                program.admitting_file(*call_id).or(Some(source)),
+                receiver,
+                &residue.member,
+            )
+            .len()
+                > 1
+        {
+            let member = &residue.member;
+            let other = if residue.first == *member_id {
+                residue.second
+            } else {
+                residue.first
+            };
+            let taken = module_stem(program, implementation.source);
+            let fix = match declaring
+                .get(&other)
+                .map(|index| program.implementations[*index].source)
+            {
+                // Two modules: the file that took both chooses with a selector,
+                // which is the spelling B318 S4 exists to give it.
+                Some(elsewhere) if elsewhere != implementation.source => {
+                    let subject = subject_head_name(program, implementation.subject);
+                    format!(
+                        "select one at the import — `import {taken}::{{ (impl {subject})::{member} }};` \
+                         — or drop an import"
+                    )
+                }
+                // One module: no import separates them, so the declarations are
+                // what has to change (B315's two fixes).
+                _ => {
+                    "narrow one bound so the two are disjoint, or declare it on a trait".to_string()
+                }
+            };
+            violations.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **program.span_map.get(call_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "this receiver satisfies the bounds of TWO blanket `impl` blocks that both \
+                         declare '{member}', and an inherent member is taken from the first \
+                         declared without ranking — swapping the two blocks would change which \
+                         body runs: {fix}"
+                    ),
+                },
+                source,
+            ));
             continue;
-        };
-        if admitted.contains(member_id) {
+        }
+        if !restricting.contains(&source) && hidden.is_empty() {
+            continue;
+        }
+        if implementation.source == source {
             continue;
         }
         let member = implementation
@@ -58461,12 +59600,41 @@ pub fn check_impl_selector_admission(program: &mut Program) {
             .find(|(_, id)| *id == member_id)
             .map(|(name, _)| *name)
             .unwrap_or("the member");
-        let module = program
-            .canonical_sources
-            .get(implementation.source.0 as usize)
-            .and_then(|path: &std::path::PathBuf| path.file_stem())
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("that module");
+        let module = module_stem(program, implementation.source);
+        // The EXPORT gate first (B318 S4, RULED 2026-09-13): a block its module
+        // does not export is INVISIBLE, and no selector the file can write
+        // reaches it except the marked one. Said before the selector arm
+        // because "widen your selector" is bad advice about a block no selector
+        // widens onto.
+        if hidden.contains(&implementation.impl_id)
+            && !reached.contains(&(source, implementation.impl_id))
+        {
+            let subject = subject_head_name(program, implementation.subject);
+            violations.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **program.span_map.get(call_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "'{member}' is provided by an `impl` in module `{module}` that \
+                         `{module}` does not export, so it contributes no methods here. Reach \
+                         it — `import {module}::{{ #(impl {subject}) }};` — or write `export` \
+                         on the block"
+                    ),
+                },
+                source,
+            ));
+            continue;
+        }
+        if !restricting.contains(&source) {
+            continue;
+        }
+        let Some(admitted) = restricted.get(&(source, implementation.source)) else {
+            continue;
+        };
+        if admitted.contains(member_id) {
+            continue;
+        }
         let claim = match selector_of.get(&(source, implementation.source)) {
             Some(text) => format!("this file's selector `(impl {text})` does not admit it"),
             None => "this file imports that module `only`, which admits none".to_string(),
@@ -58506,31 +59674,14 @@ pub fn check_impl_selector_admission(program: &mut Program) {
 /// import brings: `names.md` §4.1's "a child pulls its parent" loads every file
 /// on the way, and probe P7's whole point is that an intermediate module's
 /// `impl` arrives with it. `only` declines the lot.
-fn statement_sources(program: &Program, restriction: &ImportImplRestriction) -> Vec<SourceId> {
+fn statement_sources(
+    program: &Program,
+    references: &HashMap<(SourceId, Span), Id>,
+    restriction: &ImportImplRestriction,
+) -> Vec<SourceId> {
     let mut sources: Vec<SourceId> = Vec::new();
-    for selector in &restriction.selectors {
-        let Some(source) = module_source_by_name(program, restriction.source, &selector.path)
-        else {
-            continue;
-        };
-        if source != restriction.source && !sources.contains(&source) {
-            sources.push(source);
-        }
-        for ancestor in ancestor_module_sources(program, source, selector.path.len()) {
-            if ancestor != restriction.source && !sources.contains(&ancestor) {
-                sources.push(ancestor);
-            }
-        }
-    }
     for span in &restriction.path_spans {
-        let Some(Some(definition)) =
-            program
-                .type_references
-                .iter()
-                .find_map(|(source, at, id, _)| {
-                    (*source == restriction.source && at == span).then_some(*id)
-                })
-        else {
+        let Some(definition) = references.get(&(restriction.source, *span)).copied() else {
             continue;
         };
         let Some(home) = program.source_of(definition) else {
@@ -58546,63 +59697,6 @@ fn statement_sources(program: &Program, restriction: &ImportImplRestriction) -> 
         }
     }
     sources
-}
-
-/// The file a module path names, found by NAME rather than through a recorded
-/// reference — see [`ImportImplSelector::path`] for why a selector needs this.
-///
-/// A module's file is `<segments>.vl` or `<segments>/lib.vl` under whichever
-/// package root it came from, so a loaded source's path ENDS the way the
-/// segments spell it. Ambiguity is resolved toward the importer: two packages
-/// with the same directory shape both match the suffix, and the one sharing the
-/// longer prefix with the importing file is the one the import reached.
-fn module_source_by_name(
-    program: &Program,
-    importer: SourceId,
-    segments: &[String],
-) -> Option<SourceId> {
-    if segments.is_empty() {
-        return None;
-    }
-    let home = program
-        .canonical_sources
-        .get(importer.0 as usize)
-        .cloned()
-        .unwrap_or_default();
-    // The longest prefix that names a loaded file: `a::b::item` is the module
-    // `a::b` reaching a name, and `a::b::c` may be a module in its own right.
-    for length in (1..=segments.len()).rev() {
-        // Matched by PATH COMPONENTS, not by string suffix: a canonical path on
-        // Windows is `\\`-separated, and `Path::ends_with` compares components
-        // (both separators read as one there), so the same candidate matches
-        // on every host — the string form never matched a `\\` path.
-        let mut tail = std::path::PathBuf::new();
-        for segment in &segments[..length] {
-            tail.push(segment);
-        }
-        let candidates = [tail.with_extension("vl"), tail.join("lib.vl")];
-        let mut best: Option<(usize, SourceId)> = None;
-        for (index, loaded) in program.canonical_sources.iter().enumerate() {
-            if !candidates
-                .iter()
-                .any(|candidate| loaded.ends_with(candidate))
-            {
-                continue;
-            }
-            let shared = loaded
-                .components()
-                .zip(home.components())
-                .take_while(|(left, right)| left == right)
-                .count();
-            if best.is_none_or(|(previous, _)| shared > previous) {
-                best = Some((shared, SourceId(index as u32)));
-            }
-        }
-        if let Some((_, source)) = best {
-            return Some(source);
-        }
-    }
-    None
 }
 
 /// The files of the modules ABOVE `source` on its own path — `x.vl` for
