@@ -16,6 +16,8 @@
 // `undefined` binds as the BARE type, and the absence is yours to guard.
 // Each such binding carries a `///` note saying so.
 
+export *;
+
 /// `Event` — a host object, bound opaquely: its fields are reached through
 /// `[extern(get/set, …)]` accessors, never as vilan struct fields (a vilan
 /// `struct` is a positional array at runtime and would read the wrong slots).

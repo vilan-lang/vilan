@@ -12,6 +12,8 @@
 import std::db::{ Database, Row, Statement };
 import pkg::notes::{ AuthOutcome, Note };
 
+export *;
+
 // --- node:crypto bindings for password hashing (sync, fits the dispatch
 // path). A candidate for std promotion once proven.
 

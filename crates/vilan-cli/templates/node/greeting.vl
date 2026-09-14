@@ -1,6 +1,8 @@
 // A module is just a file beside the entry — there is no module declaration.
 // `main.vl` reaches this one as `pkg::greeting`.
 
+export *;
+
 fun greeting(name: str): str {
 	"hello, " + name
 }

@@ -18,6 +18,8 @@ import pkg::notes::{ AuthOutcome, Note };
 import pkg::routes::{ Route, href };
 import pkg::store::NotesClient;
 
+export *;
+
 // --- styles (compiled at build time; see the styling guide) ---
 
 let shell = const style::style()

@@ -6,6 +6,8 @@
 
 import std::router::{ Routable, segments };
 
+export *;
+
 [derive(PartialEq)]
 enum Route {
 	Home,

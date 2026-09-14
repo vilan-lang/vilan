@@ -15,6 +15,8 @@
 // module-qualified path legal in TYPE position too, so `counter_card`'s return
 // is written `style::Style` and this file imports nothing at all.
 
+export *;
+
 // Typed atomic styles (proposal/ui-styling.md): built inside `const`, so the
 // rules land in app.css at build time; `.styled(..)` just sets the classes.
 fun counter_card(): style::Style {

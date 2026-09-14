@@ -23,6 +23,8 @@ import std::rpc::{ RpcError, SocketTransport };
 import pkg::store::TodoClient;
 import pkg::todo::Todo;
 
+export *;
+
 // The styles (proposal/ui-styling.md): typed values built inside `const`, so
 // every rule below lands in `dist/client.css` at BUILD time — app.html's old
 // handwritten <style> block is gone. Atomic classes dedup across components;

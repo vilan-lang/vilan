@@ -5,6 +5,8 @@
 // coloring lets the browser entry import its generated client from there
 // without reaching the server-only bodies).
 
+export *;
+
 [derive(Wire, PartialEq)]
 struct Todo {
 	id: i32,

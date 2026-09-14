@@ -1,5 +1,3 @@
-export *;
-
 // Payload sizes: the same values as bare frames and inside the RPC envelopes,
 // in both codecs. The §4.1 single-pass envelope writes args/results directly
 // into the envelope's serializer, so the envelope overhead is framing only —
@@ -14,6 +12,8 @@ import std::option::Option::{ self, None, Some };
 import std::rpc::{ encode_reply, encode_request, reply };
 import std::wire::{ Codec, Frame, Serializer, Wire, encode };
 import pkg::report::section;
+
+export *;
 
 [derive(Wire)]
 struct BenchTodo {
