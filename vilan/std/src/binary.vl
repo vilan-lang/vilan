@@ -16,12 +16,12 @@ import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializ
 
 /// A growable byte sink: amortized-doubling buffer, `finish` slices to the
 /// written length.
-struct BinaryWriter {
+export struct BinaryWriter {
 	buffer: Shared<Bytes>,
 	used: Shared<i32>,
 }
 
-impl BinaryWriter {
+export impl BinaryWriter {
 	fun new(): BinaryWriter {
 		BinaryWriter { buffer = Shared::new(Bytes::alloc(64)), used = Shared::new(0) }
 	}
@@ -115,7 +115,7 @@ impl BinaryWriter {
 
 // The visitor's write half, natively. Structure calls the schema already
 // carries (struct shape, list/variant ends) write nothing.
-impl BinaryWriter with Serialize {
+export impl BinaryWriter with Serialize {
 	fun begin_struct(self, fields: i32) {}
 
 	fun field(self, name: str) {}
@@ -382,7 +382,7 @@ impl BinaryReader with Deserialize {
 }
 
 /// Encode a `Wire` value as compact bytes — the direct path (no record).
-fun encode_binary<T: Wire>(value: T): Bytes {
+export fun encode_binary<T: Wire>(value: T): Bytes {
 	let writer = BinaryWriter::new();
 	value.describe(writer);
 	writer.finish()
@@ -390,7 +390,7 @@ fun encode_binary<T: Wire>(value: T): Bytes {
 
 /// Decode compact bytes as a `Wire` value; `Err(reason)` names the first
 /// structural failure (truncation, an over-declared length, unknown variant).
-fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
+export fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
 	let reader = BinaryReader::new(bytes);
 	let value: T = T::rebuild(reader);
 	match reader.error.read() {
@@ -401,7 +401,7 @@ fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
 
 /// The binary codec (§6.2): byte frames over the writer/reader pair. A text
 /// frame poisons the reader — a sticky decode error, never a crash.
-fun binary_codec(): Codec {
+export fun binary_codec(): Codec {
 	Codec {
 		writer = || {
 			let writer = BinaryWriter::new();

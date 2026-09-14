@@ -1,5 +1,7 @@
 import pkg::option::Option::{ self, None, Some };
 
+export *;
+
 /// The lazy-sequence protocol. `next` advances the iterator's own state, so it
 /// takes `&mut self`: a stateful iterator — a cursor, a counter, an adapter
 /// holding an upstream — is exactly what this trait is for, and a by-value

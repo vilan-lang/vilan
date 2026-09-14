@@ -46,7 +46,7 @@ import pkg::style::Style;
 /// One attribute in an element's ordered attribute list. Ordering is INSERTION
 /// ORDER — the component wrote them in code order — so serialization is
 /// deterministic by construction (the differential relies on it).
-struct Attribute {
+export struct Attribute {
 	name: str,
 	value: str,
 }
@@ -54,7 +54,7 @@ struct Attribute {
 /// One child in an element's ordered child list — an element or a TEXT NODE.
 /// Text children make mixed content real: prose interleaves with inline
 /// elements as siblings, never through wrapper spans.
-enum Child {
+export enum Child {
 	Element(View),
 	Text(str),
 }
@@ -63,7 +63,7 @@ enum Child {
 /// no owner — nothing survives the request — and its mutable parts are `Shared`,
 /// so a `View` is a REFERENCE (like the browser's `Element`): chaining and
 /// passing it share the one node rather than snapshotting it.
-struct View {
+export struct View {
 	tag: str,
 	attributes: Shared<List<Attribute>>,
 	children: Shared<List<Child>>,
@@ -78,7 +78,7 @@ struct View {
 /// replaces the seed (`set_attribute` is set-or-replace by name). KEEP the
 /// SVG tag story IN STEP with the browser twin's `is_svg_tag` allowlist
 /// (browser/ui.vl) — the layer system shares no file between them.
-fun view(tag: str): View {
+export fun view(tag: str): View {
 	let attributes: Shared<List<Attribute>> = Shared::new([]);
 	if tag == "svg" {
 		set_attribute(attributes, "xmlns", "http://www.w3.org/2000/svg");
@@ -90,7 +90,7 @@ fun view(tag: str): View {
 /// `setAttribute`/`className`: a repeated name updates its value and keeps its
 /// position; a new name appends. This is what makes attribute order insertion
 /// order.
-fun set_attribute(attributes: Shared<List<Attribute>>, name: str, value: str) {
+export fun set_attribute(attributes: Shared<List<Attribute>>, name: str, value: str) {
 	mut updated: List<Attribute> = [];
 	mut found = false;
 	for attribute in attributes.read() {
@@ -121,7 +121,7 @@ fun add_style_declaration(attributes: Shared<List<Attribute>>, declaration: str)
 	set_attribute(attributes, "style", next);
 }
 
-impl View {
+export impl View {
 	/// Static text content. Like the DOM's `textContent`, this REPLACES any
 	/// children the node had.
 	fun text(self, content: str): View {
@@ -376,7 +376,7 @@ impl View {
 /// where the server side grows a reason to call it: its value forms `place`
 /// into a region on both twins.
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
-struct Region {
+export struct Region {
 	parent: View,
 }
 
@@ -386,9 +386,9 @@ struct Region {
 /// render is one pass in source order and nothing ever moves, so a row here is
 /// its own position and the struct carries no state at all.
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
-struct Row {}
+export struct Row {}
 
-impl Region {
+export impl Region {
 	/// Opens a region at `parent`'s current end.
 	fun open(parent: View): Region {
 		Region { parent }
@@ -446,19 +446,19 @@ impl Region {
 /// `Slot` and not `Child` for the reason this file makes plainest: `Child` is
 /// the ENUM `render` walks, three declarations above.
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
-trait Slot {
+export trait Slot {
 	fun place(self, parent: View);
 }
 
 /// A child element.
-impl View with Slot {
+export impl View with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Element(self));
 	}
 }
 
 /// A static text node.
-impl str with Slot {
+export impl str with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Text(self));
 	}
@@ -466,7 +466,7 @@ impl str with Slot {
 
 /// A text node, read once — the value at render time is the value served.
 /// A BLANKET over the read trait (B158/B165), like the browser twin.
-impl type S: Source<str> with Slot {
+export impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Text(self.get()));
 	}
@@ -474,7 +474,7 @@ impl type S: Source<str> with Slot {
 
 /// Several child elements, in order — the static run A46's fragment would
 /// lower to.
-impl List<View> with Slot {
+export impl List<View> with Slot {
 	fun place(self, parent: View) {
 		for item in self {
 			parent.children.write().push(Child::Element(item));
@@ -487,7 +487,7 @@ impl List<View> with Slot {
 /// change — through a `Region`, so the replacement keeps the hole's position
 /// (A71) — and here there is no later change to follow, so the value is
 /// written at its position directly and no anchor is served.
-impl type S: Source<View> with Slot {
+export impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Element(self.get()));
 	}
@@ -497,7 +497,7 @@ impl type S: Source<View> with Slot {
 /// server end, with the single-view arm's story above: the browser twin keeps
 /// the run in place through a `Region`, and a one-pass render needs no anchor
 /// to do the same. KEEP IN STEP with the browser twin.
-impl type S: Source<List<View>> with Slot {
+export impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
 		let items: List<View> = self.get();
 		for item in items {
@@ -521,7 +521,7 @@ impl type S: Source<List<View>> with Slot {
 // KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 
 /// Conditional content as a child — `View::when`'s value form.
-struct Conditional<S: Source<bool>, C: Slot> {
+export struct Conditional<S: Source<bool>, C: Slot> {
 	condition: S,
 	body: (|| C) context owner_scope,
 }
@@ -529,26 +529,26 @@ struct Conditional<S: Source<bool>, C: Slot> {
 /// A dynamic subtree as a child — `View::swap`'s value form. No `gated`/`armed`
 /// half: route chunks are a browser thing (nothing is ever in flight here), so
 /// the server twin holds only what it renders.
-struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
+export struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A keyed reactive run as a child — `View::bind_each`'s value form.
-struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -556,7 +556,7 @@ struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
 
 /// Conditional content at THIS position, read once: the body renders when
 /// `condition` is currently true and nothing when it is false.
-fun when<S: Source<bool>, C: Slot>(
+export fun when<S: Source<bool>, C: Slot>(
 	condition: S,
 	body: (sync || C) context owner_scope,
 ): Conditional<S, C> {
@@ -565,7 +565,7 @@ fun when<S: Source<bool>, C: Slot>(
 
 /// The dynamic subtree at THIS position, read once: the branch for `source`'s
 /// CURRENT value.
-fun swap<T: PartialEq, S: Source<T>, C: Slot>(
+export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
@@ -573,7 +573,7 @@ fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 }
 
 /// A keyed reactive run at THIS position, rendered from the current items.
-fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
@@ -582,7 +582,7 @@ fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
@@ -590,7 +590,7 @@ fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
@@ -598,7 +598,7 @@ fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	EachBy { source, key, render }
 }
 
-impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
+export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		if self.condition.get() {
 			let region = Region::open(parent);
@@ -608,25 +608,25 @@ impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 	}
 }
 
-impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
+export impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_swap(parent, self.source, self.render);
 	}
 }
 
-impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
-impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
@@ -693,19 +693,19 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 /// what `<div name(value)>` desugars through (`.attr`, never `.bind_attr`).
 /// The tracked arm is a BLANKET over `Source<str>` (B158/B165).
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
-trait AttrValue {
+export trait AttrValue {
 	fun apply(self, parent: View, name: str);
 }
 
 /// Set once.
-impl str with AttrValue {
+export impl str with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		set_attribute(parent.attributes, name, self);
 	}
 }
 
 /// Read once — exactly `bind_attr`, for every `Source<str>`.
-impl type S: Source<str> with AttrValue {
+export impl type S: Source<str> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		set_attribute(parent.attributes, name, self.get());
 	}
@@ -735,19 +735,19 @@ fun is_void_element(tag: str): bool {
 
 /// Escape a text node: `&`, `<`, `>` become entities (`&` FIRST so entities
 /// aren't double-escaped). Renders `<script>` inert.
-fun escape_text(value: str): str {
+export fun escape_text(value: str): str {
 	value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 }
 
 /// Escape a double-quoted attribute value: `&` and `"` become entities.
-fun escape_attribute(value: str): str {
+export fun escape_attribute(value: str): str {
 	value.replace("&", "&amp;").replace("\"", "&quot;")
 }
 
 /// Serialize a `View` to HTML — the SSR entry point. No pretty-printing:
 /// byte-stable output, attributes in insertion order, proper escaping, void
 /// elements without a closing tag.
-fun render(view: View): str {
+export fun render(view: View): str {
 	mut out = "<" + view.tag;
 	for attribute in view.attributes.read() {
 		out = out + " " + attribute.name + "=\"" + escape_attribute(attribute.value) + "\"";
@@ -780,10 +780,10 @@ fun render(view: View): str {
 let chunk_pending_signal: SignalCell<bool> = SignalCell::new(false);
 let chunk_error_signal: SignalCell<Option<str>> = SignalCell::new(None);
 
-fun chunk_pending(): SignalCell<bool> {
+export fun chunk_pending(): SignalCell<bool> {
 	chunk_pending_signal
 }
 
-fun chunk_failure(): SignalCell<Option<str>> {
+export fun chunk_failure(): SignalCell<Option<str>> {
 	chunk_error_signal
 }

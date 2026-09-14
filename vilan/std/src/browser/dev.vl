@@ -14,7 +14,7 @@ import pkg::option::Option::{ self, None, Some };
 
 /// True only while a dev shim is present — i.e. inside a `run --watch` browser
 /// round. Guards every other hook so they are inert without a shim.
-[extern("__hmr_active")]
+export [extern("__hmr_active")]
 external fun hmr_active(): bool;
 
 /// Join the current swap's teardown list (a shim global). Runs, and is cleared,
@@ -36,7 +36,7 @@ external fun hmr_take<T>(key: str): Option<T>;
 /// Register a cleanup to run before the next hot swap re-evaluates the bundle
 /// (`hmr.md` §4) — the sanctioned patch for state the swap can't see on its own
 /// (a raw interval, a bare task). A no-op with no dev shim.
-fun on_teardown(cleanup: || void) {
+export fun on_teardown(cleanup: || void) {
 	if hmr_active() {
 		hmr_register_teardown(cleanup);
 	}
@@ -46,7 +46,7 @@ fun on_teardown(cleanup: || void) {
 /// `hot.data`). `T` must be transferable-as-value (plain data): the call site is
 /// checked, so a closure, view, resource, or reactive cell is a compile error,
 /// not a value silently smuggled across code. A no-op with no dev shim.
-fun stash<T>(key: str, value: T) {
+export fun stash<T>(key: str, value: T) {
 	if hmr_active() {
 		hmr_stash(key, value);
 	}
@@ -55,7 +55,7 @@ fun stash<T>(key: str, value: T) {
 /// Recover a value stashed before the last hot swap, or `None` on first boot, a
 /// fingerprint miss, or a plain reload (`hmr.md` §4). Same transfer bound on `T`
 /// as `stash`. A no-op (`None`) with no dev shim.
-fun take<T>(key: str): Option<T> {
+export fun take<T>(key: str): Option<T> {
 	if hmr_active() {
 		hmr_take(key)
 	} else {

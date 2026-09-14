@@ -1,3 +1,5 @@
+export *;
+
 trait Default {
 	fun default(): Self;
 }

@@ -15,6 +15,8 @@
 
 import pkg::option::Option;
 
+export *;
+
 external struct Context<T>;
 
 impl Context<type T> {

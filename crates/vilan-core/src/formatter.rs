@@ -3209,7 +3209,20 @@ impl<'src> Printer<'src> {
     /// control-flow forms (`if`/`for`/`match`/block), declarations (including a
     /// `macro fun`, a `macro { .. }` block, and a `[name] item` macro attribute),
     /// and `use`/`import` (which already emit their own `;`) do not.
+    ///
+    /// `export` ASKS THE ITEM UNDER IT (B318 S6). The marker is a statement
+    /// WRAPPER, not a statement kind: `export fun f()` takes no `;` because a
+    /// function does not, and `export let x = 1;` takes one for the same reason
+    /// a bare `let` does. Excluding every `Export` printed `export let x = 1`
+    /// without its terminator, which does not re-parse — so the printer's
+    /// verification bailed and the whole FILE came back unformatted, silently
+    /// (a bail is not a diagnostic, and `vilan fmt --check` reads a bailed file
+    /// as already-formatted). S6's curation is what made it reachable: five of
+    /// std's module-level `let`s carry the marker.
     fn needs_semicolon(node: &Node<'src>) -> bool {
+        if let Node::Export(_, inner) = node {
+            return Self::needs_semicolon(&inner.0);
+        }
         !matches!(
             node,
             Node::If(_)
@@ -3225,7 +3238,6 @@ impl<'src> Printer<'src> {
                 | Node::Module(_, _)
                 | Node::Derive(_, _)
                 | Node::Service(_, _)
-                | Node::Export(..)
                 | Node::Use(_)
                 | Node::Import(..)
                 | Node::MacroFun(_)

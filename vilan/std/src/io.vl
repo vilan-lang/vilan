@@ -2,6 +2,8 @@
 // `panic`/`assert`, available on every target. Process-level and stdin I/O
 // (`scan`, `args`, `env`, `exit`) live in the Node platform layer `std::process`.
 
+export *;
+
 [extern("console.log")]
 external fun print(message: any): void;
 

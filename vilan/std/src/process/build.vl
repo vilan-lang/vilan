@@ -26,7 +26,7 @@ import pkg::result::Result::{ self, Err, Ok };
 import pkg::watch::is_watching;
 
 /// What one browser leg's build emitted, as the build itself knows it.
-struct LegBuild {
+export struct LegBuild {
 	/// The leg's name — `client` for `[entry.client]`.
 	leg: str,
 	/// The directory holding this build's artifacts, which is what their file
@@ -57,7 +57,7 @@ struct LegBuild {
 	assets: List<str>,
 }
 
-impl LegBuild {
+export impl LegBuild {
 	/// Every artifact this build emitted, as `(url, file)` pairs in serving
 	/// order: the bundle, the style sidecar if there is one, the chunks, then
 	/// the bundled resources. The url is `/<name>` — what every shell in this
@@ -92,7 +92,7 @@ impl LegBuild {
 /// Why a leg's build could not be described. Named, not a panic: a server that
 /// asks about a leg it never built has made a recoverable mistake, and the
 /// message says which one.
-enum BuildError {
+export enum BuildError {
 	/// No build manifest where one was expected — the payload is the path.
 	/// The leg was never built, or the process is running from a directory
 	/// that is not the project root.
@@ -102,7 +102,7 @@ enum BuildError {
 	Unreadable(str),
 }
 
-impl BuildError {
+export impl BuildError {
 	/// One sentence: what was looked for, and what would produce it.
 	fun message(self): str {
 		match self {
@@ -118,7 +118,7 @@ impl BuildError {
 /// build: since the manifest is written on EVERY build of a browser leg, its
 /// absence means one thing and `"chunks": []` means another, which is exactly
 /// the difference §5.9 argued the always-written manifest buys.
-fun build_of(leg: str): Result<LegBuild, BuildError> {
+export fun build_of(leg: str): Result<LegBuild, BuildError> {
 	// `dist/` is where every multi-entry build puts a leg, and a server runs
 	// from the project root — the two facts the hand-written `"dist/client.js"`
 	// already assumed, now assumed in exactly one place.
@@ -140,7 +140,7 @@ fun build_of(leg: str): Result<LegBuild, BuildError> {
 /// to start beats 404ing every asset for the life of the process
 /// (`fullstack-dx.md` §5.4, §10.7). `!` cannot express this at a boot site —
 /// it asserts-or-RETURNS, and `main` returns no `Result` to carry the residual.
-fun require_build(leg: str): LegBuild {
+export fun require_build(leg: str): LegBuild {
 	match build_of(leg) {
 		Ok(let build) => build,
 		Err(let error) => panic(error.message()),
@@ -188,7 +188,7 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 
 /// One artifact of a build, ready to answer a request: where it is asked for,
 /// where it lives, what it is, and the bytes read when the server booted.
-struct BuildAsset {
+export struct BuildAsset {
 	/// The url this artifact answers on — `/client.js`.
 	url: str,
 	/// Where it lives on disk — `dist/client.js`.
@@ -216,7 +216,7 @@ struct BuildAsset {
 /// server, naming the file and the leg (`fullstack-dx.md` §5.4). 404ing it per
 /// request would be the same silence this design exists to remove: the build
 /// said it wrote the file, so its absence is not a routing question.
-fun load_build(build: LegBuild): List<BuildAsset> {
+export fun load_build(build: LegBuild): List<BuildAsset> {
 	mut assets: List<BuildAsset> = [];
 	for artifact in build.artifacts() {
 		let (url, file) = artifact;
@@ -242,7 +242,7 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 /// The artifact `path` asks for, if this build has one. A query string is
 /// ignored, so `/client.js?v=2` reaches the bundle — a cache-buster is not a
 /// different file.
-fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
+export fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 	let route = path.split("?")[0];
 	for asset in assets {
 		if asset.url == route {
@@ -277,7 +277,7 @@ fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 /// watch that re-read as text would have served a fresh CORRUPTION of every
 /// binary artifact, and differed from the boot copy in exactly the bytes a
 /// `.png` is made of.
-fun asset_body(asset: BuildAsset): Bytes {
+export fun asset_body(asset: BuildAsset): Bytes {
 	if is_watching() {
 		fs::read_bytes(asset.file)
 	} else {
@@ -321,7 +321,7 @@ fun asset_body(asset: BuildAsset): Bytes {
 /// utf8 BY SPEC, and naming a charset on those is the error, not the fix.
 /// `.webmanifest` earns a row of its own for a third reason: Chrome rejects a
 /// manifest served as anything but `application/manifest+json`.
-fun content_type_of(file: str): Option<str> {
+export fun content_type_of(file: str): Option<str> {
 	// The extension comes from `path::extname` (kolt.local 017), not from
 	// `file.split(".").last()`. The hand-rolled form was a copy of `extname`
 	// with `extname`'s two classic bugs in it: `.gitignore` typed as an

@@ -52,12 +52,12 @@ import pkg::range::Range;
 
 /// A CSS length: a token's IDENTITY (`var(--space-4)`) or a literal unit.
 /// `root` carries the token's `:root` declaration ("" when none).
-struct Length {
+export struct Length {
 	text: str,
 	root: str,
 }
 
-impl Length {
+export impl Length {
 	fun px(value: f64): Length {
 		Length { text = i"{value}px", root = "" }
 	}
@@ -137,7 +137,7 @@ impl Length {
 
 /// The spacing scale (Tailwind's, rem-based). The scale is data; the
 /// validation is const evaluation — an unknown step fails the build.
-fun space(step: i32): Length {
+export fun space(step: i32): Length {
 	let value = match step {
 		0 => "0px",
 		1 => "0.25rem",
@@ -158,16 +158,16 @@ fun space(step: i32): Length {
 }
 
 /// A CSS color: a ramp token's identity (`var(--gray-50)`) or a literal.
-struct Color {
+export struct Color {
 	text: str,
 	root: str,
 }
 
-fun ramp(name: str, step: i32, value: str): Color {
+export fun ramp(name: str, step: i32, value: str): Color {
 	Color { text = i"var(--{name}-{step})", root = i":root\{--{name}-{step}:{value}\}" }
 }
 
-impl Color {
+export impl Color {
 	fun white(): Color {
 		Color { text = "#ffffff", root = "" }
 	}
@@ -406,7 +406,7 @@ fun check_not_blank(what: str, value: str) {
 /// How far a radial gradient's ending shape reaches — the CSS extent
 /// keywords. Position (`at 20% 40%`) is deliberately not modelled: the sites
 /// that want it want it computed from custom properties, which is `raw`'s job.
-enum RadialExtent {
+export enum RadialExtent {
 	ClosestSide = "closest-side",
 	ClosestCorner = "closest-corner",
 	FarthestSide = "farthest-side",
@@ -417,7 +417,7 @@ enum RadialExtent {
 /// image over a color, and `background` takes one color). Open one with
 /// `Gradient::linear`/`Gradient::radial`, add stops, and hand it to
 /// `background_gradient`.
-struct Gradient {
+export struct Gradient {
 	// The CSS function and its geometry argument, kept apart so `render`
 	// composes them once: `linear-gradient` + `90deg`, `radial-gradient` +
 	// `closest-side`.
@@ -433,7 +433,7 @@ struct Gradient {
 	roots: List<str>,
 }
 
-impl Gradient {
+export impl Gradient {
 	/// `degrees` is the CSS angle: 0 points up, 90 to the right, 180 down.
 	fun linear(degrees: f64): Gradient {
 		Gradient {
@@ -494,7 +494,7 @@ impl Gradient {
 /// generic's trait dispatch. An `emit` inside an impl here would escape the
 /// check and reach the emitted JS as a live `__emit_asset` with no runtime
 /// binding.
-trait CssValue {
+export trait CssValue {
 	/// The declaration's value text, exactly as it renders into CSS.
 	fun css_text(self): str;
 
@@ -504,7 +504,7 @@ trait CssValue {
 }
 
 /// A complete CSS value, written verbatim. Declares no token.
-impl str with CssValue {
+export impl str with CssValue {
 	fun css_text(self): str {
 		self
 	}
@@ -515,7 +515,7 @@ impl str with CssValue {
 }
 
 /// A length — a token's identity plus the `:root` line that defines it.
-impl Length with CssValue {
+export impl Length with CssValue {
 	fun css_text(self): str {
 		self.text
 	}
@@ -526,7 +526,7 @@ impl Length with CssValue {
 }
 
 /// A color — `Length`'s twin, same token discipline.
-impl Color with CssValue {
+export impl Color with CssValue {
 	fun css_text(self): str {
 		self.text
 	}
@@ -554,7 +554,7 @@ impl Color with CssValue {
 /// declaring it, which is exactly the hazard the single-hole path was built
 /// to close. A piece describes both halves, and [`piece`] puts the line on
 /// the sheet.
-trait CssPiece {
+export trait CssPiece {
 	/// The piece's text, exactly as it renders into the value.
 	fun piece_text(self): str;
 
@@ -562,7 +562,7 @@ trait CssPiece {
 	fun piece_root(self): str;
 }
 
-impl str with CssPiece {
+export impl str with CssPiece {
 	fun piece_text(self): str {
 		self
 	}
@@ -572,7 +572,7 @@ impl str with CssPiece {
 	}
 }
 
-impl i32 with CssPiece {
+export impl i32 with CssPiece {
 	fun piece_text(self): str {
 		i"{self}"
 	}
@@ -582,7 +582,7 @@ impl i32 with CssPiece {
 	}
 }
 
-impl f64 with CssPiece {
+export impl f64 with CssPiece {
 	fun piece_text(self): str {
 		i"{self}"
 	}
@@ -592,7 +592,7 @@ impl f64 with CssPiece {
 	}
 }
 
-impl u32 with CssPiece {
+export impl u32 with CssPiece {
 	fun piece_text(self): str {
 		i"{self}"
 	}
@@ -602,7 +602,7 @@ impl u32 with CssPiece {
 	}
 }
 
-impl BigInt with CssPiece {
+export impl BigInt with CssPiece {
 	fun piece_text(self): str {
 		i"{self}"
 	}
@@ -612,7 +612,7 @@ impl BigInt with CssPiece {
 	}
 }
 
-impl bool with CssPiece {
+export impl bool with CssPiece {
 	fun piece_text(self): str {
 		i"{self}"
 	}
@@ -622,7 +622,7 @@ impl bool with CssPiece {
 	}
 }
 
-impl Length with CssPiece {
+export impl Length with CssPiece {
 	fun piece_text(self): str {
 		self.text
 	}
@@ -632,7 +632,7 @@ impl Length with CssPiece {
 	}
 }
 
-impl Color with CssPiece {
+export impl Color with CssPiece {
 	fun piece_text(self): str {
 		self.text
 	}
@@ -650,7 +650,7 @@ impl Color with CssPiece {
 /// AND `:root{--gray-500:#6b7280}` — the token discipline the single-hole
 /// path has always had, reaching the position that had no correct spelling at
 /// all. Compile-time only, like every other emitter here.
-fun piece<V: CssPiece>(value: V): str {
+export fun piece<V: CssPiece>(value: V): str {
 	let root = value.piece_root();
 	if root != "" {
 		emit("css", root);
@@ -660,7 +660,7 @@ fun piece<V: CssPiece>(value: V): str {
 
 // --- keyword properties ---------------------------------------------------------
 
-enum Display {
+export enum Display {
 	Flex = "flex",
 	Grid = "grid",
 	Block = "block",
@@ -672,7 +672,7 @@ enum Display {
 	Hidden = "none",
 }
 
-enum Position {
+export enum Position {
 	Static = "static",
 	Relative = "relative",
 	Absolute = "absolute",
@@ -680,14 +680,14 @@ enum Position {
 	Sticky = "sticky",
 }
 
-enum FlexDirection {
+export enum FlexDirection {
 	Row = "row",
 	Column = "column",
 	RowReverse = "row-reverse",
 	ColumnReverse = "column-reverse",
 }
 
-enum AlignItems {
+export enum AlignItems {
 	Start = "flex-start",
 	Center = "center",
 	End = "flex-end",
@@ -695,7 +695,7 @@ enum AlignItems {
 	Baseline = "baseline",
 }
 
-enum JustifyContent {
+export enum JustifyContent {
 	Start = "flex-start",
 	Center = "center",
 	End = "flex-end",
@@ -704,27 +704,27 @@ enum JustifyContent {
 	Evenly = "space-evenly",
 }
 
-enum TextAlign {
+export enum TextAlign {
 	Left = "left",
 	Center = "center",
 	Right = "right",
 }
 
-enum Cursor {
+export enum Cursor {
 	Pointer = "pointer",
 	Default = "default",
 	Text = "text",
 	NotAllowed = "not-allowed",
 }
 
-enum Overflow {
+export enum Overflow {
 	Visible = "visible",
 	Hidden = "hidden",
 	Auto = "auto",
 	Scroll = "scroll",
 }
 
-enum WhiteSpace {
+export enum WhiteSpace {
 	Normal = "normal",
 	Nowrap = "nowrap",
 	Pre = "pre",
@@ -732,7 +732,7 @@ enum WhiteSpace {
 	PreLine = "pre-line",
 }
 
-enum UserSelect {
+export enum UserSelect {
 	Auto = "auto",
 	Text = "text",
 	All = "all",
@@ -776,7 +776,7 @@ fun encode36(value: u32): str {
 
 // --- Style ----------------------------------------------------------------------
 
-struct Style {
+export struct Style {
 	// Slot key `media:condition:property` -> (class name, declaration). The
 	// declaration is kept so condition combinators can re-emit it under
 	// their selector.
@@ -786,7 +786,7 @@ struct Style {
 /// Opens a builder chain. Property methods reach the const-only asset
 /// channel, so construction belongs inside a `const` expression; selection
 /// and merging (`+`, `class_list`) are ordinary runtime code.
-fun style(): Style {
+export fun style(): Style {
 	Style { rules = Map::new() }
 }
 
@@ -1042,7 +1042,7 @@ fun token_axis(token: str): i32 {
 /// construction: every value handed out below has been through
 /// [`canonical_condition`], so nothing downstream re-sorts, re-checks or
 /// wonders.
-struct Condition {
+export struct Condition {
 	tokens: List<str>,
 }
 
@@ -1053,7 +1053,7 @@ trait IntoConditions {
 	fun conditions(self): Condition;
 }
 
-impl Condition with IntoConditions {
+export impl Condition with IntoConditions {
 	fun conditions(self): Condition {
 		self
 	}
@@ -1062,7 +1062,7 @@ impl Condition with IntoConditions {
 /// `+` is the INTERSECTION: "both of these at once". One operator, one reading,
 /// and it is what lets a set be named — `let interactive = hover() +
 /// active().not();`.
-impl Condition with Add {
+export impl Condition with Add {
 	fun add(self, b: Condition): Condition {
 		mut tokens = self.tokens;
 		for token in b.tokens {
@@ -1226,31 +1226,31 @@ fun media_condition(min_width: str): Condition {
 
 /// An arbitrary pseudo-class. The name is free-form and reaches all of CSS;
 /// what it may not do is open with the grammar's own marker bytes.
-fun pseudo(name: str): Condition {
+export fun pseudo(name: str): Condition {
 	pseudo_condition(name)
 }
 
-fun hover(): Condition {
+export fun hover(): Condition {
 	condition_of("hover")
 }
 
-fun focus(): Condition {
+export fun focus(): Condition {
 	condition_of("focus")
 }
 
-fun active(): Condition {
+export fun active(): Condition {
 	condition_of("active")
 }
 
-fun disabled(): Condition {
+export fun disabled(): Condition {
 	condition_of("disabled")
 }
 
-fun first(): Condition {
+export fun first(): Condition {
 	condition_of("first-child")
 }
 
-fun last(): Condition {
+export fun last(): Condition {
 	condition_of("last-child")
 }
 
@@ -1259,7 +1259,7 @@ fun last(): Condition {
 /// and not preferences: it must come LAST in a compound selector with nothing
 /// after it, and at most one may appear. Both are canonicaliser rules; neither
 /// is statable if `::selection` is just another pseudo token.
-fun element(name: str): Condition {
+export fun element(name: str): Condition {
 	check_not_blank("a pseudo-element name", name);
 	check_attribute_name(name);
 	condition_of("%" + name)
@@ -1267,53 +1267,53 @@ fun element(name: str): Condition {
 
 /// An attribute on the element itself — PRESENCE (`[name]`). `.eq(value)`
 /// narrows it to the exact form (`[name="value"]`).
-fun attribute(name: str): Condition {
+export fun attribute(name: str): Condition {
 	attribute_condition(name)
 }
 
 /// The ancestor GUARD — the element's own slots, conditioned on an ANCESTOR
 /// matching `condition`. `within(attribute("data-theme").eq("dark"))` is the
 /// theme condition.
-fun within(condition: Condition): Condition {
+export fun within(condition: Condition): Condition {
 	within_condition(condition)
 }
 
 /// Every direct CHILD of the element — `.sX > *`, the parent-owned spacing
 /// idiom. Its rule emits inside `@layer vilan`, so a child's own `Style`
 /// always wins against a rule reaching in from an ancestor.
-fun children(): Condition {
+export fun children(): Condition {
 	condition_of(">*")
 }
 
 /// Every direct child BUT THE FIRST — `> :not(:first-child)`, which carries
 /// its argument's specificity so divide outranks children on a property both
 /// touch, whatever the authoring order.
-fun divide(): Condition {
+export fun divide(): Condition {
 	condition_of(">*+*")
 }
 
 /// A min-width breakpoint. Field 0 of the slot key, and at most one per set.
-fun media(min_width: str): Condition {
+export fun media(min_width: str): Condition {
 	media_condition(min_width)
 }
 
-fun sm(): Condition {
+export fun sm(): Condition {
 	media_condition("640px")
 }
 
-fun md(): Condition {
+export fun md(): Condition {
 	media_condition("768px")
 }
 
-fun lg(): Condition {
+export fun lg(): Condition {
 	media_condition("1024px")
 }
 
-fun xl(): Condition {
+export fun xl(): Condition {
 	media_condition("1280px")
 }
 
-impl Condition {
+export impl Condition {
 	/// NEGATION, on the value it negates (A95's whole argument): `.not()`
 	/// belongs where the negated thing is written, so `hover() +
 	/// active().not()` says `:hover:not(:active)` and nothing has to reason
@@ -1664,7 +1664,7 @@ fun stage_rule(class: str, line: str) {
 	stage("css", class, line);
 }
 
-impl Style {
+export impl Style {
 	/// The one chokepoint: hash the slot, STAGE the atomic rule against its
 	/// class, insert last-wins — across the property's whole FAMILY, so a
 	/// shorthand set here clears the longhands it covers under this condition
@@ -2434,7 +2434,7 @@ impl Style {
 // `b`'s slots replay in b's own insertion order, which is its authoring order,
 // so a right side that itself mixes a shorthand and a longhand lands the same
 // way it resolved on its own.
-impl Style with Add {
+export impl Style with Add {
 	fun add(self, b: Style): Style {
 		mut rules = self.rules;
 		for key in b.rules.keys() {
@@ -2465,7 +2465,7 @@ impl Style with Add {
 /// properties under `[data-theme="…"]`, a `:root` token table, a reset's
 /// `box-sizing`. Reach for `Style` first; reach for this when the thing being
 /// styled is a selector rather than a view.
-struct Declarations {
+export struct Declarations {
 	// `property:value` pairs, `;`-joined; "" while empty.
 	text: str,
 	// The `:root` lines of the theme tokens spent in those declarations,
@@ -2479,11 +2479,11 @@ struct Declarations {
 /// the channel. Nothing reaches the stylesheet until `declare` puts the chain
 /// under a selector — a token's `:root` line included: the chain accumulates
 /// the lines it owes and `declare` puts them there with the block.
-fun declarations(): Declarations {
+export fun declarations(): Declarations {
 	Declarations { text = "", roots = [] }
 }
 
-impl Declarations {
+export impl Declarations {
 	/// Any property, any `CssValue` — `Style::raw`'s counterpart, and the
 	/// spelling for the two things this surface exists for: a custom property
 	/// (`--color-ink`) and a plain CSS property under a selector no class
@@ -2546,7 +2546,7 @@ impl Declarations {
 ///     .color("--color-ground", Color::hex("#161616")))
 /// // @layer vilan{[data-theme="iron-dark"]{--color-ink:#fafafa;--color-ground:#161616}}
 /// ```
-fun declare(selector: str, body: Declarations) {
+export fun declare(selector: str, body: Declarations) {
 	check_selector(selector);
 	if body.text == "" {
 		panic(i"the declaration block for \"{selector}\" declares nothing — add a declaration with .raw(..), .color(..) or .length(..), or drop the block");
@@ -2608,7 +2608,7 @@ fun declare(selector: str, body: Declarations) {
 /// // @layer vilan.preflight{*,::before,::after{box-sizing:border-box}}
 /// // …and one line per rule below, deduped and sorted with everything else
 /// ```
-fun preflight() {
+export fun preflight() {
 	// Structure. The universal box model is the one rule the whole system
 	// leans on: `width(px(200)).padding(space(4))` measures 200 under it and
 	// 232 without.

@@ -1,5 +1,7 @@
 import pkg::string::str;
 
+export *;
+
 /// Convert a value to a string. Implement `Display` for your own types so
 /// `value.to_string()` — and generic `T: Display` code — works for them.
 trait Display {

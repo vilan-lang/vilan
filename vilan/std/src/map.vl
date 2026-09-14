@@ -10,6 +10,8 @@ import pkg::hash::{ Hash, Hashable };
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 
+export *;
+
 struct Map<K: Hashable, V> {
 	table: NativeMap<(K, V)>,
 }

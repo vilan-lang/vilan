@@ -15,7 +15,7 @@ import pkg::wire::Wire;
 let header_segment = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9"; // {"alg":"HS512","typ":"JWT"}
 
 /// Signs `claims` under `secret`, returning the compact token.
-async fun sign_hs512<C: Wire>(secret: Bytes, claims: C): str {
+export async fun sign_hs512<C: Wire>(secret: Bytes, claims: C): str {
 	let payload = encode_url(encode_utf8(encode_json(claims)));
 	let signing_input = header_segment + "." + payload;
 	let signature = hmac_sha512(secret, encode_utf8(signing_input));
@@ -24,7 +24,7 @@ async fun sign_hs512<C: Wire>(secret: Bytes, claims: C): str {
 
 /// Verifies `token` under `secret`: the signature must match (constant-time)
 /// and the payload must decode as `C`. Anything else is `None`.
-async fun verify_hs512<C: Wire>(secret: Bytes, token: str): Option<C> {
+export async fun verify_hs512<C: Wire>(secret: Bytes, token: str): Option<C> {
 	let parts = token.split(".");
 	if parts.len() != 3 || parts[0] != header_segment {
 		None
@@ -44,7 +44,7 @@ async fun verify_hs512<C: Wire>(secret: Bytes, token: str): Option<C> {
 }
 
 /// The payload segment (already signature-verified) decoded as `C`.
-fun decode_claims<C: Wire>(segment: str): Option<C> {
+export fun decode_claims<C: Wire>(segment: str): Option<C> {
 	match decode_url(segment) {
 		Some(let payload) => {
 			let decoded: Result<C, str> = decode_json(decode_utf8(payload));

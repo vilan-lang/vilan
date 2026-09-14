@@ -8,6 +8,8 @@
 
 import pkg::reactive::Subscription;
 
+export *;
+
 external struct Element;
 
 /// `document.getElementById(id)` — the element with that id (the mount point a

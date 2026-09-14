@@ -75,13 +75,18 @@ fn style_source() -> String {
 /// up to the closing `}` in column zero. `style.vl` indents with tabs, so a
 /// top-level item is exactly the span between its header and the first
 /// unindented `}`.
+///
+/// B318's visibility marker is stripped before the header is offered, so
+/// `opens` is written against the DECLARATION — `impl Style {` matches
+/// `export impl Style {` — and a later change to what `style.vl` exports
+/// cannot silently empty one of these scans.
 fn top_level_block(source: &str, opens: impl Fn(&str) -> bool) -> Vec<&str> {
     let mut lines = source.lines();
     let mut block = Vec::new();
     let mut inside = false;
     for line in lines.by_ref() {
         if !inside {
-            inside = opens(line);
+            inside = opens(strip_visibility_marker(line));
             continue;
         }
         if line == "}" {
@@ -91,6 +96,20 @@ fn top_level_block(source: &str, opens: impl Fn(&str) -> bool) -> Vec<&str> {
     }
     assert!(!block.is_empty(), "no block opened, or none closed");
     block
+}
+
+/// `line` without a leading `export` / `export(in PATH)` marker.
+fn strip_visibility_marker(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix("export") else {
+        return line;
+    };
+    match rest
+        .strip_prefix("(in ")
+        .and_then(|rest| rest.find(')').map(|at| &rest[at + 1..]))
+    {
+        Some(rest) => rest.trim_start(),
+        None => rest.strip_prefix(' ').unwrap_or(line),
+    }
 }
 
 /// Every `fun name(self, …)` declared in an `impl Style` block, in source order,

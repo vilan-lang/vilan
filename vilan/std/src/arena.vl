@@ -1,6 +1,8 @@
 import pkg::option::Option::{ self, None, Some };
 import pkg::random::range;
 
+export *;
+
 // `std::arena` — a generational arena: stable, deletion-safe identities for
 // values of any type `T`, with no per-type bookkeeping.
 //

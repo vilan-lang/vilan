@@ -12,12 +12,12 @@ import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer };
 import pkg::option::Option::{ self, None, Some };
 import pkg::task::{ CancelSignal, ambient_signal };
 
-external struct Response;
+export external struct Response;
 
 /// GET `url` and await the response. Inside a nursery's dynamic extent the
 /// request carries the ambient cancel signal (the structural bridge), so
 /// cancellation aborts it in flight.
-fun fetch(url: str): Response {
+export fun fetch(url: str): Response {
 	let options = new_request_init();
 	attach_ambient_signal(options);
 	fetch_with(url, options)
@@ -32,7 +32,7 @@ fun attach_ambient_signal(options: RequestInit) {
 	}
 }
 
-impl Response {
+export impl Response {
 	/// The HTTP status code (e.g. 200).
 	[extern(get, "status")]
 	external fun status(self): i32;
@@ -67,7 +67,7 @@ external struct BodyReader;
 /// One `reader.read()` result: `{ done, value }`.
 external struct ChunkResult;
 
-impl Response {
+export impl Response {
 	[extern(get, "body")]
 	external fun body_stream(self): BodyStream;
 }
@@ -96,7 +96,7 @@ impl ChunkResult {
 /// One request header. A two-field struct lowers to the `[name, value]` array that
 /// the host `fetch` accepts as a headers entry, so `List<Header>` is a valid
 /// `HeadersInit` with no conversion.
-struct Header {
+export struct Header {
 	name: str,
 	value: str,
 }
@@ -133,7 +133,7 @@ impl RequestInit {
 async external fun fetch_with(url: str, options: RequestInit): Response;
 
 /// A request being built: its method + URL, an optional body, and headers.
-struct Request {
+export struct Request {
 	url: str,
 	method: str,
 	body: str,
@@ -141,18 +141,18 @@ struct Request {
 }
 
 /// Start a GET request.
-fun get(url: str): Request {
+export fun get(url: str): Request {
 	Request { url, method = "GET", body = "", headers = [] }
 }
 
 /// Start a POST request carrying `body`.
-fun post(url: str, body: str): Request {
+export fun post(url: str, body: str): Request {
 	Request { url, method = "POST", body, headers = [] }
 }
 
 /// A one-shot binary POST (no header chaining): send `body` as bytes and await
 /// the response — the byte-capable leg of the RPC transport (§6.2).
-fun post_bytes(url: str, body: Bytes): Response {
+export fun post_bytes(url: str, body: Bytes): Response {
 	let options = new_request_init();
 	options.set_method("POST");
 	options.set_body_bytes(body);
@@ -160,7 +160,7 @@ fun post_bytes(url: str, body: Bytes): Response {
 	fetch_with(url, options)
 }
 
-impl Request {
+export impl Request {
 	/// Add a request header (e.g. `Content-Type`, `Authorization`).
 	fun header(own self, name: str, value: str): Request {
 		self.headers.push(Header { name, value });

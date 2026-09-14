@@ -21,6 +21,8 @@
 
 import pkg::style::{ Color, Length, Style, space as scale_step, style as open_style };
 
+export *;
+
 // --- lengths ------------------------------------------------------------------
 
 fun rem(value: f64): Length {

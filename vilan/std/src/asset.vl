@@ -5,6 +5,8 @@
 // expression — a runtime call path is a compile error. `emit_keyed` below is
 // the same channel with the contribution's own sort key.
 
+export *;
+
 [extern("__emit_asset")]
 external fun emit(kind: str, line: str): void;
 

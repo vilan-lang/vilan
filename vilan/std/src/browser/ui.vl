@@ -66,7 +66,7 @@ import pkg::style::Style;
 
 /// A handle to a DOM element under construction — nothing more: ownership is
 /// the enclosing boundary's job.
-struct View {
+export struct View {
 	element: Element,
 }
 
@@ -76,7 +76,7 @@ struct View {
 /// else is an HTML element. Tags that exist in BOTH vocabularies (`a`,
 /// `title`, `style`, `script`) resolve to HTML — inline SVG rarely wants
 /// them, and a link around an icon is the HTML `a`.
-fun view(tag: str): View {
+export fun view(tag: str): View {
 	if is_svg_tag(tag) {
 		View { element = create_element_ns("http://www.w3.org/2000/svg", tag) }
 	} else {
@@ -130,7 +130,7 @@ fun is_svg_tag(tag: str): bool {
 	}
 }
 
-impl View {
+export impl View {
 	/// Static text content.
 	fun text(self, content: str): View {
 		self.element.set_text(content);
@@ -669,17 +669,17 @@ external fun chunk_preload_arm(arm: i32): void;
 /// rebinds the gate call's type arguments onto it by position. `swap_split`
 /// then joins the in-flight fetch this started rather than opening a second
 /// one.
-fun chunk_preload<T: PartialEq, S: Source<T>>(source: S) {
+export fun chunk_preload<T: PartialEq, S: Source<T>>(source: S) {
 	chunk_preload_arm(chunk_arm(source.get()));
 }
 
 /// True while a route chunk is being fetched.
-fun chunk_pending(): SignalCell<bool> {
+export fun chunk_pending(): SignalCell<bool> {
 	chunk_pending_signal
 }
 
 /// Why the last route chunk fetch failed, or `None`.
-fun chunk_failure(): SignalCell<Option<str>> {
+export fun chunk_failure(): SignalCell<Option<str>> {
 	chunk_error_signal
 }
 
@@ -735,7 +735,7 @@ fun clear_chunk_error() {
 /// `Slot::place`, and the parent methods below become one-line sugar over
 /// them. Nothing in this order changes a signature.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
-struct Region {
+export struct Region {
 	anchor: Text,
 	live: Shared<List<View>>,
 	rows: Shared<List<Row>>,
@@ -757,11 +757,11 @@ struct Region {
 /// KEEP IN STEP with the process twin's copy (process/ui.vl), where a row is
 /// nothing at all: a server render is one pass in source order, so a row IS
 /// wherever it was written.
-struct Row {
+export struct Row {
 	marker: Text,
 }
 
-impl Region {
+export impl Region {
 	/// Opens a region at `parent`'s current end — the caller's position in
 	/// the chain.
 	fun open(parent: View): Region {
@@ -900,19 +900,19 @@ impl Region {
 /// taken on the process twin (the `enum Child` `render` walks), and every doc
 /// page and generic helper in the estate spells the bound `Slot` today.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
-trait Slot {
+export trait Slot {
 	fun place(self, parent: View);
 }
 
 /// A child element.
-impl View with Slot {
+export impl View with Slot {
 	fun place(self, parent: View) {
 		parent.element.append(self.element);
 	}
 }
 
 /// A static text node.
-impl str with Slot {
+export impl str with Slot {
 	fun place(self, parent: View) {
 		parent.element.append_text(create_text_node(self));
 	}
@@ -926,7 +926,7 @@ impl str with Slot {
 /// reactively — a cell, a derived signal, a `RemoteSource`, a user's own
 /// mirror — and `str`'s own impl outranks it by the specificity order wherever
 /// both would match.
-impl type S: Source<str> with Slot {
+export impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		let node = create_text_node("");
 		parent.element.append_text(node);
@@ -945,7 +945,7 @@ impl type S: Source<str> with Slot {
 /// Several child elements, in order — a STATIC run, placed once. This is the
 /// arm a fragment literal would walk through (A46): its type is `List<View>`,
 /// and a list already fills a child position.
-impl List<View> with Slot {
+export impl List<View> with Slot {
 	fun place(self, parent: View) {
 		for item in self {
 			parent.element.append(item.element);
@@ -979,7 +979,7 @@ impl List<View> with Slot {
 /// replacement before that anchor, so a reactive element child in the middle
 /// of a chain stays in the middle — which is what `{expr}` means the same
 /// thing either way requires.
-impl type S: Source<View> with Slot {
+export impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
 		let region = Region::open(parent);
 		let live: Shared<Option<View>> = Shared::new(None);
@@ -1010,7 +1010,7 @@ impl type S: Source<View> with Slot {
 /// compare, so there is nothing to reconcile against; it is the grouping arm,
 /// with the same ownership story as the single-view arm above — and, with it,
 /// the same `Region`, so the whole run keeps the hole's position (A71).
-impl type S: Source<List<View>> with Slot {
+export impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
 		let region = Region::open(parent);
 		let live: Shared<List<View>> = Shared::new([]);
@@ -1060,7 +1060,7 @@ impl type S: Source<List<View>> with Slot {
 // KEEP IN STEP with the process twin's copy (process/ui.vl).
 
 /// Conditional content as a child — `View::when`'s value form.
-struct Conditional<S: Source<bool>, C: Slot> {
+export struct Conditional<S: Source<bool>, C: Slot> {
 	condition: S,
 	body: (|| C) context owner_scope,
 }
@@ -1083,7 +1083,7 @@ struct Conditional<S: Source<bool>, C: Slot> {
 /// ordinary build constructs `wire = || {}` and the whole machinery stays
 /// unreferenced, which is what keeps a flagless build emitting what it always
 /// did (§4).
-struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
+export struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 	gated: Option<SignalCell<T>>,
@@ -1092,20 +1092,20 @@ struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
 }
 
 /// A keyed reactive run as a child — `View::bind_each`'s value form.
-struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -1115,7 +1115,7 @@ struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
 /// view is mounted under a fresh owner; when it turns false the owner is
 /// disposed and the content removed. The value form of `View::when` — write it
 /// in a child hole when the conditional is one child among siblings.
-fun when<S: Source<bool>, C: Slot>(
+export fun when<S: Source<bool>, C: Slot>(
 	condition: S,
 	body: (sync || C) context owner_scope,
 ): Conditional<S, C> {
@@ -1125,7 +1125,7 @@ fun when<S: Source<bool>, C: Slot>(
 /// The dynamic subtree at THIS position: whenever `source` CHANGES the previous
 /// subtree is disposed and `render` builds the new one under a fresh owner. The
 /// value form of `View::swap`.
-fun swap<T: PartialEq, S: Source<T>, C: Slot>(
+export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
@@ -1141,7 +1141,7 @@ fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 /// The gate is BUILT here and run at `place`, so `place` names nothing
 /// chunk-shaped: a build that did not ask to split never reaches this function,
 /// and none of the machinery below is emitted at all.
-fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
+export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
@@ -1223,7 +1223,7 @@ fun split_route<T: PartialEq, S: Source<T>, C: Slot>(
 /// kept in sync" on every other method in this module, and a value that IS a
 /// child has no property to bind. `{each(items, key, row)}` reads as markup
 /// where `{bind_each(..)}` reads as a setter that has escaped.
-fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
@@ -1232,7 +1232,7 @@ fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
@@ -1240,7 +1240,7 @@ fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
@@ -1248,7 +1248,7 @@ fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	EachBy { source, key, render }
 }
 
-impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
+export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		// The body lands at THIS position among the parent's children (A71),
 		// not at the end: the hole sits where the conditional content belongs,
@@ -1302,7 +1302,7 @@ impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 	}
 }
 
-impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
+export impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		// The route gate, when there is one — a no-op closure otherwise. It runs
 		// under the boundary this hole sits in, so its subscription dies with
@@ -1315,19 +1315,19 @@ impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
 	}
 }
 
-impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
-impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
@@ -1577,19 +1577,19 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 /// element-syntax attribute vocabulary. The tracked arm is a BLANKET over
 /// `Source<str>` (B158/B165), so any reactive value fills an attribute.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
-trait AttrValue {
+export trait AttrValue {
 	fun apply(self, parent: View, name: str);
 }
 
 /// Set once.
-impl str with AttrValue {
+export impl str with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		parent.element.set_attribute(name, self);
 	}
 }
 
 /// Set and track — exactly `bind_attr`, for every `Source<str>`.
-impl type S: Source<str> with AttrValue {
+export impl type S: Source<str> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		let element = parent.element;
 		self.effect(|value| {
@@ -1604,7 +1604,7 @@ impl type S: Source<str> with AttrValue {
 /// `Element`; giving IT an `Option<Element>` signature is a wider API question
 /// (A24, fullstack-dx.md §9.5) deliberately NOT taken here — this is a private
 /// guard at the mount seam alone.
-[extern("__is_null")]
+export [extern("__is_null")]
 external fun is_null(value: Element): bool;
 
 /// The lookup `mount`/`mount_root` share: fails loud, naming the id, instead
@@ -1626,7 +1626,7 @@ fun mount_target(id: str): Element {
 /// (proposal/ssr.md §1 step 3). A no-op for the empty container every client app
 /// mounts into today; on a server-rendered page it discards the server markup and
 /// mounts the live tree in its place. Render, then replace — no adoption.
-fun mount(id: str, view: View) {
+export fun mount(id: str, view: View) {
 	let element = mount_target(id);
 	element.clear();
 	element.append(view.element);
@@ -1635,7 +1635,7 @@ fun mount(id: str, view: View) {
 /// Mount a component ROOT: the body builds under a fresh ambient owner (the
 /// root boundary — every binding inside registers into it) and the view is
 /// attached. Returns the root owner; most apps let it live forever.
-fun mount_root(id: str, body: (sync || View) context owner_scope): Owner {
+export fun mount_root(id: str, body: (sync || View) context owner_scope): Owner {
 	// The initial build is a turn boundary too: bindings created during
 	// mount settle as one wave instead of notifying per-`set`.
 	let (built, root) = turn(FlushPolicy::AtSuspension, || comp(body));

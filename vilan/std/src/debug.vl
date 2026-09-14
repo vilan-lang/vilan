@@ -3,6 +3,8 @@
 // format via the host `JSON.stringify` (numbers/bools raw, strings quoted and
 // escaped); nested derived structs recurse through their own `debug`.
 
+export *;
+
 trait Debug {
 	fun debug(self): str;
 }

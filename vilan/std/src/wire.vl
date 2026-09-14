@@ -19,6 +19,8 @@ import pkg::map::Map;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 
+export *;
+
 /// The write half of the visitor: what a codec's writer implements. See
 /// `Serializer` (the record) for the call-by-call protocol notes.
 trait Serialize {

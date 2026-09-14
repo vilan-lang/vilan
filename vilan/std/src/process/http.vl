@@ -18,9 +18,9 @@ import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades 
 [extern("node:http", "createServer", retains)]
 external fun node_create_server(handler: |NodeRequest, NodeResponse| void): NodeServer;
 
-external struct NodeServer;
+export external struct NodeServer;
 
-impl NodeServer {
+export impl NodeServer {
 	[extern(method, retains)]
 	external fun listen(self, port: i32, on_ready: || void);
 
@@ -50,9 +50,9 @@ impl NodeAddress {
 	external fun port(self): i32;
 }
 
-external struct NodeRequest;
+export external struct NodeRequest;
 
-impl NodeRequest {
+export impl NodeRequest {
 	[extern(get, "url")]
 	external fun url(self): str;
 
@@ -68,9 +68,9 @@ impl NodeRequest {
 
 /// A raw TCP socket (`net.Socket`), handed over on a protocol upgrade. Frames
 /// are written as bytes; the handshake response is plain text.
-external struct NodeSocket;
+export external struct NodeSocket;
 
-impl NodeSocket {
+export impl NodeSocket {
 	[extern(method, "write")]
 	external fun write_text(self, data: str);
 
@@ -130,9 +130,9 @@ async external fun read_request_body(node: NodeRequest): str;
 [extern("node:stream/consumers", "buffer")]
 async external fun read_request_bytes(node: NodeRequest): Bytes;
 
-external struct NodeResponse;
+export external struct NodeResponse;
 
-impl NodeResponse {
+export impl NodeResponse {
 	[extern(set, "statusCode")]
 	external fun set_status_code(self, code: i32);
 
@@ -160,12 +160,12 @@ impl NodeResponse {
 
 // --- Request ---
 
-struct Request {
+export struct Request {
 	node: NodeRequest,
 	content: Bytes,
 }
 
-impl Request {
+export impl Request {
 	/// The request target (path + query), e.g. `/client.js`.
 	fun path(self): str {
 		self.node.url()
@@ -228,7 +228,7 @@ impl Request {
 
 // --- Response ---
 
-struct Response {
+export struct Response {
 	status: i32,
 	/// `(name, value)` pairs, written in order. An empty list gets the
 	/// default `Content-Type: text/plain`.
@@ -239,7 +239,7 @@ struct Response {
 /// What a response carries: a buffered text or binary body, or a live
 /// STREAM — the closure receives the open stream once the status and
 /// headers are written, and the response stays open until closed.
-enum ResponseBody {
+export enum ResponseBody {
 	Text(str),
 	Bytes(Bytes),
 	Stream(|ResponseStream| void),
@@ -249,11 +249,11 @@ enum ResponseBody {
 /// the response stays open until `close` — or until the client goes away
 /// (`on_close`). The host silently drops writes to a gone connection, so a
 /// chunk sent to a just-closed client is discarded, not an error.
-struct ResponseStream {
+export struct ResponseStream {
 	node: NodeResponse,
 }
 
-impl ResponseStream {
+export impl ResponseStream {
 	/// Write one chunk without ending the response.
 	fun send(self, chunk: str) {
 		self.node.write(chunk);
@@ -271,19 +271,19 @@ impl ResponseStream {
 	}
 }
 
-struct ResponseBuilder {
+export struct ResponseBuilder {
 	status: i32,
 	headers: List<(str, str)>,
 	body: ResponseBody,
 }
 
-impl Response {
+export impl Response {
 	fun builder(): ResponseBuilder {
 		ResponseBuilder { status = 200, headers = [], body = ResponseBody::Text("") }
 	}
 }
 
-impl ResponseBuilder {
+export impl ResponseBuilder {
 	fun code(own self, code: i32): ResponseBuilder {
 		self.status = code;
 		self
@@ -336,7 +336,7 @@ impl ResponseBuilder {
 /// meant. The quotes are part of the value — an entity-tag is quoted on the
 /// wire (RFC 9110 §8.8.3) — so this string drops into `ETag` and into
 /// comparisons exactly as returned.
-async fun etag_of(body: Bytes): str {
+export async fun etag_of(body: Bytes): str {
 	"\"" + sha256(body).to_hex().substring(0, 32) + "\""
 }
 
@@ -359,7 +359,7 @@ async fun etag_of(body: Bytes): str {
 /// missing a quote and cannot equal it; an `etag` that itself embeds a comma
 /// is the one shape this function cannot find in a list, said here rather
 /// than half-handled silently.
-fun if_none_match_matches(header: str, etag: str): bool {
+export fun if_none_match_matches(header: str, etag: str): bool {
 	if header.trim() == "*" {
 		ret true;
 	}
@@ -404,7 +404,12 @@ fun strip_weak(tag: str): str {
 /// `If-None-Match` means `412 Precondition Failed`, not `304` — a
 /// state-changing route's protocol, no part of serving bytes — so on those
 /// the header is not consulted at all and the full response goes out.
-fun etag_response(request: Request, etag: str, body: Bytes, content_type: str): ResponseBuilder {
+export fun etag_response(
+	request: Request,
+	etag: str,
+	body: Bytes,
+	content_type: str,
+): ResponseBuilder {
 	let method = request.method();
 	if method == "GET" || method == "HEAD" {
 		match request.header("If-None-Match") {
@@ -440,7 +445,7 @@ fun etag_response(request: Request, etag: str, body: Bytes, content_type: str): 
 /// with `etag_response` to build it from. The url rather than the artifact is
 /// the same argument one level down: a policy needs to know which file this
 /// is, and needs nothing else `BuildAsset` carries.
-struct CachePolicy {
+export struct CachePolicy {
 	/// Answer conditional requests for this artifact: mint an `ETag` over the
 	/// bytes being served and reply `304` when the client already has them.
 	validate: bool,
@@ -450,7 +455,7 @@ struct CachePolicy {
 	cache_control: str,
 }
 
-impl CachePolicy {
+export impl CachePolicy {
 	/// No validator and no `Cache-Control` — every byte `serve_build` sends
 	/// for this artifact is what it sends with no policy installed. The base
 	/// of a chain (`CachePolicy::none().cache_control(…)`) and the honest
@@ -480,7 +485,7 @@ impl CachePolicy {
 
 // --- Server ---
 
-struct Server {
+export struct Server {
 	/// The port to listen on before `start`, and the port actually BOUND from
 	/// `on_start` onward: binding port 0 lets the OS pick a free one, and the
 	/// server handed to `on_start` carries the number it picked (so `url()` and
@@ -506,7 +511,7 @@ struct Server {
 	node: Option<NodeServer>,
 }
 
-struct ServerBuilder {
+export struct ServerBuilder {
 	port: i32,
 	// Declared `async` (J2's typed channel): the handler may suspend, and
 	// `start()` awaits its response before writing.
@@ -534,7 +539,7 @@ struct ServerBuilder {
 	asset_cache: Option<|str| CachePolicy>,
 }
 
-impl Server {
+export impl Server {
 	fun builder(): ServerBuilder {
 		ServerBuilder {
 			port = 3000,
@@ -638,7 +643,7 @@ fun bound_port(node_server: NodeServer): i32 {
 	node_server.address().port()
 }
 
-impl ServerBuilder {
+export impl ServerBuilder {
 	fun port(own self, port: i32): ServerBuilder {
 		self.port = port;
 		self

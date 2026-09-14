@@ -6,6 +6,8 @@ import pkg::iterator::ListIterator;
 import pkg::operators::{ Add, Mul };
 import pkg::option::Option;
 
+export *;
+
 external struct List<T>;
 
 impl List<type T> {

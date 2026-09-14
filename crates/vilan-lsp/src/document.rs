@@ -6353,7 +6353,16 @@ impl<'a> StyleSurface<'a> {
     fn extend(&mut self, source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) {
         let methods = &mut self.methods;
         for item in items {
-            let Node::Impl(subject, _traits, body) = &item.0 else {
+            // B318 S6: std's `style.vl` is curated, so its blocks read
+            // `export impl Style { … }` — the marker WRAPS the declaration, and
+            // a match on the bare `Impl` sees nothing. Unwrapped rather than
+            // filtered: an unexported block is still a body this file can
+            // inline, and visibility is not what decides that.
+            let node = match &item.0 {
+                Node::Export(_, inner) => &inner.0,
+                node => node,
+            };
+            let Node::Impl(subject, _traits, body) = node else {
                 continue;
             };
             let names_style = matches!(subject.0, Node::Accessor("Style"))

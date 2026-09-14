@@ -7,6 +7,8 @@
 import pkg::bytes::Bytes;
 import pkg::range::Range;
 
+export *;
+
 /// HMAC-SHA-512 of `data` under `key`.
 [extern("__hmac_sha512")]
 async external fun hmac_sha512(key: Bytes, data: Bytes): Bytes;

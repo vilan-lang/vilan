@@ -65,7 +65,7 @@ impl Hash {
 }
 
 /// RFC 6455 §4.2.2: the `Sec-WebSocket-Accept` proof — base64(SHA-1(key+GUID)).
-fun ws_accept_key(key: str): str {
+export fun ws_accept_key(key: str): str {
 	create_hash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64")
 }
 
@@ -76,7 +76,7 @@ fun ws_accept_key(key: str): str {
 /// `Connection.session`. A service with no `authorize` hook sees
 /// `Session::anonymous()`; the app decides what more a connection's identity
 /// means by looking `identity` up in the instance the factory builds.
-struct Session {
+export struct Session {
 	/// The app's name for whoever is on the other end — a user id, a subject
 	/// claim. Empty when nothing authorized this connection.
 	identity: str,
@@ -85,7 +85,7 @@ struct Session {
 	credential: str,
 }
 
-impl Session {
+export impl Session {
 	/// A connection nothing authorized: no identity, no credential.
 	fun anonymous(): Session {
 		Session { identity = "", credential = "" }
@@ -113,13 +113,13 @@ impl Session {
 /// generated `__attach` is called with), the session `authorize` proved, and
 /// the peer's address (`""` when the host does not report one — and the
 /// PROXY's address behind a proxy).
-struct Connection {
+export struct Connection {
 	id: i32,
 	session: Session,
 	remote_addr: str,
 }
 
-impl Connection {
+export impl Connection {
 	/// The typed proxy for the `[client_service]` this connection's server may
 	/// call back into (`transport-rpc.md` §9.3, R1) — the value a service struct
 	/// holds as a field and reaches as `self.client`:
@@ -156,7 +156,7 @@ impl Connection {
 /// on the handshake. The convention (`std::rpc::rpc_protocols`) is
 /// `["vilan-rpc", "token." + credential]` — the real protocol name the server
 /// selects and echoes, and the credential riding beside it.
-struct Handshake {
+export struct Handshake {
 	path: str,
 	headers: JsonValue,
 	protocols: List<str>,
@@ -177,7 +177,7 @@ fun header_text(headers: JsonValue, name: str): Option<str> {
 	None
 }
 
-impl Handshake {
+export impl Handshake {
 	/// A named request header, or `None` when the handshake did not carry it.
 	/// Node lowercases every name it parses, so `name` is lowered to match.
 	fun header(self, name: str): Option<str> {
@@ -210,7 +210,7 @@ impl Handshake {
 /// is answered with before it is destroyed — no socket, no session, no
 /// `ReactiveServer`, which is the whole point of gating BEFORE the upgrade
 /// rather than inside a method.
-[derive(PartialEq, Debug)]
+export [derive(PartialEq, Debug)]
 enum Reject {
 	/// 401 — no credential, or one that did not verify.
 	Unauthorized,
@@ -410,7 +410,7 @@ fun selected_protocol(offered: List<str>): str {
 /// wire is forgotten here, and `on_disconnect(id)` tells the app to drop its
 /// own per-connection state (dispose a `ReactiveServer` session, say) —
 /// otherwise a long-running server leaks a session per ever-connected client.
-struct Service {
+export struct Service {
 	/// The protocol THIS connection is answered by. `Service::new` hands every
 	/// connection the same one; `Service::factory` builds a fresh service
 	/// instance per connection and returns its dispatcher's protocol (Q9).
@@ -465,7 +465,7 @@ struct Service {
 	trust_forwarded_for: bool,
 }
 
-impl Service {
+export impl Service {
 	/// The `Client::connect` service (`transport-rpc.md` §4.2): the runtime
 	/// session registry as the connection lifecycle — every connection gets a
 	/// reactive session the generated `__attach` route can answer from,
@@ -823,7 +823,7 @@ fun gate_upgrade(
 	}
 }
 
-impl ServerBuilder {
+export impl ServerBuilder {
 	/// Install an rpc service. Repeatable. Its routes answer before
 	/// `on_request`, independently of the order these calls were written —
 	/// longest mount first, computed at `build()` (§4.3).
@@ -1027,7 +1027,7 @@ fun services_answer(services: List<Service>, request: Request): Option<Response>
 /// Compose `services`' routing in front of `fallback`: rule 1's "services
 /// first, then `on_request`, always" (§4.3), independent of the order
 /// `.with_service` was called in.
-fun fold_service_requests(
+export fun fold_service_requests(
 	services: List<Service>,
 	fallback: async |Request| Response,
 ): async |Request| Response {
@@ -1062,7 +1062,7 @@ fun service_for_upgrade(services: List<Service>, request: NodeRequest): Option<S
 /// `Server::builder()` with no `.with_service` calls installs no upgrade
 /// listener beyond what the app asked for, exactly as before this layer
 /// existed.
-fun fold_service_upgrades(
+export fun fold_service_upgrades(
 	services: List<Service>,
 	fallback: Option<|NodeRequest, NodeSocket, Bytes| void>,
 ): Option<|NodeRequest, NodeSocket, Bytes| void> {

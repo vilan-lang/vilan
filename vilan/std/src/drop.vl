@@ -7,6 +7,9 @@
 // still legal — containment alone moves it and drops its fields.
 //
 // (The compiler-inserted teardown is a later slice; this declares the surface.)
+
+export *;
+
 trait Drop {
 	fun drop(&mut self);
 }

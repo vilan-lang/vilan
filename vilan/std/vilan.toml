@@ -7,7 +7,7 @@
 [library]
 name = "std"
 # std compiles with NO ambient scope (`prelude.md` §10.1). Three reasons, in
-# order of weight: std's own resolution stays greppable — 664 top-level
+# order of weight: std's own resolution stays greppable — 741 top-level
 # declarations across 63 files, every symbol somebody's lang item, and "where
 # does this name come from" must be answerable by reading the file; the
 # bootstrapping order becomes trivial rather than delicate, since the prelude's
@@ -16,18 +16,26 @@ name = "std"
 # special-cased in the compiler, so a reader sees the posture and no "std is
 # different" branch can drift.
 #
-# The census, measured at e4d192e3 and refreshable from this directory — a
-# declaration is a top-level `fun`/`external fun`/`struct`/`trait`/`enum`/`let`,
-# which is the set `visibility.md` §6 counts:
+# The census, refreshable from this directory — a declaration is a top-level
+# `fun`/`external fun`/`struct`/`trait`/`enum`/`let`, which is the set
+# `visibility.md` §6 counts. B318's marker sits AHEAD of the declaration, so the
+# recipe takes an optional `export ` or it counts only what std keeps private:
 #
-#     grep -rhE '^(external fun|fun|struct|trait|enum|let) ' --include='*.vl' src | wc -l   # 664
-#     find src -name '*.vl' | wc -l                                                         # 63
+#     grep -rhE '^(export )?(external fun|fun|struct|trait|enum|let) ' --include='*.vl' src | wc -l   # 741
+#     find src -name '*.vl' | wc -l                                                                   # 63
 #
-# 118 of the 664 are imported BY NAME by another std file — std's cross-file
-# reach, 18% of the declarations, and the floor of its curated export surface
-# under B318. That number is `visibility.md` §6's table and not a grep: it walks
-# the import statements (five of std's span lines) and resolves each leaf
-# against the declaring module.
+# std is CURATED under B318 S6 (`visibility.md` §8: std curates from release N).
+# Counting every declaration kind — the six above plus `async fun`,
+# `external struct`, `resource struct` and `macro` — that is 856 declarations,
+# 548 exported and 308 private; 33 of the 60 modules that declare anything
+# export everything and carry the bare marker:
+#
+#     grep -rlE '^export \*;' --include='*.vl' src | wc -l                                  # 33
+#
+# 152 of the declarations are reached by name or by qualification from another
+# std file — std's cross-file reach, and the FLOOR of the curated surface. That
+# number is not a grep: it is what `check_plain_reaches` reports over a program
+# importing every module, which is why it is exact where a grep would not be.
 #
 # std still CONTAINS the two prelude modules (`src/prelude.vl`, `src/web.vl`) —
 # that is a fact about contents, not about resolution.
