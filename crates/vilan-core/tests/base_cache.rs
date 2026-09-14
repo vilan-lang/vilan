@@ -1208,6 +1208,97 @@ fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// B341: the key carries the modules the entry's own SYNTAX seeds, not only the
+/// ones a `std::` path names.
+///
+/// An element desugars to `std::ui`'s `view`, and a `css` block makes
+/// `std::style::prelude` ambient inside itself — both are pushed into `to_load`
+/// beside the written imports, both load into the world, and neither is named
+/// by any `std::` path in the text. The key was `collect_module_paths(.., "std")`
+/// alone, so a plain entry and an element entry with the same import line minted
+/// the SAME key and the second was served the first's world: a world with no
+/// `std::ui` in it, in which `<div/>` fails with "cannot find 'view' in this
+/// scope". Not a cache curiosity — `vilan build` analyzes a package's entries in
+/// ONE process, so a two-entry package where one entry uses element syntax
+/// failed to build, and WHICH entry failed depended on the order the entries
+/// sorted in. Found by hygiene-36 chasing N84's shared-state flake, where two
+/// `inference` `modules::` tests read red under plain `cargo test` for the same
+/// reason.
+///
+/// Both orders, and both desugars, because the failure is asymmetric: the entry
+/// analyzed SECOND is the one that pays. The assertion is the DIAGNOSTICS and
+/// not a hit/miss delta — an element entry compiles macro worlds, and those
+/// consult the cache on their own account, so the counters here are counting two
+/// things at once (this file's opening note).
+#[test]
+fn an_entrys_desugar_seeds_are_part_of_its_world_key() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    const PLAIN: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"plain\");\n}\n";
+    const ELEMENT: &str =
+        "import std::io::print;\n\nfun main() {\n\tlet _x = <div/>;\n\tprint(\"element\");\n}\n";
+    const CSS: &str = "import std::io::print;\n\nfun main() {\n\tlet _s = css { color: \"red\"; };\n\t\
+         print(\"css\");\n}\n";
+
+    // The repro's own order: the plain entry sorts first, so it builds the
+    // world and the element entry is the one handed it.
+    vilan_core::analyzer::base_cache_clear();
+    let plain = observe(PLAIN);
+    assert_eq!(
+        plain.0, "[]",
+        "the plain entry must analyze clean: {}",
+        plain.0
+    );
+    let element = observe(ELEMENT);
+    assert_eq!(
+        element.0, "[]",
+        "an element entry analyzed after a plain one must analyze clean — it \
+         was served a world with no `std::ui` in it: {}",
+        element.0
+    );
+    assert!(
+        element.2.is_some(),
+        "and it must emit: an element entry served the plain entry's world \
+         produced no program at all"
+    );
+
+    // And the other way round, which is the order that already worked and must
+    // go on working: the element entry builds the world, the plain one misses.
+    vilan_core::analyzer::base_cache_clear();
+    let element = observe(ELEMENT);
+    assert_eq!(
+        element.0, "[]",
+        "the element entry must analyze clean alone"
+    );
+    let plain = observe(PLAIN);
+    assert_eq!(plain.0, "[]", "the plain entry must analyze clean second");
+
+    // The `css` twin, whose seed is `std::style::prelude` and whose failure
+    // said "cannot find 'style' in this scope".
+    vilan_core::analyzer::base_cache_clear();
+    let plain = observe(PLAIN);
+    assert_eq!(
+        plain.0, "[]",
+        "the plain entry must analyze clean: {}",
+        plain.0
+    );
+    let css = observe(CSS);
+    assert_eq!(
+        css.0, "[]",
+        "a `css` entry analyzed after a plain one must analyze clean: {}",
+        css.0
+    );
+    assert!(
+        css.2.is_some(),
+        "and it must emit: a `css` entry served the plain entry's world \
+         produced no program at all"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+}
+
 // ---------------------------------------------------------------------------
 // The OPEN MODULE's own world (backlog M70)
 // ---------------------------------------------------------------------------

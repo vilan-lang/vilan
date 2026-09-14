@@ -53415,6 +53415,23 @@ fn analyze_inner<'src>(
         let mut names: Vec<String> = collect_module_paths(&nodes.0, "std")
             .into_iter()
             .map(|(name, _)| seed_module(&std_roots, name))
+            // B341: and the modules the entry's own SYNTAX seeds, which no
+            // `std::` path in the text names — `std::ui` for an element,
+            // `std::style::prelude` for a `css` block. They are pushed into
+            // `to_load` beside the written imports below and they load into the
+            // world exactly as those do, so a key that omitted them said two
+            // entries built one world when they build two. `vilan build`
+            // analyzes a package's entries in ONE process, so the second entry
+            // was served the first's world and a program with an element in it
+            // failed with "cannot find 'view' in this scope" — which entry
+            // failed depending on which sorted first. Two `modules::` tests in
+            // `inference` had the same shape under plain `cargo test`, where
+            // they share a process with everything before them.
+            .chain(
+                collect_std_item_modules(&nodes.0)
+                    .into_iter()
+                    .map(|module| seed_module(&std_roots, module)),
+            )
             .collect();
         names.sort();
         names.dedup();
