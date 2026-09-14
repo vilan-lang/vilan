@@ -5932,12 +5932,19 @@ impl Document {
         // it is wanted by one code action and by nothing else — and only after
         // the block direction has declined, so a cursor in a block never pays
         // for it.
-        let style_text = self.std_style_text();
-        let style_tree = style_text
-            .as_deref()
-            .and_then(|text| vilan_core::parsing::parse(text).0);
-        let mut surface = match (style_text.as_deref(), style_tree.as_ref()) {
-            (Some(text), Some(tree)) => StyleSurface::build(text, &tree.0),
+        let std_style = self.std_style_source();
+        let style_tree = std_style
+            .as_ref()
+            .and_then(|(_, text)| vilan_core::parsing::parse(text).0);
+        // E175: and every OTHER file of the program that writes `impl Style`.
+        // Read and parsed BEFORE the surface, because the surface borrows both.
+        let sibling_texts = self.style_impl_texts(std_style.as_ref().map(|(source, _)| *source));
+        let sibling_trees: Vec<_> = sibling_texts
+            .iter()
+            .map(|text| vilan_core::parsing::parse(text).0)
+            .collect();
+        let mut surface = match (std_style.as_ref(), style_tree.as_ref()) {
+            (Some((_, text)), Some(tree)) => StyleSurface::build(text, &tree.0),
             _ => StyleSurface::default(),
         };
         // And the CURRENT file's own `impl Style` extensions (E172). The tree
@@ -5947,6 +5954,14 @@ impl Document {
         // shorthand is usually the FIRST link, and a first link with no block
         // spelling is an empty convertible prefix and no action offered.
         surface.extend(source, &root.0);
+        // The siblings last: `extend` keeps the first body registered under a
+        // name, so std outranks this file and this file outranks a sibling —
+        // which is the order a call would resolve in anyway.
+        for (text, tree) in sibling_texts.iter().zip(&sibling_trees) {
+            if let Some(tree) = tree {
+                surface.extend(text, &tree.0);
+            }
+        }
         Some(CssConversion {
             to_chain: false,
             span: node.1,
@@ -5969,7 +5984,7 @@ impl Document {
     /// modules (then there is no `style()` chain to convert either), or when the
     /// file cannot be read; the conversion degrades to the chokepoint links and
     /// the combinators rather than to a wrong answer.
-    fn std_style_text(&self) -> Option<String> {
+    fn std_style_source(&self) -> Option<(SourceId, String)> {
         let program = self.program.as_ref()?;
         let source = program.functions.iter().find_map(|(id, function)| {
             (function.name == "with_length")
@@ -5982,7 +5997,55 @@ impl Document {
                         .is_some_and(|name| name == "style.vl")
                 })
         })?;
-        std::fs::read_to_string(program.source_path(source)?).ok()
+        let text = std::fs::read_to_string(program.source_path(source)?).ok()?;
+        Some((source, text))
+    }
+
+    /// E175: the text of every OTHER file the analyzed program loaded that
+    /// writes an `impl Style` block — the css converter's reach past the file
+    /// it was invoked in.
+    ///
+    /// E167 read std's `style.vl` and E172 the current file, and that is where
+    /// the inliner stopped: kolt's `button_style` converts the prefix its own
+    /// file's `flex_row` opens and SPLITS at `.script_label()`, four lines of
+    /// `theme.vl` away, in the same package, already loaded and analyzed. The
+    /// missing half was never the parse — it is finding the files worth
+    /// parsing, and the analyzed impl table is the one thing that knows: an
+    /// `Implementation` records the file whose text declares it (B318 §3.3),
+    /// so the blocks whose subject head is `Style` name their own sources and
+    /// nothing else is read.
+    ///
+    /// Read from DISK, like std's own file: the conversion is a code action on
+    /// one document, and a sibling's unsaved buffer lives in the server's
+    /// document map, not in this one. A sibling edited but unsaved inlines its
+    /// last saved body, which is the same bargain go-to-definition makes.
+    ///
+    /// `skip` is std's own source, already read by
+    /// [`Self::std_style_source`]; `SourceId(0)` is skipped because the current
+    /// file's tree is in hand (E172) and its BUFFER, not its saved text, is
+    /// what the conversion must agree with.
+    fn style_impl_texts(&self, skip: Option<SourceId>) -> Vec<String> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen = vec![SourceId(0)];
+        seen.extend(skip);
+        let mut texts = Vec::new();
+        for implementation in program.implementations.iter() {
+            if seen.contains(&implementation.source) {
+                continue;
+            }
+            if subject_head_name(program, implementation.subject).as_deref() != Some("Style") {
+                continue;
+            }
+            seen.push(implementation.source);
+            if let Some(path) = program.source_path(implementation.source)
+                && let Ok(text) = std::fs::read_to_string(path)
+            {
+                texts.push(text);
+            }
+        }
+        texts
     }
 
     /// Every unambiguous missing-import fix in the file, folded into ONE edit
@@ -8400,8 +8463,8 @@ pub(crate) mod tests {
     }
 
     /// [`css_conversion_of`] with SIBLING files beside `main.vl` in the
-    /// workspace — E172's boundary: an `impl Style` in another file of the same
-    /// package is analyzed, and the inliner still cannot read it.
+    /// workspace — E175's subject: an `impl Style` in another file of the same
+    /// package, which the inliner reaches through the analyzed impl table.
     fn css_conversion_across(
         source: &str,
         siblings: &[(&str, &str)],
@@ -8585,17 +8648,18 @@ pub(crate) mod tests {
         );
     }
 
-    // E172's BOUNDARY, pinned rather than left to be found: the inliner reads
-    // the CURRENT file's `impl Style` bodies, and a SIBLING file's are out of
-    // reach even though the analyzer has loaded them. kolt's own `button_style`
-    // runs into this at `.script_label()`, which `theme.vl` declares — so its
-    // chain converts the prefix its own file's `flex_row` opens and splits
-    // there, where before E172 it converted nothing at all. Widening this is a
-    // change of a different kind: the current file is in hand because the
-    // conversion already raw-parses it, and a sibling's body would have to come
-    // off the analyzed impl table instead.
+    // E175: the inliner reaches a SIBLING file's `impl Style`, which is where
+    // E167 and E172 stopped. kolt's own `button_style` ran into this at
+    // `.script_label()`, four lines of `theme.vl` away and in the same package
+    // — already loaded, already analyzed, and out of reach because the
+    // converter read exactly two texts: std's `style.vl` and the buffer it was
+    // invoked in. The missing half was never the parse; it was knowing which
+    // files were worth parsing, and the analyzed impl table knows, because an
+    // `Implementation` records the file whose text declares it. The whole chain
+    // converts now, `script_label` inlined through `with_length` exactly as a
+    // std shorthand is.
     #[test]
-    fn refactor_does_not_reach_an_impl_style_extension_in_a_sibling_file() {
+    fn refactor_inlines_an_impl_style_extension_from_a_sibling_file() {
         let conversion = css_conversion_across(
             "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\n             fun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
             &[(
@@ -8603,10 +8667,30 @@ pub(crate) mod tests {
                 "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
             )],
         )
-        .expect("the prefix the file's own extension opens converts");
+        .expect("a chain reaching a sibling's extension converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t}.script_label().raw(\"outline\", \"none\")",
+            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t\tletter-spacing: {Length::px(1)};\n\t\toutline: none;\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // The reach is the IMPL TABLE's, not "every file in the package": a sibling
+    // that writes no `impl Style` is never read, and a sibling extension whose
+    // body is not a self-chain is a barrier there exactly as it is here.
+    #[test]
+    fn refactor_splits_at_a_sibling_extension_whose_body_is_not_a_chain() {
+        let conversion = css_conversion_across(
+            "import std::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\n             fun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            &[(
+                "theme.vl",
+                "import std::style::{ Color, Style };\n\nimpl Style {\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n",
+            )],
+        )
+        .expect("the convertible prefix converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tborder-radius: {Length::px(4)};\n\t}.themed().raw(\"outline\", \"none\")",
             "{conversion:?}"
         );
     }
