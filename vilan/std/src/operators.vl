@@ -28,6 +28,26 @@ trait Try<T, B> {
 /// their own modules; the compiler lowers the std pair inline.
 trait Lift {}
 
+// === `x(args)` — the call operator (backlog B340) ===========================
+
+/// The opt-in marker for the CALL operator: a value whose type implements
+/// `Callable` can be called like a function — `scale(2f)` resolves as the
+/// method `call` on it, by the ordinary method path (arity, argument types,
+/// generics and context clauses are the `call` declaration's own).
+///
+/// The impl supplies `call` itself, so the arity and the types are the impl's
+/// to choose: `fun call(self, n: f64): Length` makes a one-argument callable,
+/// `fun call(self): str` a nullary one. `self` is taken by value like every
+/// other method. Implementing `Callable` without declaring a `call` is
+/// refused — the marker alone calls nothing.
+///
+/// A `Callable` value also coerces wherever a function declaration does
+/// (`fn-coercion.md` §1): a closure-typed slot takes it, lowered as the
+/// wrapping closure `|n| value.call(n)`. A `Callable` held in a FIELD is
+/// called through the field, `(a.b)(c)` — a bare `a.b(c)` is method lookup,
+/// the same rule a closure-valued field already has.
+trait Callable {}
+
 trait Add<B = Self> {
 	fun add(self, b: B): Self {
 		panic("not implemented yet")

@@ -114,9 +114,10 @@ const MIN_FRAGMENT: usize = 8;
 /// enumeration finds the composing literal at its own site.
 const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[(
     "291",
-    "`{headline}{subject}: {}` — const evaluation's failure envelope; the two \
+    "`{headline}{subject}: {}{}` — const evaluation's failure envelope; the two \
      headlines (`const evaluation failed`, `const evaluation did not finish \
-     within the compile-time budget`) are separate literals in `const_eval.rs`",
+     within the compile-time budget`) are separate literals in `const_eval.rs`, \
+     and G24's `const let` steer is a third",
 )];
 
 /// Rows the enumeration cannot reach, ROWED BY HAND, with why the walk does
@@ -279,7 +280,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 42;
+const RULE_STATEMENT_SITES: usize = 43;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -334,6 +335,11 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "crates/vilan-core/src/parsing.rs",
         "CSS_PSEUDO_CLASS_IS_DOTTED",
         "a `css` block writes a pseudo-class as a DOTTED rule:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "CONST_HAS_NO_MUTATION",
+        "a compile-time value has no runtime mutation:",
     ),
     (
         "crates/vilan-core/src/parsing.rs",

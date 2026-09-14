@@ -951,7 +951,7 @@ fn imported_symbols(imports: &[String]) -> Vec<String> {
 /// (a local shadowing a global is counted too), which is the safe direction:
 /// the extra name is bound from the registry and then shadowed, costing one
 /// declaration and never a missing one.
-fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>) {
+pub(crate) fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>) {
     for node in nodes {
         collect_reference(node, out);
     }
@@ -2306,6 +2306,17 @@ struct Transformer<'src> {
     // instead of re-evaluating: a compound assignment's INDEXED target subscript,
     // walked once for the write and once for the synthesized re-read (B105).
     hoisted_values: HashMap<Id, js::Node<'src>>,
+    /// G24: while a closure SNAPSHOT is being written out, the compile-time
+    /// value each binding it closed over held — substituted wherever the body
+    /// reads one, so the emitted arrow carries literals instead of names it
+    /// could not resolve at runtime. Empty outside a snapshot, and SCOPED (a
+    /// nested snapshot extends it and restores on the way out).
+    const_capture_values: HashMap<Id, js::Node<'src>>,
+    /// G24: the snapshot bodies currently being written out. A `const let`'s
+    /// initializer IS its own result's site, so walking the closure would find
+    /// the snapshot again; this is what makes the body's one emission
+    /// terminate.
+    emitting_snapshots: HashSet<Id>,
     // While `Some`, every `is_bindings` lookup records the capture it resolved.
     // A match guard is walked with this on, so the leg's lowering can tell
     // whether the guard READS a capture whose copy has to be declared ahead of
@@ -2693,6 +2704,8 @@ impl<'src> Transformer<'src> {
             monomorphized: Vec::new(),
             is_bindings: HashMap::default(),
             hoisted_values: HashMap::default(),
+            const_capture_values: HashMap::default(),
+            emitting_snapshots: HashSet::default(),
             is_binding_reads: None,
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
@@ -2979,6 +2992,7 @@ impl<'src> Transformer<'src> {
                     parameters: Vec::new(),
                     body: t_main_fn_body,
                     is_async: true,
+                    origin: None,
                 })),
                 Vec::new(),
             );
@@ -3015,6 +3029,7 @@ impl<'src> Transformer<'src> {
                             ),
                         ],
                         is_async: false,
+                        origin: None,
                     })],
                 )]
             } else {
@@ -3072,6 +3087,7 @@ impl<'src> Transformer<'src> {
                     parameters: Vec::new(),
                     body: vec![js::Node::Return(Box::new(getter_body))],
                     is_async: false,
+                    origin: None,
                 });
                 hmr_expose.push(js::Node::Call(
                     Box::new(js::Node::Local("__hmr_expose".to_string())),
@@ -3536,6 +3552,7 @@ impl<'src> Transformer<'src> {
                     parameters: vec![js::Parameter { name: parameter }],
                     body: closure_body,
                     is_async: false,
+                    origin: None,
                 }),
             ],
         )
@@ -4061,7 +4078,118 @@ impl<'src> Transformer<'src> {
         )
     }
 
+    /// A const RESULT as emitted code (const-eval.md §1, §11). Plain data
+    /// serializes; G24's closure snapshot is the closure's own body, walked
+    /// here by the REAL emitter with its captured compile-time values
+    /// substituted for the bindings it closed over — so the arrow the program
+    /// gets is the one the program wrote, monomorphized and named like every
+    /// other, with `0.25` where `rem` stood.
+    ///
+    /// The substitution is a SCOPE, not a replacement: a snapshot nested
+    /// inside another (a closure returned from a closure) keeps the outer
+    /// captures in force while the inner is emitted.
+    fn const_value_node(
+        &mut self,
+        value: &ConstValue,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let ConstValue::Callable { body, captures } = value else {
+            return const_value_to_js(value);
+        };
+        let saved = self.const_capture_values.clone();
+        for (name, captured) in captures {
+            // The capture is keyed by the CONST WORLD's name for the binding.
+            // The real emission resolves it through the table that world
+            // handed the program; the const world itself — which is where a
+            // `const let` snapshot is written into a LATER site's prelude, and
+            // which runs before that table exists — resolves it through its
+            // own generator, where the name came from.
+            let binding = if self.program.const_snapshot_bindings.is_empty() {
+                self.ng.binding_named(name)
+            } else {
+                self.program.const_snapshot_bindings.get(name).copied()
+            };
+            let Some(binding) = binding else {
+                continue;
+            };
+            let node = self.const_value_node(captured, block);
+            self.const_capture_values.insert(binding, node);
+        }
+        // The closure's own initializer IS this result's site, so the
+        // const-results short-circuit in `walk_entity_inner` would hand back
+        // the snapshot again. Suspend it for exactly this id while its body
+        // is written out.
+        let reentered = self.emitting_snapshots.insert(*body);
+        let node = self.walk_entity(*body, block).unwrap_or(js::Node::Void);
+        if reentered {
+            self.emitting_snapshots.remove(body);
+        }
+        self.const_capture_values = saved;
+        node
+    }
+
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        let node = self.walk_entity_seams(id, block)?;
+        // B340 Q1: a `Callable` value in a closure-typed position. A struct is
+        // a plain JS array — it cannot be applied — so the coercion IS the
+        // wrapping closure, built here around the finished value so the copy
+        // seams below have already run on the receiver. Outermost on purpose:
+        // what the position receives is the function, and what the function
+        // closes over is whatever the seams decided the value is.
+        if let Some(&(arity, type_id)) = self.program.callable_coercions.get(&id) {
+            if let Some(wrapped) = self.wrap_callable_coercion(type_id, arity, node.clone()) {
+                return Some(wrapped);
+            }
+            return Some(node);
+        }
+        Some(node)
+    }
+
+    /// The wrapping closure a recorded `Callable` coercion lowers to (B340 Q1):
+    /// `(a, b) => <call>(<value>, a, b)`, with `call` resolved against the
+    /// value's own type through the same dispatch every method call uses — so a
+    /// coerced `Callable` and a written `x.call(a, b)` reach the same emitted
+    /// member, including a generic impl's instance.
+    ///
+    /// `None` when `call` does not resolve: the analyzer admitted the coercion,
+    /// so that cannot happen for a program that compiled, and falling back to
+    /// the bare value keeps a compiler bug a wrong answer rather than a panic.
+    fn wrap_callable_coercion(
+        &mut self,
+        type_id: TypeId,
+        arity: usize,
+        value: js::Node<'src>,
+    ) -> Option<js::Node<'src>> {
+        let parameters: Vec<js::Parameter> = (0..arity)
+            .map(|_| js::Parameter {
+                name: self.ng.next_name(),
+            })
+            .collect();
+        let mut arguments = Vec::with_capacity(arity + 1);
+        arguments.push(value);
+        arguments.extend(
+            parameters
+                .iter()
+                .map(|parameter| js::Node::Local(parameter.name.clone())),
+        );
+        let dispatch = self.resolve_dispatch_with(type_id, "call", &[], None)?;
+        let call = self.emit_dispatch(dispatch, arguments, None);
+        Some(js::Node::Closure(js::Closure {
+            parameters,
+            body: vec![js::Node::Return(Box::new(call))],
+            is_async: false,
+            origin: None,
+        }))
+    }
+
+    /// [`Self::walk_entity`] without B340's coercion wrap: the value itself,
+    /// through the ownership seams (a lifted resource temporary, a scalar view
+    /// read, a return-position copy).
+    fn walk_entity_seams(
+        &mut self,
+        id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
         // C11 (`temporary-drop.md`): a resource value that is neither bound nor
         // moved is owned by its STATEMENT. It has no name of its own, so it is
@@ -4107,8 +4235,10 @@ impl<'src> Transformer<'src> {
         // in-place serialization (const-eval.md §1). The const world itself is
         // lowered with the results map still empty for the expression being
         // evaluated, so this arm never short-circuits an evaluation.
-        if let Some(value) = self.program.const_results.get(&id) {
-            return Some(const_value_to_js(value));
+        if !self.emitting_snapshots.contains(&id)
+            && let Some(value) = self.program.const_results.get(&id).cloned()
+        {
+            return Some(self.const_value_node(&value, block));
         }
         // An expression already evaluated into a temp (B105) names the temp: the
         // whole point is that the second occurrence does not run it again.
@@ -4139,6 +4269,7 @@ impl<'src> Transformer<'src> {
                     }],
                     body,
                     is_async: false,
+                    origin: None,
                 });
                 js::Node::Call(
                     Box::new(js::Node::Property(Box::new(source), "map".to_string())),
@@ -4203,6 +4334,11 @@ impl<'src> Transformer<'src> {
                 self.variant_value(*enum_id, *variant_index, Vec::new())
             }
             Expr::Local(id) => {
+                // G24: inside a snapshot's body, a binding the closure closed
+                // over IS its compile-time value — baked, not read.
+                if let Some(captured) = self.const_capture_values.get(id) {
+                    return Some(captured.clone());
+                }
                 self.referenced_globals.insert(*id);
                 // A capture from an `is` test aliases the subject's payload slot.
                 if let Some(accessor) = self.is_bindings.get(id) {
@@ -4535,6 +4671,7 @@ impl<'src> Transformer<'src> {
                                     parameters: Vec::new(),
                                     body: vec![js::Node::Throw(Box::new(message))],
                                     is_async: false,
+                                    origin: None,
                                 })),
                                 Vec::new(),
                             ));
@@ -4721,6 +4858,8 @@ impl<'src> Transformer<'src> {
                             .current_instance
                             .as_ref()
                             .is_some_and(|instance| instance.async_closures.contains(closure_id)),
+                    // G24: the one arrow a `const` result can BE.
+                    origin: Some(*closure_id),
                 })
             }
             // `async <body>` — the spawn: `__task(async () => { <body> },
@@ -4819,6 +4958,7 @@ impl<'src> Transformer<'src> {
                                 parameters: vec![js::Parameter { name: parameter }],
                                 body: closure_body,
                                 is_async: false,
+                                origin: None,
                             }),
                         ],
                     ));
@@ -5390,6 +5530,7 @@ impl<'src> Transformer<'src> {
                         parameters: Vec::new(),
                         body: thunk_block,
                         is_async: false,
+                        origin: None,
                     });
                     let callee = match hmr_binding.form {
                         TransferForm::Value => "__hmr_adopt",
@@ -10385,6 +10526,13 @@ fn const_value_to_js<'src>(value: &ConstValue) -> js::Node<'src> {
                     .collect(),
             )],
         ),
+        // G24's snapshot is not serialized: it is the closure's own body,
+        // WALKED, with the captures substituted for its free bindings — which
+        // needs the emitter and so lives on [`Transformer::const_value_node`].
+        // Every caller goes through that method; this arm exists because the
+        // match must be total, and emitting `void 0` for a value nothing can
+        // reach here keeps a compiler bug a wrong answer rather than a panic.
+        ConstValue::Callable { .. } => js::Node::Void,
     }
 }
 
@@ -10486,6 +10634,23 @@ pub struct ConstSite<'a> {
 }
 
 impl<'src> ConstWorld<'src> {
+    /// G24: every name this world's emitter has handed an entity, inverted.
+    ///
+    /// A snapshot's captures arrive keyed by THIS world's generated names —
+    /// the interpreter sees names, not entities — and the real emission's
+    /// names are its own. This is the one table that joins them, handed to the
+    /// program beside the results so the emitter can turn "the value bound to
+    /// `$c` here" into "the value bound to this binding", which it can then
+    /// substitute under its own naming.
+    pub fn emitted_binding_names(&self) -> HashMap<String, Id> {
+        self.transformer
+            .ng
+            .names
+            .iter()
+            .map(|(id, name)| (name.clone(), *id))
+            .collect()
+    }
+
     pub fn new(program: &'src Program<'src>, options: &BuildOptions) -> Self {
         let seed = ConstProgramSeed::build(program, options);
         let mut transformer = Transformer::with_name_seed(program, options, seed.names.clone());
@@ -10562,10 +10727,18 @@ impl<'src> ConstWorld<'src> {
                 if let Some(value) = variable
                     .initial
                     .and_then(|initial| const_values.get(&initial))
+                    .cloned()
                 {
+                    // G24: a snapshot in the prelude is written out the same
+                    // way it is written into the program — the closure's body
+                    // with its captures baked — so a later `const` expression
+                    // can CALL a `const let` closure.
+                    let mut scratch = Vec::new();
+                    let node = transformer.const_value_node(&value, &mut scratch);
+                    prelude.extend(scratch);
                     prelude.push(js::Node::ConstVariable(js::Variable {
                         name,
-                        value: Box::new(const_value_to_js(value)),
+                        value: Box::new(node),
                     }));
                     continue;
                 }
@@ -10956,6 +11129,15 @@ pub mod js {
         pub parameters: Vec<Parameter>,
         pub body: Vec<Node<'src>>,
         pub is_async: bool,
+        /// G24: the CLOSURE ENTITY this arrow was emitted from, when it was
+        /// emitted from one. A const evaluation that yields a closure yields
+        /// the const world's lowering of it, whose generated names are that
+        /// world's and not the real emission's — so the snapshot stored for
+        /// the transformer is this id plus the captured values, and the real
+        /// emitter walks the entity itself. `None` for every arrow the
+        /// emitter synthesizes (a getter, a thunk, a `__task` body), none of
+        /// which any program can hold as a `const` result.
+        pub origin: Option<crate::id::Id>,
     }
 }
 
@@ -11261,6 +11443,17 @@ impl NameGenerator {
     /// "unavailable".
     fn is_taken(&self, name: &str) -> bool {
         self.seed.reserved.contains(name) || self.minted.contains(name)
+    }
+
+    /// The entity this generator handed `name` to, if any — the inverse of
+    /// [`NameGenerator::name_for`], for G24's snapshot captures (which arrive
+    /// keyed by name and must be substituted by entity). Linear in the names
+    /// minted, and asked once per capture of one snapshot.
+    fn binding_named(&self, name: &str) -> Option<Id> {
+        self.names
+            .iter()
+            .find(|(_, minted)| minted.as_str() == name)
+            .map(|(id, _)| *id)
     }
 
     fn name_for(&mut self, id: Id) -> String {

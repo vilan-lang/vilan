@@ -184,6 +184,7 @@ spec/const.md h2 92-the-const-environment
 spec/const.md h2 93-failure-and-resource-limits
 spec/const.md h2 94-results
 spec/const.md h2 95-inferred-const
+spec/const.md h2 96-const-let-and-const-fun
 spec/contexts.md h1 spec-8--contexts
 spec/contexts.md h2 81-the-model
 spec/contexts.md h2 82-reads-strict-and-safe
@@ -446,6 +447,7 @@ std/traits.md h2 stdcompare
 std/traits.md h2 stddefault
 std/traits.md h2 stdoperators-the-operator-traits
 std/traits.md h2 stdoperators-try-and-lift
+std/traits.md h2 stdoperators-callable
 tour/async.md h1 async
 tour/async.md h2 opting-out-of-waiting-async-and-await
 tour/async.md h2 async-closures

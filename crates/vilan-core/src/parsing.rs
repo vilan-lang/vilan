@@ -269,6 +269,18 @@ const CSS_BLOCK_IS_BRACE_INITIAL: &str = "a `css { … }` block is brace-initial
 const CSS_ITEM_EXPECTED: &str = "a declaration (`property: value;`), a nested rule (`.name { … }`) or a chain link \
      (`.name();`)";
 
+/// The rule `const mut` breaks (G24). Curated (diagnostics-standard.md B6):
+/// the prohibition explains itself and names both sanctioned spellings.
+///
+/// `const let` and `const fun` are the two compile-time declarations; `const
+/// mut` reads as "a mutable compile-time binding", which is a contradiction —
+/// the value IS the build's, there is no runtime storage for a mutation to
+/// land in, and anything that wanted one wanted a runtime `mut` seeded from a
+/// `const` expression.
+const CONST_HAS_NO_MUTATION: &str = "a compile-time value has no runtime mutation: `const let` binds a value the BUILD \
+     computes, and there is nowhere for a later write to go. Write `const let` for the \
+     compile-time binding, or `mut name = const ..;` for a runtime binding seeded from one";
+
 /// The rule a CSS pseudo-class written CSS-style breaks (tracker E153).
 /// Curated (diagnostics-standard.md B6): the prohibition explains itself and
 /// names the sanctioned spelling.
@@ -2245,6 +2257,13 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_statement`]'s body, past the depth bound.
     fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
+        // G24's `const let` / `const fun` / `const mut`, ahead of everything:
+        // `const` begins no other statement, and the expression fork below
+        // would otherwise read `const let` as its prefix over a `let`
+        // expression and `const fun` as a missing expression.
+        if let Some(item) = self.attempt(Self::parse_const_declaration) {
+            return Some(item);
+        }
         if let Some(item) = self.attempt(Self::parse_derived_item) {
             return Some(item);
         }
@@ -4651,6 +4670,73 @@ impl<'a, 'src> Parser<'a, 'src> {
             pattern => Node::LetDestructure((pattern, pattern_span), type_, value, mutable),
         };
         Some((node, self.span_from(start)))
+    }
+
+    /// G24 — the `const` DECLARATION forms, read at STATEMENT position before
+    /// the expression grammar sees `const` as its weak-precedence prefix:
+    /// `const let NAME[: T] = EXPR;`, `const fun NAME(..) { .. }`, and `const
+    /// mut`, which is refused.
+    ///
+    /// `None` for anything else after `const` — a plain `const <expr>` is the
+    /// prefix `parse_expression` has always read, and the statement funnel
+    /// falls through to it unchanged. Declaration position is the whole of the
+    /// restriction: `const let` is a statement, not a sub-expression, which is
+    /// what makes "module level AND locally" (R3) the complete answer to where
+    /// it may be written.
+    ///
+    /// Both forms keep the shape `Node::Const(<declaration>)`. The analyzer's
+    /// `const` arm FORWARDS its inner node, so the binding and the item walk
+    /// exactly as a plain `let` and a plain `fun` do, and what the marker adds
+    /// — the initializer evaluated at build time, the body capability-checked
+    /// at its declaration — is recorded beside the entity rather than spelled
+    /// as a second AST.
+    fn parse_const_declaration(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.peek_is(&Token::Const) {
+            return None;
+        }
+        let start = self.position;
+        match self.peek_at(1) {
+            Some(Token::Let) => {
+                self.bump();
+                let declaration = self.parse_let()?;
+                self.eat_declaration_terminator()?;
+                Some((Node::Const(Box::new(declaration)), self.span_from(start)))
+            }
+            // `const mut` is refused and then RECOVERED as the runtime `mut`
+            // it spells, so the rest of the file parses and the author gets
+            // one diagnostic rather than a cascade. The error survives the
+            // statement funnel's `attempt` because this arm returns `Some`.
+            Some(Token::Mut) => {
+                let context = self.context_stack.clone();
+                self.errors.push(ParseError {
+                    span: self.here_span(),
+                    reason: ParseErrorReason::Rule(CONST_HAS_NO_MUTATION),
+                    context,
+                    hint: None,
+                });
+                self.bump();
+                let declaration = self.parse_let()?;
+                self.eat_declaration_terminator()?;
+                Some(declaration)
+            }
+            Some(Token::Fun) => {
+                self.bump();
+                let declaration = self.parse_function()?;
+                Some((Node::Const(Box::new(declaration)), self.span_from(start)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `;` a `const let` owes, with the statement funnel's own recovery
+    /// note on a miss — the funnel's terminator handling belongs to the
+    /// expression fork this form no longer travels through.
+    fn eat_declaration_terminator(&mut self) -> Option<()> {
+        if self.eat_ctrl(';') {
+            return Some(());
+        }
+        self.note_terminator();
+        None
     }
 
     /// An assignment: `(*)? place op value`, where `place` is the struct-free

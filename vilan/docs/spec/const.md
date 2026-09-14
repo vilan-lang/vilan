@@ -212,3 +212,45 @@ computation where a stack trace can show it; `release` does. Folding is
 deterministic — the same source folds identically on every build — and
 the language server never runs the pass, since it produces nothing to
 report.
+
+## 9.6 `const let` and `const fun`
+
+Two **declarations** carry the keyword. Both are statements — module
+level or inside a body — and both are ordinary declarations otherwise.
+
+`const let NAME[: T] = EXPR;` binds a value the **build** computes. It
+is `let NAME = const EXPR;` with one addition: its result may be a
+**closure over compile-time data**, which §9.4's plain-data rule
+refuses everywhere else. Later `const` expressions call through it, and
+runtime code gets the closure's own body with the captured values baked
+in — one emitted arrow, no wrapper:
+
+```vilan
+const fun scale_step(rem: f64): |f64| f64 {
+	|n: f64| rem * n
+}
+
+const let space = scale_step(0.25);
+
+fun main() {
+	print(const space(2f));   // 0.5 — folded at build time
+	print(space(8f));         // 2   — `(n) => 0.25 * n`, emitted once
+}
+```
+
+`const mut` is refused: a compile-time value has no runtime mutation.
+Write `const let` for the compile-time binding, or `mut name = const
+..;` for a runtime binding seeded from one.
+
+`const fun NAME(..) { .. }` declares a function whose body is
+**const-evaluable, checked here**. Reaching a host capability (§9.2) is
+an error at the declaration, naming the capability, instead of at
+whichever `const` expression first tried to fold a call to it. This is
+**not** a colouring requirement: a plain `fun` is still const-callable
+under §9.2's transitive rule, and a `const fun` is still an ordinary
+function at runtime, called with runtime arguments.
+
+A `const` expression that reads a plain binding, and a `let x = const
+..` whose result is a closure, are both refused — and both refusals
+name `const let` as the declaration that admits what was wanted. The
+editor offers the edit as a quick fix.

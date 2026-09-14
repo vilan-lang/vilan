@@ -322,7 +322,7 @@ row	flagship	key
 288	flagship	this `const` expression reaches `{name}`, whose value is not compile-time-known
 289	flagship	{name} is compile-time-only; evaluate this call inside a `const` expression
 290	flagship	{subject} is compile-time-only; call it directly inside a `const` expression — a compile-time-only function has no runtime value form
-291	-	{headline}{subject}: {}
+291	-	{headline}{subject}: {}{}
 292	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
 293	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
 294	-	the `macro_std` package was not found beside `std`
@@ -510,3 +510,6 @@ row	flagship	key
 485	-	within(..) guards on ONE ancestor and was given another guard — a grandparent chain is a selector this version does not spell; guard on the ancestor that identifies the state
 486	-	within(..) guards on an ancestor's own condition and was given a child relation — children() and divide() say where a rule REACHES, not what an ancestor matches, so they belong beside the guard in the set: .on(within(attribute(name)) + children(), ..)
 487	-	within(..) guards on an ancestor and was given a pseudo-element — `::selection` is a piece of a box CSS paints, never an element something can be inside of; guard on an attribute or a pseudo-class
+488	-	implementing `Callable` requires a `call` method: `{rendered}` declares none, so `value(..)` has nothing to resolve to. The marker carries no signature of its own — write the arity and the types you mean (`fun call(self, ..): ..`), here or in an `impl {rendered}` of its own
+489	-	{base}; it declares a `call` method but does not implement `Callable` — write `impl {rendered} with Callable` to call it as a function
+490	-	`{name}` is declared `const fun`, but its body reaches {capability}, which has no compile-time answer: a `const fun` promises its body is const-evaluable, and that promise is checked here rather than at a call site. Drop the `const` to keep an ordinary function, or move the capability out of the body

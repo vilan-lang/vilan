@@ -150,3 +150,57 @@ tax.map(|t| p + t))` above — so short-circuiting and laziness are whatever
 your `and_then` does with the closure it is handed. Every receiver in one
 expression must be the same container; a type with a `map` but no `Lift` is
 refused, and a missing `map`/`and_then` is named in the error.
+
+## std::operators: `Callable`
+
+`Callable` is the opt-in marker for the **call operator**: a value whose
+type implements it is called like a function, and `value(args)` resolves
+as the method `call` on it.
+
+```vilan,fragment
+trait Callable {}                       // opt-in marker for value(args)
+```
+
+The marker declares no members. The `call` method the impl writes carries
+the arity and the types, so everything the call checks — argument count,
+argument types, generic binding, a `context` clause — is the ordinary
+method check, and `value(args)` and `value.call(args)` are the same call:
+
+```vilan
+import std::operators::Callable;
+
+struct Scale {
+	unit: f64,
+}
+
+impl Scale with Callable {
+	fun call(self, n: f64): f64 {
+		self.unit * n
+	}
+}
+
+fun main() {
+	let space = Scale { unit = 0.25 };
+	print(space(2f));             // 0.5
+	print(space.call(2f));        // 0.5 — the same call
+	let step: |f64| f64 = space;  // a Callable coerces into a closure slot
+	print(step(8f));              // 2
+}
+```
+
+Three rules complete it:
+
+- **`impl T with Callable` must give `T` a `call` method** — here or in a
+  separate `impl T` block. The marker alone calls nothing, and the refusal
+  is at the impl rather than at every call site.
+- **A `call` method without the marker stays an ordinary method.** Calling
+  such a value is refused, with the impl named as the fix.
+- **A `Callable` in a FIELD is called through the field** — `(a.b)(c)`,
+  never `a.b(c)`, which is method lookup. This is the rule a closure-valued
+  field already has, for the same reason.
+
+A `Callable` value also **coerces wherever a function declaration does**
+(`let f: |f64| f64 = space;`, `list.map(space)`): the slot takes it, and it
+is lowered as the wrapping closure `|n| space.call(n)`. A struct TYPE name
+is not a value, so `Scale(0.25)` is still the construction refusal it
+always was.

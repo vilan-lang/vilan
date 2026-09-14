@@ -857,6 +857,7 @@ pub fn post_analysis_passes(
     program.const_input_files = evaluated.input_files;
     program.const_bundled_files = evaluated.bundled;
     program.const_facts = evaluated.facts;
+    program.const_snapshot_bindings = evaluated.snapshot_bindings;
     for (error, source) in evaluated.errors {
         program.push_diagnostic(error, source);
     }

@@ -3094,6 +3094,14 @@ pub struct Analyzer<'src> {
     /// span indexes into — the check runs after `build()`, where nothing else
     /// can say (B112).
     drop_impls_to_check: Vec<(TypeId, Span, Id, Option<Id>)>,
+    /// B340: every `impl … with Callable` block, recorded during conformance
+    /// and checked post-build (`check_callable_impls`) — the marker alone
+    /// calls nothing, so the subject must provide `call` somewhere. Recorded
+    /// rather than checked in place because a `call` written in a SEPARATE
+    /// inherent block is a legal spelling, and `implementations` is only
+    /// complete once the world has resolved. `(subject, the impl's span, the
+    /// impl's id, whether THIS block declared `call`)`.
+    callable_impls_to_check: Vec<(TypeId, Span, Id, bool)>,
     /// A resource type's own `drop(&mut self)` method (destruction.md §5), keyed
     /// on the subject's NOMINAL id (struct/enum id, not `TypeId` — the same
     /// nominal type interns to several `TypeId`s, and generics share one `drop`
@@ -3870,6 +3878,14 @@ pub struct Analyzer<'src> {
     // from the return type the way a `let v: R = ..` annotation does, even when a
     // `match` sits between the call and the signature.
     expected_types: HashMap<Id, TypeId>,
+    /// B340 Q1: every expression a `Callable` value coerces to a closure at —
+    /// the expression's own id, and the arity of `call` — recorded where the
+    /// value's type and its position's expectation are both in hand
+    /// (`infer_type_inner`). The transformer lowers each as the wrapping
+    /// closure `|a, b| value.call(a, b)`; a struct is a plain JS array, so the
+    /// wrap is the whole of the coercion's runtime cost and it is paid only
+    /// where one was actually written.
+    callable_coercions: HashMap<Id, (usize, TypeId)>,
     prepped_static_accessors: Vec<(Id, TypeId, &'src str)>,
     // A qualified-generic static subject's impl-binder bindings
     // (`Boxy<i32>::make` -> {impl's T -> i32}), keyed by the accessor expr id.
@@ -4350,6 +4366,18 @@ pub struct Analyzer<'src> {
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
+    /// G24: the INITIALIZER expression of every `const let NAME = EXPR;`, a
+    /// subset of `const_exprs`. The binding is an ordinary `let` whose value
+    /// the build computes; what the marker adds over `let x = const e` is the
+    /// CLOSURE admission (`const-eval.md` §11: plain data, or a closure over
+    /// plain data), and this set is what tells the two forms apart at the
+    /// result check — and what the steer on the other form points at.
+    const_let_initializers: HashSet<Id>,
+    /// G24: every `const fun` declaration, by function entity id. The body is
+    /// run through the const capability check AT THE DECLARATION rather than
+    /// at a distant call site; the function is otherwise an ordinary `fun`,
+    /// callable at runtime with runtime arguments.
+    const_functions: HashSet<Id>,
     // The phase-1 walk's recursion depth against `WALK_DEPTH_LIMIT` (B138),
     // and whether the bound already refused once — one diagnostic per
     // analysis, not one per refused sibling subtree.
@@ -4365,6 +4393,12 @@ pub struct Analyzer<'src> {
     result_enum_id: Option<Id>,
     try_trait_id: Option<Id>,
     lift_trait_id: Option<Id>,
+    /// The std `Callable` marker (B340), resolved by identity from
+    /// `std::operators` after loading. `x(args)` on a receiver whose type
+    /// implements it resolves as the method `call`; keyed on the real std
+    /// entity, so a user's own `trait Callable` (a different id) never
+    /// makes a value callable.
+    callable_trait_id: Option<Id>,
     // The std `dev::stash`/`dev::take` functions (`hmr.md` §4), resolved by
     // identity from `std::dev` after loading. Their generic `T` carries a value
     // across a hot swap, so the call site is checked against the transfer bound
@@ -4682,9 +4716,15 @@ fn item_visibility<'a, 'src>(item: &'a Spanned<Node<'src>>) -> (Visibility<'src>
                 };
                 node = &inner.0;
             }
+            // G24: `const let` / `const fun` is an ITEM under a marker, exactly
+            // as `export` is — so a module's importable rows name it and the
+            // completion filter offers it. A `const` over a plain EXPRESSION
+            // peels to the expression, which names no item and is skipped by
+            // the row builder like any other statement.
             Node::Derive(_, inner)
             | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner) => node = &inner.0,
+            | Node::MacroAttribute(_, _, _, inner)
+            | Node::Const(inner) => node = &inner.0,
             _ => return (visibility, node),
         }
     }
@@ -4824,7 +4864,8 @@ fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
     while let Node::Export(_, inner)
     | Node::Derive(_, inner)
     | Node::Service(_, inner)
-    | Node::MacroAttribute(_, _, _, inner) = node
+    | Node::MacroAttribute(_, _, _, inner)
+    | Node::Const(inner) = node
     {
         node = &inner.0;
     }
@@ -5031,6 +5072,12 @@ fn operator_trait_method(op: BinaryOp) -> Option<(&'static str, &'static str)> {
         _ => None,
     }
 }
+
+/// The member the CALL OPERATOR resolves to (B340): `x(args)` on a receiver
+/// whose type implements `std::operators::Callable` is `x.call(args)`. Named
+/// once here so the resolver, the impl-completeness refusal and the steer on
+/// the ordinary "not callable" message cannot drift apart.
+const CALL_OPERATOR_MEMBER: &str = "call";
 
 /// The method an operator trait REQUIRES of an impl, by trait name — the one
 /// the use-site refusal already names ("add `impl P with Add` providing
@@ -5291,6 +5338,7 @@ impl<'src> Analyzer<'src> {
             diagnostics: Vec::new(),
             wire_names: HashSet::default(),
             drop_impls_to_check: Vec::new(),
+            callable_impls_to_check: Vec::new(),
             drop_method_checks: Vec::new(),
             view_suspension_checks: ViewSuspensionChecks::default(),
             wire_types_to_check: Vec::new(),
@@ -5459,6 +5507,7 @@ impl<'src> Analyzer<'src> {
             method_call_substitution: HashMap::default(),
             supertrait_self_at_call: HashMap::default(),
             expected_types: HashMap::default(),
+            callable_coercions: HashMap::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
             impl_body_subjects: HashMap::default(),
@@ -5539,12 +5588,15 @@ impl<'src> Analyzer<'src> {
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
+            const_let_initializers: HashSet::default(),
+            const_functions: HashSet::default(),
             walk_depth: 0,
             walk_depth_refused: false,
             option_enum_id: None,
             result_enum_id: None,
             try_trait_id: None,
             lift_trait_id: None,
+            callable_trait_id: None,
             hmr_stash_fn_id: None,
             hmr_take_fn_id: None,
             drop_trait_id: None,
@@ -7106,6 +7158,34 @@ impl<'src> Analyzer<'src> {
         })
     }
 
+    /// Whether the CALL OPERATOR reaches a value of this type (B340): its type
+    /// implements the std `Callable` marker, so `x(args)` resolves as the method
+    /// `call` on it — the ordinary method path, with `call`'s own arity, types,
+    /// generics and context clauses. Keyed on the resolved std entity, so a
+    /// user's own `trait Callable` (a different id) makes nothing callable, and
+    /// `false` whenever `std::operators` is not loaded.
+    fn type_is_callable(&self, subject_type: &Type) -> bool {
+        self.callable_trait_id
+            .is_some_and(|trait_id| self.type_implements_trait(subject_type, trait_id))
+    }
+
+    /// Whether this type declares a `call` member anywhere — an inherent block
+    /// or any trait impl. The evidence behind B340's two diagnostics: the impl
+    /// refusal (a `Callable` with no `call`) and the steer on the ordinary "not
+    /// callable" message (a `call` with no `Callable`).
+    fn declares_call_member(&self, subject_type: &Type) -> bool {
+        self.implementations.iter().any(|implementation| {
+            implementation
+                .declarations
+                .contains_key(CALL_OPERATOR_MEMBER)
+                && self.compare_type(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+        })
+    }
+
     /// The declared name of a derivable struct/enum item (a struct needs a body —
     /// a bodyless `external struct` has no fields to check), or `None` for
     /// anything else. Shared by the derive collectors.
@@ -7469,6 +7549,44 @@ impl<'src> Analyzer<'src> {
                 }
                 self.drop_method_checks.push((function_id, span, rendered));
             }
+        }
+    }
+
+    /// B340: `impl T with Callable` must give `T` a `call` method. The marker
+    /// declares nothing of its own — the arity and the types are the impl's —
+    /// so an impl without one is a type the call operator reaches and cannot
+    /// resolve, and the refusal at the IMPL is the only place that says so
+    /// once instead of at every call site.
+    ///
+    /// `call` counts wherever it is declared: this block, a separate inherent
+    /// block, or another trait's impl. Post-build, so `implementations` is
+    /// complete however the author spread the type's members out.
+    fn check_callable_impls(&mut self) {
+        let checks = std::mem::take(&mut self.callable_impls_to_check);
+        for (subject_type_id, span, impl_id, declares_call) in checks {
+            if declares_call {
+                continue;
+            }
+            let subject_type = subject_type_id.get_type(self);
+            if self.declares_call_member(&subject_type) {
+                continue;
+            }
+            let rendered = self.pretty_print_type(&subject_type, &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "implementing `Callable` requires a `call` method: `{rendered}` \
+                         declares none, so `value(..)` has nothing to resolve to. The marker \
+                         carries no signature of its own — write the arity and the types you \
+                         mean (`fun call(self, ..): ..`), here or in an `impl {rendered}` of \
+                         its own"
+                    ),
+                },
+                impl_id,
+            );
         }
     }
 
@@ -17842,11 +17960,21 @@ impl<'src> Analyzer<'src> {
                 .map(|field| field.type_id)
         })?;
         match field_type_id.get_type(self) {
-            Type::Closure(..) => Some(format!(
-                "; `{member_name}` is a field holding a closure: parenthesize the field \
-                 access to call it, `(x.{member_name})()` (a bare `.{member_name}()` only \
-                 looks up methods)"
-            )),
+            // B340 Q2: a field holding a `Callable` is called exactly as a
+            // field holding a closure is — `(a.b)(c)` — because `a.b(c)` is
+            // method lookup whatever the field holds. One rule, so one steer:
+            // the sentence names both value forms rather than growing a second
+            // message that says the same thing about the same mistake.
+            field_type
+                if matches!(field_type, Type::Closure(..))
+                    || self.type_is_callable(&field_type) =>
+            {
+                Some(format!(
+                    "; `{member_name}` is a field holding a closure or a `Callable`: \
+                     parenthesize the field access to call it, `(x.{member_name})()` (a bare \
+                     `.{member_name}()` only looks up methods)"
+                ))
+            }
             field_type => {
                 let field_label = self.pretty_print_type(&field_type, &HashMap::default());
                 Some(format!(
@@ -27145,6 +27273,49 @@ impl<'src> Analyzer<'src> {
         id
     }
 
+    /// G24 — `const let NAME[: T] = EXPR;`. The binding walks as an ordinary
+    /// `let`, and its INITIALIZER is marked const: `const let x = e;` folds
+    /// exactly as `let x = const e;` does, which is what makes the binding
+    /// compile-time-known to every later `const` expression (`classify`
+    /// already answers `Known::Const` for a binding whose initializer is
+    /// marked). The mark is recorded a second time in `const_let_initializers`
+    /// so the result check can admit a CLOSURE here and refuse one there.
+    ///
+    /// A destructuring `const let (a, b) = e;` marks the same expression — the
+    /// value the pattern takes apart — so the two spellings fold alike.
+    fn walk_const_let(&mut self, declaration: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        let id = self.walk_expr_node(declaration, scope_id);
+        let initializer = self
+            .variables
+            .get(&id)
+            .and_then(|variable| variable.initial)
+            .or_else(|| match self.expr_id_to_expr_map.get(&id) {
+                Some(Expr::Destructure(value_id, _)) => Some(*value_id),
+                _ => None,
+            });
+        if let Some(initializer) = initializer {
+            self.const_exprs.push(initializer);
+            self.const_let_initializers.insert(initializer);
+        }
+        id
+    }
+
+    /// G24 — `const fun NAME(..) { .. }`. An ordinary function declaration
+    /// plus a recorded promise: its body is const-evaluable, checked at THIS
+    /// declaration rather than wherever someone first tries to fold a call to
+    /// it. Not a colouring requirement — a plain `fun` stays const-callable
+    /// (`const-eval.md` §1's Zig-shaped rule), and a `const fun` stays
+    /// runtime-callable with runtime arguments.
+    fn walk_const_fun(&mut self, declaration: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        let id = self.walk_expr_node(declaration, scope_id);
+        let function_id = match self.expr_id_to_expr_map.get(&id) {
+            Some(Expr::Function(function_id)) => *function_id,
+            _ => id,
+        };
+        self.const_functions.insert(function_id);
+        id
+    }
+
     fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
         // `const expr` marks and FORWARDS: the inner expression is the entity
         // (no wrapper), so every downstream pass sees a plain subtree; the
@@ -27164,6 +27335,16 @@ impl<'src> Analyzer<'src> {
                 let id = self.new_entity_id();
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 return id;
+            }
+            // G24: the two DECLARATION forms. Each walks its inner node as the
+            // ordinary `let` / `fun` it is, and records what the marker adds
+            // beside the entity — so nothing downstream needs a second shape
+            // for a declaration that happens to be compile-time.
+            if matches!(&inner.0, Node::Let(..) | Node::LetDestructure(..)) {
+                return self.walk_const_let(inner, scope_id);
+            }
+            if matches!(&inner.0, Node::Func(_)) {
+                return self.walk_const_fun(inner, scope_id);
             }
             let inner_id = self.walk_expr_node(inner, scope_id);
             self.const_exprs.push(inner_id);
@@ -32172,7 +32353,65 @@ impl<'src> Analyzer<'src> {
         {
             waiting_on.push(expr_id);
         }
+        self.note_callable_coercion(expr_id, constraint, &inferred);
         inferred
+    }
+
+    /// B340 Q1: record an expression at which a `Callable` value coerces to a
+    /// closure. This is the ONE place a value's own type and the type its
+    /// position wants are both in hand for every landing the language has — an
+    /// argument, an annotated binding, a field, a return — so the emitter's
+    /// wrap needs no second enumeration of "where a value lands".
+    ///
+    /// The constraint's shape is tested first because this runs on every
+    /// inference entry (~330k on a cold kolt check) and a closure expectation
+    /// is a small minority of them; everything past the first `matches!` is
+    /// paid only there. The arities must AGREE: a mismatch is a type error the
+    /// reconcile reports, and recording it would have the emitter wrap a call
+    /// the program never makes.
+    fn note_callable_coercion(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
+        let Type::Closure(expected_parameter_type_ids, _, _) = constraint else {
+            return;
+        };
+        if !self.type_is_callable(inferred) {
+            return;
+        }
+        // An ALLOW-LIST of the value forms that can HOLD a `Callable`, because
+        // inference FORWARDS an expectation: a `Local` hands it to the
+        // declaration it names, a block to its tail, an `if` to each branch's.
+        // Recording every id the expectation reached would wrap a declaration
+        // (`const s = new(..)` inside the arrow's arguments) and would wrap a
+        // block AND its tail, one inside the other. The forwarded-to leaf is
+        // what the emitter walks in the landing position, and it is the only
+        // thing that needs the wrap — so each branch of an `if` takes its own,
+        // which is also the right answer.
+        if !matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(
+                Expr::Local(_)
+                    | Expr::Field(..)
+                    | Expr::Index(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Call(_)
+                    | Expr::StructInitializer(..)
+                    | Expr::Dereference(_)
+            )
+        ) {
+            return;
+        }
+        let expected_arity = expected_parameter_type_ids.len();
+        if self.callable_closure_type(inferred).is_some_and(|coerced| {
+            matches!(&coerced, Type::Closure(parameter_type_ids, _, _)
+                    if parameter_type_ids.len() == expected_arity)
+        }) {
+            // The value's OWN type rides with the site: an `Expr::Local`
+            // reference stores no type on its own id (it reads through the
+            // declaration it names), and the emitter needs a receiver type to
+            // dispatch `call` on — including at a generic impl's instance.
+            let subject_type_id = inferred.clone().get_type_id(self);
+            self.callable_coercions
+                .insert(expr_id, (expected_arity, subject_type_id));
+        }
     }
 
     fn infer_type_path(
@@ -34243,6 +34482,69 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// B340 Q1: the `call` member a `Callable` type offers to closure-coercion
+    /// — its declaration id, its NON-`self` parameter type ids, and its
+    /// declared return.
+    ///
+    /// Read straight off the declaring impl rather than through
+    /// `resolve_impl_member`, because every reader of a coercion is
+    /// `&self`-shaped (`compare_type_rigid`) and because the answer must be the
+    /// same one on both paths: one lookup, one signature, so the type the
+    /// coercion offers and the arity the emitter wraps can never disagree.
+    ///
+    /// `None` when the type is not `Callable`, when no impl declares `call`,
+    /// when `call` has no declared return, or when the signature is not written
+    /// in the receiver's own terms (a GENERIC impl, whose parameters are the
+    /// impl's binders — see `callable_closure_type`).
+    fn callable_call_signature(&self, subject_type: &Type) -> Option<(Id, Vec<TypeId>, TypeId)> {
+        if !self.type_is_callable(subject_type) {
+            return None;
+        }
+        let member_id = self.implementations.iter().find_map(|implementation| {
+            let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
+            self.compare_type(
+                subject_type,
+                implementation.subject.borrow_type(self),
+                &HashMap::default(),
+            )
+            .then_some(*member_id)
+        })?;
+        let function_id = self.resolve_member_function_id(member_id);
+        let function = self.functions.get(&function_id)?;
+        let mut parameter_type_ids = Vec::with_capacity(function.parameters.len());
+        for (index, parameter_id) in function.parameters.iter().enumerate() {
+            let parameter = self.parameters.get(parameter_id)?;
+            if index == 0 && parameter.name == "self" {
+                continue;
+            }
+            parameter_type_ids.push(parameter.type_id);
+        }
+        Some((function_id, parameter_type_ids, function.return_type_id?))
+    }
+
+    /// The closure type a `Callable` value coerces to (B340 Q1,
+    /// `fn-coercion.md` §1): `call`'s signature minus the receiver.
+    ///
+    /// Offered only when the whole signature is GROUND. A generic impl writes
+    /// `call` in its own binders (`impl Box<type T> with Callable { fun
+    /// call(self, t: T): T }`), and a coercion that handed those out would bind
+    /// the closure slot's generics to the IMPL's — the same reason a generic
+    /// `fun` has no value form (§1 rule 2). The receiver's own `x(args)` call
+    /// is unaffected: it resolves by the method path, where the impl's binders
+    /// bind from the receiver.
+    ///
+    /// The coerced type carries NO `context` clause, matching
+    /// `function_closure_type`: a clause is a declaration about the member's
+    /// body, not a threading discipline on the value.
+    fn callable_closure_type(&self, subject_type: &Type) -> Option<Type> {
+        let (_, parameter_type_ids, return_type_id) = self.callable_call_signature(subject_type)?;
+        let ground = parameter_type_ids
+            .iter()
+            .all(|parameter_type_id| self.type_is_ground(*parameter_type_id))
+            && self.type_is_ground(return_type_id);
+        ground.then(|| Type::Closure(parameter_type_ids, return_type_id, Vec::new()))
+    }
+
     /// `function_closure_type` for read-only paths (`compare_type`): an
     /// undeclared return uses `inferred_return_type`'s RECORD, or fails the
     /// coercion on this attempt.
@@ -34679,6 +34981,20 @@ impl<'src> Analyzer<'src> {
                 let function_type = self.function_closure_type(function_id)?;
                 return self.reconcile_type(a, &function_type, substitution_context);
             }
+            // B340 Q1: a value whose type implements `Callable` coerces to a
+            // matching closure type, exactly as a named function does — the
+            // coercible set of `fn-coercion.md` §1 gains one member, and it
+            // converts through the same structural reconcile so a closure
+            // slot's generics bind from `call`'s signature. Symmetric, like the
+            // function arms above, because callers reconcile in both orders.
+            (_, Type::Closure(..)) if self.type_is_callable(a) => {
+                let callable_type = self.callable_closure_type(a)?;
+                return self.reconcile_type(&callable_type, b, substitution_context);
+            }
+            (Type::Closure(..), _) if self.type_is_callable(b) => {
+                let callable_type = self.callable_closure_type(b)?;
+                return self.reconcile_type(a, &callable_type, substitution_context);
+            }
             (l, r) if l == r => (a.clone(), Vec::new()),
             _ => {
                 return None;
@@ -34895,6 +35211,18 @@ impl<'src> Analyzer<'src> {
                 .is_some_and(|function_type| {
                     self.compare_type_rigid(a, &function_type, substitution_context, rigid)
                 }),
+            // B340 Q1's read-only twin — `callable_closure_type` is already
+            // `&self`, so one signature serves both paths.
+            (_, Type::Closure(..)) if self.type_is_callable(a) => {
+                self.callable_closure_type(a).is_some_and(|callable_type| {
+                    self.compare_type_rigid(&callable_type, b, substitution_context, rigid)
+                })
+            }
+            (Type::Closure(..), _) if self.type_is_callable(b) => {
+                self.callable_closure_type(b).is_some_and(|callable_type| {
+                    self.compare_type_rigid(a, &callable_type, substitution_context, rigid)
+                })
+            }
             (a, b) if a == b => true,
             _ => false,
         }
@@ -36877,6 +37205,19 @@ impl<'src> Analyzer<'src> {
         let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         let base = format!("cannot call this as a function: it is {rendered}");
         let Type::Function(function_id) = subject_type else {
+            // B340: the type has a `call` method and no `Callable` impl. The
+            // call operator is opt-in — a `call` method is an ordinary method
+            // until the marker says otherwise — so the ONE edit that makes
+            // this call resolve is the impl, and the steer names it rather
+            // than sending the reader to `.call(..)`, which is the spelling
+            // they deliberately did not write.
+            if self.declares_call_member(subject_type) && !self.type_is_callable(subject_type) {
+                return format!(
+                    "{base}; it declares a `call` method but does not implement \
+                     `Callable` — write `impl {rendered} with Callable` to call it as \
+                     a function"
+                );
+            }
             return base;
         };
         let Some(function) = self.functions.get(function_id) else {
@@ -37379,6 +37720,37 @@ impl<'src> Analyzer<'src> {
         }
 
         let subject_expr = self.get_entity_by_id(subject_id).clone();
+
+        // B340 — the CALL OPERATOR. A VALUE whose type implements `Callable`
+        // is called by resolving `x(args)` as the method `call` on it: one
+        // path, so arity, argument types, generic binding and a `context`
+        // clause on `call` are the method path's and can never disagree with
+        // `x.call(args)` written out. The receiver is the subject expression
+        // itself, so a `Callable` reached through a field is `(a.b)(c)` — a
+        // bare `a.b(c)` stays method lookup (Q2's ruling).
+        //
+        // A struct TYPE NAME is not a value: `Point(1, 2)` keeps its own
+        // "construct it with `{ .. }`" refusal below even when `Point`
+        // implements `Callable`, because the type is not the instance and the
+        // constructor-call shape is the mistake being steered away from.
+        let names_a_type = match &subject_expr {
+            Expr::Struct(_) => true,
+            Expr::Local(target_id) => {
+                matches!(self.get_entity_by_id(*target_id), Expr::Struct(_))
+            }
+            _ => false,
+        };
+        if !names_a_type && self.type_is_callable(&subject_type) {
+            return self.resolve_method_call(
+                call_id,
+                subject_id,
+                CALL_OPERATOR_MEMBER,
+                generic_argument_ids,
+                argument_ids,
+                arguments_span,
+            );
+        }
+
         match subject_expr {
             Expr::Local(target_id) => {
                 let target = self.get_entity_by_id(target_id).clone();
@@ -44586,6 +44958,20 @@ impl<'src> Analyzer<'src> {
                     check.declarations.get("drop").copied(),
                 ));
             }
+            // B340: the same recording for `Callable`, keyed on the resolved
+            // std entity so a user's own `trait Callable` never demands a
+            // `call`. Whether the subject HAS one cannot be answered here —
+            // `call` may be declared in a separate inherent block whose
+            // registration this loop does not wait for — so the verdict is
+            // `check_callable_impls`'s, post-build.
+            if Some(trait_id) == self.callable_trait_id {
+                self.callable_impls_to_check.push((
+                    check.subject_type_id,
+                    check.span,
+                    check.impl_id,
+                    check.declarations.contains_key(CALL_OPERATOR_MEMBER),
+                ));
+            }
             // Required members are the signature-only declarations of the trait
             // AND its supertraits (a member with a default body is inherited, so
             // an impl need not provide it). Implementing `X with Ord` thus
@@ -48525,6 +48911,20 @@ pub struct Program<'src> {
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
+    /// G24: the initializer expression of every `const let NAME = EXPR;` — a
+    /// subset of the const-marked set. The const pass reads it to decide
+    /// whether a CLOSURE result is admitted at this site (`const-eval.md`
+    /// §11), and the refusal at every other site steers here.
+    pub const_let_initializers: HashSet<Id>,
+    /// G24: every `const fun`, by function id. Its body is run through the
+    /// const capability check at its DECLARATION, so the diagnostic lands on
+    /// the promise rather than on whichever call first tried to keep it.
+    pub const_functions: HashSet<Id>,
+    /// G24: the const world's generated name for each binding it named, so the
+    /// emitter can resolve a snapshot's name-keyed captures to the bindings it
+    /// will substitute for. Written by the const pass beside `const_results`
+    /// and empty whenever nothing was evaluated.
+    pub const_snapshot_bindings: HashMap<String, Id>,
     /// The contributions `asset::emit` / `asset::emit_keyed` accumulated
     /// during const evaluation; the build deduplicates, orders, and writes
     /// them beside the output.
@@ -48825,6 +49225,11 @@ pub struct Program<'src> {
     /// its emission asks for no type lookup and none can go missing. A plain
     /// element still splices by TYPE (flat storage), which is the older rule.
     pub spread_elements: HashSet<Id>,
+    /// B340 Q1: every expression a `Callable` value coerces to a closure at,
+    /// with `call`'s arity — the emitter wraps each as `(a, b) => call(x, a, b)`
+    /// (`walk_entity`). A struct is a plain JS array and cannot be applied, so
+    /// the wrap is what the coercion IS at runtime.
+    pub callable_coercions: HashMap<Id, (usize, TypeId)>,
     // The next unused entity id. Post-analysis passes (the context threading
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
@@ -55950,6 +56355,12 @@ fn analyze_inner<'src>(
             .get(scope_id)
             .and_then(|scope| scope.name_to_id_map.get("Lift").copied())
     });
+    analyzer.callable_trait_id = module_scopes.get("operators").and_then(|scope_id| {
+        analyzer
+            .scopes
+            .get(scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("Callable").copied())
+    });
     // The std `dev::stash`/`dev::take` functions, by identity (`hmr.md` §4) — set
     // only when `std::dev` is reachable, so the transfer-bound check at their call
     // sites keys on the real hooks rather than a user's same-named function.
@@ -56814,6 +57225,11 @@ fn analyze_over_world<'src>(
         // resource, and synchronous. Runs after classification so subject
         // resource-ness is settled.
         analyzer.check_drop_impls();
+        // B340: `impl … with Callable` without a `call` method. Post-build like
+        // the `Drop` restrictions above and for the same reason — `call` may be
+        // declared in a separate inherent block, and only here is the type's
+        // whole member set in hand.
+        analyzer.check_callable_impls();
         // Full per-member signature conformance (B29): every trait member an impl
         // provides by name must agree with the trait's declaration on receiver
         // convention, arity, parameter conventions/types, and return type. Runs
@@ -57668,6 +58084,9 @@ fn analyze_over_world<'src>(
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
         const_results: HashMap::default(),
+        const_let_initializers: analyzer.const_let_initializers.clone(),
+        const_functions: analyzer.const_functions.clone(),
+        const_snapshot_bindings: HashMap::default(),
         const_assets: Vec::new(),
         const_input_files: Vec::new(),
         const_bundled_files: Vec::new(),
@@ -57736,6 +58155,7 @@ fn analyze_over_world<'src>(
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
+        callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
