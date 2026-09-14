@@ -3850,13 +3850,36 @@ impl LanguageServer for Backend {
                     let range = live_span(&document, params.range);
                     for fix in document.quickfixes(program, range) {
                         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-                        changes.insert(
-                            uri.clone(),
-                            vec![TextEdit {
-                                range: document.line_index.range(&fix.span),
-                                new_text: fix.replacement,
-                            }],
-                        );
+                        // E177: a fix may edit ANOTHER file — B318 §4/§5's
+                        // "Export `S`" inserts one word in front of a
+                        // declaration wherever it lives, which is usually a
+                        // sibling module. The target carries its own converted
+                        // RANGE, so this document's line index is never asked
+                        // about another file's span; a fix whose path has no
+                        // URL is dropped rather than applied here.
+                        match fix.target {
+                            Some(target) => {
+                                let Ok(target_uri) = Url::from_file_path(&target.path) else {
+                                    continue;
+                                };
+                                changes.insert(
+                                    target_uri,
+                                    vec![TextEdit {
+                                        range: target.range,
+                                        new_text: fix.replacement,
+                                    }],
+                                );
+                            }
+                            None => {
+                                changes.insert(
+                                    uri.clone(),
+                                    vec![TextEdit {
+                                        range: document.line_index.range(&fix.span),
+                                        new_text: fix.replacement,
+                                    }],
+                                );
+                            }
+                        }
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                             title: fix.title,
                             kind: Some(CodeActionKind::QUICKFIX),
@@ -4387,6 +4410,79 @@ mod snapshot_consistency_tests {
             .expect("an edit for this file");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "import pkg::topic::help_topic;\n");
+    }
+
+    // E177, end to end: a quickfix whose edit belongs to ANOTHER FILE. Every
+    // action the server offered before this one edited the buffer it was
+    // invoked in, and the `WorkspaceEdit` it built was one map entry keyed on
+    // that buffer's own URI — so B318 §4/§5's "Export `S`" could not be an
+    // action at all, however well the paper described it. The claim here is
+    // the whole of what E177 changed: the change map is keyed on `a.vl`, not
+    // on `main.vl`, and the range in it was converted through `a.vl`'s own line
+    // index (which is what the `1` — the second line of `a.vl`, not of the open
+    // buffer — is asserting).
+    #[tokio::test]
+    async fn the_export_quickfix_edits_the_file_that_declares_the_item() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (dir, document) = crate::document::tests::analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("the reach warning's fixes are offered");
+        let export = response
+            .iter()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) if action.title == "Export `hidden`" => {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Export action: {response:#?}"));
+        assert_eq!(export.kind, Some(CodeActionKind::QUICKFIX));
+        let changes = export
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .expect("a workspace edit");
+        assert_eq!(changes.len(), 1, "one file is edited: {changes:#?}");
+        let (edited, edits) = changes.iter().next().expect("the one entry");
+        assert_ne!(edited, &uri, "the edit does NOT belong to the open buffer");
+        assert!(
+            edited.path().ends_with("a.vl"),
+            "the edit belongs to the declaring file: {edited}"
+        );
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "export ");
+        assert_eq!(edits[0].range.start, edits[0].range.end, "an insertion");
+        assert_eq!(
+            edits[0].range.start,
+            Position::new(1, 0),
+            "line 1 column 0 of `a.vl` — that file's own coordinates"
+        );
+        // And the same-file fix is still offered beside it, unchanged.
+        assert!(
+            response.iter().any(|action| matches!(
+                action,
+                CodeActionOrCommand::CodeAction(action) if action.title == "Import as `#hidden`"
+            )),
+            "{response:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // css-block S5, end to end: the server's first `refactor.rewrite` action

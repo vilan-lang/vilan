@@ -5755,6 +5755,7 @@ impl Document {
                         title: format!("Import `{name}` from {}", module_path.join("::")),
                         span: edit.span,
                         replacement: edit.replacement,
+                        target: None,
                     });
                 }
             } else if let Some(suggestion) = diagnostic
@@ -5766,6 +5767,7 @@ impl Document {
                     title: format!("Change to `{suggestion}`"),
                     span: diagnostic.span,
                     replacement: suggestion.to_string(),
+                    target: None,
                 });
             } else if let Some((span, replacement)) = self.declare_contexts_fix(program, diagnostic)
             {
@@ -5773,6 +5775,7 @@ impl Document {
                     title: "Declare the inferred contexts".to_string(),
                     span,
                     replacement,
+                    target: None,
                 });
             } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
                 // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
@@ -5786,6 +5789,7 @@ impl Document {
                     title: "Insert `;`".to_string(),
                     span: Span::from(insertion..insertion),
                     replacement: ";".to_string(),
+                    target: None,
                 });
             } else if diagnostic.msg.ends_with(DISCARDED_VALUE_MESSAGE)
                 && let Some(semicolon_span) =
@@ -5801,6 +5805,7 @@ impl Document {
                     title: "Remove `;`".to_string(),
                     span: semicolon_span,
                     replacement: String::new(),
+                    target: None,
                 });
             } else if diagnostic
                 .msg
@@ -5820,6 +5825,7 @@ impl Document {
                     title: format!("Wrap as `{hole}`"),
                     span,
                     replacement: hole,
+                    target: None,
                 });
             } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
                 && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
@@ -5839,6 +5845,7 @@ impl Document {
                     title: "Remove `!important`".to_string(),
                     span: Span::from(start..diagnostic.span.end),
                     replacement: String::new(),
+                    target: None,
                 });
             }
         }
@@ -5867,7 +5874,37 @@ impl Document {
                     title: format!("Import as `#{leaf}`"),
                     span: Span::from(at..at),
                     replacement: "#".to_string(),
+                    target: None,
                 });
+                // E177, and §5's own pairing: the OTHER way out of a plain
+                // reach is to export the thing.
+                if let Some(definition) = self.reached_definition(warning)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.contains(REACH_THROUGH_THE_MODULE) {
+                // §5's second door, the QUALIFIED reach (`import pkg::a;` then
+                // `a::hidden()`): there is no leaf to mark, so "Export" is the
+                // only fix the paper names for it.
+                if let Some(definition) = self.reached_definition(warning)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.contains(SIGNATURE_EXPOSES_A_PRIVATE_TYPE)
+                && !warning.msg.contains(EXPOSED_TYPE_IS_FOREIGN)
+            {
+                // B318 §4's "Export `S`". The warning is spanned at the
+                // EXPORTED ITEM's own name — one warning per declaration,
+                // whichever signature position found the exposure — so the
+                // type it names is recovered from the message and resolved
+                // against this file's recorded type references.
+                if let Some(definition) = self.exposed_type_definition(program, &warning.msg)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
             } else if warning.msg.ends_with(REACH_IS_REDUNDANT)
                 && self.text[..warning.span.start].ends_with('#')
             {
@@ -5875,10 +5912,140 @@ impl Document {
                     title: "Delete the `#`".to_string(),
                     span: Span::from(warning.span.start - 1..warning.span.start),
                     replacement: String::new(),
+                    target: None,
                 });
             }
         }
         fixes
+    }
+
+    /// The private item a B318 §5 reach warning is ABOUT, read off the warning
+    /// itself (E177).
+    ///
+    /// The two doors span differently — the leaf form is spanned at the leaf,
+    /// the qualified form at the whole `a::hidden` path — so the fix is not
+    /// keyed on the span's exact shape. Both messages open with the reached
+    /// PATH in backticks, and the reference index narrows every use to its own
+    /// identifier, so the occurrence inside the warning that spells the path's
+    /// last segment is the one the warning means.
+    fn reached_definition(&self, warning: &Error) -> Option<Id> {
+        let path = warning.msg.strip_prefix('`')?.split('`').next()?;
+        let leaf = path.rsplit("::").next()?;
+        self.reference_index
+            .occurrences_in(SourceId(0))
+            .find(|occurrence| {
+                spans_contain(warning.span, occurrence.span)
+                    && !occurrence.is_declaration
+                    && matches!(occurrence.definition, Definition::Entity(_))
+                    && self
+                        .program
+                        .as_ref()
+                        .and_then(|program| {
+                            crate::references::name_of(program, occurrence.definition)
+                        })
+                        .is_some_and(|name| name == leaf)
+            })
+            .and_then(|occurrence| match occurrence.definition {
+                Definition::Entity(id) => Some(id),
+                Definition::Field(..) => None,
+            })
+    }
+
+    /// B318 §4/§5's "Export `S`" (E177): the edit that inserts `export ` in
+    /// front of `definition`'s declaration, WHEREVER it lives.
+    ///
+    /// The declaration's file comes from the reference index, which carries a
+    /// declaration row for every definition in the program and not only for
+    /// this file's — so the fix reaches the sibling module the warning is
+    /// really about without the LSP guessing at a path. Its own text is read
+    /// from DISK when it is not this buffer (the same bargain go-to-definition
+    /// makes), and the range is converted through THAT file's line index here,
+    /// because the handler has only this document's.
+    ///
+    /// Four refusals, each of them a place a wrong edit would be worse than no
+    /// action:
+    ///  - a declaration with no file (generated code) has nothing to edit;
+    ///  - a declaration outside this package's source root is not ours to
+    ///    change — §4's dependency arm says so in the message, and this is the
+    ///    same rule applied to the edit;
+    ///  - an INDENTED declaration line is a member, a variant or a local, and
+    ///    `export` does not belong in front of one (a top-level item is at
+    ///    column 0 — the formatter's own invariant);
+    ///  - a line already beginning `export` (or `export(in …)`) has nothing to
+    ///    add, which is also what keeps the action from being offered twice.
+    fn export_declaration_fix(&self, program: &Program, definition: Id) -> Option<QuickFix> {
+        let entity = Definition::Entity(definition);
+        let name = crate::references::name_of(program, entity)?.to_string();
+        let declaration = self
+            .reference_index
+            .occurrences_of(entity)
+            .find(|occurrence| occurrence.is_declaration_of(entity))?;
+        let path = program.source_path(declaration.source)?.to_path_buf();
+        if let Some(root) = self.package_root()
+            && !path.starts_with(root)
+        {
+            return None;
+        }
+        let title = format!("Export `{name}`");
+        // The current buffer answers from its LIVE text — `quickfixes` runs
+        // only on a document whose snapshots agree, so that is also the
+        // analyzed text the span came from.
+        if declaration.source == SourceId(0) {
+            let at = top_level_item_start(&self.text, declaration.span.start)?;
+            return Some(QuickFix {
+                title,
+                span: Span::from(at..at),
+                replacement: "export ".to_string(),
+                target: None,
+            });
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let at = top_level_item_start(&text, declaration.span.start)?;
+        let range = LineIndex::new(&text).range(&Span::from(at..at));
+        Some(QuickFix {
+            title,
+            // Unused for a targeted fix; the warning's own span is the anchor.
+            span: Span::from(declaration.span.start..declaration.span.start),
+            replacement: "export ".to_string(),
+            target: Some(FixTarget { path, range }),
+        })
+    }
+
+    /// The private TYPE a §4 exposure warning names — `S` in "`S` is used in
+    /// the signature …" — resolved to its definition.
+    ///
+    /// The warning is spanned at the exported ITEM's declaration name and
+    /// carries the type only as text, so the name is read off the front of the
+    /// message and matched against this file's recorded type references: a
+    /// signature that names `S` records `S` at its own span, whatever the
+    /// position was. If the file's references for that name disagree about
+    /// which definition it is — two `S`es in one file, which nothing in the
+    /// estate writes — the fix is declined rather than guessed at.
+    fn exposed_type_definition(&self, program: &Program, message: &str) -> Option<Id> {
+        let exposed = message.strip_prefix('`')?.split('`').next()?;
+        let mut found: Option<Id> = None;
+        for (source, span, definition, _) in &program.type_references {
+            if *source != SourceId(0) {
+                continue;
+            }
+            let Some(definition) = *definition else {
+                continue;
+            };
+            if crate::references::name_of(program, Definition::Entity(definition)) != Some(exposed)
+            {
+                continue;
+            }
+            // An import path's own segments resolve to the same definitions its
+            // leaves bind; a signature's reference is the one this is about,
+            // but either answers the same definition, so only DISAGREEMENT
+            // matters.
+            if found.is_some_and(|seen| seen != definition) {
+                return None;
+            }
+            found = Some(definition);
+            let _ = span;
+        }
+        found
     }
 
     /// The `css`-spelling conversion offered over `range` (LIVE space, and the
@@ -6205,13 +6372,61 @@ impl Document {
     }
 }
 
+/// Where `export ` is inserted to export the top-level item whose name begins
+/// at `name_start` in `text` (E177) — the start of that item's own line.
+///
+/// `None` when the line is INDENTED (a member, a variant, a local — a top-level
+/// item is at column 0, which the formatter guarantees) or already begins
+/// `export`, in which case there is nothing to add and no action to offer.
+/// An attribute written above the item (`[derive(Json)]` on its own line)
+/// leaves the declaration's own line untouched, which is where the word goes.
+fn top_level_item_start(text: &str, name_start: usize) -> Option<usize> {
+    let line_start = text.get(..name_start)?.rfind('\n').map_or(0, |at| at + 1);
+    let line = text.get(line_start..)?;
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    if line
+        .strip_prefix("export")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    {
+        return None;
+    }
+    Some(line_start)
+}
+
 /// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
 /// `(span, replacement)` this document's own text needs — LIVE space, same
 /// convention as [`Document::organize_import_edits`].
+///
+/// E177 widened it with a TARGET. Every fix before it edited the buffer the
+/// action was invoked in, and that was not a design so much as the only thing
+/// the type could say: B318 §4/§5's "Export `S`" inserts one word in front of
+/// a declaration WHEREVER it lives, which is usually another file of the same
+/// package, so the paper's third fix shipped as a sentence in a message while
+/// its two same-file siblings shipped as actions.
 pub struct QuickFix {
     pub title: String,
+    /// The edit's span in THIS document's live text. Ignored when
+    /// [`QuickFix::target`] is `Some` — it is then the WARNING's own span, kept
+    /// so the action still anchors where the user's cursor is.
     pub span: Span,
     pub replacement: String,
+    /// E177: the other file this fix edits, when it is not this document.
+    pub target: Option<FixTarget>,
+}
+
+/// Where a cross-file [`QuickFix`] lands (E177): the file, and the range in
+/// THAT file's text.
+///
+/// The range is converted HERE rather than handed over as a span, because the
+/// conversion needs the target file's own line index and the handler has only
+/// this document's. Carrying the answer is what makes it impossible to apply a
+/// span from one file through another file's index — the failure mode that
+/// corrupts a file rather than merely looking wrong.
+pub struct FixTarget {
+    pub path: PathBuf,
+    pub range: Range,
 }
 
 /// The sentence B318 §5's plain-reach warning carries, and the key the "mark
@@ -6221,6 +6436,17 @@ const REACH_IS_UNMARKED: &str = "Importing it anyway is allowed — mark the rea
 
 /// Its twin: the marker written on an item that is exported anyway.
 const REACH_IS_REDUNDANT: &str = "the reach marker is redundant — delete the `#`";
+
+/// B318 §5's SECOND door — `import pkg::a;` then `a::hidden()`, where there is
+/// no leaf to mark and "Export" is the only fix the paper names for it.
+const REACH_THROUGH_THE_MODULE: &str = "and this path reaches it through the module";
+
+/// B318 §4's exposure warning, and the key the "Export `S`" fix reads it by.
+const SIGNATURE_EXPOSES_A_PRIVATE_TYPE: &str = "is exported, but";
+
+/// Its dependency arm: `S` belongs to another package, so there is no
+/// declaration here to export and the message says what the two ways out are.
+const EXPOSED_TYPE_IS_FOREIGN: &str = "in another package, and cannot be exported from here";
 
 /// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
 /// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
@@ -7032,6 +7258,7 @@ fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
         title: format!("Use `{spelling}`"),
         span: Span::from(at..at + "@media".len() + after_query + brace + 1),
         replacement: format!("{head} {{"),
+        target: None,
     })
 }
 
@@ -8112,6 +8339,171 @@ pub(crate) mod tests {
             });
         assert_eq!(&text[delete.span.into_range()], "#");
         assert!(delete.replacement.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E177: B318 §5's OTHER way out of a plain reach — export the thing. The
+    // edit lands in `a.vl`, which is what `QuickFix` could not say before: the
+    // type carried a span in this document and nothing else, so the paper's
+    // third fix shipped as a sentence in a message while its two one-character
+    // siblings shipped as actions. The fix is offered BESIDE the mark, because
+    // the two are genuinely different decisions ("this reach is deliberate" vs
+    // "this item should have been surface").
+    #[test]
+    fn quickfix_exports_a_reached_declaration_in_the_file_that_declares_it() {
+        const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let titles: Vec<&String> = fixes.iter().map(|fix| &fix.title).collect();
+        assert!(
+            titles.contains(&&"Import as `#hidden`".to_string()),
+            "the same-file fix is still offered: {titles:?}"
+        );
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| panic!("no export fix: {titles:?}"));
+        let target = export
+            .target
+            .as_ref()
+            .expect("the declaration lives in another file");
+        assert!(
+            target.path.ends_with("a.vl"),
+            "the edit belongs to the declaring file: {:?}",
+            target.path
+        );
+        assert_eq!(export.replacement, "export ");
+        // The range is `a.vl`'s own — line 2, column 0, where `fun hidden`
+        // begins — converted through THAT file's line index and not this
+        // document's.
+        assert_eq!(target.range.start, target.range.end, "an insertion");
+        assert_eq!(target.range.start.line, 2);
+        assert_eq!(target.range.start.character, 0);
+        // Applied, it produces the exported declaration.
+        let mut applied = MODULE.to_string();
+        let at = MODULE.find("fun hidden").expect("the declaration");
+        applied.insert_str(at, "export ");
+        assert_eq!(
+            applied,
+            "export fun shown(): i32 { 1 }\n\nexport fun hidden(): i32 { 2 }\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The QUALIFIED reach (§5's second door): `import pkg::a;` then
+    // `a::hidden()`. There is no leaf to mark, so "Export" is the only fix the
+    // paper names for it — and it is the same cross-file edit.
+    #[test]
+    fn quickfix_exports_a_declaration_reached_through_a_qualified_path() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() {\n\tlet _ = a::hidden();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export.target.as_ref().expect("another file");
+        assert!(target.path.ends_with("a.vl"), "{:?}", target.path);
+        assert_eq!(target.range.start.line, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B318 §4's "Export `S`", the exposure warning's own fix. The private type
+    // is in the SAME file here, which is the shape the warning usually takes —
+    // so the fix carries no target and edits this buffer, and the two paths
+    // through `export_declaration_fix` are both exercised by the pair.
+    #[test]
+    fn quickfix_exports_a_private_type_an_exported_signature_names() {
+        let source = "struct Secret {\n\tvalue: i32,\n}\n\n\
+                      export fun make(): Secret {\n\tSecret { value: 1 }\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("a.vl", "fun unused() {}\n")]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `Secret`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            export.target.is_none(),
+            "the declaration is in this buffer: {:?}",
+            export.target.as_ref().map(|t| &t.path)
+        );
+        let mut applied = text.clone();
+        applied.replace_range(export.span.into_range(), &export.replacement);
+        assert!(applied.starts_with("export struct Secret {"), "{applied:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The refusals, which are the half a wrong edit would be worse than no
+    // action for: an item already exported offers nothing to export (so the
+    // action is never offered twice), and a warning about a module that is
+    // already surface offers nothing at all.
+    #[test]
+    fn quickfix_never_offers_to_export_what_is_already_exported() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() {\n\tlet _ = shown();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        assert!(
+            fixes.iter().all(|fix| !fix.title.starts_with("Export ")),
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
